@@ -1,0 +1,61 @@
+{
+  "provider": "ollama",
+  "temperature": 0.2,
+  "request_timeout": 1200,
+  "thinking_stream": false,
+
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "",
+  "ollama_thinking_stream": false,
+
+  "openai_url": "https://api.openai.com/v1",
+  "openai_model": "",
+  "openai_key": "YOUR_OPENAI_API_KEY",
+  "openai_thinking_stream": false,
+
+  "siliconflow_url": "https://api.siliconflow.cn/v1",
+  "siliconflow_model": "",
+  "siliconflow_key": "YOUR_SILICONFLOW_API_KEY",
+  "siliconflow_thinking_stream": false,
+
+  "custom_url": "https://your-custom-endpoint.example.com/v1/chat/completions",
+  "custom_model": "your-custom-model",
+  "custom_key": "YOUR_CUSTOM_API_KEY",
+  "custom_headers": "{\"Authorization\":\"Bearer YOUR_CUSTOM_API_KEY\"}",
+  "custom_payload": "{\"model\":\"{{model}}\",\"messages\":{{messages}},\"stream\":{{stream}}}",
+  "custom_thinking_stream": false,
+
+  "multimodal_capabilities": {
+    "ollama": {
+      "image": true,
+      "audio": false,
+      "video": false
+    },
+    "openai": {
+      "image": true,
+      "audio": true,
+      "video": false
+    },
+    "siliconflow": {
+      "image": true,
+      "audio": false,
+      "video": false
+    },
+    "custom": {
+      "image": false,
+      "audio": false,
+      "video": false
+    }
+  },
+  "media_endpoints": {
+    "openai": {
+      "image": "https://api.openai.com/v1/images/generations"
+    },
+    "siliconflow": {
+      "image": "https://api.siliconflow.cn/v1/images/generations"
+    },
+    "custom": {
+      "image": "https://your-custom-endpoint.example.com/v1/images/generations"
+    }
+  }
+}

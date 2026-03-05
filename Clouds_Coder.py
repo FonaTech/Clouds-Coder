@@ -1,0 +1,17009 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import base64
+import csv
+import difflib
+import html
+import hashlib
+import hmac
+import io
+import importlib.util
+import json
+import mimetypes
+import os
+import queue
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import uuid
+import zipfile
+import zlib
+import xml.etree.ElementTree as ET
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path, PurePosixPath
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
+APP_VERSION = "0.1.0"
+DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+WORKDIR = Path(os.getenv("AGENT_WORKDIR", os.getcwd())).resolve()
+SCRIPT_DIR = Path(__file__).resolve().parent
+CODES_ROOT = WORKDIR / "Codes"
+LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
+MAX_TOOL_OUTPUT = 50_000
+TOKEN_THRESHOLD = 100_000
+IDLE_TIMEOUT = 60
+POLL_INTERVAL = 5
+SSE_HEARTBEAT_SECONDS = 15
+MODEL_CALL_PROGRESS_DELAY = 8.0
+MODEL_CALL_PROGRESS_INTERVAL = 12.0
+MAX_AGENT_ROUNDS = 200
+MIN_AGENT_ROUNDS = 8
+MAX_AGENT_ROUNDS_CAP = 400
+REPEATED_TOOL_LOOP_THRESHOLD = 2
+MAX_RUN_SECONDS = 3000
+MIN_RUN_TIMEOUT_SECONDS = 600
+MAX_RUN_TIMEOUT_SECONDS = 86_400
+MIN_TIMEOUT_SECONDS = 600
+MAX_TIMEOUT_SECONDS = 86_400
+DEFAULT_TIMEOUT_SECONDS = max(
+    MIN_TIMEOUT_SECONDS,
+    min(
+        MAX_TIMEOUT_SECONDS,
+        int(str(os.getenv("AGENT_TIMEOUT", str(MIN_TIMEOUT_SECONDS))) or str(MIN_TIMEOUT_SECONDS)),
+    ),
+)
+DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
+AUTO_CONTINUE_BUDGET_DEFAULT = 30
+AGENT_MAX_OUTPUT_TOKENS = 2200
+TRUNCATION_CONTINUATION_MAX_PASSES = 3
+TRUNCATION_CONTINUATION_MAX_TOKENS = 1800
+TRUNCATION_CONTINUATION_TAIL_CHARS = 2800
+TRUNCATION_CONTINUATION_ECHO_CHARS = 12000
+TRUNCATION_OVERLAP_SCAN_CHARS = 420
+TRUNCATION_PAIR_SCAN_CHARS = 120_000
+TRUNCATION_LIVE_BUFFER_MAX_CHARS = 32000
+MIN_CONTEXT_TOKEN_LIMIT = 18_000
+MAX_CONTEXT_ARCHIVE_SEGMENTS = 1200
+MODEL_OUTPUT_RETRY_TIMES = 3
+LIVE_INPUT_DELAY_WRITE_ROUNDS = 2
+LIVE_INPUT_DELAY_TOOL_ROUNDS = 1
+LIVE_INPUT_DELAY_NORMAL_ROUNDS = 0
+LIVE_INPUT_MAX_INJECTIONS = 3
+LIVE_INPUT_REINJECT_INTERVAL = 1
+LIVE_INPUT_WEIGHT_BASE_DELAYED = 0.35
+LIVE_INPUT_WEIGHT_BASE_NORMAL = 0.65
+LIVE_INPUT_WEIGHT_STEP_DELAYED = 0.30
+LIVE_INPUT_WEIGHT_STEP_NORMAL = 0.20
+RUNTIME_CONTROL_HINT_PREFIXES = (
+    "<reminder>",
+    "<todo-rescue>",
+    "<tool-retry>",
+    "<segmented-retry>",
+    "<forced-converge>",
+    "<no-tool-recovery>",
+    "<auto-context-recall>",
+    "<live-user-adjustment",
+    "<background-results>",
+    "<inbox>",
+    "<auto-continue>",
+    "<failure-recovery>",
+    "<truncate-rescue>",
+)
+SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
+SKILL_PROMPT_MAX_ITEMS = 40
+SKILL_PROMPT_MAX_CHARS = 2600
+SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
+SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
+HTML_FRONTEND_REQUEST_KEYWORDS = (
+    "html",
+    "web page",
+    "webpage",
+    "landing page",
+    "frontend",
+    "front-end",
+    "ui",
+    "ux",
+    "css",
+    "javascript",
+    "js",
+    "dashboard",
+    "report",
+    "visualization",
+    "visualisation",
+    "chart",
+    "plot",
+    "网页",
+    "頁面",
+    "页面",
+    "前端",
+    "可视化",
+    "可視化",
+    "图表",
+    "圖表",
+    "仪表盘",
+    "儀表板",
+    "报告",
+    "報告",
+    "报表",
+    "報表",
+    "html报告",
+    "html報告",
+    "フロントエンド",
+    "レポート",
+    "ダッシュボード",
+    "グラフ",
+    "可視化",
+)
+DEEP_RESEARCH_REQUEST_KEYWORDS = (
+    "deep research",
+    "deep-research",
+    "literature review",
+    "paper review",
+    "survey",
+    "research report",
+    "evidence synthesis",
+    "文献",
+    "文獻",
+    "论文",
+    "論文",
+    "深度研究",
+    "深度分析",
+    "深度总结",
+    "深度總結",
+    "综述",
+    "綜述",
+    "调研",
+    "調研",
+    "研究报告",
+    "研究報告",
+)
+DEEP_RESEARCH_RETRIEVAL_KEYWORDS = (
+    "search",
+    "web search",
+    "internet",
+    "online",
+    "lookup",
+    "source",
+    "citation",
+    "检索",
+    "檢索",
+    "联网",
+    "聯網",
+    "搜索",
+    "蒐索",
+    "查找",
+    "查詢",
+    "引用",
+    "参考文献",
+    "參考文獻",
+)
+DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS = (
+    "based on this text",
+    "only this text",
+    "given text",
+    "upload text",
+    "文本",
+    "文章",
+    "段落",
+    "只根据",
+    "僅根據",
+    "仅根据",
+    "仅基于",
+    "僅基於",
+    "不联网",
+    "不聯網",
+    "无需检索",
+    "無需檢索",
+)
+
+DANGEROUS_PATTERNS = ["rm -rf /", "sudo ", "shutdown", "reboot", "> /dev/"]
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
+
+SUPPORTED_UI_LANGUAGES = [
+    {"code": "zh-CN", "label": "简体中文"},
+    {"code": "zh-TW", "label": "繁體中文"},
+    {"code": "ja", "label": "日本語"},
+    {"code": "en", "label": "English"},
+]
+UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
+DEFAULT_UI_LANGUAGE = "zh-CN"
+DEFAULT_WEB_UI_DIR = "./web_UI"
+DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
+WEB_UI_REQUIRED_FILES = (
+    "index.html",
+    "style.css",
+    "app.js",
+    "skills.html",
+    "skills.js",
+    "skills-extra.css",
+)
+WEB_UI_OPTIONAL_FILES = ("app.ts",)
+
+IMAGE_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".svg",
+    ".avif",
+    ".heic",
+    ".heif",
+}
+AUDIO_EXTS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".webm",
+}
+VIDEO_EXTS = {
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".m4v",
+    ".mpeg",
+    ".mpg",
+    ".3gp",
+}
+CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
+CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
+CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
+CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
+RENDER_FRAME_MAX_B64_CHARS = 2_200_000
+RENDER_FRAME_MAX_POINTS = 12_000
+RENDER_FRAME_MAX_LINES = 2_000
+RENDER_FRAME_MAX_LINE_POINTS = 800
+RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS = 1.2
+CODE_PREVIEW_EXTS = {
+    ".py",
+    ".pyi",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".java",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".go",
+    ".rs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".scala",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+    ".bat",
+    ".sql",
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".xml",
+    ".xsd",
+    ".xsl",
+    ".cs",
+    ".m",
+    ".mm",
+    ".r",
+    ".pl",
+    ".lua",
+    ".dart",
+    ".vue",
+    ".svelte",
+    ".gradle",
+    ".properties",
+}
+CODE_PREVIEW_FILENAMES = {
+    "dockerfile",
+    "makefile",
+    "cmakelists.txt",
+    "justfile",
+    "gemfile",
+    "rakefile",
+    "pipfile",
+    "requirements.txt",
+}
+MEDIA_CAPABILITY_KEYS = {
+    "input_image",
+    "input_audio",
+    "input_video",
+    "output_image",
+    "output_audio",
+    "output_video",
+}
+SAMPLE_IMAGE_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
+    "b0cAAAAASUVORK5CYII="
+)
+SAMPLE_AUDIO_WAV_B64 = (
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+)
+SAMPLE_VIDEO_MP4_B64 = (
+    "AAAAFGZ0eXBpc29tAAAAAGlzb21pc28y"
+)
+
+OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
+    {
+        "id": "echarts",
+        "filename": "echarts.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js",
+            "https://unpkg.com/echarts@5.5.0/dist/echarts.min.js",
+        ],
+        "match_tokens": ["echarts", "echarts.min.js"],
+    },
+    {
+        "id": "chartjs",
+        "filename": "chart.umd.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js",
+            "https://unpkg.com/chart.js@4.4.3/dist/chart.umd.min.js",
+        ],
+        "match_tokens": ["chart.js", "chart.umd.min.js", "chart.min.js"],
+    },
+    {
+        "id": "d3",
+        "filename": "d3.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js",
+            "https://unpkg.com/d3@7.9.0/dist/d3.min.js",
+        ],
+        "match_tokens": ["d3.min.js", "/d3@"],
+    },
+    {
+        "id": "plotly",
+        "filename": "plotly.min.js",
+        "urls": [
+            "https://cdn.plot.ly/plotly-2.35.2.min.js",
+            "https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js",
+        ],
+        "match_tokens": ["plotly", "cdn.plot.ly"],
+    },
+    {
+        "id": "lodash",
+        "filename": "lodash.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js",
+            "https://unpkg.com/lodash@4.17.21/lodash.min.js",
+        ],
+        "match_tokens": ["lodash", "lodash.min.js"],
+    },
+    {
+        "id": "dayjs",
+        "filename": "dayjs.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/dayjs@1.11.11/dayjs.min.js",
+            "https://unpkg.com/dayjs@1.11.11/dayjs.min.js",
+        ],
+        "match_tokens": ["dayjs", "dayjs.min.js"],
+    },
+    {
+        "id": "axios",
+        "filename": "axios.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/axios@1.7.2/dist/axios.min.js",
+            "https://unpkg.com/axios@1.7.2/dist/axios.min.js",
+        ],
+        "match_tokens": ["axios", "axios.min.js"],
+    },
+    {
+        "id": "marked",
+        "filename": "marked.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js",
+            "https://unpkg.com/marked@12.0.2/marked.min.js",
+        ],
+        "match_tokens": ["marked", "marked.min.js"],
+    },
+    {
+        "id": "mermaid",
+        "filename": "mermaid.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js",
+            "https://unpkg.com/mermaid@10.9.1/dist/mermaid.min.js",
+        ],
+        "match_tokens": ["mermaid", "mermaid.min.js"],
+    },
+    {
+        "id": "three",
+        "filename": "three.min.js",
+        "urls": [
+            "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js",
+            "https://unpkg.com/three@0.128.0/build/three.min.js",
+        ],
+        "match_tokens": ["three.min.js", "three.js", "threejs", "threeminjs"],
+    },
+    {
+        "id": "three_module",
+        "filename": "three.module.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+            "https://unpkg.com/three@0.165.0/build/three.module.js",
+        ],
+        "match_tokens": ["three.module.js", "three.module", "/three@"],
+    },
+    {
+        "id": "p5",
+        "filename": "p5.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js",
+            "https://unpkg.com/p5@1.9.4/lib/p5.min.js",
+        ],
+        "match_tokens": ["p5.min.js", "/p5@"],
+    },
+    {
+        "id": "bootstrap",
+        "filename": "bootstrap.bundle.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js",
+            "https://unpkg.com/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js",
+        ],
+        "match_tokens": ["bootstrap.bundle.min.js", "/bootstrap@"],
+    },
+    {
+        "id": "jquery",
+        "filename": "jquery.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js",
+            "https://unpkg.com/jquery@3.7.1/dist/jquery.min.js",
+        ],
+        "match_tokens": ["jquery.min.js", "/jquery@"],
+    },
+    {
+        "id": "tailwind_browser",
+        "filename": "tailwindcss-cdn.js",
+        "urls": [
+            "https://cdn.tailwindcss.com",
+            "https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4",
+        ],
+        "match_tokens": ["cdn.tailwindcss.com", "@tailwindcss/browser", "tailwindcss"],
+    },
+]
+OFFLINE_JS_LIB_INDEX_FILE = "index.json"
+OFFLINE_JS_LIB_README_FILE = "README.md"
+
+
+def normalize_ui_language(raw: str | None) -> str:
+    key = str(raw or "").strip()
+    if key in UI_LANGUAGE_LABELS:
+        return key
+    low = key.lower()
+    aliases = {
+        "zh": "zh-CN",
+        "zh-cn": "zh-CN",
+        "zh_simplified": "zh-CN",
+        "cn": "zh-CN",
+        "zh-tw": "zh-TW",
+        "zh-hk": "zh-TW",
+        "zh_hant": "zh-TW",
+        "tc": "zh-TW",
+        "ja-jp": "ja",
+        "jp": "ja",
+        "en-us": "en",
+        "en-gb": "en",
+    }
+    mapped = aliases.get(low)
+    if mapped and mapped in UI_LANGUAGE_LABELS:
+        return mapped
+    return DEFAULT_UI_LANGUAGE
+
+
+def supported_ui_languages_payload() -> list[dict]:
+    return [dict(x) for x in SUPPORTED_UI_LANGUAGES]
+
+
+def model_language_instruction(lang: str) -> str:
+    code = normalize_ui_language(lang)
+    if code == "zh-CN":
+        return (
+            "Respond to users in Simplified Chinese by default. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    if code == "zh-TW":
+        return (
+            "Respond to users in Traditional Chinese by default. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    if code == "ja":
+        return (
+            "Respond to users in Japanese by default. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    return (
+        "Respond to users in English by default. "
+        "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+    )
+
+
+def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
+    txt = str(raw or "").strip()
+    if not txt:
+        txt = DEFAULT_WEB_UI_DIR
+    p = Path(txt).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return ((base_dir or WORKDIR).resolve() / p).resolve()
+
+
+def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
+    txt = str(raw or "").strip()
+    if not txt:
+        return ((base_dir or WORKDIR).resolve() / DEFAULT_WEB_UI_CONFIG).resolve()
+    p = Path(txt).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return ((base_dir or WORKDIR).resolve() / p).resolve()
+
+
+def load_web_ui_config_file(path: Path) -> dict:
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except Exception:
+            return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def default_multimodal_capabilities() -> dict[str, bool]:
+    return {
+        "input_image": False,
+        "input_audio": False,
+        "input_video": False,
+        "output_image": False,
+        "output_audio": False,
+        "output_video": False,
+    }
+
+
+def _to_bool_like(raw: object, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    txt = str(raw or "").strip().lower()
+    if txt in {"1", "true", "yes", "y", "on", "enabled", "enable"}:
+        return True
+    if txt in {"0", "false", "no", "n", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
+def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, bool]:
+    caps = default_multimodal_capabilities()
+    p = str(provider or "").strip().lower()
+    m = str(model or "").strip().lower()
+    if p == "ollama":
+        if any(x in m for x in ("vision", "-vl", "llava", "minicpm-v", "internvl", "qwen2.5-vl", "qwen-vl", "gemma3")):
+            caps["input_image"] = True
+        if any(x in m for x in ("omni", "audio", "speech", "voice")):
+            caps["input_audio"] = True
+        if any(x in m for x in ("omni", "video")):
+            caps["input_video"] = True
+        return caps
+    if p in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+        if any(
+            x in m
+            for x in (
+                "gpt-4o",
+                "gpt-4.1",
+                "vision",
+                "-vl",
+                "qwen-vl",
+                "gemini",
+                "claude-3",
+                "omni",
+            )
+        ):
+            caps["input_image"] = True
+        if any(x in m for x in ("omni", "audio", "speech", "voice", "realtime")):
+            caps["input_audio"] = True
+        if any(x in m for x in ("video", "omni")):
+            caps["input_video"] = True
+        if any(x in m for x in ("gpt-image", "dall-e", "sdxl", "stable-diffusion", "flux", "kolors")):
+            caps["output_image"] = True
+        if any(x in m for x in ("tts", "audio", "speech", "voice")):
+            caps["output_audio"] = True
+        if any(x in m for x in ("video", "sora", "kling", "wan")):
+            caps["output_video"] = True
+    return caps
+
+
+def parse_capability_overrides(raw: object) -> dict[str, bool]:
+    obj = raw
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return {}
+        obj = parse_json_object(txt, {})
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, bool] = {}
+    aliases = {
+        "image_input": "input_image",
+        "input_images": "input_image",
+        "image_in": "input_image",
+        "audio_input": "input_audio",
+        "input_audios": "input_audio",
+        "audio_in": "input_audio",
+        "video_input": "input_video",
+        "input_videos": "input_video",
+        "video_in": "input_video",
+        "image_output": "output_image",
+        "output_images": "output_image",
+        "image_out": "output_image",
+        "audio_output": "output_audio",
+        "output_audios": "output_audio",
+        "audio_out": "output_audio",
+        "video_output": "output_video",
+        "output_videos": "output_video",
+        "video_out": "output_video",
+    }
+    for key, value in obj.items():
+        k = str(key or "").strip().lower()
+        if not k:
+            continue
+        mapped = aliases.get(k, k)
+        if mapped in MEDIA_CAPABILITY_KEYS:
+            out[mapped] = _to_bool_like(value, default=False)
+    return out
+
+
+def merge_multimodal_capabilities(base: dict[str, bool], override: dict[str, bool]) -> dict[str, bool]:
+    out = default_multimodal_capabilities()
+    for key in MEDIA_CAPABILITY_KEYS:
+        out[key] = bool(base.get(key, False))
+    for key, value in override.items():
+        if key in MEDIA_CAPABILITY_KEYS:
+            out[key] = bool(value)
+    return out
+
+
+def parse_media_endpoints(raw: object) -> dict[str, str]:
+    obj = raw
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return {}
+        obj = parse_json_object(txt, {})
+    if not isinstance(obj, dict):
+        return {}
+    out: dict[str, str] = {}
+    for media_type in ("image", "audio", "video"):
+        v = str(obj.get(media_type, "") or "").strip()
+        if v:
+            out[media_type] = v
+    return out
+
+
+def guess_mime_from_name(name: str, fallback: str = "application/octet-stream") -> str:
+    mime, _ = mimetypes.guess_type(str(name or ""))
+    return str(mime or fallback)
+
+
+def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:
+    ext = mimetypes.guess_extension(str(mime or "").split(";", 1)[0].strip().lower())
+    if not ext:
+        return fallback
+    if ext == ".jpe":
+        return ".jpg"
+    return ext
+
+def now_ts() -> float:
+    return time.time()
+
+def normalize_timeout_seconds(
+    raw: object,
+    *,
+    minimum: int = MIN_TIMEOUT_SECONDS,
+    maximum: int = MAX_TIMEOUT_SECONDS,
+    fallback: int = DEFAULT_TIMEOUT_SECONDS,
+) -> int:
+    try:
+        value = int(float(raw))
+    except Exception:
+        value = int(fallback)
+    if maximum > 0:
+        value = min(value, int(maximum))
+    return max(int(minimum), int(value))
+
+def detect_local_lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = str(s.getsockname()[0] or "").strip()
+        s.close()
+        if ip and ip != "127.0.0.1":
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+def json_dumps(obj: object, *, indent: int | None = None) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=indent)
+
+def make_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+def sanitize_profile_id(raw: str) -> str:
+    pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
+    return pid or "profile"
+
+def detect_repo_root(cwd: Path) -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if r.returncode != 0:
+            return None
+        root = Path(r.stdout.strip())
+        return root if root.exists() else None
+    except Exception:
+        return None
+
+REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
+
+def safe_path(path_text: str, base: Path | None = None) -> Path:
+    root = (base or WORKDIR).resolve()
+    raw = str(path_text or "").strip()
+    if not raw:
+        raise ValueError("path required")
+    candidate = Path(raw)
+    path = candidate.resolve() if candidate.is_absolute() else (root / raw).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(f"path escapes workspace: {path_text}")
+    return path
+
+def _safe_js_filename(name: str, fallback: str = "lib.js") -> str:
+    raw = Path(str(name or fallback)).name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    if not safe:
+        safe = fallback
+    if not safe.lower().endswith(".js"):
+        safe = f"{safe}.js"
+    return safe
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+def _sha256_file(fp: Path) -> str:
+    h = hashlib.sha256()
+    with fp.open("rb") as f:
+        while True:
+            block = f.read(65536)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
+    req = Request(
+        str(url or "").strip(),
+        headers={"User-Agent": "Mozilla/5.0 (StandaloneWebSessionAgent)"},
+        method="GET",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        ctype = str(resp.headers.get("Content-Type", "") or "").strip()
+        return resp.read(), ctype
+
+def offline_js_lib_root(workdir: Path = WORKDIR) -> Path:
+    return (workdir / "js_lib").resolve()
+
+def _render_offline_js_catalog_md() -> str:
+    rows = [
+        "# Offline JS Library Catalog",
+        "",
+        "Pre-fetched common JS libraries for offline HTML deliverables.",
+        "",
+        "| id | filename | source urls |",
+        "|---|---|---|",
+    ]
+    for row in OFFLINE_JS_LIB_CATALOG:
+        lib_id = str(row.get("id", "") or "").strip()
+        filename = str(row.get("filename", "") or "").strip()
+        urls = [str(x).strip() for x in (row.get("urls") or []) if str(x).strip()]
+        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} |")
+    return "\n".join(rows) + "\n"
+
+def load_offline_js_lib_index(js_root: Path) -> dict:
+    fp = (js_root / OFFLINE_JS_LIB_INDEX_FILE).resolve()
+    if not fp.exists():
+        return {}
+    try:
+        raw = fp.read_text(encoding="utf-8")
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict:
+    root = offline_js_lib_root(workdir)
+    root.mkdir(parents=True, exist_ok=True)
+    fetched = 0
+    available = 0
+    missing = 0
+    rows: list[dict] = []
+    for entry in OFFLINE_JS_LIB_CATALOG:
+        lib_id = str(entry.get("id", "") or "").strip() or "lib"
+        filename = _safe_js_filename(str(entry.get("filename", "") or f"{lib_id}.js"), f"{lib_id}.js")
+        urls = [str(x).strip() for x in (entry.get("urls") or []) if str(x).strip()]
+        match_tokens = [str(x).strip().lower() for x in (entry.get("match_tokens") or []) if str(x).strip()]
+        target = root / filename
+        source = "existing"
+        error = ""
+        ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
+        if not ok:
+            for url in urls:
+                try:
+                    data, _ = _download_http_bytes(url, timeout=35.0)
+                    if len(data) < 40:
+                        error = f"download too small from {url}"
+                        continue
+                    probe = data[:1024].decode("utf-8", errors="ignore").lower()
+                    if "<html" in probe and "<script" not in probe and "tailwind" not in probe:
+                        error = f"unexpected html payload from {url}"
+                        continue
+                    target.write_bytes(data)
+                    ok = True
+                    source = url
+                    fetched += 1
+                    break
+                except Exception as exc:
+                    error = trim(str(exc), 220)
+            if not ok:
+                source = "missing"
+        if ok:
+            available += 1
+        else:
+            missing += 1
+        rows.append(
+            {
+                "id": lib_id,
+                "filename": filename,
+                "available": ok,
+                "size": int(target.stat().st_size) if target.exists() else 0,
+                "sha256": _sha256_file(target) if target.exists() else "",
+                "source": source,
+                "error": error,
+                "match_tokens": match_tokens,
+                "urls": urls,
+            }
+        )
+    payload = {
+        "generated_at": int(now_ts()),
+        "js_lib_root": str(root),
+        "total": len(OFFLINE_JS_LIB_CATALOG),
+        "available": available,
+        "missing": missing,
+        "fetched": fetched,
+        "libs": rows,
+    }
+    (root / OFFLINE_JS_LIB_INDEX_FILE).write_text(json_dumps(payload, indent=2), encoding="utf-8")
+    (root / OFFLINE_JS_LIB_README_FILE).write_text(_render_offline_js_catalog_md(), encoding="utf-8")
+    return payload
+
+def _normalize_external_js_url(url: str) -> str:
+    raw = html.unescape(str(url or "").strip())
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    return raw
+
+def is_external_js_src(url: str) -> bool:
+    low = str(url or "").strip().lower()
+    return low.startswith("http://") or low.startswith("https://") or low.startswith("//")
+
+def match_offline_js_catalog_by_url(url: str) -> dict | None:
+    target = _normalize_external_js_url(url).lower()
+    if not target:
+        return None
+    parsed = urlparse(target)
+    host_path = f"{parsed.netloc}{parsed.path}".lower()
+    basename = Path(parsed.path).name.lower()
+    if basename:
+        for entry in OFFLINE_JS_LIB_CATALOG:
+            filename = str(entry.get("filename", "") or "").strip().lower()
+            if filename and basename == filename:
+                return entry
+    for entry in OFFLINE_JS_LIB_CATALOG:
+        tokens = [str(x).strip().lower() for x in (entry.get("match_tokens") or []) if str(x).strip()]
+        if tokens and any(token in target or token in host_path for token in tokens):
+            return entry
+    return None
+
+def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
+    target_url = _normalize_external_js_url(url)
+    if not target_url:
+        return None, "empty-url"
+    parsed = urlparse(target_url)
+    base = Path(parsed.path).name.strip()
+    if not base or "." not in base:
+        h = _sha256_bytes(target_url.encode("utf-8"))[:10]
+        base = f"external_{h}.js"
+    fname = _safe_js_filename(base, "external.js")
+    ext_root = (js_root / "external").resolve()
+    ext_root.mkdir(parents=True, exist_ok=True)
+    target = ext_root / fname
+    if target.exists() and target.stat().st_size > 40:
+        return target, "cached"
+    try:
+        data, _ = _download_http_bytes(target_url, timeout=35.0)
+        if len(data) < 40:
+            return None, "download-too-small"
+        probe = data[:1024].decode("utf-8", errors="ignore").lower()
+        if "<html" in probe and "<script" not in probe:
+            return None, "unexpected-html-payload"
+        if target.exists() and target.stat().st_size > 0:
+            digest_now = _sha256_bytes(data)
+            digest_old = _sha256_file(target)
+            if digest_now != digest_old:
+                stem = target.stem
+                suffix = target.suffix or ".js"
+                target = ext_root / f"{stem}_{digest_now[:8]}{suffix}"
+        target.write_bytes(data)
+        return target, "downloaded"
+    except Exception as exc:
+        return None, trim(str(exc), 220)
+
+def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
+    s = str(text)
+    return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
+
+def compress_text_blob(text: str) -> str:
+    src = str(text or "")
+    if not src:
+        return ""
+    raw = src.encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
+
+def decompress_text_blob(blob_b64: str) -> str:
+    token = str(blob_b64 or "").strip()
+    if not token:
+        return ""
+    try:
+        raw = base64.b64decode(token.encode("ascii"))
+        return zlib.decompress(raw).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+def normalize_work_text(text: object, status: str = "") -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^\[[ x>\-]\]\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"^(pending|in[_\-\s]?progress|completed|done|blocked)\s*[·:\-\]]\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if status:
+        s = re.sub(
+            rf"\s*[—-]\s*{re.escape(status).replace('_', '[_\\-\\s]?')}\s*$",
+            "",
+            s,
+            flags=re.IGNORECASE,
+        )
+    s = re.sub(
+        r"\s*[—-]\s*(pending|in[_\-\s]?progress|completed|done|blocked)\s*$",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    return s.strip(" -")
+
+def parse_tool_arguments(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+def repair_truncated_json_object(raw: object) -> str:
+    src = str(raw or "").strip()
+    if not src:
+        return ""
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", src, re.IGNORECASE)
+    if fenced:
+        src = str(fenced.group(1) or "").strip()
+    first_obj = src.find("{")
+    if first_obj > 0:
+        src = src[first_obj:]
+    src = src.strip()
+    if not src:
+        return ""
+    if src.endswith(":"):
+        src += " null"
+    src = re.sub(r",\s*$", "", src)
+    if "\n" in src and re.search(r"[,:\[{(\"'`]$", src.rstrip()):
+        src = src[: src.rfind("\n")].rstrip()
+    if not src:
+        return ""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in src:
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == "\"":
+                in_string = False
+            continue
+        if ch == "\"":
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+            continue
+        if ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+            continue
+    if in_string:
+        src += "\""
+    src = re.sub(r",\s*$", "", src)
+    while stack:
+        opener = stack.pop()
+        src += "}" if opener == "{" else "]"
+    src = re.sub(r",(\s*[}\]])", r"\1", src)
+    return src.strip()
+
+def parse_tool_arguments_with_error(raw: object) -> tuple[dict, str]:
+    if isinstance(raw, dict):
+        return raw, ""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, "arguments is empty string"
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed, ""
+            return {}, f"arguments JSON is {type(parsed).__name__}, expected object"
+        except Exception as exc:
+            repaired = repair_truncated_json_object(text)
+            if repaired and repaired != text:
+                try:
+                    parsed_repaired = json.loads(repaired)
+                    if isinstance(parsed_repaired, dict):
+                        return parsed_repaired, "arguments JSON auto-repaired from invalid/truncated input"
+                except Exception:
+                    pass
+            brief = trim(text.replace("\n", "\\n"), 240)
+            return {}, f"arguments JSON parse failed: {exc}; raw={brief}"
+    return {}, f"unsupported arguments type: {type(raw).__name__}"
+
+def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, list[str], str]:
+    url = f"{str(base_url or '').rstrip('/')}/api/tags"
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        tags: list[str] = []
+        for item in raw.get("models", []):
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                tags.append(name.strip())
+        return True, tags, ""
+    except Exception as exc:
+        return False, [], str(exc)
+
+def list_ollama_models(base_url: str, timeout: int = 4) -> list[str]:
+    ok, tags, _ = probe_ollama_environment(base_url, timeout=timeout)
+    return tags if ok else []
+
+_OLLAMA_TAG_CACHE_LOCK = threading.Lock()
+_OLLAMA_TAG_CACHE: dict[str, dict] = {}
+
+def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refresh: bool = False) -> list[str]:
+    key = str(base_url or "").rstrip("/")
+    now = time.time()
+    cached_tags: list[str] = []
+    with _OLLAMA_TAG_CACHE_LOCK:
+        row = _OLLAMA_TAG_CACHE.get(key)
+        if row:
+            tags = row.get("tags", [])
+            cached_tags = list(tags) if isinstance(tags, list) else []
+        if (not force_refresh) and row and (now - float(row.get("ts", 0.0))) <= ttl_seconds:
+            return list(cached_tags)
+    ok, tags, _ = probe_ollama_environment(base_url)
+    if ok:
+        with _OLLAMA_TAG_CACHE_LOCK:
+            _OLLAMA_TAG_CACHE[key] = {"ts": now, "tags": list(tags)}
+        return list(tags)
+    if cached_tags:
+        return list(cached_tags)
+    with _OLLAMA_TAG_CACHE_LOCK:
+        _OLLAMA_TAG_CACHE[key] = {"ts": now, "tags": []}
+    return []
+
+def resolve_ollama_model(base_url: str, preferred: str) -> str:
+    models = list_ollama_models(base_url)
+    if not models:
+        return preferred
+    if preferred in models:
+        return preferred
+    lowered = [(m, m.lower()) for m in models]
+    for m, low in lowered:
+        if "coder" in low or "code" in low:
+            return m
+    return models[0]
+
+def infer_thinking_model(model: str) -> bool:
+    # Thinking control is disabled globally: do not infer or force it by model name.
+    return False
+
+def split_thinking_content(text: str) -> tuple[str, str]:
+    if not text:
+        return "", ""
+    src = str(text)
+    thinking_parts: list[str] = []
+
+    def _collect(group_text: str):
+        s = str(group_text or "").strip()
+        if s:
+            thinking_parts.append(s)
+
+    def _repl_think(m: re.Match) -> str:
+        _collect(m.group(1))
+        return ""
+
+    def _repl_block(m: re.Match) -> str:
+        _collect(m.group(1))
+        return ""
+
+    body = re.sub(r"(?is)<think>(.*?)</think>", _repl_think, src)
+    body = re.sub(r"(?is)```(?:thinking|reasoning)\s*([\s\S]*?)```", _repl_block, body)
+    body = re.sub(r"(?is)<\|start_of_thought\|>(.*?)<\|end_of_thought\|>", _repl_block, body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    thinking = "\n\n".join(part for part in thinking_parts if part).strip()
+    return body, trim(thinking, 24_000) if thinking else ""
+
+def strip_thinking_content(text: str) -> str:
+    return split_thinking_content(text)[0]
+
+def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tuple[bool, str]:
+    if not model:
+        return False, "model required"
+    url = f"{base_url.rstrip('/')}/api/show"
+    payload = {
+        "name": model,
+    }
+    req = Request(
+        url,
+        data=json_dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            _ = resp.read()
+        return True, ""
+    except HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        low = text.lower()
+        if exc.code == 404 or "not found" in low:
+            return False, f"not found: {model}"
+        return False, f"HTTP {exc.code}: {text}"
+    except Exception as exc:
+        return False, str(exc)
+
+def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
+    url = f"{str(base_url or '').rstrip('/')}/api/ps"
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        out: list[str] = []
+        for item in raw.get("models", []) if isinstance(raw, dict) else []:
+            name = str(item.get("name", "") or "").strip()
+            if name:
+                out.append(name)
+        return out
+    except Exception:
+        return []
+
+def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[bool, str]:
+    target = str(model or "").strip()
+    if not target:
+        return False, "model required"
+    url = f"{str(base_url or '').rstrip('/')}/api/generate"
+    payload = {
+        "model": target,
+        "prompt": "ping",
+        "stream": False,
+        "keep_alive": "20m",
+        "options": {"num_predict": 1, "temperature": 0},
+    }
+    req = Request(
+        url,
+        data=json_dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        obj = parse_json_object(text, {})
+        err = str(obj.get("error", "")).strip() if isinstance(obj, dict) else ""
+        if err:
+            return False, trim(err, 180)
+        return True, "warmed"
+    except HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {exc.code}: {trim(text, 180)}"
+    except Exception as exc:
+        return False, trim(str(exc), 180)
+
+def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
+    cli = shutil.which("ollama")
+    if not cli:
+        return False, "ollama CLI not found"
+    try:
+        r = subprocess.run(
+            [cli, "pull", model],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = trim((r.stdout + r.stderr).strip() or "(no output)", 1200)
+        if r.returncode == 0:
+            return True, f"pulled model '{model}'"
+        return False, f"pull failed for '{model}': {output}"
+    except subprocess.TimeoutExpired:
+        return False, f"pull timeout for '{model}' ({timeout}s)"
+    except Exception as exc:
+        return False, f"pull failed for '{model}': {exc}"
+
+def ordered_model_candidates(base_url: str, preferred: str, exclude: set[str] | None = None) -> list[str]:
+    blocked = set(exclude or set())
+    models = list_ollama_models(base_url)
+    out = []
+    if preferred and preferred not in blocked:
+        out.append(preferred)
+    ranked = [m for m in models if m not in blocked and m != preferred]
+    ranked.sort(key=lambda m: (0 if ("coder" in m.lower() or "code" in m.lower()) else 1, m.lower()))
+    out.extend(ranked)
+    if not out and preferred and preferred not in blocked:
+        out.append(preferred)
+    dedup = []
+    seen = set()
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        dedup.append(item)
+    return dedup
+
+def pick_working_ollama_model(
+    base_url: str,
+    preferred: str,
+    *,
+    exclude: set[str] | None = None,
+    timeout: int = 10,
+    max_candidates: int = 6,
+) -> tuple[str | None, str]:
+    errors = []
+    candidates = ordered_model_candidates(base_url, preferred, exclude)[: max(1, int(max_candidates))]
+    for candidate in candidates:
+        ok, err = check_ollama_model_ready(base_url, candidate, timeout=timeout)
+        if ok:
+            return candidate, ""
+        if err:
+            errors.append(f"{candidate}: {err}")
+    return None, "; ".join(errors)
+
+def parse_json_object(text: str, default: dict | None = None) -> dict:
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else (default or {})
+    except Exception:
+        return default or {}
+
+def extract_json_object_from_text(text: str, default: dict | None = None) -> dict:
+    src = str(text or "").strip()
+    if not src:
+        return default or {}
+    direct = parse_json_object(src, {})
+    if direct:
+        return direct
+    fence = re.search(r"```json\s*(\{.*?\})\s*```", src, re.S | re.I)
+    if fence:
+        boxed = parse_json_object(fence.group(1), {})
+        if boxed:
+            return boxed
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(src):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(src[i:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return default or {}
+
+def extract_base_url(endpoint_or_base: str) -> str:
+    s = (endpoint_or_base or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    for suffix in ("/v1/chat/completions", "/chat/completions"):
+        if low.endswith(suffix):
+            return s[: -len(suffix)] or s
+    return s
+
+def complete_chat_endpoint(endpoint_or_base: str) -> str:
+    s = (endpoint_or_base or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if low.endswith("/chat/completions") or low.endswith("/v1/chat/completions"):
+        return s
+    if low.endswith("/v1"):
+        return s.rstrip("/") + "/chat/completions"
+    return s.rstrip("/") + "/v1/chat/completions"
+
+def _is_http_url(text: str) -> bool:
+    try:
+        p = urlparse(str(text or "").strip())
+        return p.scheme.lower() in {"http", "https"}
+    except Exception:
+        return False
+
+def _resolve_local_path(raw: str, base_dir: Path) -> Path:
+    src = str(raw or "").strip()
+    if not src:
+        raise ValueError("empty path")
+    p = urlparse(src)
+    if p.scheme.lower() == "file":
+        file_part = unquote(p.path or "")
+        if p.netloc:
+            file_part = f"/{p.netloc}{file_part}"
+        path = Path(file_part)
+    else:
+        path = Path(src).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeout: int = 20) -> tuple[dict, str]:
+    raw = str(source or "").strip()
+    if not raw:
+        raise ValueError("config source is required")
+    text = ""
+    source_desc = raw
+    if _is_http_url(raw):
+        req = Request(raw, method="GET")
+        try:
+            with urlopen(req, timeout=max(3, int(timeout))) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"failed to fetch config URL ({exc.code}): {trim(body, 240)}") from exc
+        except URLError as exc:
+            raise ValueError(f"failed to fetch config URL: {exc}") from exc
+    else:
+        path = _resolve_local_path(raw, base_dir)
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"config file not found: {path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise ValueError(f"failed to read config file: {path} ({exc})") from exc
+        source_desc = str(path)
+
+    config = parse_json_object(text, {})
+    if not config:
+        raise ValueError(f"invalid JSON config: {source_desc}")
+    if not looks_like_llm_config(config):
+        keys = sorted(str(k) for k in config.keys())[:16]
+        raise ValueError(
+            f"config does not look like LLM config: {source_desc} (keys={keys})"
+        )
+    return config, source_desc
+
+def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_ollama_model: str) -> dict:
+    model_caps_map = config.get("model_capabilities", {})
+    if isinstance(model_caps_map, str):
+        model_caps_map = parse_json_object(model_caps_map, {})
+    if not isinstance(model_caps_map, dict):
+        model_caps_map = {}
+
+    raw_global_caps = config.get("multimodal_capabilities", config.get("capabilities", {}))
+    if isinstance(raw_global_caps, str):
+        raw_global_caps = parse_json_object(raw_global_caps, {})
+    if not isinstance(raw_global_caps, dict):
+        raw_global_caps = {}
+
+    raw_global_media_endpoints = config.get("media_endpoints", {})
+    if isinstance(raw_global_media_endpoints, str):
+        raw_global_media_endpoints = parse_json_object(raw_global_media_endpoints, {})
+    if not isinstance(raw_global_media_endpoints, dict):
+        raw_global_media_endpoints = {}
+
+    def build_profile_capabilities(provider_key: str, provider: str, model: str) -> dict[str, bool]:
+        caps = infer_model_multimodal_capabilities(provider, model)
+        if any(k in raw_global_caps for k in MEDIA_CAPABILITY_KEYS):
+            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(raw_global_caps))
+        nested_global = raw_global_caps.get(provider_key)
+        if nested_global is not None:
+            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(nested_global))
+        direct_override = config.get(f"{provider_key}_capabilities")
+        if direct_override is not None:
+            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(direct_override))
+        model_override = model_caps_map.get(model) or model_caps_map.get(str(model or "").lower())
+        if model_override is not None:
+            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(model_override))
+        return caps
+
+    def build_profile_media_endpoints(provider_key: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if any(k in raw_global_media_endpoints for k in ("image", "audio", "video")):
+            out.update(parse_media_endpoints(raw_global_media_endpoints))
+        nested = raw_global_media_endpoints.get(provider_key)
+        if nested is not None:
+            out.update(parse_media_endpoints(nested))
+        direct = config.get(f"{provider_key}_media_endpoints")
+        if direct is not None:
+            out.update(parse_media_endpoints(direct))
+        for media_type in ("image", "audio", "video"):
+            specific = str(config.get(f"{provider_key}_{media_type}_endpoint", "") or "").strip()
+            if specific:
+                out[media_type] = specific
+        return out
+
+    def add_profile(
+        out: list[dict],
+        *,
+        profile_id: str,
+        provider: str,
+        label: str,
+        model: str = "",
+        base_url: str = "",
+        endpoint: str = "",
+        api_key: str = "",
+        headers: dict | None = None,
+        payload_template: str = "",
+        thinking_stream: bool = False,
+        temperature: float = 0.2,
+        request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
+        capabilities: dict | None = None,
+        media_endpoints: dict | None = None,
+        source: str = "config",
+    ):
+        out.append(
+            {
+                "id": profile_id,
+                "provider": provider,
+                "label": label,
+                "model": (model or "").strip(),
+                "base_url": (base_url or "").strip(),
+                "endpoint": (endpoint or "").strip(),
+                "api_key": (api_key or "").strip(),
+                "headers": headers or {},
+                "payload_template": payload_template or "",
+                "thinking_stream": bool(thinking_stream),
+                "temperature": float(temperature or 0.2),
+                "request_timeout": normalize_timeout_seconds(
+                    request_timeout,
+                    minimum=MIN_TIMEOUT_SECONDS,
+                    maximum=MAX_TIMEOUT_SECONDS,
+                    fallback=DEFAULT_REQUEST_TIMEOUT,
+                ),
+                "capabilities": capabilities or default_multimodal_capabilities(),
+                "media_endpoints": media_endpoints or {},
+                "source": source,
+            }
+        )
+
+    profiles: list[dict] = []
+    provider = str(config.get("provider", "")).strip().lower()
+    temp = float(config.get("temperature", 0.2) or 0.2)
+    timeout = normalize_timeout_seconds(
+        config.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
+        minimum=MIN_TIMEOUT_SECONDS,
+        maximum=MAX_TIMEOUT_SECONDS,
+        fallback=DEFAULT_REQUEST_TIMEOUT,
+    )
+    thinking_stream_default = bool(
+        config.get("thinking_stream", config.get("stream_thinking", False))
+    )
+
+    ollama_url = str(config.get("ollama_url", default_ollama_url)).strip() or default_ollama_url
+    ollama_model = str(config.get("ollama_model", default_ollama_model)).strip() or default_ollama_model
+    add_profile(
+        profiles,
+        profile_id="ollama",
+        provider="ollama",
+        label="Ollama",
+        model=ollama_model,
+        base_url=extract_base_url(ollama_url),
+        thinking_stream=bool(config.get("ollama_thinking_stream", thinking_stream_default)),
+        temperature=temp,
+        request_timeout=timeout,
+        capabilities=build_profile_capabilities("ollama", "ollama", ollama_model),
+        media_endpoints=build_profile_media_endpoints("ollama"),
+    )
+
+    openai_url = str(config.get("openai_url", "")).strip()
+    openai_model = str(config.get("openai_model", "")).strip()
+    openai_key = str(config.get("openai_key", "")).strip()
+    if openai_url or openai_model or openai_key:
+        add_profile(
+            profiles,
+            profile_id="openai",
+            provider="openai_compat",
+            label="OpenAI Compatible",
+            model=openai_model or "gpt-4o-mini",
+            base_url=extract_base_url(openai_url),
+            endpoint=complete_chat_endpoint(openai_url),
+            api_key=openai_key,
+            thinking_stream=bool(config.get("openai_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("openai", "openai_compat", openai_model or "gpt-4o-mini"),
+            media_endpoints=build_profile_media_endpoints("openai"),
+        )
+
+    sf_url = str(config.get("siliconflow_url", "")).strip()
+    sf_model = str(config.get("siliconflow_model", "")).strip()
+    sf_key = str(config.get("siliconflow_key", "")).strip()
+    if sf_url or sf_model or sf_key:
+        add_profile(
+            profiles,
+            profile_id="siliconflow",
+            provider="openai_compat",
+            label="SiliconFlow",
+            model=sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct",
+            base_url=extract_base_url(sf_url),
+            endpoint=complete_chat_endpoint(sf_url),
+            api_key=sf_key,
+            thinking_stream=bool(config.get("siliconflow_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("siliconflow", "openai_compat", sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct"),
+            media_endpoints=build_profile_media_endpoints("siliconflow"),
+        )
+
+    custom_url = str(config.get("custom_url", "")).strip()
+    custom_key = str(config.get("custom_key", "")).strip()
+    custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
+    custom_payload = str(config.get("custom_payload", "") or "").strip()
+    if custom_url:
+        add_profile(
+            profiles,
+            profile_id="custom",
+            provider="custom_http",
+            label="Custom HTTP",
+            model=str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model"),
+            base_url=extract_base_url(custom_url),
+            endpoint=custom_url,
+            api_key=custom_key,
+            headers=custom_headers,
+            payload_template=custom_payload,
+            thinking_stream=bool(config.get("custom_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("custom", "custom_http", str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model")),
+            media_endpoints=build_profile_media_endpoints("custom"),
+        )
+
+    if not profiles:
+        add_profile(
+            profiles,
+            profile_id="ollama",
+            provider="ollama",
+            label="Ollama",
+            model=default_ollama_model,
+            base_url=default_ollama_url,
+            thinking_stream=thinking_stream_default,
+            temperature=0.2,
+            request_timeout=DEFAULT_REQUEST_TIMEOUT,
+            capabilities=build_profile_capabilities("ollama", "ollama", default_ollama_model),
+            media_endpoints=build_profile_media_endpoints("ollama"),
+            source="default",
+        )
+
+    active_map = {
+        "ollama": "ollama",
+        "openai": "openai",
+        "siliconflow": "siliconflow",
+        "custom": "custom",
+    }
+    default_profile_id = active_map.get(provider, profiles[0]["id"])
+    return {"profiles": profiles, "default_profile_id": default_profile_id}
+
+def looks_like_llm_config(config: dict) -> bool:
+    if not isinstance(config, dict) or not config:
+        return False
+    keys = {str(k).strip().lower() for k in config.keys()}
+    markers = {
+        "provider",
+        "ollama_url",
+        "ollama_model",
+        "openai_url",
+        "openai_model",
+        "openai_key",
+        "siliconflow_url",
+        "siliconflow_model",
+        "siliconflow_key",
+        "custom_url",
+        "custom_model",
+        "custom_key",
+        "custom_headers",
+        "custom_payload",
+        "capabilities",
+        "multimodal_capabilities",
+        "model_capabilities",
+        "media_endpoints",
+        "ollama_capabilities",
+        "openai_capabilities",
+        "siliconflow_capabilities",
+        "custom_capabilities",
+        "ollama_media_endpoints",
+        "openai_media_endpoints",
+        "siliconflow_media_endpoints",
+        "custom_media_endpoints",
+        "ollama_image_endpoint",
+        "ollama_audio_endpoint",
+        "ollama_video_endpoint",
+        "openai_image_endpoint",
+        "openai_audio_endpoint",
+        "openai_video_endpoint",
+        "siliconflow_image_endpoint",
+        "siliconflow_audio_endpoint",
+        "siliconflow_video_endpoint",
+        "custom_image_endpoint",
+        "custom_audio_endpoint",
+        "custom_video_endpoint",
+        "temperature",
+        "request_timeout",
+    }
+    return bool(keys & markers)
+
+def user_id_from_ip(ip: str) -> str:
+    token = hashlib.sha256(ip.encode("utf-8")).hexdigest()[:12]
+    safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", ip)
+    return f"user_{safe_ip}_{token}"
+
+class CryptoBox:
+    def __init__(self, codes_root: Path):
+        self.codes_root = codes_root
+        self.codes_root.mkdir(parents=True, exist_ok=True)
+        self.key_file = self.codes_root / ".encryption_key"
+        self.key = self._load_or_create_key()
+
+    def _load_or_create_key(self) -> bytes:
+        if self.key_file.exists():
+            raw = self.key_file.read_text(encoding="utf-8").strip()
+            if raw:
+                return bytes.fromhex(raw)
+        key = os.urandom(32)
+        self.key_file.write_text(key.hex(), encoding="utf-8")
+        return key
+
+    def _stream_xor(self, data: bytes, nonce: bytes) -> bytes:
+        out = bytearray(len(data))
+        counter = 0
+        offset = 0
+        while offset < len(data):
+            block = hashlib.sha256(self.key + nonce + counter.to_bytes(8, "big")).digest()
+            n = min(32, len(data) - offset)
+            for i in range(n):
+                out[offset + i] = data[offset + i] ^ block[i]
+            offset += n
+            counter += 1
+        return bytes(out)
+
+    def encrypt_text(self, text: str) -> str:
+        payload = text.encode("utf-8")
+        nonce = os.urandom(16)
+        ct = self._stream_xor(payload, nonce)
+        mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
+        box = {
+            "v": 1,
+            "n": base64.b64encode(nonce).decode("ascii"),
+            "c": base64.b64encode(ct).decode("ascii"),
+            "m": mac,
+        }
+        return json_dumps(box)
+
+    def decrypt_text(self, box_text: str) -> str:
+        box = json.loads(box_text)
+        if not isinstance(box, dict) or "n" not in box or "c" not in box or "m" not in box:
+            return box_text
+        nonce = base64.b64decode(box["n"])
+        ct = base64.b64decode(box["c"])
+        mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac, box["m"]):
+            raise ValueError("Encrypted payload integrity check failed")
+        pt = self._stream_xor(ct, nonce)
+        return pt.decode("utf-8")
+
+    def write_json(self, path: Path, obj: object):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        enc = self.encrypt_text(json_dumps(obj, indent=2))
+        path.write_text(enc, encoding="utf-8")
+
+    def read_json(self, path: Path, default: object) -> object:
+        if not path.exists():
+            return default
+        raw = path.read_text(encoding="utf-8")
+        try:
+            dec = self.decrypt_text(raw)
+            return json.loads(dec)
+        except Exception:
+            try:
+                return json.loads(raw)
+            except Exception:
+                return default
+
+def parse_front_matter(text: str) -> tuple[dict, str]:
+    text = text or ""
+    if not text.startswith("---\n"):
+        return {}, text.strip()
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text.strip()
+    raw_meta = text[4:end]
+    body = text[end + 5 :].strip()
+    meta: dict[str, str] = {}
+    lines = raw_meta.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        if ":" in line and not line.startswith((" ", "\t")):
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value == "|":
+                i += 1
+                block = []
+                while i < len(lines) and lines[i].startswith(("  ", "\t")):
+                    block.append(lines[i].lstrip())
+                    i += 1
+                meta[key] = "\n".join(block).strip()
+                continue
+            meta[key] = value
+        i += 1
+    return meta, body
+
+def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        if path.stat().st_size > max_bytes:
+            return None
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> str:
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    diff = list(
+        difflib.unified_diff(
+            old_lines,
+            new_lines,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+    if len(diff) > max_lines:
+        diff = diff[:max_lines] + [f"... diff truncated, total lines={len(diff)}"]
+    return "\n".join(diff) if diff else f"@@ no textual diff for {path}"
+
+def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+    entries: list[dict] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for off in range(i2 - i1):
+                entries.append(
+                    {
+                        "kind": "context",
+                        "sign": " ",
+                        "old_line": i1 + off + 1,
+                        "new_line": j1 + off + 1,
+                        "old_col": 1,
+                        "new_col": 1,
+                        "text": old_lines[i1 + off],
+                    }
+                )
+        elif tag == "delete":
+            for idx in range(i1, i2):
+                entries.append(
+                    {
+                        "kind": "delete",
+                        "sign": "-",
+                        "old_line": idx + 1,
+                        "new_line": None,
+                        "old_col": 1,
+                        "new_col": None,
+                        "text": old_lines[idx],
+                    }
+                )
+        elif tag == "insert":
+            for idx in range(j1, j2):
+                entries.append(
+                    {
+                        "kind": "add",
+                        "sign": "+",
+                        "old_line": None,
+                        "new_line": idx + 1,
+                        "old_col": None,
+                        "new_col": 1,
+                        "text": new_lines[idx],
+                    }
+                )
+        elif tag == "replace":
+            for idx in range(i1, i2):
+                entries.append(
+                    {
+                        "kind": "delete",
+                        "sign": "-",
+                        "old_line": idx + 1,
+                        "new_line": None,
+                        "old_col": 1,
+                        "new_col": None,
+                        "text": old_lines[idx],
+                    }
+                )
+            for idx in range(j1, j2):
+                entries.append(
+                    {
+                        "kind": "add",
+                        "sign": "+",
+                        "old_line": None,
+                        "new_line": idx + 1,
+                        "old_col": None,
+                        "new_col": 1,
+                        "text": new_lines[idx],
+                    }
+                )
+    if len(entries) <= max_lines:
+        return entries
+    head = entries[: max_lines // 2]
+    tail = entries[-(max_lines // 2) :]
+    return head + [{"kind": "skip", "sign": "⋮", "old_line": None, "new_line": None, "text": "⋮"}] + tail
+
+def render_numbered_diff_text(entries: list[dict]) -> str:
+    out = []
+    for row in entries:
+        if row.get("kind") == "skip":
+            out.append("    ⋮")
+            continue
+        old_ln = row.get("old_line")
+        new_ln = row.get("new_line")
+        ln = old_ln if old_ln is not None else new_ln
+        sign = row.get("sign", " ")
+        text = row.get("text", "")
+        out.append(f"{str(ln or ''):>6} {sign} {text}")
+    return "\n".join(out)
+
+
+def normalize_rel_preview_path(path_text: str) -> str:
+    raw = str(path_text or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    try:
+        p = PurePosixPath(raw)
+        parts = [seg for seg in p.parts if seg not in ("", ".")]
+        if not parts:
+            return ""
+        return PurePosixPath(*parts).as_posix()
+    except Exception:
+        return raw.lstrip("/")
+
+
+def is_code_preview_candidate(path_text: str) -> bool:
+    rel = normalize_rel_preview_path(path_text).lower()
+    if not rel:
+        return False
+    name = PurePosixPath(rel).name.lower()
+    ext = PurePosixPath(rel).suffix.lower()
+    if ext in CODE_PREVIEW_EXTS:
+        return True
+    return name in CODE_PREVIEW_FILENAMES
+
+
+def build_code_preview_rows(
+    before_text: str,
+    after_text: str,
+    *,
+    max_rows: int = CODE_PREVIEW_STAGE_MAX_ROWS,
+) -> tuple[list[dict], bool]:
+    old_lines = str(before_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    new_lines = str(after_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if old_lines == [""]:
+        old_lines = []
+    if new_lines == [""]:
+        new_lines = []
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    rows: list[dict] = []
+    truncated = False
+
+    def _append(row: dict) -> bool:
+        nonlocal truncated
+        if len(rows) >= max_rows:
+            truncated = True
+            return False
+        rows.append(row)
+        return True
+
+    stop = False
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if stop:
+            break
+        if tag == "equal":
+            for off in range(i2 - i1):
+                if not _append(
+                    {
+                        "kind": "context",
+                        "sign": " ",
+                        "old_line": i1 + off + 1,
+                        "new_line": j1 + off + 1,
+                        "text": new_lines[j1 + off],
+                    }
+                ):
+                    stop = True
+                    break
+        elif tag == "delete":
+            for idx in range(i1, i2):
+                if not _append(
+                    {
+                        "kind": "delete",
+                        "sign": "-",
+                        "old_line": idx + 1,
+                        "new_line": None,
+                        "text": old_lines[idx],
+                    }
+                ):
+                    stop = True
+                    break
+        elif tag == "insert":
+            for idx in range(j1, j2):
+                if not _append(
+                    {
+                        "kind": "add",
+                        "sign": "+",
+                        "old_line": None,
+                        "new_line": idx + 1,
+                        "text": new_lines[idx],
+                    }
+                ):
+                    stop = True
+                    break
+        elif tag == "replace":
+            for idx in range(i1, i2):
+                if not _append(
+                    {
+                        "kind": "delete",
+                        "sign": "-",
+                        "old_line": idx + 1,
+                        "new_line": None,
+                        "text": old_lines[idx],
+                    }
+                ):
+                    stop = True
+                    break
+            if stop:
+                break
+            for idx in range(j1, j2):
+                if not _append(
+                    {
+                        "kind": "add",
+                        "sign": "+",
+                        "old_line": None,
+                        "new_line": idx + 1,
+                        "text": new_lines[idx],
+                    }
+                ):
+                    stop = True
+                    break
+    if truncated:
+        rows.append(
+            {
+                "kind": "skip",
+                "sign": "⋮",
+                "old_line": None,
+                "new_line": None,
+                "text": f"... preview truncated at {max_rows} rows",
+            }
+        )
+    return rows, truncated
+
+class EventHub:
+    def __init__(self):
+        self._subs: list[queue.Queue] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue()
+        with self._lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue):
+        with self._lock:
+            self._subs = [x for x in self._subs if x is not q]
+
+    def publish(self, event: dict):
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                pass
+
+class TodoManager:
+    def __init__(self):
+        self.items: list[dict] = []
+        self.lock = threading.Lock()
+
+    def update(self, items: list[dict]) -> str:
+        if not isinstance(items, list):
+            raise ValueError("items must be array")
+        validated = []
+        in_progress_seen = False
+        status_alias = {
+            "todo": "pending",
+            "doing": "in_progress",
+            "inprogress": "in_progress",
+            "in-progress": "in_progress",
+            "done": "completed",
+            "finish": "completed",
+            "finished": "completed",
+        }
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                raw = {"content": item, "status": "pending"}
+            elif isinstance(item, dict):
+                raw = item
+            else:
+                raise ValueError(f"item {idx}: invalid type")
+            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            content = normalize_work_text(raw_content)
+            if not content:
+                content = raw_content
+            if not content:
+                raise ValueError(f"item {idx}: content required")
+            raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
+            status = status_alias.get(raw_status, raw_status or "pending")
+            if status not in {"pending", "in_progress", "completed"}:
+                status = "pending"
+            content = normalize_work_text(content, status) or content
+            active_form = str(
+                raw.get(
+                    "activeForm",
+                    raw.get("active_form", raw.get("action", raw.get("current", ""))),
+                )
+            ).strip()
+            if status == "in_progress":
+                if in_progress_seen:
+                    status = "pending"
+                else:
+                    in_progress_seen = True
+            if not active_form:
+                if status == "in_progress":
+                    active_form = f"Working on: {content}"
+                elif status == "completed":
+                    active_form = f"Completed: {content}"
+                else:
+                    active_form = f"Pending: {content}"
+            validated.append({"content": content, "status": status, "activeForm": active_form})
+        if len(validated) > 20:
+            raise ValueError("max 20 todos")
+        if validated and not any(x["status"] == "in_progress" for x in validated):
+            for row in validated:
+                if row["status"] == "pending":
+                    row["status"] = "in_progress"
+                    row["activeForm"] = row.get("activeForm") or f"Working on: {row['content']}"
+                    break
+        with self.lock:
+            if self.items == validated:
+                return "No todo changes."
+            self.items = validated
+        return self.render()
+
+    def has_open_items(self) -> bool:
+        with self.lock:
+            return any(x.get("status") != "completed" for x in self.items)
+
+    def render(self) -> str:
+        with self.lock:
+            items = list(self.items)
+        if not items:
+            return "No todos."
+        lines = []
+        for item in items:
+            marker = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}.get(
+                item["status"], "[?]"
+            )
+            suffix = (
+                f" <- {item['activeForm']}" if item["status"] == "in_progress" else ""
+            )
+            lines.append(f"{marker} {item['content']}{suffix}")
+        done = sum(1 for x in items if x["status"] == "completed")
+        lines.append(f"\n({done}/{len(items)} completed)")
+        return "\n".join(lines)
+
+    def snapshot(self) -> list[dict]:
+        with self.lock:
+            return [dict(x) for x in self.items]
+
+EMBEDDED_SKILLS_ARCHIVE_B64 = """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
+AACAAbwIAABza2lsbHMvYWdlbnQtYnVpbGRlci9yZWZlcmVuY2VzL2FnZW50LXBoaWxvc29waHkubWRQSwECFAMUAAAACAAKA2Jc2vqBTB4GAAA0EAAAMAAA
+AAAAAAAAAAAAgAGdFAAAc2tpbGxzL2FnZW50LWJ1aWxkZXIvcmVmZXJlbmNlcy9taW5pbWFsLWFnZW50LnB5UEsBAhQDFAAAAAgACgNiXKJUwSR9CgAAXR4A
+ADMAAAAAAAAAAAAAAIABCRsAAHNraWxscy9hZ2VudC1idWlsZGVyL3JlZmVyZW5jZXMvc3ViYWdlbnQtcGF0dGVybi5weVBLAQIUAxQAAAAIAAoDYlx2NCf1
+zggAAMkeAAAxAAAAAAAAAAAAAACAAdclAABza2lsbHMvYWdlbnQtYnVpbGRlci9yZWZlcmVuY2VzL3Rvb2wtdGVtcGxhdGVzLnB5UEsBAhQDFAAAAAgACgNi
+XGTaKEKqDAAAzSYAACoAAAAAAAAAAAAAAIAB9C4AAHNraWxscy9hZ2VudC1idWlsZGVyL3NjcmlwdHMvaW5pdF9hZ2VudC5weVBLAQIUAxQAAAAIAAoDYlxE
+NfsZPAIAAHsFAAAtAAAAAAAAAAAAAACAAeY7AABza2lsbHMvY2xhd2h1Yi9idWlsdGluL19idWlsdGluX21hbmlmZXN0Lmpzb25QSwECFAMUAAAACAAKA2Jc
+sOHIytUXAABLOwAALAAAAAAAAAAAAAAAgAFtPgAAc2tpbGxzL2NsYXdodWIvYnVpbHRpbi9hZ2VudC1jb25maWcvU0tJTEwubWRQSwECFAMUAAAACAAKA2Jc
+2RZUAMkSAAD8NQAAJwAAAAAAAAAAAAAAgAGMVgAAc2tpbGxzL2NsYXdodWIvYnVpbHRpbi9hcGktZGV2L1NLSUxMLm1kUEsBAhQDFAAAAAgACgNiXGoiqNE5
+AgAA2QMAAC4AAAAAAAAAAAAAAIABmmkAAHNraWxscy9jbGF3aHViL2J1aWx0aW4vYXV0by1wci1tZXJnZXIvU0tJTEwubWRQSwECFAMUAAAACAAKA2JcW1r2
+REsWAAAgRwAAJgAAAAAAAAAAAAAAgAEfbAAAc2tpbGxzL2NsYXdodWIvYnVpbHRpbi9iYWNrdXAvU0tJTEwubWRQSwECFAMUAAAACAAKA2Jc2UtO/KIKAABL
+GAAAMQAAAAAAAAAAAAAAgAGuggAAc2tpbGxzL2NsYXdodWIvYnVpbHRpbi9jbGF1ZGUtY29kZS11c2FnZS9TS0lMTC5tZFBLAQIUAxQAAAAIAAoDYlwWqY2Q
+zAEAACgDAAAyAAAAAAAAAAAAAACAAZ+NAABza2lsbHMvY2xhd2h1Yi9idWlsdGluL2dpdGh1Yi1pbnRlZ3JhdGlvbi9TS0lMTC5tZFBLAQIUAxQAAAAIAAoD
+Ylx1QCxQIwgAAKoQAAAbAAAAAAAAAAAAAACAAbuPAABza2lsbHMvY29kZS1yZXZpZXcvU0tJTEwubWRQSwECFAMUAAAACAAKA2JcBJrcGiICAABCBAAALgAA
+AAAAAAAAAAAAgAEXmAAAc2tpbGxzL2dlbmVyYXRlZC91cGxvYWQtb2ZmaWNlLXBhcnNlci9TS0lMTC5tZFBLAQIUAxQAAAAIAAoDYlwAKrQojAAAABcBAAAx
+AAAAAAAAAAAAAACAAYWaAABza2lsbHMvZ2VuZXJhdGVkL3VwbG9hZC1wYXJzZXJzLWNhcGFiaWxpdGllcy5qc29uUEsBAhQDFAAAAAgACgNiXLwFWrw9AgAA
+ZAQAAC8AAAAAAAAAAAAAAIABYJsAAHNraWxscy9nZW5lcmF0ZWQvdXBsb2FkLXRhYnVsYXItcGFyc2VyL1NLSUxMLm1kUEsBAhQDFAAAAAgACgNiXEFQIZZe
+CAAANhMAABsAAAAAAAAAAAAAAIAB6p0AAHNraWxscy9tY3AtYnVpbGRlci9TS0lMTC5tZFBLAQIUAxQAAAAIAAoDYlw2+HfAmAQAABUKAAATAAAAAAAAAAAA
+AACAAYGmAABza2lsbHMvcGRmL1NLSUxMLm1kUEsBAhQDFAAAAAgACgNiXDL9sIJ4AgAAkQQAABoAAAAAAAAAAAAAAIABSqsAAHNraWxscy9za2lsbHNfR2Vu
+L1NLSUxMLm1kUEsBAhQDFAAAAAgACgNiXAEO4ssWAQAAtgEAACkAAAAAAAAAAAAAAIAB+q0AAHNraWxscy9za2lsbHNfR2VuL2tub3dsZWRnZV9zbmFwc2hv
+dC5qc29uUEsFBgAAAAAVABUAJQcAAFevAAAAAA=="""
+EMBEDDED_SKILLS_ARCHIVE_SHA256 = "ab17a495b2ecca356ab87e97b037b9a7cc2af0682349f11df36cf04e95d68d61"
+EMBEDDED_SKILLS_ARCHIVE_FILES = [
+    "skills/agent-builder/SKILL.md",
+    "skills/agent-builder/references/agent-philosophy.md",
+    "skills/agent-builder/references/minimal-agent.py",
+    "skills/agent-builder/references/subagent-pattern.py",
+    "skills/agent-builder/references/tool-templates.py",
+    "skills/agent-builder/scripts/init_agent.py",
+    "skills/clawhub/builtin/_builtin_manifest.json",
+    "skills/clawhub/builtin/agent-config/SKILL.md",
+    "skills/clawhub/builtin/api-dev/SKILL.md",
+    "skills/clawhub/builtin/auto-pr-merger/SKILL.md",
+    "skills/clawhub/builtin/backup/SKILL.md",
+    "skills/clawhub/builtin/claude-code-usage/SKILL.md",
+    "skills/clawhub/builtin/github-integration/SKILL.md",
+    "skills/code-review/SKILL.md",
+    "skills/generated/upload-office-parser/SKILL.md",
+    "skills/generated/upload-parsers-capabilities.json",
+    "skills/generated/upload-tabular-parser/SKILL.md",
+    "skills/mcp-builder/SKILL.md",
+    "skills/pdf/SKILL.md",
+    "skills/skills_Gen/SKILL.md",
+    "skills/skills_Gen/knowledge_snapshot.json",
+]
+
+
+def ensure_embedded_skills(workdir: Path) -> Path:
+    target = workdir / "skills"
+    state_path = target / ".embedded_bundle_state.json"
+    expected_hash = EMBEDDED_SKILLS_ARCHIVE_SHA256
+    expected_files = EMBEDDED_SKILLS_ARCHIVE_FILES
+
+    if state_path.exists():
+        state_hash = ""
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state_hash = str(state.get("sha256", ""))
+        except Exception:
+            state_hash = ""
+        if state_hash == expected_hash:
+            missing = [rel for rel in expected_files if not (workdir / rel).exists()]
+            if not missing:
+                return target
+
+    raw = base64.b64decode(EMBEDDED_SKILLS_ARCHIVE_B64.encode("ascii"))
+    root_resolved = workdir.resolve()
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            rel = Path(info.filename)
+            if rel.is_absolute() or ".." in rel.parts:
+                continue
+            target_path = (workdir / rel).resolve()
+            if not target_path.is_relative_to(root_resolved):
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(zf.read(info.filename))
+
+    target.mkdir(parents=True, exist_ok=True)
+    state_payload = {
+        "sha256": expected_hash,
+        "file_count": len(expected_files),
+        "updated_at": int(time.time()),
+    }
+    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+def _module_exists(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+def detect_upload_parser_capabilities() -> dict:
+    return {
+        "openpyxl": _module_exists("openpyxl"),
+        "xlrd": _module_exists("xlrd"),
+        "python_docx": _module_exists("docx"),
+        "python_pptx": _module_exists("pptx"),
+        "pymupdf": _module_exists("fitz"),
+        "pdftotext": bool(shutil.which("pdftotext")),
+        "xls2csv": bool(shutil.which("xls2csv")),
+        "antiword": bool(shutil.which("antiword")),
+        "catdoc": bool(shutil.which("catdoc")),
+        "catppt": bool(shutil.which("catppt")),
+        "textutil": bool(shutil.which("textutil")),
+    }
+
+def _render_cap_markdown(caps: dict) -> str:
+    rows = [
+        ("xlsx", "openpyxl or zip/xml fallback", bool(caps.get("openpyxl"))),
+        ("xls", "xlrd or xls2csv/strings fallback", bool(caps.get("xlrd") or caps.get("xls2csv"))),
+        ("csv", "builtin csv parser", True),
+        ("pdf", "PyMuPDF or pdftotext/strings fallback", bool(caps.get("pymupdf") or caps.get("pdftotext"))),
+        ("docx", "python-docx or zip/xml fallback", bool(caps.get("python_docx"))),
+        ("doc", "antiword/catdoc/textutil/strings fallback", bool(caps.get("antiword") or caps.get("catdoc") or caps.get("textutil"))),
+        ("pptx", "python-pptx or zip/xml fallback", bool(caps.get("python_pptx"))),
+        ("ppt", "catppt/textutil/strings fallback", bool(caps.get("catppt") or caps.get("textutil"))),
+    ]
+    lines = []
+    for ext, parser, ok in rows:
+        lines.append(f"- `{ext}`: {'available' if ok else 'partial'} ({parser})")
+    return "\n".join(lines)
+
+def _write_text_if_changed(path: Path, content: str):
+    old = try_read_text(path)
+    if old == content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+def ensure_generated_document_skills(skills_root: Path):
+    caps = detect_upload_parser_capabilities()
+    generated_root = skills_root / "generated"
+    cap_md = _render_cap_markdown(caps)
+    tabular_skill = f"""---
+name: upload-tabular-parser
+description: Parse uploaded CSV/XLS/XLSX files from the session upload area and extract structured text safely.
+---
+
+# Upload Tabular Parser
+
+Use this skill when the user uploads spreadsheet or csv files and asks for analysis/modification.
+
+## Runtime Capabilities
+{cap_md}
+
+## Workflow
+1. Upload file in WebUI.
+2. Read `Uploaded files context` and `<uploaded_excerpt ...>` in prompt.
+3. For full fidelity, inspect the copied file under `files/uploaded/...`.
+4. If legacy `.xls` parse quality is poor, convert first (`xls2csv` or office conversion) and re-read.
+
+## Notes
+- The backend automatically parses `.csv`, `.xls`, `.xlsx` on upload.
+- Extracted content is stored as upload preview and injected into system prompt context.
+"""
+    office_skill = f"""---
+name: upload-office-parser
+description: Parse uploaded DOC/DOCX/PPT/PPTX files from session uploads, including fallback extraction paths.
+---
+
+# Upload Office Parser
+
+Use this skill when the user uploads Word/PowerPoint documents and needs content extraction.
+
+## Runtime Capabilities
+{cap_md}
+
+## Workflow
+1. Upload file in WebUI.
+2. Read `Uploaded files context` first for quick content.
+3. For deeper edits, open the copied file in `files/uploaded/...`.
+4. For legacy `.doc/.ppt`, if extraction is weak, convert to docx/pptx/txt first, then continue.
+
+## Notes
+- The backend automatically parses `.doc`, `.docx`, `.ppt`, `.pptx`.
+- If parser dependencies are unavailable, fallback extractor is used (may lose formatting).
+"""
+    cap_json = json_dumps(
+        {
+            "generated_at": int(now_ts()),
+            "capabilities": caps,
+        },
+        indent=2,
+    )
+    _write_text_if_changed(generated_root / "upload-tabular-parser" / "SKILL.md", tabular_skill)
+    _write_text_if_changed(generated_root / "upload-office-parser" / "SKILL.md", office_skill)
+    _write_text_if_changed(generated_root / "upload-parsers-capabilities.json", cap_json)
+
+def ensure_generated_image_coding_feedback_skill(skills_root: Path):
+    generated_root = skills_root / "generated"
+    root = generated_root / "image-coding-feedback-loop"
+    skill_md = """---
+name: image-coding-feedback-loop
+description: Parse input/reference images and generated output images, score visual gaps, and drive deterministic code patch loops until acceptance criteria pass.
+---
+
+# Image Coding Feedback Loop
+
+Use this skill when the task depends on image understanding in a coding workflow:
+- replicate UI/layout from screenshots or mockups,
+- judge generated images/screenshots and improve code accordingly,
+- close the loop from visual diff -> root cause -> code patch -> re-check.
+
+## Inputs
+- Target image(s): design/mockup/screenshot/user-uploaded references.
+- Generated image(s): current output from app, script, or model generation pipeline.
+- Code scope: file paths, rendering command, and runtime constraints.
+
+## Capability Gate
+1. Check active model/image pipeline capability first.
+2. If image input is supported, use direct vision reasoning for detailed comparison.
+3. If image input is unavailable, use fallback checks:
+   - deterministic metadata checks (size/aspect/background),
+   - text checks (OCR if available),
+   - simple pixel-region checks from locally rendered output.
+4. Always report confidence level (`high|medium|low`) based on signal quality.
+
+## Workflow
+1. Define acceptance criteria before editing code:
+   - layout: alignment, spacing, component hierarchy,
+   - typography: font size/weight/line-height consistency,
+   - color/contrast: key palette and readability,
+   - state fidelity: disabled/hover/error/loading visibility.
+2. Build a visual gap table using both target and generated images:
+   - `component | expected | observed | severity | probable code locus`.
+3. Classify severity:
+   - `critical`: broken structure/readability/function cue mismatch,
+   - `major`: clear layout/style mismatch that affects UX,
+   - `minor`: polish-level deviations.
+4. Patch code with smallest safe change set:
+   - one concern per patch (layout, typography, color, state),
+   - avoid unrelated refactors in the same iteration.
+5. Re-render output images after each patch batch.
+6. Re-evaluate and update the gap table.
+7. Repeat until stop criteria:
+   - no critical gaps,
+   - major gaps <= 2 (or user-defined threshold),
+   - remaining issues documented as intentional tradeoffs.
+
+## Generated Image Evaluation (Prompt-to-Image Pipelines)
+When the task asks to generate images:
+1. Record prompt, model, seed (if any), and generation parameters.
+2. Evaluate output on:
+   - subject fidelity,
+   - composition and spatial relation,
+   - style consistency,
+   - text correctness inside image (if present),
+   - artifact/noise level.
+3. If mismatch comes from prompt/params, adjust generation config first.
+4. If mismatch comes from post-processing/rendering code, patch code and rerun.
+
+## Output Contract
+Return:
+1. Visual gap summary with severity counts.
+2. Precise code changes (files + intent for each patch).
+3. Verification result:
+   - pass/fail per acceptance criterion,
+   - confidence level and any fallback limitations.
+4. Next iteration plan if not fully passed.
+"""
+    ref_md = """# Visual Evaluation Notes
+
+Use these checks for consistent scoring:
+- Geometric consistency: position, spacing rhythm, and element overlap.
+- Typographic consistency: hierarchy (H1/H2/body), weight, line-height, truncation.
+- Color and contrast: key semantic colors and readability.
+- State fidelity: default/hover/active/disabled/error/loading.
+
+Severity baseline:
+- Critical: blocks readability or breaks interaction cues.
+- Major: obvious mismatch to target intent.
+- Minor: cosmetic, does not block understanding.
+"""
+    cap_json = json_dumps(
+        {
+            "generated_at": int(now_ts()),
+            "skill": "image-coding-feedback-loop",
+            "focus": [
+                "input_image_parsing",
+                "generated_image_evaluation",
+                "visual_gap_to_code_patch_loop",
+            ],
+        },
+        indent=2,
+    )
+    _write_text_if_changed(root / "SKILL.md", skill_md)
+    _write_text_if_changed(root / "references" / "visual-evaluation-notes.md", ref_md)
+    _write_text_if_changed(generated_root / "image-coding-feedback-loop-capabilities.json", cap_json)
+
+def _skill_knowledge_files(workdir: Path) -> list[Path]:
+    out: list[Path] = []
+    for p in [
+        workdir / "agents" / "s05_skill_loading.py",
+        workdir / "agents" / "s_full.py",
+    ]:
+        if p.exists():
+            out.append(p)
+    docs_dir = workdir / "docs"
+    if docs_dir.exists():
+        out.extend(sorted(docs_dir.rglob("s05-skill-loading.md")))
+    dedup: list[Path] = []
+    seen: set[str] = set()
+    for p in out:
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
+    return dedup
+
+def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
+    files = _skill_knowledge_files(workdir)
+    rules: list[str] = []
+    points: list[str] = []
+    sources: list[dict] = []
+
+    def push(bucket: list[str], msg: str):
+        m = str(msg or "").strip()
+        if m and m not in bucket:
+            bucket.append(m)
+
+    for fp in files:
+        raw = try_read_text(fp) or ""
+        if not raw:
+            continue
+        try:
+            rel = fp.resolve().relative_to(workdir.resolve()).as_posix()
+        except Exception:
+            rel = str(fp)
+        sources.append({"path": rel, "bytes": len(raw.encode("utf-8"))})
+        low = raw.lower()
+        if "layer 1" in low and "layer 2" in low:
+            push(rules, "Use two-layer loading: keep skill metadata cheap in prompt, load full body only on demand.")
+        if "yaml frontmatter" in low or "frontmatter" in low:
+            push(rules, "Each SKILL.md must contain YAML frontmatter with at least `name` and `description`.")
+        if "load_skill" in low:
+            push(rules, "Use `load_skill` for specialized knowledge retrieval instead of stuffing long static prompts.")
+        if ".skills/" in raw or "skills/" in raw:
+            push(rules, "Store reusable skills under the skills root and index them dynamically.")
+        if "<skill name=" in raw or "tool_result" in low:
+            push(rules, "When loading a skill, return a structured `<skill name=...>` block for deterministic parsing.")
+        if "system prompt" in low and "tokens" in low:
+            push(points, "Token budgeting matters: skill metadata should stay concise; bodies should be loaded only when needed.")
+        if "workflow" in low or "步骤" in raw:
+            push(points, "Skill instructions should be procedural, with explicit step-by-step workflows.")
+        if "examples" in low or "示例" in raw:
+            push(points, "Trigger examples improve skill discoverability and usage precision.")
+
+    if not rules:
+        rules = [
+            "Use SKILL.md with `name` + `description` frontmatter.",
+            "Prefer on-demand skill loading over oversized static prompts.",
+        ]
+    if not points:
+        points = [
+            "Keep instructions concise and actionable.",
+            "Prefer deterministic outputs and explicit tool-oriented steps.",
+        ]
+    return {
+        "generated_at": int(now_ts()),
+        "summary": "Rules and knowledge distilled from local agents/docs skill-loading references.",
+        "rules": rules[:16],
+        "knowledge_points": points[:16],
+        "sources": sources,
+    }
+
+def _sanitize_skill_slug(raw: str, fallback: str = "skills-gen") -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw or "").strip()).strip("-")
+    return slug or fallback
+
+def _build_skills_gen_skill_content(knowledge: dict) -> str:
+    rules = [str(x).strip() for x in knowledge.get("rules", []) if str(x).strip()]
+    points = [str(x).strip() for x in knowledge.get("knowledge_points", []) if str(x).strip()]
+    rule_md = "\n".join(f"- {x}" for x in (rules[:10] or ["Follow local skills docs and keep output deterministic."]))
+    point_md = "\n".join(f"- {x}" for x in (points[:10] or ["Prefer concise, high-signal skill instructions."]))
+    return f"""---
+name: skills_gen
+description: Build robust Agent SKILL.md files from flowchart structures and inject them into ./skills for immediate activation.
+---
+
+# Skills_Gen
+
+Use this skill when the user wants to design, generate, refine, and publish reusable Codex skills.
+
+## Build Rules (Local Docs)
+{rule_md}
+
+## Knowledge Points
+{point_md}
+
+## Workflow
+1. Capture the user's flowchart framework first (nodes, edges, ordering, constraints).
+2. Convert the flowchart into a practical SKILL.md structure: trigger, inputs, workflow, checks, and output contract.
+3. Keep frontmatter minimal and precise: `name`, `description`.
+4. Ensure the body is concise, deterministic, and tool-oriented.
+5. Write the skill into `./skills/<skill-folder>/SKILL.md` and trigger skill reload.
+
+## Output Contract
+- Return valid Markdown SKILL.md content.
+- Include clear trigger conditions and failure-handling guidance.
+- Avoid filler prose; prioritize executable steps and checks.
+"""
+
+def ensure_generated_skills_gen_skill(skills_root: Path, workdir: Path = WORKDIR):
+    knowledge = analyze_skill_building_knowledge(workdir)
+    root = skills_root / "skills_Gen"
+    _write_text_if_changed(root / "SKILL.md", _build_skills_gen_skill_content(knowledge))
+    _write_text_if_changed(root / "knowledge_snapshot.json", json_dumps(knowledge, indent=2))
+
+def ensure_generated_execution_recovery_skill(skills_root: Path):
+    generated_root = skills_root / "generated"
+    root = generated_root / "execution-degradation-recovery"
+    skill_md = """---
+name: execution-degradation-recovery
+description: Diagnose analysis-only/idle loops and failed tool rounds, then enforce stepwise recovery with context recall, todo chunking, and one-tool convergence.
+---
+
+# Execution Degradation Recovery
+
+Use this skill when the agent shows model degradation symptoms:
+- repeated thinking/blank assistant output,
+- no tool calls on actionable tasks,
+- repeated malformed tool arguments or failing tool loops,
+- context loss after truncation/compaction.
+
+## Triage Checklist
+1. Inspect the last 30-50 turns and classify the primary failure:
+   - `truncation`: outputs/tool args are cut off,
+   - `context_loss`: compacted history missing key details,
+   - `tool_arg_quality`: malformed/incomplete JSON tool arguments,
+   - `capability_degradation`: model keeps narrating without execution.
+2. Record concrete evidence (exact errors / statuses / turn pattern) before changing strategy.
+
+## Recovery Workflow (Mandatory Order)
+1. If context may be missing, call `context_recall` first.
+2. Build or repair todo plan with 3-7 items (one `in_progress`) via `TodoWrite` or `TodoWriteRescue`.
+3. Enter strict execution mode:
+   - execute exactly ONE tool call per round,
+   - keep tool arguments complete JSON,
+   - after each tool, update todo status.
+4. If the same tool fails repeatedly:
+   - shrink scope to a smaller subtask,
+   - repair arguments and retry only that tool once,
+   - if still blocked, output explicit blocker and stop.
+
+## Distributed/Segmented Strategy
+- Break large tasks into independently verifiable chunks.
+- Prefer deterministic sub-outputs (file exists, command exit code, patch diff).
+- Persist progress after each chunk before moving to next chunk.
+
+## Output Contract
+Return:
+1. Root-cause classification + evidence.
+2. Current chunk being executed.
+3. Tool action result and next chunk.
+4. If blocked: exact blocker + required next input.
+"""
+    triage_ref = """# Stall Signals
+
+- No-tool idle: assistant returns text/thinking but no tool call on actionable request.
+- Truncation: malformed JSON, unfinished fences, abrupt ending patterns.
+- Context loss: compact-resume triggered and key constraints missing.
+- Capability degradation: repeated narration without state-changing actions.
+
+# Fast Decision Rules
+
+1. Missing context -> `context_recall`.
+2. No todo plan -> `TodoWriteRescue`.
+3. Repeated tool failure -> one-tool strict retry with smaller chunk.
+4. Still failing -> explicit blocker, stop loop.
+"""
+    _write_text_if_changed(root / "SKILL.md", skill_md)
+    _write_text_if_changed(root / "references" / "triage-signals.md", triage_ref)
+    _write_text_if_changed(
+        generated_root / "execution-degradation-recovery-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skill": "execution-degradation-recovery",
+                "focus": [
+                    "idle-diagnosis",
+                    "failure-recovery",
+                    "segmented-execution",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
+def ensure_generated_html_frontend_report_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+    html_root = generated_root / "html-report-engineering"
+    frontend_root = generated_root / "frontend-composition-algorithm"
+    viz_root = generated_root / "visualization-report-pipeline"
+    offline_root = generated_root / "offline-html-js-bundling"
+
+    html_skill = """---
+name: html-report-engineering
+description: Build high-quality HTML/CSS/JS pages and analytical reports with responsive layout, accessibility checks, and deterministic polish loops.
+---
+
+# HTML Report Engineering
+
+Use this skill when the user asks for:
+- HTML report/dashboard/summary pages,
+- frontend writing with clear visual hierarchy,
+- analysis-to-web deliverables with charts and narrative.
+
+## Build Algorithm (HARP Loop)
+1. **Hierarchy**
+   - Define audience, goal, and acceptance criteria first.
+   - Draft section map: header -> key metrics -> evidence -> details -> conclusion/actions.
+2. **Architecture**
+   - Build semantic HTML landmarks (`header/main/section/article/footer`).
+   - Use stable class/id naming and predictable block structure.
+3. **Rendering System**
+   - Create CSS tokens in `:root` (color, spacing, radius, shadow, typography scale).
+   - Implement responsive rules for desktop/tablet/mobile breakpoints.
+4. **Polish + Proof**
+   - Add JS interactions with progressive enhancement.
+   - Run QA checks: mobile layout, overflow, contrast, keyboard nav, empty/error states.
+
+## Implementation Rules
+- Prefer a self-contained `.html` (embedded `<style>` + `<script>`) unless project structure requires split files.
+- Keep data/config objects explicit and near script top for maintainability.
+- For charts, prefer deterministic rendering; provide fallback (SVG/canvas) when external libs are unavailable.
+- If third-party JS is required, use local `./js/<library>.js` in final HTML deliverable (no CDN-only dependency).
+- For external script URLs, run offline packaging pass: map to `./js_lib`, copy to HTML sibling `./js`, then rewrite `<script src>`.
+- Avoid placeholder text once concrete content is known.
+
+## Output Contract
+Return:
+1. changed/created file paths,
+2. preview/run command,
+3. QA checklist result (pass/fail),
+4. next polish step if not yet accepted.
+"""
+
+    offline_skill = """---
+name: offline-html-js-bundling
+description: Convert HTML third-party JavaScript dependencies to offline-ready local assets by mapping/caching into ./js_lib and rewriting to ./js paths.
+---
+
+# Offline HTML JS Bundling
+
+Use this skill when:
+- user asks for offline-ready HTML deliverables,
+- session will export HTML and must run without internet,
+- generated HTML references CDN/external JS URLs.
+
+## Workflow
+1. Scan target `.html` files for external `<script src=\"http(s)://...\">`.
+2. Match common libraries from `./js_lib` first; if unmatched and online, cache into `./js_lib/external`.
+3. Copy required JS files into HTML sibling directory `./js/`.
+4. Rewrite script paths to local `./js/<file>.js`.
+5. Re-validate: no unresolved external JS URL remains in final deliverable.
+6. Report rewritten count, copied files, and unresolved URLs.
+
+## Rules
+- Keep `./js` per HTML location (do not hardcode global absolute paths).
+- Keep file names deterministic and safe (`[A-Za-z0-9._-]`).
+- Preserve existing relative local script paths if already offline-ready.
+
+## Output Contract
+Return:
+1. target HTML files processed,
+2. copied JS asset list,
+3. rewritten URL mapping summary,
+4. unresolved dependency list (if any).
+"""
+
+    frontend_skill = """---
+name: frontend-composition-algorithm
+description: Apply a repeatable HTML+CSS+JS composition algorithm for component architecture, interaction states, and maintainable front-end delivery.
+---
+
+# Frontend Composition Algorithm
+
+Use this skill when the task focuses on frontend implementation quality.
+
+## STACK Algorithm
+1. **S - Structure map**
+   - Break UI into components and state boundaries.
+   - Define static vs dynamic regions.
+2. **T - Tokenize style**
+   - Establish theme tokens (`--color-*`, `--space-*`, `--radius-*`, `--font-*`).
+   - Keep visual consistency through token reuse.
+3. **A - Assemble layout**
+   - Compose components using grid/flex with explicit spacing rhythm.
+   - Ensure mobile-first fallback before desktop enhancements.
+4. **C - Connect behavior**
+   - Wire events, data binding, loading/empty/error states.
+   - Keep JS state transitions deterministic and easy to inspect.
+5. **K - Keep quality**
+   - Check a11y semantics, focus order, contrast, and perceived performance.
+   - Minimize reflow/overdraw and remove dead CSS/JS.
+
+## Anti-Patterns to Avoid
+- Mixing layout hacks and fixed pixel positioning without responsive fallback.
+- Inline style sprawl instead of tokenized variables.
+- Heavy animation without purpose or reduced-motion fallback.
+- Shipping without state/error handling.
+"""
+
+    viz_skill = """---
+name: visualization-report-pipeline
+description: Transform analysis requirements into visual reports with chart-selection logic, narrative summarization, and verification gates.
+---
+
+# Visualization Report Pipeline
+
+Use this skill for data storytelling, report summarization, and charted analysis outputs.
+
+## Pipeline
+1. Clarify metrics, dimensions, and comparison goal.
+2. Profile data quality (missing values, outliers, scale mismatch).
+3. Select chart type by intent:
+   - trend -> line/area,
+   - comparison -> bar/column,
+   - composition -> stacked bar/donut,
+   - distribution -> histogram/box,
+   - relationship -> scatter/bubble.
+4. Build narrative blocks:
+   - key findings,
+   - evidence chart/table,
+   - interpretation,
+   - decision/action suggestion.
+5. Validate readability and truthfulness:
+   - axis integrity, labels/units, legend clarity, annotation accuracy.
+
+## Output Contract
+Return:
+1. selected chart strategy with rationale,
+2. generated report sections,
+3. validation notes (data + visual quality),
+4. follow-up analysis questions when uncertainty remains.
+"""
+
+    html_ref = """# HTML Report QA Checklist
+
+Use this checklist before final delivery:
+- Section hierarchy is clear and matches user goal.
+- Typography scale is consistent.
+- Spacing rhythm is consistent across components.
+- Mobile layout has no clipping/overlap.
+- Color contrast is readable.
+- Empty/loading/error states are present where needed.
+- Tables/charts include titles, units, and legends.
+"""
+
+    chart_ref = """# Chart Selection Quick Map
+
+- Trend across time -> line / area.
+- Category comparison -> bar / column.
+- Part-to-whole (small category count) -> donut / stacked bar.
+- Distribution -> histogram / box plot.
+- Correlation -> scatter.
+
+Validation:
+- Y-axis baseline policy documented.
+- Unit and period labels explicit.
+- Outlier handling explained.
+"""
+
+    js_lib_ref = _render_offline_js_catalog_md()
+
+    _write_text_if_changed(html_root / "SKILL.md", html_skill)
+    _write_text_if_changed(html_root / "references" / "layout-quality-checklist.md", html_ref)
+    _write_text_if_changed(frontend_root / "SKILL.md", frontend_skill)
+    _write_text_if_changed(viz_root / "SKILL.md", viz_skill)
+    _write_text_if_changed(viz_root / "references" / "chart-selection-map.md", chart_ref)
+    _write_text_if_changed(offline_root / "SKILL.md", offline_skill)
+    _write_text_if_changed(offline_root / "references" / "common-js-libs.md", js_lib_ref)
+    _write_text_if_changed(
+        generated_root / "html-report-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": [
+                    "html-report-engineering",
+                    "frontend-composition-algorithm",
+                    "visualization-report-pipeline",
+                    "offline-html-js-bundling",
+                ],
+                "focus": [
+                    "html_css_js_composition",
+                    "report_summarization",
+                    "visualization_analysis",
+                    "offline_js_dependency_localization",
+                    "qa_iteration_loop",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
+def ensure_generated_deep_research_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+    orchestrator_root = generated_root / "deep-research-orchestrator"
+    retrieval_root = generated_root / "retrieval-synthesis-fallback"
+    pdf_root = generated_root / "pdf-vision-literature-integrator"
+
+    orchestrator_skill = """---
+name: deep-research-orchestrator
+description: Route user intent into text-only deep analysis or retrieval-integrated deep research with online/offline fallback and final markdown report generation.
+---
+
+# Deep Research Orchestrator
+
+Use this skill when user asks for deep analysis, literature synthesis, evidence-backed summary, or research-style reporting.
+
+## Mode Routing
+Classify the task into one mode before execution:
+1. `text_deep_analysis`
+2. `retrieval_integrated_online`
+3. `retrieval_integrated_simulated`
+
+### Route Rules
+- If user explicitly asks web/internet/search/citations -> retrieval integrated.
+- If user asks "only based on this text/document" -> text-only mode.
+- If retrieval mode is requested but network/search is unavailable -> simulated retrieval mode.
+
+## Mandatory Workflow
+1. Clarify research question, scope, constraints, and output depth.
+2. Build a compact Todo plan (3-7 items).
+3. Execute evidence collection:
+   - text-only: parse and segment source text, then deep-analyze claims.
+   - retrieval-online: run query decomposition + multi-source collection + source grading.
+   - retrieval-simulated: run model-knowledge simulated search cards with confidence labels.
+4. Build claim-evidence map:
+   - `claim | evidence | source | confidence | caveat`.
+5. Output a final markdown report with explicit sections.
+
+## Report Contract (Markdown)
+Output must include:
+1. Executive summary
+2. Research question and method
+3. Evidence synthesis
+4. Key findings and counter-evidence
+5. Limitations and confidence
+6. Actionable conclusions
+7. Source list / simulated source list
+
+For retrieval modes, include source links when available.
+For simulated mode, explicitly label "simulated retrieval (model knowledge)".
+"""
+
+    retrieval_skill = """---
+name: retrieval-synthesis-fallback
+description: Perform online retrieval synthesis when network is available; otherwise run model-knowledge simulated retrieval with transparent confidence and source cards.
+---
+
+# Retrieval Synthesis Fallback
+
+Use this skill for retrieval-integrated deep analysis tasks.
+
+## Online Retrieval Chain
+1. Decompose query into sub-questions.
+2. Execute diverse queries (definitions, methods, benchmarks, contradictory evidence).
+3. Collect and deduplicate sources.
+4. Grade evidence quality:
+   - primary source first (official docs, papers, standards),
+   - recency, reproducibility, and direct relevance.
+5. Synthesize with citation-backed claims.
+
+## If Online Retrieval Fails
+If internet/search is unavailable or blocked:
+1. Switch to `simulated retrieval`.
+2. Produce simulated source cards:
+   - `topic`,
+   - `likely canonical source type`,
+   - `model-knowledge summary`,
+   - `confidence`,
+   - `verification-needed`.
+3. Continue synthesis but clearly mark uncertainty.
+
+## Simulated Retrieval Rules
+- Never present simulated cards as verified external citations.
+- Use confidence bands: `high`, `medium`, `low`.
+- Provide a verification checklist for future online validation.
+
+## Output
+- Integrated markdown report with:
+  - findings,
+  - evidence table,
+  - unresolved questions,
+  - verification plan.
+"""
+
+    pdf_skill = """---
+name: pdf-vision-literature-integrator
+description: Use environment-probed PyMuPDF workflow for PDF text/figure analysis only when multimodal model capability is available.
+---
+
+# PDF Vision Literature Integrator
+
+Use this skill when uploaded literature is PDF and visual figures/tables matter.
+
+## Workflow
+1. Parse PDF text blocks and page-level structure.
+2. Probe runtime environment first (do not assume PyMuPDF exists):
+   - `python -c "import importlib.util;print(bool(importlib.util.find_spec('fitz')))"`.
+3. Only if active model supports image input and `fitz` exists:
+   - run an ad-hoc extraction command/script to pull figure images,
+   - include figure evidence in multimodal analysis.
+4. Build merged evidence:
+   - text claim,
+   - visual evidence (figure/table),
+   - consistency check,
+   - confidence.
+5. Feed merged evidence into final markdown report.
+
+## Notes
+- For scanned PDFs with weak OCR, declare OCR limitation.
+- For non-multimodal models, skip figure extraction and stay in text-only evidence mode.
+- Keep figure interpretation aligned with nearby caption/paragraph context.
+"""
+
+    chain_ref = """# Deep Research Chain Reference
+
+This skill follows a practical chain:
+1. Intent routing (text-only vs retrieval integrated).
+2. Query decomposition.
+3. Evidence collection and grading.
+4. Claim-evidence mapping.
+5. Markdown report generation.
+
+Recommended external references:
+- OpenAI Deep Research overview: https://help.openai.com/en/articles/10500283-deep-research-faq
+- OpenAI Responses API and built-in web search tool docs:
+  https://platform.openai.com/docs/guides/tools-web-search
+- Retrieval-Augmented Generation (Lewis et al., 2020): https://arxiv.org/abs/2005.11401
+- ReAct reasoning and acting framework: https://arxiv.org/abs/2210.03629
+- Chain of Density summarization: https://arxiv.org/abs/2309.04269
+- PyMuPDF official docs: https://pymupdf.readthedocs.io/en/latest/
+"""
+
+    report_ref = """# Deep Analysis Markdown Template
+
+## 1. Executive Summary
+- Core conclusion
+- Why it matters
+
+## 2. Question and Scope
+- Research question
+- Scope boundaries
+- Assumptions
+
+## 3. Method
+- Mode: text-only / retrieval-online / retrieval-simulated
+- Steps executed
+- Quality checks
+
+## 4. Evidence Synthesis
+| Claim | Evidence | Source | Confidence | Caveat |
+|---|---|---|---|---|
+
+## 5. Findings
+### 5.1 Main Findings
+### 5.2 Counter-Evidence / Alternatives
+
+## 6. Limitations
+- Data gaps
+- Uncertainties
+
+## 7. Conclusions and Actions
+- Practical recommendations
+- Next validation steps
+
+## 8. Sources
+- URL list (online) or simulated source cards (offline mode)
+"""
+
+    report_script = r"""#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+
+def _list_rows(items, bullet="- "):
+    out = []
+    for row in items or []:
+        txt = str(row).strip()
+        if txt:
+            out.append(f"{bullet}{txt}")
+    return out
+
+
+def render_md(payload: dict) -> str:
+    title = str(payload.get("title") or "Deep Research Report").strip()
+    mode = str(payload.get("mode") or "unspecified").strip()
+    question = str(payload.get("question") or "").strip()
+    summary_rows = _list_rows(payload.get("summary_points", []))
+    findings_rows = _list_rows(payload.get("findings", []))
+    limits_rows = _list_rows(payload.get("limitations", []))
+    actions_rows = _list_rows(payload.get("actions", []))
+    sources_rows = _list_rows(payload.get("sources", []))
+
+    lines = [f"# {title}", ""]
+    if question:
+        lines.extend(["## Research Question", question, ""])
+    lines.extend(["## Method", f"- Mode: `{mode}`", ""])
+    lines.extend(["## Executive Summary"] + (summary_rows or ["- (pending)"]) + [""])
+    lines.extend(["## Key Findings"] + (findings_rows or ["- (pending)"]) + [""])
+    lines.extend(["## Limitations"] + (limits_rows or ["- (pending)"]) + [""])
+    lines.extend(["## Conclusions and Actions"] + (actions_rows or ["- (pending)"]) + [""])
+    lines.extend(["## Sources"] + (sources_rows or ["- (pending)"]) + [""])
+    return "\n".join(lines).strip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render deep research markdown report from JSON input.")
+    parser.add_argument("--input", required=True, help="Input JSON path")
+    parser.add_argument("--output", required=True, help="Output markdown path")
+    args = parser.parse_args()
+
+    src = Path(args.input).expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"input not found: {src}")
+    data = json.loads(src.read_text(encoding="utf-8"))
+    md = render_md(data if isinstance(data, dict) else {})
+    out = Path(args.output).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(md, encoding="utf-8")
+    print(str(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    _write_text_if_changed(orchestrator_root / "SKILL.md", orchestrator_skill)
+    _write_text_if_changed(retrieval_root / "SKILL.md", retrieval_skill)
+    _write_text_if_changed(pdf_root / "SKILL.md", pdf_skill)
+    _write_text_if_changed(orchestrator_root / "references" / "deep-research-chain.md", chain_ref)
+    _write_text_if_changed(orchestrator_root / "references" / "deep-report-template.md", report_ref)
+    _write_text_if_changed(orchestrator_root / "scripts" / "render_deep_research_report.py", report_script)
+    stale_pdf_script = pdf_root / "scripts" / "pdf_multimodal_extract.py"
+    if stale_pdf_script.exists() and stale_pdf_script.is_file():
+        try:
+            stale_pdf_script.unlink()
+        except Exception:
+            pass
+    _write_text_if_changed(
+        generated_root / "deep-research-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": [
+                    "deep-research-orchestrator",
+                    "retrieval-synthesis-fallback",
+                    "pdf-vision-literature-integrator",
+                ],
+                "focus": [
+                    "intent_mode_routing",
+                    "online_retrieval",
+                    "offline_simulated_retrieval",
+                    "pdf_text_and_figure_integration",
+                    "final_markdown_report",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
+def ensure_generated_runtime_skills_manifest(skills_root: Path):
+    generated_root = skills_root / "generated"
+    tracked = [
+        "skills_Gen/SKILL.md",
+        "skills_Gen/knowledge_snapshot.json",
+        "generated/upload-tabular-parser/SKILL.md",
+        "generated/upload-office-parser/SKILL.md",
+        "generated/image-coding-feedback-loop/SKILL.md",
+        "generated/execution-degradation-recovery/SKILL.md",
+        "generated/deep-research-orchestrator/SKILL.md",
+        "generated/retrieval-synthesis-fallback/SKILL.md",
+        "generated/pdf-vision-literature-integrator/SKILL.md",
+        "generated/deep-research-orchestrator/scripts/render_deep_research_report.py",
+        "generated/html-report-engineering/SKILL.md",
+        "generated/frontend-composition-algorithm/SKILL.md",
+        "generated/visualization-report-pipeline/SKILL.md",
+        "generated/offline-html-js-bundling/SKILL.md",
+    ]
+    present = [rel for rel in tracked if (skills_root / rel).exists()]
+    payload = {
+        "generated_at": int(now_ts()),
+        "count_expected": len(tracked),
+        "count_present": len(present),
+        "runtime_generated_skills": tracked,
+        "present": present,
+    }
+    _write_text_if_changed(generated_root / "runtime-skills-manifest.json", json_dumps(payload, indent=2))
+
+BUILTIN_CLAWHUB_SKILLS_VERSION = "2026-03-01.1"
+
+EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64 = """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"""
+
+
+def ensure_embedded_clawhub_skills(skills_root: Path):
+    builtin_root = skills_root / "clawhub" / "builtin"
+    manifest_path = builtin_root / "_builtin_manifest.json"
+    expected = [
+        "agent-config",
+        "api-dev",
+        "auto-pr-merger",
+        "backup",
+        "claude-code-usage",
+        "github-integration",
+    ]
+    if manifest_path.exists():
+        try:
+            meta = parse_json_object(manifest_path.read_text(encoding="utf-8"), {})
+            if str(meta.get("version", "")) == BUILTIN_CLAWHUB_SKILLS_VERSION:
+                ok = True
+                for slug in expected:
+                    if not (builtin_root / slug / "SKILL.md").exists():
+                        ok = False
+                        break
+                if ok:
+                    return
+        except Exception:
+            pass
+    raw = base64.b64decode(EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64.encode("ascii"))
+    root_resolved = skills_root.resolve()
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            rel = Path(info.filename)
+            if len(rel.parts) < 3 or rel.parts[0] != "clawhub" or rel.parts[1] != "builtin":
+                continue
+            target = (skills_root / rel).resolve()
+            if not target.is_relative_to(root_resolved):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(info.filename))
+
+def ensure_runtime_skills(skills_root: Path):
+    ensure_generated_document_skills(skills_root)
+    ensure_generated_image_coding_feedback_skill(skills_root)
+    ensure_generated_skills_gen_skill(skills_root)
+    ensure_generated_execution_recovery_skill(skills_root)
+    ensure_generated_html_frontend_report_skills(skills_root)
+    ensure_generated_deep_research_skills(skills_root)
+    ensure_generated_runtime_skills_manifest(skills_root)
+    ensure_embedded_clawhub_skills(skills_root)
+
+SKILL_PROTOCOL_LOCAL = "local.skill.md.v1"
+SKILL_PROTOCOL_CLAWHUB = "clawhub.skill.v1"
+SKILL_PROTOCOL_HTTP_JSON = "http.skill.json.v1"
+
+SKILL_PROTOCOL_SPECS = [
+    {
+        "protocol": SKILL_PROTOCOL_LOCAL,
+        "version": "1.0",
+        "description": "Local markdown skills discovered from SKILL.md files.",
+        "manifest_required": [],
+        "manifest_optional": ["provider_id", "description", "root", "version"],
+    },
+    {
+        "protocol": SKILL_PROTOCOL_CLAWHUB,
+        "version": "1.0",
+        "description": "Reserved standard bridge for typical clawhub skill backends.",
+        "manifest_required": ["protocol"],
+        "manifest_optional": [
+            "provider_id",
+            "description",
+            "version",
+            "root",
+            "skills[].name",
+            "skills[].file|path|content",
+            "skills[].description",
+            "skills[].attachments[]",
+        ],
+    },
+    {
+        "protocol": SKILL_PROTOCOL_HTTP_JSON,
+        "version": "1.0",
+        "description": "HTTP JSON remote skill provider manifest protocol.",
+        "manifest_required": ["protocol", "endpoint"],
+        "manifest_optional": ["provider_id", "description", "timeout", "version"],
+    },
+]
+
+class SkillStore:
+    def __init__(self, skills_root: Path):
+        self.skills_root = skills_root
+        self.skills: dict[str, dict] = {}
+        self.aliases: dict[str, str] = {}
+        self.ambiguous: dict[str, list[str]] = {}
+        self.providers: dict[str, dict] = {}
+        self.warnings: list[str] = []
+        self.fingerprint = ""
+        self.last_reload_ts = 0.0
+        self.reload(force=True)
+
+    def _sanitize_provider_id(self, raw: str, fallback: str) -> str:
+        pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
+        return pid or fallback
+
+    def _provider_exists(self, provider_id: str) -> bool:
+        return provider_id in self.providers
+
+    def _register_provider(
+        self,
+        provider_id: str,
+        protocol: str,
+        version: str,
+        description: str,
+        root: Path | None = None,
+        config_path: Path | None = None,
+    ):
+        provider_id = self._sanitize_provider_id(provider_id, "provider")
+        if provider_id in self.providers:
+            i = 2
+            base = provider_id
+            while f"{base}-{i}" in self.providers:
+                i += 1
+            provider_id = f"{base}-{i}"
+        self.providers[provider_id] = {
+            "provider_id": provider_id,
+            "protocol": protocol,
+            "protocol_version": version,
+            "description": description,
+            "root": str(root.resolve()) if root else "",
+            "config_path": str(config_path.resolve()) if config_path else "",
+            "skill_count": 0,
+        }
+        return provider_id
+
+    def _collect_attachments(
+        self,
+        skill_dir: Path,
+        *,
+        skip_name: str = "SKILL.md",
+        globs: list[str] | None = None,
+        base_dir: Path | None = None,
+    ) -> list[dict]:
+        attachments: list[dict] = []
+        seen: set[str] = set()
+        base = base_dir or skill_dir
+        candidates: list[Path] = []
+        if globs:
+            for pattern in globs:
+                for fp in sorted(base.glob(pattern)):
+                    candidates.append(fp)
+        else:
+            for fp in sorted(skill_dir.rglob("*")):
+                candidates.append(fp)
+        for fp in candidates:
+            if not fp.is_file():
+                continue
+            if fp.name in {skip_name, ".DS_Store"}:
+                continue
+            text = try_read_text(fp)
+            if text is None:
+                continue
+            rel = fp.relative_to(base).as_posix() if fp.is_relative_to(base) else fp.name
+            if rel in seen:
+                continue
+            seen.add(rel)
+            attachments.append(
+                {
+                    "path": rel,
+                    "abs_path": str(fp.resolve()),
+                    "content": text,
+                }
+            )
+        return attachments
+
+    def _register_skill(
+        self,
+        *,
+        provider_id: str,
+        protocol: str,
+        protocol_version: str,
+        name: str,
+        description: str,
+        meta: dict,
+        body: str,
+        skill_path: str,
+        attachments: list[dict],
+    ):
+        raw_name = (name or "").strip()
+        skill_name = raw_name or Path(skill_path).parent.name or "skill"
+        key = f"{provider_id}:{skill_name}"
+        if key in self.skills:
+            i = 2
+            while f"{key}#{i}" in self.skills:
+                i += 1
+            key = f"{key}#{i}"
+        record = {
+            "id": key,
+            "name": skill_name,
+            "description": (description or "-").strip() or "-",
+            "provider_id": provider_id,
+            "protocol": protocol,
+            "protocol_version": protocol_version,
+            "meta": dict(meta or {}),
+            "body": (body or "").strip(),
+            "skill_path": skill_path,
+            "attachments": attachments,
+        }
+        self.skills[key] = record
+        p = self.providers.get(provider_id)
+        if p:
+            p["skill_count"] = int(p.get("skill_count", 0)) + 1
+        if skill_name in self.aliases:
+            existing = self.aliases.pop(skill_name)
+            items = self.ambiguous.setdefault(skill_name, [])
+            if existing not in items:
+                items.append(existing)
+            if key not in items:
+                items.append(key)
+        elif skill_name in self.ambiguous:
+            items = self.ambiguous.setdefault(skill_name, [])
+            if key not in items:
+                items.append(key)
+        else:
+            self.aliases[skill_name] = key
+
+    def _load_skill_file(self, skill_file: Path, provider_id: str, protocol: str, protocol_version: str):
+        raw = try_read_text(skill_file)
+        if raw is None:
+            return
+        meta, body = parse_front_matter(raw)
+        skill_dir = skill_file.parent
+        name = str(meta.get("name", "")).strip() or skill_dir.name
+        desc = str(meta.get("description", "-"))
+        attachments = self._collect_attachments(skill_dir, skip_name=skill_file.name)
+        self._register_skill(
+            provider_id=provider_id,
+            protocol=protocol,
+            protocol_version=protocol_version,
+            name=name,
+            description=desc,
+            meta=meta,
+            body=body,
+            skill_path=str(skill_file.resolve()),
+            attachments=attachments,
+        )
+
+    def _load_local_skills(self):
+        provider_id = self._register_provider(
+            provider_id="local",
+            protocol=SKILL_PROTOCOL_LOCAL,
+            version="1.0",
+            description="Auto-discovered local SKILL.md files",
+            root=self.skills_root,
+        )
+        excluded = []
+        for segment in ("providers", "clawhub"):
+            p = self.skills_root / segment
+            if p.exists():
+                excluded.append(p.resolve())
+        for skill_file in sorted(self.skills_root.rglob("SKILL.md")):
+            resolved = skill_file.resolve()
+            if any(resolved.is_relative_to(root) for root in excluded):
+                continue
+            self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_LOCAL, "1.0")
+
+    def _load_http_provider(self, manifest_path: Path, cfg: dict):
+        endpoint = str(cfg.get("endpoint", "")).strip()
+        if not endpoint:
+            self.warnings.append(f"{manifest_path.name}: missing endpoint for {SKILL_PROTOCOL_HTTP_JSON}")
+            return
+        provider_id = self._register_provider(
+            provider_id=str(cfg.get("provider_id") or manifest_path.stem),
+            protocol=SKILL_PROTOCOL_HTTP_JSON,
+            version=str(cfg.get("version", "1.0")).strip() or "1.0",
+            description=str(cfg.get("description", "HTTP JSON provider")).strip() or "HTTP JSON provider",
+            config_path=manifest_path,
+        )
+        timeout = int(cfg.get("timeout", 4))
+        req = Request(endpoint, method="GET")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            self.warnings.append(f"{manifest_path.name}: HTTP provider fetch failed: {exc}")
+            return
+        for item in payload.get("skills", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            body = str(item.get("content", "")).strip()
+            if not body:
+                continue
+            meta = item.get("meta", {}) if isinstance(item.get("meta"), dict) else {}
+            desc = str(item.get("description", meta.get("description", "-")))
+            attachments = []
+            for a in item.get("attachments", []):
+                if not isinstance(a, dict):
+                    continue
+                apath = str(a.get("path", "")).strip() or f"{name}.txt"
+                acontent = str(a.get("content", ""))
+                attachments.append({"path": apath, "abs_path": endpoint, "content": acontent})
+            self._register_skill(
+                provider_id=provider_id,
+                protocol=SKILL_PROTOCOL_HTTP_JSON,
+                protocol_version=str(cfg.get("version", "1.0")).strip() or "1.0",
+                name=name,
+                description=desc,
+                meta=meta,
+                body=body,
+                skill_path=f"{endpoint}#{name}",
+                attachments=attachments,
+            )
+
+    def _load_clawhub_provider(self, manifest_path: Path, cfg: dict):
+        root_value = str(cfg.get("root", ".")).strip() or "."
+        root = (manifest_path.parent / root_value).resolve() if not Path(root_value).is_absolute() else Path(root_value).resolve()
+        provider_id = self._register_provider(
+            provider_id=str(cfg.get("provider_id") or f"clawhub-{manifest_path.stem}"),
+            protocol=SKILL_PROTOCOL_CLAWHUB,
+            version=str(cfg.get("version", "1.0")).strip() or "1.0",
+            description=str(cfg.get("description", "ClawHub skill provider")).strip() or "ClawHub skill provider",
+            root=root,
+            config_path=manifest_path,
+        )
+        explicit = cfg.get("skills")
+        if isinstance(explicit, list) and explicit:
+            for row in explicit:
+                if not isinstance(row, dict):
+                    continue
+                file_hint = str(row.get("file") or row.get("path") or "").strip()
+                inline_content = row.get("content")
+                source_path = None
+                raw = ""
+                if file_hint:
+                    source_path = (root / file_hint).resolve() if not Path(file_hint).is_absolute() else Path(file_hint).resolve()
+                    raw = try_read_text(source_path) or ""
+                elif inline_content is not None:
+                    raw = str(inline_content)
+                if not raw:
+                    continue
+                meta, body = parse_front_matter(raw)
+                name = str(row.get("name") or meta.get("name") or (source_path.parent.name if source_path else "clawhub_skill"))
+                desc = str(row.get("description") or meta.get("description", "-"))
+                attachment_globs = row.get("attachments")
+                globs = [str(x) for x in attachment_globs if isinstance(x, str)] if isinstance(attachment_globs, list) else None
+                skill_dir = source_path.parent if source_path else root
+                attachments = self._collect_attachments(
+                    skill_dir,
+                    skip_name=source_path.name if source_path else "SKILL.md",
+                    globs=globs,
+                    base_dir=root if globs else None,
+                )
+                self._register_skill(
+                    provider_id=provider_id,
+                    protocol=SKILL_PROTOCOL_CLAWHUB,
+                    protocol_version=str(cfg.get("version", "1.0")).strip() or "1.0",
+                    name=name,
+                    description=desc,
+                    meta=meta,
+                    body=body,
+                    skill_path=str(source_path.resolve()) if source_path else str(manifest_path.resolve()),
+                    attachments=attachments,
+                )
+            return
+        if not root.exists():
+            self.warnings.append(f"{manifest_path.name}: clawhub root not found: {root}")
+            return
+        for skill_file in sorted(root.rglob("SKILL.md")):
+            self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_CLAWHUB, "1.0")
+
+    def _load_manifest_providers(self):
+        providers_dir = self.skills_root / "providers"
+        if not providers_dir.exists():
+            return
+        for manifest_path in sorted(providers_dir.rglob("*.json")):
+            raw = try_read_text(manifest_path)
+            if not raw:
+                continue
+            try:
+                cfg = json.loads(raw)
+            except Exception:
+                self.warnings.append(f"{manifest_path.name}: invalid JSON")
+                continue
+            if not isinstance(cfg, dict):
+                continue
+            protocol = str(cfg.get("protocol", "")).strip()
+            if not protocol:
+                continue
+            if protocol == SKILL_PROTOCOL_CLAWHUB:
+                self._load_clawhub_provider(manifest_path, cfg)
+                continue
+            if protocol == SKILL_PROTOCOL_HTTP_JSON:
+                self._load_http_provider(manifest_path, cfg)
+                continue
+            if protocol == SKILL_PROTOCOL_LOCAL:
+                root_hint = str(cfg.get("root", ".")).strip() or "."
+                root = (manifest_path.parent / root_hint).resolve() if not Path(root_hint).is_absolute() else Path(root_hint).resolve()
+                provider_id = self._register_provider(
+                    provider_id=str(cfg.get("provider_id") or f"local-{manifest_path.stem}"),
+                    protocol=SKILL_PROTOCOL_LOCAL,
+                    version=str(cfg.get("version", "1.0")).strip() or "1.0",
+                    description=str(cfg.get("description", "Local manifest provider")).strip() or "Local manifest provider",
+                    root=root,
+                    config_path=manifest_path,
+                )
+                if root.exists():
+                    for skill_file in sorted(root.rglob("SKILL.md")):
+                        self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_LOCAL, "1.0")
+                else:
+                    self.warnings.append(f"{manifest_path.name}: local root not found: {root}")
+                continue
+            self.warnings.append(f"{manifest_path.name}: unsupported protocol '{protocol}'")
+
+    def _load_clawhub_autodetect(self):
+        clawhub_root = self.skills_root / "clawhub"
+        if not clawhub_root.exists():
+            return
+        has_clawhub_provider = any(p.get("protocol") == SKILL_PROTOCOL_CLAWHUB for p in self.providers.values())
+        if has_clawhub_provider:
+            return
+        provider_id = self._register_provider(
+            provider_id="clawhub-default",
+            protocol=SKILL_PROTOCOL_CLAWHUB,
+            version="1.0",
+            description="Auto-discovered clawhub bridge provider",
+            root=clawhub_root,
+        )
+        for skill_file in sorted(clawhub_root.rglob("SKILL.md")):
+            self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_CLAWHUB, "1.0")
+
+    def _skills_fingerprint(self) -> str:
+        if not self.skills_root.exists():
+            return ""
+        sha = hashlib.sha256()
+        files: list[Path] = []
+        files.extend(sorted(self.skills_root.rglob("SKILL.md")))
+        providers_dir = self.skills_root / "providers"
+        if providers_dir.exists():
+            files.extend(sorted(providers_dir.rglob("*.json")))
+        manifest = self.skills_root / "clawhub" / "builtin" / "_builtin_manifest.json"
+        if manifest.exists():
+            files.append(manifest)
+        seen: set[str] = set()
+        for fp in files:
+            try:
+                resolved = str(fp.resolve())
+            except Exception:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                rel = fp.resolve().relative_to(self.skills_root.resolve()).as_posix()
+            except Exception:
+                rel = fp.name
+            try:
+                st = fp.stat()
+                size = int(st.st_size or 0)
+                mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            except Exception:
+                size = 0
+                mtime_ns = 0
+            sha.update(rel.encode("utf-8", errors="ignore"))
+            sha.update(b"|")
+            sha.update(str(size).encode("ascii", errors="ignore"))
+            sha.update(b"|")
+            sha.update(str(mtime_ns).encode("ascii", errors="ignore"))
+            sha.update(b"\n")
+        return sha.hexdigest()
+
+    def reload(self, force: bool = False):
+        now = now_ts()
+        if (not force) and self.last_reload_ts > 0 and (now - self.last_reload_ts) < SKILL_REFRESH_MIN_INTERVAL_SECONDS:
+            return
+        fp = self._skills_fingerprint()
+        if (not force) and fp and self.fingerprint and fp == self.fingerprint and self.skills:
+            self.last_reload_ts = now
+            return
+        self.skills = {}
+        self.aliases = {}
+        self.ambiguous = {}
+        self.providers = {}
+        self.warnings = []
+        if not self.skills_root.exists():
+            self.fingerprint = fp
+            self.last_reload_ts = now
+            return
+        self._load_local_skills()
+        self._load_manifest_providers()
+        self._load_clawhub_autodetect()
+        self.fingerprint = fp
+        self.last_reload_ts = now
+
+    def descriptions(self, max_items: int = SKILL_PROMPT_MAX_ITEMS, max_chars: int = SKILL_PROMPT_MAX_CHARS) -> str:
+        if not self.skills:
+            return "(no skills)"
+        lines = [f"(indexed skills: {len(self.skills)})"]
+        shown = 0
+        for key, data in sorted(self.skills.items()):
+            if shown >= max(1, int(max_items or SKILL_PROMPT_MAX_ITEMS)):
+                break
+            simple = data.get("name", key)
+            label = simple if self.aliases.get(simple) == key else key
+            desc = data.get("description", "-")
+            lines.append(f"- {label}: {desc} [{data.get('provider_id')} | {data.get('protocol')}]")
+            shown += 1
+        remaining = max(0, len(self.skills) - shown)
+        if remaining > 0:
+            lines.append(f"... ({remaining} more skills omitted; use list_skills/load_skill on demand)")
+        if self.ambiguous:
+            lines.append("Ambiguous names require provider:name format.")
+        if self.warnings:
+            lines.append(f"Skill warnings: {len(self.warnings)}")
+        return trim("\n".join(lines), max(400, int(max_chars or SKILL_PROMPT_MAX_CHARS)))
+
+    def list_names(self) -> list[str]:
+        names = set(self.skills.keys())
+        names.update(self.aliases.keys())
+        return sorted(names)
+
+    def list_metadata(self) -> list[dict]:
+        out = []
+        for key, data in sorted(self.skills.items()):
+            meta = dict(data.get("meta", {}))
+            out.append(
+                {
+                    "id": key,
+                    "name": data.get("name", key),
+                    "qualified_name": key,
+                    "description": data.get("description", meta.get("description", "-")),
+                    "provider_id": data.get("provider_id", ""),
+                    "protocol": data.get("protocol", ""),
+                    "protocol_version": data.get("protocol_version", ""),
+                    "meta": meta,
+                    "skill_path": data.get("skill_path", ""),
+                    "attachments": [x["path"] for x in data.get("attachments", [])],
+                    "aliases": [n for n, sid in self.aliases.items() if sid == key],
+                }
+            )
+        if self.ambiguous:
+            out.append(
+                {
+                    "id": "_warnings",
+                    "name": "_warnings",
+                    "qualified_name": "_warnings",
+                    "description": "Ambiguous skill aliases detected",
+                    "provider_id": "system",
+                    "protocol": "system",
+                    "protocol_version": "1.0",
+                    "meta": {"ambiguous": self.ambiguous, "warnings": self.warnings},
+                    "skill_path": "",
+                    "attachments": [],
+                    "aliases": [],
+                }
+            )
+        return out
+
+    def list_providers(self) -> list[dict]:
+        out = []
+        for provider in sorted(self.providers.values(), key=lambda x: x["provider_id"]):
+            out.append(dict(provider))
+        return out
+
+    def list_protocols(self) -> list[dict]:
+        provider_counts: dict[str, int] = {}
+        skill_counts: dict[str, int] = {}
+        for p in self.providers.values():
+            protocol = p.get("protocol", "")
+            provider_counts[protocol] = provider_counts.get(protocol, 0) + 1
+            skill_counts[protocol] = skill_counts.get(protocol, 0) + int(p.get("skill_count", 0))
+        out = []
+        for spec in SKILL_PROTOCOL_SPECS:
+            protocol = spec["protocol"]
+            out.append(
+                {
+                    "protocol": protocol,
+                    "version": spec["version"],
+                    "description": spec["description"],
+                    "manifest_required": spec.get("manifest_required", []),
+                    "manifest_optional": spec.get("manifest_optional", []),
+                    "active_providers": provider_counts.get(protocol, 0),
+                    "active_skills": skill_counts.get(protocol, 0),
+                }
+            )
+        return out
+
+    def protocol_examples(self) -> dict:
+        return {
+            "local_manifest": {
+                "protocol": SKILL_PROTOCOL_LOCAL,
+                "provider_id": "local-extra",
+                "description": "Optional local provider mounted from a custom root",
+                "root": "../extra-skills",
+                "version": "1.0",
+            },
+            "clawhub_manifest": {
+                "protocol": SKILL_PROTOCOL_CLAWHUB,
+                "provider_id": "clawhub-default",
+                "description": "Bridge to clawhub style skills",
+                "root": "../clawhub",
+                "version": "1.0",
+                "skills": [
+                    {
+                        "name": "example-skill",
+                        "file": "example/SKILL.md",
+                        "description": "A clawhub mapped skill",
+                        "attachments": ["example/references/*.md", "example/scripts/*.py"],
+                    }
+                ],
+            },
+            "http_manifest": {
+                "protocol": SKILL_PROTOCOL_HTTP_JSON,
+                "provider_id": "remote-catalog",
+                "endpoint": "http://127.0.0.1:9000/skills.json",
+                "description": "Remote backend skill catalog",
+                "timeout": 4,
+                "version": "1.0",
+            },
+            "placement": {
+                "path": str((self.skills_root / "providers").resolve()),
+                "rule": "Drop provider JSON manifests under this folder; reload/list_skills will auto-detect them.",
+            },
+        }
+
+    def _resolve_name(self, name: str) -> tuple[str | None, str | None]:
+        target = (name or "").strip()
+        if not target:
+            return None, "Error: skill name required"
+        if target in self.skills:
+            return target, None
+        alias = self.aliases.get(target)
+        if alias:
+            return alias, None
+        if target in self.ambiguous:
+            return None, f"Error: ambiguous skill '{target}'. use: {', '.join(sorted(self.ambiguous[target]))}"
+        return None, f"Error: unknown skill '{target}'. available: {', '.join(self.list_names())}"
+
+    def load(self, name: str) -> str:
+        key, err = self._resolve_name(name)
+        if err or not key:
+            return err or "Error: skill not found"
+        skill = self.skills[key]
+        lines = [
+            (
+                f"<skill name=\"{skill.get('name','')}\" "
+                f"qualified_name=\"{key}\" "
+                f"provider=\"{skill.get('provider_id','')}\" "
+                f"protocol=\"{skill.get('protocol','')}\" "
+                f"protocol_version=\"{skill.get('protocol_version','')}\" "
+                f"path=\"{skill.get('skill_path', '')}\">"
+            ),
+            skill["body"],
+            "</skill>",
+            "<skill_meta>",
+            json_dumps(skill.get("meta", {}), indent=2),
+            "</skill_meta>",
+        ]
+        attachments = skill.get("attachments", [])
+        if attachments:
+            lines.append("<skill_attachments>")
+            for item in attachments:
+                lines.append(f"<file path=\"{item['path']}\" abs_path=\"{item['abs_path']}\">")
+                lines.append(item["content"])
+                lines.append("</file>")
+            lines.append("</skill_attachments>")
+        return "\n".join(lines)
+
+class TaskManager:
+    def __init__(self, task_dir: Path, crypto: CryptoBox):
+        self.dir = task_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.crypto = crypto
+        self.lock = threading.Lock()
+
+    def _next_id(self) -> int:
+        ids = []
+        for file in self.dir.glob("task_*.json"):
+            try:
+                ids.append(int(file.stem.split("_")[1]))
+            except Exception:
+                pass
+        return max(ids, default=0) + 1
+
+    def _path(self, task_id: int) -> Path:
+        return self.dir / f"task_{task_id}.json"
+
+    def _load(self, task_id: int) -> dict:
+        path = self._path(task_id)
+        if not path.exists():
+            raise ValueError(f"task {task_id} not found")
+        return self.crypto.read_json(path, {})
+
+    def _save(self, task: dict):
+        self.crypto.write_json(self._path(task["id"]), task)
+
+    def create(self, subject: str, description: str = "") -> str:
+        with self.lock:
+            task = {
+                "id": self._next_id(),
+                "subject": subject,
+                "description": description,
+                "status": "pending",
+                "owner": None,
+                "blockedBy": [],
+                "blocks": [],
+                "worktree": "",
+                "created_at": now_ts(),
+                "updated_at": now_ts(),
+            }
+            self._save(task)
+        return json_dumps(task, indent=2)
+
+    def get(self, task_id: int) -> str:
+        with self.lock:
+            return json_dumps(self._load(task_id), indent=2)
+
+    def update(
+        self,
+        task_id: int,
+        status: str | None = None,
+        add_blocked_by: list[int] | None = None,
+        add_blocks: list[int] | None = None,
+    ) -> str:
+        with self.lock:
+            task = self._load(task_id)
+            if status:
+                task["status"] = status
+                if status == "completed":
+                    for file in self.dir.glob("task_*.json"):
+                        other = self.crypto.read_json(file, {})
+                        if task_id in other.get("blockedBy", []):
+                            other["blockedBy"].remove(task_id)
+                            self._save(other)
+                if status == "deleted":
+                    self._path(task_id).unlink(missing_ok=True)
+                    return f"Task {task_id} deleted"
+            if add_blocked_by:
+                task["blockedBy"] = sorted(set(task["blockedBy"] + add_blocked_by))
+            if add_blocks:
+                task["blocks"] = sorted(set(task["blocks"] + add_blocks))
+            task["updated_at"] = now_ts()
+            self._save(task)
+        return json_dumps(task, indent=2)
+
+    def claim(self, task_id: int, owner: str) -> str:
+        with self.lock:
+            task = self._load(task_id)
+            task["owner"] = owner
+            task["status"] = "in_progress"
+            task["updated_at"] = now_ts()
+            self._save(task)
+        return f"Claimed task #{task_id} for {owner}"
+
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        with self.lock:
+            task = self._load(task_id)
+            task["worktree"] = worktree
+            if owner:
+                task["owner"] = owner
+            if task["status"] == "pending":
+                task["status"] = "in_progress"
+            task["updated_at"] = now_ts()
+            self._save(task)
+        return json_dumps(task, indent=2)
+
+    def unbind_worktree(self, task_id: int) -> str:
+        with self.lock:
+            task = self._load(task_id)
+            task["worktree"] = ""
+            task["updated_at"] = now_ts()
+            self._save(task)
+        return json_dumps(task, indent=2)
+
+    def list_all(self) -> str:
+        tasks = self.list_objects()
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for task in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
+                task["status"], "[?]"
+            )
+            owner = f" @{task['owner']}" if task.get("owner") else ""
+            blocked = f" blocked_by={task['blockedBy']}" if task.get("blockedBy") else ""
+            worktree = f" wt={task['worktree']}" if task.get("worktree") else ""
+            lines.append(f"{marker} #{task['id']}: {task['subject']}{owner}{blocked}{worktree}")
+        return "\n".join(lines)
+
+    def list_objects(self) -> list[dict]:
+        with self.lock:
+            tasks = []
+            for file in sorted(self.dir.glob("task_*.json")):
+                tasks.append(self.crypto.read_json(file, {}))
+            return tasks
+
+class BackgroundManager:
+    def __init__(self, workdir: Path):
+        self.workdir = workdir
+        self.tasks: dict[str, dict] = {}
+        self.notifications: queue.Queue = queue.Queue()
+        self.lock = threading.Lock()
+
+    def run(self, command: str, timeout: int = 120) -> str:
+        task_id = make_id("bg")
+        with self.lock:
+            self.tasks[task_id] = {
+                "status": "running",
+                "command": command,
+                "result": None,
+                "started_at": now_ts(),
+            }
+        th = threading.Thread(
+            target=self._exec, args=(task_id, command, timeout), daemon=True
+        )
+        th.start()
+        return f"Background task {task_id} started: {command[:80]}"
+
+    def _exec(self, task_id: str, command: str, timeout: int):
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            output = trim((r.stdout + r.stderr).strip())
+            status = "completed"
+        except Exception as exc:
+            output = f"Error: {exc}"
+            status = "error"
+        with self.lock:
+            task = self.tasks.get(task_id, {})
+            task.update(
+                {
+                    "status": status,
+                    "result": output or "(no output)",
+                    "finished_at": now_ts(),
+                }
+            )
+            self.tasks[task_id] = task
+        self.notifications.put(
+            {
+                "task_id": task_id,
+                "status": status,
+                "result": (output or "(no output)")[:500],
+            }
+        )
+
+    def check(self, task_id: str | None = None) -> str:
+        with self.lock:
+            if task_id:
+                task = self.tasks.get(task_id)
+                if not task:
+                    return f"Unknown task: {task_id}"
+                return f"[{task['status']}] {task.get('result') or '(running)'}"
+            if not self.tasks:
+                return "No bg tasks."
+            lines = []
+            for key, task in self.tasks.items():
+                lines.append(f"{key}: [{task['status']}] {task['command'][:60]}")
+            return "\n".join(lines)
+
+    def drain(self) -> list[dict]:
+        out = []
+        while True:
+            try:
+                out.append(self.notifications.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def list_objects(self) -> list[dict]:
+        with self.lock:
+            return [{**v, "id": k} for k, v in self.tasks.items()]
+
+class MessageBus:
+    def __init__(self, inbox_dir: Path, crypto: CryptoBox):
+        self.inbox_dir = inbox_dir
+        self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        self.crypto = crypto
+        self.lock = threading.Lock()
+
+    def _path(self, name: str) -> Path:
+        return self.inbox_dir / f"{name}.json"
+
+    def send(
+        self,
+        sender: str,
+        to: str,
+        content: str,
+        msg_type: str = "message",
+        extra: dict | None = None,
+    ) -> str:
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: invalid msg_type '{msg_type}'"
+        msg = {"type": msg_type, "from": sender, "content": content, "timestamp": now_ts()}
+        if extra:
+            msg.update(extra)
+        path = self._path(to)
+        with self.lock:
+            payload = self.crypto.read_json(path, [])
+            if not isinstance(payload, list):
+                payload = []
+            payload.append(msg)
+            self.crypto.write_json(path, payload)
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list[dict]:
+        path = self._path(name)
+        if not path.exists():
+            return []
+        with self.lock:
+            payload = self.crypto.read_json(path, [])
+            if not isinstance(payload, list):
+                payload = []
+            self.crypto.write_json(path, [])
+        out = []
+        for row in payload:
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
+    def broadcast(self, sender: str, content: str, names: list[str]) -> str:
+        count = 0
+        for name in names:
+            if name == sender:
+                continue
+            self.send(sender, name, content, "broadcast")
+            count += 1
+        return f"Broadcast to {count} teammates"
+
+class WorktreeManager:
+    def __init__(
+        self,
+        session_id: str,
+        task_mgr: TaskManager,
+        session_dir: Path,
+        crypto: CryptoBox,
+        repo_root: Path,
+    ):
+        self.session_id = session_id
+        self.repo_root = repo_root
+        self.task_mgr = task_mgr
+        self.crypto = crypto
+        self.state_dir = session_dir / "worktrees"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.events_path = self.state_dir / "events.json"
+        self.index_path = self.state_dir / "index.json"
+        if not self.index_path.exists():
+            self.crypto.write_json(self.index_path, {"worktrees": []})
+        if not self.events_path.exists():
+            self.crypto.write_json(self.events_path, [])
+        self.worktree_root = session_dir / "worktree_data"
+        self.worktree_root.mkdir(parents=True, exist_ok=True)
+        self.git_available = self._is_git_repo()
+        self.lock = threading.Lock()
+
+    def _is_git_repo(self) -> bool:
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _emit(self, event: str, task: dict | None = None, worktree: dict | None = None, error: str | None = None):
+        payload = {"event": event, "ts": now_ts(), "task": task or {}, "worktree": worktree or {}}
+        if error:
+            payload["error"] = error
+        with self.lock:
+            items = self.crypto.read_json(self.events_path, [])
+            if not isinstance(items, list):
+                items = []
+            items.append(payload)
+            self.crypto.write_json(self.events_path, items[-500:])
+
+    def _load_index(self) -> dict:
+        raw = self.crypto.read_json(self.index_path, {"worktrees": []})
+        return raw if isinstance(raw, dict) else {"worktrees": []}
+
+    def _save_index(self, data: dict):
+        self.crypto.write_json(self.index_path, data)
+
+    def _find(self, name: str) -> dict | None:
+        idx = self._load_index()
+        for wt in idx.get("worktrees", []):
+            if wt.get("name") == name:
+                return wt
+        return None
+
+    def _validate_name(self, name: str):
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
+            raise ValueError("Invalid worktree name")
+
+    def _run_git(self, args: list[str]) -> str:
+        if not self.git_available:
+            raise RuntimeError("Not in a git repository")
+        r = subprocess.run(
+            ["git", *args],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        if r.returncode != 0:
+            raise RuntimeError((r.stdout + r.stderr).strip() or "git command failed")
+        return (r.stdout + r.stderr).strip() or "(no output)"
+
+    def create(self, name: str, task_id: int | None = None, base_ref: str = "HEAD") -> str:
+        self._validate_name(name)
+        if self._find(name):
+            raise ValueError(f"Worktree '{name}' already exists")
+        path = self.worktree_root / name
+        branch = f"wt/{self.session_id[:6]}-{name}"
+        self._emit("worktree.create.before", {"id": task_id} if task_id else {}, {"name": name, "base_ref": base_ref})
+        try:
+            self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
+            entry = {
+                "name": name,
+                "path": str(path),
+                "branch": branch,
+                "task_id": task_id,
+                "status": "active",
+                "created_at": now_ts(),
+            }
+            idx = self._load_index()
+            idx["worktrees"].append(entry)
+            self._save_index(idx)
+            if task_id:
+                self.task_mgr.bind_worktree(task_id, name)
+            self._emit("worktree.create.after", {"id": task_id} if task_id else {}, entry)
+            return json_dumps(entry, indent=2)
+        except Exception as exc:
+            self._emit("worktree.create.failed", {"id": task_id} if task_id else {}, {"name": name}, str(exc))
+            raise
+
+    def list_all(self) -> str:
+        items = self._load_index().get("worktrees", [])
+        if not items:
+            return "No worktrees."
+        lines = []
+        for wt in items:
+            suffix = f" task={wt['task_id']}" if wt.get("task_id") else ""
+            lines.append(f"[{wt.get('status', '?')}] {wt['name']} -> {wt['path']} ({wt.get('branch', '-')}){suffix}")
+        return "\n".join(lines)
+
+    def resolve_path(self, name: str) -> Path | None:
+        wt = self._find(name)
+        if not wt:
+            return None
+        p = Path(wt["path"])
+        return p if p.exists() else None
+
+    def status(self, name: str) -> str:
+        wt = self._find(name)
+        if not wt:
+            return f"Error: unknown worktree '{name}'"
+        path = Path(wt["path"])
+        if not path.exists():
+            return f"Error: worktree path missing: {path}"
+        r = subprocess.run(
+            ["git", "status", "--short", "--branch"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return (r.stdout + r.stderr).strip() or "Clean worktree"
+
+    def run(self, name: str, command: str) -> str:
+        if any(x in command for x in DANGEROUS_PATTERNS):
+            return "Error: dangerous command blocked"
+        wt = self._find(name)
+        if not wt:
+            return f"Error: unknown worktree '{name}'"
+        path = Path(wt["path"])
+        if not path.exists():
+            return f"Error: worktree path missing: {path}"
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=path,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            return trim((r.stdout + r.stderr).strip() or "(no output)")
+        except subprocess.TimeoutExpired:
+            return "Error: timeout (300s)"
+
+    def keep(self, name: str) -> str:
+        wt = self._find(name)
+        if not wt:
+            return f"Error: unknown worktree '{name}'"
+        idx = self._load_index()
+        kept = None
+        for item in idx.get("worktrees", []):
+            if item.get("name") == name:
+                item["status"] = "kept"
+                item["kept_at"] = now_ts()
+                kept = item
+        self._save_index(idx)
+        self._emit("worktree.keep", {"id": wt.get("task_id")} if wt.get("task_id") else {}, {"name": name, "status": "kept"})
+        return json_dumps(kept, indent=2) if kept else f"Error: unknown worktree '{name}'"
+
+    def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
+        wt = self._find(name)
+        if not wt:
+            return f"Error: unknown worktree '{name}'"
+        self._emit("worktree.remove.before", {"id": wt.get("task_id")} if wt.get("task_id") else {}, {"name": name, "path": wt.get("path")})
+        try:
+            args = ["worktree", "remove"]
+            if force:
+                args.append("--force")
+            args.append(wt["path"])
+            self._run_git(args)
+            if complete_task and wt.get("task_id"):
+                self.task_mgr.update(wt["task_id"], status="completed")
+                self.task_mgr.unbind_worktree(wt["task_id"])
+                self._emit("task.completed", {"id": wt["task_id"], "status": "completed"}, {"name": name})
+            idx = self._load_index()
+            for item in idx.get("worktrees", []):
+                if item.get("name") == name:
+                    item["status"] = "removed"
+                    item["removed_at"] = now_ts()
+            self._save_index(idx)
+            self._emit("worktree.remove.after", {"id": wt.get("task_id")} if wt.get("task_id") else {}, {"name": name, "status": "removed"})
+            return f"Removed worktree '{name}'"
+        except Exception as exc:
+            self._emit("worktree.remove.failed", {"id": wt.get("task_id")} if wt.get("task_id") else {}, {"name": name}, str(exc))
+            raise
+
+    def events_recent(self, limit: int = 20) -> str:
+        n = max(1, min(int(limit or 20), 200))
+        payload = self.crypto.read_json(self.events_path, [])
+        out = payload[-n:] if isinstance(payload, list) else []
+        return json_dumps(out, indent=2)
+
+class OllamaError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+class OllamaClient:
+    _probe_cache: dict[str, dict] = {}
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: int = DEFAULT_REQUEST_TIMEOUT,
+        *,
+        provider: str = "ollama",
+        endpoint: str = "",
+        api_key: str = "",
+        headers: dict | None = None,
+        payload_template: str = "",
+        thinking_stream: bool = False,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = normalize_timeout_seconds(
+            timeout,
+            minimum=MIN_TIMEOUT_SECONDS,
+            maximum=MAX_TIMEOUT_SECONDS,
+            fallback=DEFAULT_REQUEST_TIMEOUT,
+        )
+        self.provider = provider
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.headers = headers or {}
+        self.payload_template = payload_template
+        self.thinking_stream = bool(thinking_stream)
+        self.capabilities = default_multimodal_capabilities()
+        self.media_endpoints: dict[str, str] = {}
+
+    def apply_profile(self, profile: dict):
+        self.provider = str(profile.get("provider", "ollama") or "ollama")
+        self.model = str(profile.get("model", self.model) or self.model)
+        self.base_url = str(profile.get("base_url", self.base_url) or self.base_url).rstrip("/")
+        self.endpoint = str(profile.get("endpoint", self.endpoint) or self.endpoint)
+        self.api_key = str(profile.get("api_key", self.api_key) or self.api_key)
+        hdr = profile.get("headers", {})
+        self.headers = hdr if isinstance(hdr, dict) else {}
+        t = profile.get("request_timeout", self.timeout)
+        self.timeout = normalize_timeout_seconds(
+            t,
+            minimum=MIN_TIMEOUT_SECONDS,
+            maximum=MAX_TIMEOUT_SECONDS,
+            fallback=self.timeout,
+        )
+        self.payload_template = str(profile.get("payload_template", self.payload_template) or self.payload_template)
+        self.thinking_stream = bool(profile.get("thinking_stream", self.thinking_stream))
+        declared_caps = parse_capability_overrides(profile.get("capabilities", {}))
+        self.capabilities = merge_multimodal_capabilities(
+            infer_model_multimodal_capabilities(self.provider, self.model),
+            declared_caps,
+        )
+        self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
+
+    def _probe_cache_key(self) -> str:
+        endpoint = self.endpoint.strip() if self.endpoint else ""
+        return "|".join(
+            [
+                str(self.provider or "").strip().lower(),
+                str(self.base_url or "").strip().lower(),
+                endpoint.lower(),
+                str(self.model or "").strip().lower(),
+            ]
+        )
+
+    def clear_probe_cache(self):
+        key = self._probe_cache_key()
+        if key in self._probe_cache:
+            self._probe_cache.pop(key, None)
+
+    @classmethod
+    def clear_global_probe_cache(cls):
+        cls._probe_cache.clear()
+
+    def _post_json(self, path: str, payload: dict) -> dict:
+        url = f"{self.base_url}{path}"
+        return self._post_json_url(url, payload)
+
+    def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        req = Request(
+            url,
+            data=json_dumps(payload).encode("utf-8"),
+            headers=req_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else {}
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
+        except URLError as exc:
+            raise OllamaError(f"Connection error: {exc}") from exc
+
+    def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        req = Request(
+            url,
+            data=json_dumps(payload).encode("utf-8"),
+            headers=req_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                ctype = str(resp.headers.get("Content-Type", "") or "").strip()
+                body = resp.read()
+                return body, ctype
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
+        except URLError as exc:
+            raise OllamaError(f"Connection error: {exc}") from exc
+
+    def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
+        req = Request(url, headers=self._render_headers(), method="GET")
+        try:
+            with urlopen(req, timeout=(timeout or min(self.timeout, 90))) as resp:
+                ctype = str(resp.headers.get("Content-Type", "") or "").strip()
+                return resp.read(), ctype
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
+        except URLError as exc:
+            raise OllamaError(f"Connection error: {exc}") from exc
+
+    def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
+        out = []
+        for call in tool_calls or []:
+            function = call.get("function", {})
+            name = function.get("name") or call.get("name")
+            raw_args = function.get("arguments", {})
+            args, args_error = parse_tool_arguments_with_error(raw_args)
+            call_id = call.get("id") or make_id("tool")
+            if not name:
+                continue
+            row = (
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+            )
+            if args_error:
+                row["args_error"] = args_error
+                row["raw_arguments"] = trim(raw_args, 1200)
+            out.append(row)
+        return out
+
+    def _audio_format_from_mime(self, mime: str) -> str:
+        m = str(mime or "").strip().lower()
+        if "wav" in m:
+            return "wav"
+        if "mp3" in m or "mpeg" in m:
+            return "mp3"
+        if "flac" in m:
+            return "flac"
+        if "ogg" in m or "opus" in m:
+            return "ogg"
+        if "aac" in m:
+            return "aac"
+        return "wav"
+
+    def _openai_content_parts_with_media(self, text: str, media_inputs: list[dict]) -> list[dict]:
+        parts: list[dict] = [{"type": "text", "text": str(text or "")}]
+        for media in media_inputs or []:
+            mtype = str(media.get("type", "") or "").strip().lower()
+            b64 = str(media.get("data_b64", "") or "").strip()
+            mime = str(media.get("mime", "") or "").strip()
+            if not b64:
+                continue
+            if mtype == "image":
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime or 'image/png'};base64,{b64}"},
+                    }
+                )
+            elif mtype == "audio":
+                parts.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64,
+                            "format": self._audio_format_from_mime(mime),
+                        },
+                    }
+                )
+            elif mtype == "video":
+                # OpenAI-compatible servers differ in video schema; keep it simple and explicit.
+                parts.append(
+                    {
+                        "type": "input_video",
+                        "input_video": {"data": b64, "mime_type": mime or "video/mp4"},
+                    }
+                )
+        return parts
+
+    def _prepare_request_messages(
+        self,
+        messages: list[dict],
+        provider: str,
+        media_inputs: list[dict] | None = None,
+    ) -> list[dict]:
+        out: list[dict] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "") or "").strip()
+            if not role:
+                continue
+            row: dict = {"role": role}
+            if "content" in msg:
+                row["content"] = msg.get("content", "")
+            if "name" in msg:
+                row["name"] = msg.get("name")
+            if "tool_call_id" in msg:
+                row["tool_call_id"] = msg.get("tool_call_id")
+            raw_tool_calls = msg.get("tool_calls")
+            if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                tcs: list[dict] = []
+                for tc in raw_tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                    name = str(fn.get("name") or tc.get("name") or "").strip()
+                    if not name:
+                        continue
+                    raw_args = fn.get("arguments", {})
+                    if provider == "ollama":
+                        args = parse_tool_arguments(raw_args)
+                    else:
+                        if isinstance(raw_args, str):
+                            args = raw_args
+                        elif isinstance(raw_args, (dict, list)):
+                            args = json_dumps(raw_args)
+                        else:
+                            args = str(raw_args or "")
+                    tcs.append(
+                        {
+                            "id": str(tc.get("id") or make_id("tool")),
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        }
+                    )
+                if tcs:
+                    row["tool_calls"] = tcs
+            out.append(row)
+        media_rows = [m for m in (media_inputs or []) if isinstance(m, dict)]
+        if not media_rows:
+            return out
+        user_idx = -1
+        for i in range(len(out) - 1, -1, -1):
+            if str(out[i].get("role", "")).strip() == "user":
+                user_idx = i
+                break
+        if user_idx < 0:
+            return out
+        target = out[user_idx]
+        if provider == "ollama":
+            images = [str(m.get("data_b64", "") or "").strip() for m in media_rows if str(m.get("type", "")).strip().lower() == "image"]
+            images = [x for x in images if x]
+            if images:
+                existing = target.get("images")
+                if isinstance(existing, list):
+                    target["images"] = existing + images
+                else:
+                    target["images"] = images
+            return out
+        base_text = ""
+        current = target.get("content", "")
+        if isinstance(current, str):
+            base_text = current
+        elif isinstance(current, list):
+            for part in current:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    base_text += str(part.get("text") or "")
+        target["content"] = self._openai_content_parts_with_media(base_text, media_rows)
+        return out
+
+    def _extract_openai_message(self, raw: dict) -> tuple[str, list[dict], str]:
+        choice = raw.get("choices", [{}])[0] if isinstance(raw.get("choices"), list) else {}
+        msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+        content = msg.get("content") or ""
+        thinking_parts: list[str] = []
+        if isinstance(content, list):
+            joined = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = str(part.get("type", "")).lower()
+                    if part_type in {"reasoning", "thinking", "thought"}:
+                        txt = part.get("text") or part.get("content")
+                        if txt:
+                            thinking_parts.append(str(txt))
+                        continue
+                    txt = part.get("text")
+                    if txt:
+                        joined.append(str(txt))
+                elif part:
+                    joined.append(str(part))
+            content = "\n".join(joined)
+        main, thinking_inline = split_thinking_content(content or "")
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        extra = msg.get("reasoning_content") or msg.get("reasoning")
+        if extra:
+            thinking_parts.append(str(extra))
+        thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
+        tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
+        return main, tool_calls, thinking
+
+    def _render_headers(self) -> dict:
+        out = {}
+        for k, v in (self.headers or {}).items():
+            out[str(k)] = str(v).replace("${api_key}", self.api_key)
+        keys_lower = {str(k).lower() for k in out.keys()}
+        if self.api_key and "authorization" not in keys_lower:
+            out["Authorization"] = f"Bearer {self.api_key}"
+        return out
+
+    def _media_endpoint(self, media_type: str) -> str:
+        key = str(media_type or "").strip().lower()
+        direct = str((self.media_endpoints or {}).get(key, "") or "").strip()
+        if direct:
+            if direct.startswith("/") and self.base_url:
+                return f"{self.base_url.rstrip('/')}{direct}"
+            return direct
+        provider = str(self.provider or "").strip().lower()
+        if provider in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+            base = str(self.base_url or "").strip().rstrip("/")
+            if not base:
+                return ""
+            if key == "image":
+                return f"{base}/v1/images/generations"
+            if key == "audio":
+                return f"{base}/v1/audio/speech"
+            if key == "video":
+                return f"{base}/v1/videos/generations"
+        return ""
+
+    def _decode_base64_lenient(self, raw: str) -> bytes:
+        txt = re.sub(r"\s+", "", str(raw or ""))
+        if not txt:
+            return b""
+        pad = len(txt) % 4
+        if pad:
+            txt += "=" * (4 - pad)
+        return base64.b64decode(txt.encode("ascii"), validate=False)
+
+    def _decode_data_url(self, raw: str) -> tuple[bytes, str]:
+        text = str(raw or "").strip()
+        m = re.match(r"^data:([^;,]+)?(?:;base64)?,(.*)$", text, re.IGNORECASE | re.DOTALL)
+        if not m:
+            return b"", ""
+        mime = str(m.group(1) or "").strip() or "application/octet-stream"
+        payload = m.group(2) or ""
+        return self._decode_base64_lenient(payload), mime
+
+    def _extract_generated_media(self, payload: object, media_type: str) -> tuple[bytes, str]:
+        wanted = str(media_type or "").strip().lower()
+        wanted_mime = f"{wanted}/octet-stream" if wanted else ""
+        # Direct binary response is handled by caller; this path handles JSON/object payloads.
+        if isinstance(payload, str):
+            text = payload.strip()
+            if text.startswith("data:"):
+                blob, mime = self._decode_data_url(text)
+                return blob, mime
+            try:
+                blob = self._decode_base64_lenient(text)
+                return blob, ""
+            except Exception:
+                return b"", ""
+        if isinstance(payload, list):
+            for item in payload:
+                blob, mime = self._extract_generated_media(item, media_type)
+                if blob:
+                    return blob, mime
+            return b"", ""
+        if not isinstance(payload, dict):
+            return b"", ""
+
+        # Common OpenAI-compatible response formats.
+        data_field = payload.get("data")
+        if isinstance(data_field, list):
+            for item in data_field:
+                blob, mime = self._extract_generated_media(item, media_type)
+                if blob:
+                    return blob, mime
+        if isinstance(data_field, str):
+            try:
+                blob = self._decode_base64_lenient(data_field)
+                if blob:
+                    return blob, ""
+            except Exception:
+                pass
+
+        for key in (
+            "b64_json",
+            "base64",
+            "audio_base64",
+            "image_base64",
+            "video_base64",
+        ):
+            if key in payload and isinstance(payload.get(key), str):
+                try:
+                    blob = self._decode_base64_lenient(str(payload.get(key) or ""))
+                    if blob:
+                        return blob, ""
+                except Exception:
+                    pass
+
+        for key in ("url", "image_url", "audio_url", "video_url"):
+            url = str(payload.get(key, "") or "").strip()
+            if not url:
+                continue
+            if url.startswith("data:"):
+                blob, mime = self._decode_data_url(url)
+                if blob:
+                    return blob, mime
+                continue
+            if url.startswith("http://") or url.startswith("https://"):
+                try:
+                    blob, mime = self._download_bytes(url, timeout=min(self.timeout, 90))
+                    if blob:
+                        return blob, mime
+                except Exception:
+                    continue
+
+        audio_obj = payload.get("audio")
+        if isinstance(audio_obj, dict):
+            blob, mime = self._extract_generated_media(audio_obj, media_type)
+            if blob:
+                return blob, mime
+        image_obj = payload.get("image")
+        if isinstance(image_obj, dict):
+            blob, mime = self._extract_generated_media(image_obj, media_type)
+            if blob:
+                return blob, mime
+        video_obj = payload.get("video")
+        if isinstance(video_obj, dict):
+            blob, mime = self._extract_generated_media(video_obj, media_type)
+            if blob:
+                return blob, mime
+
+        content_field = payload.get("content")
+        if isinstance(content_field, str):
+            if content_field.strip().startswith("data:"):
+                blob, mime = self._decode_data_url(content_field)
+                if blob:
+                    return blob, mime
+            try:
+                blob = self._decode_base64_lenient(content_field)
+                if blob:
+                    return blob, ""
+            except Exception:
+                pass
+        if isinstance(content_field, list):
+            for part in content_field:
+                if not isinstance(part, dict):
+                    continue
+                p_type = str(part.get("type", "") or "").strip().lower()
+                if wanted and wanted not in p_type and p_type not in {"output_text", "text"}:
+                    continue
+                blob, mime = self._extract_generated_media(part, media_type)
+                if blob:
+                    return blob, mime
+
+        # Last fallback: recurse through nested dict/list values.
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                blob, mime = self._extract_generated_media(value, media_type)
+                if blob:
+                    return blob, mime
+
+        return b"", wanted_mime
+
+    def _looks_like_unsupported_text(self, text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        bad_markers = (
+            "cannot process",
+            "can't process",
+            "do not support",
+            "not support",
+            "unsupported",
+            "unable to parse image",
+            "unable to parse audio",
+            "unable to parse video",
+            "i can only process text",
+            "only text",
+            "无法处理",
+            "不支持",
+            "仅支持文本",
+        )
+        return any(m in low for m in bad_markers)
+
+    def _active_probe_input_capability(self, media_type: str) -> tuple[bool, str]:
+        mtype = str(media_type or "").strip().lower()
+        if mtype not in {"image", "audio", "video"}:
+            return False, "unsupported media type"
+        if str(self.provider or "").strip().lower() == "ollama" and mtype in {"audio", "video"}:
+            return False, "ollama chat payload currently supports image attachments only"
+        sample_map = {
+            "image": (SAMPLE_IMAGE_PNG_B64, "image/png"),
+            "audio": (SAMPLE_AUDIO_WAV_B64, "audio/wav"),
+            "video": (SAMPLE_VIDEO_MP4_B64, "video/mp4"),
+        }
+        data_b64, mime = sample_map[mtype]
+        prompt_map = {
+            "image": "Capability probe: briefly describe this image in one sentence.",
+            "audio": "Capability probe: transcribe or describe this audio in one sentence.",
+            "video": "Capability probe: briefly describe this video in one sentence.",
+        }
+        temp_timeout = self.timeout
+        self.timeout = max(12, min(self.timeout, 40))
+        try:
+            rsp = self.chat(
+                [{"role": "user", "content": prompt_map[mtype]}],
+                max_tokens=80,
+                temperature=0.0,
+                think=False,
+                stream_thinking=False,
+                media_inputs=[{"type": mtype, "data_b64": data_b64, "mime": mime, "name": f"probe.{mtype}"}],
+                probe_mode=True,
+            )
+            txt = str(rsp.get("content", "") or "").strip()
+            if self._looks_like_unsupported_text(txt):
+                return False, trim(txt, 160)
+            if txt or rsp.get("tool_calls"):
+                return True, "ok"
+            return True, "accepted"
+        except Exception as exc:
+            return False, trim(str(exc), 180)
+        finally:
+            self.timeout = temp_timeout
+
+    def _active_probe_output_capability(self, media_type: str) -> tuple[bool, str]:
+        mtype = str(media_type or "").strip().lower()
+        endpoint = self._media_endpoint(mtype)
+        if not endpoint:
+            return False, "no media endpoint configured"
+        payload = {"model": self.model}
+        if mtype == "image":
+            payload.update({"prompt": "a tiny red dot on white background", "size": "256x256", "n": 1})
+        elif mtype == "audio":
+            payload.update({"input": "capability probe", "voice": "alloy", "format": "wav"})
+        elif mtype == "video":
+            payload.update({"prompt": "a short black frame video", "duration": 1})
+        else:
+            return False, "unsupported media type"
+        temp_timeout = self.timeout
+        self.timeout = max(15, min(self.timeout, 60))
+        try:
+            body, ctype = self._post_raw_url(endpoint, payload, headers=self._render_headers())
+            if body and ctype.lower().startswith(f"{mtype}/"):
+                return True, "binary response"
+            parsed = parse_json_object(body.decode("utf-8", errors="ignore"), {})
+            blob, blob_mime = self._extract_generated_media(parsed, mtype)
+            mime = str(blob_mime or ctype or "").strip().lower()
+            if blob and (not mime or mime.startswith(f"{mtype}/")):
+                return True, "json media payload"
+            return False, "no media found in response"
+        except Exception as exc:
+            return False, trim(str(exc), 180)
+        finally:
+            self.timeout = temp_timeout
+
+    def probe_multimodal_capabilities(self, *, force: bool = False) -> dict:
+        key = self._probe_cache_key()
+        if not force and key in self._probe_cache:
+            cached = self._probe_cache.get(key, {})
+            caps = cached.get("capabilities", {})
+            if isinstance(caps, dict):
+                return merge_multimodal_capabilities(default_multimodal_capabilities(), parse_capability_overrides(caps))
+        caps = merge_multimodal_capabilities(default_multimodal_capabilities(), self.capabilities or {})
+        details: dict[str, str] = {}
+        for mtype, cap_key in (("image", "input_image"), ("audio", "input_audio"), ("video", "input_video")):
+            ok, note = self._active_probe_input_capability(mtype)
+            caps[cap_key] = bool(ok)
+            details[cap_key] = note
+        for mtype, cap_key in (("image", "output_image"), ("audio", "output_audio"), ("video", "output_video")):
+            ok, note = self._active_probe_output_capability(mtype)
+            caps[cap_key] = bool(ok)
+            details[cap_key] = note
+        self._probe_cache[key] = {
+            "capabilities": dict(caps),
+            "details": details,
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": self.base_url,
+            "updated_at": now_ts(),
+        }
+        return dict(caps)
+
+    def probe_cache_entry(self) -> dict:
+        key = self._probe_cache_key()
+        row = self._probe_cache.get(key, {})
+        return dict(row) if isinstance(row, dict) else {}
+
+    def generate_media(
+        self,
+        media_type: str,
+        prompt: str,
+        *,
+        size: str = "",
+        duration: int = 0,
+        fmt: str = "",
+        extra: dict | None = None,
+    ) -> dict:
+        mtype = str(media_type or "").strip().lower()
+        endpoint = self._media_endpoint(mtype)
+        if not endpoint:
+            raise OllamaError(f"{mtype} endpoint is not configured")
+        payload: dict = {"model": self.model}
+        if mtype == "image":
+            payload.update({"prompt": prompt or "an abstract geometric composition", "n": 1})
+            if size:
+                payload["size"] = size
+        elif mtype == "audio":
+            payload.update(
+                {
+                    "input": prompt or "Hello from coding agent.",
+                    "voice": "alloy",
+                    "format": (fmt or "wav").lower(),
+                }
+            )
+        elif mtype == "video":
+            payload.update({"prompt": prompt or "a short cinematic scene"})
+            if duration > 0:
+                payload["duration"] = int(duration)
+        else:
+            raise OllamaError(f"unsupported media type: {media_type}")
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k in payload:
+                    continue
+                payload[str(k)] = v
+        body, ctype = self._post_raw_url(endpoint, payload, headers=self._render_headers())
+        low_ctype = str(ctype or "").strip().lower()
+        if body and low_ctype.startswith(f"{mtype}/"):
+            return {
+                "bytes": body,
+                "mime": low_ctype.split(";", 1)[0],
+                "source": "binary",
+                "endpoint": endpoint,
+            }
+        parsed = parse_json_object(body.decode("utf-8", errors="ignore"), {})
+        blob, mime = self._extract_generated_media(parsed, mtype)
+        if not blob:
+            raise OllamaError(f"{mtype} generation returned no media payload")
+        final_mime = str(mime or low_ctype or f"{mtype}/octet-stream").split(";", 1)[0].strip().lower()
+        return {
+            "bytes": blob,
+            "mime": final_mime,
+            "source": "json",
+            "endpoint": endpoint,
+            "raw": parsed,
+        }
+
+    def _chat_openai_compat(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+    ) -> dict:
+        endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
+        payload = {
+            "model": self.model,
+            "messages": req_messages,
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        content, tool_calls, thinking_content = self._extract_openai_message(raw)
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def _chat_custom_http(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+    ) -> dict:
+        endpoint = (self.endpoint or "").strip()
+        if not endpoint:
+            raise OllamaError("Custom provider endpoint is empty")
+        payload = {}
+        tpl = (self.payload_template or "").strip()
+        if tpl:
+            rendered = (
+                tpl.replace("${model}", self.model)
+                .replace("${messages_json}", json_dumps(req_messages))
+                .replace("${temperature}", str(temperature))
+                .replace("${max_tokens}", str(max_tokens))
+                .replace("${api_key}", self.api_key)
+                .replace("${think}", "true" if think else "false")
+            )
+            payload = parse_json_object(rendered, {})
+        if not payload:
+            payload = {
+                "model": self.model,
+                "messages": req_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            if tools:
+                payload["tools"] = tools
+        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        if isinstance(raw, dict) and "choices" in raw:
+            content, tool_calls, thinking_content = self._extract_openai_message(raw)
+            return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+        msg = raw.get("message", {}) if isinstance(raw, dict) else {}
+        content_raw = (
+            msg.get("content")
+            or (raw.get("content") if isinstance(raw, dict) else "")
+            or (raw.get("output") if isinstance(raw, dict) else "")
+            or ""
+        )
+        content, thinking_content = split_thinking_content(content_raw)
+        tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []) if isinstance(msg, dict) else [])
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def _chat_ollama_stream_native(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+        on_thinking_chunk=None,
+    ) -> dict:
+        payload = {
+            "model": self.model,
+            "messages": req_messages,
+            "stream": True,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        if tools:
+            payload["tools"] = tools
+        req = Request(
+            f"{self.base_url}/api/chat",
+            data=json_dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        full_content: list[str] = []
+        full_thinking: list[str] = []
+        tool_calls: list[dict] = []
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    row = line.decode("utf-8", errors="ignore").strip()
+                    if not row:
+                        continue
+                    try:
+                        part = json.loads(row)
+                    except Exception:
+                        continue
+                    msg = part.get("message", {}) if isinstance(part, dict) else {}
+                    raw_piece = msg.get("content") or ""
+                    piece_main, piece_thinking = split_thinking_content(raw_piece)
+                    if piece_main:
+                        full_content.append(piece_main)
+                    if piece_thinking:
+                        full_thinking.append(piece_thinking)
+                        if on_thinking_chunk:
+                            try:
+                                on_thinking_chunk(piece_thinking)
+                            except Exception:
+                                pass
+                    for key in ("thinking", "reasoning", "reasoning_content"):
+                        extra = msg.get(key)
+                        if extra:
+                            extra_text = str(extra)
+                            full_thinking.append(extra_text)
+                            if on_thinking_chunk:
+                                try:
+                                    on_thinking_chunk(extra_text)
+                                except Exception:
+                                    pass
+                    tcs = msg.get("tool_calls", [])
+                    if tcs:
+                        tool_calls = self._normalize_tool_calls(tcs)
+                    if part.get("done"):
+                        break
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
+        except URLError as exc:
+            raise OllamaError(f"Connection error: {exc}") from exc
+        content = "".join(full_content).strip()
+        thinking_content = trim("\n\n".join(x for x in full_thinking if str(x).strip()).strip(), 24_000)
+        return {
+            "content": content,
+            "thinking": thinking_content,
+            "tool_calls": tool_calls,
+            "raw": {"streamed": True},
+        }
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+        stream_thinking: bool = False,
+        on_thinking_chunk=None,
+        media_inputs: list[dict] | None = None,
+        probe_mode: bool = False,
+    ) -> dict:
+        provider = (self.provider or "ollama").lower()
+        req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
+        if probe_mode:
+            tools = None
+            stream_thinking = False
+        if system:
+            req_messages = [{"role": "system", "content": system}] + req_messages
+        if provider in {"openai_compat", "openai", "siliconflow"}:
+            return self._chat_openai_compat(
+                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+            )
+        if provider == "custom_http":
+            return self._chat_custom_http(
+                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+            )
+        if stream_thinking:
+            try:
+                return self._chat_ollama_stream_native(
+                    req_messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    think=False,
+                    on_thinking_chunk=on_thinking_chunk,
+                )
+            except OllamaError:
+                pass
+        openai_payload = {
+            "model": self.model,
+            "messages": req_messages,
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            openai_payload["tools"] = tools
+        try:
+            raw = self._post_json("/v1/chat/completions", openai_payload)
+            content, tool_calls, thinking_content = self._extract_openai_message(raw)
+            return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+        except OllamaError as exc:
+            status = int(getattr(exc, "status", 0) or 0)
+            # Some Ollama deployments expose /v1 but may intermittently return 5xx.
+            # Fall back to native /api/chat instead of failing the whole turn.
+            fallback_status = {0, 400, 404, 405, 500, 501, 502, 503, 504}
+            if status not in fallback_status:
+                raise
+        native_payload = {
+            "model": self.model,
+            "messages": req_messages,
+            "stream": False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+        }
+        if tools:
+            native_payload["tools"] = tools
+        raw = self._post_json("/api/chat", native_payload)
+        msg = raw.get("message", {})
+        if not isinstance(msg, dict):
+            msg = {}
+        content_src = msg.get("content")
+        if content_src is None:
+            content_src = raw.get("response", "")
+        content, thinking_inline = split_thinking_content(content_src or "")
+        thinking_parts: list[str] = []
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        seen_thinking: set[str] = set()
+        for source in (msg, raw):
+            if not isinstance(source, dict):
+                continue
+            for key in ("thinking", "reasoning", "reasoning_content", "thought"):
+                extra = source.get(key)
+                extra_text = str(extra or "").strip()
+                if extra_text and extra_text not in seen_thinking:
+                    thinking_parts.append(extra_text)
+                    seen_thinking.add(extra_text)
+        thinking_content = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
+        raw_tool_calls = msg.get("tool_calls", [])
+        if not raw_tool_calls and isinstance(raw, dict):
+            raw_tool_calls = raw.get("tool_calls", [])
+        tool_calls = self._normalize_tool_calls(raw_tool_calls)
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required or [],
+            },
+        },
+    }
+
+TOOLS = [
+    tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
+    tool_def("read_file", "Read file content.", {"path": {"type": "string"}, "limit": {"type": "integer"}}, ["path"]),
+    tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+    tool_def("edit_file", "Edit a file by replacing first match.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
+    tool_def("TodoWrite", "Update todo list.", {"items": {"type": "array", "items": {"type": "object"}}}, ["items"]),
+    tool_def(
+        "TodoWriteRescue",
+        "Fallback todo writer when TodoWrite keeps failing/repeating. Accepts simple string items and auto-normalizes schema.",
+        {
+            "items": {"type": "array", "items": {"type": "string"}},
+            "in_progress_index": {"type": "integer"},
+        },
+        ["items"],
+    ),
+    tool_def("task", "Spawn a subagent for isolated work.", {"prompt": {"type": "string"}, "agent_type": {"type": "string"}}, ["prompt"]),
+    tool_def("list_skills", "List skill names.", {}),
+    tool_def("load_skill", "Load a skill by name.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("list_skill_providers", "List discovered skill providers.", {}),
+    tool_def("list_skill_protocols", "List supported skill backend protocols.", {}),
+    tool_def(
+        "write_skill",
+        "Write a SKILL.md into global ./skills (cross-session) and reload skill index.",
+        {"path": {"type": "string"}, "content": {"type": "string"}, "overwrite": {"type": "boolean"}},
+        ["path", "content"],
+    ),
+    tool_def("scan_skills", "Force reload skills from ./skills and return summary.", {}),
+    tool_def("compress", "Compress conversation context.", {}),
+    tool_def(
+        "context_recall",
+        "Recall archived compacted context by segment id, query, or recent segments.",
+        {
+            "segment_id": {"type": "string"},
+            "query": {"type": "string"},
+            "recent_segments": {"type": "integer"},
+            "max_messages": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "include_tools": {"type": "boolean"},
+        },
+    ),
+    tool_def(
+        "generate_media",
+        "Generate image/audio/video using active model media endpoints.",
+        {
+            "media_type": {"type": "string", "enum": ["image", "audio", "video"]},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"},
+            "duration": {"type": "integer"},
+            "format": {"type": "string"},
+            "filename": {"type": "string"},
+            "extra": {"type": "object"},
+        },
+        ["media_type", "prompt"],
+    ),
+    tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
+    tool_def("check_background", "Check background tasks.", {"task_id": {"type": "string"}}),
+    tool_def("task_create", "Create task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
+    tool_def("task_get", "Get task.", {"task_id": {"type": "integer"}}, ["task_id"]),
+    tool_def("task_update", "Update task.", {"task_id": {"type": "integer"}, "status": {"type": "string"}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}}, ["task_id"]),
+    tool_def("task_list", "List tasks.", {}),
+    tool_def("claim_task", "Claim task.", {"task_id": {"type": "integer"}}, ["task_id"]),
+    tool_def("spawn_teammate", "Spawn teammate thread.", {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, ["name", "role", "prompt"]),
+    tool_def("list_teammates", "List teammates.", {}),
+    tool_def("send_message", "Send message.", {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string"}}, ["to", "content"]),
+    tool_def("read_inbox", "Read lead inbox.", {}),
+    tool_def("broadcast", "Broadcast to teammates.", {"content": {"type": "string"}}, ["content"]),
+    tool_def("shutdown_request", "Request teammate shutdown.", {"teammate": {"type": "string"}}, ["teammate"]),
+    tool_def("plan_approval", "Respond to plan approval request.", {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, ["request_id", "approve"]),
+    tool_def("worktree_create", "Create git worktree.", {"name": {"type": "string"}, "task_id": {"type": "integer"}, "base_ref": {"type": "string"}}, ["name"]),
+    tool_def("worktree_list", "List worktrees.", {}),
+    tool_def("worktree_status", "Get worktree status.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
+    tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
+    tool_def("worktree_events", "Read worktree lifecycle events.", {"limit": {"type": "integer"}}),
+]
+
+TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
+for _tool in TOOLS:
+    try:
+        _fn = _tool.get("function", {})
+        _name = str(_fn.get("name", "") or "")
+        _required = _fn.get("parameters", {}).get("required", [])
+        if _name:
+            TOOL_REQUIRED_ARGS[_name] = [str(x) for x in (_required if isinstance(_required, list) else [])]
+    except Exception:
+        continue
+
+class SessionState:
+    def __init__(
+        self,
+        session_id: str,
+        title: str,
+        root: Path,
+        ollama_base: str,
+        model: str,
+        skills_root: Path,
+        crypto: CryptoBox,
+        repo_root: Path,
+        thinking: bool = False,
+        default_llm_config: dict | None = None,
+        context_token_limit: int = TOKEN_THRESHOLD,
+        context_limit_locked: bool = False,
+        max_rounds: int = MAX_AGENT_ROUNDS,
+        max_run_seconds: int = MAX_RUN_SECONDS,
+        auto_model_switch: bool = False,
+        ui_language: str = DEFAULT_UI_LANGUAGE,
+        js_lib_root: Path | None = None,
+    ):
+        self.id = session_id
+        self.title = title
+        self.root = root / session_id
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.files_root = self.root / "files"
+        self.files_root.mkdir(parents=True, exist_ok=True)
+        self.uploads_dir = self.root / "uploads"
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+        self.js_lib_root = (js_lib_root or offline_js_lib_root(WORKDIR)).resolve()
+        self.js_lib_root.mkdir(parents=True, exist_ok=True)
+        self.context_archive_dir = self.root / "context_archive"
+        self.context_archive_dir.mkdir(parents=True, exist_ok=True)
+        self.code_preview_dir = self.root / "code_preview"
+        self.code_preview_dir.mkdir(parents=True, exist_ok=True)
+        self.meta_path = self.root / "meta.json"
+        self.state_path = self.root / "state.json"
+        self.crypto = crypto
+        self.lock = threading.Lock()
+        self.events = EventHub()
+        self.ollama = OllamaClient(ollama_base, model)
+        self.auto_model_switch = bool(auto_model_switch)
+        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
+        self.ollama_env_available = bool(env_ok)
+        self.ollama_env_tags: list[str] = list(env_tags)
+        self.thinking = False
+        self.ui_language = normalize_ui_language(ui_language)
+        self.model_profiles: dict[str, dict] = {}
+        self.active_profile_id = ""
+        self.multimodal_capability_cache: dict[str, dict] = {}
+        self.failed_selections: list[str] = []
+        self.todo = TodoManager()
+        self.skills = SkillStore(skills_root)
+        self.skill_load_cache: dict[str, dict] = {}
+        self.skills_last_refresh_ts = 0.0
+        self.skills_runtime_prepared = False
+        self.tasks = TaskManager(self.root / "tasks", crypto)
+        self.bg = BackgroundManager(self.files_root)
+        self.bus = MessageBus(self.root / "team" / "inbox", crypto)
+        self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
+        self.messages: list[dict] = []
+        self.activity: list[dict] = []
+        self.operations: list[dict] = []
+        self.code_preview_index: dict[str, list[dict]] = {}
+        self.uploads: list[dict] = []
+        self.teammates: dict[str, dict] = {}
+        self.running = False
+        self.cancel_requested = False
+        self.pending_user_inputs: list[dict] = []
+        self.run_generation = 0
+        self.live_input_seq = 0
+        self.agent_round_index = 0
+        self.current_phase = "idle"
+        self.current_tool_name = ""
+        self.rounds_without_todo = 0
+        self.last_todo_reminder_ts = 0.0
+        self.todo_reminder_count = 0
+        self.todo_write_issue_count = 0
+        self.todo_last_issue = ""
+        self.tool_retry_counts: dict[str, int] = {}
+        self.last_auto_title_ts = 0.0
+        self.live_thinking_text = ""
+        self.live_thinking_last_emit = 0.0
+        self.live_truncation_text = ""
+        self.live_truncation_kind = ""
+        self.live_truncation_tool = ""
+        self.live_truncation_active = False
+        self.live_truncation_attempts = 0
+        self.live_truncation_tokens = 0
+        self.live_truncation_last_emit = 0.0
+        self.live_run_notice_active = False
+        self.live_run_notice_label = ""
+        self.live_run_notice_started_at = 0.0
+        self.live_run_notice_elapsed = 0.0
+        self.run_model_active_seconds = 0.0
+        self.render_frame_seq = 0
+        self.render_frame_received = 0
+        self.render_frame_last_ts = 0.0
+        self.render_frame_last_kind = ""
+        self.render_frame_last_activity_emit = 0.0
+        self.render_frame_latest: dict[str, object] = {}
+        self.render_frame_last_payload: dict[str, object] = {}
+        self.research_probe_cache: dict[str, object] = {
+            "checked_at": 0.0,
+            "online_ok": False,
+            "search_ok": False,
+            "mode": "simulated",
+            "reason": "unprobed",
+        }
+        self.max_context_token_limit = max(
+            MIN_CONTEXT_TOKEN_LIMIT,
+            min(TOKEN_THRESHOLD, int(context_token_limit or TOKEN_THRESHOLD)),
+        )
+        self.context_limit_locked = bool(context_limit_locked)
+        self.context_token_upper_bound = self.max_context_token_limit
+        self.max_agent_rounds = max(
+            MIN_AGENT_ROUNDS,
+            min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
+        )
+        self.max_run_seconds = normalize_timeout_seconds(
+            max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS,
+            minimum=MIN_RUN_TIMEOUT_SECONDS,
+            maximum=MAX_RUN_TIMEOUT_SECONDS,
+            fallback=MAX_RUN_SECONDS,
+        )
+        self.truncation_count = 0
+        self.last_truncation_ts = 0.0
+        self.truncation_rescue_task_ids: list[int] = []
+        self.context_archives: list[dict] = []
+        self.last_compact_reason = ""
+        self.last_compact_ts = 0.0
+        self.created_at = now_ts()
+        self.updated_at = now_ts()
+        self.shutdown_requests: dict[str, dict] = {}
+        self.plan_requests: dict[str, dict] = {}
+        self._init_llm_profiles(default_llm_config or {})
+        self._load_if_exists()
+
+    def _sanitize_profile_id(self, raw: str) -> str:
+        return sanitize_profile_id(raw)
+
+    def _profile_cache_key(self, profile: dict | None = None, model_override: str = "") -> str:
+        row = profile if isinstance(profile, dict) else dict(self.model_profiles.get(self.active_profile_id, {}))
+        provider = str(row.get("provider", self.ollama.provider) or self.ollama.provider).strip().lower()
+        base_url = str(row.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip().lower()
+        endpoint = str(row.get("endpoint", self.ollama.endpoint) or self.ollama.endpoint).strip().lower()
+        model = str(model_override or row.get("model", self.ollama.model) or self.ollama.model).strip().lower()
+        return "|".join([provider, base_url, endpoint, model])
+
+    def _capabilities_from_profile(self, profile: dict | None = None, model_override: str = "") -> dict[str, bool]:
+        row = profile if isinstance(profile, dict) else dict(self.model_profiles.get(self.active_profile_id, {}))
+        provider = str(row.get("provider", self.ollama.provider) or self.ollama.provider)
+        model = str(model_override or row.get("model", self.ollama.model) or self.ollama.model)
+        declared = parse_capability_overrides(row.get("capabilities", {}))
+        inferred = infer_model_multimodal_capabilities(provider, model)
+        merged = merge_multimodal_capabilities(inferred, declared)
+        key = self._profile_cache_key(row, model)
+        cached = self.multimodal_capability_cache.get(key, {})
+        if isinstance(cached, dict):
+            merged = merge_multimodal_capabilities(merged, parse_capability_overrides(cached.get("capabilities", {})))
+        return merged
+
+    def _ensure_active_profile_capabilities(self, force_probe: bool = False) -> dict[str, bool]:
+        profile = dict(self.model_profiles.get(self.active_profile_id, {}))
+        if not profile:
+            return default_multimodal_capabilities()
+        key = self._profile_cache_key(profile)
+        if not force_probe:
+            cached = self.multimodal_capability_cache.get(key, {})
+            if isinstance(cached, dict):
+                caps = parse_capability_overrides(cached.get("capabilities", {}))
+                if caps:
+                    merged_cached = merge_multimodal_capabilities(
+                        self._capabilities_from_profile(profile),
+                        caps,
+                    )
+                    profile["capabilities"] = merged_cached
+                    self.model_profiles[self.active_profile_id] = profile
+                    return merged_cached
+        try:
+            probed = self.ollama.probe_multimodal_capabilities(force=True if force_probe else False)
+            merged = merge_multimodal_capabilities(self._capabilities_from_profile(profile), probed)
+            entry = self.ollama.probe_cache_entry()
+            self.multimodal_capability_cache[key] = {
+                "capabilities": merged,
+                "details": entry.get("details", {}),
+                "updated_at": float(entry.get("updated_at", now_ts()) or now_ts()),
+                "provider": str(profile.get("provider", "")),
+                "model": str(profile.get("model", "")),
+            }
+            profile["capabilities"] = merged
+            self.model_profiles[self.active_profile_id] = profile
+            self.updated_at = now_ts()
+            self._persist()
+            return merged
+        except Exception as exc:
+            merged = self._capabilities_from_profile(profile)
+            self.multimodal_capability_cache[key] = {
+                "capabilities": merged,
+                "details": {"probe_error": trim(str(exc), 240)},
+                "updated_at": now_ts(),
+                "provider": str(profile.get("provider", "")),
+                "model": str(profile.get("model", "")),
+            }
+            return merged
+
+    def _recent_multimodal_inputs(self, max_items: int = 4, max_total_bytes: int = 12 * 1024 * 1024) -> list[dict]:
+        caps = self._capabilities_from_profile()
+        wants_image = bool(caps.get("input_image", False))
+        wants_audio = bool(caps.get("input_audio", False))
+        wants_video = bool(caps.get("input_video", False))
+        if not (wants_image or wants_audio or wants_video):
+            return []
+        kind_allow = set()
+        if wants_image:
+            kind_allow.add("image")
+        if wants_audio:
+            kind_allow.add("audio")
+        if wants_video:
+            kind_allow.add("video")
+        items: list[dict] = []
+        used_rel: set[str] = set()
+        total = 0
+        with self.lock:
+            rows = list(self.uploads)
+        for row in reversed(rows):
+            kind = str(row.get("kind", "") or "").strip().lower()
+            if kind not in kind_allow:
+                continue
+            rel = str(row.get("workspace_path", "") or "").strip()
+            if not rel:
+                continue
+            try:
+                fp = safe_path(rel, self.files_root)
+            except Exception:
+                continue
+            if not fp.exists() or not fp.is_file():
+                continue
+            size = int(fp.stat().st_size or 0)
+            if size <= 0 or size > 20 * 1024 * 1024:
+                continue
+            if total + size > max_total_bytes:
+                continue
+            try:
+                data = fp.read_bytes()
+            except Exception:
+                continue
+            mime = str(row.get("mime", "") or "").strip() or guess_mime_from_name(str(row.get("filename", "") or ""), f"{kind}/octet-stream")
+            items.append(
+                {
+                    "upload_id": str(row.get("id", "")),
+                    "type": kind,
+                    "name": str(row.get("filename", fp.name)),
+                    "mime": mime,
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                    "workspace_path": rel,
+                }
+            )
+            used_rel.add(rel)
+            total += size
+            if len(items) >= max_items:
+                break
+        items.reverse()
+        if wants_image and len(items) < max_items and total < max_total_bytes:
+            extra = self._recent_local_image_inputs(
+                max_items=max_items - len(items),
+                max_total_bytes=max_total_bytes - total,
+                used_rel=used_rel,
+            )
+            items.extend(extra)
+        return items
+
+    def _recent_local_image_inputs(
+        self,
+        *,
+        max_items: int,
+        max_total_bytes: int,
+        used_rel: set[str] | None = None,
+    ) -> list[dict]:
+        out: list[dict] = []
+        if max_items <= 0 or max_total_bytes <= 0:
+            return out
+        seen = set(used_rel or set())
+        total = 0
+
+        def accept_file(fp: Path):
+            nonlocal total
+            if not fp.exists() or (not fp.is_file()):
+                return
+            if fp.suffix.lower() not in IMAGE_EXTS:
+                return
+            try:
+                rel = self._session_rel(fp)
+            except Exception:
+                return
+            if rel in seen:
+                return
+            try:
+                size = int(fp.stat().st_size or 0)
+            except Exception:
+                return
+            if size <= 0 or size > 20 * 1024 * 1024:
+                return
+            if total + size > max_total_bytes:
+                return
+            try:
+                data = fp.read_bytes()
+            except Exception:
+                return
+            mime = guess_mime_from_name(fp.name, "image/png")
+            out.append(
+                {
+                    "upload_id": "",
+                    "type": "image",
+                    "name": fp.name,
+                    "mime": mime,
+                    "data_b64": base64.b64encode(data).decode("ascii"),
+                    "workspace_path": rel,
+                    "source": "local_file",
+                }
+            )
+            total += size
+            seen.add(rel)
+
+        # Priority 1: image paths explicitly mentioned by user in recent messages.
+        tokens: list[str] = []
+        with self.lock:
+            recent_msgs = list(self.messages[-80:])
+        for row in reversed(recent_msgs):
+            if str(row.get("role", "")).strip() != "user":
+                continue
+            content = str(row.get("content", "") or "")
+            for m in re.finditer(r"([^\s\"'<>]+?\.(?:png|jpg|jpeg|webp|bmp|gif|tiff|tif|avif|heic|heif|svg))", content, re.IGNORECASE):
+                token = str(m.group(1) or "").strip()
+                if token and token not in tokens:
+                    tokens.append(token)
+            if len(tokens) >= 24:
+                break
+        for raw in tokens:
+            if len(out) >= max_items:
+                break
+            candidate = raw.strip().strip("()[]{}")
+            if not candidate:
+                continue
+            if candidate.startswith("file://"):
+                candidate = candidate[7:]
+            candidate_path = Path(candidate)
+            try:
+                fp = candidate_path.resolve() if candidate_path.is_absolute() else safe_path(candidate, self.files_root)
+            except Exception:
+                continue
+            if fp.is_absolute():
+                try:
+                    if not fp.resolve().is_relative_to(self.files_root.resolve()):
+                        continue
+                except Exception:
+                    continue
+            accept_file(fp)
+
+        # Priority 2: latest image files in session workspace.
+        if len(out) < max_items:
+            candidates: list[Path] = []
+            try:
+                for fp in self.files_root.rglob("*"):
+                    if len(candidates) >= 320:
+                        break
+                    if not fp.is_file():
+                        continue
+                    if fp.suffix.lower() not in IMAGE_EXTS:
+                        continue
+                    candidates.append(fp)
+            except Exception:
+                candidates = []
+            try:
+                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            for fp in candidates:
+                if len(out) >= max_items:
+                    break
+                accept_file(fp)
+        return out[:max_items]
+
+    def _save_generated_media(self, media_type: str, payload: dict, filename: str = "") -> dict:
+        mtype = str(media_type or "").strip().lower()
+        blob = payload.get("bytes", b"")
+        if not isinstance(blob, (bytes, bytearray)) or not blob:
+            raise ValueError("generated media payload is empty")
+        mime = str(payload.get("mime", "") or f"{mtype}/octet-stream").split(";", 1)[0].strip().lower()
+        ext = guess_ext_from_mime(mime, fallback=f".{mtype if mtype else 'bin'}")
+        safe_name = self._safe_upload_name(filename or f"generated_{mtype}{ext}")
+        if "." not in safe_name:
+            safe_name = f"{safe_name}{ext}"
+        target = self.files_root / "generated_media" / safe_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        i = 2
+        while target.exists():
+            target = target.with_name(f"{target.stem}_{i}{target.suffix}")
+            i += 1
+        target.write_bytes(bytes(blob))
+        workspace_rel = self._session_rel(target)
+        upload_id = make_id("gen")
+        meta = {
+            "id": upload_id,
+            "filename": target.name,
+            "original_name": filename or target.name,
+            "mime": mime,
+            "kind": mtype,
+            "size": int(target.stat().st_size),
+            "uploaded_at": now_ts(),
+            "stored_path": str(target),
+            "workspace_path": workspace_rel,
+            "parsed_excerpt": "",
+            "generated": True,
+        }
+        with self.lock:
+            self.uploads.append(meta)
+            self.uploads = self.uploads[-80:]
+            self.updated_at = now_ts()
+            self._persist()
+        self._emit(
+            "upload",
+            {
+                "filename": target.name,
+                "workspace_path": workspace_rel,
+                "kind": mtype,
+                "size": int(target.stat().st_size),
+                "summary": f"generated {mtype}: {workspace_rel}",
+                "preview": "",
+            },
+        )
+        return {
+            "ok": True,
+            "media_type": mtype,
+            "workspace_path": workspace_rel,
+            "filename": target.name,
+            "mime": mime,
+            "size": int(target.stat().st_size),
+        }
+
+    def _ensure_ollama_profile(self):
+        for profile in self.model_profiles.values():
+            if str(profile.get("provider", "")).lower() == "ollama":
+                return
+        pid = "ollama"
+        n = 2
+        while pid in self.model_profiles:
+            pid = f"ollama-{n}"
+            n += 1
+        self.model_profiles[pid] = {
+            "id": pid,
+            "provider": "ollama",
+            "label": "Ollama",
+            "model": self.ollama.model,
+            "base_url": self.ollama.base_url,
+            "temperature": 0.2,
+            "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+            "selection": f"{pid}::{self.ollama.model}",
+            "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
+            "media_endpoints": {},
+            "source": "auto-added",
+        }
+
+    def _init_llm_profiles(self, config: dict):
+        parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        self.model_profiles = {}
+        for idx, profile in enumerate(parsed.get("profiles", [])):
+            pid = self._sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
+            if pid in self.model_profiles:
+                n = 2
+                while f"{pid}-{n}" in self.model_profiles:
+                    n += 1
+                pid = f"{pid}-{n}"
+            row = dict(profile)
+            row["id"] = pid
+            row["selection"] = f"{pid}::{row.get('model','')}"
+            self.model_profiles[pid] = row
+        if not self.model_profiles:
+            fallback = {
+                "id": "ollama",
+                "provider": "ollama",
+                "label": "Ollama",
+                "model": self.ollama.model,
+                "base_url": self.ollama.base_url,
+                "temperature": 0.2,
+                "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+                "selection": f"ollama::{self.ollama.model}",
+                "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
+                "media_endpoints": {},
+                "source": "fallback",
+            }
+            self.model_profiles["ollama"] = fallback
+        self._ensure_ollama_profile()
+        requested = self._sanitize_profile_id(str(parsed.get("default_profile_id", "")))
+        self.active_profile_id = requested if requested in self.model_profiles else next(iter(self.model_profiles.keys()))
+        self._apply_active_profile()
+
+    def _apply_active_profile(self):
+        profile = self.model_profiles.get(self.active_profile_id)
+        if not profile:
+            return
+        row = dict(profile)
+        timeout_floor = max(MIN_TIMEOUT_SECONDS, int(self.max_run_seconds or 0))
+        row["request_timeout"] = normalize_timeout_seconds(
+            row.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
+            minimum=timeout_floor,
+            maximum=MAX_TIMEOUT_SECONDS,
+            fallback=max(DEFAULT_REQUEST_TIMEOUT, timeout_floor),
+        )
+        key = self._profile_cache_key(row)
+        cached = self.multimodal_capability_cache.get(key, {})
+        if isinstance(cached, dict):
+            cached_caps = parse_capability_overrides(cached.get("capabilities", {}))
+            if cached_caps:
+                merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
+                row["capabilities"] = merged
+                self.model_profiles[self.active_profile_id] = row
+        self.model_profiles[self.active_profile_id] = row
+        profile = row
+        self.ollama.apply_profile(profile)
+        self.thinking = False
+
+    def _profile_is_runnable(self, profile: dict) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        provider = str(profile.get("provider", "") or "").strip().lower()
+        model = str(profile.get("model", "") or "").strip()
+        if provider in {"", "unknown", "config_only"}:
+            return False
+        if not model:
+            return False
+        if provider == "ollama":
+            base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
+            return bool(base)
+        if provider in {"openai_compat", "openai", "siliconflow"}:
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(endpoint or complete_chat_endpoint(base))
+        if provider == "custom_http":
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            return bool(endpoint)
+        return False
+
+    def _option_is_runnable(self, option: dict) -> bool:
+        if not isinstance(option, dict):
+            return False
+        pid = str(option.get("profile_id", "") or "")
+        base = dict(self.model_profiles.get(pid, {}))
+        if option.get("provider") is not None:
+            base["provider"] = option.get("provider")
+        if option.get("model") is not None:
+            base["model"] = option.get("model")
+        if str(base.get("provider", "")).lower() == "ollama" and not str(base.get("base_url", "")).strip():
+            base["base_url"] = self.ollama.base_url
+        return self._profile_is_runnable(base)
+
+    def _pick_runnable_selection(self, preferred_provider: str = "", exclude: set[str] | None = None) -> str:
+        blocked = set(exclude or set())
+        entries = list(self.model_catalog().get("options", []))
+        if preferred_provider:
+            pref = str(preferred_provider or "")
+            entries.sort(
+                key=lambda x: (
+                    0 if str(x.get("provider", "")) == pref else 1,
+                    str(x.get("profile_id", "")),
+                )
+            )
+        for item in entries:
+            selection = str(item.get("selection", "") or "")
+            if not selection or selection in blocked:
+                continue
+            if not self._option_is_runnable(item):
+                continue
+            return selection
+        return ""
+
+    def model_catalog(self, force_probe: bool = False) -> dict:
+        if force_probe:
+            self._ensure_active_profile_capabilities(force_probe=True)
+        opts = []
+        ollama_profile_id = ""
+        ollama_base = self.ollama.base_url
+        for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
+            model = str(profile.get("model", "") or "")
+            selection = f"{pid}::{model}"
+            label = f"{profile.get('label', pid)} | {model or '(no-model)'}"
+            cache_key = self._profile_cache_key(profile)
+            cache_entry = self.multimodal_capability_cache.get(cache_key, {})
+            caps = self._capabilities_from_profile(profile)
+            if (not ollama_profile_id) and str(profile.get("provider", "")).lower() == "ollama":
+                ollama_profile_id = pid
+                ollama_base = str(profile.get("base_url", ollama_base) or ollama_base)
+            opts.append(
+                {
+                    "selection": selection,
+                    "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"),
+                    "model": model,
+                    "label": label,
+                    "source": profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "capabilities": caps,
+                    "capabilities_probed": bool(cache_entry),
+                    "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
+                    if isinstance(cache_entry, dict)
+                    else 0.0,
+                }
+            )
+        if not ollama_profile_id:
+            ollama_profile_id = "ollama"
+        seen = {str(x.get("selection", "")) for x in opts}
+        for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
+            if str(profile.get("provider", "")).lower() != "ollama":
+                continue
+            base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
+            if not base:
+                continue
+            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            if tags:
+                if pid == self.active_profile_id:
+                    self.ollama_env_tags = list(tags)
+            elif pid == self.active_profile_id and self.ollama_env_tags:
+                tags = list(self.ollama_env_tags)
+            for tag in tags:
+                selection = f"{pid}::{tag}"
+                if selection in seen:
+                    continue
+                seen.add(selection)
+                tag_profile = dict(profile)
+                tag_profile["model"] = tag
+                tag_cache_key = self._profile_cache_key(tag_profile, tag)
+                tag_cache_entry = self.multimodal_capability_cache.get(tag_cache_key, {})
+                tag_caps = self._capabilities_from_profile(tag_profile, model_override=tag)
+                opts.append(
+                    {
+                        "selection": selection,
+                        "profile_id": pid,
+                        "provider": "ollama",
+                        "model": tag,
+                        "label": f"{profile.get('label', 'Ollama')} | {tag}",
+                        "source": "ollama-tags",
+                        "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
+                        "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
+                        "capabilities": tag_caps,
+                        "capabilities_probed": bool(tag_cache_entry),
+                        "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
+                        if isinstance(tag_cache_entry, dict)
+                        else 0.0,
+                    }
+                )
+        runnable_opts = [x for x in opts if self._option_is_runnable(x)]
+        if runnable_opts:
+            opts = runnable_opts
+        active = self.model_profiles.get(self.active_profile_id, {})
+        selected = f"{self.active_profile_id}::{active.get('model','')}" if active else ""
+        if opts and selected not in {str(x.get("selection", "")) for x in opts}:
+            selected = str(opts[0].get("selection", ""))
+        active_caps = self._capabilities_from_profile(active if isinstance(active, dict) else {})
+        active_cache = self.multimodal_capability_cache.get(self._profile_cache_key(active if isinstance(active, dict) else {}), {})
+        return {
+            "provider": active.get("provider", "ollama"),
+            "selected": selected,
+            "models": [x["selection"] for x in opts],
+            "options": opts,
+            "thinking": self.thinking,
+            "thinking_mode": "auto",
+            "active_capabilities": active_caps,
+            "active_capabilities_probed": bool(active_cache),
+            "active_capabilities_probed_at": float(active_cache.get("updated_at", 0.0) or 0.0)
+            if isinstance(active_cache, dict)
+            else 0.0,
+        }
+
+    def set_runtime_selection(
+        self,
+        selection: str,
+        model_override: str | None = None,
+        *,
+        reset_failures: bool = True,
+    ) -> dict:
+        raw = str(selection or "").strip()
+        explicit_profile = "::" in raw
+        if "::" in raw:
+            pid, selected_model = raw.split("::", 1)
+        else:
+            pid, selected_model = self.active_profile_id, raw
+        pid = self._sanitize_profile_id(pid)
+        if pid not in self.model_profiles:
+            if pid.startswith("ollama"):
+                self.model_profiles[pid] = {
+                    "id": pid,
+                    "provider": "ollama",
+                    "label": "Ollama",
+                    "model": self.ollama.model,
+                    "base_url": self.ollama.base_url,
+                    "temperature": 0.2,
+                    "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+                    "selection": f"{pid}::{self.ollama.model}",
+                    "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
+                    "media_endpoints": {},
+                    "source": "auto-added",
+                }
+            else:
+                raise ValueError(f"profile not found: {pid}")
+        profile = dict(self.model_profiles[pid])
+        if model_override is not None and str(model_override).strip():
+            profile["model"] = str(model_override).strip()
+        elif str(selected_model).strip():
+            profile["model"] = str(selected_model).strip()
+        if not self._profile_is_runnable(profile) and not explicit_profile and str(selected_model).strip():
+            fallback = self._pick_runnable_selection(preferred_provider="ollama")
+            if fallback:
+                fpid = self._sanitize_profile_id(fallback.split("::", 1)[0])
+                if fpid in self.model_profiles:
+                    pid = fpid
+                    profile = dict(self.model_profiles[fpid])
+                    profile["model"] = str(selected_model).strip()
+        if not self._profile_is_runnable(profile):
+            provider = str(profile.get("provider", "") or "unknown")
+            model_text = str(profile.get("model", "") or "")
+            raise ValueError(
+                f"profile '{pid}' is not runnable (provider={provider}, model={model_text or '(empty)'})"
+            )
+        profile["selection"] = f"{pid}::{profile.get('model','')}"
+        self.model_profiles[pid] = profile
+        self.active_profile_id = pid
+        if reset_failures:
+            self.failed_selections = []
+        self._apply_active_profile()
+        self._ensure_active_profile_capabilities(force_probe=False)
+        self.updated_at = now_ts()
+        self._persist()
+        self._emit(
+            "status",
+            {
+                "summary": f"model selected: {profile.get('provider')} / {profile.get('model','')}",
+            },
+        )
+        return self.model_catalog()
+
+    def load_llm_config(self, config: dict, source: str = "") -> dict:
+        parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        self.multimodal_capability_cache = {}
+        OllamaClient.clear_global_probe_cache()
+        self.ollama.clear_probe_cache()
+        merged = dict(self.model_profiles)
+        for idx, profile in enumerate(parsed.get("profiles", [])):
+            pid = self._sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
+            row = dict(profile)
+            row["id"] = pid
+            row["source"] = source or row.get("source", "uploaded-config")
+            row["selection"] = f"{pid}::{row.get('model','')}"
+            merged[pid] = row
+        self.model_profiles = merged
+        self._ensure_ollama_profile()
+        if not self.model_profiles:
+            self._init_llm_profiles({})
+        default_pid = self._sanitize_profile_id(str(parsed.get("default_profile_id", "")))
+        if default_pid in self.model_profiles:
+            self.active_profile_id = default_pid
+        elif not self.active_profile_id or self.active_profile_id not in self.model_profiles:
+            self.active_profile_id = next(iter(self.model_profiles.keys()))
+        active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
+        if not self._profile_is_runnable(active_profile):
+            fallback = self._pick_runnable_selection(preferred_provider="ollama")
+            if fallback:
+                fpid, fmodel = fallback.split("::", 1) if "::" in fallback else (self.active_profile_id, "")
+                self.active_profile_id = self._sanitize_profile_id(fpid)
+                if self.active_profile_id in self.model_profiles and fmodel.strip():
+                    row = dict(self.model_profiles[self.active_profile_id])
+                    row["model"] = fmodel.strip()
+                    row["selection"] = f"{self.active_profile_id}::{row.get('model','')}"
+                    self.model_profiles[self.active_profile_id] = row
+        self._apply_active_profile()
+        self._ensure_active_profile_capabilities(force_probe=False)
+        self.updated_at = now_ts()
+        self._persist()
+        self._emit(
+            "model_config",
+            {
+                "source": source,
+                "profiles": len(parsed.get("profiles", [])),
+                "active_profile": self.active_profile_id,
+                "summary": f"llm config loaded: {len(parsed.get('profiles', []))} profiles",
+            },
+        )
+        return self.model_catalog()
+
+    def _load_if_exists(self):
+        if self.state_path.exists():
+            try:
+                raw = self.crypto.read_json(self.state_path, {})
+                self.messages = raw.get("messages", [])
+                self.activity = raw.get("activity", [])
+                self.operations = raw.get("operations", [])
+                raw_code_preview = raw.get("code_preview_index", {})
+                if isinstance(raw_code_preview, dict):
+                    clean_code_preview: dict[str, list[dict]] = {}
+                    for path_key, stage_rows in raw_code_preview.items():
+                        rel = normalize_rel_preview_path(path_key)
+                        if not rel or (not isinstance(stage_rows, list)):
+                            continue
+                        normalized_rows: list[dict] = []
+                        for row in stage_rows[-(CODE_PREVIEW_STAGE_MAX_PER_FILE * 2) :]:
+                            if not isinstance(row, dict):
+                                continue
+                            sid = str(row.get("id", "") or "").strip()
+                            if not sid:
+                                continue
+                            normalized_rows.append(
+                                {
+                                    "id": sid,
+                                    "ts": float(row.get("ts", 0.0) or 0.0),
+                                    "path": rel,
+                                    "tool": str(row.get("tool", "") or ""),
+                                    "change_type": str(row.get("change_type", "") or ""),
+                                    "added": int(row.get("added", 0) or 0),
+                                    "deleted": int(row.get("deleted", 0) or 0),
+                                    "before_blob": str(row.get("before_blob", "") or ""),
+                                    "after_blob": str(row.get("after_blob", "") or ""),
+                                    "bytes_after": int(row.get("bytes_after", 0) or 0),
+                                    "lines_after": int(row.get("lines_after", 0) or 0),
+                                }
+                            )
+                        if normalized_rows:
+                            clean_code_preview[rel] = normalized_rows[-CODE_PREVIEW_STAGE_MAX_PER_FILE :]
+                    self.code_preview_index = clean_code_preview
+                self.teammates = raw.get("teammates", {})
+                uploads = raw.get("uploads", [])
+                self.uploads = uploads if isinstance(uploads, list) else []
+                profiles = raw.get("model_profiles", {})
+                if isinstance(profiles, dict) and profiles:
+                    self.model_profiles = {}
+                    for k, v in profiles.items():
+                        if not isinstance(v, dict):
+                            continue
+                        pid = self._sanitize_profile_id(str(k))
+                        row = dict(v)
+                        row["id"] = pid
+                        row["selection"] = f"{pid}::{row.get('model','')}"
+                        self.model_profiles[pid] = row
+                raw_cap_cache = raw.get("multimodal_capability_cache", {})
+                if isinstance(raw_cap_cache, dict):
+                    clean_cache: dict[str, dict] = {}
+                    for ckey, centry in raw_cap_cache.items():
+                        key = str(ckey or "").strip()
+                        if not key or not isinstance(centry, dict):
+                            continue
+                        caps = parse_capability_overrides(centry.get("capabilities", {}))
+                        clean_cache[key] = {
+                            "capabilities": merge_multimodal_capabilities(default_multimodal_capabilities(), caps),
+                            "details": centry.get("details", {}) if isinstance(centry.get("details"), dict) else {},
+                            "updated_at": float(centry.get("updated_at", 0.0) or 0.0),
+                            "provider": str(centry.get("provider", "")),
+                            "model": str(centry.get("model", "")),
+                        }
+                    self.multimodal_capability_cache = clean_cache
+                raw_skill_cache = raw.get("skill_load_cache", {})
+                if isinstance(raw_skill_cache, dict):
+                    clean_skill_cache: dict[str, dict] = {}
+                    for skey, srow in raw_skill_cache.items():
+                        key = str(skey or "").strip()
+                        if not key or not isinstance(srow, dict):
+                            continue
+                        body_z = str(srow.get("body_z", "") or "").strip()
+                        if not body_z:
+                            continue
+                        clean_skill_cache[key] = {
+                            "fingerprint": str(srow.get("fingerprint", "") or ""),
+                            "body_z": body_z,
+                            "updated_at": float(srow.get("updated_at", 0.0) or 0.0),
+                        }
+                    self.skill_load_cache = clean_skill_cache
+                active = raw.get("active_profile_id")
+                if isinstance(active, str) and active.strip():
+                    self.active_profile_id = self._sanitize_profile_id(active)
+                self.todo.items = raw.get("todos", [])
+                self.thinking = False
+                self.context_token_upper_bound = int(
+                    raw.get("context_token_upper_bound", self.context_token_upper_bound)
+                )
+                self.context_token_upper_bound = max(
+                    MIN_CONTEXT_TOKEN_LIMIT,
+                    min(self.max_context_token_limit, self.context_token_upper_bound),
+                )
+                self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
+                self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
+                ids = raw.get("truncation_rescue_task_ids", [])
+                if isinstance(ids, list):
+                    clean_ids = []
+                    for x in ids:
+                        try:
+                            clean_ids.append(int(x))
+                        except Exception:
+                            pass
+                    self.truncation_rescue_task_ids = clean_ids[:12]
+                archives = raw.get("context_archives", [])
+                if isinstance(archives, list):
+                    clean_archives = []
+                    for seg in archives[-(MAX_CONTEXT_ARCHIVE_SEGMENTS * 2):]:
+                        if not isinstance(seg, dict):
+                            continue
+                        sid = str(seg.get("id", "")).strip()
+                        rel_path = str(seg.get("path", "")).strip()
+                        if not sid or not rel_path:
+                            continue
+                        clean_archives.append(
+                            {
+                                "id": sid,
+                                "path": rel_path,
+                                "reason": str(seg.get("reason", "")),
+                                "messages": int(seg.get("messages", 0) or 0),
+                                "bytes": int(seg.get("bytes", 0) or 0),
+                                "sha256": str(seg.get("sha256", "")),
+                                "created_at": float(seg.get("created_at", 0.0) or 0.0),
+                                "first_ts": float(seg.get("first_ts", 0.0) or 0.0),
+                                "last_ts": float(seg.get("last_ts", 0.0) or 0.0),
+                            }
+                        )
+                    self.context_archives = clean_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
+                self.last_compact_reason = str(raw.get("last_compact_reason", self.last_compact_reason) or "")
+                self.last_compact_ts = float(raw.get("last_compact_ts", self.last_compact_ts) or 0.0)
+                pending_inputs = raw.get("pending_user_inputs", [])
+                if isinstance(pending_inputs, list):
+                    clean_pending: list[dict] = []
+                    for row in pending_inputs[-60:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        clean_pending.append(
+                            {
+                                "id": int(row.get("id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "queued_round": int(row.get("queued_round", 0) or 0),
+                                "delay_rounds": int(row.get("delay_rounds", 0) or 0),
+                                "next_round": int(row.get("next_round", 0) or 0),
+                                "applied_count": int(row.get("applied_count", 0) or 0),
+                                "last_applied_round": int(row.get("last_applied_round", -1) or -1),
+                                "delay_reason": str(row.get("delay_reason", "")),
+                                "run_generation": int(row.get("run_generation", 0) or 0),
+                            }
+                        )
+                    self.pending_user_inputs = clean_pending[-40:]
+                    max_id = 0
+                    for row in self.pending_user_inputs:
+                        try:
+                            max_id = max(max_id, int(row.get("id", 0) or 0))
+                        except Exception:
+                            continue
+                    self.live_input_seq = max(self.live_input_seq, max_id)
+                self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
+                self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
+                self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
+                self.current_tool_name = str(raw.get("current_tool_name", self.current_tool_name) or "")
+                self.render_frame_seq = int(raw.get("render_frame_seq", self.render_frame_seq) or 0)
+                self.render_frame_received = int(raw.get("render_frame_received", self.render_frame_received) or 0)
+                self.render_frame_last_ts = float(raw.get("render_frame_last_ts", self.render_frame_last_ts) or 0.0)
+                self.render_frame_last_kind = str(raw.get("render_frame_last_kind", self.render_frame_last_kind) or "")
+                latest_render = raw.get("render_frame_latest", {})
+                if isinstance(latest_render, dict):
+                    self.render_frame_latest = latest_render
+                self.created_at = raw.get("created_at", self.created_at)
+                self.updated_at = raw.get("updated_at", self.updated_at)
+                self.ui_language = normalize_ui_language(raw.get("ui_language", self.ui_language))
+            except Exception:
+                pass
+        if self.meta_path.exists():
+            try:
+                meta = self.crypto.read_json(self.meta_path, {})
+                self.title = meta.get("title", self.title)
+            except Exception:
+                pass
+        if not self.model_profiles:
+            self._init_llm_profiles({})
+        if self.context_limit_locked:
+            self.context_token_upper_bound = self.max_context_token_limit
+        # Ensure previous-run volatile state and control-hint artifacts are cleared on load.
+        self._reset_runtime_state_locked(purge_runtime_hints=True)
+        self._ensure_ollama_profile()
+        if self.active_profile_id not in self.model_profiles:
+            self.active_profile_id = next(iter(self.model_profiles.keys()))
+        active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
+        if not self._profile_is_runnable(active_profile):
+            fallback = self._pick_runnable_selection(preferred_provider="ollama")
+            if fallback:
+                fpid, fmodel = fallback.split("::", 1) if "::" in fallback else (self.active_profile_id, "")
+                self.active_profile_id = self._sanitize_profile_id(fpid)
+                if self.active_profile_id in self.model_profiles and fmodel.strip():
+                    row = dict(self.model_profiles[self.active_profile_id])
+                    row["model"] = fmodel.strip()
+                    row["selection"] = f"{self.active_profile_id}::{row.get('model','')}"
+                    self.model_profiles[self.active_profile_id] = row
+        self._apply_active_profile()
+        self._prune_skill_load_cache()
+        with self.lock:
+            self._prune_code_preview_locked()
+        self._persist()
+
+    def _persist(self):
+        self._prune_skill_load_cache()
+        self._prune_code_preview_locked()
+        data = {
+            "id": self.id,
+            "title": self.title,
+            "ui_language": self.ui_language,
+            "messages": self.messages[-400:],
+            "activity": self.activity[-300:],
+            "operations": self.operations[-500:],
+            "code_preview_index": self.code_preview_index,
+            "teammates": self.teammates,
+            "uploads": self.uploads[-80:],
+            "model_profiles": self.model_profiles,
+            "active_profile_id": self.active_profile_id,
+            "multimodal_capability_cache": self.multimodal_capability_cache,
+            "skill_load_cache": self.skill_load_cache,
+            "todos": self.todo.snapshot(),
+            "thinking": self.thinking,
+            "context_token_upper_bound": self.context_token_upper_bound,
+            "context_limit_locked": bool(self.context_limit_locked),
+            "truncation_count": self.truncation_count,
+            "last_truncation_ts": self.last_truncation_ts,
+            "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
+            "context_archives": self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:],
+            "last_compact_reason": self.last_compact_reason,
+            "last_compact_ts": self.last_compact_ts,
+            "pending_user_inputs": self.pending_user_inputs[-40:],
+            "run_generation": int(self.run_generation),
+            "agent_round_index": int(self.agent_round_index),
+            "current_phase": str(self.current_phase or "idle"),
+            "current_tool_name": str(self.current_tool_name or ""),
+            "render_frame_seq": int(self.render_frame_seq),
+            "render_frame_received": int(self.render_frame_received),
+            "render_frame_last_ts": float(self.render_frame_last_ts or 0.0),
+            "render_frame_last_kind": str(self.render_frame_last_kind or ""),
+            "render_frame_latest": self.render_frame_latest if isinstance(self.render_frame_latest, dict) else {},
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        self.crypto.write_json(self.state_path, data)
+        self.crypto.write_json(self.meta_path, {"id": self.id, "title": self.title, "updated_at": self.updated_at})
+
+    def _is_runtime_control_hint(self, content: object) -> bool:
+        txt = str(content or "").strip().lower()
+        if not txt:
+            return False
+        for prefix in RUNTIME_CONTROL_HINT_PREFIXES:
+            if txt.startswith(prefix):
+                return True
+        return False
+
+    def _reset_runtime_state_locked(self, *, purge_runtime_hints: bool = False) -> int:
+        removed_hints = 0
+        if purge_runtime_hints and self.messages:
+            kept: list[dict] = []
+            for row in self.messages:
+                role = str(row.get("role", "")).strip()
+                content = row.get("content", "")
+                if role == "user" and self._is_runtime_control_hint(content):
+                    removed_hints += 1
+                    continue
+                kept.append(row)
+            if removed_hints > 0:
+                self.messages = kept[-400:]
+        self.pending_user_inputs = []
+        self.cancel_requested = False
+        self.current_phase = "idle"
+        self.current_tool_name = ""
+        self.rounds_without_todo = 0
+        self.last_todo_reminder_ts = 0.0
+        self.todo_reminder_count = 0
+        self.todo_write_issue_count = 0
+        self.todo_last_issue = ""
+        self.tool_retry_counts = {}
+        self.live_thinking_text = ""
+        self.live_thinking_last_emit = 0.0
+        self.live_truncation_text = ""
+        self.live_truncation_kind = ""
+        self.live_truncation_tool = ""
+        self.live_truncation_active = False
+        self.live_truncation_attempts = 0
+        self.live_truncation_tokens = 0
+        self.live_truncation_last_emit = 0.0
+        self.live_run_notice_active = False
+        self.live_run_notice_label = ""
+        self.live_run_notice_started_at = 0.0
+        self.live_run_notice_elapsed = 0.0
+        self.run_model_active_seconds = 0.0
+        self.agent_round_index = 0
+        return removed_hints
+
+    def _emit(self, kind: str, data: dict):
+        event = {"id": make_id("evt"), "ts": now_ts(), "type": kind, "session_id": self.id, "data": data}
+        self.events.publish(event)
+        self.operations.append(event)
+        self.operations = self.operations[-500:]
+        self.activity.append(
+            {
+                "ts": event["ts"],
+                "type": kind,
+                "summary": data.get("summary") or data.get("text") or data.get("name") or kind,
+            }
+        )
+        self.activity = self.activity[-300:]
+
+    def _emit_transient(self, kind: str, data: dict):
+        event = {"id": make_id("evt"), "ts": now_ts(), "type": kind, "session_id": self.id, "data": data}
+        self.events.publish(event)
+
+    def _safe_numeric(self, raw: object, default: float = 0.0, low: float = -1e9, high: float = 1e9) -> float:
+        try:
+            v = float(raw)
+            if v != v or v in (float("inf"), float("-inf")):
+                return float(default)
+            if v < low:
+                return float(low)
+            if v > high:
+                return float(high)
+            return v
+        except Exception:
+            return float(default)
+
+    def _sanitize_render_frame_payload(self, payload: dict) -> dict:
+        src = payload if isinstance(payload, dict) else {}
+        out: dict[str, object] = {}
+        kind = str(src.get("kind", "") or "").strip().lower()[:48] or "generic"
+        out["kind"] = kind
+        width = int(self._safe_numeric(src.get("width", 0), default=0.0, low=0.0, high=8192.0))
+        height = int(self._safe_numeric(src.get("height", 0), default=0.0, low=0.0, high=8192.0))
+        if width > 0:
+            out["width"] = width
+        if height > 0:
+            out["height"] = height
+        out["clear"] = bool(src.get("clear", False))
+        bg = str(src.get("bg", "") or "").strip()
+        if bg:
+            out["bg"] = trim(bg, 64)
+        text = str(src.get("text", "") or "")
+        if text:
+            out["text"] = trim(text, 4000)
+        summary = str(src.get("summary", "") or "")
+        if summary:
+            out["summary"] = trim(summary, 220)
+        mime = str(src.get("mime", "") or "").strip().lower()
+        if mime.startswith("image/"):
+            out["mime"] = mime
+        image_b64 = str(src.get("image_b64", "") or "").strip()
+        if image_b64 and len(image_b64) <= RENDER_FRAME_MAX_B64_CHARS:
+            out["image_b64"] = image_b64
+        points_raw = src.get("points", [])
+        points_out = []
+        if isinstance(points_raw, list):
+            for row in points_raw[:RENDER_FRAME_MAX_POINTS]:
+                if not isinstance(row, dict):
+                    continue
+                x = self._safe_numeric(row.get("x", 0.0), default=0.0)
+                y = self._safe_numeric(row.get("y", 0.0), default=0.0)
+                p = {
+                    "x": x,
+                    "y": y,
+                    "size": self._safe_numeric(row.get("size", 1.6), default=1.6, low=0.1, high=80.0),
+                    "color": trim(str(row.get("color", "") or ""), 48),
+                    "alpha": self._safe_numeric(row.get("alpha", 1.0), default=1.0, low=0.0, high=1.0),
+                }
+                points_out.append(p)
+        if points_out:
+            out["points"] = points_out
+        lines_raw = src.get("lines", [])
+        lines_out = []
+        if isinstance(lines_raw, list):
+            for line in lines_raw[:RENDER_FRAME_MAX_LINES]:
+                if not isinstance(line, dict):
+                    continue
+                pts = line.get("points", [])
+                if not isinstance(pts, list):
+                    continue
+                clean_pts = []
+                for pt in pts[:RENDER_FRAME_MAX_LINE_POINTS]:
+                    if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                        continue
+                    clean_pts.append(
+                        [
+                            self._safe_numeric(pt[0], default=0.0),
+                            self._safe_numeric(pt[1], default=0.0),
+                        ]
+                    )
+                if len(clean_pts) < 2:
+                    continue
+                lines_out.append(
+                    {
+                        "points": clean_pts,
+                        "color": trim(str(line.get("color", "") or ""), 48),
+                        "width": self._safe_numeric(line.get("width", 1.6), default=1.6, low=0.1, high=80.0),
+                        "alpha": self._safe_numeric(line.get("alpha", 1.0), default=1.0, low=0.0, high=1.0),
+                    }
+                )
+        if lines_out:
+            out["lines"] = lines_out
+        meta_raw = src.get("meta", {})
+        if isinstance(meta_raw, dict):
+            meta_out: dict[str, str] = {}
+            for k, v in list(meta_raw.items())[:20]:
+                key = trim(str(k or "").strip(), 48)
+                if not key:
+                    continue
+                meta_out[key] = trim(str(v or ""), 240)
+            if meta_out:
+                out["meta"] = meta_out
+        return out
+
+    def push_render_frame(self, payload: dict) -> dict:
+        clean = self._sanitize_render_frame_payload(payload if isinstance(payload, dict) else {})
+        now_tick = now_ts()
+        with self.lock:
+            self.render_frame_seq = int(self.render_frame_seq) + 1
+            seq = int(self.render_frame_seq)
+            self.render_frame_received = int(self.render_frame_received) + 1
+            self.render_frame_last_ts = now_tick
+            self.render_frame_last_kind = str(clean.get("kind", "") or "generic")
+            latest_meta = {
+                "kind": self.render_frame_last_kind,
+                "width": int(clean.get("width", 0) or 0),
+                "height": int(clean.get("height", 0) or 0),
+                "points": len(clean.get("points", []) or []),
+                "lines": len(clean.get("lines", []) or []),
+                "has_image": bool(clean.get("image_b64")),
+                "summary": str(clean.get("summary", "") or ""),
+                "ts": now_tick,
+            }
+            self.render_frame_latest = latest_meta
+            payload_view = dict(clean)
+            payload_view["seq"] = seq
+            payload_view["ts"] = now_tick
+            self.render_frame_last_payload = payload_view
+            self.updated_at = now_tick
+            self._persist()
+        event_payload = dict(clean)
+        event_payload["seq"] = seq
+        event_payload["ts"] = now_tick
+        self._emit_transient("render_frame", event_payload)
+        if (now_tick - float(self.render_frame_last_activity_emit or 0.0)) >= RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS:
+            self.render_frame_last_activity_emit = now_tick
+            self._emit(
+                "render_bridge",
+                {
+                    "seq": seq,
+                    "kind": str(clean.get("kind", "generic") or "generic"),
+                    "points": len(clean.get("points", []) or []),
+                    "lines": len(clean.get("lines", []) or []),
+                    "has_image": bool(clean.get("image_b64")),
+                    "summary": (
+                        f"render frame seq={seq} kind={clean.get('kind','generic')} "
+                        f"points={len(clean.get('points', []) or [])} lines={len(clean.get('lines', []) or [])}"
+                    ),
+                },
+            )
+        return {
+            "ok": True,
+            "seq": seq,
+            "kind": str(clean.get("kind", "generic") or "generic"),
+            "points": len(clean.get("points", []) or []),
+            "lines": len(clean.get("lines", []) or []),
+            "has_image": bool(clean.get("image_b64")),
+        }
+
+    def render_state_payload(self) -> dict:
+        with self.lock:
+            seq = int(self.render_frame_seq)
+            payload = dict(self.render_frame_last_payload) if isinstance(self.render_frame_last_payload, dict) else {}
+            latest = dict(self.render_frame_latest) if isinstance(self.render_frame_latest, dict) else {}
+            out = {
+                "ok": True,
+                "seq": seq,
+                "received": int(self.render_frame_received),
+                "last_ts": float(self.render_frame_last_ts or 0.0),
+                "last_kind": str(self.render_frame_last_kind or ""),
+                "latest": latest,
+            }
+            if payload:
+                payload.setdefault("seq", seq)
+                payload.setdefault("ts", float(self.render_frame_last_ts or now_ts()))
+                out["frame"] = payload
+            return out
+
+    def _prune_skill_load_cache(self):
+        if not isinstance(self.skill_load_cache, dict):
+            self.skill_load_cache = {}
+            return
+        rows = []
+        for key, row in self.skill_load_cache.items():
+            if not isinstance(row, dict):
+                continue
+            body_z = str(row.get("body_z", "") or "")
+            if not body_z:
+                continue
+            updated_at = float(row.get("updated_at", 0.0) or 0.0)
+            rows.append((str(key), row, updated_at))
+        rows.sort(key=lambda x: x[2], reverse=True)
+        kept: dict[str, dict] = {}
+        total = 0
+        for key, row, _ in rows:
+            z = str(row.get("body_z", "") or "")
+            zlen = len(z)
+            if len(kept) >= SKILL_RUNTIME_CACHE_MAX_ENTRIES:
+                continue
+            if total + zlen > SKILL_RUNTIME_CACHE_MAX_BYTES:
+                continue
+            kept[key] = row
+            total += zlen
+        self.skill_load_cache = kept
+
+    def _ensure_skills_ready(self, force: bool = False):
+        now = now_ts()
+        if (not force) and self.skills_last_refresh_ts > 0 and (
+            now - self.skills_last_refresh_ts
+        ) < SKILL_REFRESH_MIN_INTERVAL_SECONDS:
+            return
+        if force or (not self.skills_runtime_prepared):
+            ensure_runtime_skills(self.skills.skills_root)
+            self.skills_runtime_prepared = True
+        prev_fp = str(self.skills.fingerprint or "")
+        self.skills.reload(force=force)
+        self.skills_last_refresh_ts = now
+        if prev_fp and self.skills.fingerprint and prev_fp != self.skills.fingerprint:
+            self.skill_load_cache = {}
+
+    def _load_skill_with_cache(self, name: str) -> str:
+        self._ensure_skills_ready(force=False)
+        key, err = self.skills._resolve_name(name)
+        if err or not key:
+            return err or "Error: skill not found"
+        fp = str(self.skills.fingerprint or "")
+        row = self.skill_load_cache.get(key, {})
+        if isinstance(row, dict):
+            cached_fp = str(row.get("fingerprint", "") or "")
+            body_z = str(row.get("body_z", "") or "")
+            if body_z and cached_fp and cached_fp == fp:
+                restored = decompress_text_blob(body_z)
+                if restored:
+                    return restored
+        text = self.skills.load(name)
+        if text and not str(text).startswith("Error:"):
+            self.skill_load_cache[key] = {
+                "fingerprint": fp,
+                "body_z": compress_text_blob(text),
+                "updated_at": now_ts(),
+            }
+            self._prune_skill_load_cache()
+            self.updated_at = now_ts()
+            self._persist()
+        return text
+
+    def _system_prompt(self) -> str:
+        try:
+            self._ensure_skills_ready(force=False)
+        except Exception:
+            pass
+        uploads_ctx = self._uploads_prompt_block()
+        html_hint = self._html_frontend_boost_instruction()
+        research_hint = self._deep_research_boost_instruction()
+        return (
+            f"You are a coding agent running in isolated session workspace {self.files_root}. "
+            "Use tools to inspect files, execute commands, and edit code safely. "
+            "For non-trivial tasks, call TodoWrite early with 3-7 concise items "
+            "(exactly one in_progress), then update only when plan/status changes. "
+            "Avoid redundant TodoWrite calls. "
+            "If TodoWrite fails or repeats with no changes, call TodoWriteRescue with simple string items. "
+            "For multi-step work use task_create/task_update/task_list as needed. "
+            "Use load_skill only when needed; use provider:name if skill name is ambiguous. "
+            "Loaded skill content is cached per session; do not repeatedly call load_skill for the same skill unless needed. "
+            "If execution stalls (no tool calls / repeated failures), load_skill('execution-degradation-recovery') and follow it. "
+            "Use list_skill_providers and list_skill_protocols to inspect dynamic backend skill integrations. "
+            "If user asks to save generated guidance/workflow as reusable skill, call write_skill to write SKILL.md under global ./skills. "
+            "When changing files, prefer write_file/edit_file so the UI can render line-level diffs. "
+            "If a write_file/edit_file tool call fails due malformed or truncated arguments, regenerate and resend the complete JSON arguments. "
+            "If output or tool arguments look truncated, split work into smaller subtasks and execute one subtask at a time. "
+            "If context has been compacted, call context_recall to fetch exact archived messages by segment_id/query before guessing. "
+            "When a <compact-resume> hint appears, inherit pending todos/tasks and continue exploration immediately. "
+            f"Current context upper bound is ~{self.context_token_upper_bound} tokens; keep steps compact to stay under this limit. "
+            "When user asks to modify uploaded content, prioritize files under the uploaded workspace paths.\n\n"
+            "If user asks to generate image/audio/video, use generate_media when active model capability supports it.\n\n"
+            f"{(html_hint + '\n\n') if html_hint else ''}"
+            f"{(research_hint + '\n\n') if research_hint else ''}"
+            f"{model_language_instruction(self.ui_language)}\n\n"
+            f"Uploaded files context:\n{uploads_ctx}\n\n"
+            f"Available skills:\n{self.skills.descriptions()}"
+        )
+
+    def _estimate_tokens(self) -> int:
+        return len(json_dumps(self.messages)) // 4
+
+    def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
+        limit = max(1, int(self.context_token_upper_bound or 0))
+        used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
+        left = max(0, limit - used)
+        left_pct = max(0.0, min(100.0, (left * 100.0) / limit))
+        used_pct = max(0.0, min(100.0, (used * 100.0) / limit))
+        return {
+            "limit": limit,
+            "used": used,
+            "left": left,
+            "left_percent": left_pct,
+            "used_percent": used_pct,
+        }
+
+    def _estimate_output_tokens(self, text: str, thinking_text: str = "", tool_calls: list | None = None) -> int:
+        t_main = len(str(text or "")) // 4
+        t_think = len(str(thinking_text or "")) // 4
+        t_tools = 0
+        for tc in tool_calls or []:
+            try:
+                t_tools += len(json_dumps(tc)) // 4
+            except Exception:
+                t_tools += len(str(tc)) // 4
+        return max(1, t_main + t_think + t_tools)
+
+    def _derive_context_limit_from_output(self, output_tokens: int) -> int:
+        estimated = int(
+            max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, output_tokens * 12))
+        )
+        return max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, estimated))
+
+    def _trim_truncated_tail_line(self, text: str) -> str:
+        src = str(text or "")
+        if not src:
+            return ""
+        if src.endswith("\n"):
+            return src
+        idx = src.rfind("\n")
+        head = src[: idx + 1] if idx >= 0 else ""
+        tail = src[idx + 1 :] if idx >= 0 else src
+        tail_s = tail.strip()
+        if not tail_s:
+            return head.rstrip("\n")
+        if re.search(r"[,:\-({\[`\"'`]+$", tail_s):
+            return head.rstrip("\n")
+        return src
+
+    def _pair_completion_suffix(self, text: str) -> str:
+        src = str(text or "")
+        if not src:
+            return ""
+        src = src[-TRUNCATION_PAIR_SCAN_CHARS:]
+        suffix = ""
+        if src.count("```") % 2 == 1:
+            suffix += "\n```"
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in src:
+            if in_string:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == "\"":
+                    in_string = False
+                continue
+            if ch == "\"":
+                in_string = True
+                continue
+            if ch in "{[(":
+                stack.append(ch)
+                continue
+            if ch == ")" and stack and stack[-1] == "(":
+                stack.pop()
+                continue
+            if ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+                continue
+            if ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+                continue
+        if in_string:
+            suffix += "\""
+        closer = {"(": ")", "[": "]", "{": "}"}
+        while stack:
+            suffix += closer.get(stack.pop(), "")
+        return suffix
+
+    def _merge_continuation_text(self, base: str, cont: str) -> str:
+        left = str(base or "")
+        right = str(cont or "")
+        if not right.strip():
+            return left
+        merged_right = right.lstrip()
+        merged_right = re.sub(
+            r"^(继续|接下来|以下是续写|continuation[:：]?|continue[:：]?)\s*",
+            "",
+            merged_right,
+            flags=re.IGNORECASE,
+        )
+        max_scan = min(TRUNCATION_OVERLAP_SCAN_CHARS, len(left), len(merged_right))
+        for k in range(max_scan, 24, -1):
+            if left[-k:] == merged_right[:k]:
+                merged_right = merged_right[k:]
+                break
+        if not merged_right:
+            return left
+        if left and merged_right:
+            if not left.endswith(("\n", " ", "\t")) and not merged_right.startswith(
+                ("\n", " ", "\t", ".", ",", "，", "。", ";", "；", ":", "：", ")", "]", "}")
+            ):
+                return left + "\n" + merged_right
+        return left + merged_right
+
+    def _publish_live_truncation(
+        self,
+        *,
+        text: str,
+        attempts: int,
+        tokens: int,
+        active: bool,
+        kind: str = "",
+        tool: str = "",
+        force_emit: bool = False,
+    ):
+        now_tick = now_ts()
+        with self.lock:
+            prev_active = bool(self.live_truncation_active)
+            prev_text = str(self.live_truncation_text or "")
+            prev_attempts = int(self.live_truncation_attempts or 0)
+            prev_tokens = int(self.live_truncation_tokens or 0)
+            prev_kind = str(self.live_truncation_kind or "")
+            prev_tool = str(self.live_truncation_tool or "")
+            clipped = str(text or "")
+            if len(clipped) > TRUNCATION_LIVE_BUFFER_MAX_CHARS:
+                clipped = clipped[-TRUNCATION_LIVE_BUFFER_MAX_CHARS:]
+            attempts_now = max(0, int(attempts or 0))
+            tokens_now = max(0, int(tokens or 0))
+            active_now = bool(active)
+            kind_now = str(kind or "").strip()
+            tool_now = str(tool or "").strip()
+            self.live_truncation_text = clipped
+            self.live_truncation_attempts = attempts_now
+            self.live_truncation_tokens = tokens_now
+            self.live_truncation_active = active_now
+            self.live_truncation_kind = kind_now
+            self.live_truncation_tool = tool_now
+            changed = (
+                prev_active != active_now
+                or prev_text != clipped
+                or prev_attempts != attempts_now
+                or prev_tokens != tokens_now
+                or prev_kind != kind_now
+                or prev_tool != tool_now
+            )
+            if changed:
+                self.updated_at = now_tick
+            should_emit = bool(force_emit)
+            if changed and active_now:
+                should_emit = should_emit or (now_tick - self.live_truncation_last_emit >= 0.35)
+            if changed and (prev_active != active_now):
+                should_emit = True
+            if should_emit:
+                self.live_truncation_last_emit = now_tick
+        if should_emit:
+            self._emit_transient(
+                "truncation_delta",
+                {
+                    "summary": (
+                        f"truncation continuation {'active' if active else 'updated'} "
+                        f"(attempts={max(0, int(attempts or 0))}, tokens≈{max(0, int(tokens or 0))}"
+                        f"{'; kind=' + str(kind).strip() if str(kind).strip() else ''}"
+                        f"{'; tool=' + str(tool).strip() if str(tool).strip() else ''})"
+                    ),
+                    "attempts": max(0, int(attempts or 0)),
+                    "tokens": max(0, int(tokens or 0)),
+                    "active": bool(active),
+                    "kind": str(kind or "").strip(),
+                    "tool": str(tool or "").strip(),
+                },
+            )
+
+    def _clear_live_truncation(self):
+        self._publish_live_truncation(text="", attempts=0, tokens=0, active=False, force_emit=False)
+
+    def _build_truncation_continue_prompt(
+        self,
+        partial_text: str,
+        *,
+        attempt: int,
+        max_attempts: int,
+        output_tokens: int,
+    ) -> str:
+        tail = str(partial_text or "")
+        if len(tail) > TRUNCATION_CONTINUATION_TAIL_CHARS:
+            tail = tail[-TRUNCATION_CONTINUATION_TAIL_CHARS:]
+        pair_hint = self._pair_completion_suffix(tail)
+        return (
+            "<truncation-continue>"
+            "Your previous assistant output was truncated by token limit. "
+            f"attempt={attempt}/{max_attempts}, previous_tokens≈{max(0, int(output_tokens or 0))}. "
+            "Continue from the exact cut-off position only. "
+            "Do NOT restart from the beginning. Do NOT add meta commentary. "
+            "If delimiters/fences are left open, close them correctly.\n"
+            f"Pair-completion hint: {pair_hint if pair_hint else '(none)'}\n"
+            "Current tail context:\n"
+            "```text\n"
+            f"{tail}\n"
+            "```\n"
+            "</truncation-continue>"
+        )
+
+    def _continue_truncated_assistant_output(
+        self,
+        *,
+        partial_text: str,
+        output_tokens: int,
+        pinned_selection: str,
+        kind: str = "assistant",
+        tool_name: str = "",
+        max_passes: int = TRUNCATION_CONTINUATION_MAX_PASSES,
+        max_tokens: int = TRUNCATION_CONTINUATION_MAX_TOKENS,
+    ) -> tuple[str, int, dict]:
+        working = str(partial_text or "")
+        tokens_now = max(1, int(output_tokens or self._estimate_output_tokens(working, "", [])))
+        attempts = 0
+        resolved = False
+        if not working.strip():
+            return working, tokens_now, {"attempts": 0, "resolved": False}
+
+        now_tick = now_ts()
+        if now_tick - self.last_truncation_ts >= 0.2:
+            self.truncation_count += 1
+        self.last_truncation_ts = now_tick
+        old_bound = int(self.context_token_upper_bound)
+        new_bound = self._derive_context_limit_from_output(tokens_now)
+        self.context_token_upper_bound = min(old_bound, new_bound)
+
+        self._publish_live_truncation(
+            text=working,
+            attempts=0,
+            tokens=tokens_now,
+            active=True,
+            kind=kind,
+            tool=tool_name,
+            force_emit=True,
+        )
+        sys_prompt = (
+            "You are continuing a truncated output. "
+            "Return ONLY the continuation text (no markdown, no code fences unless already open, no meta). "
+            "Do not restart from the beginning."
+        )
+        if kind == "tool_args":
+            sys_prompt = (
+                "You are continuing a truncated JSON payload for tool arguments. "
+                "Return ONLY the continuation bytes that must be appended to the existing JSON. "
+                "No markdown, no explanations."
+            )
+        sys_prompt = f"{sys_prompt}\n\n{model_language_instruction(self.ui_language)}"
+
+        for idx in range(max(1, int(max_passes or TRUNCATION_CONTINUATION_MAX_PASSES))):
+            attempts = idx + 1
+            trimmed = self._trim_truncated_tail_line(working)
+            prompt = self._build_truncation_continue_prompt(
+                trimmed,
+                attempt=attempts,
+                max_attempts=max(1, int(max_passes or TRUNCATION_CONTINUATION_MAX_PASSES)),
+                output_tokens=tokens_now,
+            )
+            assist_echo = (
+                trimmed
+                if len(trimmed) <= TRUNCATION_CONTINUATION_ECHO_CHARS
+                else trimmed[-TRUNCATION_CONTINUATION_ECHO_CHARS:]
+            )
+            carry_msgs = [
+                {"role": "assistant", "content": assist_echo, "ts": now_ts()},
+                {"role": "user", "content": prompt, "ts": now_ts()},
+            ]
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "truncation continuation pass "
+                        f"{attempts}/{max(1, int(max_passes or TRUNCATION_CONTINUATION_MAX_PASSES))} "
+                        f"(tokens≈{tokens_now})"
+                    )
+                },
+            )
+            try:
+                rsp = self._chat_with_same_model_retry(
+                    carry_msgs,
+                    tools=None,
+                    system=sys_prompt,
+                    max_tokens=max(800, int(max_tokens or TRUNCATION_CONTINUATION_MAX_TOKENS)),
+                    think=False,
+                    stream_thinking=False,
+                    on_thinking_chunk=self._append_live_thinking,
+                    pinned_selection=pinned_selection,
+                    context_label="truncation continuation",
+                    retries=1,
+                    media_inputs=None,
+                )
+            except Exception as exc:
+                self._emit(
+                    "status",
+                    {"summary": f"truncation continuation failed: {trim(str(exc), 180)}"},
+                )
+                break
+            cont = str(rsp.get("content") or "")
+            if not cont.strip():
+                break
+            merged = self._merge_continuation_text(trimmed, cont)
+            if merged == working:
+                break
+            working = merged
+            tokens_now = self._estimate_output_tokens(working, "", [])
+            self._publish_live_truncation(
+                text=working,
+                attempts=attempts,
+                tokens=tokens_now,
+                active=True,
+                kind=kind,
+                tool=tool_name,
+                force_emit=False,
+            )
+            if not self._looks_like_truncated_generation(working, [], tokens_now):
+                resolved = True
+                break
+
+        finalized = self._trim_truncated_tail_line(working)
+        suffix = self._pair_completion_suffix(finalized)
+        if suffix and (not finalized.endswith(suffix)):
+            finalized = f"{finalized}{suffix}"
+            tokens_now = self._estimate_output_tokens(finalized, "", [])
+            if not self._looks_like_truncated_generation(finalized, [], tokens_now):
+                resolved = True
+
+        self._publish_live_truncation(
+            text=finalized,
+            attempts=attempts,
+            tokens=tokens_now,
+            active=False,
+            kind=kind,
+            tool=tool_name,
+            force_emit=True,
+        )
+        return finalized, tokens_now, {"attempts": attempts, "resolved": bool(resolved)}
+
+    def _parse_tool_args_text(self, text: str) -> tuple[dict, str]:
+        src = str(text or "").strip()
+        if not src:
+            return {}, "empty"
+        direct = extract_json_object_from_text(src, {})
+        if direct:
+            return direct, ""
+        repaired = repair_truncated_json_object(src)
+        if repaired and repaired != src:
+            boxed = extract_json_object_from_text(repaired, {})
+            if boxed:
+                return boxed, ""
+        return {}, "json-parse-failed"
+
+    def _recover_tool_args_from_malformed(
+        self,
+        *,
+        name: str,
+        raw_args: object,
+        pinned_selection: str,
+    ) -> tuple[bool, dict, str]:
+        if not isinstance(raw_args, (str, dict, list)):
+            return False, {}, "no raw_args"
+        raw = str(raw_args or "").strip()
+        if not raw:
+            return False, {}, "empty raw_args"
+        parsed, _ = self._parse_tool_args_text(raw)
+        if parsed:
+            return True, parsed, "parsed"
+        out_tokens = self._estimate_output_tokens(raw, "", [])
+        repaired_text, _, meta = self._continue_truncated_assistant_output(
+            partial_text=raw,
+            output_tokens=out_tokens,
+            pinned_selection=pinned_selection,
+            kind="tool_args",
+            tool_name=name,
+            max_passes=2,
+            max_tokens=1400,
+        )
+        parsed2, err2 = self._parse_tool_args_text(repaired_text)
+        if parsed2:
+            attempts = int(meta.get("attempts", 0) or 0)
+            return True, parsed2, f"continued-passes={attempts}"
+        return False, {}, err2 or "recover-failed"
+
+    def _recover_tool_args_from_missing(
+        self,
+        *,
+        name: str,
+        args: dict,
+        missing: list[str],
+        pinned_selection: str,
+    ) -> tuple[bool, dict, str]:
+        if not isinstance(args, dict):
+            return False, {}, "args-not-object"
+        src = json_dumps(args)
+        if not src:
+            return False, {}, "empty"
+        prompt = (
+            "Tool arguments appear incomplete (likely truncated). "
+            f"Missing required keys: {', '.join(missing)}. "
+            "Return ONLY a complete JSON object for the same tool call."
+        )
+        user_msg = (
+            "<tool-args-recover>\n"
+            f"tool={name}\n"
+            f"{prompt}\n"
+            "Current partial args:\n"
+            "```json\n"
+            f"{src}\n"
+            "```\n"
+            "</tool-args-recover>"
+        )
+        try:
+            rsp = self._chat_with_same_model_retry(
+                [{"role": "user", "content": user_msg, "ts": now_ts()}],
+                tools=None,
+                system=(
+                    "You repair tool argument JSON. Return ONLY one valid JSON object and nothing else.\n\n"
+                    + model_language_instruction(self.ui_language)
+                ),
+                max_tokens=1000,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="tool args recover",
+                retries=1,
+                media_inputs=None,
+            )
+        except Exception as exc:
+            return False, {}, trim(str(exc), 140)
+        out = str(rsp.get("content") or "")
+        parsed, err = self._parse_tool_args_text(out)
+        if parsed:
+            return True, parsed, "model-repaired"
+        return False, {}, err or "model-repair-failed"
+
+    def _looks_like_truncated_generation(
+        self,
+        text: str,
+        tool_calls: list | None,
+        output_tokens: int,
+    ) -> bool:
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+        # Strong structural truncation signals.
+        if raw.count("```") % 2 == 1:
+            return True
+        if raw.endswith(("{", "[", "(")):
+            return True
+        # If model already emitted tool calls, avoid false-positive text truncation detection.
+        if tool_calls:
+            return False
+
+        near_limit = output_tokens >= int(AGENT_MAX_OUTPUT_TOKENS * 0.90)
+        # Mid-size outputs (e.g. planning text ending with a Chinese colon) should not be
+        # treated as truncation unless close to max tokens or JSON-like unfinished payload.
+        json_like_tail = bool(
+            re.search(r"[\{\[][^}\]]*$", raw[-280:]) or re.search(r"\"[^\"]*\"\s*:\s*$", raw[-180:])
+        )
+        if raw.endswith((",", ":", "：")):
+            if near_limit or json_like_tail:
+                return True
+            return False
+        if raw.endswith("-"):
+            if near_limit and not re.search(r"[。！？.!?]$", raw[:-1].rstrip()):
+                return True
+            return False
+
+        if not near_limit:
+            return False
+        if re.search(r"[。！？.!?]$", raw):
+            return False
+        if len(raw) < 120:
+            return False
+        return True
+
+    def _has_open_truncation_tasks(self) -> bool:
+        for task in self.tasks.list_objects():
+            subject = str(task.get("subject", ""))
+            status = str(task.get("status", ""))
+            if subject.startswith("[TRUNCATION]") and status in {"pending", "in_progress"}:
+                return True
+        return False
+
+    def _create_truncation_subtasks(self, reason: str) -> list[int]:
+        if self._has_open_truncation_tasks():
+            return []
+        goal = self._latest_user_goal_text()
+        subjects = [
+            f"[TRUNCATION] Scope and split: {trim(goal, 88)}",
+            "[TRUNCATION] Implement current chunk with tools",
+            "[TRUNCATION] Verify output and finish next chunk",
+        ]
+        ids: list[int] = []
+        for idx, subject in enumerate(subjects):
+            desc = (
+                f"auto-created due to truncation: {trim(reason, 180)}; "
+                f"step={idx + 1}/{len(subjects)}"
+            )
+            row = parse_json_object(self.tasks.create(subject, desc), {})
+            task_id = int(row.get("id", 0) or 0)
+            if task_id > 0:
+                ids.append(task_id)
+        if not ids:
+            return []
+        self.tasks.update(ids[0], status="in_progress")
+        for i in range(1, len(ids)):
+            self.tasks.update(ids[i], add_blocked_by=[ids[i - 1]])
+        self.truncation_rescue_task_ids = list(ids)
+        self._emit(
+            "status",
+            {
+                "summary": f"truncation subtasks created: {', '.join(str(x) for x in ids)}",
+            },
+        )
+        return ids
+
+    def _ensure_truncation_todos(self):
+        if self.todo.snapshot():
+            return
+        try:
+            self.todo.update(
+                [
+                    {
+                        "content": "Split task into small subtasks",
+                        "status": "in_progress",
+                        "activeForm": "Working on: Split task into small subtasks",
+                    },
+                    {
+                        "content": "Execute one subtask and persist intermediate result",
+                        "status": "pending",
+                        "activeForm": "Pending: Execute one subtask and persist intermediate result",
+                    },
+                    {
+                        "content": "Validate and continue remaining subtasks",
+                        "status": "pending",
+                        "activeForm": "Pending: Validate and continue remaining subtasks",
+                    },
+                ]
+            )
+        except Exception:
+            pass
+
+    def _inject_truncation_rescue_hint(self, reason: str, output_tokens: int, task_ids: list[int]):
+        ids_txt = ", ".join(str(x) for x in task_ids) if task_ids else "(reuse existing tasks)"
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<truncate-rescue>"
+                    f"Detected truncation: {trim(reason, 220)}. "
+                    f"Estimated output tokens: {output_tokens}. "
+                    f"Current context upper bound: {self.context_token_upper_bound}. "
+                    f"Subtasks: {ids_txt}. "
+                    "Before retrying failed tool calls, first create/update a compact TodoWrite plan (3-7 items) "
+                    "that splits work into chunks. "
+                    "Execute one subtask at a time, keep tool arguments complete JSON and concise. "
+                    "After each subtask, update task/todo status before moving on."
+                    "</truncate-rescue>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+
+    def _handle_truncation_rescue(
+        self,
+        reason: str,
+        output_tokens: int,
+        source: str = "",
+        *,
+        allow_compact: bool = True,
+    ):
+        now_tick = now_ts()
+        if now_tick - self.last_truncation_ts < 1.5:
+            return
+        self.truncation_count += 1
+        self.last_truncation_ts = now_tick
+        old_bound = self.context_token_upper_bound
+        if not self.context_limit_locked:
+            new_bound = self._derive_context_limit_from_output(output_tokens)
+            self.context_token_upper_bound = min(old_bound, new_bound)
+            if self.context_token_upper_bound < old_bound:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"context upper bound adjusted {old_bound}->{self.context_token_upper_bound} "
+                            f"(output_tokens≈{output_tokens})"
+                        )
+                    },
+                )
+        if allow_compact and self._estimate_tokens() > self.context_token_upper_bound:
+            self._auto_compact(f"truncation-rescue:{source or 'auto'}")
+        self._ensure_truncation_todos()
+        task_ids = self._create_truncation_subtasks(reason)
+        self._inject_truncation_rescue_hint(reason, output_tokens, task_ids)
+
+    def _microcompact(self):
+        tool_messages = [m for m in self.messages if m.get("role") == "tool"]
+        if len(tool_messages) <= 3:
+            return
+        kept = tool_messages[-3:]
+        keep_ids = {id(x) for x in kept}
+        for msg in self.messages:
+            if msg.get("role") == "tool" and id(msg) not in keep_ids:
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 120:
+                    msg["content"] = "[cleared by microcompact]"
+
+    def _estimate_messages_tokens(self, rows: list[dict]) -> int:
+        try:
+            return len(json_dumps(rows)) // 4
+        except Exception:
+            total = 0
+            for row in rows:
+                total += len(str(row.get("content", ""))) // 4
+            return total
+
+    def _select_compact_tail(self, token_budget: int, min_count: int = 8, max_count: int = 48) -> list[dict]:
+        if not self.messages:
+            return []
+        budget = max(2000, int(token_budget))
+        selected: list[dict] = []
+        total = 0
+        for row in reversed(self.messages):
+            row_tokens = max(1, self._estimate_messages_tokens([row]))
+            if selected and len(selected) >= min_count and (total + row_tokens) > budget:
+                break
+            selected.append(row)
+            total += row_tokens
+            if len(selected) >= max_count:
+                break
+        selected.reverse()
+        return [dict(x) for x in selected]
+
+    def _archive_context_segment(self, rows: list[dict], reason: str) -> dict:
+        if not rows:
+            return {}
+        seg_id = f"ctxseg_{int(now_ts())}_{uuid.uuid4().hex[:8]}"
+        fp = self.context_archive_dir / f"{seg_id}.jsonl"
+        sha = hashlib.sha256()
+        first_ts = 0.0
+        last_ts = 0.0
+        count = 0
+        with fp.open("w", encoding="utf-8") as handle:
+            for idx, row in enumerate(rows):
+                line = json_dumps(row)
+                payload = (line + "\n").encode("utf-8")
+                sha.update(payload)
+                handle.write(line + "\n")
+                msg_ts = float(row.get("ts", 0.0) or 0.0)
+                if idx == 0:
+                    first_ts = msg_ts
+                last_ts = msg_ts
+                count += 1
+        rel_path = fp.relative_to(self.root).as_posix()
+        seg = {
+            "id": seg_id,
+            "path": rel_path,
+            "reason": str(reason or ""),
+            "messages": count,
+            "bytes": int(fp.stat().st_size if fp.exists() else 0),
+            "sha256": sha.hexdigest(),
+            "created_at": now_ts(),
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+        }
+        self.context_archives.append(seg)
+        self.context_archives = self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
+        return seg
+
+    def _summarize_compact_rows(self, rows: list[dict]) -> str:
+        if not rows:
+            return "(no archived rows)"
+        snippet = json_dumps(rows)[-96_000:]
+        try:
+            resp = self.ollama.chat(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize unfinished work, key decisions, and pending next actions in <= 10 bullets.\n"
+                            f"{snippet}"
+                        ),
+                    }
+                ],
+                max_tokens=900,
+                think=False,
+            )
+            text = str(resp.get("content", "")).strip()
+            if text:
+                return trim(text, 4000)
+        except Exception as exc:
+            return f"(summary failed: {exc})"
+        return "(summary unavailable)"
+
+    def _open_work_brief(self) -> str:
+        alias = {
+            "todo": "pending",
+            "doing": "in_progress",
+            "inprogress": "in_progress",
+            "in-progress": "in_progress",
+            "done": "completed",
+            "finish": "completed",
+            "finished": "completed",
+        }
+
+        def norm_status(raw: object, fallback: str) -> str:
+            key = str(raw or "").strip().lower()
+            mapped = alias.get(key, key or fallback)
+            if mapped in {"pending", "in_progress", "completed", "blocked"}:
+                return mapped
+            return fallback
+
+        todo_open: list[str] = []
+        focus = ""
+        for row in self.todo.snapshot():
+            status = norm_status(row.get("status", ""), "pending")
+            if status not in {"pending", "in_progress"}:
+                continue
+            content = normalize_work_text(row.get("content", ""), status) or str(row.get("content", "")).strip()
+            content = trim(content or "(empty todo)", 140)
+            if status == "in_progress" and not focus:
+                focus = content
+            todo_open.append(f"- [{status}] {content}")
+
+        task_open: list[str] = []
+        for row in self.tasks.list_objects():
+            status = norm_status(row.get("status", ""), "pending")
+            if status not in {"pending", "in_progress", "blocked"}:
+                continue
+            subject = normalize_work_text(row.get("subject", ""), status) or str(row.get("subject", "")).strip()
+            subject = trim(subject or "(empty task)", 140)
+            owner = str(row.get("owner", "") or "").strip()
+            owner_txt = f" @{owner}" if owner else ""
+            task_open.append(f"- #{row.get('id')} [{status}] {subject}{owner_txt}")
+
+        lines = [f"Open todos ({len(todo_open)}):"]
+        lines.extend(todo_open[:6] if todo_open else ["- none"])
+        if focus:
+            lines.append(f"Current focus: {focus}")
+        lines.append(f"Open tasks ({len(task_open)}):")
+        lines.extend(task_open[:6] if task_open else ["- none"])
+        return "\n".join(lines)
+
+    def _auto_compact(self, reason: str):
+        context_before = self._context_budget_metrics()
+        transcript_dir = self.root / "transcripts"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = transcript_dir / f"transcript_{int(now_ts())}.jsonl"
+        with transcript_path.open("w", encoding="utf-8") as handle:
+            for msg in self.messages:
+                handle.write(json_dumps(msg) + "\n")
+        tail_budget = max(4500, min(16_000, int(self.context_token_upper_bound * 0.35)))
+        tail = self._select_compact_tail(tail_budget)
+        if len(tail) >= len(self.messages):
+            tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
+        archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
+        seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
+        summary = self._summarize_compact_rows(archived_rows)
+        seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
+        seg_msg_count = int(seg.get("messages", 0) or 0) if isinstance(seg, dict) else 0
+        seg_path = str(seg.get("path", "")) if isinstance(seg, dict) else ""
+        continuation = (
+            f"If details are missing, call context_recall with segment_id='{seg_id}', max_messages=40, offset=0."
+            if seg_id
+            else "If details are missing, call context_recall with recent_segments=2."
+        )
+        compact_note = (
+            "<compact-resume>\n"
+            f"reason: {reason}\n"
+            f"transcript: {transcript_path}\n"
+            f"archive_segment: {seg_id or 'none'} messages={seg_msg_count} path={seg_path or '-'}\n"
+            f"{self._open_work_brief()}\n"
+            f"summary:\n{summary}\n"
+            f"{continuation}\n"
+            "Continue exploring from current pending work; do not restart from scratch.\n"
+            "</compact-resume>"
+        )
+        tail.append({"role": "user", "content": compact_note, "ts": now_ts()})
+        target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
+        while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
+            tail.pop(0)
+        if self._estimate_messages_tokens(tail) > target_tokens:
+            for msg in tail:
+                if msg.get("role") == "tool":
+                    msg["content"] = trim(msg.get("content", ""), 1800)
+            while len(tail) > 2 and self._estimate_messages_tokens(tail) > target_tokens:
+                tail.pop(0)
+        self.messages = tail
+        self.last_compact_reason = str(reason or "")
+        self.last_compact_ts = now_ts()
+        self._emit(
+            "compact",
+            {
+                "summary": f"context compacted ({reason}) archives={len(self.context_archives)}",
+                "reason": str(reason or ""),
+                "archive_segment": seg_id,
+                "archived_messages": seg_msg_count,
+                "context_limit_before": int(context_before.get("limit", 0)),
+                "context_used_before": int(context_before.get("used", 0)),
+                "context_left_before": int(context_before.get("left", 0)),
+                "context_left_percent_before": round(float(context_before.get("left_percent", 0.0)), 2),
+            },
+        )
+
+    def _git_status_map(self, cwd: Path) -> dict[str, str]:
+        try:
+            check = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if check.returncode != 0:
+                return {}
+            r = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if r.returncode != 0:
+                return {}
+            out = {}
+            for line in r.stdout.splitlines():
+                if not line.strip():
+                    continue
+                status = line[:2].strip()
+                path = line[3:]
+                if " -> " in path:
+                    path = path.split(" -> ", 1)[1]
+                out[path.strip()] = status
+            return out
+        except Exception:
+            return {}
+
+    def _status_delta(self, before: dict[str, str], after: dict[str, str]) -> list[str]:
+        keys = set(before.keys()) | set(after.keys())
+        changed = []
+        for k in sorted(keys):
+            if before.get(k) != after.get(k):
+                changed.append(k)
+        return changed[:60]
+
+    def _session_path(self, path_text: str) -> Path:
+        return safe_path(path_text, self.files_root)
+
+    def _session_rel(self, path: Path) -> str:
+        target = path.resolve()
+        root = self.files_root.resolve()
+        if target.is_relative_to(root):
+            return target.relative_to(root).as_posix()
+        return str(target)
+
+    def _code_preview_bucket_dir(self, rel_path: str) -> Path:
+        rel = normalize_rel_preview_path(rel_path)
+        digest = hashlib.sha1(rel.encode("utf-8", errors="ignore")).hexdigest()[:14]
+        target = self.code_preview_dir / digest
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _write_code_preview_blob(self, rel_path: str, stage_id: str, kind: str, text: str) -> str:
+        bucket = self._code_preview_bucket_dir(rel_path)
+        fp = bucket / f"{stage_id}.{kind}.txt"
+        fp.write_text(str(text or ""), encoding="utf-8")
+        return fp.relative_to(self.root).as_posix()
+
+    def _read_code_preview_blob(self, rel_blob_path: str) -> str:
+        rel = normalize_rel_preview_path(rel_blob_path)
+        if not rel:
+            return ""
+        try:
+            fp = safe_path(rel, self.root)
+        except Exception:
+            return ""
+        if not fp.exists() or not fp.is_file():
+            return ""
+        return try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES * 2) or ""
+
+    def _drop_code_preview_stage_files(self, stage: dict):
+        for key in ("before_blob", "after_blob"):
+            rel = normalize_rel_preview_path(stage.get(key, ""))
+            if not rel:
+                continue
+            try:
+                fp = safe_path(rel, self.root)
+                if fp.exists() and fp.is_file():
+                    fp.unlink()
+            except Exception:
+                continue
+
+    def _prune_code_preview_locked(self):
+        cleaned: dict[str, list[dict]] = {}
+        removed: list[dict] = []
+        for path, stages in (self.code_preview_index or {}).items():
+            rel = normalize_rel_preview_path(path)
+            if not rel or (not isinstance(stages, list)):
+                continue
+            valid: list[dict] = []
+            for row in stages:
+                if not isinstance(row, dict):
+                    continue
+                sid = str(row.get("id", "") or "").strip()
+                if not sid:
+                    continue
+                valid.append(
+                    {
+                        "id": sid,
+                        "ts": float(row.get("ts", 0.0) or 0.0),
+                        "path": rel,
+                        "tool": str(row.get("tool", "") or ""),
+                        "change_type": str(row.get("change_type", "") or ""),
+                        "added": int(row.get("added", 0) or 0),
+                        "deleted": int(row.get("deleted", 0) or 0),
+                        "before_blob": str(row.get("before_blob", "") or ""),
+                        "after_blob": str(row.get("after_blob", "") or ""),
+                        "bytes_after": int(row.get("bytes_after", 0) or 0),
+                        "lines_after": int(row.get("lines_after", 0) or 0),
+                    }
+                )
+            if len(valid) > CODE_PREVIEW_STAGE_MAX_PER_FILE:
+                removed.extend(valid[: -CODE_PREVIEW_STAGE_MAX_PER_FILE])
+                valid = valid[-CODE_PREVIEW_STAGE_MAX_PER_FILE :]
+            if valid:
+                cleaned[rel] = valid
+        total = sum(len(v) for v in cleaned.values())
+        while total > CODE_PREVIEW_STAGE_MAX_TOTAL:
+            oldest_path = ""
+            oldest_ts = None
+            for path, rows in cleaned.items():
+                if not rows:
+                    continue
+                ts = float(rows[0].get("ts", 0.0) or 0.0)
+                if oldest_ts is None or ts < oldest_ts:
+                    oldest_ts = ts
+                    oldest_path = path
+            if not oldest_path:
+                break
+            popped = cleaned[oldest_path].pop(0)
+            removed.append(popped)
+            total -= 1
+            if not cleaned[oldest_path]:
+                cleaned.pop(oldest_path, None)
+        self.code_preview_index = cleaned
+        for row in removed:
+            self._drop_code_preview_stage_files(row)
+
+    def _record_code_preview_stage(
+        self,
+        *,
+        rel_path: str,
+        before_text: str,
+        after_text: str,
+        change_type: str,
+        tool_name: str,
+        added: int,
+        deleted: int,
+    ) -> dict | None:
+        rel = normalize_rel_preview_path(rel_path)
+        if not rel or (not is_code_preview_candidate(rel)):
+            return None
+        after_raw = str(after_text or "")
+        after_bytes = len(after_raw.encode("utf-8", errors="ignore"))
+        if after_bytes > CODE_PREVIEW_STAGE_MAX_BYTES:
+            return None
+        before_raw = str(before_text or "")
+        if len(before_raw.encode("utf-8", errors="ignore")) > CODE_PREVIEW_STAGE_MAX_BYTES:
+            before_raw = ""
+        stage_id = f"stage_{int(now_ts() * 1000)}_{uuid.uuid4().hex[:6]}"
+        try:
+            before_blob = self._write_code_preview_blob(rel, stage_id, "before", before_raw)
+            after_blob = self._write_code_preview_blob(rel, stage_id, "after", after_raw)
+        except Exception:
+            return None
+        ts = now_ts()
+        stage = {
+            "id": stage_id,
+            "ts": ts,
+            "path": rel,
+            "tool": str(tool_name or ""),
+            "change_type": str(change_type or "modified"),
+            "added": int(added or 0),
+            "deleted": int(deleted or 0),
+            "before_blob": before_blob,
+            "after_blob": after_blob,
+            "bytes_after": after_bytes,
+            "lines_after": after_raw.count("\n") + (1 if after_raw else 0),
+        }
+        with self.lock:
+            rows = list(self.code_preview_index.get(rel, []))
+            rows.append(stage)
+            self.code_preview_index[rel] = rows
+            self._prune_code_preview_locked()
+            final_rows = list(self.code_preview_index.get(rel, []))
+            stage_count = len(final_rows)
+            stage_index = stage_count
+            self.updated_at = now_ts()
+        return {
+            "id": stage_id,
+            "index": stage_index,
+            "count": stage_count,
+            "path": rel,
+            "change_type": stage.get("change_type", "modified"),
+            "added": int(stage.get("added", 0) or 0),
+            "deleted": int(stage.get("deleted", 0) or 0),
+            "ts": float(stage.get("ts", ts) or ts),
+        }
+
+    def code_preview_stages(self, rel_path: str) -> dict:
+        fp = self._session_path(rel_path)
+        rel = self._session_rel(fp)
+        rel = normalize_rel_preview_path(rel)
+        if not rel:
+            raise ValueError("path required")
+        with self.lock:
+            stages = list(self.code_preview_index.get(rel, []))
+        out = []
+        total = len(stages)
+        for i, row in enumerate(stages, start=1):
+            added = int(row.get("added", 0) or 0)
+            deleted = int(row.get("deleted", 0) or 0)
+            out.append(
+                {
+                    "id": str(row.get("id", "") or ""),
+                    "index": i,
+                    "total": total,
+                    "ts": float(row.get("ts", 0.0) or 0.0),
+                    "change_type": str(row.get("change_type", "modified") or "modified"),
+                    "added": added,
+                    "deleted": deleted,
+                    "label": f"#{i} (+{added}/-{deleted})",
+                    "bytes_after": int(row.get("bytes_after", 0) or 0),
+                    "lines_after": int(row.get("lines_after", 0) or 0),
+                    "virtual": False,
+                }
+            )
+        if not out and is_code_preview_candidate(rel) and fp.exists() and fp.is_file():
+            txt = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            out = [
+                {
+                    "id": "current",
+                    "index": 1,
+                    "total": 1,
+                    "ts": float(now_ts()),
+                    "change_type": "current",
+                    "added": 0,
+                    "deleted": 0,
+                    "label": "#1 (current)",
+                    "bytes_after": len(txt.encode("utf-8", errors="ignore")),
+                    "lines_after": txt.count("\n") + (1 if txt else 0),
+                    "virtual": True,
+                }
+            ]
+        return {"path": rel, "latest_id": (out[-1]["id"] if out else ""), "stages": out}
+
+    def code_preview_payload(self, rel_path: str, stage_id: str = "latest") -> dict:
+        fp = self._session_path(rel_path)
+        rel = normalize_rel_preview_path(self._session_rel(fp))
+        if not rel:
+            raise ValueError("path required")
+        requested = str(stage_id or "latest").strip() or "latest"
+        with self.lock:
+            stages = list(self.code_preview_index.get(rel, []))
+        before_text = ""
+        after_text = ""
+        stage_meta: dict = {}
+        total = len(stages)
+        idx = -1
+        if stages:
+            if requested.lower() in {"", "latest", "current"}:
+                idx = len(stages) - 1
+            else:
+                for i, row in enumerate(stages):
+                    if str(row.get("id", "")).strip() == requested:
+                        idx = i
+                        break
+            if idx >= 0:
+                stage_meta = dict(stages[idx])
+                before_text = self._read_code_preview_blob(str(stage_meta.get("before_blob", "") or ""))
+                after_text = self._read_code_preview_blob(str(stage_meta.get("after_blob", "") or ""))
+                if not after_text and fp.exists() and fp.is_file():
+                    after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                if not before_text and after_text:
+                    before_text = after_text
+        if not stage_meta:
+            if requested.lower() not in {"", "latest", "current"}:
+                raise KeyError(f"stage not found: {requested}")
+            if not fp.exists() or not fp.is_file():
+                raise FileNotFoundError(f"file not found: {rel}")
+            after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            before_text = after_text
+            stage_meta = {
+                "id": "current",
+                "ts": now_ts(),
+                "change_type": "current",
+                "added": 0,
+                "deleted": 0,
+                "bytes_after": len(after_text.encode("utf-8", errors="ignore")),
+                "lines_after": after_text.count("\n") + (1 if after_text else 0),
+                "virtual": True,
+            }
+            idx = 0
+            total = max(total, 1)
+        rows, truncated = build_code_preview_rows(before_text, after_text, max_rows=CODE_PREVIEW_STAGE_MAX_ROWS)
+        stage_out = {
+            "id": str(stage_meta.get("id", "current") or "current"),
+            "index": int(idx + 1),
+            "total": int(total if total > 0 else 1),
+            "ts": float(stage_meta.get("ts", 0.0) or 0.0),
+            "change_type": str(stage_meta.get("change_type", "modified") or "modified"),
+            "added": int(stage_meta.get("added", 0) or 0),
+            "deleted": int(stage_meta.get("deleted", 0) or 0),
+            "virtual": bool(stage_meta.get("virtual", False)),
+            "bytes_after": int(stage_meta.get("bytes_after", len(after_text.encode("utf-8", errors="ignore"))) or 0),
+            "lines_after": int(stage_meta.get("lines_after", after_text.count("\n") + (1 if after_text else 0)) or 0),
+        }
+        return {
+            "path": rel,
+            "requested_stage": requested,
+            "stage": stage_out,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": bool(truncated),
+            "full_text": after_text,
+        }
+
+    def _safe_upload_name(self, filename: str) -> str:
+        raw = Path(str(filename or "upload.bin")).name
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+        return safe or f"upload_{int(now_ts())}.bin"
+
+    def _decode_text_bytes(self, data: bytes) -> str:
+        if not data:
+            return ""
+        if b"\x00" in data[:4096]:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
+
+    def _extract_pdf_text(self, pdf_path: Path) -> str:
+        tool = shutil.which("pdftotext")
+        if tool:
+            try:
+                r = subprocess.run(
+                    [tool, "-layout", str(pdf_path), "-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout.strip()
+            except Exception:
+                pass
+        try:
+            raw = pdf_path.read_bytes()
+            text = raw.decode("latin-1", errors="ignore")
+            chunks = re.findall(r"\(([^()]{4,2000})\)", text)
+            merged = "\n".join(chunks)
+            return trim(merged, 24_000)
+        except Exception:
+            return ""
+
+    def _module_available(self, name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except Exception:
+            return False
+
+    def _run_text_extractor_cmd(self, cmd: list[str], timeout: int = 45) -> str:
+        if not cmd:
+            return ""
+        exe = shutil.which(str(cmd[0]))
+        if not exe:
+            return ""
+        real_cmd = [exe] + [str(x) for x in cmd[1:]]
+        try:
+            r = subprocess.run(
+                real_cmd,
+                capture_output=True,
+                text=True,
+                errors="ignore",
+                timeout=timeout,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _extract_strings_fallback(self, fp: Path, min_len: int = 4) -> str:
+        text = self._run_text_extractor_cmd(["strings", "-n", str(min_len), str(fp)], timeout=30)
+        if text:
+            return trim(text, 24_000)
+        try:
+            raw = fp.read_bytes().decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+        chunks = re.findall(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff\s\-\_\.\,\:\;\(\)\[\]\/]{3,}", raw)
+        return trim("\n".join(chunks), 24_000)
+
+    def _extract_xml_text_tokens(self, xml_text: str, local_names: tuple[str, ...] = ("t",)) -> list[str]:
+        names = {x.lower() for x in local_names}
+        out: list[str] = []
+        if not xml_text.strip():
+            return out
+        try:
+            root = ET.fromstring(xml_text)
+            for node in root.iter():
+                tag = str(node.tag)
+                local = tag.rsplit("}", 1)[-1].split(":", 1)[-1].lower()
+                if local not in names:
+                    continue
+                text = (node.text or "").strip()
+                if text:
+                    out.append(html.unescape(text))
+        except Exception:
+            for name in names:
+                pattern = rf"(?is)<(?:\w+:)?{re.escape(name)}\b[^>]*>(.*?)</(?:\w+:)?{re.escape(name)}>"
+                for m in re.finditer(pattern, xml_text):
+                    raw = re.sub(r"(?is)<[^>]+>", "", m.group(1))
+                    val = html.unescape(raw).strip()
+                    if val:
+                        out.append(val)
+        return out
+
+    def _extract_csv_text(self, raw: bytes) -> str:
+        text = self._decode_text_bytes(raw)
+        if not text:
+            return ""
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        sample = "\n".join(lines[:40])
+        dialect = csv.excel
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            pass
+        table_lines: list[str] = []
+        try:
+            reader = csv.reader(io.StringIO(text), dialect)
+            for i, row in enumerate(reader):
+                if i >= 180:
+                    break
+                vals = [str(v).strip() for v in row]
+                if any(vals):
+                    table_lines.append("\t".join(vals))
+        except Exception:
+            table_lines = lines[:180]
+        return trim("\n".join(table_lines), 24_000)
+
+    def _extract_xlsx_text(self, fp: Path) -> str:
+        if self._module_available("openpyxl"):
+            try:
+                import openpyxl  # type: ignore
+
+                wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+                lines: list[str] = []
+                for ws in list(wb.worksheets)[:5]:
+                    lines.append(f"[Sheet] {ws.title}")
+                    rows = 0
+                    for row in ws.iter_rows(min_row=1, max_row=200, values_only=True):
+                        vals = [str(v).strip() for v in row if v not in (None, "")]
+                        if not vals:
+                            continue
+                        lines.append("\t".join(vals))
+                        rows += 1
+                        if rows >= 120:
+                            break
+                wb.close()
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                shared: list[str] = []
+                if "xl/sharedStrings.xml" in zf.namelist():
+                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                    shared = self._extract_xml_text_tokens(shared_xml, ("t",))
+                lines: list[str] = []
+                for name in sorted(zf.namelist()):
+                    if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
+                        continue
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    lines.append(f"[Sheet] {Path(name).stem}")
+                    taken = 0
+                    for row_raw in rows_raw:
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        vals: list[str] = []
+                        for attrs, body in cells:
+                            ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
+                            ctype = (ctype_m.group(1) if ctype_m else "").strip()
+                            token = ""
+                            if ctype == "inlineStr":
+                                tvals = self._extract_xml_text_tokens(body, ("t",))
+                                token = " ".join(tvals).strip()
+                            else:
+                                vm = re.search(r"(?is)<v\b[^>]*>(.*?)</v>", body)
+                                if vm:
+                                    raw = re.sub(r"(?is)<[^>]+>", "", vm.group(1)).strip()
+                                    if ctype == "s" and raw.isdigit():
+                                        idx = int(raw)
+                                        if 0 <= idx < len(shared):
+                                            token = shared[idx]
+                                        else:
+                                            token = raw
+                                    else:
+                                        token = html.unescape(raw)
+                            token = token.strip()
+                            if token:
+                                vals.append(token)
+                        if vals:
+                            lines.append("\t".join(vals))
+                            taken += 1
+                        if taken >= 120:
+                            break
+                    if len(lines) >= 600:
+                        break
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_xls_text(self, fp: Path) -> str:
+        if self._module_available("xlrd"):
+            try:
+                import xlrd  # type: ignore
+
+                wb = xlrd.open_workbook(str(fp), on_demand=True)
+                lines: list[str] = []
+                for si in range(min(wb.nsheets, 5)):
+                    sh = wb.sheet_by_index(si)
+                    lines.append(f"[Sheet] {sh.name}")
+                    for r in range(min(sh.nrows, 120)):
+                        vals: list[str] = []
+                        for c in range(sh.ncols):
+                            value = sh.cell_value(r, c)
+                            if value in ("", None):
+                                continue
+                            vals.append(str(value).strip())
+                        if vals:
+                            lines.append("\t".join(vals))
+                wb.release_resources()
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+            except Exception:
+                pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+        if xls2csv_text:
+            return trim(xls2csv_text, 24_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_docx_text(self, fp: Path) -> str:
+        if self._module_available("docx"):
+            try:
+                import docx  # type: ignore
+
+                doc = docx.Document(str(fp))
+                lines: list[str] = []
+                for p in doc.paragraphs:
+                    text = (p.text or "").strip()
+                    if text:
+                        lines.append(text)
+                for tb in doc.tables:
+                    for row in tb.rows:
+                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                        vals = [v for v in vals if v]
+                        if vals:
+                            lines.append("\t".join(vals))
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
+                lines: list[str] = []
+                for name in sorted(parts):
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    tokens = self._extract_xml_text_tokens(xml_text, ("t",))
+                    if tokens:
+                        lines.append(f"[Part] {Path(name).name}")
+                        lines.extend(tokens[:2000])
+                    if len(lines) >= 4000:
+                        break
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_doc_text(self, fp: Path) -> str:
+        for cmd in (
+            ["antiword", str(fp)],
+            ["catdoc", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 24_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_pptx_text(self, fp: Path) -> str:
+        if self._module_available("pptx"):
+            try:
+                import pptx  # type: ignore
+
+                pres = pptx.Presentation(str(fp))
+                lines: list[str] = []
+                for idx, slide in enumerate(pres.slides, 1):
+                    lines.append(f"[Slide {idx}]")
+                    for shape in slide.shapes:
+                        text = ""
+                        if hasattr(shape, "text"):
+                            text = str(getattr(shape, "text") or "").strip()
+                        if text:
+                            lines.append(text)
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
+                lines: list[str] = []
+                for name in sorted(slides):
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    tokens = self._extract_xml_text_tokens(xml_text, ("t",))
+                    if tokens:
+                        lines.append(f"[Slide] {Path(name).stem}")
+                        lines.extend(tokens[:600])
+                if lines:
+                    return trim("\n".join(lines), 24_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_ppt_text(self, fp: Path) -> str:
+        for cmd in (
+            ["catppt", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 24_000)
+        return self._extract_strings_fallback(fp)
+
+    def _upload_workspace_target(self, safe_name: str) -> Path:
+        base = self.files_root / "uploaded"
+        base.mkdir(parents=True, exist_ok=True)
+        candidate = base / safe_name
+        if not candidate.exists():
+            return candidate
+        stem = candidate.stem
+        suffix = candidate.suffix
+        i = 2
+        while True:
+            test = base / f"{stem}_{i}{suffix}"
+            if not test.exists():
+                return test
+            i += 1
+
+    def _uploads_prompt_block(self, max_chars: int = 24_000) -> str:
+        with self.lock:
+            items = list(self.uploads[-10:])
+        if not items:
+            return "(none)"
+        lines = []
+        remaining = max_chars
+        for item in items:
+            lines.append(
+                f"- {item.get('filename','')} => {item.get('workspace_path','')} "
+                f"({item.get('kind','file')}, {item.get('size',0)} bytes)"
+            )
+            excerpt = str(item.get("parsed_excerpt", "")).strip()
+            if not excerpt or remaining < 200:
+                continue
+            chunk = excerpt[: min(len(excerpt), min(3000, remaining))]
+            lines.append(f"<uploaded_excerpt path=\"{item.get('workspace_path','')}\">")
+            lines.append(chunk)
+            lines.append("</uploaded_excerpt>")
+            remaining -= len(chunk)
+        return "\n".join(lines)
+
+    def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
+        safe_name = self._safe_upload_name(filename)
+        upload_id = make_id("upload")
+        stored = self.uploads_dir / f"{upload_id}_{safe_name}"
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_bytes(raw)
+        ext = stored.suffix.lower()
+        text_like_ext = {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
+            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".sh", ".sql", ".html",
+            ".css", ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".cfg", ".md", ".txt",
+            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".csv",
+        }
+        parsed_excerpt = ""
+        kind = "binary"
+        mime_low = str(mime or "").strip().lower()
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            kind = "image"
+        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            kind = "video"
+        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            kind = "audio"
+        elif ext == ".pdf" or "pdf" in mime_low:
+            kind = "pdf"
+            parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
+        elif ext == ".csv":
+            kind = "csv"
+            parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
+        elif ext == ".xlsx":
+            kind = "excel"
+            parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
+        elif ext == ".xls":
+            kind = "excel"
+            parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
+        elif ext == ".pptx":
+            kind = "presentation"
+            parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
+        elif ext == ".ppt":
+            kind = "presentation"
+            parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
+        elif ext == ".docx":
+            kind = "document"
+            parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
+        elif ext == ".doc":
+            kind = "document"
+            parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
+        elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
+            kind = "text"
+            parsed_excerpt = trim(self._decode_text_bytes(raw), 24_000)
+        workspace_target = self._upload_workspace_target(safe_name)
+        workspace_target.parent.mkdir(parents=True, exist_ok=True)
+        workspace_target.write_bytes(raw)
+        workspace_rel = self._session_rel(workspace_target)
+        meta = {
+            "id": upload_id,
+            "filename": safe_name,
+            "original_name": str(filename or safe_name),
+            "mime": mime or "",
+            "kind": kind,
+            "size": len(raw),
+            "uploaded_at": now_ts(),
+            "stored_path": str(stored),
+            "workspace_path": workspace_rel,
+            "parsed_excerpt": parsed_excerpt,
+        }
+        with self.lock:
+            self.uploads.append(meta)
+            self.uploads = self.uploads[-80:]
+            self.updated_at = now_ts()
+            self._persist()
+        self._emit(
+            "upload",
+            {
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "summary": f"upload: {safe_name} -> {workspace_rel}",
+                "preview": trim(parsed_excerpt, 500),
+            },
+        )
+        loaded_config = None
+        low_name = safe_name.lower()
+        cfg_obj = {}
+        if ext == ".json" or "json" in (mime or "").lower() or "config" in low_name:
+            cfg_text = self._decode_text_bytes(raw)
+            cfg_obj = parse_json_object(cfg_text, {})
+        named_config = (
+            low_name == "llm.config.json"
+            or low_name.endswith(".llm.config.json")
+            or low_name.endswith("llm_config.json")
+        )
+        if cfg_obj and (named_config or looks_like_llm_config(cfg_obj)):
+            loaded_config = self.load_llm_config(cfg_obj, source=workspace_rel)
+        return {
+            "id": upload_id,
+            "filename": safe_name,
+            "workspace_path": workspace_rel,
+            "kind": kind,
+            "size": len(raw),
+            "uploaded_at": meta["uploaded_at"],
+            "preview": trim(parsed_excerpt, 1200),
+            "model_catalog": loaded_config,
+        }
+
+    def _auto_switch_model(self, reason: str) -> bool:
+        if not bool(self.auto_model_switch):
+            self._emit(
+                "status",
+                {"summary": f"model recover skipped (auto model switch disabled): {trim(reason, 180)}"},
+            )
+            return False
+        failed_selection = f"{self.active_profile_id}::{self.ollama.model}"
+        if failed_selection not in self.failed_selections:
+            self.failed_selections.append(failed_selection)
+        entries = self.model_catalog().get("options", [])
+        current_provider = str(self.ollama.provider or "")
+        entries = sorted(
+            entries,
+            key=lambda x: (
+                0 if str(x.get("provider", "")) == current_provider else 1,
+                str(x.get("profile_id", "")),
+            ),
+        )
+        picked = None
+        for item in entries:
+            selection = str(item.get("selection", ""))
+            if not selection or selection in self.failed_selections:
+                continue
+            if not self._option_is_runnable(item):
+                continue
+            picked = selection
+            break
+        if not picked and self.ollama.provider == "ollama":
+            tags = list_ollama_models(self.ollama.base_url)
+            for tag in tags:
+                selection = f"{self.active_profile_id}::{tag}"
+                if selection in self.failed_selections:
+                    continue
+                picked = selection
+                break
+        if not picked:
+            self._emit(
+                "status",
+                {"summary": f"model recover failed after error: {trim(reason, 220)}"},
+            )
+            return False
+        self.set_runtime_selection(picked, reset_failures=False)
+        self.updated_at = now_ts()
+        self._persist()
+        self._emit(
+            "status",
+            {
+                "summary": f"model auto-switched to {picked} (thinking={'on' if self.thinking else 'off'})",
+            },
+        )
+        return True
+
+    def _looks_like_incomplete_reply(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        done_markers = [
+            "任务完成",
+            "已完成",
+            "全部完成",
+            "done",
+            "completed",
+            "finished",
+            "all set",
+        ]
+        if any(x in t for x in done_markers):
+            return False
+        continue_markers = [
+            "让我",
+            "我将",
+            "继续",
+            "接下来",
+            "重新分析",
+            "修复代码",
+            "i will",
+            "i'll",
+            "let me",
+            "next",
+            "continue",
+        ]
+        return any(x in t for x in continue_markers)
+
+    def _looks_like_user_decision_needed(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        ask_markers = [
+            "would you like",
+            "let me know",
+            "which option",
+            "choose one",
+            "do you want",
+            "你想",
+            "请选择",
+            "请告诉我",
+            "你希望",
+            "要不要",
+            "是否",
+            "可选项",
+        ]
+        has_question = ("?" in t) or ("？" in text)
+        has_option_list = any(token in t for token in ["1.", "2.", "3.", "option", "选项"])
+        return has_question and (has_option_list or any(x in t for x in ask_markers))
+
+    def _clear_live_thinking(self):
+        with self.lock:
+            self.live_thinking_text = ""
+            self.live_thinking_last_emit = 0.0
+
+    def _append_live_thinking(self, chunk: str):
+        piece = str(chunk or "").strip()
+        if not piece:
+            return
+        now_tick = now_ts()
+        with self.lock:
+            if self.cancel_requested or (not self.running):
+                return
+            self.live_thinking_text = (self.live_thinking_text + ("\n" if self.live_thinking_text else "") + piece)[-24_000:]
+            self.updated_at = now_tick
+            should_emit = (now_tick - self.live_thinking_last_emit) >= 0.35
+            if should_emit:
+                self.live_thinking_last_emit = now_tick
+        if should_emit:
+            self._emit(
+                "thinking_delta",
+                {
+                    "summary": "thinking streaming",
+                    "size": len(self.live_thinking_text),
+                },
+            )
+
+    def _looks_nontrivial_request(self, text: str) -> bool:
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        if len(t) >= 120:
+            return True
+        markers = [
+            "实现",
+            "修复",
+            "重构",
+            "设计",
+            "构建",
+            "后端",
+            "前端",
+            "自动化",
+            "workflow",
+            "architecture",
+            "build",
+            "implement",
+            "refactor",
+            "fix",
+            "debug",
+            "multi-step",
+        ]
+        return any(x in t for x in markers)
+
+    def _is_default_session_title(self, title: str) -> bool:
+        t = str(title or "").strip()
+        if not t:
+            return True
+        low = t.lower()
+        default_titles = {
+            "web session",
+            "session",
+            "web 会话",
+            "会话",
+            "web 會話",
+            "會話",
+            "web セッション",
+            "セッション",
+        }
+        if low in default_titles or t in default_titles:
+            return True
+        if re.fullmatch(
+            r"(web[\s_-]*)?(session|会话|會話|セッション)[\s_-]*\d*",
+            low,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        if t == self.id:
+            return True
+        if re.fullmatch(r"sess_[a-z0-9]{6,}", low):
+            return True
+        return False
+
+    def _title_context_brief(self) -> str:
+        goal = self._latest_user_goal_text()
+        todo_rows = []
+        for row in self.todo.snapshot():
+            status = str(row.get("status", "pending"))
+            if status not in {"pending", "in_progress", "completed"}:
+                status = "pending"
+            content = normalize_work_text(row.get("content", ""), status) or str(row.get("content", "")).strip()
+            if content:
+                todo_rows.append(f"[{status}] {trim(content, 80)}")
+            if len(todo_rows) >= 4:
+                break
+        task_rows = []
+        for row in self.tasks.list_objects():
+            status = str(row.get("status", "pending"))
+            if status not in {"pending", "in_progress", "blocked", "completed"}:
+                status = "pending"
+            subject = normalize_work_text(row.get("subject", ""), status) or str(row.get("subject", "")).strip()
+            if subject:
+                task_rows.append(f"#{row.get('id')}[{status}] {trim(subject, 80)}")
+            if len(task_rows) >= 4:
+                break
+        todos_txt = " | ".join(todo_rows) if todo_rows else "none"
+        tasks_txt = " | ".join(task_rows) if task_rows else "none"
+        return (
+            f"goal: {trim(goal, 180)}\n"
+            f"todos: {todos_txt}\n"
+            f"tasks: {tasks_txt}"
+        )
+
+    def _normalize_auto_title(self, raw: str) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        text = text.replace("\r", " ").replace("\n", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"^['\"`#\-\s]+|['\"`#\-\s]+$", "", text).strip()
+        text = re.sub(r"^[Tt]itle\s*[:：]\s*", "", text).strip()
+        if not text:
+            return ""
+        if len(text) > 40:
+            text = text[:40].rstrip(" -_:;,.")
+        if self._is_default_session_title(text):
+            return ""
+        return text
+
+    def _fallback_auto_title(self) -> str:
+        goal = self._latest_user_goal_text()
+        if not goal:
+            return ""
+        candidate = normalize_work_text(goal) or goal
+        candidate = re.sub(
+            r"^(实现|實現|修复|修復|构建|構建|创建|創建|请|請|帮我|幫我|需要|"
+            r"implement|fix|build|create|please|need|"
+            r"実装|修正|作成|構築|お願い)\s*",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        return self._normalize_auto_title(candidate)
+
+    def _maybe_auto_rename_session_title(self, trigger: str = "") -> bool:
+        now_tick = now_ts()
+        with self.lock:
+            current = str(self.title or "").strip()
+            if not self._is_default_session_title(current):
+                return False
+            if (now_tick - float(self.last_auto_title_ts or 0.0)) < 12:
+                return False
+            self.last_auto_title_ts = now_tick
+
+        prompt = (
+            "Generate one concise session title from current coding task progress.\n"
+            "Rules:\n"
+            "- max 20 characters (or 3-6 English words)\n"
+            "- no quotes, no markdown, no punctuation-only title\n"
+            "- output title only\n\n"
+            f"{self._title_context_brief()}"
+        )
+        candidate = ""
+        try:
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=(
+                    "You generate short practical session titles for developer workflow tracking. "
+                    f"{model_language_instruction(self.ui_language)}"
+                ),
+                max_tokens=24,
+                think=False,
+            )
+            candidate = self._normalize_auto_title(str(rsp.get("content", "") or ""))
+        except Exception:
+            candidate = ""
+        if not candidate:
+            candidate = self._fallback_auto_title()
+        if not candidate:
+            return False
+
+        with self.lock:
+            old_title = str(self.title or "").strip()
+            if not self._is_default_session_title(old_title):
+                return False
+            if candidate == old_title:
+                return False
+            self.title = candidate
+            self.updated_at = now_ts()
+            self._persist()
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"session auto-renamed ({trigger or 'progress'}): "
+                    f"'{trim(old_title, 36)}' -> '{candidate}'"
+                )
+            },
+        )
+        return True
+
+    def _ensure_runtime_model_ready(self):
+        active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
+        if not self._profile_is_runnable(active_profile):
+            if not bool(self.auto_model_switch):
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "runtime model is not runnable; auto model switch disabled, "
+                            "please switch model manually"
+                        )
+                    },
+                )
+                return
+            fallback = self._pick_runnable_selection(
+                preferred_provider=str(self.ollama.provider or ""),
+                exclude={f"{self.active_profile_id}::{self.ollama.model}"},
+            )
+            if fallback:
+                self.set_runtime_selection(fallback, reset_failures=False)
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "runtime model auto-recovered from non-runnable profile "
+                            f"to {fallback}"
+                        )
+                    },
+                )
+            return
+        if str(self.ollama.provider or "").lower() != "ollama":
+            return
+        try:
+            tags = list_ollama_models(self.ollama.base_url)
+        except Exception:
+            tags = []
+        if not tags:
+            return
+        current_model = str(self.ollama.model or "").strip()
+        if current_model:
+            loaded = list_loaded_ollama_models(self.ollama.base_url, timeout=5)
+            if current_model not in set(loaded):
+                woke, wake_err = wake_ollama_model(self.ollama.base_url, current_model, timeout=40)
+                if woke:
+                    self._emit(
+                        "status",
+                        {"summary": f"woke pinned ollama model: {current_model}"},
+                    )
+                elif wake_err:
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                f"pinned model wake failed for '{current_model}': "
+                                f"{trim(wake_err, 160)}"
+                            )
+                        },
+                    )
+        if self.ollama.model in tags:
+            return
+        preferred = resolve_ollama_model(self.ollama.base_url, current_model)
+        if not preferred or preferred == current_model:
+            return
+        if not bool(self.auto_model_switch):
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"detected unavailable ollama tag '{current_model}' in scan; "
+                        "auto model switch disabled, please switch manually"
+                    )
+                },
+            )
+            return
+        selection = f"{self.active_profile_id}::{preferred}"
+        self.set_runtime_selection(selection, reset_failures=False)
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"model preflight switched unavailable tag '{current_model}' "
+                    f"-> '{preferred}'"
+                )
+            },
+        )
+
+    def _active_runtime_selection(self) -> str:
+        profile = dict(self.model_profiles.get(self.active_profile_id, {}))
+        model = str(profile.get("model", self.ollama.model) or self.ollama.model).strip()
+        return f"{self.active_profile_id}::{model}"
+
+    def _call_interruptible(
+        self,
+        fn,
+        poll_interval: float = 0.08,
+        *,
+        progress_label: str = "model call",
+        progress_interval: float | None = None,
+        progress_delay: float | None = None,
+    ):
+        if self.cancel_requested:
+            raise OllamaError("interrupted by user", status=499)
+        done = threading.Event()
+        box: dict[str, object] = {}
+        start_ts = time.time()
+        interval = MODEL_CALL_PROGRESS_INTERVAL if progress_interval is None else float(progress_interval)
+        delay = MODEL_CALL_PROGRESS_DELAY if progress_delay is None else float(progress_delay)
+        label = trim(str(progress_label or "model call"), 120) or "model call"
+        last_progress_emit = start_ts
+        with self.lock:
+            self.live_run_notice_active = True
+            self.live_run_notice_label = label
+            self.live_run_notice_started_at = float(start_ts)
+            self.live_run_notice_elapsed = 0.0
+        self._emit_transient("runtime_progress", {"state": "start", "label": label, "elapsed": 0.0})
+
+        def worker():
+            try:
+                box["result"] = fn()
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        try:
+            while True:
+                if done.wait(poll_interval):
+                    break
+                if self.cancel_requested:
+                    raise OllamaError("interrupted by user", status=499)
+                if interval > 0:
+                    now = time.time()
+                    if now - start_ts >= delay and now - last_progress_emit >= interval:
+                        last_progress_emit = now
+                        with self.lock:
+                            self.live_run_notice_elapsed = max(0.0, now - start_ts)
+                        self._emit_transient(
+                            "runtime_progress",
+                            {
+                                "state": "tick",
+                                "label": label,
+                                "elapsed": round(max(0.0, now - start_ts), 1),
+                            },
+                        )
+            if "error" in box:
+                err = box.get("error")
+                if isinstance(err, Exception):
+                    raise err
+                raise OllamaError(trim(str(err), 220))
+            return box.get("result", {})
+        finally:
+            end_elapsed = max(0.0, time.time() - start_ts)
+            with self.lock:
+                self.live_run_notice_elapsed = end_elapsed
+                if self.running:
+                    self.run_model_active_seconds = max(
+                        0.0,
+                        float(self.run_model_active_seconds or 0.0) + end_elapsed,
+                    )
+                self.live_run_notice_active = False
+                self.live_run_notice_label = ""
+                self.live_run_notice_started_at = 0.0
+            self._emit_transient(
+                "runtime_progress",
+                {"state": "stop", "label": label, "elapsed": round(end_elapsed, 1)},
+            )
+
+    def _chat_with_same_model_retry(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        max_tokens: int | None = None,
+        think: bool | None = None,
+        stream_thinking: bool = False,
+        on_thinking_chunk=None,
+        pinned_selection: str = "",
+        context_label: str = "agent",
+        retries: int = MODEL_OUTPUT_RETRY_TIMES,
+        media_inputs: list[dict] | None = None,
+    ) -> dict:
+        retry_budget = max(0, int(retries or 0))
+        pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
+        last_exc: OllamaError | None = None
+        wake_attempted = False
+        for attempt in range(1, retry_budget + 2):
+            try:
+                return self._call_interruptible(
+                    lambda: self.ollama.chat(
+                        messages,
+                        tools=tools,
+                        system=system,
+                        max_tokens=max_tokens,
+                        think=False,
+                        stream_thinking=bool(stream_thinking),
+                        on_thinking_chunk=on_thinking_chunk,
+                        media_inputs=media_inputs,
+                    ),
+                    progress_label=f"{context_label} model call",
+                )
+            except OllamaError as exc:
+                last_exc = exc
+                if self.cancel_requested or "interrupted by user" in str(exc).lower():
+                    raise
+                wake_note = ""
+                status = int(getattr(exc, "status", 0) or 0)
+                if (
+                    not wake_attempted
+                    and str(self.ollama.provider or "").lower() == "ollama"
+                    and status in {0, 408, 429, 500, 502, 503, 504}
+                ):
+                    wake_attempted = True
+                    model_now = str(self.ollama.model or "").strip()
+                    if model_now:
+                        woke, wake_err = wake_ollama_model(self.ollama.base_url, model_now, timeout=35)
+                        if woke:
+                            wake_note = " | wake=ok"
+                        elif wake_err:
+                            wake_note = f" | wake={trim(wake_err, 96)}"
+                if attempt > retry_budget:
+                    break
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{context_label} model call failed on {pin}; "
+                            f"retry {attempt}/{retry_budget}: {trim(str(exc), 180)}"
+                            f"{wake_note}"
+                        )
+                    },
+                )
+                time.sleep(min(1.4, 0.35 * attempt))
+        raise last_exc if last_exc is not None else OllamaError("chat failed")
+
+    def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
+        meta = {
+            "command": command,
+            "cwd": str(cwd),
+            "timeout": timeout,
+            "exit_code": None,
+            "duration_ms": 0,
+            "changed_files": [],
+            "output": "",
+            "error": "",
+        }
+        if any(x in command for x in DANGEROUS_PATTERNS):
+            meta["error"] = "Error: dangerous command blocked"
+            meta["output"] = meta["error"]
+            return meta
+        before = self._git_status_map(cwd)
+        start = time.time()
+        proc: subprocess.Popen | None = None
+
+        def _stop_process(p: subprocess.Popen):
+            try:
+                p.terminate()
+                p.wait(timeout=1.5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            while True:
+                elapsed = time.time() - start
+                if self.cancel_requested:
+                    _stop_process(proc)
+                    out, err = proc.communicate(timeout=0.4)
+                    merged = (out + err).strip()
+                    meta["error"] = "Error: interrupted by user"
+                    meta["output"] = trim(merged or meta["error"])
+                    meta["exit_code"] = -130
+                    break
+                if timeout > 0 and elapsed >= timeout:
+                    _stop_process(proc)
+                    out, err = proc.communicate(timeout=0.4)
+                    merged = (out + err).strip()
+                    meta["error"] = f"Error: timeout ({timeout}s)"
+                    meta["output"] = trim(merged or meta["error"])
+                    meta["exit_code"] = -1
+                    break
+                try:
+                    out, err = proc.communicate(timeout=0.2)
+                    meta["exit_code"] = proc.returncode
+                    meta["output"] = trim((out + err).strip() or "(no output)")
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except Exception as exc:
+            meta["error"] = f"Error: {exc}"
+            meta["output"] = meta["error"]
+            meta["exit_code"] = -1
+        meta["duration_ms"] = int((time.time() - start) * 1000)
+        after = self._git_status_map(cwd)
+        meta["changed_files"] = self._status_delta(before, after) if before or after else []
+        return meta
+
+    def _run_bash(self, command: str) -> str:
+        return self._run_shell_meta(command, self.files_root, 120)["output"]
+
+    def _run_read(self, path: str, limit: int | None = None) -> str:
+        try:
+            lines = self._session_path(path).read_text(encoding="utf-8").splitlines()
+            if limit and limit < len(lines):
+                lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
+            return trim("\n".join(lines))
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    def _is_html_file_rel(self, path: str) -> bool:
+        low = str(path or "").strip().lower()
+        return low.endswith(".html") or low.endswith(".htm")
+
+    def _resolve_offline_js_asset_for_url(self, src_url: str) -> tuple[Path | None, str]:
+        if not is_external_js_src(src_url):
+            return None, "not-external"
+        target_url = _normalize_external_js_url(src_url)
+        catalog = match_offline_js_catalog_by_url(target_url)
+        if catalog:
+            filename = _safe_js_filename(
+                str(catalog.get("filename", "") or f"{catalog.get('id', 'lib')}.js"),
+                "lib.js",
+            )
+            fp = (self.js_lib_root / filename).resolve()
+            if fp.exists() and fp.is_file() and fp.stat().st_size > 40:
+                return fp, "catalog"
+            try:
+                ensure_offline_js_libs(self.js_lib_root.parent, force=False)
+            except Exception:
+                pass
+            if fp.exists() and fp.is_file() and fp.stat().st_size > 40:
+                return fp, "catalog-refreshed"
+        cached_fp, reason = cache_external_js_url(self.js_lib_root, target_url)
+        if cached_fp and cached_fp.exists() and cached_fp.is_file():
+            return cached_fp, reason
+        return None, reason
+
+    def _localize_html_js_dependencies(self, rel_path: str) -> dict:
+        if not self._is_html_file_rel(rel_path):
+            return {"applied": False, "summary": ""}
+        try:
+            html_fp = self._session_path(rel_path)
+        except Exception as exc:
+            return {"applied": False, "summary": f"offline-js skipped ({exc})"}
+        if not html_fp.exists() or (not html_fp.is_file()):
+            return {"applied": False, "summary": ""}
+        src = try_read_text(html_fp)
+        if src is None:
+            return {"applied": False, "summary": ""}
+        js_dir = (html_fp.parent / "js").resolve()
+        rewritten_count = 0
+        copied: list[str] = []
+        unresolved: list[str] = []
+        copied_set: set[str] = set()
+        unresolved_set: set[str] = set()
+
+        def _resolve_and_rewrite(url: str) -> str | None:
+            nonlocal rewritten_count
+            asset, reason = self._resolve_offline_js_asset_for_url(url)
+            if not asset:
+                key = _normalize_external_js_url(url)
+                if key and key not in unresolved_set:
+                    unresolved_set.add(key)
+                    unresolved.append(f"{key} ({reason})")
+                return None
+            js_dir.mkdir(parents=True, exist_ok=True)
+            dst_name = _safe_js_filename(asset.name, "lib.js")
+            dst = (js_dir / dst_name).resolve()
+            try:
+                if (not dst.exists()) or dst.stat().st_size != asset.stat().st_size:
+                    shutil.copy2(asset, dst)
+            except Exception as exc:
+                key = _normalize_external_js_url(url)
+                if key and key not in unresolved_set:
+                    unresolved_set.add(key)
+                    unresolved.append(f"{key} (copy-failed:{trim(str(exc), 120)})")
+                return None
+            if dst_name not in copied_set:
+                copied_set.add(dst_name)
+                copied.append(dst_name)
+            rewritten_count += 1
+            return f"./js/{dst_name}"
+
+        quoted_re = re.compile(
+            r"(?is)(?P<prefix><script\b[^>]*?\bsrc\s*=\s*)(?P<q>['\"])(?P<url>[^\"']+)(?P=q)"
+        )
+        unquoted_re = re.compile(
+            r"(?is)(?P<prefix><script\b[^>]*?\bsrc\s*=\s*)(?P<url>[^\s\"'>]+)"
+        )
+
+        def _replace_quoted(m: re.Match) -> str:
+            full = m.group(0)
+            url = str(m.group("url") or "").strip()
+            if not is_external_js_src(url):
+                return full
+            repl = _resolve_and_rewrite(url)
+            if not repl:
+                return full
+            q = str(m.group("q") or "\"")
+            return f"{m.group('prefix')}{q}{repl}{q}"
+
+        def _replace_unquoted(m: re.Match) -> str:
+            full = m.group(0)
+            url = str(m.group("url") or "").strip()
+            if (not url) or (not is_external_js_src(url)):
+                return full
+            repl = _resolve_and_rewrite(url)
+            if not repl:
+                return full
+            return f"{m.group('prefix')}{repl}"
+
+        after = quoted_re.sub(_replace_quoted, src)
+        after = unquoted_re.sub(_replace_unquoted, after)
+        if after != src:
+            html_fp.write_text(after, encoding="utf-8")
+        if rewritten_count <= 0 and not unresolved:
+            return {"applied": False, "summary": ""}
+        summary = (
+            f"offline-js: localized={rewritten_count}, copied={len(copied)}, "
+            f"unresolved={len(unresolved)} for {self._session_rel(html_fp)}"
+        )
+        return {
+            "applied": rewritten_count > 0,
+            "summary": summary,
+            "localized": rewritten_count,
+            "copied": copied,
+            "unresolved": unresolved,
+            "path": self._session_rel(html_fp),
+        }
+
+    def _run_write(self, path: str, content: str) -> str:
+        try:
+            fp = self._session_path(path)
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content, encoding="utf-8")
+            return f"Wrote {len(content)} bytes to {path}"
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
+        try:
+            fp = self._session_path(path)
+            content = fp.read_text(encoding="utf-8")
+            if old_text not in content:
+                return f"Error: text not found in {path}"
+            fp.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
+            return f"Edited {path}"
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    def _write_global_skill(self, args: dict) -> str:
+        rel_raw = str(args.get("path", "") or "").strip().replace("\\", "/")
+        if not rel_raw:
+            return "Error: path is required"
+        rel_path = Path(rel_raw)
+        if rel_path.name.lower() == "skill.md":
+            final_rel = rel_path.parent / "SKILL.md"
+        else:
+            final_rel = rel_path / "SKILL.md"
+        try:
+            target = safe_path(final_rel.as_posix(), self.skills.skills_root)
+        except Exception as exc:
+            return f"Error: invalid skill path: {exc}"
+        overwrite = bool(args.get("overwrite", False))
+        if target.exists() and not overwrite:
+            return (
+                f"Error: skill already exists at {target}. "
+                "Set overwrite=true to replace it."
+            )
+        body = str(args.get("content", "") or "").strip()
+        if not body:
+            return "Error: content is required"
+        meta, _ = parse_front_matter(body)
+        if not meta.get("name") or not meta.get("description"):
+            inferred_name = re.sub(r"[^A-Za-z0-9._-]+", "-", target.parent.name).strip("-") or "custom-skill"
+            inferred_desc = "User provided reusable skill."
+            if body.startswith("---"):
+                # Keep user content unchanged if it already carries front matter.
+                pass
+            else:
+                body = (
+                    "---\n"
+                    f"name: {inferred_name}\n"
+                    f"description: {inferred_desc}\n"
+                    "---\n\n"
+                    f"{body}\n"
+                )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        try:
+            self._ensure_skills_ready(force=True)
+            self.skill_load_cache = {}
+        except Exception:
+            pass
+        try:
+            rel_saved = target.resolve().relative_to(self.skills.skills_root.resolve()).as_posix()
+        except Exception:
+            rel_saved = str(target)
+        self._emit(
+            "skill_write",
+            {
+                "path": rel_saved,
+                "summary": f"skill written: {rel_saved}",
+            },
+        )
+        return f"OK: wrote skill to {rel_saved}"
+
+    def _scan_global_skills(self) -> str:
+        try:
+            self._ensure_skills_ready(force=True)
+        except Exception:
+            pass
+        payload = {
+            "skills_count": len(self.skills.skills),
+            "skill_names": sorted(self.skills.list_names())[:240],
+            "providers": self.skills.list_providers(),
+            "protocols": self.skills.list_protocols(),
+            "warnings": list(self.skills.warnings),
+        }
+        return json_dumps(payload, indent=2)
+
+    def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
+        subtools = [
+            tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
+            tool_def("read_file", "Read file.", {"path": {"type": "string"}}, ["path"]),
+        ]
+        if agent_type != "Explore":
+            subtools.extend(
+                [
+                    tool_def("write_file", "Write file.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+                    tool_def("edit_file", "Edit file.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
+                ]
+            )
+        msgs = [{"role": "user", "content": prompt}]
+        last_text = ""
+        pinned_selection = self._active_runtime_selection()
+        for _ in range(20):
+            try:
+                sub_system = f"You are a focused subagent. {model_language_instruction(self.ui_language)}"
+                response = self._chat_with_same_model_retry(
+                    msgs,
+                    tools=subtools,
+                    system=sub_system,
+                    think=False,
+                    pinned_selection=pinned_selection,
+                    context_label="subagent",
+                    retries=MODEL_OUTPUT_RETRY_TIMES,
+                )
+            except OllamaError as exc:
+                return f"Error: {exc}"
+            text = str(response.get("content") or "")
+            tcs = response.get("tool_calls", [])
+            entry = {"role": "assistant", "content": text}
+            if tcs:
+                entry["tool_calls"] = [
+                    {
+                        "id": t["id"],
+                        "type": "function",
+                        "function": {"name": t["function"]["name"], "arguments": json_dumps(t["function"]["arguments"])},
+                    }
+                    for t in tcs
+                ]
+            msgs.append(entry)
+            last_text = text or last_text
+            if not tcs:
+                break
+            for tc in tcs:
+                name = tc["function"]["name"]
+                args = tc["function"]["arguments"]
+                args_error = str(tc.get("args_error", "") or "").strip()
+                raw_args = tc.get("raw_arguments")
+                if args_error:
+                    if name in {"TodoWrite", "TodoWriteRescue"}:
+                        repaired, repaired_out = self._attempt_malformed_tool_repair(name, raw_args)
+                        if repaired:
+                            msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(repaired_out)})
+                            continue
+                    out = (
+                        f"Error: malformed arguments for tool '{name}'. {args_error}. "
+                        "Please regenerate this tool call with complete JSON arguments."
+                    )
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
+                    continue
+                missing = self._missing_required_args(name, args)
+                if missing:
+                    repaired, repaired_out = self._attempt_malformed_tool_repair(name, args)
+                    if repaired:
+                        msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(repaired_out)})
+                        continue
+                    out = (
+                        f"Error: tool '{name}' missing required arguments: {', '.join(missing)}. "
+                        "Likely truncated tool call. Please regenerate complete JSON arguments."
+                    )
+                    msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
+                    continue
+                if name == "bash":
+                    out = self._run_bash(args.get("command", ""))
+                elif name == "read_file":
+                    out = self._run_read(args.get("path", ""))
+                elif name == "write_file":
+                    out = self._run_write(args.get("path", ""), args.get("content", ""))
+                elif name == "edit_file":
+                    out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
+                else:
+                    out = f"Unknown tool: {name}"
+                msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
+        return last_text or "(subagent done)"
+
+    def _spawn_teammate(self, name: str, role: str, prompt: str) -> str:
+        member = self.teammates.get(name)
+        if member and member.get("status") == "working":
+            return f"Error: teammate '{name}' already working"
+        self.teammates[name] = {"name": name, "role": role, "status": "working", "updated_at": now_ts()}
+
+        def worker():
+            try:
+                result = self.run_subagent(f"Teammate={name}, role={role}\n{prompt}", agent_type="general-purpose")
+                self.bus.send(name, "lead", f"[{name}] {result}", "message")
+                status = "idle"
+            except Exception as exc:
+                self.bus.send(name, "lead", f"[{name}] failed: {exc}", "message")
+                status = "error"
+            with self.lock:
+                if name in self.teammates:
+                    self.teammates[name]["status"] = status
+                    self.teammates[name]["updated_at"] = now_ts()
+                self._emit("teammate", {"summary": f"{name} -> {status}"})
+                self._persist()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return f"Spawned teammate '{name}' ({role})"
+
+    def _list_teammates(self) -> str:
+        if not self.teammates:
+            return "No teammates."
+        lines = []
+        for m in self.teammates.values():
+            lines.append(f"{m['name']} ({m['role']}): {m['status']}")
+        return "\n".join(lines)
+
+    def _handle_shutdown_request(self, teammate: str) -> str:
+        req_id = make_id("shutdown")
+        self.shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+        self.bus.send("lead", teammate, "Please shut down.", "shutdown_request", {"request_id": req_id})
+        if teammate in self.teammates:
+            self.teammates[teammate]["status"] = "shutdown"
+        return f"Shutdown request {req_id} sent to '{teammate}'"
+
+    def _handle_plan_approval(self, request_id: str, approve: bool, feedback: str = "") -> str:
+        req = self.plan_requests.get(request_id)
+        if not req:
+            return f"Error: unknown plan request_id '{request_id}'"
+        req["status"] = "approved" if approve else "rejected"
+        self.bus.send("lead", req["from"], feedback, "plan_approval_response", {"request_id": request_id, "approve": approve, "feedback": feedback})
+        return f"Plan {req['status']} for '{req['from']}'"
+
+    def _is_html_frontend_goal(self, text: str) -> bool:
+        probe = str(text or "").strip().lower()
+        if not probe:
+            return False
+        for key in HTML_FRONTEND_REQUEST_KEYWORDS:
+            k = str(key or "").strip().lower()
+            if k and k in probe:
+                return True
+        return False
+
+    def _html_frontend_boost_instruction(self) -> str:
+        goal = self._latest_user_goal_text()
+        if not self._is_html_frontend_goal(goal):
+            return ""
+        index = load_offline_js_lib_index(self.js_lib_root)
+        available_rows = [
+            str(item.get("id", "")).strip()
+            for item in (index.get("libs", []) if isinstance(index, dict) else [])
+            if isinstance(item, dict) and bool(item.get("available", False))
+        ]
+        libs_hint = ", ".join([x for x in available_rows if x][:10]) if available_rows else "none"
+        return (
+            "Current task is likely frontend/html/report oriented. "
+            "Load specialized skills when needed: "
+            "load_skill('html-report-engineering'), "
+            "load_skill('frontend-composition-algorithm'), "
+            "load_skill('visualization-report-pipeline'), "
+            "load_skill('offline-html-js-bundling'). "
+            "Use this build algorithm: "
+            "1) define audience + acceptance criteria; "
+            "2) draft information architecture; "
+            "3) scaffold semantic HTML; "
+            "4) apply CSS tokens + responsive layout; "
+            "5) wire JS state/data interactions; "
+            "6) localize external JS dependencies to ./js from ./js_lib; "
+            "7) run QA loop for desktop/mobile/a11y/performance and iterate. "
+            f"Offline JS libs available now: {libs_hint}. "
+            "Final exported HTML should avoid unresolved CDN-only script src."
+        )
+
+    def _contains_any_keyword(self, text: str, keywords: tuple[str, ...]) -> bool:
+        probe = str(text or "").strip().lower()
+        if not probe:
+            return False
+        for row in keywords:
+            key = str(row or "").strip().lower()
+            if key and key in probe:
+                return True
+        return False
+
+    def _is_deep_research_goal(self, text: str) -> bool:
+        return self._contains_any_keyword(text, DEEP_RESEARCH_REQUEST_KEYWORDS)
+
+    def _http_probe_ok(self, url: str, timeout: float = 4.0) -> bool:
+        target = str(url or "").strip()
+        if not target:
+            return False
+        try:
+            req = Request(target, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                if 200 <= status < 400:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _probe_live_search_runtime(self, force: bool = False) -> dict[str, object]:
+        now_tick = float(now_ts())
+        cached = self.research_probe_cache if isinstance(self.research_probe_cache, dict) else {}
+        checked_at = float(cached.get("checked_at", 0.0) or 0.0)
+        if (not force) and checked_at > 0 and (now_tick - checked_at) < 180:
+            return {
+                "checked_at": checked_at,
+                "online_ok": bool(cached.get("online_ok", False)),
+                "search_ok": bool(cached.get("search_ok", False)),
+                "mode": str(cached.get("mode", "simulated") or "simulated"),
+                "reason": str(cached.get("reason", "") or ""),
+            }
+        online_ok = False
+        search_ok = False
+        reason = "offline"
+        try:
+            online_ok = self._http_probe_ok("https://example.com", timeout=4.0) or self._http_probe_ok(
+                "https://www.wikipedia.org", timeout=4.0
+            )
+            if online_ok:
+                search_ok = self._http_probe_ok("https://duckduckgo.com/?q=research", timeout=5.0)
+                if search_ok:
+                    reason = "search-ready"
+                else:
+                    reason = "internet-ok-search-check-failed"
+            else:
+                search_ok = False
+                reason = "network-unreachable"
+        except Exception as exc:
+            online_ok = False
+            search_ok = False
+            reason = f"probe-error:{trim(str(exc), 120)}"
+        mode = "online" if search_ok else "simulated"
+        payload = {
+            "checked_at": now_tick,
+            "online_ok": bool(online_ok),
+            "search_ok": bool(search_ok),
+            "mode": mode,
+            "reason": reason,
+        }
+        self.research_probe_cache = dict(payload)
+        return payload
+
+    def _detect_deep_research_mode(self, text: str) -> str:
+        goal = str(text or "").strip()
+        if not self._is_deep_research_goal(goal):
+            return ""
+        force_text_only = self._contains_any_keyword(goal, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS)
+        retrieval_requested = self._contains_any_keyword(goal, DEEP_RESEARCH_RETRIEVAL_KEYWORDS)
+        if force_text_only and (not retrieval_requested):
+            return "text_deep_analysis"
+        if retrieval_requested:
+            probe = self._probe_live_search_runtime(force=False)
+            return "retrieval_integrated_online" if bool(probe.get("search_ok", False)) else "retrieval_integrated_simulated"
+        return "text_deep_analysis"
+
+    def _deep_research_boost_instruction(self) -> str:
+        goal = self._latest_user_goal_text()
+        mode = self._detect_deep_research_mode(goal)
+        if not mode:
+            return ""
+        probe = self._probe_live_search_runtime(force=False)
+        if mode == "text_deep_analysis":
+            mode_hint = "Mode=text_deep_analysis (independent text deep analysis)."
+        elif mode == "retrieval_integrated_online":
+            mode_hint = "Mode=retrieval_integrated_online (internet retrieval synthesis)."
+        else:
+            mode_hint = (
+                "Mode=retrieval_integrated_simulated (internet/search unavailable; use model-knowledge simulated retrieval cards)."
+            )
+        return (
+            "Current task is deep-research oriented. "
+            "Load specialized skills when needed: "
+            "load_skill('deep-research-orchestrator'), "
+            "load_skill('retrieval-synthesis-fallback'), "
+            "load_skill('pdf-vision-literature-integrator'). "
+            f"{mode_hint} "
+            f"Search runtime probe: online_ok={bool(probe.get('online_ok', False))}, "
+            f"search_ok={bool(probe.get('search_ok', False))}, reason={probe.get('reason', '')}. "
+            "If analyzing PDF literature and image capability is available, integrate extracted PDF figures with textual evidence. "
+            "If model image-input capability is false, skip figure extraction and stay in text-only evidence mode. "
+            "Final output must be a structured markdown deep-analysis report."
+        )
+
+    def _latest_user_goal_text(self) -> str:
+        for msg in reversed(self.messages):
+            if msg.get("role") != "user":
+                continue
+            text = str(msg.get("content", "")).strip()
+            if not text:
+                continue
+            if text.startswith("<"):
+                continue
+            return trim(text.replace("\n", " "), 220)
+        return "current task"
+
+    def _todo_write_rescue(self, args: dict) -> str:
+        raw_items = args.get("items", [])
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("items must be a non-empty array")
+        limited = raw_items[:7]
+        clean_items = []
+        for idx, item in enumerate(limited):
+            if isinstance(item, dict):
+                content = str(item.get("content", item.get("text", item.get("title", "")))).strip()
+            else:
+                content = str(item).strip()
+            content = normalize_work_text(content) or content
+            if not content:
+                continue
+            clean_items.append(
+                {
+                    "content": content,
+                    "status": "pending",
+                    "activeForm": f"Pending: {content}",
+                }
+            )
+        if not clean_items:
+            raise ValueError("no valid todo item text")
+        in_progress_index = int(args.get("in_progress_index", 0) or 0)
+        if in_progress_index < 0 or in_progress_index >= len(clean_items):
+            in_progress_index = 0
+        clean_items[in_progress_index]["status"] = "in_progress"
+        clean_items[in_progress_index]["activeForm"] = f"Working on: {clean_items[in_progress_index]['content']}"
+        return self.todo.update(clean_items)
+
+    def _analyze_todo_result(self, tool_name: str, output: str) -> tuple[str, str]:
+        txt = str(output or "").strip()
+        low = txt.lower()
+        if not txt:
+            return ("failed", "empty output")
+        if txt.startswith("Error:"):
+            return ("failed", txt[6:].strip() or "unknown error")
+        if "no todo changes" in low:
+            if self.todo.snapshot():
+                return ("ok", "todo already up to date")
+            return ("repeat", "same todo payload repeated")
+        if tool_name == "TodoWriteRescue":
+            return ("ok", "rescue path success")
+        if self.todo.snapshot():
+            return ("ok", "todo updated")
+        return ("unknown", trim(txt, 120))
+
+    def _inject_todo_rescue_hint(self, reason: str):
+        goal = self._latest_user_goal_text()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<todo-rescue>"
+                    f"TodoWrite issue detected: {trim(reason, 220)}. "
+                    "Call TodoWriteRescue now with 3-7 concise items (array of strings) "
+                    "and set in_progress_index=0. "
+                    f"Goal reference: {goal}"
+                    "</todo-rescue>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": f"todo fallback requested: {trim(reason, 100)}"},
+        )
+
+    def _next_tool_retry_count(self, name: str) -> int:
+        key = str(name or "").strip() or "unknown-tool"
+        count = int(self.tool_retry_counts.get(key, 0) or 0) + 1
+        self.tool_retry_counts[key] = min(count, 9)
+        return count
+
+    def _clear_tool_retry_count(self, name: str):
+        key = str(name or "").strip() or "unknown-tool"
+        if key in self.tool_retry_counts:
+            self.tool_retry_counts.pop(key, None)
+
+    def _inject_immediate_tool_retry_hint(self, name: str, reason: str):
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<tool-retry>"
+                    f"Tool '{name}' failed due to malformed/incomplete arguments: {trim(reason, 220)}. "
+                    "Retry immediately now. Regenerate ONLY this tool call with complete JSON arguments, "
+                    "minimal scope, and no extra narration."
+                    "</tool-retry>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": f"tool retry requested immediately: {name}"},
+        )
+
+    def _tighten_context_for_segmented_retry(self, reason: str, output_tokens: int):
+        if self.context_limit_locked:
+            return
+        old_bound = int(self.context_token_upper_bound)
+        reduced = int(max(MIN_CONTEXT_TOKEN_LIMIT, min(old_bound - 1200, old_bound * 0.78)))
+        derived = self._derive_context_limit_from_output(max(1, output_tokens))
+        new_bound = min(old_bound, reduced, derived)
+        if new_bound < old_bound:
+            self.context_token_upper_bound = new_bound
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "context upper bound reduced for segmented retry "
+                        f"{old_bound}->{new_bound} ({trim(reason, 90)})"
+                    )
+                },
+            )
+
+    def _inject_segmented_retry_hint(self, name: str, reason: str):
+        goal = self._latest_user_goal_text()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<segmented-retry>"
+                    f"Immediate retry for tool '{name}' failed again: {trim(reason, 220)}. "
+                    "Switch to segmented execution: "
+                    "1) call TodoWrite/TodoWriteRescue with 3-7 chunked items, "
+                    "2) execute only current chunk, "
+                    "3) regenerate failed tool call for this chunk with complete JSON, "
+                    "4) update todo/task then continue next chunk. "
+                    f"Goal reference: {goal}"
+                    "</segmented-retry>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": f"segmented retry mode enabled for {name}"},
+        )
+
+    def _tool_calls_fingerprint(self, tool_calls: list[dict]) -> str:
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return ""
+        parts: list[str] = []
+        for tc in tool_calls[:6]:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            name = str(fn.get("name", "")).strip()
+            args = fn.get("arguments", {})
+            args_error = str(tc.get("args_error", "")).strip()
+            try:
+                if isinstance(args, (dict, list)):
+                    args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                else:
+                    args_text = str(args)
+            except Exception:
+                args_text = str(args)
+            args_text = trim(args_text, 280).replace("\n", " ")
+            parts.append(f"{name}|{args_error}|{args_text}")
+        raw = "||".join(parts)
+        if not raw:
+            return ""
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _inject_forced_convergence_hint(self, tool_names: list[str], reason: str):
+        uniq = []
+        for name in tool_names:
+            n = str(name or "").strip()
+            if not n or n in uniq:
+                continue
+            uniq.append(n)
+        focus = ", ".join(uniq[:3]) if uniq else "tool call"
+        goal = self._latest_user_goal_text()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<forced-converge>"
+                    f"Repeated tool loop detected on {focus}: {trim(reason, 220)}. "
+                    "Mandatory convergence mode: "
+                    "1) keep only one in_progress item, "
+                    "2) execute exactly ONE tool call for that item in next round, "
+                    "3) update todo/task status immediately after each chunk, "
+                    "4) if blocked, return blocker and stop instead of retrying the same call. "
+                    f"Goal reference: {goal}"
+                    "</forced-converge>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": f"forced segmented convergence enabled for {focus}"},
+        )
+
+    def _diagnose_no_tool_idle(self, latest_text: str, streak: int) -> dict:
+        raw = str(latest_text or "")
+        clean = strip_thinking_content(raw).strip()
+        recent = list(self.messages[-40:])
+        tool_errors = 0
+        truncate_hints = 0
+        compact_hints = 0
+        blank_assistant = 0
+        for row in recent:
+            role = str(row.get("role", "")).strip()
+            content = str(row.get("content", "") or "")
+            low = content.lower()
+            if role == "tool" and low.strip().startswith("error:"):
+                tool_errors += 1
+            if "truncate-rescue" in low or "truncated" in low:
+                truncate_hints += 1
+            if "<compact-resume>" in low or "context_recall" in low:
+                compact_hints += 1
+            if role == "assistant" and not strip_thinking_content(content).strip():
+                blank_assistant += 1
+        if self.last_compact_ts > 0:
+            compact_hints += 1
+        causes: list[str] = []
+        actions: list[str] = []
+        if truncate_hints > 0:
+            causes.append("possible truncation/partial output")
+            actions.append("split into smaller subtasks and regenerate full tool JSON")
+        if compact_hints > 0:
+            causes.append("context may be compacted")
+            actions.append("call context_recall first for latest segment details")
+        if tool_errors > 0:
+            causes.append("recent tool execution errors")
+            actions.append("repair arguments for one failing tool and retry only that tool")
+        if not clean:
+            causes.append("assistant content is empty or thinking-only")
+            actions.append("produce one concrete tool call instead of narration")
+        if blank_assistant >= 2:
+            causes.append("repeated blank assistant turns")
+            actions.append("force one-tool convergence mode")
+        if not causes:
+            causes.append("model drifted into analysis-only mode")
+            actions.append("start with TodoWriteRescue and execute one in-progress step")
+        goal_hint = self._latest_user_goal_text()
+        return {
+            "streak": int(streak),
+            "causes": causes[:4],
+            "actions": actions[:4],
+            "work_pending": bool(
+                self.todo.has_open_items()
+                or self._looks_like_incomplete_reply(raw)
+                or self._looks_nontrivial_request(goal_hint)
+            ),
+        }
+
+    def _inject_no_tool_recovery_hint(self, diagnosis: dict):
+        streak = int(diagnosis.get("streak", 0) or 0)
+        causes = ", ".join(str(x) for x in (diagnosis.get("causes") or []) if str(x).strip()) or "unknown"
+        actions = [str(x).strip() for x in (diagnosis.get("actions") or []) if str(x).strip()]
+        action_text = " | ".join(actions[:4]) if actions else "run one concrete tool call"
+        recall_hint = ""
+        if self.context_archives:
+            seg = self.context_archives[-1]
+            seg_id = str(seg.get("id", "")).strip()
+            if seg_id:
+                recall_hint = (
+                    f"Call context_recall first with segment_id='{seg_id}', max_messages=40, offset=0. "
+                )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<no-tool-recovery>"
+                    f"No-tool idle detected (streak={streak}). Diagnosis: {causes}. "
+                    f"{recall_hint}"
+                    "Mandatory next steps: "
+                    "0) call load_skill('execution-degradation-recovery') when available, "
+                    "1) TodoWrite/TodoWriteRescue with 3-7 concise items (one in_progress), "
+                    "2) execute exactly ONE concrete tool call for that in_progress item, "
+                    "3) if blocked, report exact blocker and stop. "
+                    f"Recovery focus: {action_text}."
+                    "</no-tool-recovery>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "no-tool idle diagnosis injected "
+                    f"(streak={streak}; causes={trim(causes, 120)})"
+                )
+            },
+        )
+
+    def _ensure_failure_recovery_todos(self, reason: str):
+        if self.todo.snapshot():
+            return
+        goal = self._latest_user_goal_text()
+        rows = [
+            {
+                "content": f"Triage failure root cause ({trim(reason, 120)})",
+                "status": "in_progress",
+                "activeForm": f"Working on: Triage failure root cause ({trim(reason, 80)})",
+            },
+            {
+                "content": "Recover critical context with context_recall if compacted/truncated",
+                "status": "pending",
+                "activeForm": "Pending: Recover critical context with context_recall if compacted/truncated",
+            },
+            {
+                "content": f"Split goal into 3-7 subtasks and execute one tool step at a time ({trim(goal, 90)})",
+                "status": "pending",
+                "activeForm": "Pending: Split goal into 3-7 subtasks and execute one tool step at a time",
+            },
+            {
+                "content": "If still blocked, output explicit blocker and required next input",
+                "status": "pending",
+                "activeForm": "Pending: If still blocked, output explicit blocker and required next input",
+            },
+        ]
+        try:
+            self.todo.update(rows)
+            self._emit(
+                "status",
+                {"summary": f"recovery todo bootstrap created ({trim(reason, 120)})"},
+            )
+        except Exception:
+            pass
+
+    def _auto_context_recall_for_recovery(self) -> bool:
+        if not self.context_archives:
+            return False
+        recent = self.messages[-16:]
+        for row in reversed(recent):
+            content = str(row.get("content", "") or "")
+            if "<auto-context-recall>" in content:
+                return False
+        try:
+            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "offset": 0})
+        except Exception:
+            return False
+        text = str(recalled or "").strip()
+        if (not text) or text.startswith("Error:"):
+            return False
+        self.messages.append(
+            {
+                "role": "user",
+                "content": f"<auto-context-recall>\n{trim(text, 7000)}\n</auto-context-recall>",
+                "ts": now_ts(),
+            }
+        )
+        self._emit("status", {"summary": "auto context_recall injected for recovery"})
+        return True
+
+    def _extract_text_items_from_raw_args(self, raw: object) -> list[str]:
+        if isinstance(raw, dict):
+            items = raw.get("items")
+            if isinstance(items, list):
+                out = []
+                for item in items:
+                    if isinstance(item, dict):
+                        text = str(item.get("content", item.get("text", item.get("title", "")))).strip()
+                    else:
+                        text = str(item).strip()
+                    if text and text not in out:
+                        out.append(text)
+                if out:
+                    return out[:7]
+        text = str(raw or "")
+        if not text.strip():
+            return []
+        out = []
+        # Try quoted string extraction first (best for truncated JSON arrays)
+        for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text):
+            token = m.group(1)
+            low = token.strip().lower()
+            if low in {"items", "content", "status", "activeform", "in_progress_index"}:
+                continue
+            try:
+                token_decoded = bytes(token, "utf-8").decode("unicode_escape")
+            except Exception:
+                token_decoded = token
+            token_decoded = token_decoded.strip()
+            if token_decoded and token_decoded not in out:
+                out.append(token_decoded)
+        if out:
+            return out[:7]
+        # Fallback: parse non-empty lines / bullets
+        for line in text.splitlines():
+            s = line.strip().strip(",")
+            s = re.sub(r"^[\-\*\d\.\)\s]+", "", s).strip()
+            if not s:
+                continue
+            if s.lower() in {"items", "content", "status", "activeform"}:
+                continue
+            if s not in out:
+                out.append(s)
+        return out[:7]
+
+    def _resolve_context_archive_segment(self, segment_id: str) -> dict | None:
+        sid = str(segment_id or "").strip()
+        if not sid:
+            return None
+        for seg in reversed(self.context_archives):
+            if str(seg.get("id", "")) == sid:
+                return seg
+        return None
+
+    def _load_context_archive_messages(self, seg: dict) -> list[dict]:
+        rel_path = str(seg.get("path", "")).strip()
+        if not rel_path:
+            return []
+        fp = (self.root / rel_path).resolve()
+        if not fp.exists() or not fp.is_file():
+            return []
+        rows: list[dict] = []
+        try:
+            with fp.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    obj = parse_json_object(raw, {})
+                    if not isinstance(obj, dict):
+                        continue
+                    rows.append(obj)
+        except Exception:
+            return []
+        return rows
+
+    def _context_recall(self, args: dict) -> str:
+        segment_id = str(args.get("segment_id", "") or "").strip()
+        query = str(args.get("query", "") or "").strip()
+        recent_segments = int(args.get("recent_segments", 2) or 2)
+        max_messages = int(args.get("max_messages", 30) or 30)
+        offset = int(args.get("offset", 0) or 0)
+        include_tools = bool(args.get("include_tools", True))
+        recent_segments = max(1, min(20, recent_segments))
+        max_messages = max(1, min(120, max_messages))
+        offset = max(0, offset)
+
+        segments: list[dict] = []
+        if segment_id:
+            seg = self._resolve_context_archive_segment(segment_id)
+            if not seg:
+                return f"Error: unknown archive segment '{segment_id}'"
+            segments = [seg]
+        else:
+            segments = list(self.context_archives[-recent_segments:])
+        if not segments:
+            return "No archived context segments available."
+
+        query_low = query.lower()
+        matches: list[dict] = []
+        for seg in segments:
+            seg_id = str(seg.get("id", ""))
+            rows = self._load_context_archive_messages(seg)
+            for idx, row in enumerate(rows):
+                role = str(row.get("role", ""))
+                if not include_tools and role == "tool":
+                    continue
+                content = str(row.get("content", ""))
+                if query_low:
+                    pool = f"{role}\n{row.get('name', '')}\n{content}".lower()
+                    if query_low not in pool:
+                        continue
+                out_row = {
+                    "segment_id": seg_id,
+                    "index": idx,
+                    "role": role,
+                    "name": row.get("name", ""),
+                    "tool_call_id": row.get("tool_call_id", ""),
+                    "ts": float(row.get("ts", 0.0) or 0.0),
+                    "content": trim(content, 6000),
+                }
+                if "thinking" in row:
+                    out_row["thinking"] = trim(row.get("thinking", ""), 2500)
+                matches.append(out_row)
+
+        total = len(matches)
+        page = matches[offset : offset + max_messages]
+        selected_segments = [
+            {
+                "id": str(seg.get("id", "")),
+                "reason": str(seg.get("reason", "")),
+                "messages": int(seg.get("messages", 0) or 0),
+                "created_at": float(seg.get("created_at", 0.0) or 0.0),
+                "path": str(seg.get("path", "")),
+            }
+            for seg in segments
+        ]
+        payload = {
+            "query": query,
+            "segment_id": segment_id or "",
+            "segments_considered": selected_segments,
+            "total_matches": total,
+            "offset": offset,
+            "returned": len(page),
+            "next_offset": (offset + len(page)) if (offset + len(page)) < total else None,
+            "matches": page,
+        }
+        return json_dumps(payload, indent=2)
+
+    def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
+        # Safe auto-repair only for todo tools; file/code tools require regenerate.
+        if name not in {"TodoWrite", "TodoWriteRescue"}:
+            return False, ""
+        items = self._extract_text_items_from_raw_args(raw_args)
+        if not items:
+            return False, "no recoverable todo items from malformed arguments"
+        try:
+            output = self._dispatch_tool("TodoWriteRescue", {"items": items, "in_progress_index": 0})
+            return True, output
+        except Exception as exc:
+            return False, f"rescue failed: {exc}"
+
+    def _missing_required_args(self, name: str, args: dict) -> list[str]:
+        required = TOOL_REQUIRED_ARGS.get(name, [])
+        if not required:
+            return []
+        if not isinstance(args, dict):
+            return list(required)
+        missing = []
+        for key in required:
+            if key not in args:
+                missing.append(key)
+        return missing
+
+    def _dispatch_tool(self, name: str, args: dict) -> str:
+        if name == "bash":
+            meta = self._run_shell_meta(args["command"], self.files_root, 120)
+            self._emit(
+                "command",
+                {
+                    "name": "bash",
+                    "command": meta["command"],
+                    "cwd": meta["cwd"],
+                    "exit_code": meta["exit_code"],
+                    "duration_ms": meta["duration_ms"],
+                    "changed_files": meta["changed_files"],
+                    "output": trim(meta["output"], 1200),
+                    "summary": f"bash ({meta['exit_code']}) {meta['command'][:80]}",
+                },
+            )
+            return meta["output"]
+        if name == "read_file":
+            fp = self._session_path(args["path"])
+            rel = self._session_rel(fp)
+            out = self._run_read(rel, args.get("limit"))
+            self._emit("file_read", {"path": rel, "summary": f"read file: {rel}"})
+            return out
+        if name == "write_file":
+            fp = self._session_path(args["path"])
+            rel = self._session_rel(fp)
+            existed = fp.exists()
+            before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            out = self._run_write(rel, args["content"])
+            if not out.startswith("Error"):
+                offline_result = self._localize_html_js_dependencies(rel)
+                summary = str(offline_result.get("summary", "") or "").strip()
+                if summary:
+                    self._emit("status", {"summary": summary})
+                    out = f"{out}\n{summary}"
+                after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                diff = make_unified_diff(rel, before_text, after_text)
+                numbered = make_numbered_diff(before_text, after_text)
+                numbered_text = render_numbered_diff_text(numbered)
+                added = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+                deleted = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+                code_stage = self._record_code_preview_stage(
+                    rel_path=rel,
+                    before_text=before_text,
+                    after_text=after_text,
+                    change_type=("added" if not existed else "modified"),
+                    tool_name="write_file",
+                    added=added,
+                    deleted=deleted,
+                )
+                patch_payload = {
+                    "path": rel,
+                    "abs_path": str(fp),
+                    "session_rel_path": rel,
+                    "session_root": str(self.files_root),
+                    "change_type": "added" if not existed else "modified",
+                    "added": added,
+                    "deleted": deleted,
+                    "diff": trim(diff, 30_000),
+                    "diff_numbered": trim(numbered_text, 30_000),
+                    "diff_rows": numbered,
+                    "summary": f"file {'added' if not existed else 'modified'}: {rel} (+{added}/-{deleted})",
+                }
+                if code_stage:
+                    patch_payload["code_stage"] = code_stage
+                self._emit(
+                    "file_patch",
+                    patch_payload,
+                )
+            return out
+        if name == "edit_file":
+            fp = self._session_path(args["path"])
+            rel = self._session_rel(fp)
+            before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            out = self._run_edit(rel, args["old_text"], args["new_text"])
+            if not out.startswith("Error"):
+                offline_result = self._localize_html_js_dependencies(rel)
+                summary = str(offline_result.get("summary", "") or "").strip()
+                if summary:
+                    self._emit("status", {"summary": summary})
+                    out = f"{out}\n{summary}"
+                after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                diff = make_unified_diff(rel, before_text, after_text)
+                numbered = make_numbered_diff(before_text, after_text)
+                numbered_text = render_numbered_diff_text(numbered)
+                added = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+                deleted = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+                code_stage = self._record_code_preview_stage(
+                    rel_path=rel,
+                    before_text=before_text,
+                    after_text=after_text,
+                    change_type="modified",
+                    tool_name="edit_file",
+                    added=added,
+                    deleted=deleted,
+                )
+                patch_payload = {
+                    "path": rel,
+                    "abs_path": str(fp),
+                    "session_rel_path": rel,
+                    "session_root": str(self.files_root),
+                    "change_type": "modified",
+                    "added": added,
+                    "deleted": deleted,
+                    "diff": trim(diff, 30_000),
+                    "diff_numbered": trim(numbered_text, 30_000),
+                    "diff_rows": numbered,
+                    "summary": f"file modified: {rel} (+{added}/-{deleted})",
+                }
+                if code_stage:
+                    patch_payload["code_stage"] = code_stage
+                self._emit(
+                    "file_patch",
+                    patch_payload,
+                )
+            return out
+        if name == "TodoWrite":
+            return self.todo.update(args["items"])
+        if name == "TodoWriteRescue":
+            return self._todo_write_rescue(args)
+        if name == "task":
+            return self.run_subagent(args["prompt"], args.get("agent_type", "Explore"))
+        if name == "list_skills":
+            self._ensure_skills_ready(force=False)
+            return ", ".join(self.skills.list_names())
+        if name == "load_skill":
+            return self._load_skill_with_cache(args["name"])
+        if name == "list_skill_providers":
+            self._ensure_skills_ready(force=False)
+            return json_dumps(self.skills.list_providers(), indent=2)
+        if name == "list_skill_protocols":
+            self._ensure_skills_ready(force=False)
+            return json_dumps(self.skills.list_protocols(), indent=2)
+        if name == "write_skill":
+            return self._write_global_skill(args)
+        if name == "scan_skills":
+            return self._scan_global_skills()
+        if name == "compress":
+            return "Compress requested."
+        if name == "context_recall":
+            return self._context_recall(args)
+        if name == "generate_media":
+            media_type = str(args.get("media_type", "") or "").strip().lower()
+            if media_type not in {"image", "audio", "video"}:
+                return "Error: media_type must be one of image/audio/video"
+            prompt = str(args.get("prompt", "") or "").strip()
+            if not prompt:
+                return "Error: prompt is required"
+            cap_key = f"output_{media_type}"
+            caps = self._ensure_active_profile_capabilities(force_probe=False)
+            if not bool(caps.get(cap_key, False)):
+                caps = self._ensure_active_profile_capabilities(force_probe=True)
+            if not bool(caps.get(cap_key, False)):
+                return (
+                    f"Error: active model '{self.ollama.model}' does not support {media_type} output "
+                    f"(capability={cap_key}=false after active probe)"
+                )
+            try:
+                generated = self.ollama.generate_media(
+                    media_type,
+                    prompt,
+                    size=str(args.get("size", "") or "").strip(),
+                    duration=int(args.get("duration", 0) or 0),
+                    fmt=str(args.get("format", "") or "").strip(),
+                    extra=args.get("extra") if isinstance(args.get("extra"), dict) else None,
+                )
+                saved = self._save_generated_media(
+                    media_type,
+                    generated,
+                    filename=str(args.get("filename", "") or "").strip(),
+                )
+                return json_dumps(saved, indent=2)
+            except Exception as exc:
+                return f"Error: generate_media failed: {exc}"
+        if name == "background_run":
+            out = self.bg.run(args["command"], int(args.get("timeout", 120)))
+            self._emit(
+                "command",
+                {
+                    "name": "background_run",
+                    "command": args["command"],
+                    "cwd": str(self.files_root),
+                    "summary": f"background_run: {args['command'][:80]}",
+                },
+            )
+            return out
+        if name == "check_background":
+            return self.bg.check(args.get("task_id"))
+        if name == "task_create":
+            return self.tasks.create(args["subject"], args.get("description", ""))
+        if name == "task_get":
+            return self.tasks.get(int(args["task_id"]))
+        if name == "task_update":
+            return self.tasks.update(int(args["task_id"]), args.get("status"), args.get("add_blocked_by"), args.get("add_blocks"))
+        if name == "task_list":
+            return self.tasks.list_all()
+        if name == "claim_task":
+            return self.tasks.claim(int(args["task_id"]), "lead")
+        if name == "spawn_teammate":
+            return self._spawn_teammate(args["name"], args["role"], args["prompt"])
+        if name == "list_teammates":
+            return self._list_teammates()
+        if name == "send_message":
+            return self.bus.send("lead", args["to"], args["content"], args.get("msg_type", "message"))
+        if name == "read_inbox":
+            return json_dumps(self.bus.read_inbox("lead"), indent=2)
+        if name == "broadcast":
+            return self.bus.broadcast("lead", args["content"], list(self.teammates.keys()))
+        if name == "shutdown_request":
+            return self._handle_shutdown_request(args["teammate"])
+        if name == "plan_approval":
+            return self._handle_plan_approval(args["request_id"], bool(args["approve"]), args.get("feedback", ""))
+        if name == "worktree_create":
+            return self.worktrees.create(args["name"], args.get("task_id"), args.get("base_ref", "HEAD"))
+        if name == "worktree_list":
+            return self.worktrees.list_all()
+        if name == "worktree_status":
+            return self.worktrees.status(args["name"])
+        if name == "worktree_run":
+            wt_path = self.worktrees.resolve_path(args["name"])
+            if wt_path is None:
+                return f"Error: unknown worktree '{args['name']}'"
+            meta = self._run_shell_meta(args["command"], wt_path, 300)
+            self._emit(
+                "command",
+                {
+                    "name": "worktree_run",
+                    "worktree": args["name"],
+                    "command": meta["command"],
+                    "cwd": meta["cwd"],
+                    "exit_code": meta["exit_code"],
+                    "duration_ms": meta["duration_ms"],
+                    "changed_files": meta["changed_files"],
+                    "output": trim(meta["output"], 1200),
+                    "summary": f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}",
+                },
+            )
+            return meta["output"]
+        if name == "worktree_keep":
+            return self.worktrees.keep(args["name"])
+        if name == "worktree_remove":
+            return self.worktrees.remove(args["name"], bool(args.get("force", False)), bool(args.get("complete_task", False)))
+        if name == "worktree_events":
+            return self.worktrees.events_recent(int(args.get("limit", 20)))
+        return f"Unknown tool: {name}"
+
+    def _live_input_delay_locked(self) -> tuple[int, str]:
+        phase = str(self.current_phase or "")
+        tool = str(self.current_tool_name or "")
+        if tool in {"write_file", "edit_file"} or phase in {"tool:write_file", "tool:edit_file"}:
+            return LIVE_INPUT_DELAY_WRITE_ROUNDS, "write-phase"
+        if phase.startswith("tool:"):
+            return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
+        return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
+
+    def _enqueue_running_user_input(self, content: str) -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        with self.lock:
+            self.live_input_seq += 1
+            delay_rounds, delay_reason = self._live_input_delay_locked()
+            round_idx = int(self.agent_round_index)
+            row = {
+                "id": int(self.live_input_seq),
+                "content": text,
+                "queued_at": now_ts(),
+                "queued_round": round_idx,
+                "delay_rounds": int(delay_rounds),
+                "next_round": int(round_idx + delay_rounds),
+                "applied_count": 0,
+                "last_applied_round": -1,
+                "delay_reason": delay_reason,
+                "run_generation": int(self.run_generation),
+            }
+            self.pending_user_inputs.append(row)
+            self.pending_user_inputs = self.pending_user_inputs[-40:]
+            self.updated_at = now_ts()
+            self._persist()
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "live user input queued "
+                    f"(id={row['id']}, delay_rounds={delay_rounds}, reason={delay_reason})"
+                )
+            },
+        )
+        return row
+
+    def _inject_pending_user_inputs(self) -> int:
+        injected: list[dict] = []
+        with self.lock:
+            if not self.pending_user_inputs:
+                return 0
+            round_idx = int(self.agent_round_index)
+            current_generation = int(self.run_generation)
+            kept: list[dict] = []
+            for row in list(self.pending_user_inputs):
+                row_generation = int(row.get("run_generation", current_generation) or current_generation)
+                if row_generation != current_generation:
+                    continue
+                next_round = int(row.get("next_round", round_idx) or round_idx)
+                if round_idx < next_round:
+                    kept.append(row)
+                    continue
+                content = trim(str(row.get("content", "") or "").strip(), 6000)
+                if not content:
+                    continue
+                applied = int(row.get("applied_count", 0) or 0) + 1
+                delay_rounds = int(row.get("delay_rounds", 0) or 0)
+                base_weight = (
+                    float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                    if delay_rounds > 0
+                    else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                )
+                weight_step = (
+                    float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                    if delay_rounds > 0
+                    else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                )
+                weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                payload = (
+                    "<live-user-adjustment "
+                    f"id=\"{int(row.get('id', 0) or 0)}\" "
+                    f"priority=\"{priority}\" "
+                    f"weight=\"{weight:.2f}\">"
+                    f"\n{content}\n"
+                    "</live-user-adjustment>"
+                )
+                self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                injected.append(
+                    {
+                        "id": int(row.get("id", 0) or 0),
+                        "weight": weight,
+                        "priority": priority,
+                        "applied": applied,
+                    }
+                )
+                row["applied_count"] = applied
+                row["last_applied_round"] = round_idx
+                if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                    row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
+                    kept.append(row)
+            self.pending_user_inputs = kept[-40:]
+            if injected:
+                self.updated_at = now_ts()
+                self._persist()
+        for item in injected:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "live input applied "
+                        f"(id={item['id']}, priority={item['priority']}, weight={item['weight']:.2f}, "
+                        f"pass={item['applied']}/{LIVE_INPUT_MAX_INJECTIONS})"
+                    )
+                },
+            )
+        return len(injected)
+
+    def submit_user_message(self, content: str):
+        start_worker = False
+        dropped_stale_inputs = 0
+        removed_runtime_hints = 0
+        with self.lock:
+            if self.running:
+                pass
+            else:
+                if self.pending_user_inputs:
+                    dropped_stale_inputs = len(self.pending_user_inputs)
+                removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
+                self.run_generation = int(self.run_generation) + 1
+                self.messages.append({"role": "user", "content": content, "ts": now_ts()})
+                if not self.todo.snapshot() and self._looks_nontrivial_request(content):
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "<reminder>Start with TodoWrite for this non-trivial request.</reminder>",
+                            "ts": now_ts(),
+                        }
+                    )
+                self._emit("status", {"summary": "todo bootstrap reminder inserted"})
+                self.running = True
+                self.current_phase = "starting"
+                self.current_tool_name = ""
+                self.updated_at = now_ts()
+                self._emit("message", {"role": "user", "text": content, "summary": "user message"})
+                self._persist()
+                start_worker = True
+        if dropped_stale_inputs > 0:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "stale delayed live inputs cleared before new run "
+                        f"(count={dropped_stale_inputs})"
+                    )
+                },
+            )
+        if removed_runtime_hints > 0:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "cleared runtime control hints before new run "
+                        f"(count={removed_runtime_hints})"
+                    )
+                },
+            )
+        if not start_worker:
+            row = self._enqueue_running_user_input(content)
+            return {
+                "ok": True,
+                "queued": True,
+                "running": True,
+                "queue_id": int(row.get("id", 0) or 0),
+                "delay_rounds": int(row.get("delay_rounds", 0) or 0),
+                "delay_reason": str(row.get("delay_reason", "")),
+            }
+        threading.Thread(target=self._agent_worker, daemon=True).start()
+        return {"ok": True, "queued": False, "running": True}
+
+    def manual_compact(self):
+        with self.lock:
+            self._auto_compact("manual")
+            self.updated_at = now_ts()
+            self._persist()
+
+    def interrupt(self):
+        with self.lock:
+            self.cancel_requested = True
+            phase = str(self.current_phase or "idle")
+            tool = str(self.current_tool_name or "")
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "interrupt requested "
+                        f"(phase={phase}{', tool=' + tool if tool else ''})"
+                    )
+                },
+            )
+            self._persist()
+
+    def _agent_worker(self):
+        try:
+            self._ensure_runtime_model_ready()
+            pinned_selection = self._active_runtime_selection()
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"run model pinned: {pinned_selection} "
+                        f"(auto-switch disabled, retry={MODEL_OUTPUT_RETRY_TIMES})"
+                    )
+                },
+            )
+            active_caps = self._ensure_active_profile_capabilities(force_probe=False)
+            media_last_user_ts = -1.0
+            auto_continue_budget = AUTO_CONTINUE_BUDGET_DEFAULT
+            started_at = now_ts()
+            no_tool_rounds = 0
+            last_tool_fp = ""
+            repeated_tool_rounds = 0
+            forced_convergence_budget = 2
+            force_single_tool_rounds = 0
+            with self.lock:
+                self.current_phase = "run-loop"
+                self.current_tool_name = ""
+            for _ in range(self.max_agent_rounds):
+                with self.lock:
+                    self.agent_round_index = int(self.agent_round_index) + 1
+                    self.current_phase = "model-call"
+                    self.current_tool_name = ""
+                if self.cancel_requested:
+                    self._emit("status", {"summary": "run interrupted"})
+                    break
+                if self.max_run_seconds > 0:
+                    now_tick = now_ts()
+                    with self.lock:
+                        model_active_total = float(self.run_model_active_seconds or 0.0)
+                        model_active_now = bool(self.live_run_notice_active)
+                        model_started_at = float(self.live_run_notice_started_at or 0.0)
+                    if model_active_now and model_started_at > 0:
+                        model_active_total += max(0.0, now_tick - model_started_at)
+                    idle_elapsed = max(0.0, now_tick - started_at - model_active_total)
+                    if idle_elapsed > self.max_run_seconds:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "stop: max idle run time reached "
+                                    f"({self.max_run_seconds}s, model-active excluded)"
+                                )
+                            },
+                        )
+                        break
+                self._microcompact()
+                if self._estimate_tokens() > self.context_token_upper_bound:
+                    self._auto_compact("auto")
+                notifs = self.bg.drain()
+                if notifs:
+                    text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
+                    self.messages.append({"role": "user", "content": f"<background-results>\n{text}\n</background-results>", "ts": now_ts()})
+                    self._emit("background", {"summary": f"{len(notifs)} background notifications"})
+                inbox = self.bus.read_inbox("lead")
+                if inbox:
+                    self.messages.append({"role": "user", "content": f"<inbox>{json_dumps(inbox, indent=2)}</inbox>", "ts": now_ts()})
+                    self._emit("inbox", {"summary": f"{len(inbox)} inbox messages"})
+                self._inject_pending_user_inputs()
+                latest_user_ts = 0.0
+                for row in reversed(self.messages):
+                    if str(row.get("role", "")).strip() == "user":
+                        try:
+                            latest_user_ts = float(row.get("ts", 0.0) or 0.0)
+                        except Exception:
+                            latest_user_ts = 0.0
+                        break
+                media_inputs_round = None
+                if latest_user_ts > media_last_user_ts:
+                    media_inputs_round = self._recent_multimodal_inputs()
+                    media_last_user_ts = latest_user_ts
+                    if media_inputs_round:
+                        media_types = ",".join(
+                            sorted(
+                                {
+                                    str(x.get("type", ""))
+                                    for x in media_inputs_round
+                                    if isinstance(x, dict)
+                                }
+                            )
+                        )
+                        img_names = [
+                            str(x.get("name", ""))
+                            for x in media_inputs_round
+                            if isinstance(x, dict) and str(x.get("type", "")).strip().lower() == "image"
+                        ]
+                        name_preview = ", ".join([n for n in img_names if n][:3])
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "multimodal inputs attached for latest user turn "
+                                    f"({len(media_inputs_round)} files: {media_types}"
+                                    f"{'; images=' + name_preview if name_preview else ''}) "
+                                    f"capabilities={json_dumps(active_caps)}"
+                                )
+                            },
+                        )
+                self._clear_live_thinking()
+                self._clear_live_truncation()
+                response = self._chat_with_same_model_retry(
+                    self.messages,
+                    tools=TOOLS,
+                    system=self._system_prompt(),
+                    max_tokens=AGENT_MAX_OUTPUT_TOKENS,
+                    think=False,
+                    stream_thinking=False,
+                    on_thinking_chunk=self._append_live_thinking,
+                    pinned_selection=pinned_selection,
+                    context_label="agent turn",
+                    retries=MODEL_OUTPUT_RETRY_TIMES,
+                    media_inputs=media_inputs_round,
+                )
+                text = str(response.get("content") or "")
+                thinking_text = str(response.get("thinking") or "").strip()
+                text_main, text_embedded_thinking = split_thinking_content(text)
+                if text_embedded_thinking:
+                    if thinking_text:
+                        thinking_text = trim(f"{thinking_text}\n\n{text_embedded_thinking}", 24_000)
+                    else:
+                        thinking_text = text_embedded_thinking
+                text = text_main
+                if not thinking_text:
+                    with self.lock:
+                        thinking_text = str(self.live_thinking_text or "").strip()
+                tool_calls = response.get("tool_calls", [])
+                if force_single_tool_rounds > 0 and isinstance(tool_calls, list) and len(tool_calls) > 1:
+                    original_count = len(tool_calls)
+                    tool_calls = list(tool_calls[:1])
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "forced convergence active: "
+                                f"tool calls limited {original_count}->1 "
+                                f"(remaining rounds={force_single_tool_rounds})"
+                            )
+                        },
+                    )
+                output_tokens = self._estimate_output_tokens(text, thinking_text, tool_calls)
+                round_truncation_triggered = False
+                if self._looks_like_truncated_generation(text, tool_calls, output_tokens):
+                    text, output_tokens, trunc_meta = self._continue_truncated_assistant_output(
+                        partial_text=text,
+                        output_tokens=output_tokens,
+                        pinned_selection=pinned_selection,
+                    )
+                    attempts = int(trunc_meta.get("attempts", 0) or 0)
+                    resolved = bool(trunc_meta.get("resolved", False))
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "truncation continuation "
+                                f"{'resolved' if resolved else 'partial'} "
+                                f"(attempts={attempts}, tokens≈{output_tokens})"
+                            )
+                        },
+                    )
+                    if self._looks_like_truncated_generation(text, tool_calls, output_tokens):
+                        self._handle_truncation_rescue(
+                            "assistant output appears truncated after continuation",
+                            output_tokens,
+                            source="assistant-output",
+                        )
+                        round_truncation_triggered = True
+                assistant = {"role": "assistant", "content": text, "ts": now_ts()}
+                if thinking_text:
+                    assistant["thinking"] = thinking_text
+                self._clear_live_thinking()
+                if tool_calls:
+                    assistant["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["function"]["name"], "arguments": json_dumps(tc["function"]["arguments"])},
+                        }
+                        for tc in tool_calls
+                    ]
+                self.messages.append(assistant)
+                if text.strip() or thinking_text:
+                    emit_text = text if text.strip() else "[thinking-only output]"
+                    emit_summary = "assistant message" if text.strip() else "assistant thinking-only message"
+                    self._emit("message", {"role": "assistant", "text": emit_text, "summary": emit_summary})
+                    try:
+                        self._maybe_auto_rename_session_title("task-progress")
+                    except Exception:
+                        pass
+                if not tool_calls:
+                    with self.lock:
+                        self.current_phase = "no-tools"
+                        self.current_tool_name = ""
+                    no_tool_rounds += 1
+                    last_tool_fp = ""
+                    repeated_tool_rounds = 0
+                    decision_probe = text if str(text or "").strip() else thinking_text
+                    decision_needed = self._looks_like_user_decision_needed(decision_probe)
+                    if decision_needed:
+                        self._emit("status", {"summary": "waiting for user input: assistant asked for a decision"})
+                        break
+                    diagnosis = self._diagnose_no_tool_idle(decision_probe, no_tool_rounds)
+                    done_markers = ["任务完成", "已完成", "all set", "done", "completed", "finished"]
+                    done_probe = f"{text}\n{thinking_text}".strip().lower()
+                    done_like = any(x in done_probe for x in done_markers)
+                    pending_like = bool(diagnosis.get("work_pending", False)) or self.todo.has_open_items()
+                    if no_tool_rounds >= 2 and pending_like:
+                        self._ensure_failure_recovery_todos(
+                            f"no-tool streak {no_tool_rounds}: {', '.join(diagnosis.get('causes', []) or [])}"
+                        )
+                        self._auto_context_recall_for_recovery()
+                    if (not done_like) and no_tool_rounds >= 1 and pending_like:
+                        if auto_continue_budget > 0:
+                            auto_continue_budget -= 1
+                            if no_tool_rounds >= 2:
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                self._inject_no_tool_recovery_hint(diagnosis)
+                                summary = "no-tool recovery mode engaged"
+                            else:
+                                summary = "no-tool idle detected; giving one extra execution turn"
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        f"{summary} "
+                                        f"(streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                    )
+                                },
+                            )
+                            continue
+                    can_continue = auto_continue_budget > 0 and (
+                        self.todo.has_open_items() or self._looks_like_incomplete_reply(text)
+                    )
+                    if can_continue:
+                        if self.cancel_requested:
+                            self._emit("status", {"summary": "run interrupted"})
+                            break
+                        auto_continue_budget -= 1
+                        if no_tool_rounds % 6 == 0:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "<auto-continue>Please continue executing the pending work. "
+                                        "Use tools and do not stop at explanation-only text.</auto-continue>"
+                                    ),
+                                    "ts": now_ts(),
+                                }
+                            )
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "auto-continue triggered "
+                                        f"(no-tool streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                    )
+                                },
+                            )
+                        else:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "no tool calls; allowing more thinking "
+                                        f"(streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                    )
+                                },
+                            )
+                        continue
+                    if no_tool_rounds >= 2 and pending_like:
+                        self._ensure_failure_recovery_todos(
+                            f"no-tool stop path at streak {no_tool_rounds}"
+                        )
+                        self._inject_no_tool_recovery_hint(diagnosis)
+                    if self.todo.has_open_items():
+                        self._emit("status", {"summary": "stop: no tool calls while todos still open"})
+                    else:
+                        self._emit("status", {"summary": "stop: model returned without tool calls"})
+                    break
+                with self.lock:
+                    self.current_phase = "tool-dispatch"
+                    self.current_tool_name = ""
+                no_tool_rounds = 0
+                used_todo = False
+                todo_attempted = False
+                manual_compact = False
+                retry_requested_this_round = False
+                retry_count_seen_this_round: dict[str, int] = {}
+                round_tool_names: list[str] = []
+                round_error_count = 0
+                round_ok_count = 0
+                stop_due_to_repeated_tool_loop = False
+                interrupted_in_tools = False
+                round_tool_fp = self._tool_calls_fingerprint(tool_calls)
+                for tc in tool_calls:
+                    if self.cancel_requested:
+                        interrupted_in_tools = True
+                        self._emit("status", {"summary": "run interrupted"})
+                        break
+                    name = tc["function"]["name"]
+                    with self.lock:
+                        self.current_phase = f"tool:{name}"
+                        self.current_tool_name = name
+                    round_tool_names.append(name)
+                    args = tc["function"]["arguments"]
+                    args_error = str(tc.get("args_error", "") or "").strip()
+                    raw_args = tc.get("raw_arguments")
+                    self._emit("tool_start", {"name": name, "summary": f"tool start: {name}"})
+                    dispatched_name = name
+                    output = ""
+                    skip_dispatch = False
+                    if args_error:
+                        repaired, repaired_output = self._attempt_malformed_tool_repair(name, raw_args)
+                        if repaired:
+                            output = repaired_output
+                            dispatched_name = "TodoWriteRescue"
+                            skip_dispatch = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": f"tool args auto-repaired: {name} -> TodoWriteRescue"
+                                },
+                            )
+                        else:
+                            ok, args2, note = self._recover_tool_args_from_malformed(
+                                name=name,
+                                raw_args=raw_args,
+                                pinned_selection=pinned_selection,
+                            )
+                            if ok and isinstance(args2, dict):
+                                args = args2
+                                args_error = ""
+                                self._emit(
+                                    "status",
+                                    {"summary": f"tool args recovered in-process: {name} ({note})"},
+                                )
+                            else:
+                                retry_count = retry_count_seen_this_round.get(name)
+                                if retry_count is None:
+                                    retry_count = self._next_tool_retry_count(name)
+                                    retry_count_seen_this_round[name] = retry_count
+                                output = (
+                                    f"Error: malformed arguments for tool '{name}'. {args_error}. "
+                                    "Please regenerate this tool call with complete JSON arguments."
+                                )
+                                skip_dispatch = True
+                                self._emit(
+                                    "status",
+                                    {
+                                        "summary": f"tool args malformed: {name}, regenerate requested"
+                                    },
+                                )
+                                if retry_count <= 1:
+                                    self._inject_immediate_tool_retry_hint(
+                                        name,
+                                        f"malformed arguments ({trim(args_error, 160)})",
+                                    )
+                                    retry_requested_this_round = True
+                                else:
+                                    self._tighten_context_for_segmented_retry(
+                                        f"tool args malformed: {name}",
+                                        output_tokens,
+                                    )
+                                    if not round_truncation_triggered:
+                                        self._handle_truncation_rescue(
+                                            f"tool args malformed after retry: {name}",
+                                            output_tokens,
+                                            source=f"tool-args-retry:{name}",
+                                        )
+                                        round_truncation_triggered = True
+                                    self._inject_segmented_retry_hint(
+                                        name,
+                                        f"malformed arguments persisted ({trim(args_error, 160)})",
+                                    )
+                                    retry_requested_this_round = True
+                    if not skip_dispatch:
+                        missing = self._missing_required_args(name, args)
+                        if missing:
+                            repaired, repaired_output = self._attempt_malformed_tool_repair(name, args)
+                            if repaired:
+                                output = repaired_output
+                                dispatched_name = "TodoWriteRescue"
+                                skip_dispatch = True
+                                self._emit(
+                                    "status",
+                                    {
+                                        "summary": f"tool args auto-repaired: {name} missing {', '.join(missing)}"
+                                    },
+                                )
+                            else:
+                                ok, args3, note = self._recover_tool_args_from_missing(
+                                    name=name,
+                                    args=args if isinstance(args, dict) else {},
+                                    missing=list(missing),
+                                    pinned_selection=pinned_selection,
+                                )
+                                if ok and isinstance(args3, dict):
+                                    args = args3
+                                    missing = self._missing_required_args(name, args)
+                                    if not missing:
+                                        self._emit(
+                                            "status",
+                                            {"summary": f"tool args recovered in-process: {name} ({note})"},
+                                        )
+                                if missing:
+                                    retry_count = retry_count_seen_this_round.get(name)
+                                    if retry_count is None:
+                                        retry_count = self._next_tool_retry_count(name)
+                                        retry_count_seen_this_round[name] = retry_count
+                                    output = (
+                                        f"Error: tool '{name}' missing required arguments: {', '.join(missing)}. "
+                                        "Likely truncated tool call. Please regenerate this tool call with complete JSON arguments."
+                                    )
+                                    skip_dispatch = True
+                                    self._emit(
+                                        "status",
+                                        {
+                                            "summary": f"tool args incomplete: {name}, regenerate requested"
+                                        },
+                                    )
+                                    if retry_count <= 1:
+                                        self._inject_immediate_tool_retry_hint(
+                                            name,
+                                            f"missing required args: {', '.join(missing)}",
+                                        )
+                                        retry_requested_this_round = True
+                                    else:
+                                        self._tighten_context_for_segmented_retry(
+                                            f"tool args incomplete: {name}",
+                                            output_tokens,
+                                        )
+                                        if not round_truncation_triggered:
+                                            self._handle_truncation_rescue(
+                                                f"tool args incomplete after retry: {name} missing {', '.join(missing)}",
+                                                output_tokens,
+                                                source=f"tool-missing-retry:{name}",
+                                            )
+                                            round_truncation_triggered = True
+                                        self._inject_segmented_retry_hint(
+                                            name,
+                                            f"missing args persisted: {', '.join(missing)}",
+                                        )
+                                        retry_requested_this_round = True
+                    if not skip_dispatch:
+                        try:
+                            output = self._dispatch_tool(name, args)
+                        except Exception as exc:
+                            output = f"Error: {exc}"
+                    if str(output).startswith("Error"):
+                        round_error_count += 1
+                    else:
+                        round_ok_count += 1
+                        self._clear_tool_retry_count(name)
+                    if dispatched_name in {"TodoWrite", "TodoWriteRescue"}:
+                        todo_attempted = True
+                        state, reason = self._analyze_todo_result(dispatched_name, output)
+                        if state == "ok":
+                            used_todo = True
+                            self.todo_write_issue_count = 0
+                            self.todo_last_issue = ""
+                        else:
+                            self.todo_write_issue_count += 1
+                            self.todo_last_issue = reason
+                            if self.todo_write_issue_count >= 2 and not self.todo.snapshot():
+                                self._inject_todo_rescue_hint(reason)
+                                self.todo_write_issue_count = 1
+                    if dispatched_name == "compress":
+                        manual_compact = True
+                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(output), "ts": now_ts()})
+                    self._emit("tool_result", {"name": name, "result": trim(output, 500), "summary": f"tool done: {name}"})
+                with self.lock:
+                    self.current_tool_name = ""
+                    self.current_phase = "post-tools"
+                if interrupted_in_tools:
+                    break
+                if force_single_tool_rounds > 0:
+                    force_single_tool_rounds = max(0, force_single_tool_rounds - 1)
+                if (
+                    round_tool_fp
+                    and round_tool_fp == last_tool_fp
+                    and round_error_count > 0
+                    and round_ok_count == 0
+                ):
+                    repeated_tool_rounds += 1
+                else:
+                    repeated_tool_rounds = 0
+                last_tool_fp = round_tool_fp
+                if repeated_tool_rounds >= REPEATED_TOOL_LOOP_THRESHOLD:
+                    loop_reason = (
+                        "identical tool calls keep failing "
+                        f"(repeat_count={repeated_tool_rounds + 1})"
+                    )
+                    if forced_convergence_budget > 0:
+                        forced_convergence_budget -= 1
+                        self._tighten_context_for_segmented_retry(
+                            f"repeated tool loop: {', '.join(round_tool_names[:3])}",
+                            output_tokens,
+                        )
+                        if not round_truncation_triggered:
+                            self._handle_truncation_rescue(
+                                f"repeated tool loop on {', '.join(round_tool_names[:3])}",
+                                output_tokens,
+                                source="repeated-tool-loop",
+                            )
+                            round_truncation_triggered = True
+                        self._inject_forced_convergence_hint(round_tool_names, loop_reason)
+                        self._ensure_failure_recovery_todos(loop_reason)
+                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                        retry_requested_this_round = True
+                        repeated_tool_rounds = 0
+                    else:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "stop: repeated tool loop detected; "
+                                    "halted early to avoid max loop exhaustion"
+                                )
+                            },
+                        )
+                        stop_due_to_repeated_tool_loop = True
+                if round_error_count > 0 and round_ok_count == 0:
+                    self._ensure_failure_recovery_todos(
+                        f"all tool calls failed in round ({', '.join(round_tool_names[:4])})"
+                    )
+                    self._auto_context_recall_for_recovery()
+                    if not retry_requested_this_round:
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "<failure-recovery>"
+                                    "All tool calls in the last round failed. "
+                                    "Switch to strict step mode now: "
+                                    "1) call load_skill('execution-degradation-recovery') if available, "
+                                    "2) keep only one in_progress todo item, "
+                                    "3) execute exactly one repaired tool call, "
+                                    "4) if still failing, report blocker with exact error and stop."
+                                    "</failure-recovery>"
+                                ),
+                                "ts": now_ts(),
+                            }
+                        )
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "failure recovery hint injected "
+                                    "(all tool calls failed in previous round)"
+                                )
+                            },
+                        )
+                        retry_requested_this_round = True
+                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                if used_todo:
+                    self.rounds_without_todo = 0
+                    self.todo_reminder_count = 0
+                elif todo_attempted:
+                    self.rounds_without_todo = max(0, self.rounds_without_todo - 1)
+                else:
+                    self.rounds_without_todo += 1
+                now_tick = now_ts()
+                can_remind = (now_tick - self.last_todo_reminder_ts) >= 20
+                if can_remind and self.todo_reminder_count < 2:
+                    if not self.todo.snapshot() and self.rounds_without_todo >= 2:
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": "<reminder>Please call TodoWrite now. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
+                                "ts": now_tick,
+                            }
+                        )
+                        self.last_todo_reminder_ts = now_tick
+                        self.todo_reminder_count += 1
+                    elif self.todo.has_open_items() and self.rounds_without_todo >= 4:
+                        self.messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>", "ts": now_tick})
+                        self.last_todo_reminder_ts = now_tick
+                        self.todo_reminder_count += 1
+                if manual_compact:
+                    self._auto_compact("tool-requested")
+                if retry_requested_this_round:
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "<auto-continue>"
+                                "Immediate retry workflow is active. Continue now with tool calls only."
+                                "</auto-continue>"
+                            ),
+                            "ts": now_ts(),
+                        }
+                    )
+                if stop_due_to_repeated_tool_loop:
+                    break
+            else:
+                self._emit("error", {"summary": f"max loop reached ({self.max_agent_rounds})"})
+        except Exception as exc:
+            self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
+        finally:
+            dropped_pending_inputs = 0
+            removed_runtime_hints = 0
+            with self.lock:
+                if self.pending_user_inputs:
+                    dropped_pending_inputs = len(self.pending_user_inputs)
+                removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
+                self.running = False
+                self.updated_at = now_ts()
+                self._persist()
+            if dropped_pending_inputs > 0:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "discarded delayed live inputs after run finished "
+                            f"(count={dropped_pending_inputs})"
+                        )
+                    },
+                )
+            if removed_runtime_hints > 0:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "runtime control hints cleaned after run finished "
+                            f"(count={removed_runtime_hints})"
+                        )
+                    },
+                )
+            self._emit("status", {"summary": "run finished"})
+
+    def snapshot(self, include_model_catalog: bool = False, lite: bool = False) -> dict:
+        with self.lock:
+            msg_window = 120 if lite else 200
+            op_feed_window = 80 if lite else 240
+            upload_window = 16 if lite else 40
+            conversation_window = 160 if lite else 400
+            activity_window = 40 if lite else 100
+            ops_window = 60 if lite else 200
+            visible_messages = []
+            conversation_feed = []
+            for msg in self.messages[-msg_window:]:
+                role = msg.get("role")
+                if role == "tool":
+                    continue
+                text = msg.get("content", "")
+                if not text and msg.get("tool_calls"):
+                    names = [x.get("function", {}).get("name", "?") for x in msg["tool_calls"]]
+                    text = f"[tool calls] {', '.join(names)}"
+                if isinstance(text, list):
+                    text = json_dumps(text)
+                ts = float(msg.get("ts", 0.0)) if isinstance(msg, dict) else 0.0
+                row = {"role": role, "text": str(text), "ts": ts, "type": "message"}
+                thinking = str(msg.get("thinking", "")).strip() if isinstance(msg, dict) else ""
+                if thinking:
+                    row["thinking"] = thinking
+                visible_messages.append(row)
+                conversation_feed.append(row)
+            for op in self.operations[-op_feed_window:]:
+                t = op.get("type")
+                if t == "command":
+                    d = op.get("data", {})
+                    out_text = str(d.get("output", ""))
+                    if lite and out_text:
+                        out_text = trim(out_text, 2200)
+                    d_view = dict(d)
+                    if lite and d_view.get("output") is not None:
+                        d_view["output"] = out_text
+                    text = (
+                        f"[command] {d.get('name','')}\n"
+                        f"$ {d.get('command','')}\n"
+                        f"cwd: {d.get('cwd','')}\n"
+                        f"exit: {d.get('exit_code','-')}  duration: {d.get('duration_ms','-')}ms\n"
+                        f"changed: {', '.join(d.get('changed_files', []) or [])}\n"
+                        f"{out_text}"
+                    )
+                    conversation_feed.append(
+                        {"role": "system", "type": "command", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    )
+                elif t == "file_patch":
+                    d = op.get("data", {})
+                    patch_text = d.get("diff_numbered") or d.get("diff") or ""
+                    if lite and patch_text:
+                        patch_text = trim(str(patch_text), 2600)
+                    d_view = dict(d)
+                    if lite and d_view.get("diff_numbered") is not None:
+                        d_view["diff_numbered"] = trim(str(d_view.get("diff_numbered") or ""), 2600)
+                    if lite and d_view.get("diff") is not None:
+                        d_view["diff"] = trim(str(d_view.get("diff") or ""), 2600)
+                    text = (
+                        f"[file_patch] {d.get('path','')}\n"
+                        f"location: {d.get('session_rel_path', d.get('path',''))}\n"
+                        f"session_root: {d.get('session_root','')}\n"
+                        f"+{d.get('added',0)} / -{d.get('deleted',0)}\n"
+                        f"{patch_text}"
+                    )
+                    conversation_feed.append(
+                        {"role": "system", "type": "file_patch", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    )
+                elif t == "upload":
+                    d = op.get("data", {})
+                    preview = str(d.get("preview", ""))
+                    if lite and preview:
+                        preview = trim(preview, 800)
+                    d_view = dict(d)
+                    if lite and d_view.get("preview") is not None:
+                        d_view["preview"] = preview
+                    text = (
+                        f"[upload] {d.get('filename','')}\n"
+                        f"path: {d.get('workspace_path','')}\n"
+                        f"kind: {d.get('kind','')} size: {d.get('size',0)}\n"
+                        f"{preview}"
+                    )
+                    conversation_feed.append(
+                        {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    )
+            conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
+            upload_view = []
+            for item in self.uploads[-upload_window:]:
+                upload_view.append(
+                    {
+                        "id": item.get("id"),
+                        "filename": item.get("filename"),
+                        "workspace_path": item.get("workspace_path"),
+                        "kind": item.get("kind"),
+                        "size": item.get("size"),
+                        "uploaded_at": item.get("uploaded_at"),
+                        "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                    }
+                )
+            operations_view = []
+            for op in self.operations[-ops_window:]:
+                if not lite:
+                    operations_view.append(op)
+                    continue
+                row = dict(op)
+                data = dict(row.get("data") or {})
+                typ = str(row.get("type") or "")
+                if typ == "command":
+                    data["output"] = trim(str(data.get("output") or ""), 1000)
+                elif typ == "file_patch":
+                    data["diff_numbered"] = trim(str(data.get("diff_numbered") or ""), 1200)
+                    data["diff"] = trim(str(data.get("diff") or ""), 1200)
+                elif typ == "upload":
+                    data["preview"] = trim(str(data.get("preview") or ""), 600)
+                row["data"] = data
+                operations_view.append(row)
+            ctx = self._context_budget_metrics()
+            model_catalog = self.model_catalog() if include_model_catalog else None
+            return {
+                "id": self.id,
+                "title": self.title,
+                "running": self.running,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "model": self.ollama.model,
+                "provider": self.ollama.provider,
+                "ui_language": self.ui_language,
+                "ollama_base_url": self.ollama.base_url,
+                "thinking": self.thinking,
+                "thinking_stream": bool(self.ollama.thinking_stream),
+                "live_thinking": str(self.live_thinking_text or "") if self.running else "",
+                "live_truncation_text": str(self.live_truncation_text or "") if self.running else "",
+                "live_truncation_kind": str(self.live_truncation_kind or "") if self.running else "",
+                "live_truncation_tool": str(self.live_truncation_tool or "") if self.running else "",
+                "live_truncation_active": bool(self.live_truncation_active) if self.running else False,
+                "live_truncation_attempts": int(self.live_truncation_attempts) if self.running else 0,
+                "live_truncation_tokens": int(self.live_truncation_tokens) if self.running else 0,
+                "live_run_notice_active": bool(self.live_run_notice_active and self.running),
+                "live_run_notice_label": str(self.live_run_notice_label or ""),
+                "live_run_notice_started_at": float(self.live_run_notice_started_at or 0.0),
+                "live_run_notice_elapsed": round(float(self.live_run_notice_elapsed or 0.0), 1),
+                "max_agent_rounds": int(self.max_agent_rounds),
+                "max_run_seconds": int(self.max_run_seconds),
+                "auto_model_switch": bool(self.auto_model_switch),
+                "agent_round_index": int(self.agent_round_index),
+                "agent_phase": str(self.current_phase or "idle"),
+                "agent_active_tool": str(self.current_tool_name or ""),
+                "queued_user_inputs_count": len(self.pending_user_inputs),
+                "context_token_upper_bound": int(self.context_token_upper_bound),
+                "context_token_limit_config": int(self.max_context_token_limit),
+                "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_tokens_estimate": int(ctx.get("used", 0)),
+                "context_left_tokens": int(ctx.get("left", 0)),
+                "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
+                "context_used_percent": round(float(ctx.get("used_percent", 0.0)), 2),
+                "truncation_count": int(self.truncation_count),
+                "compact_segments_count": len(self.context_archives),
+                "last_compact_reason": self.last_compact_reason,
+                "last_compact_ts": self.last_compact_ts,
+                "last_compact_segment_id": (self.context_archives[-1]["id"] if self.context_archives else ""),
+                "render_bridge": {
+                    "seq": int(self.render_frame_seq),
+                    "received": int(self.render_frame_received),
+                    "last_ts": float(self.render_frame_last_ts or 0.0),
+                    "last_kind": str(self.render_frame_last_kind or ""),
+                    "latest": (self.render_frame_latest if isinstance(self.render_frame_latest, dict) else {}),
+                },
+                "session_files_root": str(self.files_root),
+                "llm_model_catalog": model_catalog,
+                "messages": visible_messages,
+                "conversation_feed": conversation_feed[-conversation_window:],
+                "uploads": upload_view,
+                "todos": self.todo.snapshot(),
+                "tasks": self.tasks.list_objects(),
+                "background": self.bg.list_objects(),
+                "teammates": list(self.teammates.values()),
+                "activity": self.activity[-activity_window:],
+                "operations": operations_view,
+            }
+
+    def export_bundle(self) -> bytes:
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("snapshot_decrypted.json", json_dumps(self.snapshot(), indent=2))
+            for fp in sorted(self.root.rglob("*")):
+                if not fp.is_file():
+                    continue
+                rel = fp.relative_to(self.root).as_posix()
+                zf.writestr(rel, fp.read_bytes())
+        bio.seek(0)
+        return bio.read()
+
+class SessionManager:
+    def __init__(
+        self,
+        root: Path,
+        ollama_base: str,
+        model: str,
+        skills_root: Path,
+        js_lib_root: Path,
+        crypto: CryptoBox,
+        repo_root: Path,
+        thinking: bool = False,
+        default_llm_config: dict | None = None,
+        default_language: str = DEFAULT_UI_LANGUAGE,
+        context_token_limit: int = TOKEN_THRESHOLD,
+        context_limit_locked: bool = False,
+        max_rounds: int = MAX_AGENT_ROUNDS,
+        max_run_seconds: int = MAX_RUN_SECONDS,
+        auto_model_switch: bool = False,
+    ):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.ollama_base = ollama_base
+        self.model = model
+        self.skills_root = skills_root
+        self.js_lib_root = js_lib_root.resolve()
+        self.crypto = crypto
+        self.repo_root = repo_root
+        self.thinking = False
+        self.default_llm_config = default_llm_config or {}
+        self.context_token_limit = max(
+            MIN_CONTEXT_TOKEN_LIMIT,
+            min(TOKEN_THRESHOLD, int(context_token_limit or TOKEN_THRESHOLD)),
+        )
+        self.context_limit_locked = bool(context_limit_locked)
+        self.max_rounds = max(
+            MIN_AGENT_ROUNDS,
+            min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
+        )
+        self.max_run_seconds = normalize_timeout_seconds(
+            max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS,
+            minimum=MIN_RUN_TIMEOUT_SECONDS,
+            maximum=MAX_RUN_TIMEOUT_SECONDS,
+            fallback=MAX_RUN_SECONDS,
+        )
+        self.auto_model_switch = bool(auto_model_switch)
+        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
+        self.ollama_env_available = bool(env_ok)
+        self.ollama_env_tags: list[str] = list(env_tags)
+        self.lock = threading.Lock()
+        self.sessions: dict[str, SessionState] = {}
+        self.user_root = self.root.parent
+        self.user_root.mkdir(parents=True, exist_ok=True)
+        self.user_prefs_path = self.user_root / "user_prefs.json"
+        self.user_model_profiles: dict[str, dict] = {}
+        self.user_active_profile_id = ""
+        self.user_language = normalize_ui_language(default_language)
+        loaded_from_prefs = self._load_user_prefs()
+        self._load_existing()
+        if not loaded_from_prefs and self.sessions:
+            latest = max(self.sessions.values(), key=lambda s: float(s.updated_at))
+            self._sync_from_session(latest, apply_to_all=False)
+
+    def _profiles_from_config(self, config: dict) -> tuple[dict[str, dict], str]:
+        parsed = parse_llm_config_profiles(config, self.ollama_base, self.model)
+        profiles: dict[str, dict] = {}
+        for idx, profile in enumerate(parsed.get("profiles", [])):
+            pid = sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
+            if pid in profiles:
+                n = 2
+                while f"{pid}-{n}" in profiles:
+                    n += 1
+                pid = f"{pid}-{n}"
+            row = dict(profile)
+            row["id"] = pid
+            row["selection"] = f"{pid}::{row.get('model','')}"
+            profiles[pid] = row
+        if not profiles:
+            profiles["ollama"] = {
+                "id": "ollama",
+                "provider": "ollama",
+                "label": "Ollama",
+                "model": self.model,
+                "base_url": self.ollama_base,
+                "temperature": 0.2,
+                "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+                "selection": f"ollama::{self.model}",
+                "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
+                "media_endpoints": {},
+                "source": "fallback",
+            }
+        requested = sanitize_profile_id(str(parsed.get("default_profile_id", "")))
+        active = requested if requested in profiles else next(iter(profiles.keys()))
+        return profiles, active
+
+    def _active_profile(self) -> dict:
+        return dict(self.user_model_profiles.get(self.user_active_profile_id, {}))
+
+    def _sync_ollama_defaults(self, active_profile: dict | None = None):
+        picked: dict = {}
+        if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
+            picked = dict(active_profile)
+        else:
+            for row in self.user_model_profiles.values():
+                if str(row.get("provider", "")).lower() == "ollama":
+                    picked = dict(row)
+                    break
+        if not picked:
+            return
+        model = str(picked.get("model", self.model) or self.model).strip()
+        base = extract_base_url(str(picked.get("base_url", self.ollama_base) or self.ollama_base)).strip()
+        if model:
+            self.model = model
+        if base:
+            self.ollama_base = base
+
+    def _ensure_user_ollama_profile(self):
+        for pid, profile in list(self.user_model_profiles.items()):
+            if str(profile.get("provider", "")).lower() == "ollama":
+                row = dict(profile)
+                sid = sanitize_profile_id(str(row.get("id", pid) or pid))
+                model = str(row.get("model", self.model) or self.model).strip()
+                base = extract_base_url(str(row.get("base_url", self.ollama_base) or self.ollama_base)).strip()
+                if model:
+                    row["model"] = model
+                if base:
+                    row["base_url"] = base
+                if not str(row.get("label", "")).strip():
+                    row["label"] = "Ollama"
+                row["id"] = sid
+                row["selection"] = f"{sid}::{row.get('model','')}"
+                self.user_model_profiles[sid] = row
+                if sid != pid:
+                    self.user_model_profiles.pop(pid, None)
+                return
+        pid = "ollama"
+        n = 2
+        while pid in self.user_model_profiles:
+            pid = f"ollama-{n}"
+            n += 1
+        self.user_model_profiles[pid] = {
+            "id": pid,
+            "provider": "ollama",
+            "label": "Ollama",
+            "model": self.model,
+            "base_url": self.ollama_base,
+            "temperature": 0.2,
+            "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+            "selection": f"{pid}::{self.model}",
+            "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
+            "media_endpoints": {},
+            "source": "auto-added",
+        }
+
+    def _persist_user_prefs(self):
+        data = {
+            "model_profiles": self.user_model_profiles,
+            "active_profile_id": self.user_active_profile_id,
+            "model": self.model,
+            "ollama_base": self.ollama_base,
+            "thinking": self.thinking,
+            "ui_language": self.user_language,
+            "updated_at": now_ts(),
+        }
+        self.crypto.write_json(self.user_prefs_path, data)
+
+    def _prefer_ollama_profile_from_tags(self):
+        tags = list_ollama_models_cached(self.ollama_base)
+        if tags:
+            self.ollama_env_tags = list(tags)
+        elif self.ollama_env_tags:
+            tags = list(self.ollama_env_tags)
+        if not tags:
+            return
+        target_pid = ""
+        for pid, profile in self.user_model_profiles.items():
+            if str(profile.get("provider", "")).lower() == "ollama":
+                target_pid = pid
+                break
+        if not target_pid:
+            target_pid = "ollama"
+            n = 2
+            while target_pid in self.user_model_profiles:
+                target_pid = f"ollama-{n}"
+                n += 1
+            self.user_model_profiles[target_pid] = {
+                "id": target_pid,
+                "provider": "ollama",
+                "label": "Ollama",
+                "model": tags[0],
+                "base_url": self.ollama_base,
+                "temperature": 0.2,
+                "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+                "capabilities": infer_model_multimodal_capabilities("ollama", tags[0]),
+                "media_endpoints": {},
+                "source": "startup-autodetect",
+            }
+        profile = dict(self.user_model_profiles[target_pid])
+        current = str(profile.get("model", "")).strip()
+        profile["model"] = current if current in tags else tags[0]
+        profile["base_url"] = self.ollama_base
+        profile["selection"] = f"{target_pid}::{profile.get('model','')}"
+        self.user_model_profiles[target_pid] = profile
+        self.user_active_profile_id = target_pid
+
+    def _load_user_prefs(self) -> bool:
+        loaded = False
+        if self.user_prefs_path.exists():
+            raw = self.crypto.read_json(self.user_prefs_path, {})
+            self.user_language = normalize_ui_language(raw.get("ui_language", self.user_language))
+            profiles = raw.get("model_profiles", {})
+            if isinstance(profiles, dict) and profiles:
+                for k, v in profiles.items():
+                    if not isinstance(v, dict):
+                        continue
+                    pid = sanitize_profile_id(str(k))
+                    row = dict(v)
+                    row["id"] = pid
+                    row["selection"] = f"{pid}::{row.get('model','')}"
+                    self.user_model_profiles[pid] = row
+                active = sanitize_profile_id(str(raw.get("active_profile_id", "")))
+                if active in self.user_model_profiles:
+                    self.user_active_profile_id = active
+                loaded = bool(self.user_model_profiles)
+        if not self.user_model_profiles:
+            self.user_model_profiles, self.user_active_profile_id = self._profiles_from_config(self.default_llm_config)
+        self._ensure_user_ollama_profile()
+        if not loaded:
+            self._prefer_ollama_profile_from_tags()
+        if self.user_active_profile_id not in self.user_model_profiles:
+            self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
+        self._preflight_user_ollama_profile()
+        self._ensure_user_active_runnable()
+        active = self._active_profile()
+        self._sync_ollama_defaults(active)
+        self.thinking = False
+        self._persist_user_prefs()
+        return loaded
+
+    def _preflight_user_ollama_profile(self):
+        profile = self.user_model_profiles.get(self.user_active_profile_id, {})
+        if str(profile.get("provider", "ollama")).lower() != "ollama":
+            return
+        base = str(profile.get("base_url", self.ollama_base) or self.ollama_base)
+        tags = list_ollama_models_cached(base)
+        if tags:
+            self.ollama_env_tags = list(tags)
+        elif self.ollama_env_tags:
+            tags = list(self.ollama_env_tags)
+        if not tags:
+            return
+        current = str(profile.get("model", "") or self.model)
+        picked = current if current in tags else tags[0]
+        profile["base_url"] = base
+        profile["model"] = picked
+        profile["selection"] = f"{self.user_active_profile_id}::{picked}"
+        self.user_model_profiles[self.user_active_profile_id] = profile
+
+    def _set_session_profile(self, sess: SessionState, profile_id: str, profile: dict):
+        row = dict(profile)
+        row["id"] = profile_id
+        row["selection"] = f"{profile_id}::{row.get('model','')}"
+        if not sess._profile_is_runnable(row):
+            provider = str(row.get("provider", "") or "unknown")
+            model = str(row.get("model", "") or "")
+            raise ValueError(
+                f"profile '{profile_id}' is not runnable (provider={provider}, model={model or '(empty)'})"
+            )
+        sess.model_profiles[profile_id] = row
+        sess.active_profile_id = profile_id
+        sess.failed_selections = []
+        sess._apply_active_profile()
+        sess.updated_at = now_ts()
+        sess._persist()
+
+    def _apply_user_defaults_to_session(self, sess: SessionState, *, clear_cap_cache: bool = False):
+        for pid, profile in self.user_model_profiles.items():
+            row = dict(profile)
+            row["id"] = pid
+            row["selection"] = f"{pid}::{row.get('model','')}"
+            sess.model_profiles[pid] = row
+        preferred = ""
+        if self.user_active_profile_id in sess.model_profiles:
+            candidate = dict(sess.model_profiles.get(self.user_active_profile_id, {}))
+            if sess._profile_is_runnable(candidate):
+                preferred = self.user_active_profile_id
+        if not preferred:
+            for pid, profile in sess.model_profiles.items():
+                if sess._profile_is_runnable(profile):
+                    preferred = pid
+                    break
+        if preferred:
+            sess.active_profile_id = preferred
+        sess.failed_selections = []
+        if clear_cap_cache:
+            sess.multimodal_capability_cache = {}
+            sess.ollama.clear_probe_cache()
+        sess.ui_language = normalize_ui_language(self.user_language)
+        sess.auto_model_switch = bool(self.auto_model_switch)
+        sess._apply_active_profile()
+        sess.updated_at = now_ts()
+        sess._persist()
+
+    def _sync_from_session(self, sess: SessionState, *, apply_to_all: bool):
+        synced: dict[str, dict] = {}
+        for pid, profile in sess.model_profiles.items():
+            row = dict(profile)
+            sid = sanitize_profile_id(str(pid))
+            row["id"] = sid
+            row["selection"] = f"{sid}::{row.get('model','')}"
+            synced[sid] = row
+        if synced:
+            self.user_model_profiles = synced
+        self._ensure_user_ollama_profile()
+        active = sanitize_profile_id(str(sess.active_profile_id))
+        if active in self.user_model_profiles:
+            self.user_active_profile_id = active
+        elif self.user_model_profiles:
+            self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
+        self._ensure_user_active_runnable()
+        active_profile = self._active_profile()
+        self._sync_ollama_defaults(active_profile)
+        self.thinking = False
+        self.user_language = normalize_ui_language(getattr(sess, "ui_language", self.user_language))
+        self._persist_user_prefs()
+        if not apply_to_all:
+            return
+        for other in self.sessions.values():
+            if other.id == sess.id:
+                continue
+            self._apply_user_defaults_to_session(other, clear_cap_cache=True)
+
+    def _load_existing(self):
+        for path in sorted(self.root.glob("*")):
+            if not path.is_dir():
+                continue
+            sid = path.name
+            title = sid
+            meta = path / "meta.json"
+            if meta.exists():
+                try:
+                    title = self.crypto.read_json(meta, {}).get("title", sid)
+                except Exception:
+                    pass
+            self.sessions[sid] = SessionState(
+                sid,
+                title,
+                self.root,
+                self.ollama_base,
+                self.model,
+                self.skills_root,
+                self.crypto,
+                self.repo_root,
+                self.thinking,
+                self.default_llm_config,
+                self.context_token_limit,
+                self.context_limit_locked,
+                self.max_rounds,
+                self.max_run_seconds,
+                self.auto_model_switch,
+                self.user_language,
+                self.js_lib_root,
+            )
+            if not self.sessions[sid].model_profiles:
+                self._apply_user_defaults_to_session(self.sessions[sid])
+
+    def create(self, title: str | None = None) -> SessionState:
+        with self.lock:
+            sid = make_id("sess")
+            name = title.strip() if title else sid
+            sess = SessionState(
+                sid,
+                name,
+                self.root,
+                self.ollama_base,
+                self.model,
+                self.skills_root,
+                self.crypto,
+                self.repo_root,
+                self.thinking,
+                self.default_llm_config,
+                self.context_token_limit,
+                self.context_limit_locked,
+                self.max_rounds,
+                self.max_run_seconds,
+                self.auto_model_switch,
+                self.user_language,
+                self.js_lib_root,
+            )
+            self._apply_user_defaults_to_session(sess)
+            self.sessions[sid] = sess
+            return sess
+
+    def get(self, session_id: str) -> SessionState | None:
+        with self.lock:
+            return self.sessions.get(session_id)
+
+    def rename(self, session_id: str, title: str) -> SessionState:
+        with self.lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                raise KeyError(session_id)
+            sess.title = title.strip() or sess.id
+            sess.updated_at = now_ts()
+            sess._persist()
+            return sess
+
+    def delete(self, session_id: str) -> bool:
+        with self.lock:
+            sess = self.sessions.pop(session_id, None)
+        if not sess:
+            return False
+        sess.interrupt()
+        shutil.rmtree(sess.root, ignore_errors=True)
+        return True
+
+    def _user_profile_is_runnable(self, profile: dict) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        provider = str(profile.get("provider", "") or "").strip().lower()
+        model = str(profile.get("model", "") or "").strip()
+        if provider in {"", "unknown", "config_only"}:
+            return False
+        if not model:
+            return False
+        if provider == "ollama":
+            base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
+            return bool(base)
+        if provider in {"openai_compat", "openai", "siliconflow"}:
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(endpoint or complete_chat_endpoint(base))
+        if provider == "custom_http":
+            return bool(str(profile.get("endpoint", "") or "").strip())
+        return False
+
+    def _option_is_runnable(self, option: dict) -> bool:
+        if not isinstance(option, dict):
+            return False
+        pid = str(option.get("profile_id", "") or "")
+        profile = dict(self.user_model_profiles.get(pid, {}))
+        if option.get("provider") is not None:
+            profile["provider"] = option.get("provider")
+        if option.get("model") is not None:
+            profile["model"] = option.get("model")
+        if str(profile.get("provider", "")).lower() == "ollama" and not str(profile.get("base_url", "")).strip():
+            profile["base_url"] = self.ollama_base
+        return self._user_profile_is_runnable(profile)
+
+    def _ensure_user_active_runnable(self):
+        active = self._active_profile()
+        if self._user_profile_is_runnable(active):
+            return
+        for pid, profile in self.user_model_profiles.items():
+            if self._user_profile_is_runnable(profile):
+                self.user_active_profile_id = pid
+                return
+
+    def _probe_user_active_capabilities(self, force_probe: bool = False):
+        profile = self._active_profile()
+        if not profile or not self._user_profile_is_runnable(profile):
+            return
+        client = OllamaClient(
+            str(profile.get("base_url", self.ollama_base) or self.ollama_base),
+            str(profile.get("model", self.model) or self.model),
+            int(profile.get("request_timeout", DEFAULT_REQUEST_TIMEOUT) or DEFAULT_REQUEST_TIMEOUT),
+            provider=str(profile.get("provider", "ollama") or "ollama"),
+            endpoint=str(profile.get("endpoint", "") or ""),
+            api_key=str(profile.get("api_key", "") or ""),
+            headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
+            payload_template=str(profile.get("payload_template", "") or ""),
+            thinking_stream=bool(profile.get("thinking_stream", False)),
+        )
+        client.apply_profile(profile)
+        caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
+        merged = merge_multimodal_capabilities(
+            merge_multimodal_capabilities(
+                infer_model_multimodal_capabilities(str(profile.get("provider", "")), str(profile.get("model", ""))),
+                parse_capability_overrides(profile.get("capabilities", {})),
+            ),
+            caps,
+        )
+        profile["capabilities"] = merged
+        self.user_model_profiles[self.user_active_profile_id] = profile
+        self._persist_user_prefs()
+        probe_entry = client.probe_cache_entry()
+        probe_details = probe_entry.get("details", {}) if isinstance(probe_entry, dict) else {}
+        probe_updated_at = float(
+            (probe_entry.get("updated_at", now_ts()) if isinstance(probe_entry, dict) else now_ts()) or now_ts()
+        )
+        for sess in self.sessions.values():
+            if self.user_active_profile_id not in sess.model_profiles:
+                continue
+            row = dict(sess.model_profiles[self.user_active_profile_id])
+            row["capabilities"] = merged
+            sess.model_profiles[self.user_active_profile_id] = row
+            cache_key = sess._profile_cache_key(row)
+            sess.multimodal_capability_cache[cache_key] = {
+                "capabilities": merged,
+                "details": probe_details if isinstance(probe_details, dict) else {},
+                "updated_at": probe_updated_at,
+                "provider": str(row.get("provider", "")),
+                "model": str(row.get("model", "")),
+            }
+            if sess.active_profile_id == self.user_active_profile_id:
+                sess.ollama.apply_profile(row)
+            sess.updated_at = now_ts()
+            sess._persist()
+
+    def model_catalog(self, force_probe: bool = False) -> dict:
+        if force_probe:
+            try:
+                self._probe_user_active_capabilities(force_probe=True)
+            except Exception:
+                pass
+        opts = []
+        ollama_profile_id = ""
+        ollama_base = self.ollama_base
+        for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
+            model = str(profile.get("model", "") or "")
+            caps = merge_multimodal_capabilities(
+                infer_model_multimodal_capabilities(str(profile.get("provider", "")), model),
+                parse_capability_overrides(profile.get("capabilities", {})),
+            )
+            if (not ollama_profile_id) and str(profile.get("provider", "")).lower() == "ollama":
+                ollama_profile_id = pid
+                ollama_base = str(profile.get("base_url", ollama_base) or ollama_base)
+            opts.append(
+                {
+                    "selection": f"{pid}::{model}",
+                    "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"),
+                    "model": model,
+                    "label": f"{profile.get('label', pid)} | {model or '(no-model)'}",
+                    "source": profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "capabilities": caps,
+                }
+            )
+        if not ollama_profile_id:
+            ollama_profile_id = "ollama"
+        seen = {str(x.get("selection", "")) for x in opts}
+        for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
+            if str(profile.get("provider", "")).lower() != "ollama":
+                continue
+            base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
+            if not base:
+                continue
+            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            if tags:
+                if pid == self.user_active_profile_id:
+                    self.ollama_env_tags = list(tags)
+            elif pid == self.user_active_profile_id and self.ollama_env_tags:
+                tags = list(self.ollama_env_tags)
+            for tag in tags:
+                selection = f"{pid}::{tag}"
+                if selection in seen:
+                    continue
+                seen.add(selection)
+                tag_caps = merge_multimodal_capabilities(
+                    infer_model_multimodal_capabilities("ollama", tag),
+                    parse_capability_overrides(profile.get("capabilities", {})),
+                )
+                opts.append(
+                    {
+                        "selection": selection,
+                        "profile_id": pid,
+                        "provider": "ollama",
+                        "model": tag,
+                        "label": f"{profile.get('label', 'Ollama')} | {tag}",
+                        "source": "ollama-tags",
+                        "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
+                        "thinking_stream": bool(profile.get("thinking_stream", False)),
+                        "capabilities": tag_caps,
+                    }
+                )
+        runnable_opts = [x for x in opts if self._option_is_runnable(x)]
+        if runnable_opts:
+            opts = runnable_opts
+        active = self.user_model_profiles.get(self.user_active_profile_id, {})
+        selected = f"{self.user_active_profile_id}::{active.get('model','')}" if active else ""
+        if opts and selected not in {str(x.get("selection", "")) for x in opts}:
+            selected = str(opts[0].get("selection", ""))
+        active_caps = merge_multimodal_capabilities(
+            infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),
+            parse_capability_overrides(active.get("capabilities", {})),
+        )
+        return {
+            "provider": active.get("provider", "ollama"),
+            "models": [x["selection"] for x in opts] or [self.model],
+            "options": opts,
+            "selected": selected,
+            "thinking": self.thinking,
+            "thinking_mode": "auto",
+            "active_capabilities": active_caps,
+        }
+
+    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+        raw = str(model or "").strip()
+        if not raw:
+            raise ValueError("model required")
+        explicit_profile = "::" in raw
+        if "::" in raw:
+            pid, selected_model = raw.split("::", 1)
+        else:
+            pid, selected_model = self.user_active_profile_id, raw
+        pid = sanitize_profile_id(pid)
+        with self.lock:
+            profile = dict(self.user_model_profiles.get(pid, {}))
+            if not profile:
+                if pid.startswith("ollama"):
+                    profile = {
+                        "id": pid,
+                        "provider": "ollama",
+                        "label": "Ollama",
+                        "model": selected_model or self.model,
+                        "base_url": self.ollama_base,
+                        "capabilities": infer_model_multimodal_capabilities("ollama", selected_model or self.model),
+                        "media_endpoints": {},
+                        "source": "runtime",
+                    }
+                else:
+                    raise ValueError(f"profile not found: {pid}")
+            if selected_model.strip():
+                profile["model"] = selected_model.strip()
+            if str(profile.get("provider", "")).lower() == "ollama" and selected_model.strip():
+                profile["capabilities"] = infer_model_multimodal_capabilities("ollama", selected_model.strip())
+            if not self._user_profile_is_runnable(profile) and not explicit_profile and selected_model.strip():
+                fallback_pid = ""
+                for xpid, xprofile in self.user_model_profiles.items():
+                    if str(xprofile.get("provider", "")).lower() == "ollama" and self._user_profile_is_runnable(xprofile):
+                        fallback_pid = xpid
+                        break
+                if not fallback_pid:
+                    for xpid, xprofile in self.user_model_profiles.items():
+                        if self._user_profile_is_runnable(xprofile):
+                            fallback_pid = xpid
+                            break
+                if fallback_pid:
+                    pid = fallback_pid
+                    profile = dict(self.user_model_profiles[fallback_pid])
+                    profile["model"] = selected_model.strip()
+            if not self._user_profile_is_runnable(profile):
+                provider = str(profile.get("provider", "") or "unknown")
+                model_text = str(profile.get("model", "") or "")
+                raise ValueError(
+                    f"profile '{pid}' is not runnable (provider={provider}, model={model_text or '(empty)'})"
+                )
+            profile["id"] = pid
+            profile["selection"] = f"{pid}::{profile.get('model','')}"
+            self.user_model_profiles[pid] = profile
+            self.user_active_profile_id = pid
+            self._sync_ollama_defaults(profile)
+            self.thinking = False
+            try:
+                self._probe_user_active_capabilities(force_probe=False)
+            except Exception:
+                pass
+            self._persist_user_prefs()
+            for sess in self.sessions.values():
+                try:
+                    self._set_session_profile(sess, pid, profile)
+                except Exception:
+                    sess.ollama.model = self.model
+                    sess.thinking = False
+                    sess.updated_at = now_ts()
+                    sess._persist()
+            return self.model_catalog()
+
+    def apply_llm_config(self, session_id: str, config: dict, source: str = "") -> dict:
+        with self.lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                raise KeyError(session_id)
+            catalog = sess.load_llm_config(config, source=source)
+            self._sync_from_session(sess, apply_to_all=True)
+            return catalog
+
+    def reset_to_llm_config(self, config: dict, source: str = "") -> dict:
+        cfg = dict(config or {})
+        OllamaClient.clear_global_probe_cache()
+        profiles, active = self._profiles_from_config(cfg)
+        with self.lock:
+            normalized: dict[str, dict] = {}
+            for pid, row in profiles.items():
+                item = dict(row)
+                item["id"] = sanitize_profile_id(str(pid))
+                item["selection"] = f"{item['id']}::{item.get('model','')}"
+                if source:
+                    item["source"] = source
+                normalized[item["id"]] = item
+            self.default_llm_config = cfg
+            self.user_model_profiles = normalized or self.user_model_profiles
+            if active in self.user_model_profiles:
+                self.user_active_profile_id = active
+            elif self.user_model_profiles:
+                self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
+            self._ensure_user_ollama_profile()
+            self._preflight_user_ollama_profile()
+            self._ensure_user_active_runnable()
+            active_profile = self._active_profile()
+            self._sync_ollama_defaults(active_profile)
+            self.thinking = False
+            self._persist_user_prefs()
+            for sess in self.sessions.values():
+                self._apply_user_defaults_to_session(sess, clear_cap_cache=True)
+        return self.model_catalog()
+
+    def set_user_language(self, language: str) -> dict:
+        lang = normalize_ui_language(language)
+        with self.lock:
+            self.user_language = lang
+            for sess in self.sessions.values():
+                sess.ui_language = lang
+                sess.updated_at = now_ts()
+                sess._persist()
+            self._persist_user_prefs()
+        return {"ok": True, "language": lang}
+
+    def set_session_language(self, session_id: str, language: str, set_user_default: bool = False) -> dict:
+        lang = normalize_ui_language(language)
+        with self.lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                raise KeyError(session_id)
+            sess.ui_language = lang
+            sess.updated_at = now_ts()
+            sess._persist()
+            if set_user_default:
+                self.user_language = lang
+                self._persist_user_prefs()
+        return {"ok": True, "session_id": session_id, "language": lang, "set_user_default": bool(set_user_default)}
+
+    def import_default_llm_config(self, session_id: str) -> dict:
+        cfg = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
+        if not cfg:
+            raise FileNotFoundError(f"missing or invalid config: {LLM_CONFIG_PATH}")
+        return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
+
+    def list(self) -> list[dict]:
+        with self.lock:
+            items = []
+            for sess in self.sessions.values():
+                with sess.lock:
+                    message_count = 0
+                    for row in sess.messages:
+                        if str(row.get("role", "")).strip() == "tool":
+                            continue
+                        message_count += 1
+                items.append(
+                    {
+                        "id": sess.id,
+                        "title": sess.title,
+                        "running": bool(sess.running),
+                        "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
+                        "updated_at": float(sess.updated_at),
+                        "message_count": int(message_count),
+                    }
+                )
+            return sorted(items, key=lambda x: x["updated_at"], reverse=True)
+
+INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clouds Coder</title>
+<link rel="stylesheet" href="/assets/style.css">
+<script>
+window.MathJax={
+  tex:{
+    inlineMath:[['$','$'],['\\(','\\)']],
+    displayMath:[['$$','$$'],['\\[','\\]']]
+  },
+  options:{
+    skipHtmlTags:['script','noscript','style','textarea','pre','code']
+  }
+};
+</script>
+<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+<div class="bg-layer"></div>
+<div class="app">
+<header>
+  <div>
+    <h1>Clouds Coder</h1>
+    <p>WebUI 驱动的会话式集成编程 Agent 平台</p>
+    <p>Powered By Fona</p>
+  </div>
+  <div class="actions">
+    <select id="langSelect"></select>
+    <select id="modelSelect"></select>
+    <button id="applyModelBtn" class="subtle">Apply Model</button>
+    <button id="importConfigBtn" class="subtle">Upload LLM.config.json</button>
+    <input id="configInput" type="file" accept=".json,application/json" style="display:none">
+    <a id="downloadBtn" href="#" target="_blank" rel="noreferrer">Open Skills Studio</a>
+  </div>
+</header>
+<div class="status-cards" id="topStats"></div>
+<main>
+  <aside class="panel">
+    <div class="panel-title">Sessions</div>
+    <div id="sessionList"></div>
+    <div id="sessionsControls" class="sessions-controls">
+      <button id="newSessionBtn">New Session</button>
+      <button id="renameSessionBtn" class="subtle">Rename</button>
+      <button id="deleteSessionBtn" class="subtle danger">Delete</button>
+    </div>
+  </aside>
+  <section class="panel chat">
+    <div class="panel-title">Conversation</div>
+    <div id="chatTabs" class="chat-tabs"></div>
+    <div id="convView" class="conv-view">
+      <div id="chat"></div>
+      <div class="composer">
+        <textarea id="prompt" placeholder="描述你的任务，或让 Agent 使用工具执行操作..."></textarea>
+        <div id="uploadDrop" class="upload-drop">拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件</div>
+        <input id="uploadInput" type="file" multiple>
+        <div id="uploadList" class="mono upload-list"></div>
+        <div class="row">
+          <button id="sendBtn">Send</button>
+          <button id="interruptBtn" class="subtle">Interrupt</button>
+          <button id="compactBtn" class="subtle">Compact</button>
+          <button id="refreshBtn" class="subtle">Refresh</button>
+          <a id="downloadSessionBtn" class="subtle disabled" href="#">Export Session</a>
+          <div id="ctxLive" class="ctx-live" title="Remaining context budget">
+            <span class="ctx-live-dot"></span>
+            <span id="ctxLiveText" class="mono">ctx_left=-</span>
+            <span class="ctx-live-bar"><span id="ctxLiveFill" class="ctx-live-fill"></span></span>
+          </div>
+        </div>
+        <div id="errorBox" class="error-box hidden"></div>
+      </div>
+    </div>
+    <div id="previewView" class="preview-view hidden">
+      <div class="preview-head">
+        <div id="previewMeta" class="mono"></div>
+        <div id="previewStageWrap" class="preview-stage-wrap hidden">
+          <select id="previewStageSelect" class="preview-stage-select"></select>
+          <div id="previewStageStat" class="mono preview-stage-stat"></div>
+        </div>
+        <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
+        <button id="previewReloadBtn" class="subtle">Reload</button>
+      </div>
+      <div id="previewBody" class="preview-body"></div>
+    </div>
+  </section>
+  <aside class="panel">
+    <div class="panel-title">Runtime</div>
+    <div id="runtimeScroll">
+    <div id="status" class="mono"></div>
+    <div id="renderBridge" class="render-bridge hidden">
+      <div id="renderMeta" class="mono render-meta"></div>
+      <canvas id="renderCanvas" class="render-canvas" width="960" height="280"></canvas>
+    </div>
+    <h3>Todos</h3>
+    <div id="todos"></div>
+    <h3>Tasks</h3>
+    <div id="tasks"></div>
+    <h3>Activity</h3>
+    <div id="activity"></div>
+    <h3>Commands</h3>
+    <div id="commands"></div>
+    <h3>File Diffs</h3>
+    <div id="diffs"></div>
+    <h3>Catalog</h3>
+    <div id="catalog"></div>
+    </div>
+  </aside>
+</main>
+</div>
+<script src="/assets/app.js"></script>
+</body>
+</html>
+"""
+
+APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
+:root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
+*{box-sizing:border-box}
+body{margin:0;font-family:'Space Grotesk','Noto Sans SC',sans-serif;background:var(--bg);color:var(--fg)}
+.bg-layer{position:fixed;inset:0;background:radial-gradient(1200px 520px at 0% 0%,#dbe9ff 0,#f3f5f8 55%),radial-gradient(1000px 520px at 100% 100%,#d9fff2 0,#f3f5f8 55%);z-index:-1}
+.app{max-width:1540px;margin:0 auto;padding:20px}
+header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
+h1{margin:0;font-size:1.8rem}
+header p{margin:.2rem 0 0;color:var(--muted)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+button,a{border:1px solid var(--line);padding:10px 14px;border-radius:12px;background:#fff;color:var(--fg);text-decoration:none;cursor:pointer;font-weight:600;transition:transform .15s ease,box-shadow .15s ease}
+button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27,45,.08)}
+#sendBtn,#newSessionBtn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0}
+.subtle{background:#f6f8fa}
+.actions select{padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff;min-width:160px}
+.think-switch{display:flex;align-items:center;gap:6px;border:1px solid var(--line);padding:8px 10px;border-radius:12px;background:#fff;font-weight:600}
+.danger{color:var(--warn);border-color:#f3c0c0}
+.disabled{pointer-events:none;opacity:.5}
+.status-cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:12px}
+.stat{background:linear-gradient(140deg,#fff,#f7fbff);border:1px solid var(--line);border-radius:14px;padding:10px 12px}
+.stat .k{font-size:.78rem;color:var(--muted)}
+.stat .v{font-size:1.25rem;font-weight:700}
+main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
+.panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;height:100%}
+.panel-title{font-weight:700;margin-bottom:8px}
+#sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.session-item{padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+.session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
+.chat #chat{flex:1;min-height:0;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:8px;background:#fff;border:1px solid var(--line);border-radius:12px;overscroll-behavior:contain;overflow-anchor:none}
+.chat-tabs{display:flex;align-items:center;gap:6px;min-height:38px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f6f9ff;margin-bottom:8px;overflow:auto}
+.chat-tab{display:inline-flex;align-items:center;gap:6px;max-width:240px;padding:6px 10px;border:1px solid #d5deec;border-radius:10px;background:#fff;color:#1f2c3d;font-weight:600;cursor:pointer;white-space:nowrap}
+.chat-tab.active{border-color:#97b7f3;background:#eaf2ff}
+.chat-tab-title{overflow:hidden;text-overflow:ellipsis}
+.chat-tab-close{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;font-size:12px;line-height:1;border:0;background:#eef2f8;color:#425466;cursor:pointer}
+.chat-tab-close:hover{background:#dbe5f4}
+.conv-view{display:flex;flex-direction:column;flex:1;min-height:0}
+.preview-view{display:flex;flex-direction:column;flex:1;min-height:0;border:1px solid var(--line);border-radius:12px;background:#fff;overflow:hidden}
+.preview-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line);background:#f7faff}
+#previewMeta{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.preview-stage-wrap{display:flex;align-items:center;gap:8px;min-width:0}
+.preview-stage-select{max-width:230px;padding:6px 8px;border:1px solid #cdd8ea;border-radius:8px;background:#fff;font-size:.78rem;color:#1f2d3d}
+.preview-stage-stat{font-size:.72rem;color:#5f6f87;white-space:nowrap}
+.preview-body{flex:1;min-height:0;overflow:auto;background:#fff}
+.preview-frame{width:100%;height:100%;border:0;background:#fff}
+.preview-md{padding:14px}
+.preview-code-scroll{height:100%;overflow:auto;background:#fbfdff}
+.preview-code-shell{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;line-height:1.5;background:#fbfdff;color:#1f2b3d;min-width:100%;width:max-content}
+.code-row{display:grid;grid-template-columns:82px max-content;align-items:stretch;min-width:100%;border-bottom:1px solid #e7eef8}
+.code-row.code-add{background:linear-gradient(90deg,#e8fff0 0%,#f4fff8 100%)}
+.code-row.code-delete{background:linear-gradient(90deg,#ffecef 0%,#fff6f7 100%)}
+.code-row.code-skip{background:#f1f5fa}
+.code-gutter{display:flex;align-items:center;gap:6px;padding:3px 8px;border-right:1px solid #dbe4f1;background:#f2f7ff;color:#5b6a80;user-select:none;-webkit-user-select:none}
+.code-row.code-add .code-gutter{background:#dcf8e7}
+.code-row.code-delete .code-gutter{background:#ffe2e8}
+.code-sign{display:inline-block;width:12px;text-align:center;font-weight:700;user-select:none;-webkit-user-select:none}
+.code-ln{display:inline-block;min-width:44px;text-align:right;font-variant-numeric:tabular-nums;user-select:none;-webkit-user-select:none}
+.code-ln-empty{opacity:.4}
+.code-code{padding:3px 10px;white-space:pre;overflow:visible;min-width:0}
+.code-code-delete{user-select:none;-webkit-user-select:none;color:#8a2323;pointer-events:none}
+.code-row.code-add .code-sign{color:#0f7b33}
+.code-row.code-delete .code-sign{color:#a12626}
+.code-row.code-context .code-sign{color:#76859b}
+.code-row.code-skip .code-sign{color:#66758b}
+.code-tok-kw{color:#1d4ed8;font-weight:700}
+.code-tok-str{color:#b45309}
+.code-tok-com{color:#6b7280;font-style:italic}
+.code-tok-num{color:#7c3aed}
+.code-tok-lit{color:#0f766e;font-weight:700}
+.code-tok-punc{color:#64748b}
+.code-tok-op{color:#475569}
+.code-tok-id{color:#1f2937}
+.code-tok-fn{color:#0369a1;font-weight:600}
+.code-tok-type{color:#8b5cf6;font-weight:600}
+.code-tok-dec{color:#be123c;font-weight:600}
+.msg-preview-row{margin-top:6px}
+.msg-preview-btn{border:1px solid #c8d8ee;background:#f5f9ff;color:#204a7a;padding:4px 8px;border-radius:999px;font-size:.75rem;cursor:pointer}
+.msg-preview-btn:hover{background:#eaf2ff}
+.msg{padding:10px 12px;border-radius:12px;max-width:88%;white-space:normal}
+.msg.user{align-self:flex-end;background:#e6f0ff}
+.msg.assistant{align-self:flex-start;background:#eefdf6}
+.msg.system{align-self:stretch;max-width:100%;background:#f6f8fa;color:#334155;border:1px solid #e5e7eb}
+.msg-md{line-height:1.55;word-break:break-word;overflow-wrap:anywhere}
+.msg-md>*:first-child{margin-top:0}
+.msg-md>*:last-child{margin-bottom:0}
+.msg-md p{margin:.35rem 0}
+.msg-md h1,.msg-md h2,.msg-md h3,.msg-md h4,.msg-md h5,.msg-md h6{margin:.55rem 0 .35rem;line-height:1.35;font-weight:700}
+.msg-md h1{font-size:1.1rem}
+.msg-md h2{font-size:1.05rem}
+.msg-md h3{font-size:1rem}
+.msg-md h4,.msg-md h5,.msg-md h6{font-size:.94rem}
+.msg-md ul,.msg-md ol{margin:.35rem 0 .45rem 1.15rem;padding:0}
+.msg-md li{margin:.2rem 0}
+.msg-md blockquote{margin:.5rem 0;padding:.4rem .6rem;border-left:3px solid #9db8e8;background:#eef4ff;border-radius:6px;color:#27446f}
+.msg-md .md-inline-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;padding:1px 5px;border-radius:5px;background:#e8eef8;border:1px solid #d3dded;color:#1e3a5f;white-space:pre}
+.msg-md .md-code-lang{display:inline-block;margin:.3rem 0 0;padding:2px 8px;border:1px solid #cfd9ea;border-bottom:0;border-radius:8px 8px 0 0;background:#f3f7fd;color:#3b4f6d;font-size:.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.msg-md .md-code{margin:0 0 .55rem;max-width:100%;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:0 8px 8px 8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.4;white-space:pre}
+.msg-md .md-table{margin:.5rem 0;border-collapse:collapse;max-width:100%;width:100%;display:block;overflow:auto;background:#fff}
+.msg-md .md-table th,.msg-md .md-table td{border:1px solid #d7e0ec;padding:6px 8px;text-align:left;vertical-align:top;white-space:nowrap}
+.msg-md .md-table th{background:#f5f8fc;font-weight:700}
+.msg-md a{color:#1f5cc4;text-decoration:underline}
+.msg-md a:hover{color:#17479b}
+.msg-thinking{margin-top:8px;border:1px solid #d8dde6;background:#f1f3f7;border-radius:8px;padding:6px 8px}
+.msg-thinking-label{font-size:.7rem;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
+.msg-thinking pre{margin:0;max-height:140px;overflow:auto;font-size:.72rem;line-height:1.35;color:#4b5563;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
+.msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
+.msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
+.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35}
+.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35}
+.composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
+.composer textarea{width:100%;min-height:100px;border:1px solid var(--line);border-radius:12px;padding:10px;resize:vertical}
+.upload-drop{margin-top:8px;border:1px dashed #8aa8d1;border-radius:10px;background:#f7fbff;padding:8px 10px;font-size:.84rem;color:#375076;cursor:pointer}
+.upload-drop.dragover{border-color:#1f6feb;background:#eaf2ff}
+#uploadInput{display:none}
+.upload-list{margin-top:6px;border:1px solid var(--line);border-radius:10px;background:#fff;max-height:88px;overflow:auto;padding:6px}
+.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.ctx-live{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d6deea;border-radius:999px;background:#f8fbff;min-width:250px}
+.ctx-live-dot{width:8px;height:8px;border-radius:50%;background:#13b8a6;box-shadow:0 0 0 rgba(19,184,166,.45);animation:ctxPulse 1.6s ease-in-out infinite}
+.ctx-live-bar{position:relative;display:inline-block;width:84px;height:6px;border-radius:999px;background:#e5edf8;overflow:hidden}
+.ctx-live-fill{display:block;height:100%;width:0%;background:linear-gradient(90deg,#13b8a6,#1f6feb);transition:width .24s ease,background .24s ease}
+.ctx-live.warn .ctx-live-dot{background:#e1a400}
+.ctx-live.warn .ctx-live-fill{background:linear-gradient(90deg,#ffcc66,#e1a400)}
+.ctx-live.danger .ctx-live-dot{background:#cf3b3b}
+.ctx-live.danger .ctx-live-fill{background:linear-gradient(90deg,#ff8a8a,#cf3b3b)}
+.ctx-live.danger{border-color:#f1c5c5;background:#fff4f4}
+.error-box{margin-top:8px;padding:8px 10px;border:1px solid #f2b4b4;background:#fff1f1;color:#8f1d1d;border-radius:8px}
+.hidden{display:none}
+#runtimeScroll{flex:1;min-height:0;overflow:auto;padding-right:2px}
+#status{font-size:.9rem;color:var(--muted);margin-bottom:8px;line-height:1.35}
+.render-bridge{margin:0 0 10px;border:1px solid #d9e4f1;border-radius:10px;background:#fbfdff;overflow:hidden}
+.render-meta{padding:6px 8px;border-bottom:1px solid #e6edf7;color:#51627a;font-size:.76rem;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.render-canvas{display:block;width:100%;height:220px;background:#ffffff}
+.compact-toast{position:fixed;top:16px;right:16px;z-index:9999;max-width:320px;background:#0f1b2d;color:#fff;border-radius:12px;padding:10px 12px;box-shadow:0 10px 26px rgba(15,27,45,.28);opacity:0;transform:translateY(-8px);pointer-events:none;transition:opacity .2s ease,transform .2s ease}
+.compact-toast.show{opacity:1;transform:translateY(0)}
+#todos,#tasks,#activity,#commands,#diffs,#catalog{overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fff}
+#todos,#tasks{height:220px;max-height:240px}
+#activity,#commands,#diffs,#catalog{height:160px;max-height:160px}
+h3{font-size:.96rem;margin:10px 0 6px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem}
+.tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#f1f6ff;border:1px solid #d6e4ff;font-size:.75rem;margin-right:6px}
+.board-summary{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:.8rem;margin-bottom:8px}
+.todo-list,.task-list{display:flex;flex-direction:column;gap:8px}
+.todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff}
+.todo-item.st-pending,.task-item.st-pending{border-left-color:#7b8798}
+.todo-item.st-in_progress,.task-item.st-in_progress{border-left-color:#1f6feb;background:#eef5ff}
+.todo-item.st-completed,.task-item.st-completed{border-left-color:#13b8a6;background:#edfcf7}
+.todo-item.st-blocked,.task-item.st-blocked{border-left-color:#b96b00;background:#fff6ea}
+.todo-item.st-deleted,.task-item.st-deleted{border-left-color:#a0a6b0;background:#f7f8fa}
+.todo-head,.task-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}
+.status-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #d6deea;background:#f1f5fa;color:#334155;font-size:.72rem;font-weight:700;letter-spacing:.02em}
+.status-badge.st-in_progress{background:#e9f1ff;border-color:#bfd4ff;color:#0f4ca8}
+.status-badge.st-completed{background:#e4faf1;border-color:#b9efd9;color:#0f7d57}
+.status-badge.st-blocked{background:#fff1df;border-color:#ffd8a8;color:#935300}
+.status-badge.st-deleted{background:#f0f2f5;border-color:#d4dae2;color:#5e6775}
+.todo-content,.task-subject{font-size:.88rem;line-height:1.35}
+.todo-meta,.task-meta{margin-top:4px;font-size:.76rem;color:var(--muted);line-height:1.35}
+.todo-index,.task-id{color:#475467}
+.cmd-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#f9fbff}
+.cmd-main{font-weight:600}
+.cmd-sub{color:var(--muted);font-size:.82rem}
+.diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff}
+.diff-head{font-weight:600;margin-bottom:4px}
+.diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
+.diff-line-add{background:#eaffea;color:#0f6a1b}
+.diff-line-del{background:#ffeaea;color:#8a1d1d}
+.diff-line-hunk{background:#edf4ff;color:#1f4b8f}
+@keyframes ctxPulse{
+  0%{box-shadow:0 0 0 0 rgba(19,184,166,.45)}
+  70%{box-shadow:0 0 0 8px rgba(19,184,166,0)}
+  100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}
+}
+@media (max-width:1180px){
+  .status-cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+  main{grid-template-columns:1fr;height:auto;max-height:none;min-height:0}
+  .panel{min-height:280px}
+  .chat #chat{height:46vh;max-height:46vh;flex:none}
+  #sessionList{height:40vh;max-height:40vh;flex:none}
+  .sessions-controls{grid-template-columns:1fr 1fr}
+  #newSessionBtn{grid-column:1 / -1}
+  .ctx-live{margin-left:0;width:100%;min-width:0}
+  #runtimeScroll{max-height:42vh}
+}
+"""
+
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true}};
+const MD_CACHE=new Map();
+const MD_CACHE_MAX=420;
+const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
+const SNAPSHOT_DELAY_VISIBLE_MS=120;
+const SNAPSHOT_DELAY_HIDDEN_MS=1200;
+const SESSION_POLL_VISIBLE_MS=12000;
+const SESSION_POLL_HIDDEN_MS=30000;
+const PANEL_SCROLL_ACTIVE_MS=1100;
+const CHAT_SCROLL_ACTIVE_MS=420;
+const CHAT_SCROLL_LOCK_MS=1200;
+const CHAT_SCROLL_RENDER_THROTTLE_MS=70;
+const CHAT_SCROLL_SYNC_DEBOUNCE_MS=260;
+const CHAT_SCROLL_SETTLE_MS=620;
+const CHAT_SCROLL_SETTLE_EPS_PX=1;
+const CHAT_VIRT={heights:Object.create(null),heightVersion:0,avgHeight:140,overscanPx:900,maxCacheKeys:2800,poolByKind:Object.create(null),poolSize:0,poolMax:420};
+const RENDER_EVT_TYPES=new Set(['render_frame','render_bridge']);
+const RENDER_QUEUE_MAX=140;
+const RENDER_META_MIN_INTERVAL_MS=180;
+const RENDER={queue:[],raf:0,canvas:null,ctx:null,lastSeq:0,lastPaintAt:0,lastMetaAt:0,lastSummary:'',hideTimer:0,imgTicket:0};
+const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties']);
+const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt']);
+const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini'};
+const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini'};
+const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
+const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library'])};
+S.staticMode=STATIC_UI;
+const COMPACT_AUTO_REFRESH_COUNT=3;
+const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
+const E=id=>document.getElementById(id);
+const I18N={
+  'en':{
+    app_title:'Clouds Coder',app_subtitle:'WebUI-driven conversational coding agent platform',powered_by:'Powered By Fona',
+    apply_model:'Apply Model',upload_llm_config:'Upload LLM.config.json',open_skills:'Open Skills Studio',skills_offline:'Skills Studio (Offline)',
+    panel_sessions:'Sessions',panel_conversation:'Conversation',panel_runtime:'Runtime',
+    btn_new_session:'New Session',btn_rename:'Rename',btn_delete:'Delete',
+    btn_send:'Send',btn_interrupt:'Interrupt',btn_compact:'Compact',btn_refresh:'Refresh',btn_export_session:'Export Session',
+    prompt_placeholder:'Describe your task, or ask the agent to use tools to perform actions...',
+    upload_drop:'Drag and drop code / Markdown / PDF / Excel / Word / PPT / CSV here, or click to choose files',
+    sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
+    stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_model:'Model',
+    no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_catalog:'No catalog',no_uploads:'No uploads',
+    running:'running',idle:'idle',open:'open',completed:'completed',blocked:'blocked',
+    status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
+    owner_unassigned:'owner=unassigned',
+    session_title_prompt:'Session title',web_session:'Web Session',rename_session_prompt:'Rename session',session_default:'Session',
+    select_session_first:'Select a session first',delete_confirm:'Delete current session and its persisted state?',
+    no_model_selected:'No model selected',config_uploaded_no_profiles:'Config uploaded, but no model profiles were parsed',
+    file_too_large:'File too large',
+    compact_auto:'Auto compact triggered',
+    rel_path:'Relative path',thinking:'thinking',thinking_stream:'thinking (stream)',
+    copy_code:'Copy Code',copy_done:'Copied'
+  },
+  'zh-CN':{
+    app_title:'Clouds Coder',app_subtitle:'WebUI 驱动的会话式集成编程 Agent 平台',powered_by:'Powered By Fona',
+    apply_model:'应用模型',upload_llm_config:'上传 LLM.config.json',open_skills:'打开 Skills Studio',skills_offline:'Skills Studio（离线）',
+    panel_sessions:'会话',panel_conversation:'对话',panel_runtime:'运行态',
+    btn_new_session:'新建会话',btn_rename:'重命名',btn_delete:'删除',
+    btn_send:'发送',btn_interrupt:'中断',btn_compact:'压缩',btn_refresh:'刷新',btn_export_session:'导出会话',
+    prompt_placeholder:'描述你的任务，或让 Agent 使用工具执行操作...',
+    upload_drop:'拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件',
+    sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
+    stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_model:'模型',
+    no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_catalog:'暂无目录',no_uploads:'暂无上传',
+    running:'运行中',idle:'空闲',open:'未完成',completed:'已完成',blocked:'阻塞',
+    status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
+    owner_unassigned:'owner=未分配',
+    session_title_prompt:'会话标题',web_session:'Web 会话',rename_session_prompt:'重命名会话',session_default:'会话',
+    select_session_first:'请先选择会话',delete_confirm:'确认删除当前会话及其持久化状态？',
+    no_model_selected:'未选择模型',config_uploaded_no_profiles:'配置已上传，但未解析到可用模型配置',
+    file_too_large:'文件过大',
+    compact_auto:'自动 compact 触发',
+    rel_path:'相对路径',thinking:'思考',thinking_stream:'思考（流式）',
+    copy_code:'复制代码',copy_done:'已复制'
+  },
+  'zh-TW':{
+    app_title:'Clouds Coder',app_subtitle:'WebUI 驅動的會話式整合程式 Agent 平台',powered_by:'Powered By Fona',
+    apply_model:'套用模型',upload_llm_config:'上傳 LLM.config.json',open_skills:'開啟 Skills Studio',skills_offline:'Skills Studio（離線）',
+    panel_sessions:'會話',panel_conversation:'對話',panel_runtime:'執行狀態',
+    btn_new_session:'新增會話',btn_rename:'重新命名',btn_delete:'刪除',
+    btn_send:'送出',btn_interrupt:'中斷',btn_compact:'壓縮',btn_refresh:'重新整理',btn_export_session:'匯出會話',
+    prompt_placeholder:'描述你的任務，或要求 Agent 使用工具執行操作...',
+    upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案',
+    sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
+    stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_model:'模型',
+    no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
+    running:'執行中',idle:'閒置',open:'未完成',completed:'已完成',blocked:'阻塞',
+    status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
+    owner_unassigned:'owner=未指派',
+    session_title_prompt:'會話標題',web_session:'Web 會話',rename_session_prompt:'重新命名會話',session_default:'會話',
+    select_session_first:'請先選擇會話',delete_confirm:'確認刪除目前會話與其持久化狀態？',
+    no_model_selected:'尚未選擇模型',config_uploaded_no_profiles:'設定已上傳，但未解析到可用模型設定',
+    file_too_large:'檔案過大',
+    compact_auto:'已觸發自動 compact',
+    rel_path:'相對路徑',thinking:'思考',thinking_stream:'思考（串流）',
+    copy_code:'複製程式碼',copy_done:'已複製'
+  },
+  'ja':{
+    app_title:'Clouds Coder',app_subtitle:'WebUI 駆動の対話型コーディング Agent プラットフォーム',powered_by:'Powered By Fona',
+    apply_model:'モデル適用',upload_llm_config:'LLM.config.json をアップロード',open_skills:'Skills Studio を開く',skills_offline:'Skills Studio（オフライン）',
+    panel_sessions:'セッション',panel_conversation:'会話',panel_runtime:'ランタイム',
+    btn_new_session:'新規セッション',btn_rename:'リネーム',btn_delete:'削除',
+    btn_send:'送信',btn_interrupt:'中断',btn_compact:'コンパクト',btn_refresh:'更新',btn_export_session:'セッションをエクスポート',
+    prompt_placeholder:'タスクを説明するか、Agent にツール実行を依頼してください...',
+    upload_drop:'コード / Markdown / PDF / Excel / Word / PPT / CSV をドラッグ＆ドロップ、またはクリックして選択',
+    sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
+    stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_model:'モデル',
+    no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
+    running:'実行中',idle:'待機中',open:'未完了',completed:'完了',blocked:'ブロック',
+    status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
+    owner_unassigned:'owner=未割り当て',
+    session_title_prompt:'セッション名',web_session:'Web セッション',rename_session_prompt:'セッション名を変更',session_default:'セッション',
+    select_session_first:'先にセッションを選択してください',delete_confirm:'現在のセッションと保存状態を削除しますか？',
+    no_model_selected:'モデルが未選択です',config_uploaded_no_profiles:'設定はアップロードされましたが、モデルプロファイルを解析できませんでした',
+    file_too_large:'ファイルが大きすぎます',
+    compact_auto:'自動 compact を実行',
+    rel_path:'相対パス',thinking:'thinking',thinking_stream:'thinking (stream)',
+    copy_code:'Copy Code',copy_done:'Copied'
+  }
+};
+function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
+function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
+function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
+function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
+function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('importConfigBtn','upload_llm_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('compactBtn','btn_compact');setText('refreshBtn','btn_refresh');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}}
+function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderSkillsEntryLink()}
+async function api(path,opt={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
+function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
+function nearBottom(el,threshold=24){const t=Math.max(0,Number(threshold)||24);return (el.scrollHeight-el.scrollTop-el.clientHeight)<=t}
+function snapshotDelayMs(){return document.visibilityState==='hidden'?SNAPSHOT_DELAY_HIDDEN_MS:SNAPSHOT_DELAY_VISIBLE_MS}
+function sessionPollDelayMs(){return document.visibilityState==='hidden'?SESSION_POLL_HIDDEN_MS:SESSION_POLL_VISIBLE_MS}
+function applyStaticUiClass(){document.documentElement.classList.toggle('ui-static',!!(S.staticMode&&S.frozen))}
+function shouldFreezeAfterRender(){return !!(S.staticMode&&S.bootRendered&&(document.visibilityState==='hidden'))}
+function freezeAutoUpdates(){if(!S.staticMode)return;S.frozen=true;if(S.refreshTimer){clearTimeout(S.refreshTimer);S.refreshTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.es){try{S.es.close()}catch(_){}S.es=null}applyStaticUiClass()}
+function resumeAutoUpdates(){if(!S.staticMode)return;S.frozen=false;applyStaticUiClass();if(S.activeId&&!S.es)bindEvents(S.activeId);scheduleSessionPoll(true)}
+function _panelIsUserScrolling(el){
+  if(!el)return false;
+  const now=Date.now();
+  const lastTs=Number(el._panelUserScrollTs||0);
+  const lockUntil=Number(el._panelUserScrollLockTs||0);
+  const active=(lastTs>0)&&((now-lastTs)<PANEL_SCROLL_ACTIVE_MS);
+  return active||(lockUntil>now);
+}
+function setPanelHtml(id,html){
+  const el=E(id);
+  if(!el)return;
+  const locked=(id==='sessionList'||id==='todos'||id==='tasks');
+  const atTop=el.scrollTop<=1;
+  const follow=locked?false:(S.follow[id]??true);
+  const keepBottom=follow||nearBottom(el);
+  const prevTop=Number(el.scrollTop||0);
+  const dist=el.scrollHeight-el.scrollTop-el.clientHeight;
+  const prev=S.panelHtml[id];
+  if(prev===html){
+    return;
+  }
+  S.panelHtml[id]=html;
+  const pinWhileScrolling=locked&&_panelIsUserScrolling(el);
+  el.innerHTML=html;
+  if(pinWhileScrolling){
+    const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
+    el.scrollTop=Math.max(0,Math.min(prevTop,maxTop));
+    return;
+  }
+  if(locked&&atTop){
+    el.scrollTop=0;
+    return;
+  }
+  if(keepBottom){
+    el.scrollTop=el.scrollHeight;
+  }else{
+    el.scrollTop=Math.max(0,el.scrollHeight-el.clientHeight-dist);
+  }
+}
+function formatContextLeft(snap){const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct))return '-';return `${left} (${pct.toFixed(1)}%)`}
+function scheduleCompactRefreshBurst(count=COMPACT_AUTO_REFRESH_COUNT){if(!S.activeId)return;const n=Math.max(1,Math.min(10,Number(count)||COMPACT_AUTO_REFRESH_COUNT));for(let i=0;i<n;i++){setTimeout(()=>{if(!S.activeId)return;refreshSnapshot().catch(()=>{})},90+(i*COMPACT_AUTO_REFRESH_INTERVAL_MS))}}
+function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct)){textEl.textContent='ctx_left=-';fill.style.width='0%';box.classList.remove('warn','danger');return}const safePct=Math.max(0,Math.min(100,pct));textEl.textContent=`ctx_left=${left} (${safePct.toFixed(1)}%)`;fill.style.width=`${safePct}%`;box.classList.toggle('warn',safePct<=35&&safePct>15);box.classList.toggle('danger',safePct<=15)}
+function showCompactToast(text){let el=document.querySelector('.compact-toast');if(!el){el=document.createElement('div');el.className='compact-toast';document.body.appendChild(el)}el.textContent=text;el.classList.add('show');if(el._t)clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),2800)}
+function parseCompactReason(data){const direct=String(data?.reason||'').trim();if(direct)return direct;const s=String(data?.summary||'');const m=s.match(/context compacted \\(([^)]*)\\)/);return m?String(m[1]||'').trim():''}
+function isRenderRuntimeEventType(evtType){return RENDER_EVT_TYPES.has(String(evtType||''))}
+function pullRenderState(id,force=false){const sid=String(id||S.activeId||'').trim();if(!sid||S.renderStateInFlight)return;const now=Date.now();if(!force&&now-Number(S.lastRenderStatePullAt||0)<1200)return;S.lastRenderStatePullAt=now;S.renderStateInFlight=true;api('/api/sessions/'+sid+'/render-state').then(st=>{if(!st||typeof st!=='object')return;const frame=st?.frame;if(frame&&typeof frame==='object'){_renderBridgeEnqueue(frame);return}const seq=Number(st?.seq||0);if(seq<=0)return;const kind=String(st?.last_kind||st?.latest?.kind||'generic');const latest=st?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeShow();_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(90000)}).catch(()=>{}).finally(()=>{S.renderStateInFlight=false})}
+function _renderBridgeShow(){const wrap=E('renderBridge');if(!wrap)return null;wrap.classList.remove('hidden');if(RENDER.hideTimer){clearTimeout(RENDER.hideTimer);RENDER.hideTimer=0}return wrap}
+function _renderBridgeHideLater(ms=90000){if(RENDER.hideTimer){clearTimeout(RENDER.hideTimer);RENDER.hideTimer=0}RENDER.hideTimer=setTimeout(()=>{const wrap=E('renderBridge');if(wrap)wrap.classList.add('hidden')},Math.max(4000,Number(ms)||90000))}
+function _renderBridgeEnsureCanvas(){const canvas=E('renderCanvas');if(!canvas)return null;const wrap=_renderBridgeShow();if(!wrap)return null;const ctx=(canvas.getContext&&canvas.getContext('2d'))?canvas.getContext('2d'):null;if(!ctx)return null;const dpr=Math.max(1,Math.min(3,window.devicePixelRatio||1));const rect=canvas.getBoundingClientRect();const w=Math.max(260,Math.floor(rect.width||canvas.clientWidth||canvas.width||960));const h=Math.max(120,Math.floor(rect.height||canvas.clientHeight||canvas.height||220));const bw=Math.max(260,Math.floor(w*dpr));const bh=Math.max(120,Math.floor(h*dpr));if(canvas.width!==bw||canvas.height!==bh){canvas.width=bw;canvas.height=bh;ctx.setTransform(1,0,0,1,0,0);ctx.scale(dpr,dpr)}RENDER.canvas=canvas;RENDER.ctx=ctx;return{canvas,ctx,w,h}}
+function _renderBridgeSafeNum(v,def=0,min=-1e6,max=1e6){const n=Number(v);if(!Number.isFinite(n))return def;return Math.max(min,Math.min(max,n))}
+function _renderBridgeColor(raw,fallback='#1f6feb'){const s=String(raw||'').trim();if(/^#[0-9a-fA-F]{3,8}$/.test(s))return s;if(/^rgba?\\(([^)]+)\\)$/.test(s))return s;if(/^hsla?\\(([^)]+)\\)$/.test(s))return s;return fallback}
+function _renderBridgeUpdateMeta(text,force=false){const meta=E('renderMeta');if(!meta)return;const now=Date.now();if(!force&&now-Number(RENDER.lastMetaAt||0)<RENDER_META_MIN_INTERVAL_MS)return;const txt=String(text||'').trim();if(!txt)return;RENDER.lastMetaAt=now;RENDER.lastSummary=txt;meta.textContent=txt}
+function _renderBridgeDrawImage(frame,ctx,w,h){const b64=String(frame?.image_b64||'').trim();if(!b64)return;const mime=String(frame?.mime||'image/png').trim()||'image/png';const src=`data:${mime};base64,${b64}`;const ticket=Number(RENDER.imgTicket||0)+1;RENDER.imgTicket=ticket;const img=new Image();img.onload=()=>{if(ticket!==Number(RENDER.imgTicket||0))return;ctx.drawImage(img,0,0,w,h)};img.onerror=()=>{};img.src=src}
+function _renderBridgeDrawFrame(frame){const ready=_renderBridgeEnsureCanvas();if(!ready)return;const {ctx,w,h}=ready;const srcW=Math.max(1,_renderBridgeSafeNum(frame?.width,0,0,8192));const srcH=Math.max(1,_renderBridgeSafeNum(frame?.height,0,0,8192));const sx=(srcW>0)?(w/srcW):1;const sy=(srcH>0)?(h/srcH):1;const clear=!!frame?.clear||!RENDER.lastPaintAt;if(clear){ctx.clearRect(0,0,w,h)}const bg=String(frame?.bg||'').trim();if(bg){ctx.fillStyle=_renderBridgeColor(bg,'#ffffff');ctx.fillRect(0,0,w,h)}if(String(frame?.image_b64||'').trim()){_renderBridgeDrawImage(frame,ctx,w,h)}const lines=Array.isArray(frame?.lines)?frame.lines:[];if(lines.length){for(const line of lines){const pts=Array.isArray(line?.points)?line.points:[];if(pts.length<2)continue;ctx.beginPath();const p0=pts[0];const x0=_renderBridgeSafeNum(Array.isArray(p0)?p0[0]:0,0)*sx;const y0=_renderBridgeSafeNum(Array.isArray(p0)?p0[1]:0,0)*sy;ctx.moveTo(x0,y0);for(let i=1;i<pts.length;i++){const p=pts[i];ctx.lineTo(_renderBridgeSafeNum(Array.isArray(p)?p[0]:0,0)*sx,_renderBridgeSafeNum(Array.isArray(p)?p[1]:0,0)*sy)}ctx.strokeStyle=_renderBridgeColor(line?.color,'#1f6feb');ctx.globalAlpha=_renderBridgeSafeNum(line?.alpha,1,0,1);ctx.lineWidth=_renderBridgeSafeNum(line?.width,1.6,0.1,60);ctx.stroke();ctx.globalAlpha=1}}const points=Array.isArray(frame?.points)?frame.points:[];if(points.length){for(const p of points){ctx.beginPath();ctx.arc(_renderBridgeSafeNum(p?.x,0)*sx,_renderBridgeSafeNum(p?.y,0)*sy,_renderBridgeSafeNum(p?.size,1.6,0.1,40),0,Math.PI*2);ctx.fillStyle=_renderBridgeColor(p?.color,'#1a7f64');ctx.globalAlpha=_renderBridgeSafeNum(p?.alpha,1,0,1);ctx.fill();ctx.globalAlpha=1}}const txt=String(frame?.text||'').trim();if(txt){ctx.fillStyle='#26364d';ctx.font='12px ui-monospace, SFMono-Regular, Menlo, monospace';ctx.fillText(txt.slice(0,240),8,18)}RENDER.lastPaintAt=Date.now();RENDER.lastSeq=Math.max(Number(RENDER.lastSeq||0),Number(frame?.seq||0));const lineCount=Array.isArray(frame?.lines)?frame.lines.length:0;const pointCount=Array.isArray(frame?.points)?frame.points.length:0;const kind=String(frame?.kind||'generic');_renderBridgeUpdateMeta(`render seq=${RENDER.lastSeq} · kind=${kind} · lines=${lineCount} · points=${pointCount}`,true);_renderBridgeHideLater(90000)}
+function _renderBridgeDrain(){RENDER.raf=0;if(!Array.isArray(RENDER.queue)||!RENDER.queue.length)return;const latest=RENDER.queue[RENDER.queue.length-1]||{};RENDER.queue.length=0;_renderBridgeDrawFrame(latest);if(RENDER.queue.length){RENDER.raf=requestAnimationFrame(_renderBridgeDrain)}}
+function _renderBridgeEnqueue(frame){if(!frame||typeof frame!=='object')return;_renderBridgeShow();if(!Array.isArray(RENDER.queue))RENDER.queue=[];RENDER.queue.push(frame);if(RENDER.queue.length>RENDER_QUEUE_MAX){RENDER.queue=RENDER.queue.slice(-Math.floor(RENDER_QUEUE_MAX*0.6))}const summary=String(frame?.summary||'').trim();if(summary){_renderBridgeUpdateMeta(summary,false)}if(!RENDER.raf){RENDER.raf=requestAnimationFrame(_renderBridgeDrain)}}
+function _renderBridgeSyncFromSnapshot(snap){const rb=snap?.render_bridge||null;if(!rb||typeof rb!=='object')return;const seq=Number(rb?.seq||0);if(seq<=0)return;_renderBridgeShow();const kind=String(rb?.last_kind||rb?.latest?.kind||'generic');const latest=rb?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(90000)}
+function onRuntimeEvent(evt){if(!evt)return;const typ=String(evt.type||'');if(typ==='render_frame'){_renderBridgeEnqueue(evt.data||{});return}if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(90000)}return}if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(!(reason==='auto'||reason.startsWith('truncation-rescue')))return;const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · refresh x${COMPACT_AUTO_REFRESH_COUNT}`)}}
+function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills');if(offline){link.removeAttribute('target');link.removeAttribute('rel')}else{link.setAttribute('target','_blank');link.setAttribute('rel','noreferrer')}}
+function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function boardsSignature(snap){return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
+function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);return `${rows.length}|${sig}`}
+function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';E('topStats').innerHTML=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_model'),model]].map(([k,v])=>`<div class=\"stat\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('')}
+function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
+function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮')return 'diff-line-hunk';return ''}
+function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
+function splitTableRow(line){const src=String(line||'').trim().replace(/^\\|/,'').replace(/\\|$/,'');if(!src)return[];return src.split('|').map(x=>String(x||'').trim())}
+function isTableSeparator(line){const cells=splitTableRow(line);if(!cells.length)return false;return cells.every(cell=>/^:?-{3,}:?$/.test(cell))}
+function _mathTake(tokens,raw){
+  const idx=tokens.length;
+  tokens.push(String(raw||''));
+  return `\\u0000MATH${idx}\\u0000`;
+}
+function _mathExtract(raw){
+  let txt=String(raw||'');
+  const tokens=[];
+  txt=txt.replace(/<math[\\s\\S]*?<\\/math>/gi,m=>_mathTake(tokens,m));
+  txt=txt.replace(/\\\\\\[[\\s\\S]*?\\\\\\]/g,m=>_mathTake(tokens,m));
+  txt=txt.replace(/\\$\\$[\\s\\S]*?\\$\\$/g,m=>_mathTake(tokens,m));
+  txt=txt.replace(/\\\\\\([\\s\\S]*?\\\\\\)/g,m=>_mathTake(tokens,m));
+  let out='';
+  for(let i=0;i<txt.length;){
+    const ch=txt[i];
+    if(ch!=='$'){out+=ch;i+=1;continue}
+    if(i+1<txt.length&&txt[i+1]==='$'){out+='$$';i+=2;continue}
+    if(i>0&&txt[i-1]==='\\\\'){out+=ch;i+=1;continue}
+    let j=i+1;
+    let found=-1;
+    while(j<txt.length){
+      if(txt[j]==='\\n')break;
+      if(txt[j]==='$'&&txt[j-1]!=='\\\\'){found=j;break}
+      j+=1;
+    }
+    if(found>i+1){out+=_mathTake(tokens,txt.slice(i,found+1));i=found+1;continue}
+    out+=ch;
+    i+=1;
+  }
+  return {text:out,tokens};
+}
+function _sanitizeMathML(raw){
+  let s=String(raw||'');
+  if(!/^<math[\\s>]/i.test(s)||!/<\\/math>\\s*$/i.test(s))return '';
+  s=s.replace(/<script[\\s\\S]*?<\\/script>/gi,'');
+  s=s.replace(/\\son[a-z0-9_-]+\\s*=\\s*(\"[^\"]*\"|'[^']*')/gi,'');
+  s=s.replace(/\\sstyle\\s*=\\s*(\"[^\"]*\"|'[^']*')/gi,'');
+  return s;
+}
+function _mathTokenToHtml(raw){
+  const s=String(raw||'');
+  if(/^<math[\\s>]/i.test(s)){
+    const safe=_sanitizeMathML(s);
+    return safe||esc(s);
+  }
+  return esc(s);
+}
+function _mathRestore(text,tokens){
+  const src=String(text||'');
+  return src.replace(/\\u0000MATH(\\d+)\\u0000/g,(_,n)=>_mathTokenToHtml(tokens[Number(n)]||''));
+}
+function _maybeMath(text){
+  const s=String(text||'');
+  if(!s)return false;
+  return /<math[\\s>]|\\$\\$|\\$(?!\\s)|\\\\\\(|\\\\\\[/.test(s);
+}
+function _mathTypeset(root,key=''){
+  if(!root)return;
+  const k=String(key||'').trim();
+  if(k&&root.getAttribute('data-math-key')===k)return;
+  const txt=String(root.textContent||'');
+  const html=String(root.innerHTML||'');
+  if(!_maybeMath(txt)&&!/<math[\\s>]/i.test(html))return;
+  const run=(retry)=>{
+    const mj=window.MathJax;
+    if(!mj||typeof mj.typesetPromise!=='function'){
+      if(retry<10)setTimeout(()=>run(retry+1),180);
+      return;
+    }
+    if(root._mathPending)return;
+    root._mathPending=true;
+    Promise.resolve(mj.typesetPromise([root]))
+      .catch(()=>{})
+      .finally(()=>{
+        root._mathPending=false;
+        if(k)root.setAttribute('data-math-key',k);
+      });
+  };
+  run(0);
+}
+function renderInlineMarkdown(raw){
+  const inlineCodes=[];
+  const codeSafe=String(raw||'').replace(/`([^`]+)`/g,(_,c)=>{
+    const idx=inlineCodes.length;
+    inlineCodes.push(String(c||''));
+    return `\\u0000ICODE${idx}\\u0000`;
+  });
+  const pack=_mathExtract(codeSafe);
+  let s=esc(pack.text);
+  s=s.replace(/\\u0000ICODE(\\d+)\\u0000/g,(_,n)=>`<code class=\"md-inline-code\">${esc(inlineCodes[Number(n)]||'')}</code>`);
+  s=s.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
+  s=s.replace(/__([^_]+)__/g,'<strong>$1</strong>');
+  s=s.replace(/\\*([^*]+)\\*/g,'<em>$1</em>');
+  s=s.replace(/_([^_]+)_/g,'<em>$1</em>');
+  s=s.replace(/~~([^~]+)~~/g,'<del>$1</del>');
+  s=s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g,(_,txt,url)=>`<a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${txt}</a>`);
+  return _mathRestore(s,pack.tokens);
+}
+function renderMarkdown(text){const src=String(text||'').replace(/\\r\\n?/g,'\\n');const codeBlocks=[];let body=src.replace(/```([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)```/g,(_,lang,code)=>{const idx=codeBlocks.length;const langTag=String(lang||'').trim();const codeHtml=`<pre class=\"md-code\"><code>${esc(String(code||'').replace(/\\n$/,''))}</code></pre>`;codeBlocks.push(langTag?`<div class=\"md-code-lang\">${esc(langTag)}</div>${codeHtml}`:codeHtml);return `\\u0000CODE${idx}\\u0000`});const lines=body.split('\\n');const out=[];let para=[];let inUl=false;let inOl=false;const flushPara=()=>{if(!para.length)return;out.push(`<p>${renderInlineMarkdown(para.join(' '))}</p>`);para=[]};const closeLists=()=>{if(inUl){out.push('</ul>');inUl=false}if(inOl){out.push('</ol>');inOl=false}};for(let i=0;i<lines.length;i++){const line=String(lines[i]||'');const trimLine=line.trim();if(!trimLine){flushPara();closeLists();continue}if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){flushPara();closeLists();const header=splitTableRow(line);const rows=[];i+=2;while(i<lines.length&&String(lines[i]||'').includes('|')&&String(lines[i]||'').trim()){rows.push(splitTableRow(lines[i]));i+=1}i-=1;const th=header.map(cell=>`<th>${renderInlineMarkdown(cell)}</th>`).join('');const tb=rows.map(r=>`<tr>${r.map(c=>`<td>${renderInlineMarkdown(c)}</td>`).join('')}</tr>`).join('');out.push(`<table class=\"md-table\"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);continue}const hm=trimLine.match(/^(#{1,6})\\s+(.+)$/);if(hm){flushPara();closeLists();const lv=Math.max(1,Math.min(6,hm[1].length));out.push(`<h${lv}>${renderInlineMarkdown(hm[2])}</h${lv}>`);continue}if(/^>\\s?/.test(trimLine)){flushPara();closeLists();out.push(`<blockquote>${renderInlineMarkdown(trimLine.replace(/^>\\s?/,''))}</blockquote>`);continue}const om=trimLine.match(/^\\d+\\.\\s+(.+)$/);if(om){flushPara();if(inUl){out.push('</ul>');inUl=false}if(!inOl){out.push('<ol>');inOl=true}out.push(`<li>${renderInlineMarkdown(om[1])}</li>`);continue}const um=trimLine.match(/^[-*+]\\s+(.+)$/);if(um){flushPara();if(inOl){out.push('</ol>');inOl=false}if(!inUl){out.push('<ul>');inUl=true}out.push(`<li>${renderInlineMarkdown(um[1])}</li>`);continue}para.push(trimLine)}flushPara();closeLists();let html=out.join('');html=html.replace(/\\u0000CODE(\\d+)\\u0000/g,(_,n)=>codeBlocks[Number(n)]||'');return html||'<p></p>'}
+function renderMarkdownCached(text,key){const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const html=renderMarkdown(text);if(k){MD_CACHE.set(k,html);if(MD_CACHE.size>MD_CACHE_MAX){const first=MD_CACHE.keys().next().value;MD_CACHE.delete(first)}}return html}
+function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='code')return '{}';return '📄'}
+function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
+function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
+function encodePreviewPath(path){return normalizePreviewPath(path).split('/').filter(Boolean).map(x=>encodeURIComponent(x)).join('/')}
+function previewFileUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-file/${rel}${ts}`}
+function previewCodeStagesUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code-stages/${rel}${ts}`}
+function previewCodeUrl(sessionId,path,stage='latest',forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const st=encodeURIComponent(String(stage||'latest'));const ts=forceReload?`&ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code/${rel}?stage=${st}${ts}`}
+function _previewLatestCodeStageHint(path){const rel=normalizePreviewPath(path);const ops=Array.isArray(S.snap?.operations)?S.snap.operations:[];for(let i=ops.length-1;i>=0;i--){const op=ops[i]||{};if(String(op.type||'')!=='file_patch')continue;const d=op.data||{};const p=normalizePreviewPath(d.session_rel_path||d.path||'');if(p!==rel)continue;const sid=String(d?.code_stage?.id||'').trim();if(sid)return sid}return ''}
+function _previewResetStageUi(){const wrap=E('previewStageWrap');const sel=E('previewStageSelect');const stat=E('previewStageStat');if(wrap)wrap.classList.add('hidden');if(sel){sel.innerHTML='';sel.onchange=null}if(stat)stat.textContent=''}
+function _previewRenderStageSelector(tab,stages,selectedReq,payload=null){
+  const wrap=E('previewStageWrap');
+  const sel=E('previewStageSelect');
+  const stat=E('previewStageStat');
+  if(!wrap||!sel||!stat)return;
+  const rows=Array.isArray(stages)?stages:[];
+  if(!rows.length){
+    wrap.classList.add('hidden');
+    sel.innerHTML='';
+    stat.textContent='';
+    return;
+  }
+  wrap.classList.remove('hidden');
+  const opts=[`<option value="latest">Latest</option>`];
+  for(const row of rows){
+    const id=String(row?.id||'').trim();
+    if(!id)continue;
+    const idx=Number(row?.index||0);
+    const total=Number(row?.total||rows.length||0);
+    const label=String(row?.label||`#${idx||0}`);
+    opts.push(`<option value="${esc(id)}">${esc(`${label} (${idx}/${total})`)}</option>`);
+  }
+  sel.innerHTML=opts.join('');
+  const selected=String(selectedReq||'latest');
+  sel.value=selected;
+  if(sel.value!==selected)sel.value='latest';
+  sel.onchange=()=>{tab.codeStageId=String(sel.value||'latest');renderActivePreview(true)};
+  const stage=payload?.stage||null;
+  if(stage){
+    const idx=Number(stage.index||0);
+    const total=Number(stage.total||0);
+    const add=Number(stage.added||0);
+    const del=Number(stage.deleted||0);
+    const linesAfter=Number(stage.lines_after||0);
+    const lineTail=(Number.isFinite(linesAfter)&&linesAfter>0)?` · lines=${linesAfter}`:'';
+    stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
+    return;
+  }
+  const latest=rows[rows.length-1]||{};
+  const idx=Number(latest.index||rows.length||0);
+  const total=Number(latest.total||rows.length||0);
+  const add=Number(latest.added||0);
+  const del=Number(latest.deleted||0);
+  const linesAfter=Number(latest.lines_after||0);
+  const lineTail=(Number.isFinite(linesAfter)&&linesAfter>0)?` · lines=${linesAfter}`:'';
+  stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
+}
+function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
+function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:true,backtick:false};if(v==='json')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
+function _codeWordSet(lang){return CODE_KEYWORDS[String(lang||'default')]||CODE_KEYWORDS.default}
+function _isWordStart(ch){return /[A-Za-z_$]/.test(ch)}
+function _isWordChar(ch){return /[A-Za-z0-9_$]/.test(ch)}
+function _codeTok(cls,text){return `<span class="code-tok-${cls}">${esc(text)}</span>`}
+function _codeNextNonSpace(src,start){for(let k=Math.max(0,Number(start)||0);k<src.length;k++){const ch=src[k]||'';if(!/\\s/.test(ch))return ch}return ''}
+function highlightCodeLine(raw,lang){
+  const src=String(raw||'');
+  if(!src)return '';
+  const cfg=_codeLangConfig(lang);
+  const kws=_codeWordSet(lang);
+  const typeDeclWords=new Set(['class','interface','struct','enum','trait','protocol','namespace','module','package','type']);
+  const fnDeclWords=new Set(['def','function','func','fn','sub']);
+  let i=0;
+  let out='';
+  let declHint='';
+  while(i<src.length){
+    const ch=src[i]||'';
+    const next=src[i+1]||'';
+    if(cfg.xmlComment&&src.startsWith('<!--',i)){
+      const end=src.indexOf('-->',i+4);
+      const j=end>=0?(end+3):src.length;
+      out+=_codeTok('com',src.slice(i,j));
+      i=j;
+      continue;
+    }
+    if(cfg.blockComment&&ch==='/'&&next==='*'){
+      const end=src.indexOf('*/',i+2);
+      const j=end>=0?(end+2):src.length;
+      out+=_codeTok('com',src.slice(i,j));
+      i=j;
+      continue;
+    }
+    if(cfg.slashComment&&ch==='/'&&next==='/'){
+      out+=_codeTok('com',src.slice(i));
+      break;
+    }
+    if(cfg.dashComment&&ch==='-'&&next==='-'){
+      out+=_codeTok('com',src.slice(i));
+      break;
+    }
+    if(cfg.hashComment&&ch==='#'){
+      out+=_codeTok('com',src.slice(i));
+      break;
+    }
+    if(ch==='@'&&_isWordStart(next)){
+      let j=i+2;
+      while(j<src.length&&_isWordChar(src[j]||''))j+=1;
+      out+=_codeTok('dec',src.slice(i,j));
+      i=j;
+      continue;
+    }
+    if(ch==='"'||ch==="'"||(cfg.backtick&&ch==='`')){
+      const q=ch;
+      let j=i+1;
+      while(j<src.length){
+        if(src[j]==='\\\\'){j+=2;continue}
+        if(src[j]===q){j+=1;break}
+        j+=1;
+      }
+      out+=_codeTok('str',src.slice(i,Math.min(j,src.length)));
+      i=Math.min(j,src.length);
+      continue;
+    }
+    if(/[0-9]/.test(ch)){
+      let j=i+1;
+      while(j<src.length&&/[0-9A-Fa-f_xX\\.]/.test(src[j]||''))j+=1;
+      out+=_codeTok('num',src.slice(i,j));
+      i=j;
+      continue;
+    }
+    if(_isWordStart(ch)){
+      let j=i+1;
+      while(j<src.length&&_isWordChar(src[j]||''))j+=1;
+      const word=src.slice(i,j);
+      const low=word.toLowerCase();
+      if(kws.has(word)||kws.has(low)){
+        out+=_codeTok('kw',word);
+        if(typeDeclWords.has(low))declHint='type';
+        else if(fnDeclWords.has(low))declHint='fn';
+        else declHint='';
+      }else if(CODE_LITERAL_WORDS.has(low)){
+        out+=_codeTok('lit',word);
+        declHint='';
+      }else{
+        const nextNonSpace=_codeNextNonSpace(src,j);
+        if(declHint==='type'){
+          out+=_codeTok('type',word);
+        }else if(declHint==='fn'){
+          out+=_codeTok('fn',word);
+        }else if(nextNonSpace==='('){
+          out+=_codeTok('fn',word);
+        }else if(/^[A-Z]/.test(word)){
+          out+=_codeTok('type',word);
+        }else{
+          out+=_codeTok('id',word);
+        }
+        declHint='';
+      }
+      i=j;
+      continue;
+    }
+    if(/[=+\\-*/%!&|^~<>?:]/.test(ch)){
+      out+=_codeTok('op',ch);
+      i+=1;
+      continue;
+    }
+    if(/[{}()[\\];,.]/.test(ch)){
+      out+=_codeTok('punc',ch);
+      i+=1;
+      continue;
+    }
+    out+=esc(ch);
+    i+=1;
+  }
+  return out;
+}
+function _renderCodeRowHtml(kind,sign,oldLn,newLn,txt,lang,useHighlight){
+  const oldStr=(oldLn===null||oldLn===undefined||oldLn==='')?'':String(oldLn);
+  const newStr=(newLn===null||newLn===undefined||newLn==='')?'':String(newLn);
+  const lineNo=newStr||oldStr;
+  const text=String(txt||'');
+  const codeHtml=useHighlight?highlightCodeLine(text,lang):esc(text);
+  const codeCls=(kind==='delete')?'code-code code-code-delete':'code-code';
+  const modAttr=(kind==='add'||kind==='delete')?'1':'0';
+  return `<div class="code-row code-${esc(kind)}" data-kind="${esc(kind)}" data-old-line="${esc(oldStr)}" data-new-line="${esc(newStr)}" data-mod="${modAttr}"><div class="code-gutter"><span class="code-sign">${esc(sign)}</span><span class="code-ln ${lineNo?'':'code-ln-empty'}">${esc(lineNo)}</span></div><div class="${codeCls}">${codeHtml}</div></div>`;
+}
+function _renderCodeRows(rows,lang){
+  const arr=Array.isArray(rows)?rows:[];
+  const useHighlight=arr.length<=6000;
+  return arr.map(row=>{
+    const kind=String(row?.kind||'context');
+    const sign=String(row?.sign||' ');
+    return _renderCodeRowHtml(kind,sign,row?.old_line,row?.new_line,row?.text,lang,useHighlight);
+  }).join('');
+}
+function _renderCodeFullText(fullText,lang,rows){
+  const normalized=String(fullText??'').replace(/\\r\\n?/g,'\\n');
+  let lines=normalized.split('\\n');
+  if(lines.length&&lines[lines.length-1]==='')lines=lines.slice(0,-1);
+  if(!lines.length)return '';
+  const diffRows=Array.isArray(rows)?rows:[];
+  const addByLine=Object.create(null);
+  const deletedByAnchor=Object.create(null);
+  let pendingDeletes=[];
+  const tailAnchor=lines.length+1;
+  const flushDeletes=(anchor)=>{
+    if(!pendingDeletes.length)return;
+    const a=Math.max(1,Math.floor(Number(anchor)||tailAnchor));
+    const key=String(a);
+    if(!Array.isArray(deletedByAnchor[key]))deletedByAnchor[key]=[];
+    deletedByAnchor[key]=deletedByAnchor[key].concat(pendingDeletes);
+    pendingDeletes=[];
+  };
+  for(const row of diffRows){
+    const kind=String(row?.kind||'context');
+    const newLnNum=Number(row?.new_line||0);
+    if(kind==='delete'){
+      pendingDeletes.push(row);
+      continue;
+    }
+    if(pendingDeletes.length){
+      const anchor=(Number.isFinite(newLnNum)&&newLnNum>0)?newLnNum:tailAnchor;
+      flushDeletes(anchor);
+    }
+    if(kind==='add'&&Number.isFinite(newLnNum)&&newLnNum>0){
+      addByLine[String(Math.floor(newLnNum))]=1;
+    }
+  }
+  if(pendingDeletes.length)flushDeletes(tailAnchor);
+  const useHighlight=lines.length<=6000;
+  const out=[];
+  for(let i=0;i<lines.length;i++){
+    const lineNo=i+1;
+    const beforeDeletes=deletedByAnchor[String(lineNo)]||[];
+    for(const d of beforeDeletes){
+      out.push(_renderCodeRowHtml('delete','-',d?.old_line,'',d?.text,lang,useHighlight));
+    }
+    const isAdd=!!addByLine[String(lineNo)];
+    out.push(_renderCodeRowHtml(isAdd?'add':'context',isAdd?'+':' ','',lineNo,lines[i],lang,useHighlight));
+  }
+  const tailDeletes=deletedByAnchor[String(tailAnchor)]||[];
+  for(const d of tailDeletes){
+    out.push(_renderCodeRowHtml('delete','-',d?.old_line,'',d?.text,lang,useHighlight));
+  }
+  return out.join('');
+}
+function _codeRowsToStageText(rows){
+  const arr=Array.isArray(rows)?rows:[];
+  const out=[];
+  for(const row of arr){
+    const kind=String(row?.kind||'context');
+    if(kind==='delete')continue;
+    const text=String(row?.text||'');
+    const ln=Math.floor(Number(row?.new_line||0));
+    if(ln>0){
+      while(out.length<ln)out.push('');
+      out[ln-1]=text;
+      continue;
+    }
+    out.push(text);
+  }
+  return out.join('\\n');
+}
+function _setPreviewCopyState(tab){
+  const btn=E('previewCopyBtn');
+  if(!btn)return;
+  const isCode=!!(tab&&tab.kind==='code');
+  btn.classList.toggle('hidden',!isCode);
+  btn.disabled=!isCode;
+  if(isCode)btn.textContent=t('copy_code');
+}
+async function copyPreviewCode(){
+  const tab=activePreviewTab();
+  if(!tab||tab.kind!=='code')return;
+  const body=E('previewBody');
+  if(!body)return;
+  const text=String(body._previewCopyText||'');
+  if(!text)return;
+  const btn=E('previewCopyBtn');
+  const restore=()=>{if(btn){btn.disabled=false;btn.textContent=t('copy_code')}};
+  try{
+    if(btn)btn.disabled=true;
+    if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+      await navigator.clipboard.writeText(text);
+    }else{
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.setAttribute('readonly','readonly');
+      ta.style.position='fixed';
+      ta.style.left='-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if(btn){
+      btn.textContent=t('copy_done');
+      setTimeout(restore,1100);
+    }
+  }catch(err){
+    restore();
+    showError(err?.message||String(err));
+  }
+}
+function _bindPreviewCopyGuard(){
+  const body=E('previewBody');
+  if(!body||body._copyGuardBound)return;
+  body._copyGuardBound=true;
+  body.addEventListener('copy',ev=>{
+    const tab=activePreviewTab();
+    if(!tab||tab.kind!=='code')return;
+    const sel=(window.getSelection&&typeof window.getSelection==='function')?window.getSelection():null;
+    if(!sel||sel.isCollapsed)return;
+    const inBody=(sel.anchorNode&&body.contains(sel.anchorNode))||(sel.focusNode&&body.contains(sel.focusNode));
+    if(!inBody)return;
+    const text=String(body._previewCopyText||'');
+    if(!text||!ev.clipboardData)return;
+    ev.preventDefault();
+    ev.clipboardData.setData('text/plain',text);
+  });
+}
+function _codePreviewHotAnchor(rows,stage){
+  const arr=Array.isArray(rows)?rows:[];
+  if(!arr.length)return 1;
+  const linesAfter=Math.max(0,Math.floor(Number(stage?.lines_after||0)));
+  const tailAnchor=(linesAfter>0?linesAfter:1)+1;
+  const events=[];
+  const pushEvent=(line,weight=1)=>{
+    const ln=Math.max(1,Math.floor(Number(line)||0));
+    const wt=Math.max(1,Math.floor(Number(weight)||1));
+    if(!Number.isFinite(ln)||ln<=0)return;
+    events.push({line:ln,weight:wt});
+  };
+  let pendingDel=0;
+  for(const row of arr){
+    const kind=String(row?.kind||'context');
+    const newLn=Math.floor(Number(row?.new_line||0));
+    if(kind==='delete'){
+      pendingDel+=1;
+      continue;
+    }
+    if(pendingDel>0){
+      pushEvent(newLn>0?newLn:tailAnchor,pendingDel);
+      pendingDel=0;
+    }
+    if(kind==='add'&&newLn>0){
+      pushEvent(newLn,1);
+    }
+  }
+  if(pendingDel>0){
+    pushEvent(tailAnchor,pendingDel);
+  }
+  if(!events.length){
+    for(const row of arr){
+      const kind=String(row?.kind||'context');
+      if(kind!=='add'&&kind!=='delete')continue;
+      const line=Math.floor(Number(row?.new_line||row?.old_line||1));
+      if(line>0)return line;
+    }
+    return 1;
+  }
+  events.sort((a,b)=>a.line-b.line);
+  const gap=20;
+  const clusters=[];
+  let cur={start:events[0].line,end:events[0].line,score:events[0].weight};
+  for(let i=1;i<events.length;i++){
+    const ev=events[i];
+    if(ev.line<=cur.end+gap){
+      cur.end=Math.max(cur.end,ev.line);
+      cur.score+=ev.weight;
+      continue;
+    }
+    clusters.push(cur);
+    cur={start:ev.line,end:ev.line,score:ev.weight};
+  }
+  clusters.push(cur);
+  clusters.sort((a,b)=>{
+    if(b.score!==a.score)return b.score-a.score;
+    if(a.start!==b.start)return a.start-b.start;
+    return a.end-b.end;
+  });
+  return Math.max(1,Math.floor(Number(clusters[0]?.start||1)));
+}
+function _scrollCodePreviewToAnchor(body,anchorLine){
+  if(!body)return;
+  const scrollHost=body.querySelector('.preview-code-scroll')||body;
+  const anchor=Math.max(1,Math.floor(Number(anchorLine)||1));
+  const rows=body.querySelectorAll('.code-row');
+  if(!rows||!rows.length)return;
+  let target=null;
+  for(const row of rows){
+    const ln=Math.floor(Number(row.getAttribute('data-new-line')||0));
+    if(ln>=anchor){target=row;break;}
+  }
+  if(!target){
+    target=body.querySelector('.code-row.code-add,.code-row.code-delete')||rows[0];
+  }
+  if(!target)return;
+  const top=Math.max(0,Math.floor(Number(target.offsetTop)||0)-16);
+  scrollHost.scrollTop=top;
+}
+async function _renderCodePreviewTab(tab,body,forceReload=false){const ticket=String(++S.previewNonce);body.setAttribute('data-preview-ticket',ticket);body.innerHTML='<div class=\"preview-md msg-md\">...</div>';const requested=String(tab.codeStageId||'latest').trim()||'latest';try{const stageList=await api(previewCodeStagesUrl(S.activeId,tab.path,forceReload));if(body.getAttribute('data-preview-ticket')!==ticket)return;const stages=Array.isArray(stageList?.stages)?stageList.stages:[];let reqStage=requested;if(reqStage!=='latest'&&!stages.some(x=>String(x?.id||'')===reqStage)){reqStage='latest';tab.codeStageId='latest'}const hint=_previewLatestCodeStageHint(tab.path);const latestId=String(stageList?.latest_id||stages[stages.length-1]?.id||hint||'');const guard=(reqStage==='latest')?`latest:${latestId}`:`fixed:${reqStage}`;const key=`${tab.id}|${tab.kind}|${guard}`;if(!forceReload&&body.getAttribute('data-preview-key')===key&&body.getAttribute('data-preview-ready')==='1'){_previewRenderStageSelector(tab,stages,reqStage,null);return}const data=await api(previewCodeUrl(S.activeId,tab.path,reqStage,forceReload));if(body.getAttribute('data-preview-ticket')!==ticket)return;body.setAttribute('data-preview-key',key);body.setAttribute('data-preview-ready','1');if(reqStage==='latest'){tab.codeStageId='latest'}else if(data?.stage?.id){tab.codeStageId=String(data.stage.id)}_previewRenderStageSelector(tab,stages,tab.codeStageId||reqStage,data);const lang=_previewLangFromPath(tab.path);const rows=Array.isArray(data?.rows)?data.rows:[];const fullText=(typeof data?.full_text==='string')?data.full_text:'';const copyText=fullText||_codeRowsToStageText(rows);body._previewCopyText=copyText;const fullHtml=_renderCodeFullText(fullText,lang,rows);const rowsHtml=fullHtml||_renderCodeRows(rows,lang);body.innerHTML=`<div class=\"preview-code-scroll\"><div class=\"preview-code-shell\">${rowsHtml}</div></div>`;const hotAnchor=_codePreviewHotAnchor(rows,data?.stage||{});requestAnimationFrame(()=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;_scrollCodePreviewToAnchor(body,hotAnchor)})}catch(err){if(body.getAttribute('data-preview-ticket')!==ticket)return;body.removeAttribute('data-preview-ready');body._previewCopyText='';_previewResetStageUi();body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`}}
+function previewButtonHtml(path){const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return '';const title=rel.split('/').pop()||rel;return `<div class=\"msg-preview-row\"><button class=\"msg-preview-btn\" data-preview-path=\"${esc(rel)}\" title=\"${esc(title)}\">${previewKindIcon(kind)} ${esc(title)}</button></div>`}
+function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':'')};st.tabs.push(row)}st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function closePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');const idx=st.tabs.findIndex(x=>x.id===id);if(idx<0)return;st.tabs.splice(idx,1);if(st.active===id)st.active='conversation';renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function activatePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');if(id==='conversation'){st.active='conversation'}else if(st.tabs.some(x=>x.id===id)){st.active=id}else{st.active='conversation'}renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function activePreviewTab(){if(!S.activeId)return null;const st=ensurePreviewState(S.activeId);if(st.active==='conversation')return null;return st.tabs.find(x=>x.id===st.active)||null}
+function renderPreviewTabs(){const host=E('chatTabs');if(!host)return;if(!S.activeId){host.innerHTML='';return}const st=ensurePreviewState(S.activeId);const convActive=st.active==='conversation';const tabs=[`<button class=\"chat-tab${convActive?' active':''}\" data-tab-id=\"conversation\"><span class=\"chat-tab-title\">💬 ${esc(t('panel_conversation'))}</span></button>`];for(const tab of st.tabs){tabs.push(`<div class=\"chat-tab${st.active===tab.id?' active':''}\" data-tab-id=\"${esc(tab.id)}\"><span class=\"chat-tab-title\">${previewKindIcon(tab.kind)} ${esc(tab.title||tab.path)}</span><button class=\"chat-tab-close\" data-close-id=\"${esc(tab.id)}\">×</button></div>`)}host.innerHTML=tabs.join('');for(const el of host.querySelectorAll('[data-tab-id]')){el.onclick=()=>activatePreviewTab(el.getAttribute('data-tab-id')||'conversation')}for(const el of host.querySelectorAll('[data-close-id]')){el.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();closePreviewTab(el.getAttribute('data-close-id')||'')}}}
+function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewCopyState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function renderActivePreview(forceReload=false){
+  const pv=E('previewView');
+  const body=E('previewBody');
+  const meta=E('previewMeta');
+  if(!pv||!body||!meta)return;
+  const tab=activePreviewTab();
+  _setPreviewCopyState(tab);
+  if(!tab){
+    meta.textContent='';
+    body.innerHTML='';
+    body._previewCopyText='';
+    body.removeAttribute('data-preview-key');
+    body.removeAttribute('data-preview-ready');
+    _previewResetStageUi();
+    return;
+  }
+  meta.textContent=tab.path;
+  if(tab.kind==='code'){
+    const req=String(tab.codeStageId||'latest');
+    const hint=_previewLatestCodeStageHint(tab.path);
+    const guard=(req==='latest')?`latest:${hint}`:`fixed:${req}`;
+    const hotKey=`${tab.id}|${tab.kind}|${guard}`;
+    const prevKey=String(body.getAttribute('data-preview-key')||'');
+    if(!forceReload&&req==='latest'&&!hint&&prevKey.startsWith(`${tab.id}|${tab.kind}|latest:`)&&body.getAttribute('data-preview-ready')==='1')return;
+    if(!forceReload&&body.getAttribute('data-preview-key')===hotKey&&body.getAttribute('data-preview-ready')==='1')return;
+    void _renderCodePreviewTab(tab,body,forceReload);
+    return;
+  }
+  body._previewCopyText='';
+  _previewResetStageUi();
+  const key=`${tab.id}|${tab.kind}`;
+  if(!forceReload&&body.getAttribute('data-preview-key')===key)return;
+  body.setAttribute('data-preview-key',key);
+  body.removeAttribute('data-preview-ready');
+  const url=previewFileUrl(S.activeId,tab.path,forceReload);
+  if(tab.kind==='html'){
+    body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
+    return;
+  }
+  body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
+  const ticket=String(++S.previewNonce);
+  body.setAttribute('data-preview-ticket',ticket);
+  fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<article class=\"preview-md msg-md\">${renderMarkdown(txt)}</article>`;const article=body.querySelector('article.preview-md');if(article){_mathTypeset(article,`pv:${key}:${txt.length}`)}}).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`})
+}
+function renderChat(){const c=E('chat');const first=!c._chatHasRendered;const keep=first||Boolean(S.follow.chat);const dist=c.scrollHeight-c.scrollTop-c.clientHeight;c.innerHTML='';const feed=S.snap?.conversation_feed||S.snap?.messages||[];for(const m of feed){const d=document.createElement('div');d.className='msg '+(m.role==='user'?'user':m.role==='assistant'?'assistant':'system');if(m.type==='file_patch'&&m.data){const p=m.data;const loc=p.session_rel_path||p.path||'';const root=p.session_root||'';const preview=previewButtonHtml(loc);d.innerHTML=`<div class=\"msg-system-head\">file_patch · ${esc(loc)} (+${esc(p.added??0)} / -${esc(p.deleted??0)})</div><div class=\"msg-system-meta\">${esc(t('rel_path'))}: ${esc(loc)}\\nsession: ${esc(root)}</div>${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div>`}else if(m.type==='upload'&&m.data){const u=m.data;const upath=u.workspace_path||'';const preview=previewButtonHtml(upath);d.innerHTML=`<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">path: ${esc(upath)} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`}else if(m.type==='command'&&m.data){const x=m.data;d.innerHTML=`<div class=\"msg-system-head\">command · ${esc(x.name||'command')} · exit=${esc(x.exit_code??'-')}</div><div class=\"msg-system-meta\">$ ${esc(x.command||'')}\\ncwd: ${esc(x.cwd||'')}</div><pre class=\"msg-code-shell\">${esc(x.output||'')}</pre>`}else if(m.role==='assistant'&&m.thinking){const key=`${Number(m.ts||0)}:${String(m.role||'')}:${String(m.type||'')}:${String(m.text||'').length}:${String(m.thinking||'').length}:${String(m.text||'').slice(-12)}:${String(m.thinking||'').slice(-12)}`;d.innerHTML=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;_mathTypeset(d,key)}else{const key=`${Number(m.ts||0)}:${String(m.role||'')}:${String(m.type||'')}:${String(m.text||'').length}:${String(m.text||'').slice(-12)}`;d.innerHTML=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div>`;_mathTypeset(d,key)}c.appendChild(d)}const liveThinking=String(S.snap?.live_thinking||'').trim();if(liveThinking){const d=document.createElement('div');d.className='msg assistant';d.innerHTML=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(liveThinking)}</pre></div>`;c.appendChild(d)}for(const btn of c.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}if(keep){c.scrollTop=c.scrollHeight}else{c.scrollTop=Math.max(0,c.scrollHeight-c.clientHeight-dist)}c._chatHasRendered=true;renderPreviewTabs();renderPreviewVisibility()}
+function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
+function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
+function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
+function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
+function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}const nodes=chatEl.querySelectorAll('.msg[data-run-live=\"1\"]');if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const pre=node.querySelector('pre');if(!pre)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));pre.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
+function _chatVirtCollectRows(){const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);const rows=[];for(let i=0;i<feed.length;i++){const r=feed[i]||{};rows.push({...r,_vk:_chatVirtRowKey(r,i)})}const liveThinking=String(S.snap?.live_thinking||'').trim();if(liveThinking){rows.push({role:'assistant',type:'live_thinking',ts:Number(S.snap?.updated_at||Date.now()/1000),text:liveThinking,_vk:`live:${liveThinking.length}:${liveThinking.slice(-24)}`})}const liveTrunc=String(S.snap?.live_truncation_text||'').trim();if(liveTrunc){const active=!!S.snap?.live_truncation_active;const attempts=Number(S.snap?.live_truncation_attempts||0);const tokens=Number(S.snap?.live_truncation_tokens||0);const kind=String(S.snap?.live_truncation_kind||'').trim();const tool=String(S.snap?.live_truncation_tool||'').trim();rows.push({role:'assistant',type:'live_truncation',ts:Number(S.snap?.updated_at||Date.now()/1000),text:liveTrunc,active:active,attempts:attempts,tokens:tokens,kind:kind,tool:tool,_vk:`trunc:${attempts}:${tokens}:${active?1:0}:${kind}:${tool}:${liveTrunc.length}:${liveTrunc.slice(-24)}`})}const runActive=Boolean(S.snap?.running&&S.snap?.live_run_notice_active);if(runActive){const label=String(S.snap?.live_run_notice_label||'model call').trim()||'model call';const startedAt=Number(S.snap?.live_run_notice_started_at||0);const snapElapsed=Number(S.snap?.live_run_notice_elapsed||0);const elapsed=startedAt>0?Math.max(snapElapsed,(Date.now()/1000)-startedAt):snapElapsed;rows.push({role:'assistant',type:'live_run_notice',ts:Number(S.snap?.updated_at||Date.now()/1000),label:label,elapsed:elapsed,startedAt:startedAt,_vk:`run:${label}:${Math.round(startedAt*10)}`})}return rows}
+function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const base=Math.max(72,Math.min(560,80+Math.ceil((txtLen+thinkLen)/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
+function _chatVirtBindPreviewButtons(root){if(!root)return;for(const btn of root.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}}
+function _chatVirtPruneHeightCache(rows){const keys=Object.keys(CHAT_VIRT.heights||{});if(keys.length<=CHAT_VIRT.maxCacheKeys)return;const keep=new Set(rows.map(x=>String(x?._vk||'')));for(const k of keys){if(!keep.has(k)){delete CHAT_VIRT.heights[k]}}}
+function _chatVirtPoolForKind(kind){const key=String(kind||'text');let pool=CHAT_VIRT.poolByKind[key];if(!Array.isArray(pool)){pool=[];CHAT_VIRT.poolByKind[key]=pool}return pool}
+function _chatVirtAcquireNode(kind){const key=String(kind||'text');const pool=_chatVirtPoolForKind(key);const node=pool.pop();if(node){CHAT_VIRT.poolSize=Math.max(0,Number(CHAT_VIRT.poolSize||0)-1);return node}const fresh=document.createElement('div');fresh.setAttribute('data-pool-kind',key);return fresh}
+function _chatVirtReleaseNode(node){
+  if(!node)return;
+  const key=String(node.getAttribute('data-pool-kind')||'text');
+  if(Number(CHAT_VIRT.poolSize||0)>=Number(CHAT_VIRT.poolMax||420))return;
+  node.innerHTML='';
+  node.className='msg';
+  node.removeAttribute('data-vk');
+  node.removeAttribute('data-math-key');
+  node.removeAttribute('data-math-request');
+  node.removeAttribute('style');
+  node._mathPending=false;
+  const pool=_chatVirtPoolForKind(key);
+  pool.push(node);
+  CHAT_VIRT.poolSize=Number(CHAT_VIRT.poolSize||0)+1;
+}
+function _chatVirtReleaseRendered(root){if(!root)return;for(const node of root.querySelectorAll('.msg[data-vk]')){_chatVirtReleaseNode(node)}}
+function _chatVirtBuildMessageNode(m){
+  let kind='assistant_text';
+  if(m.type==='file_patch'&&m.data)kind='file_patch';
+  else if(m.type==='upload'&&m.data)kind='upload';
+  else if(m.type==='command'&&m.data)kind='command';
+  else if(m.type==='live_thinking')kind='live_thinking';
+  else if(m.type==='live_truncation')kind='live_truncation';
+  else if(m.type==='live_run_notice')kind='live_run_notice';
+  else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
+  else kind='plain_text';
+  const d=_chatVirtAcquireNode(kind);
+  d.setAttribute('data-pool-kind',kind);
+  d.removeAttribute('data-math-request');
+  d.removeAttribute('data-run-live');
+  d.removeAttribute('data-run-label');
+  d.removeAttribute('data-run-start');
+  d.removeAttribute('data-run-elapsed');
+  d.removeAttribute('data-run-anchor');
+  d.removeAttribute('data-run-last-sec');
+  d.className='msg '+(m.role==='user'?'user':m.role==='assistant'?'assistant':'system');
+  if(m.type==='file_patch'&&m.data){
+    const p=m.data;
+    const loc=p.session_rel_path||p.path||'';
+    const root=p.session_root||'';
+    const preview=previewButtonHtml(loc);
+    d.innerHTML=`<div class=\"msg-system-head\">file_patch · ${esc(loc)} (+${esc(p.added??0)} / -${esc(p.deleted??0)})</div><div class=\"msg-system-meta\">${esc(t('rel_path'))}: ${esc(loc)}\\nsession: ${esc(root)}</div>${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div>`;
+    return d;
+  }
+  if(m.type==='upload'&&m.data){
+    const u=m.data;
+    const upath=u.workspace_path||'';
+    const preview=previewButtonHtml(upath);
+    d.innerHTML=`<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">path: ${esc(upath)} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    return d;
+  }
+  if(m.type==='command'&&m.data){
+    const x=m.data;
+    d.innerHTML=`<div class=\"msg-system-head\">command · ${esc(x.name||'command')} · exit=${esc(x.exit_code??'-')}</div><div class=\"msg-system-meta\">$ ${esc(x.command||'')}\\ncwd: ${esc(x.cwd||'')}</div><pre class=\"msg-code-shell\">${esc(x.output||'')}</pre>`;
+    return d;
+  }
+  if(m.type==='live_thinking'){
+    d.innerHTML=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
+    d.setAttribute('data-math-request',`${String(m._vk||'')}:live-thinking`);
+    return d;
+  }
+  if(m.type==='live_truncation'){
+    const lang=String(S.snap?.ui_language||'').toLowerCase();
+    const active=!!m.active;
+    const attempts=Number(m.attempts||0);
+    const tk=Number(m.tokens||0);
+    const kindTxt=String(m.kind||'').trim();
+    const toolTxt=String(m.tool||'').trim();
+    const extra=[];if(kindTxt)extra.push('kind='+kindTxt);if(toolTxt)extra.push('tool='+toolTxt);
+    const extraTxt=extra.length?(' · '+extra.map(x=>esc(x)).join(' · ')):'';
+    const label=lang.startsWith('zh')?'截断恢复':(lang.startsWith('ja')?'切り詰め復旧':'Truncation Recovery');
+    const stateTxt=lang.startsWith('zh')?(active?'进行中':'已完成'):(lang.startsWith('ja')?(active?'進行中':'完了'):(active?'active':'done'));
+    const key=`${m._vk}:live-trunc`;
+    d.innerHTML=`<div class=\"msg-system-head\">${esc(label)} · ${esc(stateTxt)} · passes=${esc(attempts)} · tokens≈${esc(tk)}${extraTxt}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div>`;
+    d.setAttribute('data-math-request',key);
+    return d;
+  }
+  if(m.type==='live_run_notice'){
+    const label=String(m.label||'model call');
+    const elapsedNow=Math.max(0,Number(m.elapsed||0));
+    const startedAt=Number(m.startedAt||0);
+    d.setAttribute('data-run-live','1');
+    d.setAttribute('data-run-label',label);
+    if(startedAt>0)d.setAttribute('data-run-start',String(startedAt));
+    d.setAttribute('data-run-elapsed',String(elapsedNow));
+    d.setAttribute('data-run-anchor',String(Date.now()/1000));
+    d.setAttribute('data-run-last-sec',String(Math.floor(elapsedNow)));
+    d.innerHTML=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(label)}</div><pre>${esc(_chatVirtLiveRunText(label,elapsedNow))}</pre></div>`;
+    return d;
+  }
+  if(m.role==='assistant'&&m.thinking){
+    const key=`${m._vk}:assistant-thinking`;
+    d.innerHTML=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;
+    d.setAttribute('data-math-request',key);
+    return d;
+  }
+  const textKey=`${m._vk}:text`;
+  d.innerHTML=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',textKey)}</div>`;
+  if(m.role==='assistant'||m.role==='user'){
+    d.setAttribute('data-math-request',textKey);
+  }
+  return d;
+}
+function _chatVirtFindWindow(rows,top,bottom){const startTarget=Math.max(0,top-CHAT_VIRT.overscanPx);const endTarget=Math.max(0,bottom+CHAT_VIRT.overscanPx);let start=0;let acc=0;while(start<rows.length){const h=_chatVirtEstimatedHeight(rows[start]);if((acc+h)>=startTarget)break;acc+=h;start+=1}let end=start;let accEnd=acc;while(end<rows.length&&accEnd<=endTarget){accEnd+=_chatVirtEstimatedHeight(rows[end]);end+=1}end=Math.min(rows.length,end+2);return {start,end,topOffset:acc,endOffset:accEnd}}
+function _chatVirtBindScroll(chatEl){
+  if(chatEl._virtBound)return;
+  chatEl._virtBound=true;
+  const markManual=(lockMs=CHAT_SCROLL_LOCK_MS)=>{
+    const now=Date.now();
+    chatEl._virtUserScrollTs=now;
+    chatEl._virtManualUnlockTs=Math.max(
+      Number(chatEl._virtManualUnlockTs||0),
+      now+Math.max(120,Number(lockMs)||CHAT_SCROLL_LOCK_MS)
+    );
+  };
+  const scheduleScrollRender=()=>{
+    if(chatEl._virtRendering)return;
+    const now=Date.now();
+    const lastTs=Number(chatEl._virtLastScrollRenderTs||0);
+    const dt=now-lastTs;
+    const wait=Math.max(0,CHAT_SCROLL_RENDER_THROTTLE_MS-dt);
+    if(wait>0){
+      if(chatEl._virtScrollRenderTimer)return;
+      chatEl._virtScrollRenderTimer=setTimeout(()=>{
+        chatEl._virtScrollRenderTimer=0;
+        if(chatEl._virtRaf)return;
+        chatEl._virtRaf=requestAnimationFrame(()=>{
+          chatEl._virtRaf=0;
+          chatEl._virtLastScrollRenderTs=Date.now();
+          renderChat('scroll');
+        });
+      },wait);
+      return;
+    }
+    if(chatEl._virtRaf)return;
+    chatEl._virtRaf=requestAnimationFrame(()=>{
+      chatEl._virtRaf=0;
+      chatEl._virtLastScrollRenderTs=Date.now();
+      renderChat('scroll');
+    });
+  };
+  chatEl.addEventListener('wheel',ev=>{
+    const dy=Number(ev?.deltaY||0);
+    if(!dy)return;
+    const now=Date.now();
+    chatEl._virtLastWheelTs=now;
+    chatEl._virtLastWheelDy=dy;
+    const atBottomBefore=nearBottom(chatEl,6);
+    if(dy<0){
+      markManual(CHAT_SCROLL_LOCK_MS);
+      S.follow.chat=false;
+      return;
+    }
+    if(!atBottomBefore){
+      markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.45));
+      S.follow.chat=false;
+      return;
+    }
+    S.follow.chat=true;
+    chatEl._virtManualUnlockTs=0;
+  },{passive:true});
+  chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.7))},{passive:true});
+  chatEl.addEventListener('touchstart',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.7))},{passive:true});
+  chatEl.addEventListener('scroll',()=>{
+    const now=Date.now();
+    chatEl._virtUserScrollTs=now;
+    chatEl._virtLastScrollTs=now;
+    chatEl._virtLastScrollTop=Number(chatEl.scrollTop||0);
+    const atBottom=nearBottom(chatEl,6);
+    const manualLock=Number(chatEl._virtManualUnlockTs||0)>now;
+    const recentUpIntent=(now-Number(chatEl._virtLastWheelTs||0))<220&&Number(chatEl._virtLastWheelDy||0)<0;
+    if(atBottom&&!manualLock&&!recentUpIntent){
+      S.follow.chat=true;
+      chatEl._virtManualUnlockTs=0;
+    }else{
+      S.follow.chat=false;
+      if(!atBottom||recentUpIntent){
+        chatEl._virtManualUnlockTs=Math.max(Number(chatEl._virtManualUnlockTs||0),now+CHAT_SCROLL_LOCK_MS);
+      }
+    }
+    scheduleScrollRender();
+  });
+}
+function renderChat(reason='snapshot'){
+  const c=E('chat');
+  if(!c)return;
+  _chatVirtBindScroll(c);
+  if(reason!=='scroll'){
+    if(c._virtScrollRenderTimer){clearTimeout(c._virtScrollRenderTimer);c._virtScrollRenderTimer=0;}
+    if(c._virtRaf){cancelAnimationFrame(c._virtRaf);c._virtRaf=0;}
+  }
+  const first=!c._chatHasRendered;
+  const atBottomNow=nearBottom(c,6);
+  const manualLock=Number(c._virtManualUnlockTs||0)>Date.now();
+  const keep=first||(!manualLock&&(atBottomNow||Boolean(S.follow.chat)));
+  const dist=c.scrollHeight-c.scrollTop-c.clientHeight;
+  const feedSig=String(S.lastFeedSig||feedSignature(S.snap||{}));
+  let rows=[];
+  if(reason==='scroll'&&Array.isArray(c._virtRowsCacheRows)&&String(c._virtRowsCacheSig||'')===feedSig){
+    rows=c._virtRowsCacheRows;
+  }else{
+    rows=_chatVirtCollectRows();
+    c._virtRowsCacheSig=feedSig;
+    c._virtRowsCacheRows=rows;
+  }
+  _chatVirtPruneHeightCache(rows);
+  const top=Math.max(0,c.scrollTop);
+  const bottom=top+Math.max(0,c.clientHeight||0);
+  const win=_chatVirtFindWindow(rows,top,bottom);
+  const totalKey=`${feedSig}|hv=${Number(CHAT_VIRT.heightVersion||0)}|rows=${rows.length}`;
+  let totalEstimated=0;
+  if(reason==='scroll'&&String(c._virtTotalKey||'')===totalKey){
+    totalEstimated=Number(c._virtTotalEstimated||0);
+  }else{
+    for(let i=0;i<rows.length;i++){totalEstimated+=_chatVirtEstimatedHeight(rows[i])}
+    c._virtTotalKey=totalKey;
+    c._virtTotalEstimated=totalEstimated;
+  }
+  const firstKey=String(rows[win.start]?._vk||'');
+  const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
+  const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
+  if(reason==='scroll'&&c._virtRangeKey===rangeKey){
+    return;
+  }
+  c._virtRangeKey=rangeKey;
+  const frag=document.createDocumentFragment();
+  const topGap=document.createElement('div');
+  topGap.style.height=`${Math.max(0,Math.floor(win.topOffset))}px`;
+  topGap.style.pointerEvents='none';
+  topGap.style.flex='0 0 auto';
+  frag.appendChild(topGap);
+  const rendered=[];
+  for(let i=win.start;i<win.end;i++){
+    const row=rows[i];
+    const node=_chatVirtBuildMessageNode(row);
+    node.setAttribute('data-vk',String(row._vk||''));
+    rendered.push(node);
+    frag.appendChild(node);
+  }
+  const bottomGap=document.createElement('div');
+  bottomGap.style.height=`${Math.max(0,Math.floor(totalEstimated-win.endOffset))}px`;
+  bottomGap.style.pointerEvents='none';
+  bottomGap.style.flex='0 0 auto';
+  frag.appendChild(bottomGap);
+  c._virtRendering=true;
+  _chatVirtReleaseRendered(c);
+  c.innerHTML='';
+  c.appendChild(frag);
+  _chatVirtBindPreviewButtons(c);
+  if(reason!=='scroll'){
+    for(const node of rendered){
+      const req=String(node.getAttribute('data-math-request')||'').trim();
+      if(req)_mathTypeset(node,`chat:${req}`);
+    }
+  }
+  let measuredSum=0;
+  let measuredCount=0;
+  let hasHeightChange=false;
+  if(reason!=='scroll'){
+    for(const node of rendered){
+      const key=String(node.getAttribute('data-vk')||'');
+      if(!key)continue;
+      const h=Math.max(48,Math.ceil(node.getBoundingClientRect().height||node.offsetHeight||0));
+      if(!h)continue;
+      measuredSum+=h;
+      measuredCount+=1;
+      const prev=Number(CHAT_VIRT.heights[key]||0);
+      if(!prev||Math.abs(prev-h)>=3){
+        CHAT_VIRT.heights[key]=h;
+        hasHeightChange=true;
+      }
+    }
+    if(measuredCount>0){
+      const avgNow=Math.round(measuredSum/measuredCount);
+      CHAT_VIRT.avgHeight=Math.max(72,Math.min(420,Math.round((CHAT_VIRT.avgHeight*4+avgNow)/5)));
+    }
+    if(hasHeightChange){
+      CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
+    }
+  }
+  if(reason!=='scroll'){
+    if(keep){
+      c.scrollTop=c.scrollHeight;
+    }else{
+      c.scrollTop=Math.max(0,c.scrollHeight-c.clientHeight-dist);
+    }
+  }
+  c._chatHasRendered=true;
+  c._virtRendering=false;
+  if(hasHeightChange&&reason!=='scroll'){
+    if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
+    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
+  }
+  if(reason!=='scroll'){
+    renderPreviewTabs();
+    renderPreviewVisibility();
+  }
+  _chatVirtSyncRunTicker(c);
+}
+function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
+async function uploadFiles(fileList){if(!S.activeId||!fileList||!fileList.length)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();for(const file of Array.from(fileList)){if(file.size>20*1024*1024){showError(`${t('file_too_large')}: ${file.name} (>20MB)`);continue}const arr=await file.arrayBuffer();const payload={filename:file.name,mime:file.type||'',content_b64:ab2b64(arr)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)})}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
+function statusClass(status){return `st-${normalizeStatus(status)}`}
+function statusLabel(status){const s=normalizeStatus(status);if(s==='in_progress')return t('status_in_progress');if(s==='completed')return t('status_completed');if(s==='blocked')return t('status_blocked');if(s==='deleted')return t('status_deleted');return t('status_pending')}
+function cleanWorkText(text,status=''){let s=String(text??'').replace(/\\s+/g,' ').trim();if(!s)return '';s=s.replace(/^\\[[ x>\\-]\\]\\s*/i,'');s=s.replace(/^(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*[·:\\-\\]]\\s*/i,'');if(status){const st=String(status).replace('_','[_\\\\-\\\\s]?');s=s.replace(new RegExp(`\\\\s*[—-]\\\\s*${st}\\\\s*$`,'i'),'')}s=s.replace(/\\s*[—-]\\s*(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*$/i,'');return s.trim()||String(text??'').trim()}
+function formatTs(ts){const v=Number(ts||0);if(!v)return '';try{return new Date(v*1000).toLocaleString()}catch(_){return ''}}
+function renderTodoBoard(items){const todos=Array.isArray(items)?items:[];if(!todos.length)return `<div class=\"mono\">${esc(t('no_todos'))}</div>`;const done=todos.filter(t=>normalizeStatus(t?.status)==='completed').length;const open=todos.length-done;const cards=todos.map((t,idx)=>{const status=normalizeStatus(t?.status);const content=cleanWorkText(t?.content,status)||'(empty todo)';const active=String(t?.activeForm||'').trim();const meta=status==='in_progress'&&active?`<div class=\"todo-meta\">${esc(cleanWorkText(active,status))}</div>`:'';return `<div class=\"todo-item ${statusClass(status)}\"><div class=\"todo-head\"><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span><span class=\"mono todo-index\">#${idx+1}</span></div><div class=\"todo-content\">${esc(content)}</div>${meta}</div>`}).join('');return `<div class=\"board-summary\"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div><div class=\"todo-list\">${cards}</div>`}
+function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
+renderCtxLive(S.snap);
+_renderBridgeSyncFromSnapshot(S.snap||{});
+setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]));
+setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
+setPanelHtml('activity',(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)).map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`);
+const ops=S.snap?.operations||[];
+const cmds=ops.filter(x=>x.type==='command').slice(-30).reverse();
+setPanelHtml('commands',cmds.map(e=>`<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(e.data.name||'command')} · exit=${esc(e.data.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(e.data.command||'')}<br>${esc(e.data.cwd||'')}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+const diffs=ops.filter(x=>x.type==='file_patch').slice(-20).reverse();
+setPanelHtml('diffs',diffs.map(e=>`<div class=\"diff-item\"><div class=\"diff-head\">${esc(e.data.path)} (+${esc(e.data.added)} / -${esc(e.data.deleted)})</div><div class=\"cmd-sub\">${esc(e.data.session_rel_path||e.data.path||'')}<br>${esc(e.data.session_root||'')}</div><div class=\"diff-body\">${diffHtml(e.data.diff_numbered||e.data.diff)}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_diffs'))}</div>`);
+const protocols=(S.protocols||[]).map(x=>`<div><span class=\"tag\">protocol</span>${esc(x.protocol)} · providers=${esc(x.active_providers)} · skills=${esc(x.active_skills)}</div>`).join('');
+const providers=(S.providers||[]).map(x=>`<div><span class=\"tag\">provider</span>${esc(x.provider_id)} · ${esc(x.protocol)} · skills=${esc(x.skill_count)}</div>`).join('');
+const skills=(S.skills||[]).filter(x=>x.id!=='_warnings').map(x=>`<div><span class=\"tag\">skill</span>${esc(x.qualified_name||x.name)} - ${esc(x.description||'')}</div>`).join('');
+const tools=(S.tools||[]).slice(0,16).map(x=>`<div><span class=\"tag\">tool</span>${esc(x.name)}</div>`).join('');
+setPanelHtml('catalog',protocols+providers+skills+tools||`<div class=\"mono\">${esc(t('no_catalog'))}</div>`);
+const uploads=(S.snap?.uploads||[]).slice(-8).reverse();
+E('uploadList').innerHTML=uploads.map(u=>`<div>${esc(u.filename)} → ${esc(u.workspace_path||'')} (${esc(u.kind||'')}, ${esc(u.size||0)}B)</div>`).join('')||`<div>${esc(t('no_uploads'))}</div>`;
+const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';
+const dl1=E('downloadSessionBtn');
+if(S.activeId){dl1.classList.remove('disabled');dl1.href=sessionZip}else{dl1.classList.add('disabled');dl1.href='#'}
+renderSkillsEntryLink()}
+function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection)}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;return{options,models,selected,thinking}}
+function _modelNameFromSelection(selection){const raw=String(selection||'').trim();if(!raw)return'';if(raw.includes('::')){const parts=raw.split('::',2);return String(parts[1]||parts[0]||'').trim()}return raw}
+function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;renderModelControls();return true}
+function renderModelControls(){const sel=E('modelSelect');if(!sel)return;sel.innerHTML='';const opts=S.modelOptions||[];if(opts.length){for(const it of opts){const op=document.createElement('option');op.value=it.selection;op.textContent=it.label||it.selection;sel.appendChild(op)}}else{const models=S.models||[];if(!models.length&&S.config?.model){const op=document.createElement('option');op.value=S.config.model;op.textContent=S.config.model;sel.appendChild(op)}for(const m of models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(S.config?.model){sel.value=S.config.model;if(sel.value!==S.config.model){const op=document.createElement('option');op.value=S.config.model;op.textContent=S.config.model;sel.appendChild(op);sel.value=S.config.model}}}
+async function refreshSessions(){const rows=await api('/api/sessions');S.sessions=rows;const sig=sessionsSignature(rows);if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions();renderStats()}if(!S.activeId&&rows.length)await selectSession(rows[0].id)}
+function _chatVirtIsUserScrolling(chatEl){
+  if(!chatEl)return false;
+  const now=Date.now();
+  const manualLock=Number(chatEl._virtManualUnlockTs||0)>now;
+  const lastScrollTs=Math.max(Number(chatEl._virtLastScrollTs||0),Number(chatEl._virtUserScrollTs||0));
+  const activeScroll=lastScrollTs>0&&(now-lastScrollTs)<CHAT_SCROLL_SETTLE_MS;
+  const recentInput=Number(chatEl._virtLastWheelTs||0)>0&&(now-Number(chatEl._virtLastWheelTs||0))<CHAT_SCROLL_ACTIVE_MS;
+  return manualLock||activeScroll||recentInput;
+}
+function _chatVirtDebounceWhileScrolling(chatEl,timerField,fn,delayMs=CHAT_SCROLL_SYNC_DEBOUNCE_MS){
+  if(!chatEl||typeof fn!=='function'){if(typeof fn==='function')fn();return;}
+  const delay=Math.max(60,Number(delayMs)||CHAT_SCROLL_SYNC_DEBOUNCE_MS);
+  const probeTopField=`${timerField}_probeTop`;
+  const probeTsField=`${timerField}_probeTs`;
+  if(chatEl[timerField]){
+    clearTimeout(chatEl[timerField]);
+    chatEl[timerField]=0;
+  }
+  const run=()=>{
+    if(_chatVirtIsUserScrolling(chatEl)){
+      chatEl[probeTopField]=NaN;
+      chatEl[probeTsField]=0;
+      chatEl[timerField]=setTimeout(run,delay);
+      return;
+    }
+    const now=Date.now();
+    const top=Number(chatEl.scrollTop||0);
+    const prevTop=Number(chatEl[probeTopField]);
+    const prevTs=Number(chatEl[probeTsField]||0);
+    if(!Number.isFinite(prevTop)||Math.abs(top-prevTop)>CHAT_SCROLL_SETTLE_EPS_PX){
+      chatEl[probeTopField]=top;
+      chatEl[probeTsField]=now;
+      chatEl[timerField]=setTimeout(run,Math.max(80,delay));
+      return;
+    }
+    if((now-prevTs)<CHAT_SCROLL_SETTLE_MS){
+      chatEl[timerField]=setTimeout(run,Math.max(80,delay));
+      return;
+    }
+    chatEl[timerField]=0;
+    chatEl[probeTopField]=NaN;
+    chatEl[probeTsField]=0;
+    fn();
+  };
+  chatEl[timerField]=setTimeout(run,delay);
+}
+async function refreshSnapshot(opt={}){
+  const forceFull=!!opt.forceFull;
+  const allowWhenFrozen=!!opt.allowWhenFrozen;
+  if(!S.activeId)return;
+  if(S.staticMode&&S.frozen&&!allowWhenFrozen&&!forceFull)return;
+  if(S.refreshInFlight){
+    S.pendingSnapshot=true;
+    S.pendingFullSnapshot=!!(S.pendingFullSnapshot||forceFull);
+    return;
+  }
+  S.refreshInFlight=true;
+  try{
+    ensurePreviewState(S.activeId);
+    const q=forceFull?'?lite=0':'?lite=1';
+    S.snap=await api('/api/sessions/'+S.activeId+q);
+    const cat=S.snap?.llm_model_catalog;
+    const hasCat=!!(
+      cat&&(
+        (Array.isArray(cat.options)&&cat.options.length>0)||
+        (Array.isArray(cat.models)&&cat.models.length>0)||
+        String(cat.selected||'').trim()
+      )
+    );
+    if(hasCat){
+      applyModelCatalog(cat);
+    }else if(S.snap?.model&&!String(S.config?.model||'').trim()){
+      S.config=S.config||{};
+      S.config.model=String(S.snap.model||'').trim();
+      renderModelControls();
+    }
+    if(S.snap?.ui_language){
+      S.config=S.config||{};
+      S.config.language=S.snap.ui_language;
+      renderLanguageControls();
+      applyMainI18n();
+    }
+    const chatEl=E('chat');
+    const scrolling=_chatVirtIsUserScrolling(chatEl);
+    const feedSig=feedSignature(S.snap);
+    if(forceFull||feedSig!==S.lastFeedSig){
+      S.lastFeedSig=feedSig;
+      if(scrolling&&chatEl){
+        _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('snapshot'));
+      }else{
+        if(chatEl&&chatEl._virtScrollSyncTimer){
+          clearTimeout(chatEl._virtScrollSyncTimer);
+          chatEl._virtScrollSyncTimer=0;
+          chatEl._virtScrollSyncTimer_probeTop=NaN;
+          chatEl._virtScrollSyncTimer_probeTs=0;
+        }
+        renderChat();
+      }
+    }
+    const boardSig=boardsSignature(S.snap);
+    if(forceFull||boardSig!==S.lastBoardsSig){
+      S.lastBoardsSig=boardSig;
+      if(scrolling&&chatEl){
+        _chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);
+      }else{
+        if(chatEl&&chatEl._virtBoardsSyncTimer){
+          clearTimeout(chatEl._virtBoardsSyncTimer);
+          chatEl._virtBoardsSyncTimer=0;
+          chatEl._virtBoardsSyncTimer_probeTop=NaN;
+          chatEl._virtBoardsSyncTimer_probeTs=0;
+        }
+        renderBoards();
+      }
+    }
+    renderActivePreview(false);
+    S.bootRendered=true;
+    if(shouldFreezeAfterRender()){
+      freezeAutoUpdates();
+    }else if(S.staticMode&&S.snap?.running&&S.frozen){
+      resumeAutoUpdates();
+    }
+  }finally{
+    S.refreshInFlight=false;
+    if(S.pendingSnapshot){
+      const nextFull=!!S.pendingFullSnapshot;
+      S.pendingSnapshot=false;
+      S.pendingFullSnapshot=false;
+      scheduleSnapshot({forceFull:nextFull,allowWhenFrozen:allowWhenFrozen,delayMs:Math.max(80,Math.round(snapshotDelayMs()/2))});
+    }
+  }
+}
+function scheduleSnapshot(opt={}){if(!S.activeId)return;const forceFull=!!opt.forceFull;const allowWhenFrozen=!!opt.allowWhenFrozen;if(S.staticMode&&S.frozen&&!allowWhenFrozen&&!forceFull)return;if(forceFull)S.scheduledFullSnapshot=true;if(S.refreshTimer)return;const d=Number(opt.delayMs);const delay=(Number.isFinite(d)&&d>=0)?d:snapshotDelayMs();S.refreshTimer=setTimeout(async()=>{S.refreshTimer=null;const runFull=!!S.scheduledFullSnapshot;S.scheduledFullSnapshot=false;try{await refreshSnapshot({forceFull:runFull,allowWhenFrozen:allowWhenFrozen})}catch(_){}},delay)}
+function scheduleSessionPoll(reset=false){if(S.staticMode&&S.frozen)return;if(reset&&S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.sessionPollTimer)return;S.sessionPollTimer=setTimeout(async()=>{S.sessionPollTimer=null;if(S.staticMode&&S.frozen)return;try{await refreshSessions()}catch(_){}finally{scheduleSessionPoll(false)}},sessionPollDelayMs())}
+function bindEvents(id){if(S.es)S.es.close();S.esId=String(id||'');if(S.staticMode&&S.frozen){S.es=null;return}S.es=new EventSource('/api/sessions/'+id+'/events');const es=S.es;es.onopen=()=>{pullRenderState(id,true);scheduleSnapshot({forceFull:false,delayMs:40})};es.onmessage=(ev)=>{try{const row=JSON.parse(ev.data);onRuntimeEvent(row);const typ=String(row?.type||'');if(isRenderRuntimeEventType(typ))return;const hidden=(document.visibilityState==='hidden');if(hidden&&!S.snap?.running)return;scheduleSnapshot({forceFull:false})}catch(_){const hidden=(document.visibilityState==='hidden');if(hidden&&!S.snap?.running)return;scheduleSnapshot({forceFull:false})}};es.onerror=()=>{const hidden=(document.visibilityState==='hidden');if(!(hidden&&!S.snap?.running)){scheduleSnapshot({forceFull:false,delayMs:Math.max(300,snapshotDelayMs())})}if(es.readyState===2){setTimeout(()=>{if(S.esId===String(id||'')&&(!S.staticMode||!S.frozen))bindEvents(id)},1000)}}}
+async function loadModelCatalog(forceRefresh=false){const q=forceRefresh?'?refresh=1':'';if(S.activeId){return await api('/api/sessions/'+S.activeId+'/models'+q)}return await api('/api/models'+q)}
+async function selectSession(id){S.activeId=id;S.frozen=false;applyStaticUiClass();renderSessions();ensurePreviewState(id);bindEvents(id);pullRenderState(id,true);await refreshSnapshot({forceFull:true,allowWhenFrozen:true});renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);showError('')}
+async function createSession(){showError('');const title=prompt(t('session_title_prompt'),t('web_session'));const out=await api('/api/sessions',{method:'POST',body:JSON.stringify({title:title||t('web_session')})});await refreshSessions();await selectSession(out.id)}
+async function renameSession(){if(!S.activeId){showError(t('select_session_first'));return}const old=S.sessions.find(x=>x.id===S.activeId)?.title||t('session_default');const s=prompt(t('rename_session_prompt'),old);if(!s)return;await api('/api/sessions/'+S.activeId,{method:'PATCH',body:JSON.stringify({title:s})});await refreshSessions();await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
+async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
+async function importDefaultConfig(){try{if(!S.activeId){showError(t('select_session_first'));return}const ci=E('configInput');if(ci)ci.click()}catch(err){showError(err.message||String(err))}}
+async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
+async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});refreshSessions().catch(()=>{});scheduleSnapshot({forceFull:false,delayMs:60,allowWhenFrozen:true})}catch(err){showError(err.message)}}
+async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});refreshSessions().catch(()=>{});scheduleSnapshot({forceFull:false,allowWhenFrozen:true})}
+async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});refreshSessions().catch(()=>{});scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);scheduleSnapshot({forceFull:false,allowWhenFrozen:true})}
+async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=()=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+PANEL_SCROLL_ACTIVE_MS)};el.addEventListener('wheel',mark,{passive:true});el.addEventListener('touchstart',mark,{passive:true});el.addEventListener('mousedown',mark,{passive:true});el.addEventListener('scroll',mark,{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+"""
+
+APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
+type Msg={role:string;text:string;thinking?:string};
+type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
+type Snapshot={id:string;title:string;running:boolean;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
+type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
+type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
+type SkillProtocol={protocol:string;version:string;active_providers:number;active_skills:number;description:string};
+type ToolMeta={name:string;description:string;parameters:Record<string,unknown>};
+type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean};
+type ModelCatalog={provider:string;models:string[];selected:string;thinking:boolean;thinking_mode?:string;note?:string;options?:ModelOption[]};
+async function api<T>(path:string,opt:RequestInit={}):Promise<T>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw new Error(await r.text());return await r.json() as T}
+export const loadSessions=()=>api<SessionSummary[]>('/api/sessions');
+export const loadSnapshot=(id:string)=>api<Snapshot>(`/api/sessions/${id}`);
+export const loadSessionModels=(id:string)=>api<ModelCatalog>(`/api/sessions/${id}/models`);
+export const uploadSessionFile=(id:string,filename:string,mime:string,content_b64:string)=>api<UploadMeta>(`/api/sessions/${id}/uploads`,{method:'POST',body:JSON.stringify({filename,mime,content_b64})});
+export const loadSkills=()=>api<SkillMeta[]>('/api/skills');
+export const loadSkillProviders=()=>api<SkillProvider[]>('/api/skills/providers');
+export const loadSkillProtocols=()=>api<SkillProtocol[]>('/api/skills/protocols');
+export const loadSkillProtocolExamples=()=>api<Record<string,unknown>>('/api/skills/protocol-examples');
+export const loadTools=()=>api<ToolMeta[]>('/api/tools');
+export const loadModels=()=>api<ModelCatalog>('/api/models');
+export const setModel=(model:string)=>api<ModelCatalog>('/api/config/model',{method:'POST',body:JSON.stringify({selection:model,model})});
+export const setSessionModel=(id:string,selection:string)=>api<ModelCatalog>(`/api/sessions/${id}/config/model`,{method:'POST',body:JSON.stringify({selection})});
+export const importDefaultLlmConfig=(id:string)=>api<{ok:boolean;catalog:ModelCatalog;source:string}>(`/api/sessions/${id}/config/import-default`,{method:'POST'});
+export const createSession=(title:string)=>api<{id:string;title:string}>('/api/sessions',{method:'POST',body:JSON.stringify({title})});
+export const renameSession=(id:string,title:string)=>api<{id:string;title:string}>(`/api/sessions/${id}`,{method:'PATCH',body:JSON.stringify({title})});
+export const deleteSession=(id:string)=>api<{ok:boolean}>(`/api/sessions/${id}`,{method:'DELETE'});
+"""
+
+SKILLS_INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fona Skills Studio</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div class="bg-layer"></div>
+<div class="app skills-app">
+<header>
+  <div>
+    <h1>Fona Skills Studio</h1>
+    <p>基于现有 WebUI 风格的图形化 Skills 制作平台</p>
+    <p>Flowchart → LLM 解析 → SKILL.md 注入 ./skills</p>
+  </div>
+  <div class="actions">
+    <select id="skillsLangSelect"></select>
+    <select id="modelSelect"></select>
+    <button id="applyModelBtn" class="subtle">Apply Model</button>
+    <button id="refreshBtn" class="subtle">Refresh</button>
+    <a id="agentLink" href="#" target="_blank" rel="noreferrer">Open Agent UI</a>
+  </div>
+</header>
+<div class="status-cards" id="topStats"></div>
+<main class="skills-main">
+  <aside class="panel skills-panel-left">
+    <div class="panel-title">Rules & Knowledge</div>
+    <div class="row">
+      <button id="analyzeBtn">Analyze agents/docs</button>
+      <button id="scanBtn" class="subtle">Scan Skills</button>
+    </div>
+    <div id="rulesSummary" class="mono block-scroll compact-block"></div>
+    <h3>Rules</h3>
+    <div id="rulesList" class="block-scroll grow-block"></div>
+    <h3>Sources</h3>
+    <div id="sourceList" class="block-scroll grow-block"></div>
+  </aside>
+  <section class="panel skills-panel-center">
+    <div class="panel-title">Flow Builder</div>
+    <div class="row compact flow-tabs">
+      <button id="flowTabNodeBtn" class="subtle active">Node</button>
+      <button id="flowTabLinkBtn" class="subtle">Manual Link</button>
+    </div>
+    <div id="flowPanelNode" class="flow-panel active">
+      <div class="row compact">
+        <input id="nodeTitle" placeholder="Node title">
+        <select id="nodeType">
+          <option value="goal">goal</option>
+          <option value="input">input</option>
+          <option value="process">process</option>
+          <option value="check">check</option>
+          <option value="output">output</option>
+        </select>
+        <button id="addNodeBtn">Add Node</button>
+      </div>
+      <textarea id="nodeContent" class="node-content" placeholder="Node content..."></textarea>
+    </div>
+    <div id="flowPanelLink" class="flow-panel">
+      <div class="row compact">
+        <select id="edgeFrom"></select>
+        <select id="edgeFromSide">
+          <option value="">from:auto</option>
+          <option value="top">from:top</option>
+          <option value="right">from:right</option>
+          <option value="bottom">from:bottom</option>
+          <option value="left">from:left</option>
+        </select>
+        <select id="edgeTo"></select>
+        <select id="edgeToSide">
+          <option value="">to:auto</option>
+          <option value="top">to:top</option>
+          <option value="right">to:right</option>
+          <option value="bottom">to:bottom</option>
+          <option value="left">to:left</option>
+        </select>
+        <input id="edgeLabel" placeholder="edge label">
+        <button id="addEdgeBtn" class="subtle">Connect</button>
+        <button id="removeNodeBtn" class="subtle danger">Delete Node</button>
+      </div>
+      <div class="row compact edge-meta-row">
+        <label class="inline-check">
+          <input id="edgeBidirectional" type="checkbox">
+          Bidirectional
+        </label>
+        <input id="edgeReturnN" type="number" min="1" step="1" value="1" placeholder="return n">
+        <span class="mono edge-tip">Drag ports + hold Shift => bidirectional (n)</span>
+      </div>
+    </div>
+    <div class="flow-stage">
+      <div id="flowZoomPill" class="flow-zoom-pill">
+        <button id="flowZoomOutBtn" class="subtle" title="Zoom out">-</button>
+        <span id="flowZoomText" class="mono">100%</span>
+        <button id="flowZoomInBtn" class="subtle" title="Zoom in">+</button>
+      </div>
+      <div id="flowWrap" class="flow-wrap">
+        <svg id="flowSvg"></svg>
+        <div id="flowCanvas"></div>
+      </div>
+      <div id="flowHelpOverlay" class="flow-wrap-help">
+        <div class="t">Canvas Tips</div>
+        <div>1. 拖拽节点移动位置</div>
+        <div>2. 从节点四边圆点拖拽连线</div>
+        <div>3. 按住 Shift 拖拽 => 双向链路</div>
+        <div>4. 双击连线附近 => 删除连线</div>
+        <div>5. 右上角 +/- 或滚轮/捏合 => 缩放</div>
+      </div>
+    </div>
+    <div class="row">
+      <button id="resetFlowBtn" class="subtle">Reset Flow</button>
+      <button id="exportFlowBtn" class="subtle">Export Flow JSON</button>
+      <button id="importFlowBtn" class="subtle">Import Flow JSON</button>
+    </div>
+    <textarea id="flowJson" class="mono flow-json" placeholder="Flow JSON..."></textarea>
+  </section>
+  <aside class="panel skills-panel-right">
+    <div class="panel-title">Skill Draft & Publish</div>
+    <input id="skillName" placeholder="skill name (e.g. web-api-review)">
+    <input id="skillPath" placeholder="skill path (e.g. generated/web-api-review)">
+    <input id="skillDesc" placeholder="short description">
+    <textarea id="requirements" class="req-box" placeholder="extra requirements..."></textarea>
+    <div class="row">
+      <button id="generateBtn">Generate + Inject</button>
+      <button id="saveBtn" class="subtle">Save Current Markdown</button>
+    </div>
+    <textarea id="skillMarkdown" class="mono skill-md" placeholder="Generated SKILL.md content..."></textarea>
+    <div class="skills-catalog">
+      <div class="row compact">
+        <h3>Skills Explorer</h3>
+        <span id="skillsStats" class="mono"></span>
+      </div>
+      <div class="row compact explorer-actions">
+        <button id="previewToFlowBtn" class="subtle">Load To Flow Builder</button>
+      </div>
+      <div id="skillsUploadDrop" class="upload-drop skills-upload-drop">拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮</div>
+      <div class="row compact upload-actions">
+        <button id="skillsUploadFileBtn" class="subtle">Upload Files</button>
+        <button id="skillsUploadFolderBtn" class="subtle">Upload Folder</button>
+      </div>
+      <input id="skillsUploadInput" type="file" multiple accept=".zip,.md,.markdown,.txt">
+      <input id="skillsUploadDirInput" type="file" multiple webkitdirectory directory>
+      <div id="skillsUploadList" class="mono upload-list"></div>
+      <div id="skillsTree" class="block-scroll tree-scroll"></div>
+      <h3>Selected Skill</h3>
+      <div id="skillPreview" class="mono block-scroll preview-scroll"></div>
+    </div>
+    <div id="errorBox" class="error-box hidden"></div>
+  </aside>
+</main>
+</div>
+<script src="/assets/skills.js"></script>
+</body>
+</html>
+"""
+
+SKILLS_EXTRA_CSS = """
+.skills-main{display:grid;grid-template-columns:minmax(280px,330px) minmax(560px,1fr) minmax(390px,500px);gap:12px;height:78vh;min-height:680px;max-height:78vh;align-items:stretch}
+.skills-app .panel{min-height:0;overflow:hidden}
+.skills-panel-left,.skills-panel-center,.skills-panel-right{display:flex;flex-direction:column;gap:8px;min-height:0}
+.skills-panel-left,.skills-panel-right{overflow-y:auto;overflow-x:hidden;padding-right:4px}
+.skills-panel-right{overflow-y:auto !important;overflow-x:hidden !important;overscroll-behavior:contain}
+.skills-panel-center{overflow-y:auto !important;overflow-x:hidden !important;padding-bottom:14px;padding-right:4px;overscroll-behavior:contain;scrollbar-gutter:stable}
+.skills-panel-left .row{flex-wrap:wrap}
+.skills-app .panel textarea,.skills-app .panel input,.skills-app .panel select{width:100%;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#fff}
+.skills-app .panel textarea{min-height:78px;resize:vertical}
+.skills-app .compact{gap:6px;align-items:center}
+.skills-app .compact input,.skills-app .compact select{min-width:0}
+.skills-panel-center .row.compact{flex-wrap:wrap}
+.flow-tabs{margin-bottom:2px}
+.flow-tabs button{flex:1}
+.flow-tabs button.active{border-color:var(--brand);background:#ecf3ff;color:#134a9a}
+.flow-panel{display:none;min-height:0}
+.flow-panel.active{display:block}
+#edgeFromSide,#edgeToSide{max-width:118px}
+#edgeReturnN{max-width:110px}
+.edge-meta-row{margin-top:2px}
+.inline-check{display:inline-flex;align-items:center;gap:6px;padding:2px 4px}
+.edge-tip{font-size:.72rem;color:#61748f}
+.flow-stage{position:relative;flex:1;min-height:260px}
+.flow-wrap{position:relative;width:100%;height:100%;border:1px solid var(--line);border-radius:12px;background:#fff;min-height:260px;overflow:auto;scrollbar-gutter:stable both-edges;cursor:grab}
+.flow-wrap.flow-panning{cursor:grabbing}
+.flow-zoom-pill{position:absolute;right:12px;top:12px;z-index:4;display:inline-flex;align-items:center;gap:4px;padding:4px;border:1px solid #c8d6ea;border-radius:999px;background:rgba(255,255,255,.9);box-shadow:0 4px 12px rgba(15,27,45,.12)}
+.flow-zoom-pill button{min-width:30px;height:28px;padding:0 8px;border-radius:999px}
+#flowZoomText{min-width:54px;text-align:center;color:#234266}
+.flow-wrap-help{position:absolute;left:12px;bottom:12px;z-index:2;pointer-events:none;max-width:320px;padding:8px 10px;border:1px solid rgba(127,149,184,.35);border-radius:10px;background:rgba(255,255,255,.74);backdrop-filter:blur(2px);color:#2f425f;font-size:.74rem;line-height:1.35;box-shadow:0 3px 10px rgba(15,27,45,.08)}
+.flow-wrap-help .t{font-weight:700;margin-bottom:3px;color:#1f3e67}
+.skills-panel-center .flow-stage{margin-bottom:12px}
+.skills-panel-center .flow-stage + .row{margin-top:6px;margin-bottom:10px}
+#flowSvg{position:absolute;left:0;top:0;min-width:1300px;min-height:900px;pointer-events:none}
+#flowCanvas{position:relative;min-width:1300px;min-height:900px}
+.flow-node{position:absolute;width:180px;min-height:98px;border:1px solid #d7e4f5;border-radius:10px;background:linear-gradient(150deg,#ffffff,#f4f8ff);padding:8px;cursor:move;box-shadow:0 6px 14px rgba(15,27,45,.08)}
+.flow-node.active{border-color:var(--brand);box-shadow:0 8px 16px rgba(31,111,235,.16)}
+.flow-port{position:absolute;width:12px;height:12px;border-radius:999px;border:2px solid #7f95b8;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.12);opacity:0;transition:opacity .12s ease,transform .12s ease;cursor:crosshair;z-index:3}
+.flow-node:hover .flow-port,.flow-port.active{opacity:1}
+.flow-port:hover{transform:scale(1.15);border-color:#1f6feb}
+.flow-port.side-top{left:50%;top:-7px;transform:translateX(-50%)}
+.flow-port.side-right{right:-7px;top:50%;transform:translateY(-50%)}
+.flow-port.side-bottom{left:50%;bottom:-7px;transform:translateX(-50%)}
+.flow-port.side-left{left:-7px;top:50%;transform:translateY(-50%)}
+.flow-link-preview{stroke:#1f6feb;stroke-width:2;stroke-dasharray:5 4;opacity:.85;pointer-events:none}
+.flow-edge-label{fill:#2f425f;font-size:11px;font-weight:600}
+.flow-return-badge{position:absolute;right:6px;bottom:6px;padding:1px 6px;border-radius:999px;background:#1f6feb;color:#fff;font-size:.7rem;font-weight:700;line-height:1.25;box-shadow:0 2px 6px rgba(31,111,235,.26)}
+.flow-node .t{font-weight:700;font-size:.84rem}
+.flow-node .k{font-size:.74rem;color:#4b6b94;text-transform:uppercase}
+.flow-node .c{margin-top:4px;font-size:.78rem;color:#334155;white-space:pre-wrap;max-height:62px;overflow:auto}
+.block-scroll{border:1px solid var(--line);border-radius:10px;background:#fff;padding:8px;overflow:auto;min-height:90px}
+.compact-block{max-height:90px}
+.grow-block{flex:1;min-height:120px}
+.skills-panel-left .grow-block{min-height:82px}
+.node-content{min-height:92px;max-height:170px}
+.flow-json{min-height:100px;max-height:170px}
+.req-box{min-height:84px;max-height:130px}
+.skill-md{min-height:120px;max-height:168px}
+.skills-catalog{display:flex;flex-direction:column;gap:8px;flex:none;min-height:0}
+.skills-upload-drop{font-size:.82rem;padding:8px 10px}
+#skillsUploadInput,#skillsUploadDirInput{display:none}
+.explorer-actions button{width:100%}
+.upload-actions button{flex:1}
+.upload-list{min-height:44px;max-height:96px;overflow:auto}
+.tree-scroll{height:300px;min-height:240px;max-height:420px;flex:none}
+.preview-scroll{height:220px;min-height:180px;max-height:320px;flex:none}
+#skillsStats{margin-left:auto;color:var(--muted)}
+.skill-tree details{margin:4px 0}
+.skill-tree summary{cursor:pointer;list-style:none;padding:4px 6px;border-radius:8px}
+.skill-tree summary:hover{background:#f3f7ff}
+.skill-tree summary::-webkit-details-marker{display:none}
+.skill-tree .tree-folder{font-weight:600;color:#334155}
+.skill-tree .tree-children{padding-left:16px}
+.skill-item{border:1px solid #e5ebf5;border-radius:9px;background:#fbfdff;padding:6px 8px;margin:4px 0;cursor:pointer}
+.skill-item:hover{border-color:#bfd4ff;background:#f4f8ff}
+.skill-item.active{border-color:#1f6feb;background:#ecf3ff}
+.skill-item .name{font-weight:700;font-size:.82rem}
+.skill-item .desc{font-size:.76rem;color:#516175;white-space:pre-wrap}
+.skill-item .path{font-size:.72rem;color:#708097}
+.skills-app .block-scroll::-webkit-scrollbar,.skills-app .flow-wrap::-webkit-scrollbar,.flow-node .c::-webkit-scrollbar{width:10px;height:10px}
+.skills-app .block-scroll::-webkit-scrollbar-thumb,.skills-app .flow-wrap::-webkit-scrollbar-thumb,.flow-node .c::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
+.skills-app .block-scroll::-webkit-scrollbar-track,.skills-app .flow-wrap::-webkit-scrollbar-track,.flow-node .c::-webkit-scrollbar-track{background:#edf2f9}
+.skills-panel-left::-webkit-scrollbar,.skills-panel-center::-webkit-scrollbar,.skills-panel-right::-webkit-scrollbar{width:10px;height:10px}
+.skills-panel-left::-webkit-scrollbar-thumb,.skills-panel-center::-webkit-scrollbar-thumb,.skills-panel-right::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
+.skills-panel-left::-webkit-scrollbar-track,.skills-panel-center::-webkit-scrollbar-track,.skills-panel-right::-webkit-scrollbar-track{background:#edf2f9}
+.skills-panel-center{scrollbar-color:#c7d4e6 #edf2f9;scrollbar-width:thin}
+@media (max-width:1180px){
+  .skills-main{grid-template-columns:1fr;height:auto;max-height:none;min-height:0}
+  .flow-wrap{height:320px;min-height:320px;flex:none}
+  .grow-block{max-height:180px;flex:none}
+  .skills-panel-right{overflow-y:visible !important}
+  .skills-catalog{display:flex;flex-direction:column}
+  .tree-scroll{max-height:260px;flex:none}
+  .preview-scroll{max-height:220px}
+}
+"""
+
+SKILLS_APP_JS = """const S={config:null,rules:null,skillScan:{skills_count:0,skills:[],tree:{type:'dir',name:'skills',path:'',children:[]},warnings:[]},flow:{nodes:[],edges:[]},flowZoom:1,selectedNodeId:null,drag:null,linkDrag:null,pan:null,skillMap:{},activeSkillFile:'',uploadReports:[]};
+const E=id=>document.getElementById(id);
+const I18N={'en':{title:'Fona Skills Studio',subtitle:'Visual Skills authoring platform with the same WebUI style',flow_line:'Flowchart → LLM parse → SKILL.md inject into ./skills',apply_model:'Apply Model',refresh:'Refresh',open_agent:'Open Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'Analyze agents/docs',scan:'Scan Skills',rules:'Rules',sources:'Sources',flow_builder:'Flow Builder',tab_node:'Node',tab_manual_link:'Manual Link',add_node:'Add Node',connect:'Connect',delete_node:'Delete Node',bidirectional:'Bidirectional',drag_tip:'Drag ports + hold Shift => bidirectional (n)',canvas_tips:'Canvas Tips',tip1:'1. Drag nodes to move',tip2:'2. Drag from side ports to create links',tip3:'3. Hold Shift while dragging => bidirectional',tip4:'4. Double-click near an edge => delete edge',tip5:'5. Use +/- buttons to zoom',reset_flow:'Reset Flow',export_flow:'Export Flow JSON',import_flow:'Import Flow JSON',draft_publish:'Skill Draft & Publish',generate_inject:'Generate + Inject',save_markdown:'Save Current Markdown',skills_explorer:'Skills Explorer',load_to_flow:'Load To Flow Builder',upload_drop:'Drop skills (SKILL.md / .zip) here, or use upload buttons below',upload_files:'Upload Files',upload_folder:'Upload Folder',selected_skill:'Selected Skill',stat_rules:'Rules',stat_skills:'Skills',stat_model:'Model',stat_nodes:'Flow Nodes',no_rules:'No rules',no_sources:'No sources',no_skill_selected:'No skill selected',no_uploads:'No uploads',select_skill_first:'select a skill first',no_model_selected:'no model selected',invalid_flow_json:'invalid flow json',summary:'summary',generated_at:'generated_at',skills_unit:'skills',upload_parse_failed:'upload parse failed',folder:'folder',empty:'(empty)'},
+'zh-CN':{title:'Fona Skills Studio',subtitle:'基于现有 WebUI 风格的图形化 Skills 制作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'应用模型',refresh:'刷新',open_agent:'打开 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'扫描 Skills',rules:'规则',sources:'来源',flow_builder:'流程构建器',tab_node:'节点',tab_manual_link:'手动连线',add_node:'添加节点',connect:'连接',delete_node:'删除节点',bidirectional:'双向',drag_tip:'拖拽端口并按 Shift => 双向链路 (n)',canvas_tips:'画布提示',tip1:'1. 拖拽节点移动位置',tip2:'2. 从节点四边端口拖拽连线',tip3:'3. 按住 Shift 拖拽 => 双向链路',tip4:'4. 双击连线附近 => 删除连线',tip5:'5. 使用 +/- 按钮缩放',reset_flow:'重置流程',export_flow:'导出 Flow JSON',import_flow:'导入 Flow JSON',draft_publish:'技能草稿与发布',generate_inject:'生成并注入',save_markdown:'保存当前 Markdown',skills_explorer:'技能浏览器',load_to_flow:'载入到流程构建器',upload_drop:'拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮',upload_files:'上传文件',upload_folder:'上传文件夹',selected_skill:'已选 Skill',stat_rules:'规则',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程节点',no_rules:'暂无规则',no_sources:'暂无来源',no_skill_selected:'未选择 Skill',no_uploads:'暂无上传',select_skill_first:'请先选择一个 skill',no_model_selected:'未选择模型',invalid_flow_json:'无效的 flow json',summary:'摘要',generated_at:'生成时间',skills_unit:'个 skills',upload_parse_failed:'上传解析失败',folder:'目录',empty:'(空)'},
+'zh-TW':{title:'Fona Skills Studio',subtitle:'基於現有 WebUI 風格的圖形化 Skills 製作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'套用模型',refresh:'重新整理',open_agent:'開啟 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'掃描 Skills',rules:'規則',sources:'來源',flow_builder:'流程建構器',tab_node:'節點',tab_manual_link:'手動連線',add_node:'新增節點',connect:'連線',delete_node:'刪除節點',bidirectional:'雙向',drag_tip:'拖曳端口並按 Shift => 雙向鏈路 (n)',canvas_tips:'畫布提示',tip1:'1. 拖曳節點移動位置',tip2:'2. 從節點四邊端口拖曳連線',tip3:'3. 按住 Shift 拖曳 => 雙向鏈路',tip4:'4. 雙擊連線附近 => 刪除連線',tip5:'5. 使用 +/- 按鈕縮放',reset_flow:'重設流程',export_flow:'匯出 Flow JSON',import_flow:'匯入 Flow JSON',draft_publish:'技能草稿與發布',generate_inject:'生成並注入',save_markdown:'儲存目前 Markdown',skills_explorer:'技能瀏覽器',load_to_flow:'載入至流程建構器',upload_drop:'拖曳上傳 skills（SKILL.md / .zip），或使用下方上傳按鈕',upload_files:'上傳檔案',upload_folder:'上傳資料夾',selected_skill:'已選 Skill',stat_rules:'規則',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程節點',no_rules:'尚無規則',no_sources:'尚無來源',no_skill_selected:'未選擇 Skill',no_uploads:'尚無上傳',select_skill_first:'請先選擇一個 skill',no_model_selected:'尚未選擇模型',invalid_flow_json:'無效的 flow json',summary:'摘要',generated_at:'產生時間',skills_unit:'個 skills',upload_parse_failed:'上傳解析失敗',folder:'資料夾',empty:'(空)'},
+'ja':{title:'Fona Skills Studio',subtitle:'既存 WebUI スタイルのビジュアル Skills 制作プラットフォーム',flow_line:'Flowchart → LLM 解析 → SKILL.md を ./skills へ注入',apply_model:'モデル適用',refresh:'更新',open_agent:'Agent UI を開く',rules_knowledge:'Rules & Knowledge',analyze:'agents/docs を解析',scan:'Skills をスキャン',rules:'ルール',sources:'ソース',flow_builder:'フロービルダー',tab_node:'ノード',tab_manual_link:'手動リンク',add_node:'ノード追加',connect:'接続',delete_node:'ノード削除',bidirectional:'双方向',drag_tip:'ポートをドラッグ + Shift で双方向リンク (n)',canvas_tips:'Canvas Tips',tip1:'1. ノードをドラッグして移動',tip2:'2. ノード端子からドラッグして接続',tip3:'3. Shift を押しながらドラッグで双方向',tip4:'4. エッジ付近をダブルクリックで削除',tip5:'5. +/- ボタンでズーム',reset_flow:'Flow をリセット',export_flow:'Flow JSON をエクスポート',import_flow:'Flow JSON をインポート',draft_publish:'Skill 下書きと公開',generate_inject:'生成して注入',save_markdown:'現在の Markdown を保存',skills_explorer:'Skills Explorer',load_to_flow:'Flow Builder に読み込む',upload_drop:'skills（SKILL.md / .zip）をドラッグ＆ドロップ、または下のアップロードを使用',upload_files:'ファイルをアップロード',upload_folder:'フォルダをアップロード',selected_skill:'選択中 Skill',stat_rules:'ルール',stat_skills:'Skills',stat_model:'モデル',stat_nodes:'Flow ノード',no_rules:'ルールなし',no_sources:'ソースなし',no_skill_selected:'Skill が選択されていません',no_uploads:'アップロードなし',select_skill_first:'先に skill を選択してください',no_model_selected:'モデルが未選択です',invalid_flow_json:'無効な flow json',summary:'summary',generated_at:'generated_at',skills_unit:'skills',upload_parse_failed:'upload parse failed',folder:'folder',empty:'(empty)'}};
+function currentLang(){const c=String(S.config?.language||'').trim();if(c&&I18N[c])return c;return 'zh-CN'}
+function t(key){const lang=currentLang();const pack=I18N[lang]||I18N['en'];return String((pack&&pack[key])??(I18N['en']&&I18N['en'][key])??key)}
+function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
+function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
+function renderLanguageControls(){const sel=E('skillsLangSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(S.config?.language)sel.value=S.config.language}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/skillslab/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;applySkillsI18n();renderLanguageControls();setStats();renderRules();renderSkills()}
+function applySkillsI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('subtitle');if(hp&&hp[1])hp[1].textContent=t('flow_line');setText('applyModelBtn','apply_model');setText('refreshBtn','refresh');setText('agentLink','open_agent');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('rules_knowledge');if(panels&&panels[1])panels[1].textContent=t('flow_builder');if(panels&&panels[2])panels[2].textContent=t('draft_publish');setText('analyzeBtn','analyze');setText('scanBtn','scan');setText('flowTabNodeBtn','tab_node');setText('flowTabLinkBtn','tab_manual_link');setText('addNodeBtn','add_node');setText('addEdgeBtn','connect');setText('removeNodeBtn','delete_node');setText('resetFlowBtn','reset_flow');setText('exportFlowBtn','export_flow');setText('importFlowBtn','import_flow');setText('generateBtn','generate_inject');setText('saveBtn','save_markdown');setText('previewToFlowBtn','load_to_flow');setText('skillsUploadFileBtn','upload_files');setText('skillsUploadFolderBtn','upload_folder');const ud=E('skillsUploadDrop');if(ud)ud.textContent=t('upload_drop');const edgeTip=document.querySelector('.edge-tip');if(edgeTip)edgeTip.textContent=t('drag_tip');setPlaceholder('nodeTitle','tab_node');setPlaceholder('nodeContent','flow_builder');setPlaceholder('edgeLabel','connect');setPlaceholder('flowJson','export_flow');setPlaceholder('skillName','skills_explorer');setPlaceholder('skillPath','skills_explorer');setPlaceholder('skillDesc','draft_publish');setPlaceholder('requirements','rules_knowledge');setPlaceholder('skillMarkdown','draft_publish');const hs=document.querySelectorAll('.skills-panel-left h3, .skills-panel-right h3');if(hs&&hs[0])hs[0].textContent=t('rules');if(hs&&hs[1])hs[1].textContent=t('sources');if(hs&&hs[2])hs[2].textContent=t('skills_explorer');if(hs&&hs[3])hs[3].textContent=t('selected_skill');const tip=document.querySelector('#flowHelpOverlay .t');if(tip)tip.textContent=t('canvas_tips');const tipRows=document.querySelectorAll('#flowHelpOverlay div');if(tipRows&&tipRows[1])tipRows[1].textContent=t('tip1');if(tipRows&&tipRows[2])tipRows[2].textContent=t('tip2');if(tipRows&&tipRows[3])tipRows[3].textContent=t('tip3');if(tipRows&&tipRows[4])tipRows[4].textContent=t('tip4');if(tipRows&&tipRows[5])tipRows[5].textContent=t('tip5');const inlineCheck=document.querySelector('.inline-check');if(inlineCheck){const txt=inlineCheck.childNodes[inlineCheck.childNodes.length-1];if(txt&&txt.nodeType===Node.TEXT_NODE)txt.textContent=' '+t('bidirectional')}}
+async function api(path,opt={}){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
+function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
+function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
+function defaultFlow(){return{nodes:[{id:'goal',type:'goal',title:'Goal',content:'Define target skill behavior.',x:30,y:30},{id:'inputs',type:'input',title:'Inputs',content:'List user intent, constraints, and context.',x:280,y:30},{id:'process',type:'process',title:'Process',content:'Translate into deterministic workflow.',x:530,y:30},{id:'checks',type:'check',title:'Checks',content:'Validate quality and failure handling.',x:280,y:210},{id:'output',type:'output',title:'Output',content:'Emit SKILL.md and inject to ./skills.',x:530,y:210}],edges:[{from:'goal',to:'inputs',label:''},{from:'inputs',to:'process',label:''},{from:'process',to:'checks',label:''},{from:'checks',to:'output',label:''}]}}
+function normalizeSkillScan(payload){if(Array.isArray(payload)){const skills=payload.map(x=>({name:x.name||x.qualified_name||'skill',description:x.description||'',path:'',skill_file:x.qualified_name||x.name||'',provider:x.provider_id||'',protocol:x.protocol||'',preview:''}));return{skills_count:skills.length,skills,tree:{type:'dir',name:'skills',path:'',children:skills.map(x=>({type:'skill',...x}))},warnings:[]}}const obj=(payload&&typeof payload==='object')?payload:{};const skills=Array.isArray(obj.skills)?obj.skills:[];const tree=(obj.tree&&typeof obj.tree==='object')?obj.tree:{type:'dir',name:'skills',path:'',children:[]};const warnings=Array.isArray(obj.warnings)?obj.warnings:[];return{skills_count:Number(obj.skills_count||skills.length)||skills.length,skills,tree,warnings}}
+function setStats(){const model=S.config?.model_catalog?.selected||'-';const skills=S.skillScan?.skills_count||0;const rules=(S.rules?.rules||[]).length;E('topStats').innerHTML=[[t('stat_rules'),rules],[t('stat_skills'),skills],[t('stat_model'),model],[t('stat_nodes'),(S.flow.nodes||[]).length]].map(([k,v])=>`<div class=\"stat\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const st=E('skillsStats');if(st)st.textContent=`${skills} ${t('skills_unit')}`}
+function renderModelControls(){const sel=E('modelSelect');if(!sel)return;sel.innerHTML='';const cat=S.config?.model_catalog||{};const opts=cat.options||[];if(opts.length){for(const it of opts){const op=document.createElement('option');op.value=it.selection;op.textContent=it.label||it.selection;sel.appendChild(op)}}else{for(const m of (cat.models||[])){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(cat.selected)sel.value=cat.selected}
+function renderRules(){const r=S.rules||{};E('rulesSummary').innerHTML=`<div>${esc(t('summary'))}: ${esc(r.summary||'-')}</div><div>${esc(t('generated_at'))}: ${esc(r.generated_at||'-')}</div>`;E('rulesList').innerHTML=(r.rules||[]).map(x=>`<div>• ${esc(x)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_rules'))}</div>`;E('sourceList').innerHTML=(r.sources||[]).map(s=>`<div class=\"mono\">${esc(s.path)} (${esc(s.bytes)} bytes)</div>`).join('')||`<div class=\"mono\">${esc(t('no_sources'))}</div>`}
+function buildSkillMap(){S.skillMap={};for(const row of (S.skillScan?.skills||[])){const key=String(row.skill_file||row.path||row.name||'').trim();if(!key)continue;S.skillMap[key]=row}}
+function skillItemHtml(skill){const file=String(skill.skill_file||skill.path||'');const active=(file&&file===S.activeSkillFile)?' active':'';return `<div class=\"skill-item${active}\" data-skill-file=\"${esc(file)}\"><div class=\"name\">${esc(skill.name||'skill')}</div><div class=\"desc\">${esc(skill.description||'')}</div><div class=\"path\">${esc(file||skill.path||'')}</div></div>`}
+function treeNodeHtml(node,depth=0){if(!node||typeof node!=='object')return'';if(String(node.type)==='skill')return skillItemHtml(node);const children=Array.isArray(node.children)?node.children:[];const openAttr=depth<=1?' open':'';const title=esc(node.name||t('folder'));const childHtml=children.length?children.map(x=>treeNodeHtml(x,depth+1)).join(''):`<div class=\"mono\">${esc(t('empty'))}</div>`;return `<details${openAttr}><summary><span class=\"tree-folder\">${title}</span></summary><div class=\"tree-children\">${childHtml}</div></details>`}
+function trimText(s,maxLen=1600){const raw=String(s||'');if(raw.length<=maxLen)return raw;return raw.slice(0,maxLen)+'\\n...\\n[truncated]'}
+function flowSlug(text,fallback='node'){const s=String(text||'').toLowerCase().replace(/[^a-z0-9._-]+/g,'-').replace(/^-+|-+$/g,'');return s||fallback}
+function safeNodeId(base,taken){const b=flowSlug(base,'n');if(!taken.has(b)){taken.add(b);return b}let i=2;while(taken.has(`${b}-${i}`))i++;const out=`${b}-${i}`;taken.add(out);return out}
+function parseFrontMatterMd(md){const src=String(md||'');const m=src.match(/^---\\s*\\n([\\s\\S]*?)\\n---\\s*(?:\\n|$)/);if(!m)return{meta:{},body:src};const meta={};for(const line of String(m[1]||'').split(/\\r?\\n/)){const idx=line.indexOf(':');if(idx<=0)continue;const k=line.slice(0,idx).trim();const v=line.slice(idx+1).trim();if(k)meta[k]=v}return{meta,body:src.slice(m[0].length)}}
+function collectSections(body){const out=[];const lines=String(body||'').split(/\\r?\\n/);let cur={title:'Overview',content:''};for(const line of lines){const hm=String(line||'').match(/^#{1,3}\\s+(.+?)\\s*$/);if(hm){if(String(cur.content||'').trim())out.push(cur);cur={title:String(hm[1]||'').trim()||'Section',content:''};continue}cur.content+=(cur.content?'\\n':'')+line}if(String(cur.content||'').trim())out.push(cur);return out}
+function pickSectionText(sections,keywords,fallback=''){const keys=(keywords||[]).map(k=>String(k).toLowerCase());for(const sec of sections){const t=String(sec?.title||'').toLowerCase();if(keys.some(k=>t.includes(k)))return String(sec?.content||'').trim()}return String(fallback||'').trim()}
+function parseSkillToFlow(md,fallbackName,fallbackDesc){const parsed=parseFrontMatterMd(md);const meta=parsed.meta||{};const body=String(parsed.body||md||'').trim();const sections=collectSections(body);const nonEmptyLines=body.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);const overview=nonEmptyLines.slice(0,8).join('\\n');const title=String(meta.name||fallbackName||'Imported Skill').trim()||'Imported Skill';const desc=String(meta.description||fallbackDesc||'').trim();const goalText=trimText(desc||pickSectionText(sections,['goal','purpose','overview','目标','概述'],overview||'Define target behavior.'),680);const inputText=trimText(pickSectionText(sections,['input','parameter','context','prerequisite','输入','上下文','前置'],'Collect user intent, constraints, and required files.'),720);const processText=trimText(pickSectionText(sections,['workflow','process','steps','instruction','procedure','流程','步骤','执行'],body||'Execute deterministic workflow with clear tool usage and outputs.'),900);const checkText=trimText(pickSectionText(sections,['check','validation','verify','quality','guardrail','failure','test','检查','校验','验证'],'Validate outputs, handle failure paths, and enforce quality gates.'),720);const outputText=trimText(pickSectionText(sections,['output','deliverable','response','result','输出','产出'],'Produce final answer and artifacts with traceable evidence.'),680);const taken=new Set();const nodes=[{id:safeNodeId('goal',taken),type:'goal',title:'Goal',content:goalText,x:30,y:30},{id:safeNodeId('inputs',taken),type:'input',title:'Inputs',content:inputText,x:280,y:30},{id:safeNodeId('process',taken),type:'process',title:'Process',content:processText,x:530,y:30},{id:safeNodeId('checks',taken),type:'check',title:'Checks',content:checkText,x:280,y:220},{id:safeNodeId('output',taken),type:'output',title:'Output',content:outputText,x:530,y:220}];const edges=[{from:nodes[0].id,to:nodes[1].id,label:''},{from:nodes[1].id,to:nodes[2].id,label:''},{from:nodes[2].id,to:nodes[3].id,label:''},{from:nodes[3].id,to:nodes[4].id,label:''}];return{title,description:desc,nodes,edges}}
+function upsertSkillRow(row){if(!row||!row.skill_file)return;const key=String(row.skill_file);if(Array.isArray(S.skillScan?.skills)){const idx=S.skillScan.skills.findIndex(x=>String(x.skill_file||x.path||x.name||'')===key);if(idx>=0){S.skillScan.skills[idx]={...S.skillScan.skills[idx],...row}}}if(S.skillMap)S.skillMap[key]={...(S.skillMap[key]||{}),...row}}
+async function ensureSkillContent(skillFile){const key=String(skillFile||S.activeSkillFile||'').trim();if(!key)throw new Error('no skill selected');const row=S.skillMap[key]||{};if(String(row.content||'').trim())return row;const out=await api('/api/skillslab/skill?skill_file='+encodeURIComponent(key));const merged={...row,...out};upsertSkillRow(merged);return merged}
+async function selectSkill(skillFile){S.activeSkillFile=String(skillFile||'').trim();renderSkills();try{await ensureSkillContent(S.activeSkillFile);renderSkillPreview();showError('')}catch(err){renderSkillPreview();showError(err.message||String(err))}}
+function renderSkillPreview(){const el=E('skillPreview');if(!el)return;const key=S.activeSkillFile||Object.keys(S.skillMap||{})[0]||'';if(!key){el.innerHTML=`<div class=\"mono\">${esc(t('no_skill_selected'))}</div>`;return}S.activeSkillFile=key;const row=S.skillMap[key]||{};const header=`name: ${row.name||'-'}\\npath: ${row.skill_file||row.path||'-'}\\nprovider: ${row.provider||'-'}\\nprotocol: ${row.protocol||'-'}\\ndescription: ${row.description||'-'}`;const fullBody=String(row.content||row.preview||'').trim();el.innerHTML=`<div>${esc(header)}</div><hr><pre>${esc(trimText(fullBody||'(no preview)',3600))}</pre>`}
+function renderUploadReports(){const el=E('skillsUploadList');if(!el)return;const rows=(S.uploadReports||[]).slice(-20).reverse();el.innerHTML=rows.map(r=>`${esc(r.filename)} · imported=${esc(r.imported_count||0)} skipped=${esc(r.skipped_count||0)} errors=${esc(r.error_count||0)}`).join('<br>')||`<div>${esc(t('no_uploads'))}</div>`}
+function renderSkills(){buildSkillMap();const treeEl=E('skillsTree');if(treeEl){const root=S.skillScan?.tree||{type:'dir',name:'skills',path:'',children:[]};treeEl.innerHTML=`<div class=\"skill-tree\">${treeNodeHtml(root,0)}</div>`;for(const el of treeEl.querySelectorAll('.skill-item')){el.onclick=()=>selectSkill(el.getAttribute('data-skill-file')||'').catch(err=>showError(err.message||String(err)));el.ondblclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)))}}renderSkillPreview();renderUploadReports();setStats()}
+async function loadSelectedSkillToFlow(){const key=String(S.activeSkillFile||'').trim();if(!key)throw new Error(t('select_skill_first'));const row=await ensureSkillContent(key);const parsed=parseSkillToFlow(row.content||row.preview||'',row.name,row.description);S.flow={nodes:parsed.nodes,edges:parsed.edges};S.selectedNodeId=S.flow.nodes[0]?.id||null;renderFlow();renderNodeEditor();exportFlow();if(E('skillMarkdown'))E('skillMarkdown').value=String(row.content||'');if(E('skillName')&&!E('skillName').value.trim())E('skillName').value=flowSlug(row.name||parsed.title||'skill','skill');if(E('skillDesc')&&!E('skillDesc').value.trim())E('skillDesc').value=String(row.description||parsed.description||'');showError('')}
+const FLOW_SIDES=['top','right','bottom','left'];
+function normalizeSide(side){const s=String(side||'').trim().toLowerCase();return FLOW_SIDES.includes(s)?s:''}
+function nodeCenter(n){return{x:(Number(n.x)||0)+90,y:(Number(n.y)||0)+48}}
+function nodePortPoint(n,side){const x=Number(n.x)||0;const y=Number(n.y)||0;const hh=49;switch(normalizeSide(side)){case'top':return{x:x+90,y:y};case'right':return{x:x+180,y:y+hh};case'bottom':return{x:x+90,y:y+98};case'left':return{x:x,y:y+hh};default:return nodeCenter(n)}}
+function inferEdgeSides(a,b){const ax=Number(a?.x)||0;const ay=Number(a?.y)||0;const bx=Number(b?.x)||0;const by=Number(b?.y)||0;const dx=bx-ax;const dy=by-ay;if(Math.abs(dx)>=Math.abs(dy)){return dx>=0?{from:'right',to:'left'}:{from:'left',to:'right'}}return dy>=0?{from:'bottom',to:'top'}:{from:'top',to:'bottom'}}
+function edgeFromSide(e){return normalizeSide(e?.fromSide||e?.from_side||'')}
+function edgeToSide(e){return normalizeSide(e?.toSide||e?.to_side||'')}
+function edgeBidirectional(e){return Boolean(e?.bidirectional||e?.bi||false)}
+function parseReturnCount(v){const n=Number.parseInt(String(v??''),10);if(Number.isFinite(n)&&n>0)return n;return 1}
+function edgeReturnN(e){return parseReturnCount(e?.returnCount??e?.return_count??1)}
+function edgePathLabel(e){const f=String(e?.from||'').trim()||'?';const t=String(e?.to||'').trim()||'?';const bi=edgeBidirectional(e);const base=bi?`${f} ↔ ${t}`:`${f} → ${t}`;const n=bi?`  n=${edgeReturnN(e)}`:'';const lbl=String(e?.label||'').trim();if(!lbl)return base+n;return `${base}${n}  |  ${lbl}`}
+function connectEdge(from,to,label='',fromSide='',toSide='',bidirectional=false,returnCount=1){const f=String(from||'').trim();const t=String(to||'').trim();if(!f||!t||f===t)return false;const fs=normalizeSide(fromSide);const ts=normalizeSide(toSide);const bi=Boolean(bidirectional);const rn=parseReturnCount(returnCount);const idx=(S.flow.edges||[]).findIndex(e=>String(e.from||'')===f&&String(e.to||'')===t);const prev=idx>=0?(S.flow.edges[idx]||{}):{};const next={from:f,to:t,label:String(label||prev.label||'')};if(fs)next.fromSide=fs;if(ts)next.toSide=ts;if(bi){next.bidirectional=true;next.returnCount=rn}if(idx>=0){S.flow.edges[idx]=next}else{S.flow.edges.push(next)}return true}
+const FLOW_ZOOM_MIN=0.5;
+const FLOW_ZOOM_MAX=2.6;
+function getFlowZoom(){const z=Number(S.flowZoom||1);return Number.isFinite(z)&&z>0?z:1}
+function clampFlowZoom(z){const v=Number(z||1);if(!Number.isFinite(v))return 1;return Math.max(FLOW_ZOOM_MIN,Math.min(FLOW_ZOOM_MAX,v))}
+function updateFlowZoomUI(){const el=E('flowZoomText');if(!el)return;el.textContent=`${Math.round(getFlowZoom()*100)}%`}
+function setFlowZoom(next,anchorClientX=null,anchorClientY=null){const wrap=E('flowWrap');const prev=getFlowZoom();const z=clampFlowZoom(next);if(Math.abs(z-prev)<1e-4){updateFlowZoomUI();return}let localX=null,localY=null,rect=null;if(wrap&&Number.isFinite(anchorClientX)&&Number.isFinite(anchorClientY)){rect=wrap.getBoundingClientRect();localX=anchorClientX-rect.left+wrap.scrollLeft;localY=anchorClientY-rect.top+wrap.scrollTop}S.flowZoom=z;renderFlow();if(wrap&&rect&&localX!==null&&localY!==null){const contentX=localX/prev;const contentY=localY/prev;const nextLocalX=contentX*z;const nextLocalY=contentY*z;wrap.scrollLeft=Math.max(0,nextLocalX-(anchorClientX-rect.left));wrap.scrollTop=Math.max(0,nextLocalY-(anchorClientY-rect.top))}updateFlowZoomUI()}
+function zoomFlowBy(step,anchorClientX=null,anchorClientY=null){const cur=getFlowZoom();setFlowZoom(cur+step,anchorClientX,anchorClientY)}
+function resolveEdgeSidesAndPoints(edge,byId){const a=byId[String(edge?.from||'')],b=byId[String(edge?.to||'')];if(!a||!b)return null;let fs=edgeFromSide(edge);let ts=edgeToSide(edge);if(!fs||!ts){const autoSides=inferEdgeSides(a,b);if(!fs)fs=autoSides.from;if(!ts)ts=autoSides.to}return{a,b,fromSide:fs,toSide:ts,p1:nodePortPoint(a,fs),p2:nodePortPoint(b,ts)}}
+function pointToSegmentDistance(px,py,x1,y1,x2,y2){const dx=x2-x1,dy=y2-y1;const len2=dx*dx+dy*dy;if(len2<=1e-6){const ddx=px-x1,ddy=py-y1;return Math.sqrt(ddx*ddx+ddy*ddy)}let t=((px-x1)*dx+(py-y1)*dy)/len2;t=Math.max(0,Math.min(1,t));const cx=x1+t*dx,cy=y1+t*dy;const ex=px-cx,ey=py-cy;return Math.sqrt(ex*ex+ey*ey)}
+function findNearestEdgeIndexAt(px,py,threshold=14){const byId={};for(const n of (S.flow.nodes||[])){byId[n.id]=n}const z=getFlowZoom();let bestIdx=-1;let best=Number.POSITIVE_INFINITY;for(let i=0;i<(S.flow.edges||[]).length;i++){const e=S.flow.edges[i];const rp=resolveEdgeSidesAndPoints(e,byId);if(!rp)continue;const x1=(Number(rp.p1.x)||0)*z,y1=(Number(rp.p1.y)||0)*z,x2=(Number(rp.p2.x)||0)*z,y2=(Number(rp.p2.y)||0)*z;const dLine=pointToSegmentDistance(px,py,x1,y1,x2,y2);const dArrow=Math.hypot(px-x2,py-y2);const d=Math.min(dLine,dArrow);if(d<best){best=d;bestIdx=i}}if(best<=Math.max(6,Number(threshold)||14))return bestIdx;return -1}
+function beginLinkDrag(nodeId,side,ev){if(ev){ev.preventDefault();ev.stopPropagation()}const canvas=E('flowCanvas');if(!canvas)return;const rect=canvas.getBoundingClientRect();S.drag=null;S.pan=null;S.selectedNodeId=String(nodeId||'');S.linkDrag={fromId:String(nodeId||''),fromSide:normalizeSide(side)||'right',toX:(ev?ev.clientX:rect.left)-rect.left,toY:(ev?ev.clientY:rect.top)-rect.top};renderNodeEditor();renderFlow()}
+function renderFlow(){const canvas=E('flowCanvas');const svg=E('flowSvg');if(!canvas||!svg)return;const z=getFlowZoom();canvas.innerHTML='';svg.innerHTML='';const defs=document.createElementNS('http://www.w3.org/2000/svg','defs');const marker=document.createElementNS('http://www.w3.org/2000/svg','marker');marker.setAttribute('id','arrow');marker.setAttribute('viewBox','0 0 10 10');marker.setAttribute('refX','10');marker.setAttribute('refY','5');marker.setAttribute('markerWidth','7');marker.setAttribute('markerHeight','7');marker.setAttribute('orient','auto-start-reverse');const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d','M 0 0 L 10 5 L 0 10 z');path.setAttribute('fill','#7f95b8');marker.appendChild(path);defs.appendChild(marker);svg.appendChild(defs);const byId={};let baseW=1300,baseH=900;for(const n of S.flow.nodes){byId[n.id]=n;baseW=Math.max(baseW,(Number(n.x)||0)+230);baseH=Math.max(baseH,(Number(n.y)||0)+190)}const viewW=Math.max(320,Math.floor(baseW*z));const viewH=Math.max(220,Math.floor(baseH*z));canvas.style.minWidth=`${viewW}px`;canvas.style.minHeight=`${viewH}px`;svg.style.minWidth=`${viewW}px`;svg.style.minHeight=`${viewH}px`;svg.setAttribute('width',String(viewW));svg.setAttribute('height',String(viewH));const returnMap={};for(const e of (S.flow.edges||[])){const a=byId[e.from],b=byId[e.to];if(!a||!b)continue;let fs=edgeFromSide(e);let ts=edgeToSide(e);if(!fs||!ts){const autoSides=inferEdgeSides(a,b);if(!fs)fs=autoSides.from;if(!ts)ts=autoSides.to}const pa=nodePortPoint(a,fs);const pb=nodePortPoint(b,ts);const ca={x:pa.x*z,y:pa.y*z};const cb={x:pb.x*z,y:pb.y*z};const bi=edgeBidirectional(e);const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',String(ca.x));line.setAttribute('y1',String(ca.y));line.setAttribute('x2',String(cb.x));line.setAttribute('y2',String(cb.y));line.setAttribute('stroke','#7f95b8');line.setAttribute('stroke-width','1.8');if(bi)line.setAttribute('marker-start','url(#arrow)');line.setAttribute('marker-end','url(#arrow)');svg.appendChild(line);const lbl=document.createElementNS('http://www.w3.org/2000/svg','text');lbl.setAttribute('x',String((ca.x+cb.x)/2));lbl.setAttribute('y',String((ca.y+cb.y)/2-7));lbl.setAttribute('text-anchor','middle');lbl.setAttribute('class','flow-edge-label');lbl.textContent=edgePathLabel(e);svg.appendChild(lbl);if(bi){const n=edgeReturnN(e);const f=String(e.from||'').trim();const t=String(e.to||'').trim();if(f)returnMap[f]=Math.max(Number(returnMap[f]||0),n);if(t)returnMap[t]=Math.max(Number(returnMap[t]||0),n)}}if(S.linkDrag&&byId[S.linkDrag.fromId]){const src=nodePortPoint(byId[S.linkDrag.fromId],S.linkDrag.fromSide);const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',String(src.x*z));line.setAttribute('y1',String(src.y*z));line.setAttribute('x2',String(Number(S.linkDrag.toX)||src.x*z));line.setAttribute('y2',String(Number(S.linkDrag.toY)||src.y*z));line.setAttribute('class','flow-link-preview');svg.appendChild(line)}for(const n of S.flow.nodes){const d=document.createElement('div');d.className='flow-node'+(n.id===S.selectedNodeId?' active':'');d.style.left=((Number(n.x)||0)*z)+'px';d.style.top=((Number(n.y)||0)*z)+'px';d.style.transform=`scale(${z})`;d.style.transformOrigin='top left';d.innerHTML=`<div class=\"k\">${esc(n.type||'node')}</div><div class=\"t\">${esc(n.title||n.id)}</div><div class=\"c\">${esc(n.content||'')}</div>`;d.onmousedown=(ev)=>{ev.preventDefault();S.linkDrag=null;S.selectedNodeId=n.id;const zz=getFlowZoom();S.drag={id:n.id,dx:ev.clientX-((Number(n.x)||0)*zz),dy:ev.clientY-((Number(n.y)||0)*zz)};renderFlow();renderNodeEditor()};d.onclick=()=>{S.selectedNodeId=n.id;renderFlow();renderNodeEditor()};for(const side of FLOW_SIDES){const p=document.createElement('div');p.className='flow-port side-'+side+((S.linkDrag&&S.linkDrag.fromId===n.id&&S.linkDrag.fromSide===side)?' active':'');p.setAttribute('data-node-id',String(n.id));p.setAttribute('data-side',side);p.onmousedown=(ev)=>beginLinkDrag(n.id,side,ev);d.appendChild(p)}const backN=Number(returnMap[String(n.id)]||0);if(backN>0){const badge=document.createElement('div');badge.className='flow-return-badge';badge.textContent='n='+String(backN);d.appendChild(badge)}canvas.appendChild(d)}renderEdgeSelects();scheduleFlowWrapAdjust();updateFlowZoomUI()}
+let flowWrapRaf=0;
+function adjustFlowWrapHeight(){const wrap=E('flowWrap');const panel=document.querySelector('.skills-panel-center');const stage=wrap&&wrap.closest?wrap.closest('.flow-stage'):null;if(!wrap||!panel||!stage)return;const mobile=(window.matchMedia&&window.matchMedia('(max-width:1180px)').matches);if(mobile){stage.style.height='320px';stage.style.minHeight='320px';wrap.style.height='100%';return}const kids=Array.from(panel.children||[]);let used=0;for(const el of kids){if(el===stage||el===wrap)continue;const st=getComputedStyle(el);used+=el.offsetHeight+(parseFloat(st.marginTop)||0)+(parseFloat(st.marginBottom)||0)}const ps=getComputedStyle(panel);const gap=(parseFloat(ps.rowGap||ps.gap)||0);if(kids.length>1)used+=gap*(kids.length-1);const vh=Math.max(760,window.innerHeight||900);const maxPx=Math.floor(vh*0.58);let available=Math.floor(panel.clientHeight-used);if(!Number.isFinite(available))available=360;available=Math.max(280,Math.min(maxPx,available));stage.style.height=`${available}px`;stage.style.minHeight='260px';wrap.style.height='100%'}
+function scheduleFlowWrapAdjust(){if(flowWrapRaf)cancelAnimationFrame(flowWrapRaf);flowWrapRaf=requestAnimationFrame(()=>{flowWrapRaf=0;adjustFlowWrapHeight()})}
+function switchFlowPanel(mode){const m=(String(mode||'').toLowerCase()==='link')?'link':'node';const nodeBtn=E('flowTabNodeBtn');const linkBtn=E('flowTabLinkBtn');const nodePanel=E('flowPanelNode');const linkPanel=E('flowPanelLink');if(nodeBtn)nodeBtn.classList.toggle('active',m==='node');if(linkBtn)linkBtn.classList.toggle('active',m==='link');if(nodePanel)nodePanel.classList.toggle('active',m==='node');if(linkPanel)linkPanel.classList.toggle('active',m==='link');scheduleFlowWrapAdjust()}
+function renderEdgeSelects(){const ids=S.flow.nodes.map(n=>n.id);const render=id=>{const el=E(id);if(!el)return;const cur=el.value;el.innerHTML=ids.map(x=>`<option value=\"${esc(x)}\">${esc(x)}</option>`).join('');if(cur&&ids.includes(cur))el.value=cur};render('edgeFrom');render('edgeTo')}
+function renderNodeEditor(){const n=S.flow.nodes.find(x=>x.id===S.selectedNodeId)||null;if(!n)return;E('nodeTitle').value=n.title||'';E('nodeType').value=n.type||'process';E('nodeContent').value=n.content||''}
+function syncNodeEditor(){const n=S.flow.nodes.find(x=>x.id===S.selectedNodeId)||null;if(!n)return;n.title=E('nodeTitle').value.trim()||n.id;n.type=E('nodeType').value.trim()||'process';n.content=E('nodeContent').value;renderFlow()}
+function addNode(){const title=E('nodeTitle').value.trim()||'node';const type=E('nodeType').value.trim()||'process';const id=(title.toLowerCase().replace(/[^a-z0-9._-]+/g,'-').replace(/^-+|-+$/g,''))||('n'+(S.flow.nodes.length+1));let final=id;let i=2;while(S.flow.nodes.find(n=>n.id===final)){final=id+'-'+i;i++}S.flow.nodes.push({id:final,type,title,content:E('nodeContent').value||'',x:40+((S.flow.nodes.length%4)*240),y:40+Math.floor(S.flow.nodes.length/4)*150});S.selectedNodeId=final;renderFlow();renderNodeEditor();setStats()}
+function removeNode(){if(!S.selectedNodeId)return;S.flow.nodes=S.flow.nodes.filter(n=>n.id!==S.selectedNodeId);S.flow.edges=S.flow.edges.filter(e=>e.from!==S.selectedNodeId&&e.to!==S.selectedNodeId);if(S.linkDrag&&S.linkDrag.fromId===S.selectedNodeId)S.linkDrag=null;S.selectedNodeId=S.flow.nodes[0]?.id||null;renderFlow();renderNodeEditor();setStats()}
+function addEdge(){const from=E('edgeFrom').value,to=E('edgeTo').value,label=E('edgeLabel').value.trim();const fromSide=normalizeSide(E('edgeFromSide')?.value||'');const toSide=normalizeSide(E('edgeToSide')?.value||'');const bi=Boolean(E('edgeBidirectional')?.checked);const rn=parseReturnCount(E('edgeReturnN')?.value||1);if(!connectEdge(from,to,label,fromSide,toSide,bi,rn))return;renderFlow();setStats()}
+function resetFlow(){S.flow=defaultFlow();S.drag=null;S.linkDrag=null;S.selectedNodeId=S.flow.nodes[0]?.id||null;renderFlow();renderNodeEditor();setStats()}
+function exportFlow(){E('flowJson').value=JSON.stringify(S.flow,null,2)}
+function importFlow(){try{const obj=JSON.parse(E('flowJson').value||'{}');if(!Array.isArray(obj.nodes)||!Array.isArray(obj.edges))throw new Error(t('invalid_flow_json'));S.flow=obj;S.selectedNodeId=S.flow.nodes[0]?.id||null;renderFlow();renderNodeEditor();setStats();showError('')}catch(err){showError(err.message||String(err))}}
+async function applyModel(){try{const selection=E('modelSelect').value;if(!selection){showError(t('no_model_selected'));return}S.config.model_catalog=await api('/api/skillslab/model',{method:'POST',body:JSON.stringify({selection})});renderModelControls();setStats();showError('')}catch(err){showError(err.message||String(err))}}
+async function analyzeRules(){try{S.rules=await api('/api/skillslab/rules');renderRules();setStats();showError('')}catch(err){showError(err.message||String(err))}}
+async function scanSkills(){try{const out=await api('/api/skillslab/skills');S.skillScan=normalizeSkillScan(out);if(!S.activeSkillFile&&S.skillScan.skills.length){S.activeSkillFile=String(S.skillScan.skills[0].skill_file||'')}renderSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function generateSkill(){try{const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function saveSkill(){try{const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+function isUploadSkillCandidate(name){const n=String(name||'').toLowerCase();if(n.endsWith('.zip')||n.endsWith('.md')||n.endsWith('.markdown')||n.endsWith('.txt'))return true;return n.endsWith('/skill.md')||n.endsWith('skill.md')}
+async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`File too large: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
+function bindSkillUpload(){const drop=E('skillsUploadDrop');const input=E('skillsUploadInput');const dirInput=E('skillsUploadDirInput');const fileBtn=E('skillsUploadFileBtn');const folderBtn=E('skillsUploadFolderBtn');if(!drop||!input||!dirInput)return;const consume=async(files,resetter)=>{try{await uploadSkillFiles(files)}catch(err){showError(err.message||String(err))}if(typeof resetter==='function')resetter()};drop.onclick=()=>input.click();if(fileBtn)fileBtn.onclick=()=>input.click();if(folderBtn)folderBtn.onclick=()=>dirInput.click();input.onchange=()=>consume(input.files,()=>{input.value=''});dirInput.onchange=()=>consume(dirInput.files,()=>{dirInput.value=''});for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');consume(e.dataTransfer?.files||[])})}
+function bindFlowZoom(){const outBtn=E('flowZoomOutBtn');const inBtn=E('flowZoomInBtn');if(outBtn)outBtn.onclick=()=>zoomFlowBy(-0.1);if(inBtn)inBtn.onclick=()=>zoomFlowBy(0.1);updateFlowZoomUI()}
+function bindFlowPan(){const wrap=E('flowWrap');if(!wrap)return;wrap.addEventListener('mousedown',ev=>{if(ev.button!==0)return;const target=ev.target;if(!target||!target.closest||!target.closest('#flowWrap'))return;if(target.closest('.flow-node,.flow-port,input,textarea,select,button,a,label,.flow-zoom-pill'))return;S.drag=null;S.linkDrag=null;S.pan={sx:ev.clientX,sy:ev.clientY,left:wrap.scrollLeft,top:wrap.scrollTop};wrap.classList.add('flow-panning');ev.preventDefault()})}
+async function refreshAll(forceProbe=false){const q=forceProbe?'?refresh=1':'';S.config=await api('/api/skillslab/config'+q);renderLanguageControls();applySkillsI18n();S.rules=await api('/api/skillslab/rules');S.skillScan=normalizeSkillScan(await api('/api/skillslab/skills'));renderModelControls();renderRules();renderSkills();setStats();const ap=S.config?.agent_port;E('agentLink').href=(ap?`http://${location.hostname}:${ap}`:'#');scheduleFlowWrapAdjust()}
+window.addEventListener('mousemove',ev=>{if(S.drag){const n=S.flow.nodes.find(x=>x.id===S.drag.id);if(!n)return;const z=getFlowZoom();n.x=Math.max(6,(ev.clientX-S.drag.dx)/z);n.y=Math.max(6,(ev.clientY-S.drag.dy)/z);renderFlow();return}if(S.linkDrag){const canvas=E('flowCanvas');if(!canvas)return;const rect=canvas.getBoundingClientRect();S.linkDrag.toX=ev.clientX-rect.left;S.linkDrag.toY=ev.clientY-rect.top;renderFlow();return}if(S.pan){const wrap=E('flowWrap');if(!wrap){S.pan=null;return}const dx=ev.clientX-Number(S.pan.sx||0);const dy=ev.clientY-Number(S.pan.sy||0);wrap.scrollLeft=Math.max(0,Number(S.pan.left||0)-dx);wrap.scrollTop=Math.max(0,Number(S.pan.top||0)-dy)}})
+window.addEventListener('mouseup',ev=>{if(S.drag){S.drag=null;return}if(S.pan){const wrap=E('flowWrap');if(wrap)wrap.classList.remove('flow-panning');S.pan=null;return}if(!S.linkDrag)return;const fromId=String(S.linkDrag.fromId||'').trim();const fromSide=normalizeSide(S.linkDrag.fromSide||'');const target=document.elementFromPoint(ev.clientX,ev.clientY);const port=target&&target.closest?target.closest('.flow-port'):null;if(port){const toId=String(port.getAttribute('data-node-id')||'').trim();const toSide=normalizeSide(port.getAttribute('data-side')||'');if(fromId&&toId&&fromId!==toId&&toSide){const shiftBi=Boolean(ev.shiftKey);const optBi=Boolean(E('edgeBidirectional')?.checked);const bi=shiftBi||optBi;const rn=parseReturnCount(E('edgeReturnN')?.value||1);connectEdge(fromId,toId,'',fromSide,toSide,bi,rn);setStats()}}S.linkDrag=null;renderFlow()})
+window.addEventListener('dblclick',ev=>{if(S.linkDrag)return;const wrap=E('flowWrap');const canvas=E('flowCanvas');if(!wrap||!canvas)return;const target=ev.target;const inFlow=Boolean(target&&target.closest&&target.closest('#flowWrap'));if(!inFlow)return;const rect=canvas.getBoundingClientRect();const px=ev.clientX-rect.left;const py=ev.clientY-rect.top;const idx=findNearestEdgeIndexAt(px,py,16);if(idx<0)return;ev.preventDefault();S.flow.edges.splice(idx,1);renderFlow();setStats()})
+window.addEventListener('resize',()=>scheduleFlowWrapAdjust())
+window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=addNode;E('removeNodeBtn').onclick=removeNode;E('addEdgeBtn').onclick=addEdge;E('resetFlowBtn').onclick=resetFlow;E('exportFlowBtn').onclick=exportFlow;E('importFlowBtn').onclick=importFlow;E('analyzeBtn').onclick=analyzeRules;E('scanBtn').onclick=scanSkills;E('generateBtn').onclick=generateSkill;E('saveBtn').onclick=saveSkill;E('applyModelBtn').onclick=applyModel;E('refreshBtn').onclick=()=>refreshAll(true);const langSel=E('skillsLangSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const tabNode=E('flowTabNodeBtn');const tabLink=E('flowTabLinkBtn');if(tabNode)tabNode.onclick=()=>switchFlowPanel('node');if(tabLink)tabLink.onclick=()=>switchFlowPanel('link');const loadBtn=E('previewToFlowBtn');if(loadBtn)loadBtn.onclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)));E('nodeTitle').oninput=syncNodeEditor;E('nodeType').onchange=syncNodeEditor;E('nodeContent').oninput=syncNodeEditor;bindSkillUpload();bindFlowZoom();bindFlowPan();switchFlowPanel('node');resetFlow();scheduleFlowWrapAdjust();applySkillsI18n();try{await refreshAll(false)}catch(err){showError(err.message||String(err))}})
+"""
+
+class AppContext:
+    def _sync_global_ollama_defaults(self, active_profile: dict | None = None):
+        picked: dict = {}
+        if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
+            picked = dict(active_profile)
+        else:
+            for row in self.global_profiles.values():
+                if str(row.get("provider", "")).lower() == "ollama":
+                    picked = dict(row)
+                    break
+        if not picked:
+            return
+        model = str(picked.get("model", self.model) or self.model).strip()
+        base = extract_base_url(str(picked.get("base_url", self.base_url) or self.base_url)).strip()
+        if model:
+            self.model = model
+        if base:
+            self.base_url = base
+
+    def __init__(
+        self,
+        workspace: Path,
+        base_url: str,
+        model: str,
+        skills_root: Path,
+        thinking: bool = False,
+        default_language: str = DEFAULT_UI_LANGUAGE,
+        context_token_limit: int = TOKEN_THRESHOLD,
+        context_limit_locked: bool = False,
+        max_rounds: int = MAX_AGENT_ROUNDS,
+        max_run_seconds: int = MAX_RUN_SECONDS,
+        auto_model_switch: bool = False,
+    ):
+        self.workspace = workspace
+        self.base_url = base_url
+        self.model = model
+        self.thinking = False
+        self.js_lib_root = offline_js_lib_root(self.workspace)
+        self.offline_js_summary: dict = {}
+        try:
+            self.offline_js_summary = ensure_offline_js_libs(self.workspace, force=False)
+        except Exception as exc:
+            self.offline_js_summary = {
+                "generated_at": int(now_ts()),
+                "js_lib_root": str(self.js_lib_root),
+                "total": len(OFFLINE_JS_LIB_CATALOG),
+                "available": 0,
+                "missing": len(OFFLINE_JS_LIB_CATALOG),
+                "fetched": 0,
+                "error": trim(str(exc), 220),
+            }
+        self.default_language = normalize_ui_language(default_language)
+        self.context_token_limit = max(
+            MIN_CONTEXT_TOKEN_LIMIT,
+            min(TOKEN_THRESHOLD, int(context_token_limit or TOKEN_THRESHOLD)),
+        )
+        self.context_limit_locked = bool(context_limit_locked)
+        self.max_rounds = max(
+            MIN_AGENT_ROUNDS,
+            min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
+        )
+        self.max_run_seconds = normalize_timeout_seconds(
+            max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS,
+            minimum=MIN_RUN_TIMEOUT_SECONDS,
+            maximum=MAX_RUN_TIMEOUT_SECONDS,
+            fallback=MAX_RUN_SECONDS,
+        )
+        self.auto_model_switch = bool(auto_model_switch)
+        self.skills_root = skills_root
+        ensure_runtime_skills(self.skills_root)
+        self.skills_store = SkillStore(self.skills_root)
+        self.skills_store_refresh_ts = 0.0
+        self.default_llm_config = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
+        self.global_profiles_payload = parse_llm_config_profiles(
+            self.default_llm_config, self.base_url, self.model
+        )
+        self.global_profiles = {
+            str(p.get("id")): dict(p) for p in self.global_profiles_payload.get("profiles", [])
+        }
+        self.global_active_profile_id = str(
+            self.global_profiles_payload.get("default_profile_id")
+            or (next(iter(self.global_profiles.keys())) if self.global_profiles else "ollama")
+        )
+        active = self.global_profiles.get(self.global_active_profile_id, {})
+        self._sync_global_ollama_defaults(active if isinstance(active, dict) else {})
+        self.thinking = False
+        self.codes_root = CODES_ROOT
+        self.codes_root.mkdir(parents=True, exist_ok=True)
+        self.crypto = CryptoBox(self.codes_root)
+        self._session_mgrs: dict[str, SessionManager] = {}
+        self._lock = threading.Lock()
+        self.tool_specs = TOOLS
+        self.web_ui_config_path = str(resolve_optional_file_path("", self.workspace))
+        self.web_ui_dir = resolve_web_ui_dir_path(DEFAULT_WEB_UI_DIR, self.workspace)
+        self.web_ui_external_requested = False
+        self.web_ui_external_enabled = False
+        self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
+        self.web_ui_assets_override: dict[str, str] = {}
+
+    def _builtin_web_ui_assets(self) -> dict[str, str]:
+        return {
+            "index.html": INDEX_HTML,
+            "style.css": APP_CSS,
+            "app.js": APP_JS,
+            "app.ts": APP_TS,
+            "skills.html": SKILLS_INDEX_HTML,
+            "skills.js": SKILLS_APP_JS,
+            "skills-extra.css": SKILLS_EXTRA_CSS,
+        }
+
+    def _resolve_external_web_ui_file(self, root: Path, name: str) -> Path | None:
+        candidates = [root / name, root / "frontend" / name]
+        for fp in candidates:
+            try:
+                if fp.exists() and fp.is_file():
+                    return fp
+            except Exception:
+                continue
+        return None
+
+    def validate_external_web_ui(self, ui_dir: Path) -> dict:
+        root = resolve_web_ui_dir_path(str(ui_dir), self.workspace)
+        out: dict = {
+            "ok": False,
+            "dir": str(root),
+            "required_files": list(WEB_UI_REQUIRED_FILES),
+            "optional_files": list(WEB_UI_OPTIONAL_FILES),
+            "resolved_files": {},
+            "missing_files": [],
+            "errors": [],
+            "checked_at": now_ts(),
+        }
+        if not root.exists():
+            out["errors"].append("directory_not_found")
+            return out
+        if not root.is_dir():
+            out["errors"].append("not_a_directory")
+            return out
+        for name in WEB_UI_REQUIRED_FILES:
+            fp = self._resolve_external_web_ui_file(root, name)
+            if not fp:
+                out["missing_files"].append(name)
+                continue
+            txt = try_read_text(fp, max_bytes=4_000_000)
+            if txt is None:
+                out["errors"].append(f"unreadable:{name}")
+                continue
+            if not str(txt).strip():
+                out["errors"].append(f"empty:{name}")
+                continue
+            out["resolved_files"][name] = str(fp)
+        for name in WEB_UI_OPTIONAL_FILES:
+            fp = self._resolve_external_web_ui_file(root, name)
+            if fp:
+                out["resolved_files"][name] = str(fp)
+        out["ok"] = not out["missing_files"] and not out["errors"]
+        return out
+
+    def _load_external_web_ui_assets(self, resolved_files: dict) -> tuple[dict[str, str], list[str]]:
+        assets: dict[str, str] = {}
+        errs: list[str] = []
+        for name, fp_raw in resolved_files.items():
+            fp = Path(str(fp_raw))
+            txt = try_read_text(fp, max_bytes=4_000_000)
+            if txt is None:
+                errs.append(f"read_failed:{name}")
+                continue
+            assets[name] = txt
+        return assets, errs
+
+    def export_builtin_web_ui(self, ui_dir: Path, overwrite: bool = False) -> dict:
+        root = resolve_web_ui_dir_path(str(ui_dir), self.workspace)
+        root.mkdir(parents=True, exist_ok=True)
+        assets = self._builtin_web_ui_assets()
+        written: list[str] = []
+        skipped: list[str] = []
+        errors: list[str] = []
+        for name, content in assets.items():
+            fp = root / name
+            try:
+                if fp.exists() and not overwrite:
+                    skipped.append(str(fp))
+                    continue
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_text(content, encoding="utf-8")
+                written.append(str(fp))
+            except Exception as exc:
+                errors.append(f"{name}:{exc}")
+        return {
+            "ok": not errors,
+            "dir": str(root),
+            "written": written,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    def web_ui_status(self) -> dict:
+        mode = "external" if self.web_ui_external_enabled else "builtin"
+        return {
+            "mode": mode,
+            "external_requested": bool(self.web_ui_external_requested),
+            "external_enabled": bool(self.web_ui_external_enabled),
+            "config_path": str(self.web_ui_config_path or ""),
+            "dir": str(self.web_ui_dir),
+            "validation": dict(self.web_ui_validation or {}),
+        }
+
+    def configure_web_ui(
+        self,
+        *,
+        config_path: str = "",
+        ui_dir: Path | str | None = None,
+        enable_external: bool = False,
+        export_builtin: bool = False,
+        export_overwrite: bool = False,
+    ) -> dict:
+        self.web_ui_config_path = str(config_path or self.web_ui_config_path or "")
+        self.web_ui_dir = resolve_web_ui_dir_path(str(ui_dir or DEFAULT_WEB_UI_DIR), self.workspace)
+        export_result: dict = {}
+        if export_builtin:
+            export_result = self.export_builtin_web_ui(self.web_ui_dir, overwrite=bool(export_overwrite))
+        self.web_ui_external_requested = bool(enable_external)
+        self.web_ui_external_enabled = False
+        self.web_ui_assets_override = {}
+        self.web_ui_validation = self.validate_external_web_ui(self.web_ui_dir)
+        if self.web_ui_external_requested and bool(self.web_ui_validation.get("ok", False)):
+            assets, errs = self._load_external_web_ui_assets(
+                self.web_ui_validation.get("resolved_files", {}) if isinstance(self.web_ui_validation, dict) else {}
+            )
+            if not errs:
+                self.web_ui_assets_override = assets
+                self.web_ui_external_enabled = True
+            else:
+                self.web_ui_validation = dict(self.web_ui_validation)
+                self.web_ui_validation["ok"] = False
+                self.web_ui_validation["errors"] = list(self.web_ui_validation.get("errors", [])) + errs
+        elif self.web_ui_external_requested:
+            self.web_ui_validation = dict(self.web_ui_validation)
+            self.web_ui_validation.setdefault("errors", [])
+            if "validation_failed" not in self.web_ui_validation["errors"]:
+                self.web_ui_validation["errors"].append("validation_failed")
+        else:
+            self.web_ui_validation = dict(self.web_ui_validation)
+            self.web_ui_validation["ok"] = False
+            self.web_ui_validation["reason"] = "external_web_ui_disabled"
+        out = self.web_ui_status()
+        out["export"] = export_result
+        return out
+
+    def refresh_web_ui_validation(self, reload_external: bool = False) -> dict:
+        validation = self.validate_external_web_ui(self.web_ui_dir)
+        self.web_ui_validation = validation
+        if reload_external and self.web_ui_external_requested:
+            self.web_ui_external_enabled = False
+            self.web_ui_assets_override = {}
+            if bool(validation.get("ok", False)):
+                assets, errs = self._load_external_web_ui_assets(validation.get("resolved_files", {}))
+                if not errs:
+                    self.web_ui_assets_override = assets
+                    self.web_ui_external_enabled = True
+                else:
+                    self.web_ui_validation = dict(validation)
+                    self.web_ui_validation["ok"] = False
+                    self.web_ui_validation["errors"] = list(self.web_ui_validation.get("errors", [])) + errs
+        return self.web_ui_status()
+
+    def _web_ui_asset(self, name: str) -> str:
+        if self.web_ui_external_enabled:
+            v = str(self.web_ui_assets_override.get(name, "") or "")
+            if v:
+                return v
+        return str(self._builtin_web_ui_assets().get(name, "") or "")
+
+    def web_ui_agent_index_html(self) -> str:
+        return self._web_ui_asset("index.html")
+
+    def web_ui_agent_style_css(self) -> str:
+        return self._web_ui_asset("style.css")
+
+    def web_ui_agent_app_js(self) -> str:
+        return self._web_ui_asset("app.js")
+
+    def web_ui_agent_app_ts(self) -> str:
+        txt = self._web_ui_asset("app.ts")
+        return txt if txt else APP_TS
+
+    def web_ui_skills_index_html(self) -> str:
+        return self._web_ui_asset("skills.html")
+
+    def web_ui_skills_style_css(self) -> str:
+        base = self._web_ui_asset("style.css")
+        extra = self._web_ui_asset("skills-extra.css")
+        if extra:
+            return base + "\n" + extra
+        return base + "\n" + SKILLS_EXTRA_CSS
+
+    def web_ui_skills_js(self) -> str:
+        return self._web_ui_asset("skills.js")
+
+    def user_root(self, user_id: str) -> Path:
+        root = self.codes_root / user_id
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def manager_for_user(self, user_id: str) -> SessionManager:
+        with self._lock:
+            if user_id in self._session_mgrs:
+                return self._session_mgrs[user_id]
+            root = self.user_root(user_id) / "sessions"
+            root.mkdir(parents=True, exist_ok=True)
+            mgr = SessionManager(
+                root,
+                self.base_url,
+                self.model,
+                self.skills_root,
+                self.js_lib_root,
+                self.crypto,
+                REPO_ROOT,
+                self.thinking,
+                self.default_llm_config,
+                self.default_language,
+                self.context_token_limit,
+                self.context_limit_locked,
+                self.max_rounds,
+                self.max_run_seconds,
+                self.auto_model_switch,
+            )
+            self._session_mgrs[user_id] = mgr
+            return mgr
+
+    def _known_user_ids(self) -> list[str]:
+        ids: set[str] = set()
+        try:
+            for path in sorted(self.codes_root.glob("user_*")):
+                if path.is_dir():
+                    ids.add(path.name)
+        except Exception:
+            pass
+        with self._lock:
+            ids.update(self._session_mgrs.keys())
+        return sorted(ids)
+
+    def apply_global_llm_config(self, config: dict, source: str = "") -> dict:
+        cfg = dict(config or {})
+        OllamaClient.clear_global_probe_cache()
+        parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
+        self.default_llm_config = cfg
+        self.global_profiles_payload = parsed
+        self.global_profiles = {str(p.get("id")): dict(p) for p in parsed.get("profiles", [])}
+        self.global_active_profile_id = str(
+            parsed.get("default_profile_id")
+            or (next(iter(self.global_profiles.keys())) if self.global_profiles else "ollama")
+        )
+        active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
+        self._sync_global_ollama_defaults(active)
+        self.thinking = False
+
+        def normalized_profiles() -> tuple[dict[str, dict], str]:
+            rows: dict[str, dict] = {}
+            for idx, profile in enumerate(parsed.get("profiles", [])):
+                pid = sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
+                if pid in rows:
+                    n = 2
+                    while f"{pid}-{n}" in rows:
+                        n += 1
+                    pid = f"{pid}-{n}"
+                item = dict(profile)
+                item["id"] = pid
+                item["selection"] = f"{pid}::{item.get('model','')}"
+                if source:
+                    item["source"] = source
+                rows[pid] = item
+            if not rows:
+                rows["ollama"] = {
+                    "id": "ollama",
+                    "provider": "ollama",
+                    "label": "Ollama",
+                    "model": self.model,
+                    "base_url": self.base_url,
+                    "temperature": 0.2,
+                    "request_timeout": DEFAULT_REQUEST_TIMEOUT,
+                    "selection": f"ollama::{self.model}",
+                    "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
+                    "media_endpoints": {},
+                    "source": source or "fallback",
+                }
+            requested = sanitize_profile_id(str(parsed.get("default_profile_id", "")))
+            active_id = requested if requested in rows else next(iter(rows.keys()))
+            return rows, active_id
+
+        profiles_map, active_id = normalized_profiles()
+
+        persisted_path = ""
+        persisted_error = ""
+        try:
+            LLM_CONFIG_PATH.write_text(json_dumps(cfg, indent=2), encoding="utf-8")
+            persisted_path = str(LLM_CONFIG_PATH)
+        except Exception as exc:
+            persisted_error = str(exc)
+
+        updated_users = 0
+        updated_sessions = 0
+        live_users = 0
+        live_sessions = 0
+        disk_users = 0
+        disk_sessions = 0
+        errors: list[str] = []
+
+        with self._lock:
+            live_mgrs = list(self._session_mgrs.items())
+        for uid, mgr in live_mgrs:
+            try:
+                mgr.reset_to_llm_config(cfg, source=source or "global-config")
+                live_users += 1
+                live_sessions += len(mgr.sessions)
+            except Exception as exc:
+                errors.append(f"{uid}: {exc}")
+
+        live_user_ids = {uid for uid, _ in live_mgrs}
+        for user_dir in sorted(self.codes_root.glob("user_*")):
+            if not user_dir.is_dir():
+                continue
+            uid = user_dir.name
+            if uid in live_user_ids:
+                continue
+            try:
+                user_prefs_path = user_dir / "user_prefs.json"
+                ui_lang = self.default_language
+                if user_prefs_path.exists():
+                    raw = self.crypto.read_json(user_prefs_path, {})
+                    ui_lang = normalize_ui_language(raw.get("ui_language", ui_lang))
+                active_profile = dict(profiles_map.get(active_id, {}))
+                ollama_profile = {}
+                if str(active_profile.get("provider", "")).lower() == "ollama":
+                    ollama_profile = dict(active_profile)
+                else:
+                    for prow in profiles_map.values():
+                        if str(prow.get("provider", "")).lower() == "ollama":
+                            ollama_profile = dict(prow)
+                            break
+                model_text = str(ollama_profile.get("model", self.model) or self.model)
+                base_text = str(ollama_profile.get("base_url", self.base_url) or self.base_url)
+                user_prefs_payload = {
+                    "model_profiles": profiles_map,
+                    "active_profile_id": active_id,
+                    "model": model_text,
+                    "ollama_base": base_text,
+                    "thinking": False,
+                    "ui_language": ui_lang,
+                    "updated_at": now_ts(),
+                }
+                self.crypto.write_json(user_prefs_path, user_prefs_payload)
+                disk_users += 1
+
+                sessions_root = user_dir / "sessions"
+                if sessions_root.exists() and sessions_root.is_dir():
+                    for state_file in sorted(sessions_root.glob("*/state.json")):
+                        if not state_file.exists() or not state_file.is_file():
+                            continue
+                        try:
+                            sraw = self.crypto.read_json(state_file, {})
+                            sraw["model_profiles"] = profiles_map
+                            sraw["active_profile_id"] = active_id
+                            sraw["multimodal_capability_cache"] = {}
+                            sraw["updated_at"] = now_ts()
+                            self.crypto.write_json(state_file, sraw)
+                            disk_sessions += 1
+                        except Exception as exc:
+                            errors.append(f"{uid}:{state_file.name}: {exc}")
+            except Exception as exc:
+                errors.append(f"{uid}: {exc}")
+
+        updated_users = live_users + disk_users
+        updated_sessions = live_sessions + disk_sessions
+
+        out = {
+            "ok": not errors,
+            "source": source,
+            "profiles": len(parsed.get("profiles", [])),
+            "default_profile_id": self.global_active_profile_id,
+            "updated_users": updated_users,
+            "updated_sessions": updated_sessions,
+            "live_users_updated": live_users,
+            "disk_users_updated": disk_users,
+            "live_sessions_updated": live_sessions,
+            "disk_sessions_updated": disk_sessions,
+            "persisted_path": persisted_path,
+        }
+        if persisted_error:
+            out["persist_warning"] = persisted_error
+        if errors:
+            out["errors"] = errors[:20]
+        return out
+
+    def source_bundle(self) -> bytes:
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Clouds_Coder.py", Path(__file__).read_text(encoding="utf-8"))
+            zf.writestr("frontend/index.html", INDEX_HTML)
+            zf.writestr("frontend/style.css", APP_CSS)
+            zf.writestr("frontend/app.js", APP_JS)
+            zf.writestr("frontend/app.ts", APP_TS)
+            zf.writestr("frontend/skills.html", SKILLS_INDEX_HTML)
+            zf.writestr("frontend/skills.js", SKILLS_APP_JS)
+            zf.writestr("frontend/skills-extra.css", SKILLS_EXTRA_CSS)
+            try:
+                ensure_runtime_skills(self.skills_root)
+            except Exception:
+                pass
+            if self.skills_root.exists():
+                for fp in sorted(self.skills_root.rglob("*")):
+                    if not fp.is_file() or fp.name == ".DS_Store":
+                        continue
+                    rel = fp.relative_to(self.workspace).as_posix()
+                    zf.writestr(rel, fp.read_text(encoding="utf-8"))
+            try:
+                ensure_offline_js_libs(self.workspace, force=False)
+            except Exception:
+                pass
+            if self.js_lib_root.exists():
+                for fp in sorted(self.js_lib_root.rglob("*")):
+                    if not fp.is_file() or fp.name == ".DS_Store":
+                        continue
+                    rel = fp.relative_to(self.workspace).as_posix()
+                    zf.writestr(rel, fp.read_bytes())
+            zf.writestr(
+                "README.txt",
+                "Run: python Clouds_Coder.py --host 0.0.0.0 --port 8080\n"
+                "Default model: OLLAMA_MODEL (fallback qwen2.5-coder:7b)\n"
+                "Default base URL: OLLAMA_BASE_URL (fallback http://127.0.0.1:11434)\n",
+            )
+        bio.seek(0)
+        return bio.read()
+
+    def tools_catalog(self) -> list[dict]:
+        out = []
+        for item in self.tool_specs:
+            fn = item.get("function", {})
+            out.append(
+                {
+                    "name": fn.get("name"),
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }
+            )
+        return out
+
+    def _ensure_skills_store(self, force: bool = False) -> SkillStore:
+        now = now_ts()
+        with self._lock:
+            if force or (now - float(self.skills_store_refresh_ts or 0.0)) >= SKILL_REFRESH_MIN_INTERVAL_SECONDS:
+                if force:
+                    ensure_runtime_skills(self.skills_root)
+                self.skills_store.reload(force=force)
+                self.skills_store_refresh_ts = now
+            return self.skills_store
+
+    def skills_catalog(self) -> list[dict]:
+        store = self._ensure_skills_store(force=False)
+        return store.list_metadata()
+
+    def skill_providers_catalog(self) -> list[dict]:
+        store = self._ensure_skills_store(force=False)
+        return store.list_providers()
+
+    def skill_protocols_catalog(self) -> list[dict]:
+        store = self._ensure_skills_store(force=False)
+        return store.list_protocols()
+
+    def skill_protocol_examples(self) -> dict:
+        store = self._ensure_skills_store(force=False)
+        return store.protocol_examples()
+
+    def _reload_skills_for_live_sessions(self):
+        self._ensure_skills_store(force=True)
+        with self._lock:
+            mgrs = list(self._session_mgrs.values())
+        for mgr in mgrs:
+            try:
+                with mgr.lock:
+                    for sess in mgr.sessions.values():
+                        try:
+                            sess._ensure_skills_ready(force=True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    def _decode_uploaded_text(self, raw: bytes) -> str:
+        for enc in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    def _normalize_skill_rel_dir(self, rel: str, fallback: str) -> str:
+        src = str(rel or "").replace("\\", "/")
+        parts: list[str] = []
+        for part in PurePosixPath(src).parts:
+            seg = str(part or "").strip()
+            if not seg or seg in {".", ".."}:
+                continue
+            seg = re.sub(r"[^A-Za-z0-9._-]+", "-", seg).strip("-._")
+            if not seg:
+                continue
+            parts.append(seg[:72])
+        if not parts:
+            fb = _sanitize_skill_slug(fallback, "uploaded-skill")
+            return f"uploaded/{fb}"
+        return "/".join(parts)
+
+    def _skills_tree_payload(self) -> dict:
+        self._ensure_skills_store(force=False)
+        root_node: dict = {"type": "dir", "name": "skills", "path": "", "children": []}
+        dir_nodes: dict[str, dict] = {"": root_node}
+        skill_rows: list[dict] = []
+        skill_files = sorted(self.skills_root.rglob("SKILL.md"))
+        for fp in skill_files:
+            if not fp.is_file():
+                continue
+            try:
+                rel_file = fp.relative_to(self.skills_root).as_posix()
+            except Exception:
+                continue
+            rel_dir = fp.parent.relative_to(self.skills_root).as_posix()
+            rel_key = "" if rel_dir in {".", ""} else rel_dir
+            text = try_read_text(fp) or ""
+            meta, _ = parse_front_matter(text)
+            skill_name = str(meta.get("name", "") or fp.parent.name).strip() or fp.parent.name
+            skill_desc = str(meta.get("description", "") or "").strip()
+            provider = str(meta.get("provider_id", "") or "")
+            protocol = str(meta.get("protocol", "") or "")
+            skill_row = {
+                "name": skill_name,
+                "description": skill_desc,
+                "path": rel_key,
+                "skill_file": rel_file,
+                "provider": provider,
+                "protocol": protocol,
+                "preview": trim(text, 1600),
+            }
+            skill_rows.append(skill_row)
+            cur = ""
+            if rel_key:
+                for seg in Path(rel_key).parts:
+                    next_key = f"{cur}/{seg}" if cur else str(seg)
+                    if next_key not in dir_nodes:
+                        parent = dir_nodes[cur]
+                        node = {"type": "dir", "name": str(seg), "path": next_key, "children": []}
+                        parent["children"].append(node)
+                        dir_nodes[next_key] = node
+                    cur = next_key
+            parent_node = dir_nodes[rel_key]
+            parent_node["children"].append(
+                {
+                    "type": "skill",
+                    "name": skill_name,
+                    "description": skill_desc,
+                    "path": rel_key,
+                    "skill_file": rel_file,
+                    "provider": provider,
+                    "protocol": protocol,
+                    "preview": trim(text, 800),
+                }
+            )
+
+        def sort_tree(node: dict):
+            children = list(node.get("children", []))
+            dirs = [x for x in children if x.get("type") == "dir"]
+            skills = [x for x in children if x.get("type") == "skill"]
+            dirs.sort(key=lambda x: str(x.get("name", "")).lower())
+            skills.sort(
+                key=lambda x: (
+                    str(x.get("name", "")).lower(),
+                    str(x.get("skill_file", "")).lower(),
+                )
+            )
+            node["children"] = dirs + skills
+            for item in dirs:
+                sort_tree(item)
+
+        sort_tree(root_node)
+        return {"root": root_node, "skills": skill_rows}
+
+    def write_skill_file(self, path: str, content: str, overwrite: bool = False) -> dict:
+        rel_raw = str(path or "").strip().replace("\\", "/")
+        if not rel_raw:
+            raise ValueError("path is required")
+        rel_path = Path(rel_raw)
+        if rel_path.name.lower() == "skill.md":
+            final_rel = rel_path.parent / "SKILL.md"
+        else:
+            final_rel = rel_path / "SKILL.md"
+        try:
+            target = safe_path(final_rel.as_posix(), self.skills_root)
+        except Exception as exc:
+            raise ValueError(f"invalid skill path: {exc}") from exc
+        if target.exists() and not overwrite:
+            raise ValueError(f"skill already exists at {target}; set overwrite=true to replace it")
+        body = str(content or "").strip()
+        if not body:
+            raise ValueError("content is required")
+        meta, _ = parse_front_matter(body)
+        if not meta.get("name") or not meta.get("description"):
+            inferred_name = _sanitize_skill_slug(target.parent.name, "custom-skill")
+            inferred_desc = "User provided reusable skill."
+            if not body.startswith("---"):
+                body = (
+                    "---\n"
+                    f"name: {inferred_name}\n"
+                    f"description: {inferred_desc}\n"
+                    "---\n\n"
+                    f"{body}\n"
+                )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        self._reload_skills_for_live_sessions()
+        try:
+            rel_saved = target.resolve().relative_to(self.skills_root.resolve()).as_posix()
+        except Exception:
+            rel_saved = str(target)
+        return {"ok": True, "path": rel_saved, "name": str(target.parent.name)}
+
+    def scan_skills(self) -> dict:
+        self._reload_skills_for_live_sessions()
+        store = self._ensure_skills_store(force=False)
+        tree = self._skills_tree_payload()
+        return {
+            "skills_count": len(store.skills),
+            "skill_names": sorted(store.list_names())[:300],
+            "skills": tree.get("skills", []),
+            "tree": tree.get("root", {"type": "dir", "name": "skills", "path": "", "children": []}),
+            "providers": store.list_providers(),
+            "protocols": store.list_protocols(),
+            "warnings": list(store.warnings),
+        }
+
+    def skill_detail(self, skill_file: str) -> dict:
+        rel_raw = str(skill_file or "").strip().replace("\\", "/")
+        if not rel_raw:
+            raise ValueError("skill_file is required")
+        rel_path = Path(rel_raw)
+        if rel_path.name.lower() != "skill.md":
+            rel_path = rel_path / "SKILL.md"
+        try:
+            target = safe_path(rel_path.as_posix(), self.skills_root)
+        except Exception as exc:
+            raise ValueError(f"invalid skill_file: {exc}") from exc
+        if not target.exists() or not target.is_file():
+            raise ValueError(f"skill not found: {rel_raw}")
+        text = try_read_text(target) or ""
+        meta, body = parse_front_matter(text)
+        try:
+            rel_dir = target.parent.relative_to(self.skills_root).as_posix()
+            rel_file = target.relative_to(self.skills_root).as_posix()
+        except Exception:
+            rel_dir = target.parent.as_posix()
+            rel_file = target.as_posix()
+        return {
+            "name": str(meta.get("name", "") or target.parent.name).strip() or target.parent.name,
+            "description": str(meta.get("description", "") or "").strip(),
+            "path": "" if rel_dir in {"", "."} else rel_dir,
+            "skill_file": rel_file,
+            "provider": str(meta.get("provider_id", "") or ""),
+            "protocol": str(meta.get("protocol", "") or ""),
+            "content": text,
+            "body": body,
+        }
+
+    def import_uploaded_skills(self, filename: str, raw: bytes, mime: str = "", overwrite: bool = False) -> dict:
+        safe_name = Path(str(filename or "skills-upload.bin")).name
+        lower = safe_name.lower()
+        imported: list[dict] = []
+        skipped: list[dict] = []
+        errors: list[dict] = []
+
+        def save_skill(rel_dir: str, text: str, source: str):
+            rel_norm = self._normalize_skill_rel_dir(rel_dir, Path(source).stem or "uploaded-skill")
+            meta, _ = parse_front_matter(str(text or ""))
+            inferred_name = str(meta.get("name", "")).strip()
+            inferred_desc = str(meta.get("description", "")).strip()
+            try:
+                saved = self.write_skill_file(rel_norm, text, overwrite=overwrite)
+                imported.append(
+                    {
+                        "source": source,
+                        "path": saved.get("path", ""),
+                        "name": inferred_name or saved.get("name", Path(rel_norm).name),
+                        "description": inferred_desc,
+                    }
+                )
+            except Exception as exc:
+                msg = str(exc)
+                row = {"source": source, "path": rel_norm, "error": msg}
+                if "already exists" in msg and not overwrite:
+                    skipped.append(row)
+                else:
+                    errors.append(row)
+
+        try:
+            if lower.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+                    members = sorted(zf.infolist(), key=lambda x: x.filename.lower())
+                    for info in members:
+                        if info.is_dir():
+                            continue
+                        rel_name = str(info.filename or "").replace("\\", "/")
+                        if Path(rel_name).name.lower() != "skill.md":
+                            continue
+                        try:
+                            data = zf.read(info.filename)
+                        except Exception as exc:
+                            errors.append({"source": rel_name, "error": f"read failed: {exc}"})
+                            continue
+                        text = self._decode_uploaded_text(data)
+                        parent_rel = str(PurePosixPath(rel_name).parent)
+                        if parent_rel in {"", "."}:
+                            parent_rel = f"uploaded/{_sanitize_skill_slug(Path(safe_name).stem, 'zip-skill')}"
+                        save_skill(parent_rel, text, rel_name)
+            elif lower.endswith((".md", ".markdown", ".txt")):
+                text = self._decode_uploaded_text(raw)
+                raw_rel = str(PurePosixPath(str(filename or ""))).replace("\\", "/")
+                parent_rel = str(PurePosixPath(raw_rel).parent)
+                if Path(raw_rel).name.lower() != "skill.md":
+                    parent_rel = str(PurePosixPath(parent_rel) / _sanitize_skill_slug(Path(raw_rel).stem, "uploaded-skill"))
+                if parent_rel in {"", "."}:
+                    parent_rel = f"uploaded/{_sanitize_skill_slug(Path(safe_name).stem, 'uploaded-skill')}"
+                save_skill(parent_rel, text, safe_name)
+            else:
+                raise ValueError("unsupported upload type; use .zip or .md/.markdown/.txt")
+        except Exception as exc:
+            errors.append({"source": safe_name, "error": str(exc)})
+
+        scan = self.scan_skills()
+        return {
+            "ok": len(errors) == 0,
+            "filename": safe_name,
+            "mime": str(mime or ""),
+            "imported_count": len(imported),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "imported": imported,
+            "skipped": skipped,
+            "errors": errors,
+            "scan": scan,
+        }
+
+    def _llm_client_for_user(self, user_id: str) -> tuple[OllamaClient, bool, dict]:
+        mgr = self.manager_for_user(user_id)
+        active = dict(mgr.user_model_profiles.get(mgr.user_active_profile_id, {}))
+        provider = str(active.get("provider", "ollama") or "ollama")
+        model = str(active.get("model", mgr.model) or mgr.model)
+        base_url = str(active.get("base_url", mgr.ollama_base) or mgr.ollama_base)
+        timeout = int(DEFAULT_REQUEST_TIMEOUT or DEFAULT_TIMEOUT_SECONDS)
+        client = OllamaClient(
+            base_url=base_url,
+            model=model,
+            timeout=max(MIN_TIMEOUT_SECONDS, min(timeout, MAX_TIMEOUT_SECONDS)),
+            provider=provider,
+            endpoint=str(active.get("endpoint", "") or ""),
+            api_key=str(active.get("api_key", "") or ""),
+            headers=active.get("headers", {}) if isinstance(active.get("headers"), dict) else {},
+            payload_template=str(active.get("payload_template", "") or ""),
+            thinking_stream=bool(active.get("thinking_stream", False)),
+        )
+        client.apply_profile(active)
+        think = False
+        return client, think, active
+
+    def _fallback_skill_markdown(self, skill_name: str, description: str, nodes: list[dict], rules: list[str]) -> str:
+        norm_name = _sanitize_skill_slug(skill_name, "generated-skill")
+        desc = description.strip() or "Generated skill from flowchart and local skill-building rules."
+        node_lines = []
+        for i, n in enumerate(nodes, start=1):
+            title = str(n.get("title", "") or n.get("type", "") or f"step-{i}").strip()
+            body = str(n.get("content", "") or "").strip()
+            if body:
+                node_lines.append(f"{i}. {title}: {body}")
+            else:
+                node_lines.append(f"{i}. {title}")
+        if not node_lines:
+            node_lines = ["1. Capture user intent and constraints.", "2. Execute deterministically with clear checks."]
+        rule_lines = "\n".join(f"- {r}" for r in (rules[:8] or ["Keep SKILL.md concise and tool-oriented."]))
+        wf_lines = "\n".join(f"- {x}" for x in node_lines)
+        return f"""---
+name: {norm_name}
+description: {desc}
+---
+
+# {norm_name}
+
+Use this skill when tasks match this flow pattern and reusable execution is needed.
+
+## Trigger
+- User asks for repeatable workflow execution in this domain.
+- User needs deterministic steps and clear quality checks.
+
+## Workflow
+{wf_lines}
+
+## Local Build Rules
+{rule_lines}
+
+## Output Contract
+- Return concrete outputs, key assumptions, and next actions.
+- Keep responses concise unless the user requests more depth.
+"""
+
+    def generate_skill_from_flow(self, user_id: str, payload: dict) -> dict:
+        skill_name = str(payload.get("skill_name", "") or "").strip() or "generated-skill"
+        skill_path = str(payload.get("skill_path", "") or "").strip() or f"generated/{_sanitize_skill_slug(skill_name)}"
+        description = str(payload.get("description", "") or "").strip()
+        extra_requirements = str(payload.get("requirements", "") or "").strip()
+        nodes_raw = payload.get("nodes", [])
+        edges_raw = payload.get("edges", [])
+        nodes: list[dict] = nodes_raw if isinstance(nodes_raw, list) else []
+        edges: list[dict] = edges_raw if isinstance(edges_raw, list) else []
+        nodes_clean: list[dict] = []
+        for i, row in enumerate(nodes):
+            if not isinstance(row, dict):
+                continue
+            nid = str(row.get("id", "") or f"n{i+1}")
+            nodes_clean.append(
+                {
+                    "id": nid,
+                    "type": str(row.get("type", "step") or "step"),
+                    "title": str(row.get("title", "") or nid),
+                    "content": str(row.get("content", "") or ""),
+                }
+            )
+        edges_clean: list[dict] = []
+        for row in edges:
+            if not isinstance(row, dict):
+                continue
+            frm = str(row.get("from", "") or "").strip()
+            to = str(row.get("to", "") or "").strip()
+            if not frm or not to:
+                continue
+            edges_clean.append({"from": frm, "to": to, "label": str(row.get("label", "") or "")})
+        knowledge = analyze_skill_building_knowledge(self.workspace)
+        rules = [str(x) for x in knowledge.get("rules", []) if str(x).strip()]
+        llm, think, profile = self._llm_client_for_user(user_id)
+        mgr = self.manager_for_user(user_id)
+        lang = normalize_ui_language(getattr(mgr, "user_language", self.default_language))
+        prompt_data = {
+            "target_skill_name": skill_name,
+            "target_skill_path": skill_path,
+            "description": description,
+            "requirements": extra_requirements,
+            "flow_nodes": nodes_clean,
+            "flow_edges": edges_clean,
+            "local_skill_rules": rules[:12],
+            "knowledge_points": knowledge.get("knowledge_points", []),
+        }
+        system = (
+            "You are Skills_Gen. Convert flowchart structures into high-quality Codex SKILL.md files. "
+            f"{model_language_instruction(lang)} "
+            "Return JSON only with keys: skill_name, skill_path, description, skill_markdown, quality_checks."
+        )
+        user_prompt = (
+            "Generate one robust SKILL.md from this data.\n"
+            "Requirements:\n"
+            "- YAML frontmatter with name+description.\n"
+            "- concise, deterministic, practical workflow.\n"
+            "- include trigger, workflow, output contract, and failure handling.\n"
+            "- no markdown fences around JSON.\n\n"
+            f"{json_dumps(prompt_data, indent=2)}"
+        )
+        llm_raw = ""
+        llm_thinking = ""
+        parsed: dict = {}
+        try:
+            rsp = llm.chat(
+                [{"role": "user", "content": user_prompt}],
+                system=system,
+                max_tokens=2600,
+                temperature=0.2,
+                think=think,
+                stream_thinking=bool(llm.thinking_stream and think),
+            )
+            llm_raw = str(rsp.get("content", "") or "")
+            llm_thinking = str(rsp.get("thinking", "") or "")
+            parsed = extract_json_object_from_text(llm_raw, {})
+        except Exception as exc:
+            parsed = {"error": str(exc)}
+
+        out_name = str(parsed.get("skill_name", "") or skill_name).strip() or skill_name
+        out_path = str(parsed.get("skill_path", "") or skill_path).strip() or skill_path
+        out_desc = str(parsed.get("description", "") or description).strip()
+        out_md = str(parsed.get("skill_markdown", "") or "").strip()
+        if not out_md:
+            out_md = self._fallback_skill_markdown(out_name, out_desc, nodes_clean, rules)
+        meta, _ = parse_front_matter(out_md)
+        if not meta.get("name") or not meta.get("description"):
+            fallback_name = _sanitize_skill_slug(out_name, "generated-skill")
+            fallback_desc = out_desc or "Generated skill from flowchart."
+            out_md = (
+                "---\n"
+                f"name: {fallback_name}\n"
+                f"description: {fallback_desc}\n"
+                "---\n\n"
+                f"{out_md}\n"
+            )
+        auto_inject = bool(payload.get("auto_inject", True))
+        save_result = {"ok": False}
+        if auto_inject:
+            save_result = self.write_skill_file(
+                out_path,
+                out_md,
+                overwrite=bool(payload.get("overwrite", True)),
+            )
+        return {
+            "ok": True,
+            "skill_name": out_name,
+            "skill_path": out_path,
+            "description": out_desc,
+            "skill_markdown": out_md,
+            "auto_injected": auto_inject,
+            "save_result": save_result,
+            "model_profile": {
+                "provider": str(profile.get("provider", "")),
+                "model": str(profile.get("model", llm.model)),
+                "base_url": str(profile.get("base_url", llm.base_url)),
+                "thinking": bool(think),
+            },
+            "knowledge_summary": {
+                "rules": rules[:10],
+                "sources": knowledge.get("sources", []),
+            },
+            "llm_raw": llm_raw,
+            "llm_thinking": llm_thinking,
+            "llm_parsed": parsed,
+        }
+
+    def model_catalog(self) -> dict:
+        opts = []
+        for pid, profile in self.global_profiles.items():
+            model = str(profile.get("model", ""))
+            caps = merge_multimodal_capabilities(
+                infer_model_multimodal_capabilities(str(profile.get("provider", "")), model),
+                parse_capability_overrides(profile.get("capabilities", {})),
+            )
+            opts.append(
+                {
+                    "selection": f"{pid}::{model}",
+                    "profile_id": pid,
+                    "provider": profile.get("provider", ""),
+                    "model": model,
+                    "label": f"{profile.get('label', pid)} | {model}",
+                    "source": profile.get("source", ""),
+                    "capabilities": caps,
+                }
+            )
+        selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
+        selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
+        active_caps = merge_multimodal_capabilities(
+            infer_model_multimodal_capabilities(
+                str(selected_profile.get("provider", "")),
+                str(selected_profile.get("model", self.model)),
+            ),
+            parse_capability_overrides(selected_profile.get("capabilities", {})),
+        )
+        return {
+            "provider": selected_profile.get("provider", "ollama"),
+            "models": [x["selection"] for x in opts] or [self.model],
+            "options": opts,
+            "selected": selected,
+            "thinking": self.thinking,
+            "thinking_mode": "auto",
+            "active_capabilities": active_caps,
+        }
+
+    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+        raw = str(model or "").strip()
+        if not raw:
+            raise ValueError("model required")
+        if "::" in raw:
+            pid, selected_model = raw.split("::", 1)
+        else:
+            pid, selected_model = self.global_active_profile_id, raw
+        pid = re.sub(r"[^A-Za-z0-9._-]+", "-", pid.strip().lower()).strip("-") or self.global_active_profile_id
+        if pid not in self.global_profiles:
+            self.global_profiles[pid] = {
+                "id": pid,
+                "provider": "ollama",
+                "label": pid,
+                "model": selected_model or self.model,
+                "base_url": self.base_url,
+                "capabilities": infer_model_multimodal_capabilities("ollama", selected_model or self.model),
+                "media_endpoints": {},
+                "source": "runtime",
+            }
+        if selected_model.strip():
+            self.global_profiles[pid]["model"] = selected_model.strip()
+            if str(self.global_profiles[pid].get("provider", "")).lower() == "ollama":
+                self.global_profiles[pid]["capabilities"] = infer_model_multimodal_capabilities(
+                    "ollama", selected_model.strip()
+                )
+        self.global_active_profile_id = pid
+        selected_profile = dict(self.global_profiles.get(pid, {}))
+        self._sync_global_ollama_defaults(selected_profile)
+        self.thinking = False
+        selection = f"{pid}::{str(selected_profile.get('model', self.model) or self.model)}"
+        with self._lock:
+            for mgr in self._session_mgrs.values():
+                try:
+                    mgr.set_runtime_model(selection, self.thinking)
+                except Exception:
+                    pass
+        return self.model_catalog()
+
+class AgentHTTPServer(ThreadingHTTPServer):
+    def __init__(self, addr: tuple[str, int], handler, app: AppContext):
+        super().__init__(addr, handler)
+        self.app = app
+
+    def handle_error(self, request, client_address):
+        _, exc, _ = sys.exc_info()
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)):
+            return
+        return super().handle_error(request, client_address)
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebAgent/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
+            return
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _session_mgr(self) -> SessionManager:
+        return self.app.manager_for_user(self._user_id())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_bytes(self, data: bytes, content_type: str, filename: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", "inline")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _sse_write(self, payload: bytes) -> bool:
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+            return False
+
+    def do_GET(self):
+        parsed_url = urlparse(self.path)
+        path = unquote(parsed_url.path)
+        query = parse_qs(parsed_url.query or "")
+        refresh_probe = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False) or _to_bool_like(
+            (query.get("probe", ["0"]) or ["0"])[0], default=False
+        )
+        mgr = self._session_mgr()
+        if path == "/":
+            return self._send_text(self.app.web_ui_agent_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_agent_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/app.js":
+            return self._send_text(self.app.web_ui_agent_app_js(), "application/javascript; charset=utf-8")
+        if path == "/assets/app.ts":
+            return self._send_text(self.app.web_ui_agent_app_ts(), "text/plain; charset=utf-8")
+        if path == "/api/health":
+            return self._send_json({"ok": True, "version": APP_VERSION, "workspace": str(WORKDIR)})
+        if path == "/api/webui/validate":
+            reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
+            return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+        if path == "/api/config":
+            model_cat = mgr.model_catalog()
+            skills_port = int(getattr(self.app, "skills_port", 0) or 0)
+            skills_enabled = bool(getattr(self.app, "skills_ui_enabled", False))
+            skills_url = ""
+            if skills_enabled and skills_port > 0:
+                host = self.headers.get("Host", "").strip()
+                if host:
+                    host_only = host.split(":", 1)[0]
+                    skills_url = f"http://{host_only}:{skills_port}"
+                else:
+                    skills_url = f"http://127.0.0.1:{skills_port}"
+            web_ui_state = self.app.web_ui_status()
+            return self._send_json(
+                {
+                    "workspace": str(self.app.workspace),
+                    "client_ip": self._client_ip(),
+                    "user_id": self._user_id(),
+                    "codes_root": str(self.app.codes_root),
+                    "user_root": str(self.app.user_root(self._user_id())),
+                    "ollama_base_url": mgr.ollama_base,
+                    "model": model_cat.get("selected", mgr.model),
+                    "thinking": model_cat.get("thinking", mgr.thinking),
+                    "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "supported_languages": supported_ui_languages_payload(),
+                    "repo_root": str(REPO_ROOT),
+                    "skills_root": str(self.app.skills_root),
+                    "llm_config_path": str(LLM_CONFIG_PATH),
+                    "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
+                    "skills_port": skills_port,
+                    "skills_ui_enabled": skills_enabled,
+                    "skills_ui_url": skills_url,
+                    "web_ui": web_ui_state,
+                    "web_ui_mode": str(web_ui_state.get("mode", "builtin")),
+                    "web_ui_external_enabled": bool(web_ui_state.get("external_enabled", False)),
+                    "web_ui_dir": str(web_ui_state.get("dir", "")),
+                    "context_token_limit": int(mgr.context_token_limit),
+                    "context_limit_locked": bool(mgr.context_limit_locked),
+                    "run_timeout": int(mgr.max_run_seconds),
+                    "auto_model_switch": bool(mgr.auto_model_switch),
+                    "timeout_min": int(MIN_RUN_TIMEOUT_SECONDS),
+                    "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
+                }
+            )
+        if path == "/api/models":
+            return self._send_json(mgr.model_catalog(force_probe=refresh_probe))
+        if path == "/api/tools":
+            return self._send_json(self.app.tools_catalog())
+        if path == "/api/skills":
+            return self._send_json(self.app.skills_catalog())
+        if path == "/api/skills/providers":
+            return self._send_json(self.app.skill_providers_catalog())
+        if path == "/api/skills/protocols":
+            return self._send_json(self.app.skill_protocols_catalog())
+        if path == "/api/skills/protocol-examples":
+            return self._send_json(self.app.skill_protocol_examples())
+        if path == "/api/sessions":
+            return self._send_json(mgr.list())
+        if path == "/api/export/source.zip":
+            return self._send_json({"error": "Use /api/sessions/{id}/export.zip for current user session export."}, status=400)
+        m = re.match(r"^/api/sessions/([^/]+)/preview-code-stages/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                payload = sess.code_preview_stages(rel)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(payload)
+        m = re.match(r"^/api/sessions/([^/]+)/preview-code/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            stage = str((query.get("stage", ["latest"]) or ["latest"])[0] or "latest").strip() or "latest"
+            try:
+                payload = sess.code_preview_payload(rel, stage_id=stage)
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except KeyError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(payload)
+        m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                fp = safe_path(rel, sess.files_root)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            if not fp.exists() or not fp.is_file():
+                return self._send_json({"error": "file not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/octet-stream")
+            if content_type.startswith("text/") and "charset=" not in content_type.lower():
+                content_type = f"{content_type}; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        m = re.match(r"^/api/sessions/([^/]+)/render-state$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                payload = sess.render_state_payload()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(payload)
+        m = re.match(r"^/api/sessions/([^/]+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            lite_snapshot = _to_bool_like((query.get("lite", ["0"]) or ["0"])[0], default=False)
+            include_model_catalog = _to_bool_like(
+                (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
+            ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
+            return self._send_json(
+                sess.snapshot(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+            )
+        m = re.match(r"^/api/sessions/([^/]+)/events$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            return self._stream_events(sess)
+        m = re.match(r"^/api/sessions/([^/]+)/models$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            return self._send_json(sess.model_catalog(force_probe=refresh_probe))
+        m = re.match(r"^/api/sessions/([^/]+)/export.zip$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            return self._send_bytes(sess.export_bundle(), "application/zip", f"{sess.id}_session_export.zip")
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        mgr = self._session_mgr()
+        if path == "/api/config/model":
+            payload = self._read_json()
+            model = str(payload.get("selection", payload.get("model", ""))).strip()
+            if not model:
+                return self._send_json({"error": "model required"}, status=400)
+            try:
+                return self._send_json(mgr.set_runtime_model(model, None))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/config/language":
+            payload = self._read_json()
+            language = str(payload.get("language", payload.get("lang", ""))).strip()
+            if not language:
+                return self._send_json({"error": "language required"}, status=400)
+            try:
+                out = mgr.set_user_language(language)
+                out["supported_languages"] = supported_ui_languages_payload()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/webui/export":
+            payload = self._read_json()
+            ui_dir_raw = str(payload.get("dir", "") or "").strip()
+            overwrite = bool(payload.get("overwrite", False))
+            ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
+            out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
+            return self._send_json(out, status=201 if out.get("ok") else 400)
+        m = re.match(r"^/api/sessions/([^/]+)/config/model$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            payload = self._read_json()
+            selection = str(payload.get("selection", payload.get("model", ""))).strip()
+            if not selection:
+                return self._send_json({"error": "selection required"}, status=400)
+            model_override = payload.get("model_override")
+            try:
+                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
+                mgr._sync_from_session(sess, apply_to_all=True)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(out)
+        m = re.match(r"^/api/sessions/([^/]+)/config/language$", path)
+        if m:
+            sid = m.group(1)
+            payload = self._read_json()
+            language = str(payload.get("language", payload.get("lang", ""))).strip()
+            if not language:
+                return self._send_json({"error": "language required"}, status=400)
+            set_user_default = bool(payload.get("set_user_default", False))
+            try:
+                out = mgr.set_session_language(sid, language, set_user_default=set_user_default)
+                out["supported_languages"] = supported_ui_languages_payload()
+            except KeyError:
+                return self._send_json({"error": "session not found"}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(out)
+        m = re.match(r"^/api/sessions/([^/]+)/config/import-default$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                out = mgr.import_default_llm_config(sess.id)
+                return self._send_json({"ok": True, "catalog": out, "source": str(LLM_CONFIG_PATH)})
+            except FileNotFoundError as exc:
+                fallback_cfg = {}
+                fallback_source = ""
+                for item in reversed(sess.uploads):
+                    name = str(item.get("filename", "")).lower()
+                    rel = str(item.get("workspace_path", ""))
+                    if not rel or (not name.endswith(".json") and "config" not in name):
+                        continue
+                    try:
+                        fp = safe_path(rel, sess.files_root)
+                        raw = try_read_text(fp) or ""
+                        obj = parse_json_object(raw, {})
+                        if obj and looks_like_llm_config(obj):
+                            fallback_cfg = obj
+                            fallback_source = rel
+                            break
+                    except Exception:
+                        continue
+                if fallback_cfg:
+                    try:
+                        out = mgr.apply_llm_config(sess.id, fallback_cfg, source=fallback_source or "uploaded-config")
+                        return self._send_json({"ok": True, "catalog": out, "source": fallback_source or "uploaded-config"})
+                    except Exception as inner:
+                        return self._send_json({"error": str(inner)}, status=400)
+                return self._send_json({"error": f"{exc}. Please upload LLM.config.json in WebUI first."}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/sessions":
+            payload = self._read_json()
+            sess = mgr.create(payload.get("title"))
+            return self._send_json({"id": sess.id, "title": sess.title, "ui_language": sess.ui_language}, status=201)
+        m = re.match(r"^/api/sessions/([^/]+)/uploads$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            payload = self._read_json()
+            filename = str(payload.get("filename", "")).strip()
+            mime = str(payload.get("mime", "")).strip()
+            content_b64 = str(payload.get("content_b64", "")).strip()
+            if not filename or not content_b64:
+                return self._send_json({"error": "filename and content_b64 required"}, status=400)
+            try:
+                raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+            except Exception:
+                return self._send_json({"error": "invalid base64 payload"}, status=400)
+            if len(raw) > 20 * 1024 * 1024:
+                return self._send_json({"error": "max upload size is 20MB"}, status=413)
+            meta = sess.add_upload(filename, raw, mime)
+            if isinstance(meta.get("model_catalog"), dict):
+                try:
+                    mgr._sync_from_session(sess, apply_to_all=True)
+                except Exception:
+                    pass
+            return self._send_json(meta, status=201)
+        m = re.match(r"^/api/sessions/([^/]+)/render-frame$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            payload = self._read_json()
+            frame = payload.get("frame") if isinstance(payload, dict) else {}
+            if not isinstance(frame, dict):
+                frame = payload if isinstance(payload, dict) else {}
+            try:
+                out = sess.push_render_frame(frame if isinstance(frame, dict) else {})
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(out, status=201)
+        m = re.match(r"^/api/sessions/([^/]+)/message$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            payload = self._read_json()
+            text = str(payload.get("content", "")).strip()
+            if not text:
+                return self._send_json({"error": "content required"}, status=400)
+            try:
+                out = sess.submit_user_message(text)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(out if isinstance(out, dict) else {"ok": True})
+        m = re.match(r"^/api/sessions/([^/]+)/compact$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            sess.manual_compact()
+            return self._send_json({"ok": True})
+        m = re.match(r"^/api/sessions/([^/]+)/interrupt$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            sess.interrupt()
+            return self._send_json({"ok": True})
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_PATCH(self):
+        path = unquote(urlparse(self.path).path)
+        mgr = self._session_mgr()
+        m = re.match(r"^/api/sessions/([^/]+)$", path)
+        if not m:
+            return self._send_json({"error": "not found"}, status=404)
+        sid = m.group(1)
+        payload = self._read_json()
+        title = str(payload.get("title", "")).strip()
+        if not title:
+            return self._send_json({"error": "title required"}, status=400)
+        try:
+            sess = mgr.rename(sid, title)
+        except KeyError:
+            return self._send_json({"error": "session not found"}, status=404)
+        return self._send_json({"id": sess.id, "title": sess.title})
+
+    def do_DELETE(self):
+        path = unquote(urlparse(self.path).path)
+        mgr = self._session_mgr()
+        m = re.match(r"^/api/sessions/([^/]+)$", path)
+        if not m:
+            return self._send_json({"error": "not found"}, status=404)
+        ok = mgr.delete(m.group(1))
+        if not ok:
+            return self._send_json({"error": "session not found"}, status=404)
+        return self._send_json({"ok": True})
+
+    def _stream_events(self, sess: SessionState):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        sub = sess.events.subscribe()
+        try:
+            hello = f"data: {json_dumps({'type': 'hello', 'session_id': sess.id})}\n\n".encode("utf-8")
+            if not self._sse_write(hello):
+                return
+            while True:
+                try:
+                    event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    chunk = f"data: {json_dumps(event)}\n\n".encode("utf-8")
+                except queue.Empty:
+                    chunk = f": ping {int(now_ts())}\n\n".encode("utf-8")
+                if not self._sse_write(chunk):
+                    break
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        finally:
+            sess.events.unsubscribe(sub)
+
+class SkillsHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebSkills/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
+            return
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _session_mgr(self) -> SessionManager:
+        return self.app.manager_for_user(self._user_id())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed_url = urlparse(self.path)
+        path = unquote(parsed_url.path)
+        query = parse_qs(parsed_url.query or "")
+        refresh_probe = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False) or _to_bool_like(
+            (query.get("probe", ["0"]) or ["0"])[0], default=False
+        )
+        mgr = self._session_mgr()
+        if path == "/":
+            return self._send_text(self.app.web_ui_skills_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_skills_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/skills.js":
+            return self._send_text(self.app.web_ui_skills_js(), "application/javascript; charset=utf-8")
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "skills-studio", "version": APP_VERSION})
+        if path == "/api/webui/validate":
+            reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
+            return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+        if path == "/api/skillslab/config":
+            web_ui_state = self.app.web_ui_status()
+            return self._send_json(
+                {
+                    "workspace": str(self.app.workspace),
+                    "skills_root": str(self.app.skills_root),
+                    "llm_config_path": str(LLM_CONFIG_PATH),
+                    "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
+                    "skills_port": int(getattr(self.app, "skills_port", 0) or 0),
+                    "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
+                    "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "supported_languages": supported_ui_languages_payload(),
+                    "web_ui": web_ui_state,
+                }
+            )
+        if path == "/api/skillslab/rules":
+            return self._send_json(analyze_skill_building_knowledge(self.app.workspace))
+        if path == "/api/skillslab/skills":
+            return self._send_json(self.app.scan_skills())
+        if path == "/api/skillslab/skill":
+            q = parse_qs(urlparse(self.path).query)
+            skill_file = str((q.get("skill_file") or q.get("path") or [""])[0]).strip()
+            try:
+                return self._send_json(self.app.skill_detail(skill_file))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        mgr = self._session_mgr()
+        if path == "/api/webui/export":
+            payload = self._read_json()
+            ui_dir_raw = str(payload.get("dir", "") or "").strip()
+            overwrite = bool(payload.get("overwrite", False))
+            ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
+            out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
+            return self._send_json(out, status=201 if out.get("ok") else 400)
+        if path == "/api/skillslab/model":
+            payload = self._read_json()
+            selection = str(payload.get("selection", payload.get("model", ""))).strip()
+            if not selection:
+                return self._send_json({"error": "selection required"}, status=400)
+            try:
+                return self._send_json(mgr.set_runtime_model(selection, None))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/skillslab/language":
+            payload = self._read_json()
+            language = str(payload.get("language", payload.get("lang", ""))).strip()
+            if not language:
+                return self._send_json({"error": "language required"}, status=400)
+            try:
+                out = mgr.set_user_language(language)
+                out["supported_languages"] = supported_ui_languages_payload()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/skillslab/generate":
+            payload = self._read_json()
+            try:
+                out = self.app.generate_skill_from_flow(self._user_id(), payload if isinstance(payload, dict) else {})
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/skillslab/save":
+            payload = self._read_json()
+            p = str(payload.get("path", "")).strip()
+            c = str(payload.get("content", ""))
+            overwrite = bool(payload.get("overwrite", False))
+            try:
+                out = self.app.write_skill_file(p, c, overwrite=overwrite)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/skillslab/scan":
+            try:
+                return self._send_json(self.app.scan_skills())
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/skillslab/upload":
+            payload = self._read_json()
+            filename = str(payload.get("filename", "")).strip()
+            content_b64 = str(payload.get("content_b64", "")).strip()
+            mime = str(payload.get("mime", "")).strip()
+            overwrite = bool(payload.get("overwrite", False))
+            if not filename or not content_b64:
+                return self._send_json({"error": "filename and content_b64 required"}, status=400)
+            try:
+                raw = base64.b64decode(content_b64, validate=True)
+            except Exception:
+                return self._send_json({"error": "invalid base64 payload"}, status=400)
+            if len(raw) > 30 * 1024 * 1024:
+                return self._send_json({"error": "max upload size is 30MB"}, status=413)
+            try:
+                out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+def main():
+    parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", default=8080, type=int)
+    parser.add_argument(
+        "--ctx_limit",
+        default=TOKEN_THRESHOLD,
+        type=int,
+        help=f"Session context token limit [{MIN_CONTEXT_TOKEN_LIMIT}-{TOKEN_THRESHOLD}]",
+    )
+    parser.add_argument(
+        "--max_rounds",
+        default=MAX_AGENT_ROUNDS,
+        type=int,
+        help=f"Per-run max agent rounds [{MIN_AGENT_ROUNDS}-{MAX_AGENT_ROUNDS_CAP}]",
+    )
+    parser.add_argument(
+        "--timeout",
+        "--run_timeout",
+        "--max_run_seconds",
+        dest="run_timeout",
+        default=MAX_RUN_SECONDS,
+        type=int,
+        help=(
+            "Global timeout scheduler in seconds "
+            f"(minimum {MIN_RUN_TIMEOUT_SECONDS}, model-active time excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--live_input_delay_write",
+        default=LIVE_INPUT_DELAY_WRITE_ROUNDS,
+        type=int,
+        help="Live input delay rounds when currently writing files (write_file/edit_file)",
+    )
+    parser.add_argument(
+        "--live_input_delay_tool",
+        default=LIVE_INPUT_DELAY_TOOL_ROUNDS,
+        type=int,
+        help="Live input delay rounds when currently in non-write tool phase",
+    )
+    parser.add_argument(
+        "--live_input_delay_normal",
+        default=LIVE_INPUT_DELAY_NORMAL_ROUNDS,
+        type=int,
+        help="Live input delay rounds during normal thinking phase",
+    )
+    parser.add_argument(
+        "--live_input_max_injections",
+        default=LIVE_INPUT_MAX_INJECTIONS,
+        type=int,
+        help="Maximum repeated reinjections for one live user message",
+    )
+    parser.add_argument(
+        "--live_input_reinject_interval",
+        default=LIVE_INPUT_REINJECT_INTERVAL,
+        type=int,
+        help="Rounds between live input reinjections while ramping weight",
+    )
+    parser.add_argument(
+        "--live_input_weight_base_delayed",
+        default=LIVE_INPUT_WEIGHT_BASE_DELAYED,
+        type=float,
+        help="Initial live-input weight when message is delayed (0-1)",
+    )
+    parser.add_argument(
+        "--live_input_weight_base_normal",
+        default=LIVE_INPUT_WEIGHT_BASE_NORMAL,
+        type=float,
+        help="Initial live-input weight in normal phase (0-1)",
+    )
+    parser.add_argument(
+        "--live_input_weight_step_delayed",
+        default=LIVE_INPUT_WEIGHT_STEP_DELAYED,
+        type=float,
+        help="Weight increment per reinjection when message is delayed (0-1)",
+    )
+    parser.add_argument(
+        "--live_input_weight_step_normal",
+        default=LIVE_INPUT_WEIGHT_STEP_NORMAL,
+        type=float,
+        help="Weight increment per reinjection in normal phase (0-1)",
+    )
+    parser.add_argument(
+        "--skills_port",
+        default=None,
+        type=int,
+        help="Skills Studio web port (default: agent port + 1)",
+    )
+    parser.add_argument(
+        "--no_Skills_UI",
+        "--no_skills_ui",
+        dest="no_skills_ui",
+        action="store_true",
+        help="Disable Skills Studio web UI server startup",
+    )
+    parser.add_argument(
+        "--web_ui_config",
+        default="",
+        help=f"WebUI config JSON path (default: {DEFAULT_WEB_UI_CONFIG} under workspace)",
+    )
+    parser.add_argument(
+        "--web_ui_dir",
+        default="",
+        help=f"External WebUI directory path (default: {DEFAULT_WEB_UI_DIR})",
+    )
+    parser.add_argument(
+        "--use_external_web_ui",
+        dest="use_external_web_ui",
+        action="store_true",
+        help="Enable loading external WebUI folder after validation.",
+    )
+    parser.add_argument(
+        "--no_external_web_ui",
+        dest="use_external_web_ui",
+        action="store_false",
+        help="Disable loading external WebUI folder and force built-in UI.",
+    )
+    parser.add_argument(
+        "--export_web_ui",
+        action="store_true",
+        help="Export built-in WebUI files to web_ui_dir on startup.",
+    )
+    parser.add_argument(
+        "--export_web_ui_force",
+        action="store_true",
+        help="Overwrite existing files when exporting built-in WebUI.",
+    )
+    parser.add_argument(
+        "--lang",
+        "--language",
+        dest="language",
+        default=DEFAULT_UI_LANGUAGE,
+        help="Default UI/model language (zh-CN|zh-TW|ja|en)",
+    )
+    parser.add_argument(
+        "--config",
+        default="",
+        help="LLM config source (URL or local file path)",
+    )
+    parser.add_argument("--ollama-base-url", default=DEFAULT_OLLAMA_BASE_URL)
+    parser.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
+    parser.add_argument(
+        "--auto_model_switch",
+        "--enable_auto_model_switch",
+        dest="auto_model_switch",
+        action="store_true",
+        help="Enable automatic runtime model switching/recovery (default: disabled).",
+    )
+    parser.add_argument(
+        "--no_auto_model_switch",
+        "--disable_auto_model_switch",
+        dest="auto_model_switch",
+        action="store_false",
+        help="Disable automatic runtime model switching/recovery.",
+    )
+    parser.set_defaults(auto_model_switch=False, use_external_web_ui=None)
+    args = parser.parse_args()
+    ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
+    web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
+    web_ui_config = load_web_ui_config_file(web_ui_config_path)
+    raw_web_ui_dir = str(args.web_ui_dir or web_ui_config.get("web_ui_dir") or web_ui_config.get("dir") or "").strip()
+    resolved_web_ui_dir = resolve_web_ui_dir_path(raw_web_ui_dir or DEFAULT_WEB_UI_DIR, WORKDIR)
+    cfg_external = _to_bool_like(
+        web_ui_config.get("external_web_ui_enabled", web_ui_config.get("enable_external", False)),
+        default=False,
+    )
+    cli_external = getattr(args, "use_external_web_ui", None)
+    resolved_use_external_web_ui = cfg_external if cli_external is None else bool(cli_external)
+    resolved_export_web_ui = bool(
+        args.export_web_ui
+        or _to_bool_like(
+            web_ui_config.get("export_builtin_on_start", web_ui_config.get("export_on_start", False)),
+            default=False,
+        )
+    )
+    resolved_export_web_ui_force = bool(
+        args.export_web_ui_force
+        or _to_bool_like(
+            web_ui_config.get("export_force", web_ui_config.get("overwrite_export", False)),
+            default=False,
+        )
+    )
+    external_config: dict = {}
+    external_config_source = ""
+    bootstrap_base_url = args.ollama_base_url
+    bootstrap_model = args.model
+    external_default_provider = ""
+    if str(args.config or "").strip():
+        try:
+            external_config, external_config_source = load_llm_config_from_source(
+                str(args.config),
+                base_dir=WORKDIR,
+            )
+            parsed_ext = parse_llm_config_profiles(external_config, bootstrap_base_url, bootstrap_model)
+            ext_profiles = {str(p.get("id")): dict(p) for p in parsed_ext.get("profiles", [])}
+            ext_default_id = str(parsed_ext.get("default_profile_id") or "")
+            ext_active = dict(ext_profiles.get(ext_default_id, {}))
+            if ext_active:
+                external_default_provider = str(ext_active.get("provider", "") or "").strip().lower()
+                if external_default_provider == "ollama":
+                    bootstrap_base_url = str(ext_active.get("base_url", bootstrap_base_url) or bootstrap_base_url)
+                    bootstrap_model = str(ext_active.get("model", bootstrap_model) or bootstrap_model)
+            print(f"[web-agent] external config loaded: {external_config_source}")
+        except Exception as exc:
+            print(f"[web-agent] invalid --config: {exc}")
+            sys.exit(2)
+    startup_tags = list_ollama_models(bootstrap_base_url)
+    if startup_tags:
+        resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
+    else:
+        resolved_model = bootstrap_model
+    resolved_thinking = False
+    requested_ctx_limit = int(args.ctx_limit or TOKEN_THRESHOLD)
+    resolved_ctx_limit = max(
+        MIN_CONTEXT_TOKEN_LIMIT,
+        min(TOKEN_THRESHOLD, requested_ctx_limit),
+    )
+    if resolved_ctx_limit != requested_ctx_limit:
+        print(
+            f"[web-agent] ctx_limit adjusted {requested_ctx_limit}->{resolved_ctx_limit} "
+            f"(allowed range {MIN_CONTEXT_TOKEN_LIMIT}-{TOKEN_THRESHOLD})"
+        )
+    requested_max_rounds = int(args.max_rounds or MAX_AGENT_ROUNDS)
+    resolved_max_rounds = max(
+        MIN_AGENT_ROUNDS,
+        min(MAX_AGENT_ROUNDS_CAP, requested_max_rounds),
+    )
+    if resolved_max_rounds != requested_max_rounds:
+        print(
+            f"[web-agent] max_rounds adjusted {requested_max_rounds}->{resolved_max_rounds} "
+            f"(allowed range {MIN_AGENT_ROUNDS}-{MAX_AGENT_ROUNDS_CAP})"
+        )
+    requested_run_timeout = int(args.run_timeout if args.run_timeout is not None else MAX_RUN_SECONDS)
+    resolved_run_timeout = normalize_timeout_seconds(
+        requested_run_timeout,
+        minimum=MIN_RUN_TIMEOUT_SECONDS,
+        maximum=MAX_RUN_TIMEOUT_SECONDS,
+        fallback=MAX_RUN_SECONDS,
+    )
+    if resolved_run_timeout != requested_run_timeout:
+        print(
+            f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
+            f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
+        )
+    requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
+    resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
+    if resolved_live_input_delay_write != requested_live_input_delay_write:
+        print(
+            f"[web-agent] live_input_delay_write adjusted {requested_live_input_delay_write}->{resolved_live_input_delay_write} "
+            "(allowed range 0-20)"
+        )
+    requested_live_input_delay_tool = int(args.live_input_delay_tool if args.live_input_delay_tool is not None else LIVE_INPUT_DELAY_TOOL_ROUNDS)
+    resolved_live_input_delay_tool = max(0, min(20, requested_live_input_delay_tool))
+    if resolved_live_input_delay_tool != requested_live_input_delay_tool:
+        print(
+            f"[web-agent] live_input_delay_tool adjusted {requested_live_input_delay_tool}->{resolved_live_input_delay_tool} "
+            "(allowed range 0-20)"
+        )
+    requested_live_input_delay_normal = int(args.live_input_delay_normal if args.live_input_delay_normal is not None else LIVE_INPUT_DELAY_NORMAL_ROUNDS)
+    resolved_live_input_delay_normal = max(0, min(20, requested_live_input_delay_normal))
+    if resolved_live_input_delay_normal != requested_live_input_delay_normal:
+        print(
+            f"[web-agent] live_input_delay_normal adjusted {requested_live_input_delay_normal}->{resolved_live_input_delay_normal} "
+            "(allowed range 0-20)"
+        )
+    requested_live_input_max_injections = int(args.live_input_max_injections if args.live_input_max_injections is not None else LIVE_INPUT_MAX_INJECTIONS)
+    resolved_live_input_max_injections = max(1, min(20, requested_live_input_max_injections))
+    if resolved_live_input_max_injections != requested_live_input_max_injections:
+        print(
+            f"[web-agent] live_input_max_injections adjusted {requested_live_input_max_injections}->{resolved_live_input_max_injections} "
+            "(allowed range 1-20)"
+        )
+    requested_live_input_reinject_interval = int(args.live_input_reinject_interval if args.live_input_reinject_interval is not None else LIVE_INPUT_REINJECT_INTERVAL)
+    resolved_live_input_reinject_interval = max(1, min(20, requested_live_input_reinject_interval))
+    if resolved_live_input_reinject_interval != requested_live_input_reinject_interval:
+        print(
+            f"[web-agent] live_input_reinject_interval adjusted {requested_live_input_reinject_interval}->{resolved_live_input_reinject_interval} "
+            "(allowed range 1-20)"
+        )
+
+    def _clamp_01(name: str, raw: object, default_value: float) -> float:
+        requested = float(raw if raw is not None else default_value)
+        resolved = max(0.0, min(1.0, requested))
+        if resolved != requested:
+            print(f"[web-agent] {name} adjusted {requested}->{resolved} (allowed range 0-1)")
+        return resolved
+
+    resolved_live_input_weight_base_delayed = _clamp_01(
+        "live_input_weight_base_delayed",
+        args.live_input_weight_base_delayed,
+        LIVE_INPUT_WEIGHT_BASE_DELAYED,
+    )
+    resolved_live_input_weight_base_normal = _clamp_01(
+        "live_input_weight_base_normal",
+        args.live_input_weight_base_normal,
+        LIVE_INPUT_WEIGHT_BASE_NORMAL,
+    )
+    resolved_live_input_weight_step_delayed = _clamp_01(
+        "live_input_weight_step_delayed",
+        args.live_input_weight_step_delayed,
+        LIVE_INPUT_WEIGHT_STEP_DELAYED,
+    )
+    resolved_live_input_weight_step_normal = _clamp_01(
+        "live_input_weight_step_normal",
+        args.live_input_weight_step_normal,
+        LIVE_INPUT_WEIGHT_STEP_NORMAL,
+    )
+
+    globals()["LIVE_INPUT_DELAY_WRITE_ROUNDS"] = resolved_live_input_delay_write
+    globals()["LIVE_INPUT_DELAY_TOOL_ROUNDS"] = resolved_live_input_delay_tool
+    globals()["LIVE_INPUT_DELAY_NORMAL_ROUNDS"] = resolved_live_input_delay_normal
+    globals()["LIVE_INPUT_MAX_INJECTIONS"] = resolved_live_input_max_injections
+    globals()["LIVE_INPUT_REINJECT_INTERVAL"] = resolved_live_input_reinject_interval
+    globals()["LIVE_INPUT_WEIGHT_BASE_DELAYED"] = resolved_live_input_weight_base_delayed
+    globals()["LIVE_INPUT_WEIGHT_BASE_NORMAL"] = resolved_live_input_weight_base_normal
+    globals()["LIVE_INPUT_WEIGHT_STEP_DELAYED"] = resolved_live_input_weight_step_delayed
+    globals()["LIVE_INPUT_WEIGHT_STEP_NORMAL"] = resolved_live_input_weight_step_normal
+    globals()["DEFAULT_REQUEST_TIMEOUT"] = resolved_run_timeout
+    globals()["DEFAULT_TIMEOUT_SECONDS"] = resolved_run_timeout
+    resolved_auto_model_switch = bool(getattr(args, "auto_model_switch", False))
+    resolved_language = normalize_ui_language(getattr(args, "language", DEFAULT_UI_LANGUAGE))
+    skills_root = ensure_embedded_skills(WORKDIR)
+    ensure_runtime_skills(skills_root)
+    app = AppContext(
+        WORKDIR,
+        bootstrap_base_url,
+        resolved_model,
+        skills_root,
+        resolved_thinking,
+        resolved_language,
+        resolved_ctx_limit,
+        ctx_limit_locked,
+        resolved_max_rounds,
+        resolved_run_timeout,
+        resolved_auto_model_switch,
+    )
+    config_apply_result: dict = {}
+    if external_config:
+        try:
+            config_apply_result = app.apply_global_llm_config(external_config, source=external_config_source)
+            resolved_model = str(app.model or resolved_model)
+        except Exception as exc:
+            print(f"[web-agent] failed to apply --config: {exc}")
+            sys.exit(2)
+    web_ui_state = app.configure_web_ui(
+        config_path=str(web_ui_config_path),
+        ui_dir=resolved_web_ui_dir,
+        enable_external=resolved_use_external_web_ui,
+        export_builtin=resolved_export_web_ui,
+        export_overwrite=resolved_export_web_ui_force,
+    )
+    skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
+    setattr(app, "agent_port", int(args.port))
+    setattr(app, "skills_port", int(skills_port))
+    setattr(app, "skills_ui_enabled", False)
+    server = AgentHTTPServer((args.host, args.port), Handler, app)
+    skills_server = None
+    skills_thread = None
+    if args.no_skills_ui:
+        print("[web-agent] skills studio disabled by --no_Skills_UI")
+    elif int(skills_port) != int(args.port):
+        try:
+            skills_server = AgentHTTPServer((args.host, skills_port), SkillsHandler, app)
+            skills_thread = threading.Thread(target=skills_server.serve_forever, daemon=True)
+            skills_thread.start()
+            setattr(app, "skills_ui_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] skills studio failed to start on {args.host}:{skills_port}: {exc}")
+    else:
+        print("[web-agent] skills studio disabled: skills_port equals agent port")
+    print(f"[web-agent] workspace={WORKDIR}")
+    print(f"[web-agent] repo_root={REPO_ROOT}")
+    print(f"[web-agent] codes_root={app.codes_root}")
+    print(f"[web-agent] skills_root={skills_root}")
+    print(f"[web-agent] web_ui_config={web_ui_config_path}")
+    print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
+    print(
+        "[web-agent] web_ui_mode="
+        f"{web_ui_state.get('mode', 'builtin')} "
+        f"(external_requested={'on' if bool(web_ui_state.get('external_requested')) else 'off'})"
+    )
+    if resolved_export_web_ui:
+        exp = web_ui_state.get("export", {}) if isinstance(web_ui_state, dict) else {}
+        print(
+            "[web-agent] web_ui_export="
+            f"ok={bool(exp.get('ok', False))} "
+            f"written={len(exp.get('written', []))} skipped={len(exp.get('skipped', []))} "
+            f"errors={len(exp.get('errors', []))}"
+        )
+    web_ui_validation = web_ui_state.get("validation", {}) if isinstance(web_ui_state, dict) else {}
+    if bool(web_ui_state.get("external_requested", False)) and not bool(web_ui_state.get("external_enabled", False)):
+        print(
+            "[web-agent] external web ui validation failed; fallback to built-in UI "
+            f"(missing={len(web_ui_validation.get('missing_files', []))}, "
+            f"errors={len(web_ui_validation.get('errors', []))})"
+        )
+    js_summary = app.offline_js_summary if isinstance(app.offline_js_summary, dict) else {}
+    print(
+        "[web-agent] js_lib="
+        f"{app.js_lib_root} "
+        f"available={js_summary.get('available', 0)}/{js_summary.get('total', len(OFFLINE_JS_LIB_CATALOG))} "
+        f"fetched={js_summary.get('fetched', 0)} missing={js_summary.get('missing', 0)}"
+    )
+    if LLM_CONFIG_PATH.exists():
+        print(f"[web-agent] llm_config={LLM_CONFIG_PATH}")
+    else:
+        print(f"[web-agent] llm_config missing; you can upload LLM.config.json in WebUI")
+    if startup_tags:
+        print(f"[web-agent] ollama tags detected={len(startup_tags)} startup_model={resolved_model}")
+    else:
+        print(f"[web-agent] ollama tags unavailable; using requested model={resolved_model}")
+    print(f"[web-agent] ollama={bootstrap_base_url} model={resolved_model} thinking={resolved_thinking}")
+    if external_config_source:
+        print(
+            "[web-agent] --config applied "
+            f"(source={external_config_source}, provider={external_default_provider or 'mixed'}, "
+            f"updated_users={config_apply_result.get('updated_users', 0)}, "
+            f"updated_sessions={config_apply_result.get('updated_sessions', 0)})"
+        )
+        if config_apply_result.get("persisted_path"):
+            print(f"[web-agent] llm_config persisted to {config_apply_result.get('persisted_path')}")
+        if config_apply_result.get("persist_warning"):
+            print(f"[web-agent] llm_config persist warning: {config_apply_result.get('persist_warning')}")
+    print(f"[web-agent] language={resolved_language} ({UI_LANGUAGE_LABELS.get(resolved_language, resolved_language)})")
+    print(f"[web-agent] ctx_limit={resolved_ctx_limit}")
+    print(f"[web-agent] ctx_limit_lock={'on' if ctx_limit_locked else 'off'}")
+    print(f"[web-agent] max_rounds={resolved_max_rounds}")
+    print(
+        f"[web-agent] run_timeout={resolved_run_timeout}s "
+        "(global scheduler; model-active spans excluded)"
+    )
+    print(f"[web-agent] auto_model_switch={'on' if resolved_auto_model_switch else 'off'}")
+    print(
+        "[web-agent] live_input_tuning="
+        f"delay(write/tool/normal)={LIVE_INPUT_DELAY_WRITE_ROUNDS}/{LIVE_INPUT_DELAY_TOOL_ROUNDS}/{LIVE_INPUT_DELAY_NORMAL_ROUNDS}, "
+        f"max_injections={LIVE_INPUT_MAX_INJECTIONS}, reinject_interval={LIVE_INPUT_REINJECT_INTERVAL}, "
+        f"weight_base(delayed/normal)={LIVE_INPUT_WEIGHT_BASE_DELAYED:.2f}/{LIVE_INPUT_WEIGHT_BASE_NORMAL:.2f}, "
+        f"weight_step(delayed/normal)={LIVE_INPUT_WEIGHT_STEP_DELAYED:.2f}/{LIVE_INPUT_WEIGHT_STEP_NORMAL:.2f}"
+    )
+    print(
+        "[web-agent] skills_ui="
+        + ("enabled" if bool(getattr(app, "skills_ui_enabled", False)) else "disabled")
+    )
+    if str(args.host).strip() in {"0.0.0.0", "::"}:
+        lan_ip = detect_local_lan_ip()
+        print(f"[web-agent] bind=all interfaces")
+        print(f"[web-agent] open local: http://127.0.0.1:{args.port}")
+        print(f"[web-agent] open lan:   http://{lan_ip}:{args.port}")
+        if skills_server:
+            print(f"[skills-studio] open local: http://127.0.0.1:{skills_port}")
+            print(f"[skills-studio] open lan:   http://{lan_ip}:{skills_port}")
+    else:
+        print(f"[web-agent] open http://{args.host}:{args.port}")
+        if skills_server:
+            print(f"[skills-studio] open http://{args.host}:{skills_port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[web-agent] shutting down")
+    finally:
+        if skills_server:
+            try:
+                skills_server.shutdown()
+            except Exception:
+                pass
+            try:
+                skills_server.server_close()
+            except Exception:
+                pass
+        server.server_close()
+
+if __name__ == "__main__":
+    main()
