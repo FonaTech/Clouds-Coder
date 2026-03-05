@@ -588,7 +588,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主要参考（你指定）
+### 12.1 主要参考
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -600,7 +600,7 @@ flowchart TD
 - Todo/task/worktree/team 机制在概念与接口层继承，并整合到 standalone web agent
 - `SKILL.md` 按需加载方法被复用并扩展到 Skills Studio
 
-### 12.2 建议补充参考
+### 12.2 补充参考
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
@@ -608,7 +608,7 @@ flowchart TD
 - PyInstaller: https://pyinstaller.org/
 - Nuitka: https://nuitka.net/
 
-### 12.3 本仓库实现过程参考
+### 12.3 本仓库实现过程
 
 - `Clouds_Coder.py`（运行时架构、API、前端桥接）
 - `packaging/README.md`（打包与分发说明）

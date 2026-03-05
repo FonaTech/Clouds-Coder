@@ -588,7 +588,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主な参照（指定）
+### 12.1 主な参照
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -600,7 +600,7 @@ flowchart TD
 - Todo/task/worktree/team を概念・インターフェースレベルで継承し standalone runtime に統合
 - `SKILL.md` のオンデマンド読み込み手法を再利用し Skills Studio へ拡張
 
-### 12.2 追加推奨参照
+### 12.2 追加参照
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
@@ -608,7 +608,7 @@ flowchart TD
 - PyInstaller: https://pyinstaller.org/
 - Nuitka: https://nuitka.net/
 
-### 12.3 本リポジトリ実装時の参照
+### 12.3 本リポジトリ実装
 
 - `Clouds_Coder.py`（ランタイム構成、API、フロント連携）
 - `packaging/README.md`（配布/パッケージング）
