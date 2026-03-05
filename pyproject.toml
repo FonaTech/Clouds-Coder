@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clouds-coder"
+version = "0.1.0"
+description = "Clouds Coder: local-first Cloud CLI coder runtime with Web UI and Skills Studio."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Clouds Coder Contributors" }
+]
+keywords = [
+  "agent",
+  "coding-agent",
+  "cli",
+  "webui",
+  "ollama",
+  "automation"
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+  "anthropic>=0.25.0",
+  "python-dotenv>=1.0.0"
+]
+
+[project.scripts]
+clouds-coder = "Clouds_Coder:main"
+
+[tool.setuptools]
+py-modules = ["Clouds_Coder"]
