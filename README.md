@@ -1,19 +1,19 @@
-<div align="center">
-  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
-  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">Cloud CLI Coder Runtime</div>
-  <p>CLI execution plane × Web user plane for reliable, observable Vibe Coding.</p>
-  <p>
-    <a href="./README.md">English</a> ·
-    <a href="./README-zh.md">中文</a> ·
-    <a href="./README-ja.md">日本語</a>
-  </p>
-  <p>
-    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-    <a href="./LICENSE">MIT License</a> ·
-    <a href="./LLM.config.json">LLM Config Template</a>
-  </p>
+<h1 align="center">Clouds Coder</h1>
+<h3 align="center">Cloud CLI Coder Runtime</h3>
+<p align="center">CLI execution plane × Web user plane for reliable, observable Vibe Coding.</p>
+<p align="center">
+  <a href="./README.md">English</a> ·
+  <a href="./README-zh.md">中文</a> ·
+  <a href="./README-ja.md">日本語</a>
+</p>
+<p align="center">
+  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./LICENSE">MIT License</a> ·
+  <a href="./LLM.config.json">LLM Config Template</a>
+</p>
+<p align="center">
   <img src="./Intro.png" alt="Clouds Coder Introduction" width="980" />
-</div>
+</p>
 
 Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
 

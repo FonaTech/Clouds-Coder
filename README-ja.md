@@ -1,19 +1,19 @@
-<div align="center">
-  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
-  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">クラウド CLI コーディングランタイム</div>
-  <p>CLI 実行面 × Web ユーザー面の分離協調で、信頼性と可観測性の高い Vibe Coding 体験を提供。</p>
-  <p>
-    <a href="./README.md">English</a> ·
-    <a href="./README-zh.md">中文</a> ·
-    <a href="./README-ja.md">日本語</a>
-  </p>
-  <p>
-    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-    <a href="./LICENSE">MIT License</a> ·
-    <a href="./LLM.config.json">LLM Config Template</a>
-  </p>
+<h1 align="center">Clouds Coder</h1>
+<h3 align="center">クラウド CLI コーディングランタイム</h3>
+<p align="center">CLI 実行面 × Web ユーザー面の分離協調で、信頼性と可観測性の高い Vibe Coding 体験を提供。</p>
+<p align="center">
+  <a href="./README.md">English</a> ·
+  <a href="./README-zh.md">中文</a> ·
+  <a href="./README-ja.md">日本語</a>
+</p>
+<p align="center">
+  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./LICENSE">MIT License</a> ·
+  <a href="./LLM.config.json">LLM Config Template</a>
+</p>
+<p align="center">
   <img src="./Intro.png" alt="Clouds Coder 紹介トップ" width="980" />
-</div>
+</p>
 
 Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
 

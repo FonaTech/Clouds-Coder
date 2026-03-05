@@ -1,19 +1,19 @@
-<div align="center">
-  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
-  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">云端 CLI 编码智能体运行时</div>
-  <p>CLI 执行面 × Web 用户面分离协同，构建可靠可观测的 Vibe Coding 体验。</p>
-  <p>
-    <a href="./README.md">English</a> ·
-    <a href="./README-zh.md">中文</a> ·
-    <a href="./README-ja.md">日本語</a>
-  </p>
-  <p>
-    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-    <a href="./LICENSE">MIT License</a> ·
-    <a href="./LLM.config.json">LLM Config Template</a>
-  </p>
+<h1 align="center">Clouds Coder</h1>
+<h3 align="center">云端 CLI 编码智能体运行时</h3>
+<p align="center">CLI 执行面 × Web 用户面分离协同，构建可靠可观测的 Vibe Coding 体验。</p>
+<p align="center">
+  <a href="./README.md">English</a> ·
+  <a href="./README-zh.md">中文</a> ·
+  <a href="./README-ja.md">日本語</a>
+</p>
+<p align="center">
+  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./LICENSE">MIT License</a> ·
+  <a href="./LLM.config.json">LLM Config Template</a>
+</p>
+<p align="center">
   <img src="./Intro.png" alt="Clouds Coder 介绍首页" width="980" />
-</div>
+</p>
 
 Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
 
