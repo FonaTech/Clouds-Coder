@@ -1,8 +1,23 @@
-# Clouds Coder
+<div align="center">
+  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
+  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">云端 CLI 编码智能体运行时</div>
+  <p>CLI 执行面 × Web 用户面分离协同，构建可靠可观测的 Vibe Coding 体验。</p>
+  <p>
+    <a href="./README.md">English</a> ·
+    <a href="./README-zh.md">中文</a> ·
+    <a href="./README-ja.md">日本語</a>
+  </p>
+  <p>
+    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+    <a href="./LICENSE">MIT License</a> ·
+    <a href="./LLM.config.json">LLM Config Template</a>
+  </p>
+  <img src="./Intro.png" alt="Clouds Coder 介绍首页" width="980" />
+</div>
 
-Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）编码智能体平台，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
+Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
 
-它面向真实复杂任务场景，目标是把 CLI 级执行力与 Web 级可视化交互融合成更顺滑的 Vibe Coding 体验，同时解决超时、截断、上下文过载、只思考不执行等问题。
+它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
 ## 1. 项目定位
 
@@ -12,12 +27,11 @@ Clouds Coder 的核心目标：
 
 本仓库从学习型 agent 代码演进为可部署的 standalone 运行时，聚焦：
 
-- CLI/Web 分离协同与低门槛上手
-- 长任务可靠性
-- 截断恢复与续写
-- 上下文预算控制
-- Web UI 可观测执行状态
-- 工具优先的可落地执行链路
+- 前后端分离协同：云端执行、Web 端交互，降低本地环境耦合
+- 降低 CLI 学习门槛：把复杂执行过程转为可视化、可追踪、可操作流程
+- 降低分发与部署成本：统一运行时入口，减少“每端独立配置”负担
+- 降低 Vibe Coding 采纳成本：让非 CLI 重度用户也能快速进入高质量工作流
+- 稳定性与执行收敛能力作为核心能力：timeout 调度、截断续写、上下文预算、执行收敛控制
 
 ## 1.1 架构传承与复用说明
 
@@ -52,9 +66,28 @@ Skills 复用说明：
 - `skills/generated/*` 为本项目扩展的场景化 skills（报告、退化恢复、HTML 管线、上传解析等）
 - 运行时工具接口与 skill 链路保持兼容（如 `load_skill`、`list_skills`、`write_skill`）
 
+## 1.2 超越编程 CLI：面向通用任务的内核定位
+
+Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可在单会话中执行并审计复合知识工作流的通用智能体运行时：
+
+- 编程类任务：实现、重构、调试、测试、补丁审阅
+- 分析类任务：文件挖掘、文档解析、结构化提取、对比研究
+- 综合类任务：跨源推理、决策备忘录、风险与假设汇总
+- 报告与可视化任务：HTML 报告、Markdown 叙事、阶段化代码与工件预览
+
+核心执行链路强调三阶段高效闭环：
+
+- `LLM（思考/规划）` -> 把目标拆解为约束明确的步骤与验收条件
+- `Coding（解析/执行）` -> 通过确定性工具执行与产物落地推进任务
+- `LLM（汇总/分析）` -> 校验中间结果并输出可追溯的最终结论
+
+这种设计通过“思考必须转化为可执行动作与可验证工件”的机制，显著降低只思考不执行的漂移风险。
+
 ## 2. 核心特性
 
 - 会话隔离的 agent runtime
+- 单会话内通用任务路由（编程 + 分析 + 综合 + 报告）
+- 内置 `LLM -> Coding -> LLM` 三阶段执行模式，适配复杂多步骤工作
 - 内置 Web UI + 可选外部 Web UI
 - Skills Studio（独立端口）用于扫描/编辑/生成/上传 skills
 - Ollama 探测与模型目录加载
@@ -67,6 +100,7 @@ Skills 复用说明：
 - SSE 心跳与写入异常处理
 - 预览链路：Markdown/HTML/文件/代码阶段预览
 - 前端资源控制：live/static 冻结、快照调度、对话虚拟化
+- 科研任务友好：工件优先、阶段可追溯、可复现持久化链路
 
 ## 3. 架构总览
 
@@ -104,6 +138,21 @@ Skills 复用说明：
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+Mermaid：
+
+```mermaid
+flowchart TB
+  UX["体验与溯源层<br/>多预览 / 阶段历史 / 运行进度 / Skills Flow"]
+  UI["展示层<br/>Agent Web UI + Skills Studio"]
+  API["API 与流式层<br/>REST + SSE + render-state/frame"]
+  ORCH["编排与控制层<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
+  EXEC["模型与工具执行层<br/>OllamaClient + tool dispatch<br/>bash/read/write/edit/skills/context/task"]
+  DATA["工件与持久化层<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations"]
+  UX --> UI --> API --> ORCH --> EXEC --> DATA
+  EXEC --> API
+  DATA --> UI
+```
+
 ### 3.1 程序交互架构图
 
 ```text
@@ -130,6 +179,24 @@ SessionManager ──► SessionState（会话级运行时状态机）
                 │
                 ▼
         Web UI 实时更新（chat/runtime/preview/skills）
+```
+
+Mermaid：
+
+```mermaid
+flowchart LR
+  U["用户浏览器 / Web UI"] -->|REST + SSE| S["ThreadingHTTPServer"]
+  S --> H["Handler (Agent APIs)"]
+  S --> SH["SkillsHandler (Skills Studio APIs)"]
+  H --> SM["SessionManager"]
+  SM --> SS["SessionState"]
+  SS --> MC["模型调用编排<br/>Ollama/OpenAI-compatible"]
+  SS --> TD["工具执行<br/>bash/read/write/edit/skills/task"]
+  SS --> RC["恢复控制<br/>truncation/timeout/no-tool idle"]
+  SS --> EH["EventHub"]
+  SS --> FS["工件存储<br/>files/uploads/code_preview/context_archive"]
+  FS --> PV["Preview APIs + render-state/frame + 历史溯源"]
+  PV --> U
 ```
 
 ### 3.2 任务逻辑图
@@ -159,6 +226,28 @@ Agent Loop
    │
    ▼
 预览/历史/导出（MD/代码/HTML + 阶段备份）
+```
+
+Mermaid：
+
+```mermaid
+flowchart TD
+  A["用户目标"] --> B["意图与上下文摄入<br/>上传/历史/上下文预算"]
+  B --> C["规划与分解<br/>Todo/Task/Worktree"]
+  C --> D["Agent Loop"]
+  D --> E["Model Call"]
+  E --> F["正常输出"]
+  E --> G["工具调用请求"]
+  G --> H["执行工具"]
+  H --> D
+  E --> I["截断信号"]
+  I --> J["续写/恢复"]
+  J --> D
+  D --> K["no-tool idle 检测 + 恢复提示"]
+  D --> L["timeout 治理<br/>模型 active 时段不计时"]
+  D --> M["context 压力 -> compact + recall"]
+  D --> N["收敛结果与工件"]
+  N --> O["预览/历史/导出<br/>MD/代码/HTML + 阶段备份"]
 ```
 
 ## 4. 关键运行时组件（来自源码）
@@ -206,6 +295,14 @@ Agent Loop
 - 用户显式设置后触发手动锁定模式
 - UI 展示估算 tokens 与剩余预算
 - 压力上升时自动 compact + archive recall
+
+### 5.5 面向通用与科研任务的 `LLM -> Coding -> LLM` 可靠链路
+
+- 阶段 A（`LLM 规划`）：将模糊目标转成可执行、可验收的子任务。
+- 阶段 B（`Coding 执行`）：强制通过工具化解析/计算/写入，把进度落地为文件、命令与工件。
+- 阶段 C（`LLM 汇总`）：基于中间工件给出可解释结论，明确假设、边界和未解问题。
+- 结构性抑制空想：若连续截断/空白输出，控制器自动切换为更细粒度分解，而不是重复长调用。
+- 科研数值严谨性保障：鼓励单位归一、数值范围合理性检查、多源交叉验证，以及异常差值时的再计算后再出报告。
 
 ## 6. Web UI 与性能策略
 
@@ -343,6 +440,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 偏向确定性恢复，而非盲目重试
 - 会话级产物可持久化，利于追踪与复现
 - 面向长任务稳定执行，不是仅面向短提示
+- 相比传统编程 CLI，更强调通用任务适配与任务闭环完成
 
 ## 11.1 架构优势（深度）
 
@@ -371,6 +469,122 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 对比纯 Web Copilot：Clouds Coder 不只是建议层交互，还提供服务端真实工具执行与工件持久化链路。
 - 对比纯本地 CLI Agent：Clouds Coder 降低逐端环境配置成本，并增加共享可视化控制平面。
 - 对比重型多服务 Agent 平台：Clouds Coder 在保持轻量拓扑的同时，仍提供会话隔离、流式可观测与长任务恢复能力。
+
+## 11.4 为什么它比传统编程 CLI 更通用
+
+- 传统编程 CLI 通常聚焦“改代码”；Clouds Coder 聚焦“任务闭环”，覆盖取证、解析、执行、汇总、报告交付全链路。
+- 传统编程 CLI 常把运行状态埋在终端日志；Clouds Coder 在 Web UI 显式展示执行态、截断恢复、timeout 治理与工件溯源。
+- 传统编程 CLI 往往止步于代码产出；Clouds Coder 支持同一任务内继续产出分析结论与报告结果（Markdown/HTML/结构化预览）。
+- 传统编程 CLI 以单用户终端为中心；Clouds Coder 支持云端会话隔离执行与多会话集中调度管理。
+
+## 11.5 高效链路与科研数值严谨性
+
+Clouds Coder 在复杂理科任务中采用“可执行状态机”而不是“一次性长文本生成”。核心目标是把 `输入 -> 理解 -> 思考 -> Coding（类人书写计算）-> 计算 -> 验证 -> 再思考 -> 结果整理 -> 输出` 变成可观测、可回滚、可复核的闭环。
+
+实现一致性说明：以下链路只使用当前源码中已实现的模块/事件/工件（`SessionState`、`TodoManager`、`tool dispatch`、`code_preview`、`context_archive`、`live_truncation`、`runtime_progress`、`render-state/frame`）。未引入“硬编码科研验证器”这类源码中不存在的组件。
+
+### 11.5.1 复杂理科任务处理链路（与内核模块对齐）
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ 0) 输入 Input                                                        │
+│ 用户请求 + 文件/数据上传（PDF/CSV/代码/图片）                       │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1) 理解 Understanding                                                │
+│ 模型参与: LLM（意图解析/约束识别）                                    │
+│ 内核模块: Handler + SessionState                                    │
+│ 阶段产物: messages（用户回合 + 系统提示）                             │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2) 思考与分解 Thinking                                               │
+│ 模型参与: LLM（Todo 分解、执行顺序规划）                               │
+│ 内核模块: TodoManager + SkillStore                                  │
+│ 阶段产物: todos[]（TodoWrite/TodoWriteRescue）                        │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3) Coding（类人书写计算）                                            │
+│ 模型参与: LLM 生成可执行脚本/解析器/查询语句                         │
+│ 内核模块: tool dispatch + WorktreeManager + Skill runtime           │
+│ 阶段产物: tool_calls / file_patch / code_preview stages             │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4) 计算 Compute                                                      │
+│ 模型参与: 最小化（以确定性执行为主）                                 │
+│ 内核模块: bash/read/write/edit/background_run + 持久化                │
+│ 阶段产物: command outputs / changed files /中间结果文件               │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 5) 验证 Verify                                                       │
+│ 模型参与: LLM 复核 + 工具脚本校验（非硬编码单独验证器）               │
+│ 内核模块: SessionState + EventHub + context_archive                 │
+│ 校验动作: 公式/单位、范围异常、来源一致性、叙事一致性                  │
+│ 阶段产物: 复核消息 + read/log 证据 + 置信度表述                       │
+└───────────────┬───────────────────────────────────────┬──────────────┘
+                │通过                                    │失败/冲突
+                ▼                                        ▼
+┌──────────────────────────────────────┐     ┌─────────────────────────┐
+│ 6) 汇总 Synthesis                    │     │ 2)/3) 重分解重算回路    │
+│ 模型参与: LLM(结果解释/边界说明)     │     │ 触发: no-tool idle,      │
+│ 内核模块: SessionState + EventHub    │     │ truncation resume,       │
+│ 产物: assistant message/caveats      │     │ context compact/recall   │
+└───────────────────┬──────────────────┘     └───────────┬─────────────┘
+                    ▼                                    ▲
+┌──────────────────────────────────────────────────────────────────────┐
+│ 7) 整理与输出 Output                                                 │
+│ 内核模块: preview-file/code/render-state/frame APIs                  │
+│ 输出形态: Markdown / HTML / 代码产物 / 可视化报告                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Mermaid：
+
+```mermaid
+flowchart TD
+  IN["0 输入<br/>用户请求 + 上传文件"] --> U["1 理解<br/>LLM + SessionState(messages)"]
+  U --> P["2 分解<br/>TodoManager(TodoWrite/Rescue)"]
+  P --> C["3 Coding<br/>tool_calls + write/edit/bash"]
+  C --> K["4 计算<br/>确定性执行 + 文件落盘"]
+  K --> V["5 验证<br/>LLM复核 + read/log 脚本校验"]
+  V -->|通过| S["6 汇总<br/>assistant message + caveats"]
+  V -->|失败/冲突| R["回路控制<br/>truncation/no-tool recovery<br/>compact/recall/timeout"]
+  R --> P
+  S --> O["7 输出<br/>preview-file/code/html + render-state/frame"]
+```
+
+### 11.5.2 节点级模型参与与质量门禁
+
+| 节点 | 模型参与模块 | 核心动作 | 质量门禁 | 可追溯产物 |
+|---|---|---|---|---|
+| 输入 | LLM 轻参与（格式识别） | 上传解析、任务归档 | 文件完整性/编码检查 | 原始输入快照 |
+| 理解 | LLM 主参与 | 目标、变量、约束抽取 | 要求覆盖率检查 | `messages[]` |
+| 思考分解 | LLM 主参与 | Todo 分解、里程碑规划 | 步骤可执行性检查 | `todos[]` |
+| Coding | LLM + 工具协作 | 生成解析/计算代码与命令 | 语法与依赖检查 | `tool_calls`、`file_patch` |
+| 计算 | 工具主导 | 确定性执行与落盘 | 执行返回码/日志检查 | `operations[]`、中间文件 |
+| 验证 | LLM + 工具脚本 | 单位/范围/一致性/冲突检测 | 失败即回路重算 | `read_file` 输出、复核消息 |
+| 汇总输出 | LLM 主参与 | 解释、结论、不确定性披露 | 证据-结论对齐检查 | Markdown/HTML/代码预览 |
+
+### 11.5.3 科研数值严谨性增强策略
+
+- 先算后说：先落地可复算的脚本与中间结果，再由模型做解释，避免“仅叙事无证据”。
+- 单位与量纲前置：发布数值前执行单位归一与量纲一致性检查，避免跨单位误差。
+- 多源交叉验证：当同一指标来自不同来源时，默认进行差异比对并记录偏差区间。
+- 异常点双重检查：触发范围越界或离群时，自动回到分解/计算阶段复算。
+- 叙事一致性检查：若最终文字结论与数值表冲突，禁止直接输出，必须二次推理。
+- 不确定性显式化：证据不足时输出“置信度 + 缺口项”，而非隐式补全或强行定论。
+
+### 11.5.4 与现有框架图的映射关系
+
+- 输入/输出两端对应第 3 章中的 Presentation Layer + API & Stream Layer。
+- 理解/思考/汇总对应 Orchestration & Control Layer（`SessionState`、`TodoManager`、`EventHub`）。
+- Coding/计算对应 Model & Tool Execution Layer（tool router + worktree + runtime tools）。
+- 验证与复盘对应 Artifact & Persistence Layer（中间产物、上下文归档、阶段预览）。
+- 截断恢复、timeout 调度、上下文预算、反空想收敛共同构成该链路的稳定闭环控制面。
 
 ## 12. 参考
 

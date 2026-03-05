@@ -1,10 +1,23 @@
-# Clouds Coder
+<div align="center">
+  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
+  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">Cloud CLI Coder Runtime</div>
+  <p>CLI execution plane × Web user plane for reliable, observable Vibe Coding.</p>
+  <p>
+    <a href="./README.md">English</a> ·
+    <a href="./README-zh.md">中文</a> ·
+    <a href="./README-ja.md">日本語</a>
+  </p>
+  <p>
+    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+    <a href="./LICENSE">MIT License</a> ·
+    <a href="./LLM.config.json">LLM Config Template</a>
+  </p>
+  <img src="./Intro.png" alt="Clouds Coder Introduction" width="980" />
+</div>
 
-[English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
+Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
 
-Clouds Coder is a local-first coding agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
-
-It is designed to combine CLI-grade execution with Web-grade interaction into a smoother Vibe Coding experience, while addressing timeout, truncation, context overload, and thinking-only/tool-loop drift failures.
+Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
 ## 1. Project Positioning
 
@@ -14,12 +27,11 @@ Clouds Coder focuses on one practical goal:
 
 This repository evolves from a learning-oriented agent codebase into a production-oriented standalone runtime centered on:
 
-- CLI/Web separation with low-friction onboarding
-- Reliability under long-running model calls
-- Truncation recovery and continuation
-- Context budget control
-- Observable execution state in Web UI
-- Tool-first execution with session persistence
+- Backend/frontend separation for cloud-side execution and web-side control
+- Lowering CLI learning barrier with visible, guided execution flows
+- Lowering distribution/deployment friction with a unified runtime entrypoint
+- Reducing Vibe Coding adoption cost for non-expert users
+- Reliability and execution-convergence controls as core capabilities: timeout governance, truncation continuation, context budgeting, and anti-drift execution controls
 
 ## 1.1 Architecture Lineage and Reuse Statement
 
@@ -54,9 +66,28 @@ Skills reuse statement:
 - `skills/generated/*` are extended/generated skills built for Clouds Coder scenarios (reporting, degradation recovery, HTML pipelines, upload parsers, etc.)
 - Runtime tool names/protocols remain compatible with the skill-loading workflow (for example `load_skill`, `list_skills`, `write_skill`)
 
+## 1.2 Beyond a Coding CLI: General-Purpose Task Kernel
+
+Clouds Coder is not designed as a coding-only CLI wrapper. It is positioned as a general-purpose agent runtime that can execute and audit mixed knowledge-work flows in one session:
+
+- Programming tasks: implementation, refactor, debugging, tests, patch review
+- Analysis tasks: file mining, document parsing, structured extraction, comparison studies
+- Synthesis tasks: cross-source reasoning, decision memo drafting, risk/assumption rollups
+- Reporting/visualization tasks: HTML reports, markdown narratives, staged code + artifact previews
+
+The core execution target is a high-efficiency three-phase chain:
+
+- `LLM (thinking/planning)` -> decomposes goals, assumptions, and step constraints
+- `Coding (parsing/execution)` -> performs deterministic tool execution and artifact generation
+- `LLM (synthesis/analysis)` -> validates outputs, aggregates findings, and communicates traceable conclusions
+
+This design reduces "thinking-only" drift by forcing thought to be converted into executable actions and verifiable artifacts.
+
 ## 2. Core Features
 
 - Agent runtime with session isolation
+- General-purpose task routing (coding + analysis + synthesis + reporting) in one session graph
+- Built-in `LLM -> Coding -> LLM` execution pattern for complex multi-step work
 - Built-in Web UI + optional external Web UI loading
 - Skills Studio (separate UI/port) for skill scanning, editing, and generation
 - Ollama integration with model probing and catalog loading
@@ -69,6 +100,7 @@ Skills reuse statement:
 - SSE event stream with heartbeat and write-exception handling
 - Rich preview pipeline: markdown/html/file preview + code stage preview
 - Frontend rendering controls for resource stability (live/static freeze, snapshot strategy, virtualized chat rows)
+- Scientific-work friendly output path: artifact-first steps, traceable stage outputs, and reproducibility-oriented persistence
 
 ## 3. Architecture Overview
 
@@ -106,6 +138,21 @@ Skills reuse statement:
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+Mermaid:
+
+```mermaid
+flowchart TB
+  UX["Experience & Traceability<br/>multi-preview / stage history / runtime progress / skills flow"]
+  UI["Presentation Layer<br/>Agent Web UI + Skills Studio"]
+  API["API & Stream Layer<br/>REST + SSE + render-state/frame"]
+  ORCH["Orchestration & Control<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
+  EXEC["Model & Tool Execution<br/>OllamaClient + tool dispatch<br/>bash/read/write/edit/skills/context/task"]
+  DATA["Artifact & Persistence<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations"]
+  UX --> UI --> API --> ORCH --> EXEC --> DATA
+  EXEC --> API
+  DATA --> UI
+```
+
 ### 3.1 Interaction Architecture Diagram
 
 ```text
@@ -132,6 +179,24 @@ SessionManager ──► SessionState (per-session runtime state machine)
                 │
                 ▼
         Web UI live updates (chat/runtime/preview/skills)
+```
+
+Mermaid:
+
+```mermaid
+flowchart LR
+  U["User Browser / Web UI"] -->|REST + SSE| S["ThreadingHTTPServer"]
+  S --> H["Handler (Agent APIs)"]
+  S --> SH["SkillsHandler (Skills Studio APIs)"]
+  H --> SM["SessionManager"]
+  SM --> SS["SessionState"]
+  SS --> MC["Model orchestration<br/>Ollama/OpenAI-compatible"]
+  SS --> TD["Tool execution<br/>bash/read/write/edit/skills/task"]
+  SS --> RC["Recovery controls<br/>truncation/timeout/no-tool idle"]
+  SS --> EH["EventHub"]
+  SS --> FS["Artifact store<br/>files/uploads/code_preview/context_archive"]
+  FS --> PV["Preview APIs + render-state/frame + history timeline"]
+  PV --> U
 ```
 
 ### 3.2 Task Logic Diagram
@@ -161,6 +226,28 @@ Converged Output + Artifacts
    │
    ▼
 Preview/History/Export (MD/Code/HTML + stage backups)
+```
+
+Mermaid:
+
+```mermaid
+flowchart TD
+  A["User Goal"] --> B["Intent + Context Intake<br/>uploads/history/context budget"]
+  B --> C["Plan / Decompose<br/>Todo/Task/Worktree"]
+  C --> D["Agent Loop"]
+  D --> E["Model Call"]
+  E --> F["normal output"]
+  E --> G["tool call request"]
+  G --> H["run tool"]
+  H --> D
+  E --> I["truncation signal"]
+  I --> J["continuation / rescue"]
+  J --> D
+  D --> K["no-tool idle detection + recovery hints"]
+  D --> L["timeout governance<br/>model-active span excluded"]
+  D --> M["context pressure -> compact + recall"]
+  D --> N["Converged Output + Artifacts"]
+  N --> O["Preview / History / Export<br/>MD/Code/HTML + stage backups"]
 ```
 
 ## 4. Key Runtime Components (from source)
@@ -210,6 +297,14 @@ Clouds Coder detects truncated model output and continues generation in controll
 - Manual lock behavior when user explicitly sets `--ctx_limit`
 - Context token estimation and remaining budget shown in UI
 - Auto compaction + archive recall when budget pressure rises
+
+### 5.5 `LLM -> Coding -> LLM` Reliability Path for General and Research Tasks
+
+- Stage A (`LLM planning`): converts ambiguous goals into constrained, executable subtasks with measurable outputs.
+- Stage B (`Coding execution`): enforces tool-based parsing/computation/write steps so progress is grounded in files, commands, and artifacts.
+- Stage C (`LLM synthesis`): merges intermediate artifacts into explainable conclusions, with explicit assumptions and unresolved gaps.
+- Drift suppression by construction: if output is repeatedly truncated/blank, controller shifts to finer-grained decomposition instead of repeating long free-form calls.
+- Scientific numeric rigor checks: encourage unit normalization, value-range sanity checks, multi-source cross-validation, and re-computation on suspicious deltas before final reporting.
 
 ## 6. Web UI and Performance Strategy
 
@@ -349,6 +444,7 @@ Notes:
 - Strong bias toward deterministic recovery over optimistic retries
 - Maintains session-level artifacts for reproducibility and debugging
 - Practical support for long-run tasks rather than short toy prompts
+- Prioritizes general-task adaptability over coding-only interaction loops
 
 ## 11.1 Architecture Advantages
 
@@ -377,6 +473,122 @@ Notes:
 - Versus pure Web copilots: Clouds Coder provides direct server-side tool execution and artifact persistence, not only suggestion-level interaction.
 - Versus pure local CLI agents: Clouds Coder lowers onboarding cost by avoiding per-device environment bootstrapping and adds a shared visual control plane.
 - Versus heavy multi-service agent platforms: Clouds Coder keeps a compact runtime topology while still offering session isolation, streaming observability, and long-task recovery controls.
+
+## 11.4 Why It Is More General Than a Traditional Coding CLI
+
+- Traditional coding CLIs optimize for source-code mutation only; Clouds Coder optimizes for full-task closure: evidence collection, parsing, execution, synthesis, and report delivery.
+- Traditional coding CLIs often hide runtime state in terminal logs; Clouds Coder makes execution state, truncation recovery, timeout governance, and artifact lineage visible in Web UI.
+- Traditional coding CLIs usually stop at "code produced"; Clouds Coder supports downstream analysis/report outputs (for example markdown + HTML + structured previews) in the same run.
+- Traditional coding CLIs are user-terminal centric; Clouds Coder provides centralized, session-isolated, cloud-side CLI execution with multi-session operational control.
+
+## 11.5 Efficiency Chain and Scientific Numerical Rigor
+
+Clouds Coder treats complex scientific tasks as an executable state machine, not as a one-shot long answer. The target chain is `input -> understanding -> thinking -> coding (human-like written computation) -> compute -> verify -> re-think -> synthesize -> output` with observable checkpoints.
+
+Implementation consistency note: the following chain is constrained to modules/events/artifacts that already exist in source (`SessionState`, `TodoManager`, tool dispatch, `code_preview`, `context_archive`, `live_truncation`, `runtime_progress`, `render-state/frame`). No non-existent hardcoded scientific validator is assumed.
+
+### 11.5.1 Scientific Task Processing Pipeline (Kernel-Aligned)
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ 0) Input                                                            │
+│ user prompt + uploaded data/files (PDF/CSV/code/media)             │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1) Understanding                                                    │
+│ Model role: LLM intent parsing / constraint extraction              │
+│ Kernel modules: Handler + SessionState                              │
+│ Output: conversation messages + system prompt context               │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2) Thinking & Decomposition                                         │
+│ Model role: LLM todo split / execution ordering                     │
+│ Kernel modules: TodoManager + SkillStore                           │
+│ Output: todos[] (TodoWrite/TodoWriteRescue)                         │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3) Coding (human-like written computation)                          │
+│ Model role: generate scripts/parsers/queries                        │
+│ Kernel modules: tool dispatch + WorktreeManager + skill runtime     │
+│ Output: tool_calls / file_patch / code_preview stages               │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4) Compute                                                          │
+│ Model role: minimized; deterministic execution first                │
+│ Kernel modules: bash/read/write/edit/background_run + persistence   │
+│ Output: command outputs / changed files / intermediate files         │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 5) Verify                                                           │
+│ Model role: LLM review + tool-script checks (no hardcoded validator)│
+│ Kernel modules: SessionState + EventHub + context_archive           │
+│ Checks: formula/unit, range/outlier, source and narrative alignment │
+│ Output: review messages + read/log evidence + confidence wording    │
+└───────────────┬───────────────────────────────────────┬──────────────┘
+                │pass                                    │fail/conflict
+                ▼                                        ▼
+┌──────────────────────────────────────┐     ┌─────────────────────────┐
+│ 6) Synthesis                         │     │ Back to 2)/3) loop      │
+│ Model role: LLM explanation/caveats  │     │ triggers: anti-drift,   │
+│ Kernel modules: SessionState/EventHub│     │ truncation resume,      │
+│ Output: assistant message/caveats    │     │ context compact/recall  │
+└───────────────────┬──────────────────┘     └───────────┬─────────────┘
+                    ▼                                    ▲
+┌──────────────────────────────────────────────────────────────────────┐
+│ 7) Output                                                           │
+│ Kernel modules: preview-file/code/render-state/frame APIs          │
+│ Deliverables: Markdown / HTML / code artifacts / visual report      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Mermaid:
+
+```mermaid
+flowchart TD
+  IN["0 Input<br/>user prompt + uploads"] --> U["1 Understanding<br/>LLM + SessionState(messages)"]
+  U --> P["2 Decomposition<br/>TodoManager(TodoWrite/Rescue)"]
+  P --> C["3 Coding<br/>tool_calls + write/edit/bash"]
+  C --> K["4 Compute<br/>deterministic execution + file persistence"]
+  K --> V["5 Verify<br/>LLM review + read/log script checks"]
+  V -->|pass| S["6 Synthesis<br/>assistant message + caveats"]
+  V -->|fail/conflict| R["Recovery loop<br/>truncation/no-tool recovery<br/>compact/recall/timeout"]
+  R --> P
+  S --> O["7 Output<br/>preview-file/code/html + render-state/frame"]
+```
+
+### 11.5.2 Node-Level Model Participation and Quality Gates
+
+| Node | Model participation | Core action | Quality gate | Traceable artifact |
+|---|---|---|---|---|
+| Input | light LLM assist | ingest and normalize files/tasks | file integrity and encoding checks | raw input snapshot |
+| Understanding | LLM primary | extract goals, variables, constraints | requirement coverage check | `messages[]` |
+| Decomposition | LLM primary | split todo and milestones | executable-step check | `todos[]` |
+| Coding | LLM + tools | produce parser/compute code and commands | syntax/dependency checks | `tool_calls`, `file_patch` |
+| Compute | tools primary | deterministic execution and file writes | exit-code and log checks | `operations[]`, intermediate files |
+| Verify | LLM + tool scripts | unit/range/consistency/conflict validation | failure triggers loop-back | `read_file` outputs + review messages |
+| Synthesis/Output | LLM primary | explain results and uncertainty | evidence-to-claim consistency | markdown/html/code previews |
+
+### 11.5.3 Scientific Numerical Rigor Policies
+
+- Compute-before-narrate: produce reproducible scripts and intermediate outputs before final prose.
+- Unit and dimension first: normalize units and check dimensional consistency before publishing values.
+- Cross-source validation: compare the same metric across sources and record deviation windows.
+- Outlier re-check: out-of-range results trigger automatic decomposition/recompute loops.
+- Narrative consistency gate: textual conclusions must match tables/metrics; otherwise block output.
+- Explicit uncertainty: publish confidence + missing evidence instead of silent interpolation.
+
+### 11.5.4 Mapping to Existing Architecture Diagram
+
+- Input/output ends map to Presentation Layer + API & Stream Layer.
+- Understanding/thinking/synthesis map to Orchestration & Control Layer (`SessionState`, `TodoManager`, `EventHub`).
+- Coding/compute map to Model & Tool Execution Layer (tool router, worktree, runtime tools).
+- Verification and replay map to Artifact & Persistence Layer (intermediate artifacts, archive, stage preview).
+- Truncation recovery, timeout governance, context budgeting, and anti-drift controls form the stability loop over this pipeline.
 
 ## 12. References
 

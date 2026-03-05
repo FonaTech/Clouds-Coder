@@ -1,8 +1,23 @@
-# Clouds Coder
+<div align="center">
+  <div style="font-size:56px;font-weight:800;line-height:1.05;margin-bottom:6px;">Clouds Coder</div>
+  <div style="font-size:24px;font-weight:650;line-height:1.2;margin-bottom:8px;">クラウド CLI コーディングランタイム</div>
+  <p>CLI 実行面 × Web ユーザー面の分離協調で、信頼性と可観測性の高い Vibe Coding 体験を提供。</p>
+  <p>
+    <a href="./README.md">English</a> ·
+    <a href="./README-zh.md">中文</a> ·
+    <a href="./README-ja.md">日本語</a>
+  </p>
+  <p>
+    <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+    <a href="./LICENSE">MIT License</a> ·
+    <a href="./LLM.config.json">LLM Config Template</a>
+  </p>
+  <img src="./Intro.png" alt="Clouds Coder 紹介トップ" width="980" />
+</div>
 
-Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストのコーディングエージェント基盤で、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
+Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
 
-CLI 級の実行力と Web 級の操作体験を統合して、より滑らかな Vibe Coding 体験を実現しつつ、タイムアウト、出力切断、コンテキスト過負荷、thinking-only ループを抑制する設計です。
+主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
 ## 1. プロジェクトの位置づけ
 
@@ -12,12 +27,11 @@ Clouds Coder の中心目標は次の 1 点です。
 
 本リポジトリは学習用 agent コードから、実配備可能な standalone ランタイムへ発展し、以下を重視しています。
 
-- CLI/Web 分離協調と低コスト導入
-- 長時間タスクの信頼性
-- 切断回復と継続生成
-- コンテキスト予算制御
-- Web UI での実行可観測性
-- ツール中心の実行可能ワークフロー
+- バックエンド/フロントエンド分離協調（クラウド側実行 + Web 側操作）
+- CLI 学習障壁の低減（可視化された実行フローと操作性）
+- 配布/導入負荷の低減（統一ランタイム入口）
+- 非エキスパートにも届く Vibe Coding 導入コストの最小化
+- 信頼性と実行収束制御を中核能力として運用（timeout、切断継続、文脈予算、ドリフト抑制）
 
 ## 1.1 アーキテクチャ継承と再利用の明示
 
@@ -52,9 +66,28 @@ Skills 再利用について：
 - `skills/generated/*` は Clouds Coder 向けに拡張生成された skill 群
 - 実行時ツール契約（`load_skill`、`list_skills`、`write_skill` など）との互換性を維持
 
+## 1.2 コーディング CLI を超える汎用タスクカーネル
+
+Clouds Coder は「コードを書くためだけの CLI ラッパー」ではなく、単一セッション内で複合的な知的作業を実行・監査できる汎用エージェントランタイムとして設計されています。
+
+- プログラミング系: 実装、リファクタ、デバッグ、テスト、パッチレビュー
+- 分析系: ファイル調査、文書解析、構造化抽出、比較検討
+- 総合系: 複数ソース統合推論、意思決定メモ、リスク/仮定の集約
+- レポート/可視化系: HTML レポート、Markdown 叙述、段階コード/成果物プレビュー
+
+中核は次の 3 段チェーンを高効率に回すことです。
+
+- `LLM（思考/計画）` -> 目標を制約付き実行ステップへ分解
+- `Coding（解析/実行）` -> 決定的なツール実行で成果物を生成
+- `LLM（統合/分析）` -> 中間成果物を検証し、追跡可能な結論へ統合
+
+この構成により、「思考だけで終わる」ドリフトを抑え、思考を実行と検証可能な成果物へ強制的に接続します。
+
 ## 2. 主な機能
 
 - セッション分離された agent runtime
+- 単一セッションでの汎用タスクルーティング（コーディング + 分析 + 総合 + レポート）
+- 複雑タスク向け `LLM -> Coding -> LLM` 実行パターンを標準搭載
 - 内蔵 Web UI + 外部 Web UI の切替
 - Skills Studio（別ポート）で skill のスキャン/編集/生成/アップロード
 - Ollama モデル検出とカタログ読み込み
@@ -67,6 +100,7 @@ Skills 再利用について：
 - SSE ハートビートと書き込み例外処理
 - Markdown/HTML/ファイル/コード段階プレビュー
 - フロントエンド負荷制御（live/static 凍結、スナップショット制御、仮想リスト）
+- 研究ワークロード向け: 成果物中心、段階追跡可能、再現性重視の永続化設計
 
 ## 3. アーキテクチャ概要
 
@@ -104,6 +138,21 @@ Skills 再利用について：
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+Mermaid：
+
+```mermaid
+flowchart TB
+  UX["体験・追跡<br/>マルチプレビュー / 段階履歴 / 実行進捗 / Skills Flow"]
+  UI["表示レイヤー<br/>Agent Web UI + Skills Studio"]
+  API["API・ストリームレイヤー<br/>REST + SSE + render-state/frame"]
+  ORCH["オーケストレーション・制御<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
+  EXEC["モデル・ツール実行<br/>OllamaClient + tool dispatch<br/>bash/read/write/edit/skills/context/task"]
+  DATA["アーティファクト永続化<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations"]
+  UX --> UI --> API --> ORCH --> EXEC --> DATA
+  EXEC --> API
+  DATA --> UI
+```
+
 ### 3.1 プログラム相互作用アーキテクチャ図
 
 ```text
@@ -130,6 +179,24 @@ SessionManager ──► SessionState（セッション単位状態機械）
                 │
                 ▼
         Web UI リアルタイム更新（chat/runtime/preview/skills）
+```
+
+Mermaid：
+
+```mermaid
+flowchart LR
+  U["ユーザー Browser / Web UI"] -->|REST + SSE| S["ThreadingHTTPServer"]
+  S --> H["Handler (Agent APIs)"]
+  S --> SH["SkillsHandler (Skills Studio APIs)"]
+  H --> SM["SessionManager"]
+  SM --> SS["SessionState"]
+  SS --> MC["モデル呼び出し編成<br/>Ollama/OpenAI-compatible"]
+  SS --> TD["ツール実行<br/>bash/read/write/edit/skills/task"]
+  SS --> RC["回復制御<br/>truncation/timeout/no-tool idle"]
+  SS --> EH["EventHub"]
+  SS --> FS["アーティファクト保存<br/>files/uploads/code_preview/context_archive"]
+  FS --> PV["Preview APIs + render-state/frame + 履歴タイムライン"]
+  PV --> U
 ```
 
 ### 3.2 タスクロジック図
@@ -159,6 +226,28 @@ Agent Loop
    │
    ▼
 プレビュー/履歴/エクスポート（MD/コード/HTML + 段階バックアップ）
+```
+
+Mermaid：
+
+```mermaid
+flowchart TD
+  A["ユーザー目標"] --> B["意図・コンテキスト受理<br/>アップロード/履歴/予算"]
+  B --> C["計画・分解<br/>Todo/Task/Worktree"]
+  C --> D["Agent Loop"]
+  D --> E["Model Call"]
+  E --> F["通常出力"]
+  E --> G["ツール呼び出し要求"]
+  G --> H["ツール実行"]
+  H --> D
+  E --> I["切断シグナル"]
+  I --> J["継続/回復"]
+  J --> D
+  D --> K["no-tool idle 検知 + 回復ヒント"]
+  D --> L["timeout 制御<br/>モデル active 区間除外"]
+  D --> M["文脈圧迫 -> compact + recall"]
+  D --> N["収束出力とアーティファクト"]
+  N --> O["プレビュー/履歴/エクスポート<br/>MD/コード/HTML + 段階バックアップ"]
 ```
 
 ## 4. 主要ランタイム構成（実装ベース）
@@ -206,6 +295,14 @@ Agent Loop
 - ユーザー明示設定時は手動ロック
 - UI に推定 token と残量を表示
 - 圧迫時は自動 compact + archive recall
+
+### 5.5 汎用/研究タスク向け `LLM -> Coding -> LLM` 信頼性経路
+
+- フェーズ A（`LLM 計画`）: 曖昧な要求を、検証可能な実行サブタスクへ変換。
+- フェーズ B（`Coding 実行`）: ツールベース解析/計算/書き込みを強制し、進捗をファイル・コマンド・成果物に固定。
+- フェーズ C（`LLM 統合`）: 中間成果物を統合し、仮定・制約・未解決点を明示した説明可能な結論を出力。
+- ドリフト抑制: 切断/空白出力が続く場合は、長い自由生成を繰り返さず、より細粒度な分解実行に自動遷移。
+- 研究向け数値厳密性: 単位正規化、値域妥当性、複数ソース照合、差異発生時の再計算を経て最終報告。
 
 ## 6. Web UI とパフォーマンス戦略
 
@@ -343,6 +440,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 楽観的再試行より決定的回復を重視
 - セッション成果物を永続化し、追跡と再現が容易
 - 短いデモではなく長時間タスク実行を重視
+- 従来のコーディング CLI より、汎用タスク適応性と完遂性を重視
 
 ## 11.1 アーキテクチャ上の優位性（詳細）
 
@@ -371,6 +469,122 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 純粋な Web Copilot と比較：Clouds Coder は提案表示だけでなく、サーバ側ツール実行と成果物永続化まで提供。
 - 純粋なローカル CLI Agent と比較：端末ごとの初期構築コストを下げ、共有可能な可視化コントロールプレーンを追加。
 - 重量級マルチサービス型 Agent 基盤と比較：軽量トポロジーを維持しつつ、セッション分離、ストリーミング可観測、長タスク回復を実現。
+
+## 11.4 従来のコーディング CLI より汎用である理由
+
+- 従来 CLI は「コード変更」に最適化されがちだが、Clouds Coder は証拠収集、解析、実行、統合、レポート提出までを一連で扱う。
+- 従来 CLI は状態が端末ログに埋もれやすいが、Clouds Coder は実行状態、切断回復、timeout 制御、成果物系譜を Web UI に明示。
+- 従来 CLI はコード生成で終了しやすいが、Clouds Coder は同一ランで分析結果やレポート（Markdown/HTML/構造プレビュー）まで出力可能。
+- 従来 CLI は単一端末中心だが、Clouds Coder はクラウド側 CLI 実行とセッション分離により集中運用に向く。
+
+## 11.5 高効率チェーンと研究向け数値厳密性
+
+Clouds Coder は複雑な理工系タスクを「一発回答」ではなく、実行可能な状態機械として処理します。目標チェーンは `入力 -> 理解 -> 思考 -> Coding（人間に近い記述計算）-> 計算 -> 検証 -> 再思考 -> 統合 -> 出力` です。
+
+実装整合メモ：以下の流れは、現行ソースに実在するモジュール/イベント/成果物（`SessionState`、`TodoManager`、tool dispatch、`code_preview`、`context_archive`、`live_truncation`、`runtime_progress`、`render-state/frame`）のみで構成しています。未実装の専用「ハードコード科学検証器」は仮定していません。
+
+### 11.5.1 理工系タスク処理パイプライン（カーネル整合）
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ 0) 入力 Input                                                       │
+│ ユーザー要求 + アップロード（PDF/CSV/コード/メディア）             │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 1) 理解 Understanding                                               │
+│ モデル関与: LLM による意図解析・制約抽出                             │
+│ カーネル: Handler + SessionState                                    │
+│ 産物: messages（ユーザー回合 + system prompt）                        │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 2) 思考と分解 Thinking                                              │
+│ モデル関与: LLM による Todo 分解・実行順序設計                       │
+│ カーネル: TodoManager + SkillStore                                  │
+│ 産物: todos[]（TodoWrite/TodoWriteRescue）                           │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 3) Coding（人間に近い記述計算）                                      │
+│ モデル関与: 実行スクリプト/パーサ/クエリ生成                         │
+│ カーネル: tool dispatch + WorktreeManager + Skill runtime           │
+│ 産物: tool_calls / file_patch / code_preview stages                 │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 4) 計算 Compute                                                     │
+│ モデル関与: 最小化（決定的実行を優先）                               │
+│ カーネル: bash/read/write/edit/background_run + persistence         │
+│ 産物: command outputs / changed files / intermediate files          │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ 5) 検証 Verify                                                      │
+│ モデル関与: LLM レビュー + ツールスクリプト検証（専用固定検証器なし） │
+│ カーネル: SessionState + EventHub + context_archive                 │
+│ 検証: 式/単位、範囲外れ値、ソース整合、叙述整合                      │
+│ 産物: レビューメッセージ + read/log 根拠 + 信頼度表現                │
+└───────────────┬───────────────────────────────────────┬──────────────┘
+                │合格                                    │失敗/競合
+                ▼                                        ▼
+┌──────────────────────────────────────┐     ┌─────────────────────────┐
+│ 6) 統合 Synthesis                    │     │ 2)/3) へ戻る再計算ループ│
+│ モデル関与: 結果解釈・制約明示       │     │ anti-drift / truncation │
+│ カーネル: SessionState + EventHub    │     │ resume / timeout 制御   │
+│ 産物: assistant message/caveats      │     │ context compact/recall  │
+└───────────────────┬──────────────────┘     └───────────┬─────────────┘
+                    ▼                                    ▲
+┌──────────────────────────────────────────────────────────────────────┐
+│ 7) 出力 Output                                                      │
+│ カーネル: preview-file/code/render-state/frame APIs                 │
+│ 出力: Markdown / HTML / コード成果物 / 可視化レポート               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Mermaid：
+
+```mermaid
+flowchart TD
+  IN["0 入力<br/>要求 + アップロード"] --> U["1 理解<br/>LLM + SessionState(messages)"]
+  U --> P["2 分解<br/>TodoManager(TodoWrite/Rescue)"]
+  P --> C["3 Coding<br/>tool_calls + write/edit/bash"]
+  C --> K["4 計算<br/>決定的実行 + ファイル永続化"]
+  K --> V["5 検証<br/>LLMレビュー + read/log検証"]
+  V -->|合格| S["6 統合<br/>assistant message + caveats"]
+  V -->|失敗/競合| R["回復ループ<br/>truncation/no-tool recovery<br/>compact/recall/timeout"]
+  R --> P
+  S --> O["7 出力<br/>preview-file/code/html + render-state/frame"]
+```
+
+### 11.5.2 ノード別のモデル関与と品質ゲート
+
+| ノード | モデル関与 | 主要処理 | 品質ゲート | 追跡可能成果物 |
+|---|---|---|---|---|
+| 入力 | 軽度 LLM 補助 | 取り込みと正規化 | ファイル整合/文字コード確認 | 入力スナップショット |
+| 理解 | LLM 主導 | 目的・変数・制約抽出 | 要件カバレッジ確認 | `messages[]` |
+| 分解 | LLM 主導 | Todo/マイルストーン分解 | 実行可能性確認 | `todos[]` |
+| Coding | LLM + ツール | 解析/計算コードとコマンド生成 | 構文/依存確認 | `tool_calls`、`file_patch` |
+| 計算 | ツール主導 | 決定的実行と書き込み | 終了コード/ログ確認 | `operations[]`、中間ファイル |
+| 検証 | LLM + ツール検証 | 単位/範囲/整合/競合検知 | 失敗時はループバック | `read_file` 出力 + レビュー文 |
+| 統合/出力 | LLM 主導 | 結果説明と不確実性開示 | 根拠-主張整合確認 | markdown/html/code プレビュー |
+
+### 11.5.3 研究向け数値厳密性ポリシー
+
+- 先に計算・後で叙述: 再計算可能なスクリプトと中間成果物を先に確定。
+- 単位/次元の前置検証: 数値公開前に単位正規化と次元整合を確認。
+- 複数ソース照合: 同一指標を横断比較し、偏差レンジを記録。
+- 外れ値再検証: 範囲逸脱時は分解/計算へ自動ループバック。
+- 叙述整合ゲート: テキスト結論と表/指標が不一致なら出力停止。
+- 不確実性の明示: 根拠不足時は補間ではなく信頼度と欠落項目を開示。
+
+### 11.5.4 既存アーキテクチャ図との対応
+
+- 入出力端は Presentation Layer + API & Stream Layer に対応。
+- 理解/思考/統合は Orchestration & Control Layer（`SessionState`、`TodoManager`、`EventHub`）に対応。
+- Coding/計算は Model & Tool Execution Layer（tool router、worktree、runtime tools）に対応。
+- 検証/再現は Artifact & Persistence Layer（中間成果物、archive、stage preview）に対応。
+- 切断回復、timeout 制御、文脈予算、anti-drift が全体安定化ループを形成。
 
 ## 12. 参考
 
