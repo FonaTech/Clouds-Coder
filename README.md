@@ -1,5 +1,7 @@
 # Clouds Coder
 
+[English](./README.md) | [中文](./README-zh.md) | [日本語](./README-ja.md)
+
 Clouds Coder is a local-first coding agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
 
 It is designed to combine CLI-grade execution with Web-grade interaction into a smoother Vibe Coding experience, while addressing timeout, truncation, context overload, and thinking-only/tool-loop drift failures.
