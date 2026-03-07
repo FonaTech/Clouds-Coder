@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
-APP_VERSION = "0.1.0"
+APP_VERSION = "2026.03.07"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 WORKDIR = Path(os.getenv("AGENT_WORKDIR", os.getcwd())).resolve()
