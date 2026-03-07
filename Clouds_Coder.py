@@ -1185,8 +1185,9 @@ def normalize_work_text(text: object, status: str = "") -> str:
         flags=re.IGNORECASE,
     )
     if status:
+        status_pattern = re.escape(status).replace("_", r"[_\-\s]?")
         s = re.sub(
-            rf"\s*[—-]\s*{re.escape(status).replace('_', '[_\\-\\s]?')}\s*$",
+            rf"\s*[—-]\s*{status_pattern}\s*$",
             "",
             s,
             flags=re.IGNORECASE,
@@ -8503,6 +8504,8 @@ class SessionState:
                 "for compact reasoning and fast handoffs. "
                 "Budget controls thought depth only and must not be used as an early-stop user-facing reason."
             )
+        html_block = f"{html_hint}\n\n" if html_hint else ""
+        research_block = f"{research_hint}\n\n" if research_hint else ""
         return (
             f"You are a coding agent running in isolated session workspace {self.files_root}. "
             f"Session absolute writable root is {self.files_root}. "
@@ -8531,8 +8534,8 @@ class SessionState:
             f"Current context upper bound is ~{self.context_token_upper_bound} tokens; keep steps compact to stay under this limit. "
             "When user asks to modify uploaded content, prioritize files under the uploaded workspace paths.\n\n"
             "If user asks to generate image/audio/video, use generate_media when active model capability supports it.\n\n"
-            f"{(html_hint + '\n\n') if html_hint else ''}"
-            f"{(research_hint + '\n\n') if research_hint else ''}"
+            f"{html_block}"
+            f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploaded files context:\n{uploads_ctx}\n\n"
             f"Available skills:\n{self.skills.descriptions()}"
@@ -11669,59 +11672,56 @@ class SessionState:
             return (out_text + err_text).strip()
 
         try:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
-                bufsize=0,
-                start_new_session=(os.name == "posix"),
-            )
-            with selectors.DefaultSelector() as sel:
-                if proc.stdout is not None:
-                    try:
-                        os.set_blocking(proc.stdout.fileno(), False)
-                    except Exception:
-                        pass
-                    sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
-                if proc.stderr is not None:
-                    try:
-                        os.set_blocking(proc.stderr.fileno(), False)
-                    except Exception:
-                        pass
-                    sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+            popen_kwargs = {
+                "shell": True,
+                "cwd": cwd,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,
+                "bufsize": 0,
+                "start_new_session": (os.name == "posix"),
+            }
+            if os.name == "nt":
+                create_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
+                if create_group > 0:
+                    popen_kwargs["creationflags"] = create_group
+            proc = subprocess.Popen(command, **popen_kwargs)
+            if os.name == "nt":
+                # Windows pipe handles are not selector-friendly; use reader threads.
+                reader_threads: list[threading.Thread] = []
+
+                def _spawn_reader(stream, target: bytearray):
+                    if stream is None:
+                        return
+
+                    def _reader():
+                        while True:
+                            try:
+                                chunk = stream.read(65536)
+                            except Exception:
+                                break
+                            if not chunk:
+                                break
+                            _append_capture(target, chunk)
+
+                    th = threading.Thread(target=_reader, daemon=True)
+                    th.start()
+                    reader_threads.append(th)
+
+                _spawn_reader(proc.stdout, out_buf)
+                _spawn_reader(proc.stderr, err_buf)
+
                 while True:
                     now = time.time()
                     elapsed = now - start
-                    if self.cancel_requested:
+                    if (not meta.get("error")) and self.cancel_requested:
                         _stop_process(proc)
                         meta["error"] = "Error: interrupted by user"
                         meta["exit_code"] = -130
-                    elif timeout > 0 and elapsed >= timeout:
+                    elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
                         _stop_process(proc)
                         meta["error"] = f"Error: timeout ({timeout}s)"
                         meta["exit_code"] = -1
-                    events = sel.select(timeout=0.12)
-                    for key, _ in events:
-                        stream = key.fileobj
-                        try:
-                            chunk = os.read(stream.fileno(), 65536)
-                        except BlockingIOError:
-                            continue
-                        except Exception:
-                            chunk = b""
-                        if not chunk:
-                            try:
-                                sel.unregister(stream)
-                            except Exception:
-                                pass
-                            continue
-                        if key.data == "stderr":
-                            _append_capture(err_buf, chunk)
-                        else:
-                            _append_capture(out_buf, chunk)
                     if now >= next_progress_emit:
                         self._emit_transient(
                             "status",
@@ -11733,14 +11733,89 @@ class SessionState:
                             },
                         )
                         next_progress_emit = now + 0.8
-                    if (proc.poll() is not None) and (not sel.get_map()):
+                    if proc.poll() is not None:
                         break
+                    time.sleep(0.12)
+                try:
+                    extra_out, extra_err = proc.communicate(timeout=0.8)
+                except Exception:
+                    extra_out, extra_err = b"", b""
+                _append_capture(out_buf, extra_out or b"")
+                _append_capture(err_buf, extra_err or b"")
+                for th in reader_threads:
+                    try:
+                        th.join(timeout=0.8)
+                    except Exception:
+                        pass
                 merged = _merge_output_text()
                 if meta.get("error"):
                     meta["output"] = trim(merged or str(meta["error"]))
                 else:
                     meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
                     meta["output"] = trim(merged or "(no output)")
+            else:
+                with selectors.DefaultSelector() as sel:
+                    if proc.stdout is not None:
+                        try:
+                            os.set_blocking(proc.stdout.fileno(), False)
+                        except Exception:
+                            pass
+                        sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+                    if proc.stderr is not None:
+                        try:
+                            os.set_blocking(proc.stderr.fileno(), False)
+                        except Exception:
+                            pass
+                        sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+                    while True:
+                        now = time.time()
+                        elapsed = now - start
+                        if self.cancel_requested:
+                            _stop_process(proc)
+                            meta["error"] = "Error: interrupted by user"
+                            meta["exit_code"] = -130
+                        elif timeout > 0 and elapsed >= timeout:
+                            _stop_process(proc)
+                            meta["error"] = f"Error: timeout ({timeout}s)"
+                            meta["exit_code"] = -1
+                        events = sel.select(timeout=0.12)
+                        for key, _ in events:
+                            stream = key.fileobj
+                            try:
+                                chunk = os.read(stream.fileno(), 65536)
+                            except BlockingIOError:
+                                continue
+                            except Exception:
+                                chunk = b""
+                            if not chunk:
+                                try:
+                                    sel.unregister(stream)
+                                except Exception:
+                                    pass
+                                continue
+                            if key.data == "stderr":
+                                _append_capture(err_buf, chunk)
+                            else:
+                                _append_capture(out_buf, chunk)
+                        if now >= next_progress_emit:
+                            self._emit_transient(
+                                "status",
+                                {
+                                    "summary": (
+                                        f"bash running ({int(elapsed)}s, "
+                                        f"captured={len(out_buf) + len(err_buf)}B)"
+                                    )
+                                },
+                            )
+                            next_progress_emit = now + 0.8
+                        if (proc.poll() is not None) and (not sel.get_map()):
+                            break
+                    merged = _merge_output_text()
+                    if meta.get("error"):
+                        meta["output"] = trim(merged or str(meta["error"]))
+                    else:
+                        meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
+                        meta["output"] = trim(merged or "(no output)")
         except Exception as exc:
             meta["error"] = f"Error: {exc}"
             meta["output"] = meta["error"]
@@ -12614,6 +12689,7 @@ class SessionState:
                 "ts": 0.0,
             },
             "manager_cycles": 0,
+            "manager_summary_attempts": 0,
             "active_agent": "",
             "last_delegate": {
                 "target": "",
@@ -12653,6 +12729,7 @@ class SessionState:
         board["updated_at"] = float(src.get("updated_at", now_ts()) or now_ts())
         board["status"] = self._normalize_blackboard_status(src.get("status", board["status"]))
         board["manager_cycles"] = max(0, int(src.get("manager_cycles", 0) or 0))
+        board["manager_summary_attempts"] = max(0, int(src.get("manager_summary_attempts", 0) or 0))
         board["active_agent"] = self._sanitize_agent_role(src.get("active_agent", ""))
         raw_delegate = src.get("last_delegate", {})
         if isinstance(raw_delegate, dict):
@@ -13191,6 +13268,7 @@ class SessionState:
             ),
             f"- active_agent: {board.get('active_agent', '') or '(none)'}",
             f"- manager_cycles: {int(board.get('manager_cycles', 0) or 0)}",
+            f"- manager_summary_attempts: {int(board.get('manager_summary_attempts', 0) or 0)}",
             (
                 "- manager_judgement: "
                 f"{trim(str(judgement.get('progress', 'initializing') or ''), 40)}"
@@ -13207,6 +13285,7 @@ class SessionState:
             f"- code_artifacts: {len(board.get('code_artifacts', {}) or {})}",
             f"- execution_logs: {len(board.get('execution_logs', []) or [])}",
             f"- review_feedback: {len(board.get('review_feedback', []) or [])}",
+            f"- collaboration_history: {len(board.get('conversation_history', []) or [])}",
         ]
         approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
         if bool(approval.get("approved", False)):
@@ -13235,6 +13314,7 @@ class SessionState:
                 lines.append(f"- [{actor or 'agent'}] {txt}")
 
         _render_tail("Recent Research Notes", board.get("research_notes", []))
+        _render_tail("Recent Collaboration History", board.get("conversation_history", []))
         art = board.get("code_artifacts", {})
         lines.append("\n### Recent Code Artifacts")
         if isinstance(art, dict) and art:
@@ -13774,6 +13854,8 @@ class SessionState:
             "Never use budget as an early-stop reason shown to user before task completion. "
             "Decision policy: missing facts/API -> explorer; implementation/update -> developer; "
             "verification/gap check -> reviewer; only choose finish when review is approved and no blocking logs remain. "
+            "Prefer Manager+AgentBus co-management: when fresh agentbus handoff is available and aligned, "
+            "follow that handoff to reduce orchestration latency instead of re-planning from scratch. "
             "If finish is blocked by missing final summary after review approval, instruct Reviewer to hand off Explorer "
             "via agentbus (intent=final_summary_request) instead of silently ending. "
             f"Current task level={level or '-'}, mode={mode}, scale_preference={scale_preference}, participants={participant_text}, "
@@ -13784,6 +13866,139 @@ class SessionState:
             "Avoid assigning the same agent more than two consecutive turns unless strictly required. "
             f"{model_language_instruction(self.ui_language)}"
         )
+
+    def _manager_pick_agentbus_fast_route(
+        self,
+        board: dict | None = None,
+        *,
+        max_age_seconds: float = 240.0,
+    ) -> tuple[dict, dict] | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC:
+            return None
+        if str(profile.get("task_type", "general") or "general") == "simple_qa":
+            return None
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if bool(approval.get("approved", False)):
+            return None
+        last_delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        try:
+            last_delegate_ts = float(last_delegate.get("ts", 0.0) or 0.0)
+        except Exception:
+            last_delegate_ts = 0.0
+        now_tick = float(now_ts())
+        max_age = max(15.0, float(max_age_seconds or 240.0))
+        participants = profile.get("participants", []) if isinstance(profile.get("participants"), list) else []
+        participants_norm = [self._sanitize_agent_role(x) for x in participants]
+        participants_norm = [x for x in participants_norm if x]
+        if not participants_norm:
+            participants_norm = [self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"]
+
+        def _intent_rank(intent: str) -> int:
+            low = str(intent or "").strip().lower()
+            if low in {"final_summary_request", "review_request", "fix_request", "execute_plan", "requestresearch_support"}:
+                return 6
+            if low in {"handoff", "implementation_request", "verify_request", "tip"}:
+                return 4
+            if "summary" in low or "review" in low or "fix" in low:
+                return 5
+            if low in {"message", "info"}:
+                return 2
+            return 3
+
+        candidates: list[tuple[int, float, dict]] = []
+        for env in list(self.agent_bus_messages)[-72:]:
+            if not isinstance(env, dict):
+                continue
+            try:
+                ts = float(env.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0.0:
+                continue
+            if last_delegate_ts > 0.0 and ts + 1e-6 <= last_delegate_ts:
+                continue
+            if (now_tick - ts) > max_age:
+                continue
+            src = self._sanitize_agent_role(env.get("from", ""))
+            dst = self._sanitize_agent_role(env.get("to", ""))
+            if (not src) or (not dst) or src == dst:
+                continue
+            if dst not in participants_norm:
+                continue
+            intent = trim(str(env.get("intent", "") or "").strip().lower(), 80)
+            payload = trim(str(env.get("payload", "") or "").strip(), 1200)
+            if not payload:
+                continue
+            env_id = trim(str(env.get("id", "") or "").strip(), 80)
+            score = _intent_rank(intent)
+            if dst == "developer":
+                score += 1
+            if dst == "explorer" and ("summary" in intent):
+                score += 2
+            if dst == "reviewer" and ("review" in intent or "verify" in intent):
+                score += 1
+            candidates.append(
+                (
+                    int(score),
+                    float(ts),
+                    {
+                        "env_id": env_id,
+                        "from": src,
+                        "to": dst,
+                        "intent": intent or "message",
+                        "payload": payload,
+                        "ts": ts,
+                    },
+                )
+            )
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = candidates[0][2]
+        assigned_expert = self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"
+        task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
+        if task_level not in TASK_LEVEL_CHOICES:
+            task_level = 3
+        round_budget = int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0)
+        args = {
+            "target": best.get("to", assigned_expert),
+            "instruction": trim(str(best.get("payload", "") or ""), 1200),
+            "task_level": int(task_level),
+            "task_type": trim(str(profile.get("task_type", self.runtime_task_type or "general") or "general"), 40),
+            "complexity": trim(str(profile.get("complexity", self.runtime_task_complexity or "simple") or "simple"), 20),
+            "scale_preference": trim(
+                str(profile.get("scale_preference", self.runtime_scale_preference or "balanced") or "balanced"),
+                20,
+            ),
+            "judgement": trim(
+                (
+                    f"agentbus relay {best.get('from','?')}->{best.get('to','?')} "
+                    f"intent={best.get('intent','message')} id={best.get('env_id','-')}"
+                ),
+                200,
+            ),
+            "round_budget": int(round_budget),
+            "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+            "execution_mode": mode,
+            "participants": list(participants_norm),
+            "assigned_expert": assigned_expert,
+            "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
+            "is_mandatory": bool(best.get("to", "") in {"developer", "explorer"}),
+        }
+        meta = {
+            "env_id": best.get("env_id", ""),
+            "from": best.get("from", ""),
+            "to": best.get("to", ""),
+            "intent": best.get("intent", "message"),
+            "age_sec": max(0.0, now_tick - float(best.get("ts", now_tick) or now_tick)),
+        }
+        return args, meta
 
     def _manager_fallback_route(self) -> dict:
         board = self._ensure_blackboard()
@@ -13809,6 +14024,31 @@ class SessionState:
         )
         has_error_log = self._manager_has_error_log(board)
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
+        cycles = int(board.get("manager_cycles", 0) or 0)
+        summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
+        max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
+        if cycles >= max_budget:
+            self._emit("status", {"summary": "Max cycles reached; forcing finish."})
+            return {
+                "target": "finish",
+                "instruction": (
+                    "Maximum cycles reached. Generate final summary immediately based on current "
+                    "blackboard state and terminate."
+                ),
+                "reason": "forced-finish-budget-exhausted",
+                "source": "fallback",
+            }
+        if finish_gate_reason == "reviewer-summary-missing" and summary_attempts >= 1:
+            self._emit("status", {"summary": "Summary generation attempted; forcing finish now."})
+            return {
+                "target": "finish",
+                "instruction": (
+                    "Final summary generation was requested in previous round. Compile final report "
+                    "from current blackboard evidence now and finish."
+                ),
+                "reason": "summary-generation-timeout-finish",
+                "source": "fallback",
+            }
         if progress == "done" and can_finish_from_approval:
             return {
                 "target": "finish",
@@ -13832,16 +14072,17 @@ class SessionState:
                     "source": "fallback",
                 }
             if finish_gate_reason == "reviewer-summary-missing":
+                board["manager_summary_attempts"] = summary_attempts + 1
+                self.blackboard = board
                 return {
                     "target": "reviewer",
                     "instruction": (
-                        "Do not finish yet. Use agentbus handoff to Explorer (intent=final_summary_request), "
-                        "then ensure final wrap-up summary is produced from blackboard evidence "
-                        "(implemented outputs, validation evidence, remaining risks/next steps), and finish."
+                        "Review approved but final summary required. Write one final wrap-up summary from "
+                        "blackboard evidence (changes, validation, residual risks/next steps), and then finish."
                     ),
-                    "reason": "approval-missing-reviewer-summary",
+                    "reason": "approval-missing-reviewer-summary-request",
                     "source": "fallback",
-                    "is_mandatory": False,
+                    "is_mandatory": True,
                 }
             if finish_gate_reason == "blocking-error-log":
                 return {
@@ -13894,15 +14135,17 @@ class SessionState:
                 }
             if feedback_pass and (not can_finish_from_approval):
                 if finish_gate_reason == "reviewer-summary-missing":
+                    board["manager_summary_attempts"] = summary_attempts + 1
+                    self.blackboard = board
                     return {
                         "target": "reviewer",
                         "instruction": (
-                            "Do not finish yet. Use agentbus to hand off Explorer for final summary, "
-                            "then confirm summary includes changed files, validation evidence, and residual risks/next steps."
+                            "Quick review passed but final summary is missing. Produce concise final summary "
+                            "covering changed files and validation evidence, then finish."
                         ),
-                        "reason": "simple-code-summary-missing",
+                        "reason": "simple-code-summary-request",
                         "source": "fallback",
-                        "is_mandatory": False,
+                        "is_mandatory": True,
                     }
                 return {
                     "target": "reviewer",
@@ -13925,15 +14168,17 @@ class SessionState:
             }
         if feedback_pass and code_count > 0 and (not can_finish_from_approval):
             if finish_gate_reason == "reviewer-summary-missing":
+                board["manager_summary_attempts"] = summary_attempts + 1
+                self.blackboard = board
                 return {
                     "target": "reviewer",
                     "instruction": (
-                        "Do not finish yet. Use agentbus handoff to Explorer for final summary, "
-                        "then verify final summary covers what changed, validation evidence, and residual risks/next steps."
+                        "Review passed but final summary is still missing. Produce final summary covering "
+                        "what changed, validation evidence, and residual risks/next steps, then finish."
                     ),
-                    "reason": "feedback-pass-summary-missing",
+                    "reason": "feedback-pass-summary-request",
                     "source": "fallback",
-                    "is_mandatory": False,
+                    "is_mandatory": True,
                 }
             return {
                 "target": "reviewer",
@@ -13976,6 +14221,17 @@ class SessionState:
                 "reason": "need-review",
                 "source": "fallback",
             }
+        if cycles > 10 and (code_count > 0 or research_count > 0):
+            self._emit("status", {"summary": "Fallback default with progress; forcing finish."})
+            return {
+                "target": "finish",
+                "instruction": (
+                    "Task has produced outputs but no explicit completion condition met. "
+                    "Generate final summary of current progress and finish."
+                ),
+                "reason": "forced-finish-fallback-progress",
+                "source": "fallback",
+            }
         return {
             "target": "developer",
             "instruction": "Continue implementation and produce concrete file/tool changes.",
@@ -13990,9 +14246,16 @@ class SessionState:
         target = str(row.get("target", "") or "").strip().lower()
         if target not in AGENT_ROLES:
             return row
-        recent = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-2:]]
-        if len(recent) == 2 and recent[0] == target and recent[1] == target:
+        recent = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-4:]]
+        if len(recent) >= 2 and recent[-1] == target and recent[-2] == target:
             board = self._ensure_blackboard()
+            low_reason = str(row.get("reason", "") or "").strip().lower()
+            if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
+                row["target"] = "finish"
+                row["instruction"] = "Anti-stall: summary generation loop detected, forcing finish."
+                row["reason"] = f"{row.get('reason', '')}|anti-stall-summary-loop-finish"
+                row["source"] = "anti-stall"
+                return row
             if target != "reviewer" and len(board.get("code_artifacts", {}) or {}) > 0:
                 row["target"] = "reviewer"
                 row["instruction"] = "Parallel-check current changes and provide immediate fix/pass guidance."
@@ -14006,6 +14269,15 @@ class SessionState:
                 row["instruction"] = "Run a focused search/read step to unblock the next coding move."
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->explorer"
             row["source"] = "anti-stall"
+            return row
+        if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
+            board = self._ensure_blackboard()
+            if len(board.get("code_artifacts", {}) or {}) > 0:
+                row["target"] = "finish"
+                row["instruction"] = "Oscillation detected with existing outputs; finish now."
+                row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-finish"
+                row["source"] = "anti-stall"
+                return row
         return row
 
     def _manager_apply_task_policy(self, route: dict) -> dict:
@@ -14109,13 +14381,42 @@ class SessionState:
             board,
             latest_user_ts=latest_user_ts,
         )
+        summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
+        force_finish_override = False
+        if remaining == 0:
+            force_finish_override = True
+            target = "finish"
+            instruction = "Maximum rounds reached. Generate final summary and finish immediately."
+            row["reason"] = "forced-finish-budget"
+            row["source"] = "policy"
+            self._emit("status", {"summary": "Round budget exhausted; forcing finish."})
         if bool((board.get("approval", {}) or {}).get("approved", False)) and can_finish_from_approval:
             target = "finish"
             if not instruction:
                 instruction = "Review already approved; finish now."
-        if target == "finish" and (not can_finish_from_approval):
+        if target == "finish" and (not can_finish_from_approval) and (not force_finish_override):
             if finish_gate_reason == "reviewer-summary-missing":
-                target = "reviewer"
+                if summary_attempts >= 1:
+                    force_finish_override = True
+                    target = "finish"
+                    instruction = (
+                        "Summary generation was attempted in previous cycle. Compile final report from "
+                        "available blackboard data and finish now."
+                    )
+                    row["reason"] = "forced-finish-summary-max-retry"
+                    row["source"] = "policy"
+                    self._emit("status", {"summary": "Summary retry limit reached; forcing finish."})
+                else:
+                    board["manager_summary_attempts"] = summary_attempts + 1
+                    self.blackboard = board
+                    target = "reviewer"
+                    instruction = (
+                        "Generate final summary report covering implemented outputs, validation evidence, "
+                        "and residual risks/next steps. This is the final step before completion."
+                    )
+                    row["reason"] = "finish-blocked-summary-request"
+                    row["source"] = "policy"
+                    self._emit("status", {"summary": "Requesting final summary generation before finish."})
             elif mode == EXECUTION_MODE_SINGLE:
                 target = assigned_expert
             else:
@@ -14133,11 +14434,11 @@ class SessionState:
                     "Continue execution for updated requirements and produce concrete progress now."
                 )
             elif finish_gate_reason == "reviewer-summary-missing":
-                instruction = (
-                    "Do not finish yet. Reviewer must hand off Explorer via agentbus "
-                    "(intent=final_summary_request), then ensure final summary is produced from blackboard evidence "
-                    "(implemented outputs, validation evidence, residual risks/next steps)."
-                )
+                if not (force_finish_override and target == "finish"):
+                    instruction = (
+                        "Do not finish yet. Generate final summary first (changes, validation evidence, "
+                        "residual risks/next steps), then finish."
+                    )
             elif finish_gate_reason == "blocking-error-log":
                 instruction = (
                     "Do not finish yet. Latest execution logs still contain blocking errors. "
@@ -14148,14 +14449,18 @@ class SessionState:
                     "Do not finish yet. Completion requires fresh reviewer approval for the current user request. "
                     "Continue with one concrete step and update blackboard."
                 )
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        f"manager finish blocked ({finish_gate_reason}); rerouted to {target}"
-                    )
-                },
-            )
+            if finish_gate_reason != "reviewer-summary-missing":
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"manager finish blocked ({finish_gate_reason}); rerouted to {target}"
+                        )
+                    },
+                )
+        if target not in {"finish", "reviewer"} and finish_gate_reason != "reviewer-summary-missing":
+            board["manager_summary_attempts"] = 0
+            self.blackboard = board
         if target != "finish" and objective:
             low_instruction = instruction.lower()
             low_objective = objective.lower()
@@ -14166,7 +14471,7 @@ class SessionState:
         has_mandatory_field = isinstance(row, dict) and ("is_mandatory" in row)
         is_mandatory = _to_bool_like(row.get("is_mandatory", False), default=False) if has_mandatory_field else False
         if finish_gate_reason == "reviewer-summary-missing" and target == "reviewer":
-            is_mandatory = False
+            is_mandatory = True
             has_mandatory_field = True
         if (not has_mandatory_field) and target in AGENT_ROLES and task_type != "simple_qa":
             is_mandatory = True
@@ -14304,94 +14609,156 @@ class SessionState:
         ):
             board = self._ensure_blackboard()
         board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
-        prompt = (
-            "Read the blackboard and delegate one next short timeslice. "
-            "Return only one route_to_next_agent call.\n\n"
-            f"{self._blackboard_read_state_markdown(max_items=6)}"
-        )
-        self.manager_context.append({"role": "user", "content": prompt, "ts": now_ts()})
-        self.manager_context = self.manager_context[-400:]
-        with self.lock:
-            self.current_phase = "manager:model-call"
-            self.current_tool_name = ""
-            self.active_agent_role = "manager"
-        response = self._chat_with_same_model_retry(
-            self.manager_context,
-            tools=self._manager_route_tools(),
-            system=self._manager_system_prompt(),
-            max_tokens=600,
-            think=False,
-            stream_thinking=False,
-            on_thinking_chunk=self._append_live_thinking,
-            pinned_selection=pinned_selection,
-            context_label="manager turn",
-            retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
-            media_inputs=media_inputs_round,
-        )
-        text = str(response.get("content") or "")
-        tool_calls = response.get("tool_calls", [])
-        text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
-        if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
-            self._inject_toolcall_overflow_hint("manager")
-        assistant = {"role": "assistant", "content": text, "ts": now_ts()}
-        if tool_calls:
-            assistant["tool_calls"] = [
+        text = ""
+        tool_calls: list[dict] = []
+        used_agentbus_fast = False
+        fast_meta: dict = {}
+        fast_pick = self._manager_pick_agentbus_fast_route(board)
+        if fast_pick:
+            used_agentbus_fast = True
+            fast_args, fast_meta = fast_pick
+            with self.lock:
+                self.current_phase = "manager:agentbus-fast-route"
+                self.current_tool_name = ""
+                self.active_agent_role = "manager"
+            text = trim(
+                (
+                    "agentbus fast-route "
+                    f"{fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
+                    f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                ),
+                600,
+            )
+            tool_calls = [
                 {
-                    "id": tc["id"],
+                    "id": make_id("tc"),
                     "type": "function",
                     "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": json_dumps(tc["function"]["arguments"]),
+                        "name": "route_to_next_agent",
+                        "arguments": dict(fast_args or {}),
                     },
                 }
-                for tc in tool_calls
             ]
-        self.manager_context.append(assistant)
-        self.manager_context = self.manager_context[-400:]
-        route_only_tool_calls = False
-        if isinstance(tool_calls, list) and tool_calls:
-            tool_names = [
-                str(tc.get("function", {}).get("name", "") or "").strip().lower()
-                for tc in tool_calls
-                if isinstance(tc, dict)
-            ]
-            if tool_names and all(name in {"route_to_next_agent", "routetonext_agent"} for name in tool_names):
-                route_only_tool_calls = True
-        emit_text = str(text or "").strip()
-        if not emit_text and tool_calls and (not route_only_tool_calls):
-            emit_text = f"[tool calls] {', '.join(str(tc.get('function', {}).get('name', '?')) for tc in tool_calls)}"
-        if emit_text:
-            manager_message = {
-                "role": "assistant",
-                "content": emit_text,
-                "ts": assistant["ts"],
-                "agent_role": "manager",
-            }
-            if "tool_calls" in assistant and (not route_only_tool_calls):
-                manager_message["tool_calls"] = assistant["tool_calls"]
-            self.messages.append(manager_message)
-            self.messages = self.messages[-400:]
-        elif "tool_calls" in assistant and (not route_only_tool_calls):
-            manager_message = {
-                "role": "assistant",
-                "content": "",
-                "ts": assistant["ts"],
-                "agent_role": "manager",
-                "tool_calls": assistant["tool_calls"],
-            }
-            self.messages.append(manager_message)
-            self.messages = self.messages[-400:]
-        if emit_text:
-            self._emit(
-                "message",
+            self.manager_context.append(
                 {
-                    "role": "assistant",
-                    "agent_role": "manager",
-                    "text": emit_text,
-                    "summary": "Manager response",
+                    "role": "system",
+                    "content": (
+                        "[manager-fast-route] "
+                        f"{trim(str(text or ''), 500)}"
+                    ),
+                    "ts": now_ts(),
+                }
+            )
+            self.manager_context = self.manager_context[-400:]
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "manager fast-route via agentbus "
+                        f"({fast_meta.get('from', '?')}->{fast_meta.get('to', '?')}, "
+                        f"intent={fast_meta.get('intent', 'message')}, "
+                        f"age={float(fast_meta.get('age_sec', 0.0) or 0.0):.1f}s)"
+                    )
                 },
             )
+        else:
+            prompt = (
+                "Read the blackboard and delegate one next short timeslice. "
+                "Return only one route_to_next_agent call.\n\n"
+                f"{self._blackboard_read_state_markdown(max_items=6)}"
+            )
+            self.manager_context.append({"role": "user", "content": prompt, "ts": now_ts()})
+            self.manager_context = self.manager_context[-400:]
+            with self.lock:
+                self.current_phase = "manager:model-call"
+                self.current_tool_name = ""
+                self.active_agent_role = "manager"
+            response = self._chat_with_same_model_retry(
+                self.manager_context,
+                tools=self._manager_route_tools(),
+                system=self._manager_system_prompt(),
+                max_tokens=600,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="manager turn",
+                retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
+                media_inputs=media_inputs_round,
+            )
+            text = str(response.get("content") or "")
+            tool_calls = response.get("tool_calls", [])
+            text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
+            if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
+                self._inject_toolcall_overflow_hint("manager")
+            assistant = {"role": "assistant", "content": text, "ts": now_ts()}
+            if tool_calls:
+                assistant["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": json_dumps(tc["function"]["arguments"]),
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+            self.manager_context.append(assistant)
+            self.manager_context = self.manager_context[-400:]
+            route_only_tool_calls = False
+            if isinstance(tool_calls, list) and tool_calls:
+                tool_names = [
+                    str(tc.get("function", {}).get("name", "") or "").strip().lower()
+                    for tc in tool_calls
+                    if isinstance(tc, dict)
+                ]
+                if tool_names and all(name in {"route_to_next_agent", "routetonext_agent"} for name in tool_names):
+                    route_only_tool_calls = True
+            emit_text = str(text or "").strip()
+            if not emit_text and tool_calls and (not route_only_tool_calls):
+                emit_text = f"[tool calls] {', '.join(str(tc.get('function', {}).get('name', '?')) for tc in tool_calls)}"
+            if emit_text:
+                manager_message = {
+                    "role": "assistant",
+                    "content": emit_text,
+                    "ts": assistant["ts"],
+                    "agent_role": "manager",
+                }
+                if "tool_calls" in assistant and (not route_only_tool_calls):
+                    manager_message["tool_calls"] = assistant["tool_calls"]
+                self.messages.append(manager_message)
+                self.messages = self.messages[-400:]
+            elif "tool_calls" in assistant and (not route_only_tool_calls):
+                manager_message = {
+                    "role": "assistant",
+                    "content": "",
+                    "ts": assistant["ts"],
+                    "agent_role": "manager",
+                    "tool_calls": assistant["tool_calls"],
+                }
+                self.messages.append(manager_message)
+                self.messages = self.messages[-400:]
+            if emit_text:
+                self._emit(
+                    "message",
+                    {
+                        "role": "assistant",
+                        "agent_role": "manager",
+                        "text": emit_text,
+                        "summary": "Manager response",
+                    },
+                )
         route = self._manager_route_from_response(text, tool_calls)
+        if used_agentbus_fast:
+            route["source"] = "agentbus-fast"
+            route["reason"] = trim(
+                (
+                    f"agentbus relay {fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
+                    f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                ),
+                600,
+            )
         active_profile = self._ensure_blackboard_task_profile(board)
         target = str(route.get("target", "") or "").strip().lower()
         instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
@@ -14597,6 +14964,11 @@ class SessionState:
             if bool(is_mandatory)
             else ""
         )
+        collaboration_note = (
+            "COLLABORATION PREFERENCE: if your current step needs another specialty, "
+            "use ask_colleague immediately with explicit intent and concise payload; "
+            "do not wait for another manager cycle."
+        )
         board_md = self._blackboard_read_state_markdown(max_items=5)
         payload = (
             "<manager-delegate>\n"
@@ -14605,6 +14977,7 @@ class SessionState:
             f"instruction={instruction_text}\n"
             f"language_policy={language_note}\n"
             f"{mandatory_note}\n"
+            f"{collaboration_note}\n"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
             f"{trim(board_md, 6000)}\n"
@@ -15099,6 +15472,16 @@ class SessionState:
                 "intent": envelope["intent"],
             },
         )
+        self._blackboard_history(
+            src,
+            trim(
+                (
+                    f"agentbus {src}->{dst} ({envelope['intent']}, id={envelope['id']}): "
+                    f"{trim(envelope['payload'], 320)}"
+                ),
+                520,
+            ),
+        )
         return envelope
 
     def _agent_role_system_prompt(self, role: str) -> str:
@@ -15123,6 +15506,7 @@ class SessionState:
                 + "Role objective: analyze user goals, inspect codebase, and produce actionable research notes. "
                 + "Prefer read/search/check commands; avoid direct large code modifications. "
                 + "When new evidence appears, write concise research updates to blackboard and hand off actionable insights. "
+                + "Proactively use ask_colleague when your findings can unblock developer/reviewer immediately. "
                 + "If reviewer sends final_summary_request, produce final wrap-up summary from blackboard evidence and finish."
             )
         if role_key == "reviewer":
@@ -15138,6 +15522,7 @@ class SessionState:
             + "Role objective: implement code changes based on explorer/reviewer inputs. "
             + "Perform concrete file edits and command execution. "
             + "Continuously record progress and blockers to blackboard. "
+            + "When blocked or uncertain, immediately call ask_colleague to explorer/reviewer with focused intent. "
             + "When implementation batch is ready, send review_request to reviewer via ask_colleague."
         )
 
@@ -16092,6 +16477,7 @@ class SessionState:
                         "status": board.get("status", "INITIALIZING"),
                         "active_agent": board.get("active_agent", ""),
                         "manager_cycles": int(board.get("manager_cycles", 0) or 0),
+                        "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
                         "approval": board.get("approval", {}),
                         "last_delegate": board.get("last_delegate", {}),
                     },
