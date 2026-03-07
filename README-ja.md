@@ -8,6 +8,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog (EN/中文/日本語)</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -18,6 +19,8 @@
 Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
+
+最新アーキテクチャ更新の三言語サマリー: [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -249,6 +252,155 @@ flowchart TD
   D --> N["収束出力とアーティファクト"]
   N --> O["プレビュー/履歴/エクスポート<br/>MD/コード/HTML + 段階バックアップ"]
 ```
+
+### 3.3 モノリシック同周波数マルチエージェント協調（Blackboard モード）
+
+Clouds Coder は単一プロセスのモノリシック・ランタイム内で、役割特化の協調実行をサポートします。
+
+- `manager`: ルーティング/仲裁専任（実装を直接書かない）
+- `explorer`: 調査、依存/パス解析、環境探索
+- `developer`: 実装、ファイル編集、ツール実行
+- `reviewer`: 検証、テスト判定、承認/差し戻し
+
+これはマイクロサービス分割ではなく、「単一プロセス + 単一ブラックボード」の協調モデルです。主な利点は次の通りです。
+
+- サービス間 RPC 不要で協調レイテンシを低減
+- Blackboard スナップショットによる Manager 判断の安定化
+- 実行途中エラー時の高速な中断・再ルーティング
+
+Blackboard の主要スライス:
+
+- `original_goal`, `status`, `manager_cycles`
+- `research_notes`, `code_artifacts`, `execution_logs`, `review_feedback`
+- `owner` 付き `todos`（`manager` / `explorer` / `developer` / `reviewer`）
+- manager 判断状態（`task level`, `budget`, `remaining rounds`, `approval gate`）
+
+実行トポロジ:
+
+- `sequential`: Explorer -> Developer -> Reviewer の直列パイプライン
+- `sync`: Manager 主導の同周波数協調。動的なクロスロール再委譲を許可
+
+タスクレベル方針（Manager の意味判断、各ユーザー入力ごとに再評価）:
+
+| Level | 典型タスク形態 | モード判断 | 予算方針 |
+| --- | --- | --- | --- |
+| L1 | 単発の簡易回答 | single-agent へ切替 | 最小 |
+| L2 | 短い連続会話対応 | single-agent へ切替 | 拡張だが上限あり |
+| L3 | 軽量な複数役割協業 | sync 継続 | 収束重視の制約 |
+| L4 | 複雑な実装/調査 | sync 継続 | 拡張 |
+| L5 | システム級の長期オーケストレーション | sync 継続 | 実質無制限（確認ゲート付き） |
+
+Mermaid（モノリシック同周波数協調）:
+
+```mermaid
+flowchart LR
+  U["ユーザー入力"] --> M["Manager"]
+  M --> B["Session Blackboard"]
+  B --> E["Explorer"]
+  B --> D["Developer"]
+  B --> R["Reviewer"]
+  E -->|research notes / risk / references| B
+  D -->|code artifacts / tool outputs| B
+  R -->|review verdict / fix request| B
+  B --> M
+  M -->|delegate_task + mandatory flags + budget update| E
+  M -->|delegate_task + mandatory flags + budget update| D
+  M -->|delegate_task + mandatory flags + budget update| R
+```
+
+Mermaid（動的ルーティングと中断回帰）:
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant M as Manager
+  participant B as Blackboard
+  participant E as Explorer
+  participant D as Developer
+  participant R as Reviewer
+
+  U->>M: 新規要求 / Continue
+  M->>B: classify(task_level, mode, budget)
+  M->>E: delegate(調査目標)
+  E->>B: write(research_notes)
+  M->>D: delegate(実装目標)
+  D->>B: write(code_artifacts, execution_logs)
+  M->>R: delegate(レビュー目標)
+  R->>B: write(review_feedback, approval)
+  alt reviewer が回帰を検出
+    M->>E: API/制約を再調査
+    M->>D: レビュー指摘で修正
+  end
+  M->>B: mark_completed または continue
+```
+
+Mermaid（Blackboard 状態機械）:
+
+```mermaid
+stateDiagram-v2
+  [*] --> INITIALIZING
+  INITIALIZING --> RESEARCHING
+  RESEARCHING --> CODING
+  CODING --> TESTING
+  TESTING --> REVIEWING
+  REVIEWING --> COMPLETED
+  REVIEWING --> CODING: 修正が必要
+  CODING --> RESEARCHING: 依存/API衝突
+  TESTING --> RESEARCHING: 実行環境不一致
+```
+
+### 3.4 2026-03-07 更新セットとイノベーション対応
+
+優先度順に統合された更新:
+
+| 優先度 | 更新項目 | 実装ハイライト | アーキテクチャ影響 |
+| --- | --- | --- | --- |
+| 1 | マルチエージェント + Blackboard 融合 | 役割集合（`explorer/developer/reviewer/manager`）、blackboard 状態、sync/sequential、L1-L5 方針 | 単一ループを仲裁付き協調グラフへ拡張 |
+| 2 | サーキットブレーカと融合故障制御 | `CircuitBreakerTriggered`、`HARD_BREAK_TOOL_ERROR_THRESHOLD`、`FUSED_FAULT_BREAK_THRESHOLD` | 反復失敗をハード停止し、収束性と Token 予算を保護 |
+| 3 | 思考出力リカバリ | 寛容な `<think>` 解析、`EmptyActionError`、`<thinking-empty-recovery>` | 「思考のみで実行しない」ドリフトを抑制 |
+| 4 | メモリ有界ホットスポットプレビュー | `_compress_rows_keep_hotspot`、動的 `buffer_cap`、変更点周辺保持圧縮 | 巨大 diff/大規模置換で OOM と UI フリーズを回避 |
+| 5 | Todo 所有権 + 仲裁改善 | todo `owner`/`key`、`complete_active`、`complete_all_open`、仲裁計画制約 | 計画から実行までの責務追跡と収束制御を強化 |
+
+2026.03.07 のアーキテクチャ革新:
+
+- モノリシック同周波数マルチエージェント協調: 単一プロセス・単一ブラックボードで低摩擦協業。
+- 産業グレード実行サーキットブレーカ: 無制限リトライではなく、ハード閾値で停止。
+- OOM 安全なホットスポット描画: 変更領域を優先保持し、非重要コンテキストを圧縮。
+- 適応型思考ウェイクアップ: 空アクションドリフトを検知し、実行フェーズへ強制復帰。
+
+### 3.5 2026-03-07 詳細変更インベントリ
+
+1. コアアーキテクチャとマルチエージェント系（最優先）
+- 実行モード定数を追加: `EXECUTION_MODE_SINGLE`、`EXECUTION_MODE_SEQUENTIAL`、`EXECUTION_MODE_SYNC`。
+- 役割集合を追加: `AGENT_ROLES = ("explorer", "developer", "reviewer")` と `manager` を含む `AGENT_BUBBLE_ROLES`。
+- タスクレベル方針 `TASK_LEVEL_POLICIES`（`L1` 〜 `L5`）を追加し、意味判断ベースのモード/予算配分を可能化。
+- Blackboard 状態定数 `BLACKBOARD_STATUSES` を追加（`INITIALIZING`、`RESEARCHING`、`CODING`、`TESTING`、`REVIEWING`、`COMPLETED`、`PAUSED`）。
+
+2. サーキットブレーカとアンチドリフト強化
+- 不可逆障害をハード停止する例外 `CircuitBreakerTriggered` を追加。
+- 厳格閾値を追加: `HARD_BREAK_TOOL_ERROR_THRESHOLD = 3`、`HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3`、`FUSED_FAULT_BREAK_THRESHOLD = 3`。
+- 効果: 楽観的リトライ中心の運用を、境界付き安全収束モデルへ移行。
+
+3. 深い推論モデル向け思考出力リカバリ
+- 「思考のみ・実行なし」を捕捉する `EmptyActionError` を追加。
+- ウェイクアップ制御を追加: `EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2` と `<thinking-empty-recovery>`。
+- `split_thinking_content` を強化し、未閉じ `<think>` を含む寛容パースに対応。
+
+4. メモリ有界コードプレビューとホットスポット描画
+- 変更領域保持圧縮 `_compress_rows_keep_hotspot` を追加。
+- `make_numbered_diff` と `build_code_preview_rows` に動的 `buffer_cap` を導入し、メモリ増大を制御。
+- 効果: 巨大ファイル差分時の OOM/フロント停滞リスクを低減。
+
+5. Todo 所有権・仲裁・ワークフロー統制
+- Todo に所有者/識別子フィールド `owner`、`key` を追加。
+- 一括状態操作 API `complete_active()`、`complete_all_open()`、`clear_all()` を追加。
+- 仲裁計画制御 `ARBITER_VALID_PLANNING_STREAK_LIMIT = 4` を追加。
+
+6. 依存・雑多な制御プレーン拡張
+- オーケストレーションと非ブロッキング制御のため `deque`、`selectors`、`signal`、`shlex` を導入。
+- `RUNTIME_CONTROL_HINT_PREFIXES` に `<arbiter-continue>` と `<fault-prefill>` を追加し、回復ヒント表現を拡張。
+
+三言語の完全版更新ログ: [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
 ## 4. 主要ランタイム構成（実装ベース）
 
@@ -588,7 +740,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主な参照
+### 12.1 主な参照（指定）
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -600,7 +752,7 @@ flowchart TD
 - Todo/task/worktree/team を概念・インターフェースレベルで継承し standalone runtime に統合
 - `SKILL.md` のオンデマンド読み込み手法を再利用し Skills Studio へ拡張
 
-### 12.2 追加参照
+### 12.2 追加推奨参照
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
@@ -608,7 +760,7 @@ flowchart TD
 - PyInstaller: https://pyinstaller.org/
 - Nuitka: https://nuitka.net/
 
-### 12.3 本リポジトリ実装
+### 12.3 本リポジトリ実装時の参照
 
 - `Clouds_Coder.py`（ランタイム構成、API、フロント連携）
 - `packaging/README.md`（配布/パッケージング）

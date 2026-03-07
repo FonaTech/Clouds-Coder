@@ -8,6 +8,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 更新日志（EN/中文/日本語）</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -18,6 +19,8 @@
 Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
+
+本次架构更新三语总览见：[`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -249,6 +252,155 @@ flowchart TD
   D --> N["收敛结果与工件"]
   N --> O["预览/历史/导出<br/>MD/代码/HTML + 阶段备份"]
 ```
+
+### 3.3 单体化同频多智能体协作（Blackboard 模式）
+
+Clouds Coder 已支持在单体内核中进行角色专职协作：
+
+- `manager`：仅负责路由与仲裁（不直接写实现）
+- `explorer`：调研、依赖分析、路径与环境探测
+- `developer`：代码实现、文件修改、工具执行
+- `reviewer`：校验、测试判定、通过/阻断裁决
+
+这不是微服务拆分模型，而是“单进程 + 单黑板”的协作范式。核心收益：
+
+- 无跨服务 RPC 开销，协同延迟更低
+- 黑板状态可快照、可重放，Manager 决策更稳定
+- 任一环节报错时可快速中断并重路由
+
+黑板核心切片（Single Source of Truth）：
+
+- `original_goal`、`status`、`manager_cycles`
+- `research_notes`、`code_artifacts`、`execution_logs`、`review_feedback`
+- 带 owner 的 `todos`（`manager/explorer/developer/reviewer`）
+- manager 判定字段（任务等级、预算、剩余轮次、确认门禁）
+
+执行拓扑：
+
+- `sequential`：Explorer -> Developer -> Reviewer 串行流水线
+- `sync`：Manager 主导的同频协作，支持动态跨角色回调与接管
+
+任务等级策略（由 Manager 语义判定，每次用户输入都会重评）：
+
+| 等级 | 典型任务形态 | 模式决策 | 预算策略 |
+| --- | --- | --- | --- |
+| L1 | 一次性简单问答 | 切回 single-agent | 最小预算 |
+| L2 | 简短连续对话任务 | 切回 single-agent | 放宽但有上限 |
+| L3 | 轻量多角色工程任务 | 保持 sync | 收敛型预算 |
+| L4 | 复杂工程/调研任务 | 保持 sync | 扩展预算 |
+| L5 | 系统级长链路任务 | 保持 sync | 近似无限预算（含确认门禁） |
+
+Mermaid（单体内核下的同频协作）：
+
+```mermaid
+flowchart LR
+  U["用户输入"] --> M["Manager"]
+  M --> B["Session Blackboard"]
+  B --> E["Explorer"]
+  B --> D["Developer"]
+  B --> R["Reviewer"]
+  E -->|research notes / risk / references| B
+  D -->|code artifacts / tool outputs| B
+  R -->|review verdict / fix request| B
+  B --> M
+  M -->|delegate_task + mandatory + budget update| E
+  M -->|delegate_task + mandatory + budget update| D
+  M -->|delegate_task + mandatory + budget update| R
+```
+
+Mermaid（动态路由与中途打断）：
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant M as Manager
+  participant B as Blackboard
+  participant E as Explorer
+  participant D as Developer
+  participant R as Reviewer
+
+  U->>M: 新需求 / Continue
+  M->>B: classify(task_level, mode, budget)
+  M->>E: delegate(调研目标)
+  E->>B: write(research_notes)
+  M->>D: delegate(开发目标)
+  D->>B: write(code_artifacts, execution_logs)
+  M->>R: delegate(审核目标)
+  R->>B: write(review_feedback, approval)
+  alt reviewer 发现回归
+    M->>E: 重新检索 API/约束
+    M->>D: 按审核意见修复
+  end
+  M->>B: mark_completed 或继续
+```
+
+Mermaid（黑板状态机）：
+
+```mermaid
+stateDiagram-v2
+  [*] --> INITIALIZING
+  INITIALIZING --> RESEARCHING
+  RESEARCHING --> CODING
+  CODING --> TESTING
+  TESTING --> REVIEWING
+  REVIEWING --> COMPLETED
+  REVIEWING --> CODING: 需要修复
+  CODING --> RESEARCHING: 依赖/API冲突
+  TESTING --> RESEARCHING: 环境不匹配
+```
+
+### 3.4 2026-03-07 更新集合与创新映射
+
+按优先级合并的更新如下：
+
+| 优先级 | 更新项 | 关键实现 | 架构影响 |
+| --- | --- | --- | --- |
+| 1 | 多智能体 + 黑板融合 | `explorer/developer/reviewer/manager` 角色组、blackboard 状态、sync/sequential、L1-L5 策略 | 将单智能体流水线升级为可仲裁协作图 |
+| 2 | 熔断器与融合故障阻断 | `CircuitBreakerTriggered`、`HARD_BREAK_TOOL_ERROR_THRESHOLD`、`FUSED_FAULT_BREAK_THRESHOLD` | 多次失败触发硬阻断，保护收敛与 Token 预算 |
+| 3 | 长思考输出恢复 | 宽容 `<think>` 解析、`EmptyActionError`、`<thinking-empty-recovery>` 提示 | 减少“只思考不执行”的漂移 |
+| 4 | 内存有界热点预览 | `_compress_rows_keep_hotspot`、动态 `buffer_cap`、热点保留压缩 | 超大 diff/大文件替换场景避免 OOM 与前端卡死 |
+| 5 | Todo 所有权与仲裁增强 | todo `owner/key`、`complete_active`、`complete_all_open`、仲裁规划阈值 | 计划到执行的责任链更清晰，收敛约束更强 |
+
+2026.03.07 架构创新点：
+
+- 单体化同频多智能体协作：单进程共享黑板，低成本高一致性协同。
+- 工业级执行熔断：重试受硬阈值约束，不再无限摸鱼循环。
+- OOM 免疫热点渲染：优先保留修改区，压缩非关键上下文。
+- 自适应思考唤醒：识别空动作漂移并强制回到执行态。
+
+### 3.5 2026-03-07 详细变更清单
+
+1. 核心架构与多智能体系统（最高优先级）
+- 新增执行模式常量：`EXECUTION_MODE_SINGLE`、`EXECUTION_MODE_SEQUENTIAL`、`EXECUTION_MODE_SYNC`。
+- 新增角色集合：`AGENT_ROLES = ("explorer", "developer", "reviewer")` 与包含 `manager` 的 `AGENT_BUBBLE_ROLES`。
+- 新增任务分级策略矩阵：`TASK_LEVEL_POLICIES`（`L1` 到 `L5`），用于语义级模式/预算决策。
+- 新增黑板状态机常量：`BLACKBOARD_STATUSES`，覆盖 `INITIALIZING`、`RESEARCHING`、`CODING`、`TESTING`、`REVIEWING`、`COMPLETED`、`PAUSED`。
+
+2. 断路器与防漂移硬化
+- 新增 `CircuitBreakerTriggered`，用于不可逆故障模式下的硬性切断。
+- 新增硬阈值：`HARD_BREAK_TOOL_ERROR_THRESHOLD = 3`、`HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3`、`FUSED_FAULT_BREAK_THRESHOLD = 3`。
+- 架构效果：把“乐观重试”升级为“有边界的安全收敛”。
+
+3. 深度推理模型的思考输出恢复
+- 新增 `EmptyActionError`，捕捉“只有思考、没有可执行动作”的空转回合。
+- 新增唤醒控制：`EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2` 与运行时提示 `<thinking-empty-recovery>`。
+- 强化 `split_thinking_content`：宽容 `<think>` 扫描并支持未闭合标签兜底。
+
+4. 内存有界代码预览与热点渲染
+- 新增 `_compress_rows_keep_hotspot`：保留修改热点并压缩非关键上下文。
+- 在 `make_numbered_diff` 和 `build_code_preview_rows` 引入动态 `buffer_cap`，限制内存增长。
+- 架构效果：超大文件替换与高行数 diff 预览场景下仍可避免 OOM。
+
+5. Todo 归属、仲裁与工作流治理
+- 新增 todo 归属与身份字段：`owner`、`key`。
+- 新增批量状态 API：`complete_active()`、`complete_all_open()`、`clear_all()`。
+- 新增仲裁规划约束：`ARBITER_VALID_PLANNING_STREAK_LIMIT = 4`。
+
+6. 运行时依赖与控制平面杂项增强
+- 新增系统级依赖导入：`deque`、`selectors`、`signal`、`shlex`，用于调度与非阻塞控制路径。
+- 扩展 `RUNTIME_CONTROL_HINT_PREFIXES`：新增 `<arbiter-continue>` 与 `<fault-prefill>`，增强恢复闭环表达力。
+
+完整三语更新日志见：[`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)。
 
 ## 4. 关键运行时组件（来自源码）
 
@@ -588,7 +740,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主要参考
+### 12.1 主要参考（你指定）
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -600,7 +752,7 @@ flowchart TD
 - Todo/task/worktree/team 机制在概念与接口层继承，并整合到 standalone web agent
 - `SKILL.md` 按需加载方法被复用并扩展到 Skills Studio
 
-### 12.2 补充参考
+### 12.2 建议补充参考
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
@@ -608,7 +760,7 @@ flowchart TD
 - PyInstaller: https://pyinstaller.org/
 - Nuitka: https://nuitka.net/
 
-### 12.3 本仓库实现过程
+### 12.3 本仓库实现过程参考
 
 - `Clouds_Coder.py`（运行时架构、API、前端桥接）
 - `packaging/README.md`（打包与分发说明）

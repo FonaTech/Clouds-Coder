@@ -8,6 +8,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog (EN/中文/日本語)</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -18,6 +19,8 @@
 Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
+
+Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -249,6 +252,155 @@ flowchart TD
   D --> N["Converged Output + Artifacts"]
   N --> O["Preview / History / Export<br/>MD/Code/HTML + stage backups"]
 ```
+
+### 3.3 Monolithic Multi-Agent Collaboration (Blackboard Mode)
+
+Clouds Coder now supports role-specialized collaboration inside one monolithic runtime process:
+
+- `manager`: routing/arbitration only (does not implement code directly)
+- `explorer`: research, dependency/path analysis, environment probing
+- `developer`: implementation, file edits, tool execution
+- `reviewer`: validation, test judgment, approval/block decisions
+
+This is not a microservice cluster. All agents run in one process and synchronize through one shared blackboard (single source of truth), which gives:
+
+- lower coordination overhead (no cross-service RPC/event drift)
+- deterministic state snapshots for Manager decisions
+- faster corrective routing when errors appear mid-execution
+
+Blackboard-centered data slices:
+
+- `original_goal`, `status`, `manager_cycles`
+- `research_notes`, `code_artifacts`, `execution_logs`, `review_feedback`
+- `todos` with owner attribution (`manager`/`explorer`/`developer`/`reviewer`)
+- manager judgement state (`task level`, `budget`, `remaining rounds`, `approval gate`)
+
+Execution topologies:
+
+- `sequential`: Explorer -> Developer -> Reviewer pipeline
+- `sync`: Manager-led same-frequency collaboration, with dynamic cross-role re-routing
+
+Task-level policy (Manager semantic classification, reset per user turn):
+
+| Level | Typical task profile | Mode decision | Budget strategy |
+| --- | --- | --- | --- |
+| L1 | one-shot simple answer | switch to single-agent | minimal |
+| L2 | short conversational follow-up | switch to single-agent | increased but bounded |
+| L3 | light multi-role engineering | keep sync | constrained |
+| L4 | complex engineering/research | keep sync | expanded |
+| L5 | system-scale, long-horizon orchestration | keep sync | effectively unbounded, with confirmation gates |
+
+Mermaid (same-frequency collaboration under monolithic kernel):
+
+```mermaid
+flowchart LR
+  U["User Input"] --> M["Manager"]
+  M --> B["Session Blackboard"]
+  B --> E["Explorer"]
+  B --> D["Developer"]
+  B --> R["Reviewer"]
+  E -->|research notes / risk / references| B
+  D -->|code artifacts / tool outputs| B
+  R -->|review verdict / fix request| B
+  B --> M
+  M -->|delegate_task + mandatory flags + budget update| E
+  M -->|delegate_task + mandatory flags + budget update| D
+  M -->|delegate_task + mandatory flags + budget update| R
+```
+
+Mermaid (routing loop and dynamic interception):
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant M as Manager
+  participant B as Blackboard
+  participant E as Explorer
+  participant D as Developer
+  participant R as Reviewer
+
+  U->>M: New requirement / Continue
+  M->>B: classify(task_level, mode, budget)
+  M->>E: delegate(research objective)
+  E->>B: write(research_notes)
+  M->>D: delegate(implementation objective)
+  D->>B: write(code_artifacts, execution_logs)
+  M->>R: delegate(review objective)
+  R->>B: write(review_feedback, approval)
+  alt reviewer finds regression
+    M->>E: re-check APIs/constraints
+    M->>D: patch with reviewer feedback
+  end
+  M->>B: mark_completed or continue
+```
+
+Mermaid (blackboard state machine):
+
+```mermaid
+stateDiagram-v2
+  [*] --> INITIALIZING
+  INITIALIZING --> RESEARCHING
+  RESEARCHING --> CODING
+  CODING --> TESTING
+  TESTING --> REVIEWING
+  REVIEWING --> COMPLETED
+  REVIEWING --> CODING: fix required
+  CODING --> RESEARCHING: dependency/API conflict
+  TESTING --> RESEARCHING: env mismatch
+```
+
+### 3.4 2026-03-07 Update Set and Innovation Mapping
+
+Priority-ordered updates merged into this architecture:
+
+| Priority | Update | Implementation highlights | Architecture impact |
+| --- | --- | --- | --- |
+| 1 | Multi-agent + blackboard fusion | role set (`explorer/developer/reviewer/manager`), blackboard statuses, sync/sequential mode, task-level policy L1-L5 | upgrades single-agent loop to managed collaborative graph |
+| 2 | Circuit breaker & fused fault control | `CircuitBreakerTriggered`, `HARD_BREAK_TOOL_ERROR_THRESHOLD`, `FUSED_FAULT_BREAK_THRESHOLD` | hard stop on repeated failures to protect convergence and token budget |
+| 3 | Thinking-output recovery | tolerant `<think>` parsing, `EmptyActionError`, `<thinking-empty-recovery>` hints | reduces "thinking-only" drift in long-chain reasoning models |
+| 4 | Memory-bounded hotspot code preview | `_compress_rows_keep_hotspot`, dynamic `buffer_cap`, hotspot-preserving row compression | avoids OOM / UI stall on huge diff or full-file replacement |
+| 5 | Todo ownership + arbiter refinement | todo `owner`/`key`, `complete_active`, `complete_all_open`, arbiter planning streak constraints | tighter planning-to-execution governance and clearer responsibility routing |
+
+2026.03.07 architecture innovations:
+
+- Monolithic same-frequency multi-agent collaboration: one process, one blackboard, low coordination friction.
+- Industrial-grade execution circuit breaker: retries are bounded by hard fusion guards, not unlimited loops.
+- OOM-safe hotspot rendering: preserve modified regions while compressing non-critical context.
+- Adaptive thinking wakeup: catches empty-action drift and forces execution re-entry.
+
+### 3.5 Detailed 2026-03-07 Change Inventory
+
+1. Core architecture and multi-agent system (highest priority)
+- Added execution mode constants: `EXECUTION_MODE_SINGLE`, `EXECUTION_MODE_SEQUENTIAL`, `EXECUTION_MODE_SYNC`.
+- Added role sets: `AGENT_ROLES = ("explorer", "developer", "reviewer")` and `AGENT_BUBBLE_ROLES` (including `manager`).
+- Added task-level policy matrix: `TASK_LEVEL_POLICIES` (`L1` to `L5`) for semantic mode/budget decisions.
+- Added blackboard state machine constants: `BLACKBOARD_STATUSES` covering `INITIALIZING`, `RESEARCHING`, `CODING`, `TESTING`, `REVIEWING`, `COMPLETED`, `PAUSED`.
+
+2. Circuit breaker and anti-drift hardening
+- Added `CircuitBreakerTriggered` for hard execution cut-off on irreversible failure patterns.
+- Added strict thresholds: `HARD_BREAK_TOOL_ERROR_THRESHOLD = 3`, `HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3`, `FUSED_FAULT_BREAK_THRESHOLD = 3`.
+- Architecture effect: turns retry from optimistic repetition into bounded, safety-first convergence.
+
+3. Thinking-output recovery for deep reasoning models
+- Added `EmptyActionError` to catch "thinking-only, no executable action" turns.
+- Added wake-up controls: `EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2` with runtime hint `<thinking-empty-recovery>`.
+- Enhanced `split_thinking_content` with lenient `<think>` scanning, including unclosed-tag fallback handling.
+
+4. Memory-bounded code preview and hotspot rendering
+- Added `_compress_rows_keep_hotspot` to preserve changed regions and compress non-critical context.
+- Added dynamic `buffer_cap` limits in `make_numbered_diff` and `build_code_preview_rows` to constrain memory growth.
+- Architecture effect: keeps giant file replacements and high-line diff previews OOM-safe.
+
+5. Todo ownership, arbiter, and workflow governance
+- Added todo ownership and identity fields: `owner`, `key`.
+- Added batch state APIs: `complete_active()`, `complete_all_open()`, `clear_all()`.
+- Added arbiter planning control: `ARBITER_VALID_PLANNING_STREAK_LIMIT = 4`.
+
+6. Runtime dependency and miscellaneous control-plane additions
+- Added system-level imports for orchestration and non-blocking control paths: `deque`, `selectors`, `signal`, `shlex`.
+- Expanded `RUNTIME_CONTROL_HINT_PREFIXES` with `<arbiter-continue>` and `<fault-prefill>` for richer recovery loops.
+
+The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md).
 
 ## 4. Key Runtime Components (from source)
 
@@ -592,7 +744,7 @@ flowchart TD
 
 ## 12. References
 
-### 12.1 Primary inspirations
+### 12.1 Primary inspirations (requested)
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -604,7 +756,7 @@ flowchart TD
 - Todo/task/worktree/team mechanisms are inherited at concept and interface level, then integrated into the single-runtime web agent
 - Skills loading protocol (`SKILL.md`) and "load on demand" methodology are reused and expanded by Skills Studio
 
-### 12.2 Additional references
+### 12.2 Additional recommended references
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs (OpenAI-compatible patterns): https://platform.openai.com/docs
@@ -612,7 +764,7 @@ flowchart TD
 - PyInstaller: https://pyinstaller.org/
 - Nuitka: https://nuitka.net/
 
-### 12.3 Implementation-time used in this repository
+### 12.3 Implementation-time references used in this repository
 
 - `Clouds_Coder.py` (runtime architecture, APIs, frontend bridge)
 - `packaging/README.md` (distribution and packaging commands)
