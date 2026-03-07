@@ -1,6 +1,6 @@
 # Clouds Coder Release Notes / 发布说明 / リリースノート
 
-Version: `0.1.0`  
+Version: `2026.03.06`  
 Date: `2026-03-05`
 
 ## 中文（发布说明）
