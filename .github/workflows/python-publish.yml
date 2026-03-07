@@ -1,109 +1,34 @@
-name: Python Publish
-
-on:
-  workflow_dispatch:
-  pull_request:
-  push:
-    branches:
-      - main
-    tags:
-      - "*"
-
-jobs:
-  test:
-    name: Test (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install test deps
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest
-          python -m pip install . --no-deps
-
-      - name: Run tests
-        run: python -m pytest -q
-
-  build:
-    name: Build Dist
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Build package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build twine
-          rm -rf dist build *.egg-info
-          python -m build
-          python -m twine check dist/*
-
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-dist
-          path: dist/*
-          if-no-files-found: error
-
-  publish-token:
-    name: Publish to PyPI (API token)
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/') && secrets.PYPI_API_TOKEN != ''
-    permissions:
-      contents: read
-    steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: python-dist
-          path: dist/
-
-      - name: Publish with API token
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: dist/
-          skip-existing: true
-
-  publish-trusted:
-    name: Publish to PyPI (Trusted Publishing)
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/') && secrets.PYPI_API_TOKEN == ''
-    permissions:
-      contents: read
-      id-token: write
-    environment:
-      name: pypi
-    steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: python-dist
-          path: dist/
-
-      - name: Publish with Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/
-          skip-existing: true
+            - name: pypi-publish
+  # You may pin to the exact commit or the version.
+  # uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+  uses: pypa/gh-action-pypi-publish@v1.13.0
+  with:
+    # PyPI user
+    user: # optional, default is __token__
+    # Password for your PyPI user or an access token
+    password: # optional
+    # The repository URL to use
+    repository-url: # optional
+    # [DEPRECATED] The repository URL to use
+    repository_url: # optional, default is https://upload.pypi.org/legacy/
+    # The target directory for distribution
+    packages-dir: # optional
+    # [DEPRECATED] The target directory for distribution
+    packages_dir: # optional, default is dist
+    # Check metadata before uploading
+    verify-metadata: # optional
+    # [DEPRECATED] Check metadata before uploading
+    verify_metadata: # optional, default is true
+    # Do not fail if a Python package distribution exists in the target package index
+    skip-existing: # optional
+    # [DEPRECATED] Do not fail if a Python package distribution exists in the target package index
+    skip_existing: # optional, default is false
+    # Show verbose output.
+    verbose: # optional, default is false
+    # Show hash values of files to be uploaded
+    print-hash: # optional
+    # [DEPRECATED] Show hash values of files to be uploaded
+    print_hash: # optional, default is false
+    # [EXPERIMENTAL] Enable experimental support for PEP 740 attestations. Only works with PyPI and TestPyPI via Trusted Publishing.
+    attestations: # optional, default is true
+          
