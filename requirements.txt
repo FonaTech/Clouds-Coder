@@ -1,2 +1,9 @@
-anthropic>=0.25.0
-python-dotenv>=1.0.0
+# Core runtime dependencies for Clouds Coder.
+# The main application (Clouds_Coder.py) uses only Python standard library.
+# Keep this file intentionally minimal to avoid false hard dependencies.
+
+# Optional feature dependencies (uncomment if needed):
+# openpyxl>=3.1.0
+# xlrd>=2.0.1
+# python-docx>=1.1.2
+# python-pptx>=1.0.2
