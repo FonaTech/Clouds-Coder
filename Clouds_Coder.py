@@ -121,6 +121,8 @@ BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or
     "debug",
 }
 BENIGN_SOCKET_LOG_INTERVAL_SECONDS = 30.0
+FINAL_SUMMARY_MIN_CHARS = 80
+FINAL_SUMMARY_STRICT_MIN_CHARS = 120
 RUNTIME_CONTROL_HINT_PREFIXES = (
     "<reminder>",
     "<todo-rescue>",
@@ -766,7 +768,6 @@ def _detect_os_shell_instruction() -> str:
         "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
         "Use relative paths or the absolute session root shown above."
     )
-    
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
     txt = str(raw or "").strip()
@@ -13612,7 +13613,7 @@ class SessionState:
         finish_gate_reason = ""
         if status == "tools" and bool(safe_step.get("stop_due_to_finish", False)):
             note = f"{self._agent_display_name(role)} signaled finish via tool."
-            self._blackboard_mark_approved(note, role)
+            # Approval note should come from finish tool payload sync; avoid overwriting with generic text here.
             can_finish_now, finish_gate_reason = self._can_auto_finish_from_approval(
                 self._ensure_blackboard(),
                 latest_user_ts=self._latest_user_message_ts(),
@@ -15161,7 +15162,7 @@ class SessionState:
                 "reason": "forced-finish-budget-exhausted",
                 "source": "fallback",
             }
-        if finish_gate_reason == "reviewer-summary-missing" and summary_attempts >= 1:
+        if finish_gate_reason == "reviewer-summary-missing" and summary_attempts >= 2:
             self._emit("status", {"summary": "Summary generation attempted; forcing finish now."})
             return {
                 "target": "finish",
@@ -15195,13 +15196,28 @@ class SessionState:
                     "source": "fallback",
                 }
             if finish_gate_reason == "reviewer-summary-missing":
-                board["manager_summary_attempts"] = summary_attempts + 1
+                next_attempt = summary_attempts + 1
+                board["manager_summary_attempts"] = next_attempt
                 self.blackboard = board
+                if next_attempt >= 2:
+                    return {
+                        "target": "explorer",
+                        "instruction": (
+                            "Reviewer summary is still missing. Read blackboard sections "
+                            "(code_artifacts, execution_logs, review_feedback, status) and write one structured "
+                            "final summary to blackboard (changes, validation evidence, residual risks/next steps). "
+                            "Do not call finish tool in this step."
+                        ),
+                        "reason": "approval-missing-summary-handoff-explorer",
+                        "source": "fallback",
+                        "is_mandatory": True,
+                    }
                 return {
                     "target": "reviewer",
                     "instruction": (
-                        "Review approved but final summary required. Write one final wrap-up summary from "
-                        "blackboard evidence (changes, validation, residual risks/next steps), and then finish."
+                        "Review approved but final summary required. First call read_from_blackboard for "
+                        "code_artifacts/execution_logs/review_feedback/status, then call finish_task with summary "
+                        "including changes, validation evidence, and residual risks/next steps."
                     ),
                     "reason": "approval-missing-reviewer-summary-request",
                     "source": "fallback",
@@ -15513,6 +15529,10 @@ class SessionState:
             board,
             latest_user_ts=latest_user_ts,
         )
+        board_status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
+        code_count = len(board.get("code_artifacts", {}) or {})
+        research_count = len(board.get("research_notes", []) or [])
+        feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
         if bool((board.get("approval", {}) or {}).get("approved", False)) and can_finish_from_approval:
@@ -15521,7 +15541,7 @@ class SessionState:
                 instruction = "Review already approved; finish now."
         if target == "finish" and (not can_finish_from_approval):
             if finish_gate_reason == "reviewer-summary-missing":
-                if summary_attempts >= 1:
+                if summary_attempts >= 2:
                     force_finish_override = True
                     target = "finish"
                     instruction = (
@@ -15531,13 +15551,27 @@ class SessionState:
                     row["reason"] = "forced-finish-summary-max-retry"
                     row["source"] = "policy"
                     self._emit("status", {"summary": "Summary retry limit reached; forcing finish."})
+                elif summary_attempts >= 1:
+                    board["manager_summary_attempts"] = summary_attempts + 1
+                    self.blackboard = board
+                    target = "explorer"
+                    instruction = (
+                        "Reviewer summary is still missing. Read blackboard sections "
+                        "(code_artifacts, execution_logs, review_feedback, status) and write one structured "
+                        "final summary to blackboard: changes, validation evidence, residual risks/next steps. "
+                        "Do not call finish tool in this step."
+                    )
+                    row["reason"] = "finish-blocked-summary-handoff-explorer"
+                    row["source"] = "policy"
+                    self._emit("status", {"summary": "Reviewer summary missing; handoff to explorer synthesis."})
                 else:
                     board["manager_summary_attempts"] = summary_attempts + 1
                     self.blackboard = board
                     target = "reviewer"
                     instruction = (
-                        "Generate final summary report covering implemented outputs, validation evidence, "
-                        "and residual risks/next steps. This is the final step before completion."
+                        "Generate final summary report from blackboard evidence. First call read_from_blackboard "
+                        "(code_artifacts, execution_logs, review_feedback, status), then call finish_task.summary "
+                        "including changes, validation evidence, and residual risks/next steps."
                     )
                     row["reason"] = "finish-blocked-summary-request"
                     row["source"] = "policy"
@@ -15570,10 +15604,35 @@ class SessionState:
                     "Resolve errors and provide verifiable evidence."
                 )
             else:
-                instruction = (
-                    "Do not finish yet. Completion requires fresh reviewer approval for the current user request. "
-                    "Continue with one concrete step and update blackboard."
-                )
+                has_outputs = bool(code_count > 0 or research_count > 0)
+                if board_status == "COMPLETED" and has_outputs:
+                    force_finish_override = True
+                    target = "finish"
+                    instruction = (
+                        "Task is already in COMPLETED state with concrete outputs. "
+                        "Generate final summary from blackboard (changes, validation evidence, residual "
+                        "risks/next steps) and finish now."
+                    )
+                    row["reason"] = "finish-blocked-completed-auto-summary-close"
+                    row["source"] = "policy"
+                    self._emit(
+                        "status",
+                        {"summary": "Completion gate unresolved but board is COMPLETED; auto-closing with final summary."},
+                    )
+                elif feedback_pass and has_outputs:
+                    force_finish_override = True
+                    target = "finish"
+                    instruction = (
+                        "Reviewer feedback already passed with concrete outputs. "
+                        "Generate final summary and finish now."
+                    )
+                    row["reason"] = "finish-blocked-feedback-pass-auto-close"
+                    row["source"] = "policy"
+                else:
+                    instruction = (
+                        "Do not finish yet. Completion requires fresh reviewer approval for the current user request. "
+                        "Continue with one concrete step and update blackboard."
+                    )
             if finish_gate_reason != "reviewer-summary-missing":
                 self._emit(
                     "status",
@@ -16297,10 +16356,17 @@ class SessionState:
             if role_key == "explorer":
                 self._blackboard_set_status("RESEARCHING")
         elif name in {"finish_task", "finish_current_task", "mark_done"} and ok:
+            summary_arg = trim(str(args.get("summary", "") or "").strip(), BLACKBOARD_MAX_TEXT)
+            if summary_arg:
+                if role_key == "reviewer":
+                    self._blackboard_append_section("review_feedback", role_key, f"final_summary\n{summary_arg}")
+                elif role_key == "explorer":
+                    self._blackboard_append_section("research_notes", role_key, f"final_summary\n{summary_arg}")
             if role_key == "reviewer":
                 gate_ok, gate_reason = self._reviewer_approval_log_gate()
                 if gate_ok:
-                    self._blackboard_mark_approved(output or "finish tool acknowledged", role_key)
+                    approval_note = summary_arg or output or "finish tool acknowledged"
+                    self._blackboard_mark_approved(approval_note, role_key)
                 else:
                     self._blackboard_append_section(
                         "review_feedback",
@@ -16312,7 +16378,8 @@ class SessionState:
                     )
                     self._emit("status", {"summary": f"reviewer finish blocked: {gate_reason}"})
             else:
-                self._blackboard_mark_approved(output or "finish tool acknowledged", role_key)
+                approval_note = summary_arg or output or "finish tool acknowledged"
+                self._blackboard_mark_approved(approval_note, role_key)
         if not ok and output:
             self._blackboard_append_section(
                 "execution_logs",
@@ -16415,25 +16482,116 @@ class SessionState:
         policy_text = trim("\n".join(policy_lines).strip(), 1200)
         return clean_text, policy_text
 
+    def _final_summary_quality(self, text: str) -> dict:
+        clean = strip_thinking_content(str(text or "")).strip()
+        low = clean.lower()
+        chars = len(clean)
+        category_tokens = {
+            "changes": (
+                "changed",
+                "changes",
+                "change",
+                "modified",
+                "implemented",
+                "implementation",
+                "files",
+                "diff",
+                "patch",
+                "改动",
+                "变更",
+                "修改",
+                "实现",
+                "文件",
+            ),
+            "validation": (
+                "test",
+                "tests",
+                "pytest",
+                "validation",
+                "verified",
+                "verify",
+                "check",
+                "checks",
+                "evidence",
+                "pass",
+                "passed",
+                "验证",
+                "测试",
+                "通过",
+                "证据",
+                "日志",
+            ),
+            "risks": (
+                "risk",
+                "risks",
+                "residual",
+                "next step",
+                "next steps",
+                "follow-up",
+                "todo",
+                "limitation",
+                "known issue",
+                "caveat",
+                "风险",
+                "残留",
+                "后续",
+                "下一步",
+                "待办",
+                "限制",
+                "已知问题",
+                "建议",
+            ),
+        }
+        hits: dict[str, bool] = {}
+        for cat, words in category_tokens.items():
+            matched = any(tok in low for tok in words)
+            hits[cat] = bool(matched)
+        covered = sum(1 for v in hits.values() if bool(v))
+        ok = bool(chars >= FINAL_SUMMARY_MIN_CHARS and (covered >= 2 or (covered >= 1 and chars >= 220)))
+        strict_ok = bool(chars >= FINAL_SUMMARY_STRICT_MIN_CHARS and covered >= 2)
+        return {
+            "clean": clean,
+            "chars": int(chars),
+            "covered": int(covered),
+            "hits": hits,
+            "ok": bool(ok),
+            "strict_ok": bool(strict_ok),
+        }
+
+    def _final_summary_sufficient(self, text: str, *, strict: bool = False) -> bool:
+        verdict = self._final_summary_quality(text)
+        return bool(verdict.get("strict_ok" if strict else "ok", False))
+
+    def _finish_requires_structured_summary(self, role: str, tool_name: str) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if tool_name not in {"finish_task", "finish_current_task", "mark_done"}:
+            return False
+        if not role_key:
+            return False
+        bb = self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        task_type = str(profile.get("task_type", "general") or "general")
+        if task_type == "simple_qa":
+            return False
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
+        delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
+        delegate_instruction = str(delegate.get("instruction", "") or "").strip().lower()
+        summary_markers = (
+            "summary",
+            "wrap-up",
+            "final report",
+            "最终总结",
+            "总结",
+            "收尾",
+        )
+        if delegate_target == role_key and any(tok in delegate_reason or tok in delegate_instruction for tok in summary_markers):
+            return True
+        return bool(role_key == "reviewer" and self._is_multi_agent_mode())
+
     def _reviewer_final_summary_ready(self, board: dict | None = None) -> bool:
         def _text_good(text: str) -> bool:
-            clean = strip_thinking_content(str(text or "")).strip()
-            if not clean:
-                return False
-            if len(clean) >= 60:
-                return True
-            low = clean.lower()
-            tokens = (
-                "summary",
-                "final",
-                "结论",
-                "总结",
-                "通过",
-                "风险",
-                "建议",
-                "完成",
-            )
-            return any(tok in low for tok in tokens)
+            return self._final_summary_sufficient(text, strict=True)
 
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
@@ -16760,8 +16918,12 @@ class SessionState:
                 base
                 + "Role objective: verify developer output against goal, run checks/tests, and issue pass/fix decisions. "
                 + "If gaps remain, send fix_request to developer with concrete failure evidence and write review_feedback to blackboard. "
-                + "If task is complete, write approval evidence and hand off final summary to Explorer "
-                + "(via ask_colleague intent=final_summary_request) before ending the task."
+                + "If manager requests final summary, first call read_from_blackboard "
+                + "(sections: code_artifacts, execution_logs, review_feedback, status), then generate a structured summary "
+                + "covering changes, validation evidence, and residual risks/next steps. "
+                + "When finishing, pass this summary in finish_task.summary; empty or vague summary is invalid. "
+                + "If you cannot produce summary from current evidence, hand off Explorer via ask_colleague "
+                + "intent=final_summary_request with explicit missing evidence."
             )
         return (
             base
@@ -17589,6 +17751,26 @@ class SessionState:
             return self._todo_write_rescue(args)
         if name in {"finish_task", "finish_current_task", "mark_done"}:
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
+            if role_key == "explorer":
+                bb = self._ensure_blackboard()
+                delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+                delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
+                delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
+                if delegate_target == "explorer" and "summary-handoff" in delegate_reason:
+                    return (
+                        "Error: explorer summary handoff step must not call finish tool. "
+                        "Write structured summary to blackboard first, then wait for manager close."
+                    )
+            if self._finish_requires_structured_summary(role_key, name):
+                if not self._final_summary_sufficient(summary, strict=True):
+                    return (
+                        "Error: structured final summary is required before finish. "
+                        "Provide finish_task.summary with: "
+                        "(1) changes/files touched, "
+                        "(2) validation evidence (tests/commands/results), "
+                        "(3) residual risks or next steps. "
+                        "If evidence is missing, read_from_blackboard first or ask Explorer for final_summary_request."
+                    )
             if name == "finish_task":
                 todo_mark = self.todo.complete_all_open(summary)
             else:
@@ -18517,7 +18699,7 @@ class SessionState:
                 idle_counts[role] = 0
                 if bool(step.get("stop_due_to_finish", False)):
                     note = f"{self._agent_display_name(role)} signaled finish via tool."
-                    self._blackboard_mark_approved(note, role)
+                    # Approval note should come from finish tool payload sync; avoid overwriting with generic text here.
                     can_finish_now, finish_gate_reason = self._can_auto_finish_from_approval(
                         self._ensure_blackboard(),
                         latest_user_ts=self._latest_user_message_ts(),
@@ -18529,7 +18711,7 @@ class SessionState:
                                 {
                                     "summary": (
                                         "reviewer finish deferred: final summary missing; "
-                                        "handoff to explorer via agentbus and continue"
+                                        "manager will reroute to explorer summary synthesis"
                                     )
                                 },
                             )
