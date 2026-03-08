@@ -766,37 +766,7 @@ def _detect_os_shell_instruction() -> str:
         "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
         "Use relative paths or the absolute session root shown above."
     )
-
-
-    code = normalize_ui_language(lang)
-    if code == "zh-CN":
-        return (
-            "Language policy: use Simplified Chinese by default for all user-facing answers, plans, "
-            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
-            "Only switch language when user explicitly requests it. "
-            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
-        )
-    if code == "zh-TW":
-        return (
-            "Language policy: use Traditional Chinese by default for all user-facing answers, plans, "
-            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
-            "Only switch language when user explicitly requests it. "
-            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
-        )
-    if code == "ja":
-        return (
-            "Language policy: use Japanese by default for all user-facing answers, plans, "
-            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
-            "Only switch language when user explicitly requests it. "
-            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
-        )
-    return (
-        "Language policy: use English by default for all user-facing answers, plans, "
-        "blackboard notes, manager delegates, and agent-bus collaboration messages. "
-        "Only switch language when user explicitly requests it. "
-        "Do not translate code, file paths, commands, API/tool names, or JSON keys."
-    )
-
+    
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
     txt = str(raw or "").strip()
