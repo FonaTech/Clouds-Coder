@@ -8713,6 +8713,19 @@ class SessionState:
             "used_percent": used_pct,
         }
 
+    def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
+        self._microcompact()
+        metrics = self._context_budget_metrics()
+        used = int(metrics.get("used", 0) or 0)
+        limit = max(1, int(metrics.get("limit", 0) or 0))
+        if used < limit:
+            return False
+        now_tick = now_ts()
+        if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
+            return False
+        self._auto_compact(reason)
+        return True
+
     def _estimate_output_tokens(self, text: str, thinking_text: str = "", tool_calls: list | None = None) -> int:
         t_main = len(str(text or "")) // 4
         t_think = len(str(thinking_text or "")) // 4
@@ -16589,6 +16602,41 @@ class SessionState:
             return True
         return bool(role_key == "reviewer" and self._is_multi_agent_mode())
 
+    def _recent_agent_used_tools(
+        self,
+        role: str,
+        tool_names: set[str],
+        *,
+        lookback: int = 20,
+        max_age_seconds: float = 300.0,
+    ) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if not role_key or not tool_names:
+            return False
+        names = {str(x or "").strip() for x in tool_names if str(x or "").strip()}
+        if not names:
+            return False
+        now_tick = now_ts()
+        ctx = self._agent_context(role_key)
+        rows = ctx[-max(1, int(lookback)) :] if isinstance(ctx, list) else []
+        for row in reversed(rows):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "tool":
+                continue
+            name = str(row.get("name", "") or "").strip()
+            if name not in names:
+                continue
+            try:
+                ts = float(row.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0.0:
+                return True
+            if (now_tick - ts) <= float(max_age_seconds):
+                return True
+        return False
+
     def _reviewer_final_summary_ready(self, board: dict | None = None) -> bool:
         def _text_good(text: str) -> bool:
             return self._final_summary_sufficient(text, strict=True)
@@ -17762,6 +17810,17 @@ class SessionState:
                         "Write structured summary to blackboard first, then wait for manager close."
                     )
             if self._finish_requires_structured_summary(role_key, name):
+                if role_key == "reviewer" and not self._recent_agent_used_tools(
+                    role_key,
+                    {"read_from_blackboard"},
+                    lookback=24,
+                    max_age_seconds=420.0,
+                ):
+                    return (
+                        "Error: reviewer finalization requires blackboard evidence read. "
+                        "Call read_from_blackboard first (sections: code_artifacts, execution_logs, "
+                        "review_feedback, status), then call finish_task with structured summary."
+                    )
                 if not self._final_summary_sufficient(summary, strict=True):
                     return (
                         "Error: structured final summary is required before finish. "
@@ -18615,6 +18674,7 @@ class SessionState:
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
+            self._apply_auto_compact_if_needed("auto:multi-sync")
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
                 self.current_phase = "manager:dispatch"
@@ -18815,6 +18875,7 @@ class SessionState:
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
+            self._apply_auto_compact_if_needed("auto:multi-seq")
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
             latest_user_ts = self._latest_user_message_ts()
@@ -19054,9 +19115,7 @@ class SessionState:
                             },
                         )
                         break
-                self._microcompact()
-                if self._estimate_tokens() > self.context_token_upper_bound:
-                    self._auto_compact("auto")
+                self._apply_auto_compact_if_needed("auto")
                 notifs = self.bg.drain()
                 if notifs:
                     text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
