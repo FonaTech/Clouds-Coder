@@ -71,6 +71,14 @@ DEFAULT_TIMEOUT_SECONDS = max(
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 AGENT_MAX_OUTPUT_TOKENS = 2200
+WATCHDOG_INTENT_NO_TOOL_THRESHOLD = 2
+WATCHDOG_REPEAT_NO_TOOL_THRESHOLD = 2
+WATCHDOG_STATE_STALL_THRESHOLD = 6
+WATCHDOG_CONTEXT_STALL_THRESHOLD = 2
+WATCHDOG_REPEAT_SIMILARITY_THRESHOLD = 0.85
+WATCHDOG_CONTEXT_NEAR_RATIO = 0.92
+WATCHDOG_MAX_DECOMPOSE_STEPS = 12
+WATCHDOG_STEP_MAX_ATTEMPTS = 2
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2
 THINKING_BUDGET_FORCE_RATIO = 0.85
@@ -170,6 +178,7 @@ TASK_PROFILE_TYPES = (
 )
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
+SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
@@ -10981,9 +10990,18 @@ class SessionState:
             "重构",
             "设计",
             "构建",
+            "架构",
+            "内核",
+            "框架",
+            "死循环",
+            "状态机",
+            "调度",
             "后端",
             "前端",
             "自动化",
+            "agentbus",
+            "watchdog",
+            "decomposition",
             "workflow",
             "architecture",
             "build",
@@ -11102,7 +11120,10 @@ class SessionState:
         return {
             "task_type": "general",
             "complexity": "simple",
-            "direct_objective": "Provide the most direct useful response with minimal orchestration.",
+            "direct_objective": (
+                "Provide the most direct useful response with minimal orchestration, "
+                "anchored to the current project context and user goal."
+            ),
             "recommended_agents": ["developer"],
             "round_budget": 3,
             "reason": "default lightweight profile",
@@ -12350,6 +12371,35 @@ class SessionState:
             return trim(text.replace("\n", " "), 220)
         return "current task"
 
+    def _compose_default_direct_objective(self, base_objective: str, goal: str, task_type: str) -> str:
+        base = trim(str(base_objective or "").strip(), 520)
+        goal_clean = trim(strip_thinking_content(str(goal or "")).replace("\n", " ").strip(), 220)
+        path_hits = re.findall(
+            r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|java|go|rs|md|json|yaml|yml|toml|ini|sh|html|css|c|cpp|h)",
+            goal_clean,
+        )
+        uniq_paths: list[str] = []
+        for item in path_hits:
+            one = trim(str(item or "").strip(), 80)
+            if one and one not in uniq_paths:
+                uniq_paths.append(one)
+            if len(uniq_paths) >= 3:
+                break
+        if uniq_paths:
+            anchor = f" Project anchors: {', '.join(uniq_paths)}."
+        elif goal_clean:
+            anchor = f" Project anchor: {goal_clean}."
+        else:
+            anchor = " Project anchor: current repository context."
+        if task_type == "simple_qa":
+            postfix = " Keep orchestration lightweight and answer directly with project-aware specifics."
+        else:
+            postfix = (
+                " Keep orchestration lightweight and execution-first. "
+                "Use bounded creativity for ambiguous details while preserving existing architecture and constraints."
+            )
+        return trim(f"{base}{anchor}{postfix}", 800)
+
     def _normalize_task_profile(self, goal: str, raw: object) -> dict:
         base = self._infer_task_profile(goal)
         src = raw if isinstance(raw, dict) else {}
@@ -12362,13 +12412,22 @@ class SessionState:
         complexity = str(src.get("complexity", base.get("complexity", "simple")) or "").strip().lower()
         if complexity not in TASK_COMPLEXITY_LEVELS:
             complexity = str(base.get("complexity", "simple"))
-        direct_objective = (
-            trim(
-                str(src.get("direct_objective", base.get("direct_objective", "")) or "").strip(),
-                800,
+        src_direct_objective = trim(str(src.get("direct_objective", "") or "").strip(), 800)
+        legacy_objectives = {
+            "Provide the most direct useful response with minimal orchestration.",
+            (
+                "Provide the most direct useful response with minimal orchestration, "
+                "anchored to the current project context and user goal."
+            ),
+        }
+        if src_direct_objective and src_direct_objective not in legacy_objectives:
+            direct_objective = src_direct_objective
+        else:
+            direct_objective = self._compose_default_direct_objective(
+                str(base.get("direct_objective", "")),
+                goal,
+                task_type,
             )
-            or str(base.get("direct_objective", ""))
-        )
         rec_raw = src.get("recommended_agents", base.get("recommended_agents", []))
         recommended: list[str] = []
         if isinstance(rec_raw, list):
@@ -12669,6 +12728,702 @@ class SessionState:
         key = str(raw or "").strip().upper()
         return key if key in BLACKBOARD_STATUSES else "INITIALIZING"
 
+    def _new_watchdog_state(self) -> dict:
+        return {
+            "intent_no_tool_streak": 0,
+            "repeat_no_tool_streak": 0,
+            "state_unchanged_streak": 0,
+            "last_no_tool_text": "",
+            "last_no_tool_hash": "",
+            "last_state_fp": "",
+            "trigger_count": 0,
+            "last_trigger_reason": "",
+            "last_trigger_ts": 0.0,
+        }
+
+    def _normalize_watchdog_state(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        out = self._new_watchdog_state()
+        out["intent_no_tool_streak"] = max(0, int(src.get("intent_no_tool_streak", 0) or 0))
+        out["repeat_no_tool_streak"] = max(0, int(src.get("repeat_no_tool_streak", 0) or 0))
+        out["state_unchanged_streak"] = max(0, int(src.get("state_unchanged_streak", 0) or 0))
+        out["last_no_tool_text"] = trim(str(src.get("last_no_tool_text", "") or "").strip(), 1200)
+        out["last_no_tool_hash"] = trim(str(src.get("last_no_tool_hash", "") or "").strip(), 80)
+        out["last_state_fp"] = trim(str(src.get("last_state_fp", "") or "").strip(), 120)
+        out["trigger_count"] = max(0, int(src.get("trigger_count", 0) or 0))
+        out["last_trigger_reason"] = trim(str(src.get("last_trigger_reason", "") or "").strip(), 200)
+        out["last_trigger_ts"] = float(src.get("last_trigger_ts", 0.0) or 0.0)
+        return out
+
+    def _new_decomposition_queue_state(self) -> dict:
+        return {
+            "active": False,
+            "trigger_reason": "",
+            "created_at": 0.0,
+            "cursor": 0,
+            "steps": [],
+            "last_error": "",
+            "snapshot": "",
+            "decomposer_output": "",
+        }
+
+    def _watchdog_normalize_steps(self, rows: object) -> list[dict]:
+        if not isinstance(rows, list):
+            return []
+        out: list[dict] = []
+
+        def _infer_target(action_type: str, instruction: str, fallback: str = "developer") -> str:
+            raw = self._sanitize_agent_role(fallback) or "developer"
+            low = f"{action_type} {instruction}".lower()
+            if any(tok in low for tok in ("review", "verify", "validate", "test", "qa", "检查", "验证", "评审", "審查")):
+                return "reviewer"
+            if any(tok in low for tok in ("research", "inspect", "analy", "explore", "investigate", "分析", "调研", "調研", "探索")):
+                return "explorer"
+            return raw
+
+        for idx, row in enumerate(rows[:WATCHDOG_MAX_DECOMPOSE_STEPS]):
+            if not isinstance(row, dict):
+                continue
+            instruction = trim(
+                str(
+                    row.get("description", "")
+                    or row.get("instruction", "")
+                    or row.get("content", "")
+                    or row.get("task", "")
+                    or ""
+                ).strip(),
+                900,
+            )
+            if not instruction:
+                continue
+            action_type = trim(str(row.get("action_type", "") or "").strip(), 80)
+            target = self._sanitize_agent_role(
+                row.get("target", row.get("owner", row.get("role", row.get("agent", ""))))
+            )
+            target = target or _infer_target(action_type, instruction)
+            if target == "developer" and "incremental" not in instruction.lower():
+                instruction = trim(
+                    (
+                        f"{instruction}\n"
+                        "Use incremental edits (append/targeted replace) instead of full-file overwrite unless unavoidable."
+                    ),
+                    1000,
+                )
+            try:
+                step_no = int(row.get("step", idx + 1) or (idx + 1))
+            except Exception:
+                step_no = idx + 1
+            out.append(
+                {
+                    "step": max(1, step_no),
+                    "target": target,
+                    "action_type": action_type or "execute",
+                    "instruction": instruction,
+                    "attempts": max(0, int(row.get("attempts", 0) or 0)),
+                    "status": trim(str(row.get("status", "pending") or "pending").strip().lower(), 20) or "pending",
+                    "updated_at": float(now_ts()),
+                }
+            )
+        if not out:
+            return []
+        return out[:WATCHDOG_MAX_DECOMPOSE_STEPS]
+
+    def _normalize_decomposition_queue_state(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        out = self._new_decomposition_queue_state()
+        out["active"] = bool(src.get("active", False))
+        out["trigger_reason"] = trim(str(src.get("trigger_reason", "") or "").strip(), 200)
+        out["created_at"] = float(src.get("created_at", 0.0) or 0.0)
+        out["cursor"] = max(0, int(src.get("cursor", 0) or 0))
+        out["last_error"] = trim(str(src.get("last_error", "") or "").strip(), 400)
+        out["snapshot"] = trim(str(src.get("snapshot", "") or "").strip(), 4000)
+        out["decomposer_output"] = trim(str(src.get("decomposer_output", "") or "").strip(), 2000)
+        out["steps"] = self._watchdog_normalize_steps(src.get("steps", []))
+        if out["cursor"] >= len(out["steps"]):
+            out["active"] = False
+        return out
+
+    def _watchdog_state_fingerprint(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        payload = {
+            "status": self._normalize_blackboard_status(bb.get("status", "INITIALIZING")),
+            "goal": trim(str(bb.get("original_goal", "") or "").strip(), 400),
+            "active_agent": self._sanitize_agent_role(bb.get("active_agent", "")),
+            "delegate": self._sanitize_agent_role((bb.get("last_delegate", {}) or {}).get("target", "")),
+            "research_count": len(bb.get("research_notes", []) or []),
+            "artifact_count": len(bb.get("code_artifacts", {}) or {}),
+            "exec_count": len(bb.get("execution_logs", []) or []),
+            "review_count": len(bb.get("review_feedback", []) or []),
+            "approved": bool((bb.get("approval", {}) or {}).get("approved", False)),
+            "task_type": str(profile.get("task_type", "general") or "general"),
+            "complexity": str(profile.get("complexity", "simple") or "simple"),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _watchdog_extract_json_array(self, text: str) -> list[dict]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        probe_candidates: list[str] = [raw]
+        fence = re.findall(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
+        probe_candidates.extend([str(x or "").strip() for x in fence if str(x or "").strip()])
+        first = raw.find("[")
+        last = raw.rfind("]")
+        if first >= 0 and last > first:
+            probe_candidates.append(raw[first : last + 1].strip())
+        for candidate in probe_candidates:
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, list):
+                return [dict(x) for x in parsed if isinstance(x, dict)]
+        return []
+
+    def _watchdog_intent_without_action(self, text: str) -> bool:
+        clean = strip_thinking_content(str(text or "")).strip()
+        if not clean:
+            return False
+        low = clean.lower()
+        intent_markers = (
+            "i will",
+            "i'm going to",
+            "next step",
+            "plan to",
+            "let me",
+            "我将",
+            "我會",
+            "我会",
+            "下一步",
+            "接下来",
+            "接下來",
+            "计划",
+            "計劃",
+            "准备",
+            "準備",
+        )
+        action_markers = (
+            "wrote",
+            "edited",
+            "executed",
+            "called",
+            "ran ",
+            "已完成",
+            "已执行",
+            "已執行",
+            "已调用",
+            "已調用",
+            "完成了",
+            "执行了",
+            "執行了",
+            "调用了",
+            "調用了",
+        )
+        if any(tok in low for tok in action_markers):
+            return False
+        return any(tok in low for tok in intent_markers)
+
+    def _watchdog_similarity(self, a: str, b: str) -> float:
+        left = trim(strip_thinking_content(str(a or "")).strip(), 1800)
+        right = trim(strip_thinking_content(str(b or "")).strip(), 1800)
+        if (not left) or (not right):
+            return 0.0
+        return float(difflib.SequenceMatcher(None, left, right).ratio())
+
+    def _watchdog_context_near_limit(self) -> bool:
+        limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
+        try:
+            used = int(self._estimate_tokens())
+        except Exception:
+            used = 0
+        return bool(used >= int(limit * WATCHDOG_CONTEXT_NEAR_RATIO))
+
+    def _watchdog_snapshot_payload(self, board: dict, reason: str, role: str, step: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        code_rows = sorted(
+            list((bb.get("code_artifacts", {}) or {}).items()),
+            key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
+            reverse=True,
+        )
+        payload = {
+            "objective": trim(str(bb.get("original_goal", "") or "").strip(), 1800),
+            "trigger_reason": trim(str(reason or "").strip(), 200),
+            "active_role": self._sanitize_agent_role(role),
+            "status": self._normalize_blackboard_status(bb.get("status", "INITIALIZING")),
+            "task_profile": {
+                "task_type": str(profile.get("task_type", "general") or "general"),
+                "complexity": str(profile.get("complexity", "simple") or "simple"),
+                "direct_objective": trim(str(profile.get("direct_objective", "") or "").strip(), 600),
+            },
+            "latest_worker_step": {
+                "status": str((step or {}).get("status", "") or ""),
+                "text": trim(str((step or {}).get("text", "") or "").strip(), 600),
+            },
+            "code_artifacts": [
+                {
+                    "path": str(path),
+                    "summary": trim(str((item or {}).get("summary", "") or "").strip(), 200),
+                }
+                for path, item in code_rows[:6]
+            ],
+            "recent_execution_logs": [
+                trim(str((row or {}).get("content", "") or "").strip(), 220)
+                for row in (bb.get("execution_logs", []) or [])[-4:]
+                if isinstance(row, dict)
+            ],
+            "recent_review_feedback": [
+                trim(str((row or {}).get("content", "") or "").strip(), 220)
+                for row in (bb.get("review_feedback", []) or [])[-4:]
+                if isinstance(row, dict)
+            ],
+        }
+        return trim(json_dumps(payload, indent=2), 6000)
+
+    def _watchdog_fallback_steps(self, board: dict, reason: str) -> list[dict]:
+        profile = self._ensure_blackboard_task_profile(board)
+        objective = trim(str(profile.get("direct_objective", "") or "").strip(), 280) or trim(
+            str(board.get("original_goal", "") or "").strip(),
+            280,
+        )
+        raw = [
+            {
+                "step": 1,
+                "action_type": "research",
+                "target": "explorer",
+                "description": (
+                    "Analyze the latest blocker quickly and write concrete constraints to blackboard "
+                    f"(trigger={trim(reason, 120)})."
+                ),
+            },
+            {
+                "step": 2,
+                "action_type": "implement",
+                "target": "developer",
+                "description": (
+                    "Implement one incremental fix for the current objective and provide verifiable tool output. "
+                    f"Objective: {objective}"
+                ),
+            },
+            {
+                "step": 3,
+                "action_type": "validate",
+                "target": "reviewer",
+                "description": (
+                    "Run one validation pass, provide pass/fix verdict with evidence, and handoff summary request if needed."
+                ),
+            },
+        ]
+        return self._watchdog_normalize_steps(raw)
+
+    def _watchdog_decompose_steps(self, board: dict, reason: str, *, pinned_selection: str) -> tuple[list[dict], str, str]:
+        snapshot = self._watchdog_snapshot_payload(board, reason, str(board.get("active_agent", "") or ""), None)
+        objective = trim(str(board.get("original_goal", "") or "").strip(), 1600)
+        system_prompt = (
+            "You are a task decomposer. Your only job is to split OBJECTIVE into executable micro-steps. "
+            "Return strict JSON array only: "
+            "[{\"step\":1,\"action_type\":\"...\",\"target\":\"explorer|developer|reviewer\",\"description\":\"...\"}]. "
+            "No markdown, no prose, no code fence."
+        )
+        user_prompt = (
+            f"OBJECTIVE:\n{objective}\n\n"
+            f"TRIGGER:\n{trim(reason, 220)}\n\n"
+            "SNAPSHOT:\n"
+            f"{snapshot}\n\n"
+            "Rules: keep steps module-level (not line-by-line), use incremental edits, "
+            "and keep total steps <= 12."
+        )
+        raw_text = ""
+        parsed_steps: list[dict] = []
+        try:
+            rsp = self._chat_with_same_model_retry(
+                [{"role": "user", "content": user_prompt, "ts": now_ts()}],
+                tools=None,
+                system=system_prompt,
+                max_tokens=1200,
+                think=False,
+                stream_thinking=False,
+                pinned_selection=pinned_selection,
+                context_label="watchdog decomposer",
+                retries=max(1, min(2, int(MODEL_OUTPUT_RETRY_TIMES))),
+            )
+            raw_text = str(rsp.get("content") or "")
+            parsed_steps = self._watchdog_extract_json_array(raw_text)
+        except Exception as exc:
+            raw_text = f"decomposer-error: {trim(str(exc), 220)}"
+            parsed_steps = []
+        normalized = self._watchdog_normalize_steps(parsed_steps)
+        if not normalized:
+            normalized = self._watchdog_fallback_steps(board, reason)
+        return normalized, snapshot, trim(raw_text, 2000)
+
+    def _watchdog_activate_decomposition(
+        self,
+        board: dict,
+        *,
+        reason: str,
+        role: str,
+        step: dict | None,
+        pinned_selection: str,
+    ) -> bool:
+        dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            return False
+        steps, snapshot, raw_text = self._watchdog_decompose_steps(
+            board,
+            reason,
+            pinned_selection=pinned_selection,
+        )
+        if not steps:
+            return False
+        dq = {
+            "active": True,
+            "trigger_reason": trim(str(reason or "").strip(), 200),
+            "created_at": float(now_ts()),
+            "cursor": 0,
+            "steps": steps,
+            "last_error": "",
+            "snapshot": trim(snapshot, 4000),
+            "decomposer_output": trim(raw_text, 2000),
+        }
+        wd = self._normalize_watchdog_state(board.get("watchdog", {}))
+        wd["trigger_count"] = max(0, int(wd.get("trigger_count", 0) or 0)) + 1
+        wd["last_trigger_reason"] = trim(str(reason or "").strip(), 200)
+        wd["last_trigger_ts"] = float(now_ts())
+        wd["intent_no_tool_streak"] = 0
+        wd["repeat_no_tool_streak"] = 0
+        board["watchdog"] = wd
+        board["decomposition_queue"] = dq
+        self.blackboard = board
+        self._blackboard_touch()
+        self._blackboard_history(
+            "manager",
+            trim(
+                (
+                    "watchdog triggered decomposition "
+                    f"(reason={reason}, role={self._sanitize_agent_role(role)}, "
+                    f"steps={len(steps)})"
+                ),
+                520,
+            ),
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "watchdog triggered; switched to stateless executor queue "
+                    f"(reason={trim(reason, 90)}, steps={len(steps)})"
+                )
+            },
+        )
+        return True
+
+    def _watchdog_pick_executor_route(self, board: dict | None = None) -> tuple[dict, dict] | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if not bool(dq.get("active", False)):
+            return None
+        steps = list(dq.get("steps", []) or [])
+        if not steps:
+            return None
+        cursor = max(0, int(dq.get("cursor", 0) or 0))
+        while cursor < len(steps):
+            status = str((steps[cursor] or {}).get("status", "") or "").strip().lower()
+            if status not in {"done", "skipped"}:
+                break
+            cursor += 1
+        if cursor >= len(steps):
+            dq["active"] = False
+            dq["cursor"] = len(steps)
+            bb["decomposition_queue"] = dq
+            self.blackboard = bb
+            self._blackboard_touch()
+            return None
+        dq["cursor"] = cursor
+        step_row = steps[cursor] if isinstance(steps[cursor], dict) else {}
+        target = self._sanitize_agent_role(step_row.get("target", "")) or "developer"
+        action_type = trim(str(step_row.get("action_type", "execute") or "execute").strip(), 80) or "execute"
+        step_instruction = trim(str(step_row.get("instruction", "") or "").strip(), 900)
+        trigger_reason = trim(str(dq.get("trigger_reason", "") or "").strip(), 180)
+        total = len(steps)
+        current = cursor + 1
+        profile = self._ensure_blackboard_task_profile(bb)
+        task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
+        if task_level not in TASK_LEVEL_CHOICES:
+            task_level = 3
+        args = {
+            "target": target,
+            "instruction": trim(
+                (
+                    f"Executor mode (stateless) step {current}/{total}. "
+                    f"trigger={trigger_reason or 'watchdog'}; action_type={action_type}.\n"
+                    f"{step_instruction}\n"
+                    "Rules: execute one concrete tool call now, keep scope narrow, "
+                    "and update blackboard evidence immediately."
+                ),
+                1200,
+            ),
+            "task_level": int(task_level),
+            "task_type": trim(str(profile.get("task_type", "general") or "general"), 40),
+            "complexity": trim(str(profile.get("complexity", "simple") or "simple"), 20),
+            "scale_preference": trim(str(profile.get("scale_preference", "balanced") or "balanced"), 20),
+            "judgement": trim(
+                f"watchdog-executor-step-{current}/{total}",
+                200,
+            ),
+            "round_budget": int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0),
+            "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+            "execution_mode": normalize_execution_mode(
+                profile.get("execution_mode", self._effective_execution_mode()),
+                default=self._effective_execution_mode(),
+            ),
+            "participants": profile.get("participants", self.runtime_participants),
+            "assigned_expert": profile.get("assigned_expert", self.runtime_assigned_expert or "developer"),
+            "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
+            "is_mandatory": True,
+            "executor_mode": True,
+        }
+        bb["decomposition_queue"] = dq
+        self.blackboard = bb
+        self._blackboard_touch()
+        meta = {
+            "trigger_reason": trigger_reason,
+            "cursor": current,
+            "total": total,
+            "target": target,
+            "action_type": action_type,
+        }
+        return args, meta
+
+    def _watchdog_mark_step_progress(self, board: dict, role: str, step: dict | None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        out = {"queue_active": bool(dq.get("active", False)), "step_advanced": False}
+        if not bool(dq.get("active", False)):
+            bb["decomposition_queue"] = dq
+            self.blackboard = bb
+            return out
+        rows = list(dq.get("steps", []) or [])
+        cursor = max(0, int(dq.get("cursor", 0) or 0))
+        if cursor >= len(rows):
+            dq["active"] = False
+            dq["cursor"] = len(rows)
+            bb["decomposition_queue"] = dq
+            self.blackboard = bb
+            return {"queue_active": False, "step_advanced": False}
+        current = rows[cursor] if isinstance(rows[cursor], dict) else {}
+        target = self._sanitize_agent_role(current.get("target", "")) or "developer"
+        role_key = self._sanitize_agent_role(role)
+        if target != role_key:
+            bb["decomposition_queue"] = dq
+            self.blackboard = bb
+            return out
+        status = str((step or {}).get("status", "") or "").strip().lower()
+        text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
+        tool_results = (step or {}).get("tool_results", []) if isinstance((step or {}).get("tool_results"), list) else []
+        has_ok_tool = any(isinstance(row, dict) and bool(row.get("ok", False)) for row in tool_results)
+        success = bool(status == "tools" and has_ok_tool)
+        if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
+            success = True
+        attempts = max(0, int(current.get("attempts", 0) or 0)) + 1
+        current["attempts"] = attempts
+        current["updated_at"] = float(now_ts())
+        if success:
+            current["status"] = "done"
+            dq["cursor"] = cursor + 1
+            out["step_advanced"] = True
+            dq["last_error"] = ""
+        elif status in {"no-tools", "tools", "skip"}:
+            if attempts >= int(WATCHDOG_STEP_MAX_ATTEMPTS):
+                current["status"] = "skipped"
+                dq["cursor"] = cursor + 1
+                out["step_advanced"] = True
+                dq["last_error"] = trim(
+                    f"step {cursor + 1} skipped after {attempts} attempts ({status})",
+                    300,
+                )
+            else:
+                current["status"] = "retry"
+                dq["last_error"] = trim(
+                    f"step {cursor + 1} retry pending ({status})",
+                    300,
+                )
+        rows[cursor] = current
+        dq["steps"] = rows
+        if int(dq.get("cursor", 0) or 0) >= len(rows):
+            dq["active"] = False
+            out["queue_active"] = False
+            self._emit("status", {"summary": "stateless executor queue drained; returning to normal manager routing"})
+        else:
+            out["queue_active"] = bool(dq.get("active", False))
+        bb["decomposition_queue"] = dq
+        self.blackboard = bb
+        return out
+
+    def _watchdog_process_worker_step(
+        self,
+        board: dict,
+        *,
+        role: str,
+        step: dict,
+        state_changed: bool,
+        pinned_selection: str,
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        status = str((step or {}).get("status", "") or "").strip().lower()
+        text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
+        wd["last_state_fp"] = self._watchdog_state_fingerprint(bb)
+        if state_changed:
+            wd["state_unchanged_streak"] = 0
+        else:
+            wd["state_unchanged_streak"] = max(0, int(wd.get("state_unchanged_streak", 0) or 0)) + 1
+        if status == "tools":
+            wd["intent_no_tool_streak"] = 0
+            wd["repeat_no_tool_streak"] = 0
+            wd["last_no_tool_text"] = ""
+            wd["last_no_tool_hash"] = ""
+        elif status == "no-tools":
+            if self._watchdog_intent_without_action(text):
+                wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0)) + 1
+            else:
+                wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
+            prev_text = str(wd.get("last_no_tool_text", "") or "")
+            sim = self._watchdog_similarity(prev_text, text)
+            if sim >= float(WATCHDOG_REPEAT_SIMILARITY_THRESHOLD):
+                wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
+            else:
+                wd["repeat_no_tool_streak"] = 0
+            wd["last_no_tool_text"] = text
+            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
+        else:
+            wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
+            wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
+        bb["watchdog"] = wd
+        bb["decomposition_queue"] = dq
+        self.blackboard = bb
+        progress_row = self._watchdog_mark_step_progress(bb, role, step)
+        bb = self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        trigger_reason = ""
+        if not bool(dq.get("active", False)):
+            if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
+                trigger_reason = "intent-without-tool-call"
+            elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
+                trigger_reason = "repeated-no-tool-reply"
+            elif (
+                self._watchdog_context_near_limit()
+                and int(wd.get("state_unchanged_streak", 0) or 0) >= int(WATCHDOG_CONTEXT_STALL_THRESHOLD)
+            ):
+                trigger_reason = "context-threshold-no-state-change"
+            elif (
+                status in {"no-tools", "skip"}
+                and int(wd.get("state_unchanged_streak", 0) or 0) >= int(WATCHDOG_STATE_STALL_THRESHOLD)
+            ):
+                trigger_reason = "state-unchanged-stall"
+        triggered = False
+        if trigger_reason:
+            try:
+                last_trigger_ts = float(wd.get("last_trigger_ts", 0.0) or 0.0)
+            except Exception:
+                last_trigger_ts = 0.0
+            if now_ts() - last_trigger_ts >= 1.0:
+                triggered = self._watchdog_activate_decomposition(
+                    bb,
+                    reason=trigger_reason,
+                    role=role,
+                    step=step,
+                    pinned_selection=pinned_selection,
+                )
+                bb = self._ensure_blackboard()
+        bb["watchdog"] = self._normalize_watchdog_state(bb.get("watchdog", wd))
+        bb["decomposition_queue"] = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", dq))
+        self.blackboard = bb
+        self._blackboard_touch()
+        return {
+            "triggered": bool(triggered),
+            "trigger_reason": trigger_reason,
+            "queue_active": bool((bb.get("decomposition_queue", {}) or {}).get("active", False)),
+            "step_advanced": bool(progress_row.get("step_advanced", False)),
+        }
+
+    def _watchdog_execute_queue_step(self, *, pinned_selection: str) -> dict:
+        board = self._ensure_blackboard()
+        pick = self._watchdog_pick_executor_route(board)
+        if not pick:
+            dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
+            return {"executed": False, "queue_active": bool(dq.get("active", False)), "stop_run": False, "interrupted": False}
+        queue_args, meta = pick
+        role = self._sanitize_agent_role((queue_args or {}).get("target", "")) or "developer"
+        instruction = trim(str((queue_args or {}).get("instruction", "") or "").strip(), 1200)
+        if not instruction:
+            instruction = (
+                "Executor mode step: call one concrete tool now, keep scope narrow, and update blackboard evidence."
+            )
+        self._inject_manager_instruction(role, instruction, is_mandatory=True, executor_mode=True)
+        if role == "explorer":
+            self._blackboard_set_status("RESEARCHING")
+        elif role == "developer":
+            self._blackboard_set_status("CODING")
+        elif role == "reviewer":
+            self._blackboard_set_status("REVIEWING")
+        board_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
+        step = self._multi_agent_turn(
+            role,
+            pinned_selection=pinned_selection,
+            media_inputs_round=None,
+        )
+        safe_step = step if isinstance(step, dict) else {}
+        self._blackboard_update_from_worker_step(role, safe_step)
+        board_after = self._ensure_blackboard()
+        board_after_fp = self._watchdog_state_fingerprint(board_after)
+        wd_event = self._watchdog_process_worker_step(
+            board_after,
+            role=role,
+            step=safe_step,
+            state_changed=bool(board_after_fp != board_before_fp),
+            pinned_selection=pinned_selection,
+        )
+        status = str(safe_step.get("status", "") or "").strip().lower()
+        interrupted = bool(status == "interrupted")
+        stop_run = False
+        finish_gate_reason = ""
+        if status == "tools" and bool(safe_step.get("stop_due_to_finish", False)):
+            note = f"{self._agent_display_name(role)} signaled finish via tool."
+            self._blackboard_mark_approved(note, role)
+            can_finish_now, finish_gate_reason = self._can_auto_finish_from_approval(
+                self._ensure_blackboard(),
+                latest_user_ts=self._latest_user_message_ts(),
+            )
+            if can_finish_now:
+                self._mark_all_done_silently(note)
+                stop_run = True
+            else:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"executor finish deferred by gate ({finish_gate_reason}); "
+                            "continue watchdog queue"
+                        )
+                    },
+                )
+        dq = self._normalize_decomposition_queue_state(self._ensure_blackboard().get("decomposition_queue", {}))
+        return {
+            "executed": True,
+            "queue_active": bool(dq.get("active", False)),
+            "stop_run": bool(stop_run),
+            "interrupted": bool(interrupted),
+            "role": role,
+            "status": status,
+            "wd_event": wd_event,
+            "trigger_reason": trim(str(meta.get("trigger_reason", "") or "").strip(), 120),
+            "finish_gate_reason": finish_gate_reason,
+        }
+
     def _new_blackboard(self, goal: str = "") -> dict:
         profile = self._normalize_task_profile(goal, {})
         progress = "done" if str(profile.get("task_type", "") or "") == "simple_qa" and not str(goal or "").strip() else "initializing"
@@ -12717,6 +13472,8 @@ class SessionState:
                 "text": "",
                 "ts": 0.0,
             },
+            "watchdog": self._new_watchdog_state(),
+            "decomposition_queue": self._new_decomposition_queue_state(),
         }
 
     def _normalize_blackboard(self, raw: object) -> dict:
@@ -12866,6 +13623,10 @@ class SessionState:
                     "change_count": max(1, int(item.get("change_count", 1) or 1)),
                 }
         board["code_artifacts"] = artifacts
+        board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
+        board["decomposition_queue"] = self._normalize_decomposition_queue_state(
+            src.get("decomposition_queue", {})
+        )
         return board
 
     def _ensure_blackboard(self) -> dict:
@@ -13247,6 +14008,11 @@ class SessionState:
         goal = trim(str(board.get("original_goal", "") or "").strip(), 1800)
         status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
         delegate = board.get("last_delegate", {}) if isinstance(board.get("last_delegate"), dict) else {}
+        watchdog = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
+        dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
+        dq_steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+        dq_cursor = max(0, int(dq.get("cursor", 0) or 0))
+        dq_total = len(dq_steps)
         lines = [
             "## Blackboard State",
             f"- status: {status}",
@@ -13269,6 +14035,19 @@ class SessionState:
             f"- active_agent: {board.get('active_agent', '') or '(none)'}",
             f"- manager_cycles: {int(board.get('manager_cycles', 0) or 0)}",
             f"- manager_summary_attempts: {int(board.get('manager_summary_attempts', 0) or 0)}",
+            (
+                "- watchdog: "
+                f"intent_no_tool={int(watchdog.get('intent_no_tool_streak', 0) or 0)}, "
+                f"repeat_no_tool={int(watchdog.get('repeat_no_tool_streak', 0) or 0)}, "
+                f"state_unchanged={int(watchdog.get('state_unchanged_streak', 0) or 0)}, "
+                f"trigger_count={int(watchdog.get('trigger_count', 0) or 0)}"
+            ),
+            (
+                "- decomposition_queue: "
+                f"active={bool(dq.get('active', False))}, "
+                f"cursor={dq_cursor}, total={dq_total}, "
+                f"trigger_reason={trim(str(dq.get('trigger_reason', '') or ''), 140)}"
+            ),
             (
                 "- manager_judgement: "
                 f"{trim(str(judgement.get('progress', 'initializing') or ''), 40)}"
@@ -13357,6 +14136,7 @@ class SessionState:
                     "assigned_expert": {"type": "string", "enum": list(AGENT_ROLES)},
                     "requires_user_confirmation": {"type": "boolean"},
                     "is_mandatory": {"type": "boolean"},
+                    "executor_mode": {"type": "boolean"},
                 },
                 ["target", "instruction"],
             )
@@ -13375,6 +14155,8 @@ class SessionState:
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
+                    "semantic_confidence": {"type": "string", "enum": list(SEMANTIC_CONFIDENCE_CHOICES)},
+                    "low_confidence_reason": {"type": "string"},
                     "inherit_previous_state": {"type": "boolean"},
                     "judgement": {"type": "string"},
                     "round_budget": {"type": "integer"},
@@ -13397,6 +14179,68 @@ class SessionState:
             return False
         yes_tokens = ("继续", "确认", "开始", "执行", "同意", "go ahead", "proceed", "continue", "yes")
         return any(tok in low for tok in yes_tokens)
+
+    def _normalize_semantic_confidence(self, raw: object, *, default: str = "medium") -> str:
+        value = str(raw or "").strip().lower()
+        if value in SEMANTIC_CONFIDENCE_CHOICES:
+            return value
+        return default if default in SEMANTIC_CONFIDENCE_CHOICES else "medium"
+
+    def _merge_task_decision_for_low_confidence(self, llm_row: dict, fallback_row: dict) -> dict:
+        merged = dict(fallback_row or {})
+        row = llm_row if isinstance(llm_row, dict) else {}
+        if bool(row.get("inherit_previous_state", False)):
+            merged["inherit_previous_state"] = True
+        try:
+            lvl = int(row.get("level", 0) or 0)
+        except Exception:
+            lvl = 0
+        if lvl in TASK_LEVEL_CHOICES:
+            merged["level"] = int(lvl)
+        task_type = trim(str(row.get("task_type", "") or "").strip().lower(), 40)
+        if task_type in TASK_PROFILE_TYPES:
+            merged["task_type"] = task_type
+        complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
+        if complexity in TASK_COMPLEXITY_LEVELS:
+            merged["complexity"] = complexity
+        scale = trim(str(row.get("scale_preference", "") or "").strip().lower(), 20)
+        if scale in TASK_SCALE_PREFERENCES:
+            merged["scale_preference"] = scale
+        mode = normalize_execution_mode(row.get("execution_mode", ""), default="")
+        if mode in EXECUTION_MODE_CHOICES:
+            merged["execution_mode"] = mode
+        assigned = self._sanitize_agent_role(row.get("assigned_expert", ""))
+        if assigned:
+            merged["assigned_expert"] = assigned
+        raw_participants = row.get("participants", [])
+        participants: list[str] = []
+        if isinstance(raw_participants, list):
+            for item in raw_participants:
+                role = self._sanitize_agent_role(item)
+                if role and role not in participants:
+                    participants.append(role)
+        if participants:
+            merged["participants"] = participants[:3]
+        try:
+            budget = int(row.get("round_budget", 0) or 0)
+        except Exception:
+            budget = 0
+        if budget > 0:
+            merged["round_budget"] = int(
+                max(1, min(int(self.max_agent_rounds or MAX_AGENT_ROUNDS), int(budget)))
+            )
+        if bool(row.get("requires_user_confirmation", False)):
+            merged["requires_user_confirmation"] = True
+        objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
+        if objective:
+            merged["direct_objective"] = objective
+        judgement = trim(str(row.get("judgement", "") or "").strip(), 200)
+        if judgement:
+            merged["judgement"] = judgement
+        merged["semantic_confidence"] = self._normalize_semantic_confidence(row.get("semantic_confidence", "low"), default="low")
+        merged["low_confidence_reason"] = trim(str(row.get("low_confidence_reason", "") or "").strip(), 220)
+        merged["source"] = "manager-low-confidence+fallback"
+        return merged
 
     def _fallback_task_level_decision(self, goal_text: str) -> dict:
         profile = self._infer_task_profile(goal_text)
@@ -13501,6 +14345,8 @@ class SessionState:
                 "participants": list(inherited_participants),
                 "assigned_expert": inherited_assigned,
                 "requires_user_confirmation": bool(inherited_requires_confirmation if inherited_level == 5 else False),
+                "semantic_confidence": "low",
+                "low_confidence_reason": "rule fallback inherited previous runtime state",
                 "source": "fallback",
             }
         level = 3
@@ -13537,6 +14383,8 @@ class SessionState:
             "participants": participants,
             "assigned_expert": assigned,
             "requires_user_confirmation": bool(requires_confirmation),
+            "semantic_confidence": "low",
+            "low_confidence_reason": "rule fallback classification",
             "source": "fallback",
         }
 
@@ -13559,7 +14407,9 @@ class SessionState:
             "If user clearly indicates speed vs completeness preference, that preference has higher priority than your default strategy. "
             "Budgets are internal efficiency controls to reduce overthinking and idle loops; "
             "they must not be treated as a user-visible early-stop reason. "
-            "Output exactly one classify_task_level tool call with concise judgement and inherit_previous_state. "
+            "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
+            "and semantic_confidence(high|medium|low). "
+            "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly. "
             f"{model_language_instruction(self.ui_language)}"
         )
 
@@ -13657,16 +14507,55 @@ class SessionState:
         participants = normalized_participants[:3] or [assigned]
         if assigned not in participants:
             assigned = participants[0]
+        semantic_confidence = self._normalize_semantic_confidence(
+            row.get("semantic_confidence", "medium"),
+            default="medium",
+        )
+        decision_source = trim(str(row.get("source", "") or "").strip().lower(), 80)
+        low_confidence_mode = bool(
+            str(semantic_confidence or "medium") == "low"
+            or decision_source.startswith("fallback")
+            or "low-confidence" in decision_source
+        )
+        if low_confidence_mode:
+            rule_profile = self._infer_task_profile(goal_text)
+            fallback_task_type = str(rule_profile.get("task_type", "general") or "general")
+            fallback_complexity = str(rule_profile.get("complexity", "simple") or "simple")
+            fallback_objective = trim(str(rule_profile.get("direct_objective", "") or ""), 800)
+        else:
+            board_now = self._ensure_blackboard()
+            board_profile = board_now.get("task_profile", {}) if isinstance(board_now.get("task_profile"), dict) else {}
+            fallback_task_type = trim(
+                str(self.runtime_task_type or board_profile.get("task_type", "general") or "general"),
+                40,
+            )
+            if fallback_task_type not in TASK_PROFILE_TYPES:
+                fallback_task_type = "general"
+            fallback_complexity = trim(
+                str(self.runtime_task_complexity or board_profile.get("complexity", "simple") or "simple"),
+                20,
+            )
+            if fallback_complexity not in TASK_COMPLEXITY_LEVELS:
+                fallback_complexity = "simple"
+            fallback_objective = trim(
+                str(self.runtime_direct_objective or board_profile.get("direct_objective", "") or "").strip(),
+                800,
+            )
+            if not fallback_objective:
+                fallback_objective = (
+                    "Proceed with direct semantic objective and concrete progress for the current request."
+                )
         task_type = trim(str(row.get("task_type", "") or "").strip().lower(), 40)
         if task_type not in TASK_PROFILE_TYPES:
-            task_type = str(self._infer_task_profile(goal_text).get("task_type", "general"))
+            task_type = fallback_task_type
         complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
         if complexity not in TASK_COMPLEXITY_LEVELS:
-            complexity = str(self._infer_task_profile(goal_text).get("complexity", "simple"))
+            complexity = fallback_complexity
+        low_confidence_reason = trim(str(row.get("low_confidence_reason", "") or "").strip(), 220)
         judgement = trim(str(row.get("judgement", "") or "").strip(), 200) or "manager classified task level"
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if not objective:
-            objective = trim(str(self._infer_task_profile(goal_text).get("direct_objective", "") or ""), 800)
+            objective = fallback_objective
         self.runtime_task_level = int(level)
         self.runtime_execution_mode = mode
         self.runtime_assigned_expert = assigned
@@ -13694,6 +14583,8 @@ class SessionState:
         profile["direct_objective"] = objective
         profile["round_budget"] = int(round_budget)
         profile["inherit_previous_state"] = bool(inherit_previous_state)
+        profile["semantic_confidence"] = semantic_confidence
+        profile["low_confidence_reason"] = low_confidence_reason
         profile["recommended_agents"] = list(participants)
         profile["reason"] = trim(str(row.get("judgement", "") or row.get("source", "manager")), 400)
         profile["updated_at"] = float(now_ts())
@@ -13709,6 +14600,8 @@ class SessionState:
             "execution_mode": mode,
             "participants": list(participants),
             "assigned_expert": assigned,
+            "semantic_confidence": semantic_confidence,
+            "low_confidence_reason": low_confidence_reason,
             "updated_at": float(now_ts()),
         }
         board["active_agent"] = assigned if mode == EXECUTION_MODE_SINGLE else ""
@@ -13721,7 +14614,8 @@ class SessionState:
                 "summary": (
                     f"manager classified: L{level} "
                     f"mode={mode} scale={scale_preference} participants={','.join(participants)} "
-                    f"expert={assigned} budget={'unlimited' if int(round_budget) <= 0 else int(round_budget)}"
+                    f"expert={assigned} budget={'unlimited' if int(round_budget) <= 0 else int(round_budget)} "
+                    f"confidence={semantic_confidence}"
                 )
             },
         )
@@ -13779,10 +14673,20 @@ class SessionState:
                     row.get("inherit_previous_state", False),
                     default=False,
                 )
+                row["semantic_confidence"] = self._normalize_semantic_confidence(
+                    row.get("semantic_confidence", "medium"),
+                    default="medium",
+                )
+                if str(row.get("semantic_confidence", "medium")) == "low":
+                    fallback_row = self._fallback_task_level_decision(goal_text)
+                    merged = self._merge_task_decision_for_low_confidence(row, fallback_row)
+                    return merged
                 row["source"] = "manager"
                 return row
         row = self._fallback_task_level_decision(goal_text)
-        row["source"] = "fallback"
+        row["source"] = "fallback-no-toolcall"
+        row["semantic_confidence"] = "low"
+        row["low_confidence_reason"] = "manager classifier returned no valid tool call"
         return row
 
     def _refresh_runtime_task_policy(
@@ -14241,6 +15145,8 @@ class SessionState:
 
     def _manager_apply_anti_stall(self, route: dict) -> dict:
         row = dict(route or {})
+        if bool(row.get("executor_mode", False)):
+            return row
         if str(row.get("task_type", "") or "").strip().lower() == "simple_qa":
             return row
         target = str(row.get("target", "") or "").strip().lower()
@@ -14282,6 +15188,7 @@ class SessionState:
 
     def _manager_apply_task_policy(self, route: dict) -> dict:
         row = dict(route or {})
+        executor_mode_flag = _to_bool_like(row.get("executor_mode", False), default=False)
         board = self._ensure_blackboard()
         latest_user_ts = self._latest_user_message_ts()
         self._invalidate_stale_approval_if_needed(
@@ -14330,7 +15237,13 @@ class SessionState:
         if target not in MANAGER_ROUTE_TARGETS:
             target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
         if target in AGENT_ROLES and target not in participants:
-            target = participants[0]
+            if executor_mode_flag:
+                if len(participants) < 3:
+                    participants.append(target)
+                else:
+                    participants[-1] = target
+            else:
+                target = participants[0]
         instruction = trim(str(row.get("instruction", "") or "").strip(), 1200)
         if not instruction:
             instruction = "Proceed with one concrete next step and report evidence."
@@ -14470,6 +15383,7 @@ class SessionState:
             is_mandatory = True
         if target == "finish":
             is_mandatory = False
+            executor_mode_flag = False
         row.update(
             {
                 "target": target,
@@ -14484,6 +15398,7 @@ class SessionState:
                 "participants": list(participants),
                 "assigned_expert": assigned_expert,
                 "is_mandatory": bool(is_mandatory),
+                "executor_mode": bool(executor_mode_flag and target in AGENT_ROLES),
                 "requires_user_confirmation": bool(
                     row.get(
                         "requires_user_confirmation",
@@ -14528,6 +15443,7 @@ class SessionState:
                 "assigned_expert": trim(str(args.get("assigned_expert", "") or "").strip().lower(), 20),
                 "requires_user_confirmation": bool(args.get("requires_user_confirmation", False)),
                 "is_mandatory": _to_bool_like(args.get("is_mandatory", False), default=False),
+                "executor_mode": _to_bool_like(args.get("executor_mode", False), default=False),
                 "round_budget": args.get("round_budget", 0),
                 "reason": trim(str(text or "").strip(), 600),
                 "source": "tool",
@@ -14556,6 +15472,7 @@ class SessionState:
         objective, _ = self._split_language_policy_from_text(objective_raw, max_len=800)
         instruction, _ = self._split_language_policy_from_text(instruction_raw, max_len=1200)
         is_mandatory = bool(row.get("is_mandatory", False))
+        is_executor = bool(row.get("executor_mode", False))
         round_budget = int(row.get("round_budget", 0) or 0)
         remaining = int(row.get("remaining_rounds", -1) or -1)
         budget_text = "unlimited" if round_budget <= 0 else str(round_budget)
@@ -14564,7 +15481,11 @@ class SessionState:
         lines = [
             f"Manager -> {target_label}",
             f"L{task_level if task_level in TASK_LEVEL_CHOICES else '-'} | {mode} | {task_type}/{complexity} | scale={scale}",
-            f"mandatory={'yes' if is_mandatory else 'no'} | budget={budget_text} | remaining={remaining_text}",
+            (
+                f"mandatory={'yes' if is_mandatory else 'no'}"
+                f" | executor={'yes' if is_executor else 'no'}"
+                f" | budget={budget_text} | remaining={remaining_text}"
+            ),
         ]
         if objective:
             lines.append(f"objective: {objective}")
@@ -14580,6 +15501,7 @@ class SessionState:
             "complexity": complexity,
             "scale_preference": scale,
             "is_mandatory": is_mandatory,
+            "executor_mode": is_executor,
             "round_budget": round_budget,
             "remaining_rounds": remaining,
             "direct_objective": objective,
@@ -14604,21 +15526,24 @@ class SessionState:
         board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
         text = ""
         tool_calls: list[dict] = []
+        used_watchdog_executor = False
+        watchdog_meta: dict = {}
+        watchdog_pick = self._watchdog_pick_executor_route(board)
         used_agentbus_fast = False
         fast_meta: dict = {}
-        fast_pick = self._manager_pick_agentbus_fast_route(board)
-        if fast_pick:
-            used_agentbus_fast = True
-            fast_args, fast_meta = fast_pick
+        if watchdog_pick:
+            used_watchdog_executor = True
+            queue_args, watchdog_meta = watchdog_pick
             with self.lock:
-                self.current_phase = "manager:agentbus-fast-route"
+                self.current_phase = "manager:watchdog-executor-route"
                 self.current_tool_name = ""
                 self.active_agent_role = "manager"
             text = trim(
                 (
-                    "agentbus fast-route "
-                    f"{fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
-                    f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                    "watchdog executor route "
+                    f"step={int(watchdog_meta.get('cursor', 0) or 0)}/{int(watchdog_meta.get('total', 0) or 0)} "
+                    f"target={watchdog_meta.get('target', '?')} "
+                    f"trigger={watchdog_meta.get('trigger_reason', '') or '?'}"
                 ),
                 600,
             )
@@ -14628,7 +15553,7 @@ class SessionState:
                     "type": "function",
                     "function": {
                         "name": "route_to_next_agent",
-                        "arguments": dict(fast_args or {}),
+                        "arguments": dict(queue_args or {}),
                     },
                 }
             ]
@@ -14636,7 +15561,7 @@ class SessionState:
                 {
                     "role": "system",
                     "content": (
-                        "[manager-fast-route] "
+                        "[manager-watchdog-route] "
                         f"{trim(str(text or ''), 500)}"
                     ),
                     "ts": now_ts(),
@@ -14647,102 +15572,165 @@ class SessionState:
                 "status",
                 {
                     "summary": (
-                        "manager fast-route via agentbus "
-                        f"({fast_meta.get('from', '?')}->{fast_meta.get('to', '?')}, "
-                        f"intent={fast_meta.get('intent', 'message')}, "
-                        f"age={float(fast_meta.get('age_sec', 0.0) or 0.0):.1f}s)"
+                        "manager watchdog executor active "
+                        f"(step={int(watchdog_meta.get('cursor', 0) or 0)}/"
+                        f"{int(watchdog_meta.get('total', 0) or 0)}, "
+                        f"target={watchdog_meta.get('target', '?')}, "
+                        f"trigger={trim(str(watchdog_meta.get('trigger_reason', '') or ''), 80)})"
                     )
                 },
             )
         else:
-            prompt = (
-                "Read the blackboard and delegate one next short timeslice. "
-                "Return only one route_to_next_agent call.\n\n"
-                f"{self._blackboard_read_state_markdown(max_items=6)}"
-            )
-            self.manager_context.append({"role": "user", "content": prompt, "ts": now_ts()})
-            self.manager_context = self.manager_context[-400:]
-            with self.lock:
-                self.current_phase = "manager:model-call"
-                self.current_tool_name = ""
-                self.active_agent_role = "manager"
-            response = self._chat_with_same_model_retry(
-                self.manager_context,
-                tools=self._manager_route_tools(),
-                system=self._manager_system_prompt(),
-                max_tokens=600,
-                think=False,
-                stream_thinking=False,
-                on_thinking_chunk=self._append_live_thinking,
-                pinned_selection=pinned_selection,
-                context_label="manager turn",
-                retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
-                media_inputs=media_inputs_round,
-            )
-            text = str(response.get("content") or "")
-            tool_calls = response.get("tool_calls", [])
-            text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
-            if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
-                self._inject_toolcall_overflow_hint("manager")
-            assistant = {"role": "assistant", "content": text, "ts": now_ts()}
-            if tool_calls:
-                assistant["tool_calls"] = [
+            fast_pick = self._manager_pick_agentbus_fast_route(board)
+            if fast_pick:
+                used_agentbus_fast = True
+                fast_args, fast_meta = fast_pick
+                with self.lock:
+                    self.current_phase = "manager:agentbus-fast-route"
+                    self.current_tool_name = ""
+                    self.active_agent_role = "manager"
+                text = trim(
+                    (
+                        "agentbus fast-route "
+                        f"{fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
+                        f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                    ),
+                    600,
+                )
+                tool_calls = [
                     {
-                        "id": tc["id"],
+                        "id": make_id("tc"),
                         "type": "function",
                         "function": {
-                            "name": tc["function"]["name"],
-                            "arguments": json_dumps(tc["function"]["arguments"]),
+                            "name": "route_to_next_agent",
+                            "arguments": dict(fast_args or {}),
                         },
                     }
-                    for tc in tool_calls
                 ]
-            self.manager_context.append(assistant)
-            self.manager_context = self.manager_context[-400:]
-            route_only_tool_calls = False
-            if isinstance(tool_calls, list) and tool_calls:
-                tool_names = [
-                    str(tc.get("function", {}).get("name", "") or "").strip().lower()
-                    for tc in tool_calls
-                    if isinstance(tc, dict)
-                ]
-                if tool_names and all(name in {"route_to_next_agent", "routetonext_agent"} for name in tool_names):
-                    route_only_tool_calls = True
-            emit_text = str(text or "").strip()
-            if not emit_text and tool_calls and (not route_only_tool_calls):
-                emit_text = f"[tool calls] {', '.join(str(tc.get('function', {}).get('name', '?')) for tc in tool_calls)}"
-            if emit_text:
-                manager_message = {
-                    "role": "assistant",
-                    "content": emit_text,
-                    "ts": assistant["ts"],
-                    "agent_role": "manager",
-                }
-                if "tool_calls" in assistant and (not route_only_tool_calls):
-                    manager_message["tool_calls"] = assistant["tool_calls"]
-                self.messages.append(manager_message)
-                self.messages = self.messages[-400:]
-            elif "tool_calls" in assistant and (not route_only_tool_calls):
-                manager_message = {
-                    "role": "assistant",
-                    "content": "",
-                    "ts": assistant["ts"],
-                    "agent_role": "manager",
-                    "tool_calls": assistant["tool_calls"],
-                }
-                self.messages.append(manager_message)
-                self.messages = self.messages[-400:]
-            if emit_text:
-                self._emit(
-                    "message",
+                self.manager_context.append(
                     {
-                        "role": "assistant",
-                        "agent_role": "manager",
-                        "text": emit_text,
-                        "summary": "Manager response",
+                        "role": "system",
+                        "content": (
+                            "[manager-fast-route] "
+                            f"{trim(str(text or ''), 500)}"
+                        ),
+                        "ts": now_ts(),
+                    }
+                )
+                self.manager_context = self.manager_context[-400:]
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "manager fast-route via agentbus "
+                            f"({fast_meta.get('from', '?')}->{fast_meta.get('to', '?')}, "
+                            f"intent={fast_meta.get('intent', 'message')}, "
+                            f"age={float(fast_meta.get('age_sec', 0.0) or 0.0):.1f}s)"
+                        )
                     },
                 )
+            else:
+                prompt = (
+                    "Read the blackboard and delegate one next short timeslice. "
+                    "Return only one route_to_next_agent call.\n\n"
+                    f"{self._blackboard_read_state_markdown(max_items=6)}"
+                )
+                self.manager_context.append({"role": "user", "content": prompt, "ts": now_ts()})
+                self.manager_context = self.manager_context[-400:]
+                with self.lock:
+                    self.current_phase = "manager:model-call"
+                    self.current_tool_name = ""
+                    self.active_agent_role = "manager"
+                response = self._chat_with_same_model_retry(
+                    self.manager_context,
+                    tools=self._manager_route_tools(),
+                    system=self._manager_system_prompt(),
+                    max_tokens=600,
+                    think=False,
+                    stream_thinking=False,
+                    on_thinking_chunk=self._append_live_thinking,
+                    pinned_selection=pinned_selection,
+                    context_label="manager turn",
+                    retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
+                    media_inputs=media_inputs_round,
+                )
+                text = str(response.get("content") or "")
+                tool_calls = response.get("tool_calls", [])
+                text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
+                if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
+                    self._inject_toolcall_overflow_hint("manager")
+                assistant = {"role": "assistant", "content": text, "ts": now_ts()}
+                if tool_calls:
+                    assistant["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": json_dumps(tc["function"]["arguments"]),
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                self.manager_context.append(assistant)
+                self.manager_context = self.manager_context[-400:]
+                route_only_tool_calls = False
+                if isinstance(tool_calls, list) and tool_calls:
+                    tool_names = [
+                        str(tc.get("function", {}).get("name", "") or "").strip().lower()
+                        for tc in tool_calls
+                        if isinstance(tc, dict)
+                    ]
+                    if tool_names and all(name in {"route_to_next_agent", "routetonext_agent"} for name in tool_names):
+                        route_only_tool_calls = True
+                emit_text = str(text or "").strip()
+                if not emit_text and tool_calls and (not route_only_tool_calls):
+                    emit_text = f"[tool calls] {', '.join(str(tc.get('function', {}).get('name', '?')) for tc in tool_calls)}"
+                if emit_text:
+                    manager_message = {
+                        "role": "assistant",
+                        "content": emit_text,
+                        "ts": assistant["ts"],
+                        "agent_role": "manager",
+                    }
+                    if "tool_calls" in assistant and (not route_only_tool_calls):
+                        manager_message["tool_calls"] = assistant["tool_calls"]
+                    self.messages.append(manager_message)
+                    self.messages = self.messages[-400:]
+                elif "tool_calls" in assistant and (not route_only_tool_calls):
+                    manager_message = {
+                        "role": "assistant",
+                        "content": "",
+                        "ts": assistant["ts"],
+                        "agent_role": "manager",
+                        "tool_calls": assistant["tool_calls"],
+                    }
+                    self.messages.append(manager_message)
+                    self.messages = self.messages[-400:]
+                if emit_text:
+                    self._emit(
+                        "message",
+                        {
+                            "role": "assistant",
+                            "agent_role": "manager",
+                            "text": emit_text,
+                            "summary": "Manager response",
+                        },
+                    )
         route = self._manager_route_from_response(text, tool_calls)
+        if used_watchdog_executor:
+            route["source"] = "watchdog-executor"
+            route["reason"] = trim(
+                (
+                    f"watchdog executor step {int(watchdog_meta.get('cursor', 0) or 0)}/"
+                    f"{int(watchdog_meta.get('total', 0) or 0)} "
+                    f"target={watchdog_meta.get('target', '?')} "
+                    f"trigger={watchdog_meta.get('trigger_reason', '')}"
+                ),
+                600,
+            )
+            route["executor_mode"] = True
+            route["is_mandatory"] = True
         if used_agentbus_fast:
             route["source"] = "agentbus-fast"
             route["reason"] = trim(
@@ -14817,6 +15805,7 @@ class SessionState:
             "participants": list(participants),
             "assigned_expert": assigned_expert,
             "is_mandatory": bool(route.get("is_mandatory", False)),
+            "executor_mode": bool(route.get("executor_mode", False)),
             "requires_user_confirmation": bool(route.get("requires_user_confirmation", False)),
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
@@ -14829,6 +15818,7 @@ class SessionState:
         profile["participants"] = list(participants)
         profile["assigned_expert"] = assigned_expert
         profile["is_mandatory"] = bool(route_row.get("is_mandatory", False))
+        profile["executor_mode"] = bool(route_row.get("executor_mode", False))
         profile["requires_user_confirmation"] = bool(route_row.get("requires_user_confirmation", False))
         if task_type in TASK_PROFILE_TYPES:
             profile["task_type"] = task_type
@@ -14863,6 +15853,7 @@ class SessionState:
             "participants": list(participants),
             "assigned_expert": assigned_expert,
             "is_mandatory": bool(route_row.get("is_mandatory", False)),
+            "executor_mode": bool(route_row.get("executor_mode", False)),
             "remaining_rounds": int(remaining_rounds),
             "updated_at": float(now_ts()),
         }
@@ -14934,10 +15925,40 @@ class SessionState:
         )
         return route_row
 
-    def _inject_manager_instruction(self, role: str, instruction: str, is_mandatory: bool = False):
+    def _inject_manager_instruction(
+        self,
+        role: str,
+        instruction: str,
+        is_mandatory: bool = False,
+        executor_mode: bool = False,
+    ):
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return
+        if bool(executor_mode):
+            executor_seed = {
+                "role": "system",
+                "content": self._apply_agent_language_policy(
+                    (
+                        "Executor mode is enabled by watchdog. You are stateless for this step: "
+                        "ignore old conversational plans, execute only the delegated step, call concrete tools, "
+                        "and write verifiable evidence to blackboard."
+                    ),
+                    max_len=800,
+                ),
+                "ts": now_ts(),
+                "agent_role": role_key,
+            }
+            self.contexts[role_key] = [executor_seed]
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"executor hot-swap: reset {self._agent_display_name(role_key)} context "
+                        "for stateless execution"
+                    )
+                },
+            )
         instruction_with_policy = self._apply_agent_language_policy(
             trim(str(instruction or "").strip(), 1400),
             max_len=1400,
@@ -14957,6 +15978,14 @@ class SessionState:
             if bool(is_mandatory)
             else ""
         )
+        executor_note = (
+            (
+                "STATELESS EXECUTOR: do not re-plan globally; "
+                "complete only this delegated step and return concrete tool evidence."
+            )
+            if bool(executor_mode)
+            else ""
+        )
         collaboration_note = (
             "COLLABORATION PREFERENCE: if your current step needs another specialty, "
             "use ask_colleague immediately with explicit intent and concise payload; "
@@ -14967,9 +15996,11 @@ class SessionState:
             "<manager-delegate>\n"
             f"target={role_key}\n"
             f"is_mandatory={bool(is_mandatory)}\n"
+            f"executor_mode={bool(executor_mode)}\n"
             f"instruction={instruction_text}\n"
             f"language_policy={language_note}\n"
             f"{mandatory_note}\n"
+            f"{executor_note}\n"
             f"{collaboration_note}\n"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
@@ -16465,6 +17496,8 @@ class SessionState:
             if section == "original_goal":
                 return trim(str(board.get("original_goal", "") or "").strip(), 4000) or "(empty)"
             if section == "status":
+                wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
+                dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
                 return json_dumps(
                     {
                         "status": board.get("status", "INITIALIZING"),
@@ -16473,6 +17506,20 @@ class SessionState:
                         "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
                         "approval": board.get("approval", {}),
                         "last_delegate": board.get("last_delegate", {}),
+                        "watchdog": {
+                            "intent_no_tool_streak": int(wd.get("intent_no_tool_streak", 0) or 0),
+                            "repeat_no_tool_streak": int(wd.get("repeat_no_tool_streak", 0) or 0),
+                            "state_unchanged_streak": int(wd.get("state_unchanged_streak", 0) or 0),
+                            "trigger_count": int(wd.get("trigger_count", 0) or 0),
+                            "last_trigger_reason": trim(str(wd.get("last_trigger_reason", "") or "").strip(), 160),
+                        },
+                        "decomposition_queue": {
+                            "active": bool(dq.get("active", False)),
+                            "trigger_reason": trim(str(dq.get("trigger_reason", "") or "").strip(), 160),
+                            "cursor": int(dq.get("cursor", 0) or 0),
+                            "total": len(dq.get("steps", []) or []),
+                            "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
+                        },
                     },
                     indent=2,
                 )
@@ -17196,6 +18243,7 @@ class SessionState:
                 role,
                 instruction,
                 is_mandatory=bool(route.get("is_mandatory", False)),
+                executor_mode=bool(route.get("executor_mode", False)),
             )
             if role == "explorer":
                 self._blackboard_set_status("RESEARCHING")
@@ -17209,13 +18257,26 @@ class SessionState:
                 media_inputs_pool=media_inputs_pool,
                 media_seen_ts_by_role=media_seen_ts_by_role,
             )
+            board_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
             step = self._multi_agent_turn(
                 role,
                 pinned_selection=pinned_selection,
                 media_inputs_round=role_media_inputs,
             )
             self._blackboard_update_from_worker_step(role, step)
+            board_after = self._ensure_blackboard()
+            board_after_fp = self._watchdog_state_fingerprint(board_after)
+            wd_event = self._watchdog_process_worker_step(
+                board_after,
+                role=role,
+                step=step if isinstance(step, dict) else {},
+                state_changed=bool(board_after_fp != board_before_fp),
+                pinned_selection=pinned_selection,
+            )
             status = str(step.get("status", "") or "")
+            if bool(wd_event.get("triggered", False)):
+                idle_counts[role] = 0
+                continue
             if status == "interrupted":
                 break
             if status == "skip":
@@ -17351,6 +18412,28 @@ class SessionState:
                     media_inputs=media_inputs_pool,
                     roles=role_order,
                 )
+            dq = self._normalize_decomposition_queue_state(
+                self._ensure_blackboard().get("decomposition_queue", {})
+            )
+            if bool(dq.get("active", False)):
+                queue_exec = self._watchdog_execute_queue_step(
+                    pinned_selection=pinned_selection,
+                )
+                if bool(queue_exec.get("interrupted", False)):
+                    break
+                if bool(queue_exec.get("stop_run", False)):
+                    self._emit("status", {"summary": "watchdog executor completed task; run paused"})
+                    break
+                if not bool(queue_exec.get("executed", False)):
+                    if bool(queue_exec.get("queue_active", False)):
+                        self._emit(
+                            "status",
+                            {"summary": "watchdog queue active but no executable step; pausing to avoid deadlock"},
+                        )
+                        break
+                    continue
+                idle_counts[str(queue_exec.get("role", "") or "developer")] = 0
+                continue
             role = current_role if mode == EXECUTION_MODE_SEQUENTIAL else role_order[sync_index % len(role_order)]
             role_media_inputs = self._resolve_role_multimodal_payload(
                 role=role,
@@ -17358,12 +18441,27 @@ class SessionState:
                 media_inputs_pool=media_inputs_pool,
                 media_seen_ts_by_role=media_seen_ts_by_role,
             )
+            board_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
             step = self._multi_agent_turn(
                 role,
                 pinned_selection=pinned_selection,
                 media_inputs_round=role_media_inputs,
             )
-            status = str(step.get("status", "") or "")
+            safe_step = step if isinstance(step, dict) else {}
+            self._blackboard_update_from_worker_step(role, safe_step)
+            board_after = self._ensure_blackboard()
+            board_after_fp = self._watchdog_state_fingerprint(board_after)
+            wd_event = self._watchdog_process_worker_step(
+                board_after,
+                role=role,
+                step=safe_step,
+                state_changed=bool(board_after_fp != board_before_fp),
+                pinned_selection=pinned_selection,
+            )
+            if bool(wd_event.get("triggered", False)):
+                idle_counts[role] = 0
+                continue
+            status = str(safe_step.get("status", "") or "")
             if status == "interrupted":
                 break
             if status == "skip":
@@ -17377,7 +18475,7 @@ class SessionState:
                 continue
             if status == "tools":
                 idle_counts[role] = 0
-                if bool(step.get("stop_due_to_finish", False)):
+                if bool(safe_step.get("stop_due_to_finish", False)):
                     self._emit("status", {"summary": "finish tool called; run paused and awaiting user instruction"})
                     break
                 if mode == EXECUTION_MODE_SEQUENTIAL:
@@ -17395,7 +18493,7 @@ class SessionState:
                 idle_counts[role] = int(idle_counts.get(role, 0) or 0) + 1
                 should_stop, next_role = self._multi_agent_no_tool_transition(
                     role,
-                    str(step.get("text", "") or ""),
+                    str(safe_step.get("text", "") or ""),
                     mode=mode,
                     idle_counts=idle_counts,
                 )
@@ -17576,6 +18674,32 @@ class SessionState:
                         self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                         self._multi_agent_worker(pinned_selection=pinned_selection)
                         return
+                dq = self._normalize_decomposition_queue_state(
+                    self._ensure_blackboard().get("decomposition_queue", {})
+                )
+                if bool(dq.get("active", False)):
+                    queue_exec = self._watchdog_execute_queue_step(
+                        pinned_selection=pinned_selection,
+                    )
+                    if bool(queue_exec.get("interrupted", False)):
+                        self._emit("status", {"summary": "run interrupted"})
+                        break
+                    if bool(queue_exec.get("stop_run", False)):
+                        self._emit("status", {"summary": "watchdog executor completed task; run paused"})
+                        break
+                    if not bool(queue_exec.get("executed", False)):
+                        if bool(queue_exec.get("queue_active", False)):
+                            self._emit(
+                                "status",
+                                {"summary": "watchdog queue active but no executable step; pausing to avoid deadlock"},
+                            )
+                            break
+                        continue
+                    no_tool_rounds = 0
+                    arbiter_planning_rounds = 0
+                    fault_counter = 0
+                    last_fault_reason = ""
+                    continue
                 latest_user_ts = self._latest_user_message_ts()
                 media_inputs_round = None
                 if latest_user_ts > media_last_user_ts:
@@ -17771,6 +18895,32 @@ class SessionState:
                         arbiter_planning_rounds = 0
                         self._emit("status", {"summary": "waiting for user input: assistant asked for a decision"})
                         break
+                    wd_event = self._watchdog_process_worker_step(
+                        self._ensure_blackboard(),
+                        role=single_role,
+                        step={
+                            "status": "no-tools",
+                            "text": decision_probe,
+                            "tool_results": [],
+                        },
+                        state_changed=False,
+                        pinned_selection=pinned_selection,
+                    )
+                    if bool(wd_event.get("triggered", False)):
+                        no_tool_rounds = 0
+                        arbiter_planning_rounds = 0
+                        fault_counter = 0
+                        last_fault_reason = ""
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "watchdog triggered in single-agent planner mode; "
+                                    "switching to stateless executor queue"
+                                )
+                            },
+                        )
+                        continue
                     clean_decision_probe = strip_thinking_content(decision_probe).strip()
                     if bool(self.arbiter_enabled) and len(clean_decision_probe) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
                         arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
@@ -18024,6 +19174,8 @@ class SessionState:
                 stop_due_to_finish_task = False
                 hard_break_reason = ""
                 interrupted_in_tools = False
+                single_round_tool_results: list[dict] = []
+                single_watchdog_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
                 round_tool_fp = self._tool_calls_fingerprint(tool_calls)
                 for tc in tool_calls:
                     if self.cancel_requested:
@@ -18206,6 +19358,14 @@ class SessionState:
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"}:
                         stop_due_to_finish_task = True
                     self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(output), "ts": now_ts()})
+                    single_round_tool_results.append(
+                        {
+                            "name": dispatched_name or name,
+                            "args": args if isinstance(args, dict) else {},
+                            "output": trim(str(output or ""), 3000),
+                            "ok": not str(output).startswith("Error:"),
+                        }
+                    )
                     self._emit("tool_result", {"name": name, "result": trim(output, 500), "summary": f"tool done: {name}"})
                     if int(tool_error_streaks.get(tool_key, 0) or 0) >= HARD_BREAK_TOOL_ERROR_THRESHOLD:
                         stop_due_to_hard_break = True
@@ -18234,6 +19394,18 @@ class SessionState:
                     self.current_phase = "post-tools"
                 if interrupted_in_tools:
                     break
+                single_watchdog_after_board = self._ensure_blackboard()
+                single_watchdog_after_fp = self._watchdog_state_fingerprint(single_watchdog_after_board)
+                self._watchdog_process_worker_step(
+                    single_watchdog_after_board,
+                    role=single_role,
+                    step={
+                        "status": "tools",
+                        "tool_results": single_round_tool_results,
+                    },
+                    state_changed=bool(single_watchdog_after_fp != single_watchdog_before_fp),
+                    pinned_selection=pinned_selection,
+                )
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
