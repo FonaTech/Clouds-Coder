@@ -5,6 +5,7 @@ import base64
 from collections import deque
 import csv
 import difflib
+import errno
 import html
 import hashlib
 import hmac
@@ -904,6 +905,27 @@ def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:
 
 def now_ts() -> float:
     return time.time()
+
+
+def is_benign_socket_error(exc: BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    winerror = int(getattr(exc, "winerror", 0) or 0)
+    if winerror in {10038, 10053, 10054, 10057}:
+        return True
+    err = int(getattr(exc, "errno", 0) or 0)
+    benign_errno = {
+        int(getattr(errno, "EPIPE", 32)),
+        int(getattr(errno, "ECONNRESET", 104)),
+        int(getattr(errno, "ECONNABORTED", 103)),
+        int(getattr(errno, "ENOTCONN", 107)),
+        int(getattr(errno, "EBADF", 9)),
+    }
+    return err in benign_errno
 
 def normalize_timeout_seconds(
     raw: object,
@@ -11692,6 +11714,119 @@ class SessionState:
             err_text = err_buf.decode("utf-8", errors="replace")
             return (out_text + err_text).strip()
 
+        def _collect_with_reader_threads(proc: subprocess.Popen):
+            nonlocal next_progress_emit
+            reader_threads: list[threading.Thread] = []
+            io_queue: queue.Queue = queue.Queue()
+            active_readers: set[str] = set()
+
+            def _spawn_reader(label: str, stream):
+                if stream is None:
+                    return
+                active_readers.add(label)
+                # Selector fallback may leave PIPE FDs in non-blocking mode.
+                # Reader threads expect blocking reads to avoid early EOF/pipe close.
+                try:
+                    os.set_blocking(stream.fileno(), True)
+                except Exception:
+                    pass
+
+                def _reader():
+                    try:
+                        while True:
+                            try:
+                                chunk = stream.read(65536)
+                            except Exception:
+                                break
+                            if chunk is None:
+                                time.sleep(0.01)
+                                continue
+                            if not chunk:
+                                break
+                            io_queue.put((label, chunk))
+                    finally:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        io_queue.put((label, None))
+
+                th = threading.Thread(target=_reader, daemon=True)
+                th.start()
+                reader_threads.append(th)
+
+            _spawn_reader("stdout", proc.stdout)
+            _spawn_reader("stderr", proc.stderr)
+
+            while True:
+                now = time.time()
+                elapsed = now - start
+                if (not meta.get("error")) and self.cancel_requested:
+                    _stop_process(proc)
+                    meta["error"] = "Error: interrupted by user"
+                    meta["exit_code"] = -130
+                elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
+                    _stop_process(proc)
+                    meta["error"] = f"Error: timeout ({timeout}s)"
+                    meta["exit_code"] = -1
+                try:
+                    label, chunk = io_queue.get(timeout=0.12)
+                    if chunk is None:
+                        active_readers.discard(str(label))
+                    elif str(label) == "stderr":
+                        _append_capture(err_buf, chunk)
+                    else:
+                        _append_capture(out_buf, chunk)
+                except queue.Empty:
+                    pass
+                while True:
+                    try:
+                        label, chunk = io_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if chunk is None:
+                        active_readers.discard(str(label))
+                    elif str(label) == "stderr":
+                        _append_capture(err_buf, chunk)
+                    else:
+                        _append_capture(out_buf, chunk)
+                if now >= next_progress_emit:
+                    self._emit_transient(
+                        "status",
+                        {
+                            "summary": (
+                                f"bash running ({int(elapsed)}s, "
+                                f"captured={len(out_buf) + len(err_buf)}B)"
+                            )
+                        },
+                    )
+                    next_progress_emit = now + 0.8
+                if (proc.poll() is not None) and (not active_readers) and io_queue.empty():
+                    break
+
+            for th in reader_threads:
+                try:
+                    th.join(timeout=0.8)
+                except Exception:
+                    pass
+            while True:
+                try:
+                    label, chunk = io_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if chunk is None:
+                    continue
+                if str(label) == "stderr":
+                    _append_capture(err_buf, chunk)
+                else:
+                    _append_capture(out_buf, chunk)
+            merged = _merge_output_text()
+            if meta.get("error"):
+                meta["output"] = trim(merged or str(meta["error"]))
+            else:
+                meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
+                meta["output"] = trim(merged or "(no output)")
+
         try:
             popen_kwargs = {
                 "shell": True,
@@ -11708,135 +11843,78 @@ class SessionState:
                     popen_kwargs["creationflags"] = create_group
             proc = subprocess.Popen(command, **popen_kwargs)
             if os.name == "nt":
-                # Windows pipe handles are not selector-friendly; use reader threads.
-                reader_threads: list[threading.Thread] = []
-
-                def _spawn_reader(stream, target: bytearray):
-                    if stream is None:
-                        return
-
-                    def _reader():
-                        while True:
-                            try:
-                                chunk = stream.read(65536)
-                            except Exception:
-                                break
-                            if not chunk:
-                                break
-                            _append_capture(target, chunk)
-
-                    th = threading.Thread(target=_reader, daemon=True)
-                    th.start()
-                    reader_threads.append(th)
-
-                _spawn_reader(proc.stdout, out_buf)
-                _spawn_reader(proc.stderr, err_buf)
-
-                while True:
-                    now = time.time()
-                    elapsed = now - start
-                    if (not meta.get("error")) and self.cancel_requested:
-                        _stop_process(proc)
-                        meta["error"] = "Error: interrupted by user"
-                        meta["exit_code"] = -130
-                    elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
-                        _stop_process(proc)
-                        meta["error"] = f"Error: timeout ({timeout}s)"
-                        meta["exit_code"] = -1
-                    if now >= next_progress_emit:
-                        self._emit_transient(
-                            "status",
-                            {
-                                "summary": (
-                                    f"bash running ({int(elapsed)}s, "
-                                    f"captured={len(out_buf) + len(err_buf)}B)"
-                                )
-                            },
-                        )
-                        next_progress_emit = now + 0.8
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.12)
-                try:
-                    extra_out, extra_err = proc.communicate(timeout=0.8)
-                except Exception:
-                    extra_out, extra_err = b"", b""
-                _append_capture(out_buf, extra_out or b"")
-                _append_capture(err_buf, extra_err or b"")
-                for th in reader_threads:
-                    try:
-                        th.join(timeout=0.8)
-                    except Exception:
-                        pass
-                merged = _merge_output_text()
-                if meta.get("error"):
-                    meta["output"] = trim(merged or str(meta["error"]))
-                else:
-                    meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                    meta["output"] = trim(merged or "(no output)")
+                # Windows: read PIPE output via blocking reader threads + queue.
+                _collect_with_reader_threads(proc)
             else:
-                with selectors.DefaultSelector() as sel:
-                    if proc.stdout is not None:
-                        try:
-                            os.set_blocking(proc.stdout.fileno(), False)
-                        except Exception:
-                            pass
-                        sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
-                    if proc.stderr is not None:
-                        try:
-                            os.set_blocking(proc.stderr.fileno(), False)
-                        except Exception:
-                            pass
-                        sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
-                    while True:
-                        now = time.time()
-                        elapsed = now - start
-                        if self.cancel_requested:
-                            _stop_process(proc)
-                            meta["error"] = "Error: interrupted by user"
-                            meta["exit_code"] = -130
-                        elif timeout > 0 and elapsed >= timeout:
-                            _stop_process(proc)
-                            meta["error"] = f"Error: timeout ({timeout}s)"
-                            meta["exit_code"] = -1
-                        events = sel.select(timeout=0.12)
-                        for key, _ in events:
-                            stream = key.fileobj
+                try:
+                    with selectors.DefaultSelector() as sel:
+                        if proc.stdout is not None:
                             try:
-                                chunk = os.read(stream.fileno(), 65536)
-                            except BlockingIOError:
-                                continue
+                                os.set_blocking(proc.stdout.fileno(), False)
                             except Exception:
-                                chunk = b""
-                            if not chunk:
+                                pass
+                            sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+                        if proc.stderr is not None:
+                            try:
+                                os.set_blocking(proc.stderr.fileno(), False)
+                            except Exception:
+                                pass
+                            sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+                        while True:
+                            now = time.time()
+                            elapsed = now - start
+                            if self.cancel_requested:
+                                _stop_process(proc)
+                                meta["error"] = "Error: interrupted by user"
+                                meta["exit_code"] = -130
+                            elif timeout > 0 and elapsed >= timeout:
+                                _stop_process(proc)
+                                meta["error"] = f"Error: timeout ({timeout}s)"
+                                meta["exit_code"] = -1
+                            events = sel.select(timeout=0.12)
+                            for key, _ in events:
+                                stream = key.fileobj
                                 try:
-                                    sel.unregister(stream)
+                                    chunk = os.read(stream.fileno(), 65536)
+                                except BlockingIOError:
+                                    continue
                                 except Exception:
-                                    pass
-                                continue
-                            if key.data == "stderr":
-                                _append_capture(err_buf, chunk)
-                            else:
-                                _append_capture(out_buf, chunk)
-                        if now >= next_progress_emit:
-                            self._emit_transient(
-                                "status",
-                                {
-                                    "summary": (
-                                        f"bash running ({int(elapsed)}s, "
-                                        f"captured={len(out_buf) + len(err_buf)}B)"
-                                    )
-                                },
-                            )
-                            next_progress_emit = now + 0.8
-                        if (proc.poll() is not None) and (not sel.get_map()):
-                            break
-                    merged = _merge_output_text()
-                    if meta.get("error"):
-                        meta["output"] = trim(merged or str(meta["error"]))
+                                    chunk = b""
+                                if not chunk:
+                                    try:
+                                        sel.unregister(stream)
+                                    except Exception:
+                                        pass
+                                    continue
+                                if key.data == "stderr":
+                                    _append_capture(err_buf, chunk)
+                                else:
+                                    _append_capture(out_buf, chunk)
+                            if now >= next_progress_emit:
+                                self._emit_transient(
+                                    "status",
+                                    {
+                                        "summary": (
+                                            f"bash running ({int(elapsed)}s, "
+                                            f"captured={len(out_buf) + len(err_buf)}B)"
+                                        )
+                                    },
+                                )
+                                next_progress_emit = now + 0.8
+                            if (proc.poll() is not None) and (not sel.get_map()):
+                                break
+                        merged = _merge_output_text()
+                        if meta.get("error"):
+                            meta["output"] = trim(merged or str(meta["error"]))
+                        else:
+                            meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
+                            meta["output"] = trim(merged or "(no output)")
+                except Exception as exc:
+                    # Some platforms may reject selector registration for PIPEs.
+                    if is_benign_socket_error(exc) or isinstance(exc, ValueError):
+                        _collect_with_reader_threads(proc)
                     else:
-                        meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                        meta["output"] = trim(merged or "(no output)")
+                        raise
         except Exception as exc:
             meta["error"] = f"Error: {exc}"
             meta["output"] = meta["error"]
@@ -25181,15 +25259,34 @@ Use this skill when tasks match this flow pattern and reusable execution is need
         return self.model_catalog()
 
 class AgentHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, addr: tuple[str, int], handler, app: AppContext):
         super().__init__(addr, handler)
         self.app = app
 
     def handle_error(self, request, client_address):
         _, exc, _ = sys.exc_info()
-        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)):
+        if is_benign_socket_error(exc):
             return
         return super().handle_error(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        except OSError as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
+
+    def close_request(self, request):
+        try:
+            super().close_request(request)
+        except OSError as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -25201,8 +25298,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
-            return
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     @property
     def app(self) -> AppContext:
@@ -25229,48 +25328,70 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
         body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def _send_bytes(self, data: bytes, content_type: str, filename: str):
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", "inline")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def _sse_write(self, payload: bytes) -> bool:
         try:
             self.wfile.write(payload)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
-            return False
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return False
+            raise
 
     def do_GET(self):
         parsed_url = urlparse(self.path)
@@ -25688,12 +25809,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"ok": True})
 
     def _stream_events(self, sess: SessionState):
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
         sub = sess.events.subscribe()
         try:
             hello = (
@@ -25713,8 +25839,9 @@ class Handler(BaseHTTPRequestHandler):
                     chunk = f": ping {int(now_ts())}\n\n".encode("utf-8")
                 if not self._sse_write(chunk):
                     break
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
+        except Exception as exc:
+            if not is_benign_socket_error(exc):
+                raise
         finally:
             sess.events.unsubscribe(sub)
 
@@ -25728,8 +25855,10 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
-            return
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     @property
     def app(self) -> AppContext:
@@ -25756,23 +25885,33 @@ class SkillsHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
         body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if is_benign_socket_error(exc):
+                return
+            raise
 
     def do_GET(self):
         parsed_url = urlparse(self.path)
@@ -26384,7 +26523,15 @@ def main():
     elif int(skills_port) != int(args.port):
         try:
             skills_server = AgentHTTPServer((args.host, skills_port), SkillsHandler, app)
-            skills_thread = threading.Thread(target=skills_server.serve_forever, daemon=True)
+
+            def _skills_serve_loop():
+                try:
+                    skills_server.serve_forever()
+                except OSError as exc:
+                    if not is_benign_socket_error(exc):
+                        raise
+
+            skills_thread = threading.Thread(target=_skills_serve_loop, daemon=True)
             skills_thread.start()
             setattr(app, "skills_ui_enabled", True)
         except Exception as exc:
@@ -26495,6 +26642,11 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[web-agent] shutting down")
+    except OSError as exc:
+        if is_benign_socket_error(exc):
+            print(f"\n[web-agent] socket closed benignly ({trim(str(exc), 180)}), shutting down")
+        else:
+            raise
     finally:
         try:
             persist_report = app.persist_all_sessions(include_running=True, lock_timeout=0.6)
