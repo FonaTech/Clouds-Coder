@@ -107,6 +107,20 @@ LIVE_INPUT_WEIGHT_BASE_DELAYED = 0.35
 LIVE_INPUT_WEIGHT_BASE_NORMAL = 0.65
 LIVE_INPUT_WEIGHT_STEP_DELAYED = 0.30
 LIVE_INPUT_WEIGHT_STEP_NORMAL = 0.20
+SOCKET_NOISE_LINE_PATTERNS = (
+    re.compile(r"\bwinerror\s*10038\b", re.IGNORECASE),
+    re.compile(r"\bwsaenotsock\b", re.IGNORECASE),
+    re.compile(r"\bsocket\s+closed\s+benignly\b", re.IGNORECASE),
+    re.compile(r"\bbenign\s+socket\s+error\b", re.IGNORECASE),
+)
+BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+    "debug",
+}
+BENIGN_SOCKET_LOG_INTERVAL_SECONDS = 30.0
 RUNTIME_CONTROL_HINT_PREFIXES = (
     "<reminder>",
     "<todo-rescue>",
@@ -907,6 +921,25 @@ def now_ts() -> float:
     return time.time()
 
 
+_benign_socket_log_lock = threading.Lock()
+_benign_socket_log_state: dict[str, dict[str, float | int]] = {}
+
+
+def filter_runtime_noise_lines(text: str) -> tuple[str, int]:
+    raw = str(text or "")
+    if not raw:
+        return "", 0
+    kept: list[str] = []
+    dropped = 0
+    for line in raw.splitlines():
+        row = str(line or "")
+        if any(p.search(row) for p in SOCKET_NOISE_LINE_PATTERNS):
+            dropped += 1
+            continue
+        kept.append(row)
+    return "\n".join(kept).strip(), int(dropped)
+
+
 def is_benign_socket_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
@@ -926,6 +959,63 @@ def is_benign_socket_error(exc: BaseException | None) -> bool:
         int(getattr(errno, "EBADF", 9)),
     }
     return err in benign_errno
+
+
+def _socket_error_code(exc: BaseException | None) -> str:
+    if not isinstance(exc, OSError):
+        return str(type(exc).__name__ if exc is not None else "unknown")
+    winerror = int(getattr(exc, "winerror", 0) or 0)
+    if winerror > 0:
+        return f"winerror:{winerror}"
+    err = int(getattr(exc, "errno", 0) or 0)
+    if err > 0:
+        return f"errno:{err}"
+    return str(type(exc).__name__ if exc is not None else "OSError")
+
+
+def _log_benign_socket_error_limited(exc: BaseException | None, where: str = ""):
+    if not BENIGN_SOCKET_DEBUG_LOG_ENABLED:
+        return
+    code = _socket_error_code(exc)
+    location = str(where or "runtime").strip()
+    key = f"{location}|{code}"
+    now = now_ts()
+    suppressed = 0
+    should_emit = False
+    with _benign_socket_log_lock:
+        row = _benign_socket_log_state.get(key)
+        if not isinstance(row, dict):
+            _benign_socket_log_state[key] = {"last_ts": now, "suppressed": 0}
+            should_emit = True
+        else:
+            last_ts = float(row.get("last_ts", 0.0) or 0.0)
+            if now - last_ts >= BENIGN_SOCKET_LOG_INTERVAL_SECONDS:
+                suppressed = int(row.get("suppressed", 0) or 0)
+                row["last_ts"] = now
+                row["suppressed"] = 0
+                should_emit = True
+            else:
+                row["suppressed"] = int(row.get("suppressed", 0) or 0) + 1
+        if len(_benign_socket_log_state) > 512:
+            stale = sorted(
+                _benign_socket_log_state.items(),
+                key=lambda item: float((item[1] or {}).get("last_ts", 0.0) if isinstance(item[1], dict) else 0.0),
+            )[:128]
+            for dead_key, _ in stale:
+                _benign_socket_log_state.pop(dead_key, None)
+    if should_emit:
+        msg = f"[web-agent][debug] benign socket error {code} at {location}"
+        if suppressed > 0:
+            msg = f"{msg} (+{suppressed} suppressed)"
+        print(msg, file=sys.stderr)
+
+
+def swallow_benign_socket_error(exc: BaseException | None, where: str = "") -> bool:
+    if not is_benign_socket_error(exc):
+        return False
+    _log_benign_socket_error_limited(exc, where)
+    return True
+
 
 def normalize_timeout_seconds(
     raw: object,
@@ -11820,7 +11910,8 @@ class SessionState:
                     _append_capture(err_buf, chunk)
                 else:
                     _append_capture(out_buf, chunk)
-            merged = _merge_output_text()
+            merged_raw = _merge_output_text()
+            merged, _ = filter_runtime_noise_lines(merged_raw)
             if meta.get("error"):
                 meta["output"] = trim(merged or str(meta["error"]))
             else:
@@ -11903,7 +11994,8 @@ class SessionState:
                                 next_progress_emit = now + 0.8
                             if (proc.poll() is not None) and (not sel.get_map()):
                                 break
-                        merged = _merge_output_text()
+                        merged_raw = _merge_output_text()
+                        merged, _ = filter_runtime_noise_lines(merged_raw)
                         if meta.get("error"):
                             meta["output"] = trim(merged or str(meta["error"]))
                         else:
@@ -16130,7 +16222,9 @@ class SessionState:
             return
         name = str(item.get("name", "") or "").strip()
         args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
-        output = trim(str(item.get("output", "") or "").strip(), BLACKBOARD_MAX_TEXT)
+        output_raw = trim(str(item.get("output", "") or "").strip(), BLACKBOARD_MAX_TEXT)
+        output_clean, _ = filter_runtime_noise_lines(output_raw)
+        output = trim(output_clean, BLACKBOARD_MAX_TEXT)
         ok = bool(item.get("ok", False))
         if name in {"write_file", "edit_file"}:
             rel_path = str(args.get("path", "") or "").strip()
@@ -17523,6 +17617,7 @@ class SessionState:
             if guard_error:
                 return guard_error
             out = self.bg.run(args["command"], int(args.get("timeout", 120)))
+            out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
             self._emit(
                 "command",
                 {
@@ -17532,7 +17627,7 @@ class SessionState:
                     "summary": f"background_run: {args['command'][:80]}",
                 },
             )
-            return out
+            return trim(out_filtered or "(no output)")
         if name == "check_background":
             return self.bg.check(args.get("task_id"))
         if name == "task_create":
@@ -18063,6 +18158,15 @@ class SessionState:
                         output = self._dispatch_tool(name, args, agent_role=role_key)
                     except Exception as exc:
                         output = f"Error: {exc}"
+            raw_output = str(output or "")
+            filtered_output, filtered_rows = filter_runtime_noise_lines(raw_output)
+            if filtered_rows > 0:
+                if filtered_output:
+                    output = filtered_output
+                elif raw_output.startswith("Error:"):
+                    output = "Error: runtime socket noise filtered"
+                else:
+                    output = "(no output)"
             self._append_agent_context_message(
                 role_key,
                 {
@@ -19409,6 +19513,15 @@ class SessionState:
                             output = self._dispatch_tool(name, args)
                         except Exception as exc:
                             output = f"Error: {exc}"
+                    raw_output = str(output or "")
+                    filtered_output, filtered_rows = filter_runtime_noise_lines(raw_output)
+                    if filtered_rows > 0:
+                        if filtered_output:
+                            output = filtered_output
+                        elif raw_output.startswith("Error:"):
+                            output = "Error: runtime socket noise filtered"
+                        else:
+                            output = "(no output)"
                     tool_key = str(dispatched_name or name).strip() or str(name or "").strip() or "unknown-tool"
                     if str(output).startswith("Error"):
                         round_error_count += 1
@@ -25268,7 +25381,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         _, exc, _ = sys.exc_info()
-        if is_benign_socket_error(exc):
+        if swallow_benign_socket_error(exc, "agent-http.handle_error"):
             return
         return super().handle_error(request, client_address)
 
@@ -25276,7 +25389,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
         try:
             super().shutdown_request(request)
         except OSError as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "agent-http.shutdown_request"):
                 return
             raise
 
@@ -25284,7 +25397,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
         try:
             super().close_request(request)
         except OSError as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "agent-http.close_request"):
                 return
             raise
 
@@ -25299,7 +25412,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             super().handle()
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.handle"):
                 return
             raise
 
@@ -25336,7 +25449,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.send_json"):
                 return
             raise
 
@@ -25352,7 +25465,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.send_text"):
                 return
             raise
 
@@ -25365,7 +25478,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.send_bytes"):
                 return
             raise
 
@@ -25379,7 +25492,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.send_inline_bytes"):
                 return
             raise
 
@@ -25389,7 +25502,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             return True
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.sse_write"):
                 return False
             raise
 
@@ -25817,7 +25930,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "handler.stream_events.headers"):
                 return
             raise
         sub = sess.events.subscribe()
@@ -25840,7 +25953,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._sse_write(chunk):
                     break
         except Exception as exc:
-            if not is_benign_socket_error(exc):
+            if not swallow_benign_socket_error(exc, "handler.stream_events.loop"):
                 raise
         finally:
             sess.events.unsubscribe(sub)
@@ -25856,7 +25969,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
         try:
             super().handle()
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "skills-handler.handle"):
                 return
             raise
 
@@ -25893,7 +26006,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "skills-handler.send_json"):
                 return
             raise
 
@@ -25909,7 +26022,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
-            if is_benign_socket_error(exc):
+            if swallow_benign_socket_error(exc, "skills-handler.send_text"):
                 return
             raise
 
@@ -26528,7 +26641,7 @@ def main():
                 try:
                     skills_server.serve_forever()
                 except OSError as exc:
-                    if not is_benign_socket_error(exc):
+                    if not swallow_benign_socket_error(exc, "skills-server.serve_forever"):
                         raise
 
             skills_thread = threading.Thread(target=_skills_serve_loop, daemon=True)
@@ -26643,8 +26756,9 @@ def main():
     except KeyboardInterrupt:
         print("\n[web-agent] shutting down")
     except OSError as exc:
-        if is_benign_socket_error(exc):
-            print(f"\n[web-agent] socket closed benignly ({trim(str(exc), 180)}), shutting down")
+        if swallow_benign_socket_error(exc, "main.serve_forever"):
+            if BENIGN_SOCKET_DEBUG_LOG_ENABLED:
+                print(f"\n[web-agent][debug] socket closed benignly ({trim(str(exc), 180)}), shutting down")
         else:
             raise
     finally:
