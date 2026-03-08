@@ -736,6 +736,68 @@ def model_language_instruction(lang: str) -> str:
     )
 
 
+def _detect_os_shell_instruction() -> str:
+    """Return a shell environment note for the agent system prompt based on the host OS."""
+    import platform as _platform
+    _sys = _platform.system()
+    if _sys == "Windows":
+        return (
+            "Shell environment: Windows (cmd.exe via shell=True). "
+            "IMPORTANT — use Windows-native commands only: "
+            "use 'dir' (not 'ls'), 'type' (not 'cat'), 'del' (not 'rm'), "
+            "'move' (not 'mv'), 'copy' (not 'cp'), 'findstr' (not 'grep'), "
+            "'where' (not 'which'), 'echo %VAR%' (not 'echo $VAR'). "
+            "To list files recursively use 'dir /s /b'. "
+            "Path separator is backslash (\\). "
+            "Do NOT use POSIX paths like /workspace, /tmp, /usr, ~/... — they do not exist. "
+            "Working directory is already set; use relative paths or the absolute session root shown above."
+        )
+    if _sys == "Darwin":
+        return (
+            "Shell environment: macOS (bash/zsh). "
+            "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
+            "Package manager is 'brew'. "
+            "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
+            "Use relative paths or the absolute session root shown above."
+        )
+    # Linux / other POSIX
+    return (
+        "Shell environment: Linux (bash). "
+        "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
+        "Use relative paths or the absolute session root shown above."
+    )
+
+
+    code = normalize_ui_language(lang)
+    if code == "zh-CN":
+        return (
+            "Language policy: use Simplified Chinese by default for all user-facing answers, plans, "
+            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
+            "Only switch language when user explicitly requests it. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    if code == "zh-TW":
+        return (
+            "Language policy: use Traditional Chinese by default for all user-facing answers, plans, "
+            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
+            "Only switch language when user explicitly requests it. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    if code == "ja":
+        return (
+            "Language policy: use Japanese by default for all user-facing answers, plans, "
+            "blackboard notes, manager delegates, and agent-bus collaboration messages. "
+            "Only switch language when user explicitly requests it. "
+            "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+        )
+    return (
+        "Language policy: use English by default for all user-facing answers, plans, "
+        "blackboard notes, manager delegates, and agent-bus collaboration messages. "
+        "Only switch language when user explicitly requests it. "
+        "Do not translate code, file paths, commands, API/tool names, or JSON keys."
+    )
+
+
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
     txt = str(raw or "").strip()
     if not txt:
@@ -948,7 +1010,7 @@ def is_benign_socket_error(exc: BaseException | None) -> bool:
     if not isinstance(exc, OSError):
         return False
     winerror = int(getattr(exc, "winerror", 0) or 0)
-    if winerror in {10038, 10053, 10054, 10057}:
+    if winerror in {10038, 10053, 10054, 10057, 10093}:  # 10093 = WSANOTINITIALISED (selector on pipe)
         return True
     err = int(getattr(exc, "errno", 0) or 0)
     benign_errno = {
@@ -8632,6 +8694,7 @@ class SessionState:
             f"Session absolute writable root is {self.files_root}. "
             "For file tools, prefer relative paths like hello.txt; runtime will map them to the absolute session root. "
             "The '/workspace/...' form is only a virtual alias for path arguments; never create OS-level /workspace in shell. "
+            f"{_detect_os_shell_instruction()} "
             "Use tools to inspect files, execute commands, and edit code safely. "
             f"{route_hint}"
             f"{budget_hint} "
@@ -11800,8 +11863,18 @@ class SessionState:
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            out_text = out_buf.decode("utf-8", errors="replace")
-            err_text = err_buf.decode("utf-8", errors="replace")
+            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
+            # not UTF-8.  Detect and use the correct encoding for decoding.
+            if os.name == "nt":
+                try:
+                    import locale as _lc
+                    enc = _lc.getpreferredencoding(False) or "utf-8"
+                except Exception:
+                    enc = "utf-8"
+            else:
+                enc = "utf-8"
+            out_text = out_buf.decode(enc, errors="replace")
+            err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
 
         def _collect_with_reader_threads(proc: subprocess.Popen):
@@ -12003,14 +12076,20 @@ class SessionState:
                             meta["output"] = trim(merged or "(no output)")
                 except Exception as exc:
                     # Some platforms may reject selector registration for PIPEs.
-                    if is_benign_socket_error(exc) or isinstance(exc, ValueError):
+                    # On Windows, also catch any OSError (e.g. WinError 10093 WSANOTINITIALISED).
+                    if is_benign_socket_error(exc) or isinstance(exc, ValueError) or (os.name == "nt" and isinstance(exc, OSError)):
                         _collect_with_reader_threads(proc)
                     else:
                         raise
         except Exception as exc:
-            meta["error"] = f"Error: {exc}"
-            meta["output"] = meta["error"]
-            meta["exit_code"] = -1
+            # On Windows, WinError 10038 (WSAENOTSOCK) can surface here when
+            # selector-based I/O is used with pipe FDs. Fall back to thread-based reading.
+            if proc is not None and is_benign_socket_error(exc):
+                _collect_with_reader_threads(proc)
+            else:
+                meta["error"] = f"Error: {exc}"
+                meta["output"] = meta["error"]
+                meta["exit_code"] = -1
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
@@ -16690,6 +16769,7 @@ class SessionState:
             f"Session absolute writable root is {self.files_root}. "
             "Use relative file paths (for example hello.txt); runtime maps them to session absolute paths. "
             "If '/workspace/...' appears, treat it as a virtual alias only; never create OS-level /workspace in shell. "
+            f"{_detect_os_shell_instruction()} "
             "You must stay within your role boundary and use only provided tools. "
             "Use read_from_blackboard/write_to_blackboard to keep the shared state accurate. "
             "When communicating with other agents, use ask_colleague with structured intent/content. "
@@ -20984,7 +21064,6 @@ window.MathJax={
   }
 };
 </script>
-<script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
 </head>
 <body>
 <div class="bg-layer"></div>
@@ -21239,7 +21318,7 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .upload-list{margin-top:6px;border:1px solid var(--line);border-radius:10px;background:#fff;max-height:88px;overflow:auto;padding:6px}
 .row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 .ctx-live{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d6deea;border-radius:999px;background:#f8fbff;min-width:250px}
-.ctx-live-dot{width:8px;height:8px;border-radius:50%;background:#13b8a6;box-shadow:0 0 0 rgba(19,184,166,.45);animation:ctxPulse 1.6s ease-in-out infinite}
+.ctx-live-dot{width:8px;height:8px;border-radius:50%;background:#13b8a6;box-shadow:0 0 0 rgba(19,184,166,.45)}
 .ctx-live-bar{position:relative;display:inline-block;width:84px;height:6px;border-radius:999px;background:#e5edf8;overflow:hidden}
 .ctx-live-fill{display:block;height:100%;width:0%;background:linear-gradient(90deg,#13b8a6,#1f6feb);transition:width .24s ease,background .24s ease}
 .ctx-live.warn .ctx-live-dot{background:#e1a400}
@@ -21330,10 +21409,10 @@ APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=420;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
-const SNAPSHOT_DELAY_VISIBLE_MS=120;
-const SNAPSHOT_DELAY_HIDDEN_MS=1200;
-const SESSION_POLL_VISIBLE_MS=12000;
-const SESSION_POLL_HIDDEN_MS=30000;
+const SNAPSHOT_DELAY_VISIBLE_MS=300;
+const SNAPSHOT_DELAY_HIDDEN_MS=2400;
+const SESSION_POLL_VISIBLE_MS=30000;
+const SESSION_POLL_HIDDEN_MS=60000;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=420;
 const CHAT_SCROLL_LOCK_MS=1200;
@@ -21350,10 +21429,10 @@ const DELTA_MAX_OPERATIONS=220;
 const DELTA_MAX_UPLOADS=40;
 const DELTA_WATCHDOG_INTERVAL_MS=1800;
 const DELTA_WATCHDOG_STALL_MS=9000;
-const MARKDOWN_WORKER_MIN_CHARS=2200;
+const MARKDOWN_WORKER_MIN_CHARS=800;
 const MARKDOWN_WORKER_MAX_PENDING=96;
 const MARKDOWN_WORKER_REQ_TTL_MS=45000;
-const CHAT_VIRT={heights:Object.create(null),heightVersion:0,avgHeight:140,overscanPx:900,maxCacheKeys:2800,poolByKind:Object.create(null),poolSize:0,poolMax:420};
+const CHAT_VIRT={heights:Object.create(null),heightVersion:0,avgHeight:140,overscanPx:400,maxCacheKeys:1200,poolByKind:Object.create(null),poolSize:0,poolMax:180};
 const RENDER_EVT_TYPES=new Set(['render_frame','render_bridge']);
 const RENDER_QUEUE_MAX=140;
 const RENDER_META_MIN_INTERVAL_MS=180;
@@ -21932,7 +22011,15 @@ function _mathRunTypeset(root,key=''){
   const run=(retry)=>{
     const mj=window.MathJax;
     if(!mj||typeof mj.typesetPromise!=='function'){
-      if(retry<10)setTimeout(()=>run(retry+1),180);
+      // Lazy-load MathJax on first actual math demand
+      if(!window._mjaxLoading){
+        window._mjaxLoading=true;
+        const s=document.createElement('script');
+        s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
+        s.async=true;
+        document.head.appendChild(s);
+      }
+      if(retry<20)setTimeout(()=>run(retry+1),200);
       return;
     }
     if(root._mathPending)return;
