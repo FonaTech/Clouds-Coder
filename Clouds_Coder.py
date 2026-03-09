@@ -28781,7 +28781,7 @@ function _diffWindowLines(diff,maxLines=CHAT_DIFF_PREVIEW_MAX_LINES,beforePad=CH
 }
 function diffHtmlWindowed(diff,maxLines=CHAT_DIFF_PREVIEW_MAX_LINES,beforePad=CHAT_DIFF_PREVIEW_CONTEXT_BEFORE,afterPad=CHAT_DIFF_PREVIEW_CONTEXT_AFTER,focusMode='hotspot'){
   const mode=String(focusMode||'hotspot').trim().toLowerCase()||'hotspot';
-  const lines=String(diff||'').split('\n');
+  const lines=String(diff||'').split('\\n');
   const total=lines.length;
   const limit=Math.max(8,Math.floor(Number(maxLines)||CHAT_DIFF_PREVIEW_MAX_LINES));
   let windowed=[];
