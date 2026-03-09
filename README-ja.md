@@ -402,7 +402,7 @@ stateDiagram-v2
 
 三言語の完全版更新ログ: [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
-## 4. 主要ランタイム構成（実装ベース）
+## 4. 主要ランタイム構成
 
 メイン実装：`Clouds_Coder.py`。
 
@@ -594,7 +594,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 短いデモではなく長時間タスク実行を重視
 - 従来のコーディング CLI より、汎用タスク適応性と完遂性を重視
 
-## 11.1 アーキテクチャ上の優位性（詳細）
+## 11.1 アーキテクチャ上の優位性
 
 - All-in-one 単一ファイルカーネル（`Clouds_Coder.py`）：agent loop、ツールルータ、セッション状態機械、HTTP API、SSE、Web UI bridge、Skills Studio を同一プロセスに統合し、サービス間オーケストレーション負荷と分散障害点を削減。
 - 軽量かつ展開容易：依存は最小限（`requirements.txt`）、単一コマンドで起動可能。さらに PyInstaller/Nuitka の onedir/onefile 配布経路を標準化。
@@ -740,7 +740,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主な参照（指定）
+### 12.1 主な参照
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -752,7 +752,7 @@ flowchart TD
 - Todo/task/worktree/team を概念・インターフェースレベルで継承し standalone runtime に統合
 - `SKILL.md` のオンデマンド読み込み手法を再利用し Skills Studio へ拡張
 
-### 12.2 追加推奨参照
+### 12.2 追加参照
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
