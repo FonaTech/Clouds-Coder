@@ -402,7 +402,7 @@ stateDiagram-v2
 
 完整三语更新日志见：[`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)。
 
-## 4. 关键运行时组件（来自源码）
+## 4. 关键运行时组件
 
 主入口：`Clouds_Coder.py`。
 
@@ -594,7 +594,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - 面向长任务稳定执行，不是仅面向短提示
 - 相比传统编程 CLI，更强调通用任务适配与任务闭环完成
 
-## 11.1 架构优势（深度）
+## 11.1 架构优势
 
 - All-in-one 单文件内核（`Clouds_Coder.py`）：agent loop、工具路由、会话状态机、HTTP API、SSE 流、Web UI bridge、Skills Studio 在同一进程协作，减少跨服务编排与分布式故障点。
 - 轻量与易部署：依赖面小（`requirements.txt` 极简），单命令启动，同时支持 PyInstaller/Nuitka 的 onedir/onefile 打包路径，适配本地与分发部署。
@@ -740,7 +740,7 @@ flowchart TD
 
 ## 12. 参考
 
-### 12.1 主要参考（你指定）
+### 12.1 主要参考
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -752,7 +752,7 @@ flowchart TD
 - Todo/task/worktree/team 机制在概念与接口层继承，并整合到 standalone web agent
 - `SKILL.md` 按需加载方法被复用并扩展到 Skills Studio
 
-### 12.2 建议补充参考
+### 12.2 补充参考
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs: https://platform.openai.com/docs
