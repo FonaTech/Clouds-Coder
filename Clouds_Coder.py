@@ -28079,6 +28079,9 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-md .md-table th{background:#f5f8fc;font-weight:700}
 .msg-md a{color:#1f5cc4;text-decoration:underline}
 .msg-md a:hover{color:#17479b}
+.msg-md mjx-container{margin:.35rem 0;max-width:100%}
+.msg-md mjx-container[jax="CHTML"]{white-space:normal}
+.msg-md mjx-container[jax="CHTML"][display="true"]{display:block;overflow-x:auto;overflow-y:hidden;padding-bottom:2px}
 .msg-thinking{margin-top:8px;border:1px solid #d8dde6;background:#f1f3f7;border-radius:8px;padding:6px 8px}
 .msg-thinking-label{font-size:.7rem;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
 .msg-thinking pre{margin:0;max-height:140px;overflow:auto;font-size:.72rem;line-height:1.35;color:#4b5563;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
@@ -29032,19 +29035,77 @@ function _mdWorkerCleanupStale(){const now=Date.now();const pending=S.mdPending|
 function _mdWorkerEnsure(){
   if(S.mdWorker)return S.mdWorker;
   if(typeof Worker!=='function'||typeof Blob!=='function'||typeof URL==='undefined'||typeof URL.createObjectURL!=='function')return null;
-  const workerSrc=String.raw`
+const workerSrc=String.raw`
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>(c==='&'?'&amp;':(c==='<'?'&lt;':(c==='>'?'&gt;':'&quot;'))));
+function mathTake(tokens,raw){
+  const idx=tokens.length;
+  tokens.push(String(raw||''));
+  return '\\u0000MATH'+idx+'\\u0000';
+}
+function mathExtract(raw){
+  let txt=String(raw||'');
+  const tokens=[];
+  txt=txt.replace(/<math[\\s\\S]*?<\\/math>/gi,m=>mathTake(tokens,m));
+  txt=txt.replace(/\\\\\\[[\\s\\S]*?\\\\\\]/g,m=>mathTake(tokens,m));
+  txt=txt.replace(/\\$\\$[\\s\\S]*?\\$\\$/g,m=>mathTake(tokens,m));
+  txt=txt.replace(/\\\\\\([\\s\\S]*?\\\\\\)/g,m=>mathTake(tokens,m));
+  let out='';
+  for(let i=0;i<txt.length;){
+    const ch=txt[i];
+    if(ch!=='$'){out+=ch;i+=1;continue}
+    if(i+1<txt.length&&txt[i+1]==='$'){out+='$$';i+=2;continue}
+    if(i>0&&txt[i-1]==='\\\\'){out+=ch;i+=1;continue}
+    let j=i+1;
+    let found=-1;
+    while(j<txt.length){
+      if(txt[j]==='\\n')break;
+      if(txt[j]==='$'&&txt[j-1]!=='\\\\'){found=j;break}
+      j+=1;
+    }
+    if(found>i+1){out+=mathTake(tokens,txt.slice(i,found+1));i=found+1;continue}
+    out+=ch;
+    i+=1;
+  }
+  return {text:out,tokens};
+}
+function sanitizeMathML(raw){
+  let s=String(raw||'');
+  if(!/^<math[\\s>]/i.test(s)||!/<\\/math>\\s*$/i.test(s))return '';
+  s=s.replace(/<script[\\s\\S]*?<\\/script>/gi,'');
+  s=s.replace(/\\son[a-z0-9_-]+\\s*=\\s*(\"[^\"]*\"|'[^']*')/gi,'');
+  s=s.replace(/\\sstyle\\s*=\\s*(\"[^\"]*\"|'[^']*')/gi,'');
+  return s;
+}
+function mathTokenToHtml(raw){
+  const s=String(raw||'');
+  if(/^<math[\\s>]/i.test(s)){
+    const safe=sanitizeMathML(s);
+    return safe||esc(s);
+  }
+  return esc(s);
+}
+function mathRestore(text,tokens){
+  const src=String(text||'');
+  return src.replace(/\\u0000MATH(\\d+)\\u0000/g,(_,n)=>mathTokenToHtml(tokens[Number(n)]||''));
+}
 function inline(raw){
-  let s=esc(String(raw||''));
   const bt=String.fromCharCode(96);
-  s=s.replace(new RegExp(bt+'([^'+bt+']+)'+bt,'g'),"<code class='md-inline-code'>$1</code>");
+  const inlineCodes=[];
+  const codeSafe=String(raw||'').replace(new RegExp(bt+'([^'+bt+']+)'+bt,'g'),(_,c)=>{
+    const idx=inlineCodes.length;
+    inlineCodes.push(String(c||''));
+    return '\\u0000ICODE'+idx+'\\u0000';
+  });
+  const pack=mathExtract(codeSafe);
+  let s=esc(pack.text);
+  s=s.replace(/\\u0000ICODE(\\d+)\\u0000/g,(_,n)=>"<code class='md-inline-code'>"+esc(inlineCodes[Number(n)]||'')+"</code>");
   s=s.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
   s=s.replace(/__([^_]+)__/g,'<strong>$1</strong>');
   s=s.replace(/\\*([^*]+)\\*/g,'<em>$1</em>');
   s=s.replace(/_([^_]+)_/g,'<em>$1</em>');
   s=s.replace(/~~([^~]+)~~/g,'<del>$1</del>');
   s=s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g,"<a href='$2' target='_blank' rel='noreferrer'>$1</a>");
-  return s;
+  return mathRestore(s,pack.tokens);
 }
 function splitTableRow(line){
   const src=String(line||'').trim().replace(/^\\|/,'').replace(/\\|$/,'');
@@ -29162,6 +29223,7 @@ self.onmessage=(ev)=>{
 function _markdownNeedsMainThreadRender(text){
   const src=String(text||'').replace(/\\r\\n?/g,'\\n');
   if(!src)return false;
+  if(_maybeMath(src))return true;
   if(/(^|\\n)\\|[^\\n]*\\|\\s*\\n\\|\\s*:?-{3,}:?\\s*\\|/m.test(src))return true;
   return false;
 }
