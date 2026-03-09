@@ -744,7 +744,7 @@ flowchart TD
 
 ## 12. References
 
-### 12.1 Primary inspirations (requested)
+### 12.1 Primary inspirations
 
 - anomalyco/opencode: https://github.com/anomalyco/opencode/
 - openai/codex: https://github.com/openai/codex
@@ -756,7 +756,7 @@ flowchart TD
 - Todo/task/worktree/team mechanisms are inherited at concept and interface level, then integrated into the single-runtime web agent
 - Skills loading protocol (`SKILL.md`) and "load on demand" methodology are reused and expanded by Skills Studio
 
-### 12.2 Additional recommended references
+### 12.2 Additional references
 
 - Ollama: https://github.com/ollama/ollama
 - OpenAI API docs (OpenAI-compatible patterns): https://platform.openai.com/docs
