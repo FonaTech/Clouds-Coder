@@ -402,7 +402,7 @@ Priority-ordered updates merged into this architecture:
 
 The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md).
 
-## 4. Key Runtime Components (from source)
+## 4. Key Runtime Components
 
 Main runtime file: `Clouds_Coder.py`.
 
