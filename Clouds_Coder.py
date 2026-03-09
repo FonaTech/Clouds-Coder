@@ -15245,6 +15245,97 @@ class SessionState:
                 deduped.append(row)
             self.contexts[role] = deduped[-(limit + 1) :]
 
+    def _runtime_drift_signal_state(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        adaptive = self._normalize_adaptive_scale_state(bb.get("adaptive_scale", {}))
+        last_delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        reasons: list[str] = []
+        evidence: list[str] = []
+        delegate_target = self._sanitize_agent_role(last_delegate.get("target", ""))
+        last_role = self._sanitize_agent_role(last_reply.get("role", ""))
+        last_text = trim(
+            strip_thinking_content(str(last_reply.get("text", "") or "")).strip(),
+            1200,
+        )
+        if last_role and self._looks_like_owner_confused(last_text):
+            reasons.append("owner-confused-reply")
+            evidence.append(trim(f"last_worker[{last_role}] {last_text}", 180))
+        route_streak = self._recent_delegate_target_streak(delegate_target)
+        route_similarity = self._recent_delegate_instruction_similarity(target=delegate_target, window=3)
+        if (
+            delegate_target
+            and route_streak >= int(MANAGER_INTERVENTION_ROUTE_REPEAT_THRESHOLD)
+            and route_similarity >= float(MANAGER_INTERVENTION_ROUTE_SIMILARITY_THRESHOLD)
+        ):
+            reasons.append("repeated-same-owner-route")
+            evidence.append(trim(f"delegate_streak={route_streak}", 180))
+            evidence.append(trim(f"delegate_similarity={route_similarity:.2f}", 180))
+        if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
+            reasons.append("watchdog-intent-no-tool")
+        if int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
+            reasons.append("watchdog-repeat-no-tool")
+        if int(wd.get("state_unchanged_streak", 0) or 0) >= int(WATCHDOG_STATE_STALL_THRESHOLD):
+            reasons.append("watchdog-state-stall")
+        if any(tag.startswith("watchdog-") for tag in reasons):
+            evidence.append(
+                trim(
+                    (
+                        "watchdog "
+                        f"intent={int(wd.get('intent_no_tool_streak', 0) or 0)}, "
+                        f"repeat={int(wd.get('repeat_no_tool_streak', 0) or 0)}, "
+                        f"state={int(wd.get('state_unchanged_streak', 0) or 0)}, "
+                        f"trigger={int(wd.get('trigger_count', 0) or 0)}"
+                    ),
+                    180,
+                )
+            )
+        if str(dq.get("last_error", "") or "").strip():
+            reasons.append("queue-last-error")
+            evidence.append(trim(str(dq.get("last_error", "") or "").strip(), 180))
+        error_streak = self._recent_blocking_error_streak(bb)
+        if error_streak >= int(MANAGER_INTERVENTION_ERROR_REPEAT_THRESHOLD):
+            reasons.append("repeated-blocking-error")
+            evidence.append(trim(f"error_streak={error_streak}", 180))
+        elif self._manager_has_error_log(bb):
+            reasons.append("blocking-error-log")
+        if int(adaptive.get("semantic_loop_streak", 0) or 0) >= int(ADAPTIVE_SCALE_SEMANTIC_LOOP_THRESHOLD):
+            reasons.append("adaptive-semantic-loop")
+        if (
+            str(adaptive.get("mode", "") or "").strip().lower() == ADAPTIVE_SCALE_MODE_FALLBACK
+            and int(adaptive.get("stress_score", 0) or 0) >= int(ADAPTIVE_SCALE_DOWNGRADE_THRESHOLD)
+        ):
+            reasons.append("adaptive-fallback-pressure")
+            evidence.append(
+                trim(
+                    (
+                        "adaptive_scale "
+                        f"mode={trim(str(adaptive.get('mode', '') or '').strip(), 20) or '-'} "
+                        f"stress={int(adaptive.get('stress_score', 0) or 0)} "
+                        f"probe={trim(str(adaptive.get('probe_status', '') or '').strip(), 20) or '-'}"
+                    ),
+                    180,
+                )
+            )
+        uniq_reasons: list[str] = []
+        uniq_evidence: list[str] = []
+        for item in reasons:
+            if item and item not in uniq_reasons:
+                uniq_reasons.append(item)
+        for item in evidence:
+            if item and item not in uniq_evidence:
+                uniq_evidence.append(item)
+        return {
+            "active": bool(uniq_reasons),
+            "reasons": uniq_reasons,
+            "evidence": uniq_evidence[:6],
+            "delegate_target": delegate_target,
+            "last_role": last_role,
+            "last_text": last_text,
+        }
+
     def _adaptive_scale_update_after_worker_step(
         self,
         board: dict | None,
@@ -15292,7 +15383,6 @@ class SessionState:
             and (not probe_pass)
             and (
                 bool(text)
-                or bool(tool_results)
                 or bool((step or {}).get("stop_due_to_finish", False))
             )
         )
@@ -16737,6 +16827,7 @@ class SessionState:
         adaptive = self._normalize_adaptive_scale_state(bb.get("adaptive_scale", {}))
         last_delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
         last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        drift = self._runtime_drift_signal_state(bb)
         has_execution_signal = self._has_worker_execution_signal(bb)
         bootstrap_pending = bool(
             (not has_execution_signal)
@@ -16793,63 +16884,23 @@ class SessionState:
                 if request_payload:
                     evidence.append(trim(request_payload, 180))
 
-        target = requested_by
-        last_role = self._sanitize_agent_role(last_reply.get("role", ""))
-        last_text = trim(
-            strip_thinking_content(str(last_reply.get("text", "") or "")).strip(),
-            1200,
-        )
-        if last_role and self._looks_like_owner_confused(last_text):
-            reasons.append("owner-confused-reply")
-            evidence.append(trim(f"last_worker[{last_role}] {last_text}", 180))
-            if not target:
-                target = last_role
-
-        delegate_target = self._sanitize_agent_role(last_delegate.get("target", ""))
-        route_streak = self._recent_delegate_target_streak(delegate_target)
-        route_similarity = self._recent_delegate_instruction_similarity(target=delegate_target, window=3)
+        target = requested_by or str(drift.get("last_role", "") or "")
+        last_role = str(drift.get("last_role", "") or "")
+        last_text = str(drift.get("last_text", "") or "")
+        delegate_target = str(drift.get("delegate_target", "") or self._sanitize_agent_role(last_delegate.get("target", "")) or "")
+        for item in list(drift.get("reasons", []) or []):
+            if item and item not in reasons:
+                reasons.append(item)
+        for item in list(drift.get("evidence", []) or []):
+            if item and item not in evidence:
+                evidence.append(item)
+        drift_active = bool(drift.get("active", False))
+        strong_load_only = bool(int(loading.get("score", 0) or 0) >= max(5, int(TASK_LOADING_OVERLOAD_THRESHOLD) + 1))
         if (
-            delegate_target
-            and route_streak >= int(MANAGER_INTERVENTION_ROUTE_REPEAT_THRESHOLD)
-            and route_similarity >= float(MANAGER_INTERVENTION_ROUTE_SIMILARITY_THRESHOLD)
+            bool(loading.get("overloaded", False))
+            and str(loading.get("model_capacity", "") or "") == "small"
+            and (explicit_request or drift_active or strong_load_only)
         ):
-            reasons.append("repeated-same-owner-route")
-            evidence.append(trim(f"delegate_streak={route_streak}", 180))
-            evidence.append(trim(f"delegate_similarity={route_similarity:.2f}", 180))
-            if not target:
-                target = delegate_target
-
-        if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
-            reasons.append("watchdog-intent-no-tool")
-        if int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
-            reasons.append("watchdog-repeat-no-tool")
-        if int(wd.get("state_unchanged_streak", 0) or 0) >= int(WATCHDOG_STATE_STALL_THRESHOLD):
-            reasons.append("watchdog-state-stall")
-        if any(tag.startswith("watchdog-") for tag in reasons):
-            evidence.append(
-                trim(
-                    (
-                        "watchdog "
-                        f"intent={int(wd.get('intent_no_tool_streak', 0) or 0)}, "
-                        f"repeat={int(wd.get('repeat_no_tool_streak', 0) or 0)}, "
-                        f"state={int(wd.get('state_unchanged_streak', 0) or 0)}, "
-                        f"trigger={int(wd.get('trigger_count', 0) or 0)}"
-                    ),
-                    180,
-                )
-            )
-        if str(dq.get("last_error", "") or "").strip():
-            reasons.append("queue-last-error")
-            evidence.append(trim(str(dq.get("last_error", "") or "").strip(), 180))
-
-        error_streak = self._recent_blocking_error_streak(bb)
-        if error_streak >= int(MANAGER_INTERVENTION_ERROR_REPEAT_THRESHOLD):
-            reasons.append("repeated-blocking-error")
-            evidence.append(trim(f"error_streak={error_streak}", 180))
-        elif self._manager_has_error_log(bb):
-            reasons.append("blocking-error-log")
-
-        if bool(loading.get("overloaded", False)) and str(loading.get("model_capacity", "") or "") == "small":
             reasons.append("small-model-overload")
             evidence.append(
                 trim(
@@ -16857,7 +16908,7 @@ class SessionState:
                     180,
                 )
             )
-        if str(adaptive.get("mode", "") or "").strip().lower() == ADAPTIVE_SCALE_MODE_FALLBACK:
+        if str(adaptive.get("mode", "") or "").strip().lower() == ADAPTIVE_SCALE_MODE_FALLBACK and (explicit_request or drift_active):
             reasons.append("adaptive-scale-fallback")
             evidence.append(
                 trim(
@@ -16870,9 +16921,7 @@ class SessionState:
                     180,
                 )
             )
-        if int(adaptive.get("semantic_loop_streak", 0) or 0) >= int(ADAPTIVE_SCALE_SEMANTIC_LOOP_THRESHOLD):
-            reasons.append("adaptive-semantic-loop")
-        if trim(str(adaptive.get("probe_status", "") or "").strip().lower(), 20) == "failed":
+        if trim(str(adaptive.get("probe_status", "") or "").strip().lower(), 20) == "failed" and (explicit_request or drift_active):
             reasons.append("adaptive-probe-failed")
 
         if not target:
@@ -17404,6 +17453,7 @@ class SessionState:
             return {"triggered": False, "reason": "queue-already-active"}
         loading = self._refresh_task_loading_state(bb)
         adaptive = self._normalize_adaptive_scale_state(bb.get("adaptive_scale", {}))
+        drift = self._runtime_drift_signal_state(bb)
         if (not self._manager_contract_ready(bb)) or (not self._has_worker_execution_signal(bb)):
             return {"triggered": False, "reason": "manager-bootstrap-pending", "loading": loading}
         adaptive_pressure = bool(
@@ -17413,7 +17463,9 @@ class SessionState:
                 or int(adaptive.get("semantic_loop_streak", 0) or 0) >= int(ADAPTIVE_SCALE_SEMANTIC_LOOP_THRESHOLD)
             )
         )
-        if not bool(loading.get("overloaded", False) or adaptive_pressure):
+        strong_load_only = bool(int(loading.get("score", 0) or 0) >= max(5, int(TASK_LOADING_OVERLOAD_THRESHOLD) + 1))
+        load_driven_split = bool(loading.get("overloaded", False)) and bool(drift.get("active", False) or strong_load_only)
+        if not bool(load_driven_split or adaptive_pressure):
             return {"triggered": False, "reason": "task-loading-ok", "loading": loading}
         approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
         if bool(approval.get("approved", False)):
@@ -17439,7 +17491,14 @@ class SessionState:
                 trim(f"model_capacity={loading.get('model_capacity', 'unknown')}", 120),
                 trim(f"task_loading_score={int(loading.get('score', 0) or 0)}", 120),
                 trim(f"adaptive_scale_mode={adaptive.get('mode', ADAPTIVE_SCALE_MODE_BYPASS)}", 120),
-                trim("manager proactive split before repeated owner drift", 120),
+                trim(
+                    (
+                        "manager proactive split after drift evidence"
+                        if bool(drift.get("active", False))
+                        else "manager proactive split under severe load"
+                    ),
+                    120,
+                ),
             ],
         }
         triggered_meta = self._manager_activate_intervention_decomposition(
