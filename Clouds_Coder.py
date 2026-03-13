@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import textwrap
 import traceback
 import uuid
 import zipfile
@@ -44,7 +45,117 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODES_ROOT = WORKDIR / "Codes"
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 MAX_TOOL_OUTPUT = 50_000
+UPLOAD_PARSED_TEXT_MAX_CHARS = 120_000
+UPLOAD_PROMPT_EXCERPT_MAX_CHARS = 24_000
+UPLOAD_PREVIEW_MAX_CHARS = 1_200
+BLACKBOARD_LINKED_FILES_MAX = 240
+PDFMINER_BOOTSTRAP_TIMEOUT_SECONDS = 180
+SESSION_EXPORT_WRAP_COLUMNS = 96
+SESSION_EXPORT_BODY_FONT_SIZE = 15
+SESSION_EXPORT_HEADING_FONT_SIZE = 28
+SESSION_EXPORT_SECTION_FONT_SIZE = 21
+SESSION_EXPORT_SUBSECTION_FONT_SIZE = 17
+SESSION_EXPORT_LINE_HEIGHT = 23
 TOKEN_THRESHOLD = 100_000
+DEFAULT_SESSION_COMPRESSION_LEVEL = 3
+SESSION_COMPRESSION_LEVEL_CHOICES = (1, 2, 3, 4, 5)
+SESSION_COMPRESSION_LEVEL_CONFIG_KEYS = (
+    "session_compression_level",
+    "memory_compression_level",
+    "compression_level",
+)
+SESSION_COMPRESSION_PROFILES: dict[int, dict[str, object]] = {
+    1: {
+        "label": "preserve",
+        "description": "minimum compression",
+        "proactive_trigger_ratio": 1.01,
+        "tail_ratio": 0.64,
+        "target_ratio": 0.74,
+        "tail_min": 7200,
+        "tail_max": 24000,
+        "recent_chain_items": 8,
+        "open_work_items": 8,
+        "active_file_items": 8,
+        "history_file_items": 8,
+        "contract_items": 6,
+        "summary_chars": 5200,
+        "history_chars": 3200,
+        "compact_summary_tokens": 1050,
+    },
+    2: {
+        "label": "light",
+        "description": "light compression",
+        "proactive_trigger_ratio": 0.97,
+        "tail_ratio": 0.56,
+        "target_ratio": 0.66,
+        "tail_min": 6400,
+        "tail_max": 22000,
+        "recent_chain_items": 7,
+        "open_work_items": 7,
+        "active_file_items": 7,
+        "history_file_items": 7,
+        "contract_items": 6,
+        "summary_chars": 4600,
+        "history_chars": 2600,
+        "compact_summary_tokens": 950,
+    },
+    3: {
+        "label": "balanced",
+        "description": "balanced compression",
+        "proactive_trigger_ratio": 0.92,
+        "tail_ratio": 0.46,
+        "target_ratio": 0.56,
+        "tail_min": 5200,
+        "tail_max": 18000,
+        "recent_chain_items": 6,
+        "open_work_items": 6,
+        "active_file_items": 6,
+        "history_file_items": 6,
+        "contract_items": 5,
+        "summary_chars": 3800,
+        "history_chars": 2100,
+        "compact_summary_tokens": 860,
+    },
+    4: {
+        "label": "strong",
+        "description": "strong compression",
+        "proactive_trigger_ratio": 0.86,
+        "tail_ratio": 0.38,
+        "target_ratio": 0.48,
+        "tail_min": 4200,
+        "tail_max": 15000,
+        "recent_chain_items": 5,
+        "open_work_items": 5,
+        "active_file_items": 5,
+        "history_file_items": 5,
+        "contract_items": 4,
+        "summary_chars": 3000,
+        "history_chars": 1600,
+        "compact_summary_tokens": 760,
+    },
+    5: {
+        "label": "aggressive",
+        "description": "strongest compression",
+        "proactive_trigger_ratio": 0.80,
+        "tail_ratio": 0.30,
+        "target_ratio": 0.40,
+        "tail_min": 3400,
+        "tail_max": 12000,
+        "recent_chain_items": 4,
+        "open_work_items": 4,
+        "active_file_items": 4,
+        "history_file_items": 4,
+        "contract_items": 4,
+        "summary_chars": 2400,
+        "history_chars": 1200,
+        "compact_summary_tokens": 660,
+    },
+}
+WORKSPACE_PATH_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:"
+    r"json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h|hpp|cc|cxx|php|rb|swift|kt|scala|sql|xml|xsd|xsl|f90|f95|f03|f08"
+    r")"
+)
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
@@ -123,6 +234,13 @@ BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or
 BENIGN_SOCKET_LOG_INTERVAL_SECONDS = 30.0
 FINAL_SUMMARY_MIN_CHARS = 80
 FINAL_SUMMARY_STRICT_MIN_CHARS = 120
+_PDFMINER_BOOTSTRAP_LOCK = threading.Lock()
+_PDFMINER_BOOTSTRAP_STATE = {
+    "ready": False,
+    "attempts": 0,
+    "checked_at": 0.0,
+    "error": "",
+}
 RUNTIME_CONTROL_HINT_PREFIXES = (
     "<reminder>",
     "<todo-rescue>",
@@ -186,30 +304,24 @@ BLACKBOARD_STATUSES = (
     "PAUSED",
 )
 TASK_COMPLEXITY_LEVELS = ("simple", "complex")
-TASK_PROFILE_TYPES = (
-    "simple_qa",
-    "simple_code",
-    "research",
-    "engineering",
-    "general",
-)
+TASK_PROFILE_TYPES = ("general", "research", "implementation", "analysis", "review")
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
 SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
-        "execution_mode": EXECUTION_MODE_SINGLE,
+        "execution_mode": EXECUTION_MODE_SYNC,
         "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 4,
+        "round_budget": 6,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
     2: {
         "name": "simple_multi_turn_qa",
-        "execution_mode": EXECUTION_MODE_SINGLE,
-        "participants": ["developer"],
+        "execution_mode": EXECUTION_MODE_SYNC,
+        "participants": ["explorer", "developer"],
         "assigned_expert": "developer",
         "round_budget": 10,
         "requires_user_confirmation": False,
@@ -251,6 +363,44 @@ SKILL_PROMPT_MAX_ITEMS = 40
 SKILL_PROMPT_MAX_CHARS = 2600
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
+UNIFORM_KERNEL_VERSION = "2026-03-12.1"
+UNIFORM_KERNEL_MANAGER_STRIDE = 3
+UNIFORM_KERNEL_BUS_MAX_AGE_SECONDS = 240.0
+UNIFORM_KERNEL_LOAD_TRIGGER_SCORE = 4
+UNIFORM_KERNEL_PROACTIVE_SPLIT_SCORE = 5
+UNIFORM_KERNEL_SUMMARY_ITEM_LIMIT = 4
+UNIFORM_KERNEL_MAX_SUMMARY_CHARS = 2200
+UNIFORM_KERNEL_SKILL_HINT_LIMIT = 4
+SKILL_DISCOVERY_TOOL_NAMES = {
+    "load_skill",
+    "list_skills",
+    "list_skill_providers",
+    "list_skill_protocols",
+    "scan_skills",
+}
+NON_SUBSTANTIVE_TOOL_NAMES = {
+    *SKILL_DISCOVERY_TOOL_NAMES,
+    "compress",
+    "context_recall",
+    "read_from_blackboard",
+    "write_to_blackboard",
+    "TodoWrite",
+    "TodoWriteRescue",
+    "task_list",
+    "list_teammates",
+    "worktree_list",
+    "worktree_events",
+}
+UNIFORM_KERNEL_ACTIONABLE_BUS_INTENTS = {
+    "execute_plan",
+    "review_request",
+    "fix_request",
+    "final_summary_request",
+    "implementation_request",
+    "verify_request",
+    "requestresearch_support",
+    "handoff",
+}
 HTML_FRONTEND_REQUEST_KEYWORDS = (
     "html",
     "web page",
@@ -481,6 +631,85 @@ CODE_PREVIEW_EXTS = {
     ".pl",
     ".lua",
     ".dart",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".astro",
+    ".qml",
+    ".f",
+    ".for",
+    ".f77",
+    ".f90",
+    ".f95",
+    ".f03",
+    ".f08",
+    ".asm",
+    ".s",
+    ".pas",
+    ".pp",
+    ".lpr",
+    ".dpr",
+    ".nim",
+    ".nimble",
+    ".zig",
+    ".jl",
+    ".proto",
+    ".graphql",
+    ".gql",
+    ".rego",
+    ".hcl",
+    ".tf",
+    ".tfvars",
+    ".bzl",
+    ".bazel",
+    ".ml",
+    ".mli",
+    ".fs",
+    ".fsi",
+    ".fsx",
+    ".vb",
+    ".vbs",
+    ".tcl",
+    ".awk",
+    ".sed",
+    ".groovy",
+    ".gvy",
+    ".gy",
+    ".gsh",
+    ".clj",
+    ".cljs",
+    ".cljc",
+    ".edn",
+    ".erl",
+    ".hrl",
+    ".ex",
+    ".exs",
+    ".eex",
+    ".heex",
+    ".leex",
+    ".sol",
+    ".vy",
+    ".v",
+    ".sv",
+    ".svh",
+    ".vhd",
+    ".vhdl",
+    ".adb",
+    ".ads",
+    ".ada",
+    ".elm",
+    ".purs",
+    ".hs",
+    ".lhs",
+    ".cu",
+    ".cuh",
+    ".feature",
+    ".robot",
+    ".http",
+    ".rest",
+    ".psm1",
+    ".psd1",
     ".vue",
     ".svelte",
     ".gradle",
@@ -488,14 +717,72 @@ CODE_PREVIEW_EXTS = {
 }
 CODE_PREVIEW_FILENAMES = {
     "dockerfile",
+    "containerfile",
     "makefile",
+    "gnumakefile",
     "cmakelists.txt",
     "justfile",
     "gemfile",
     "rakefile",
     "pipfile",
+    "procfile",
+    "brewfile",
+    "vagrantfile",
+    "jenkinsfile",
+    "tiltfile",
+    "meson.build",
+    "meson_options.txt",
+    "build.bazel",
+    "workspace.bazel",
+    "buck",
+    "buckconfig",
     "requirements.txt",
 }
+TEXTUAL_UPLOAD_EXTS = set(CODE_PREVIEW_EXTS) | {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".text",
+    ".rst",
+    ".adoc",
+    ".asciidoc",
+    ".csv",
+    ".tsv",
+    ".env",
+}
+MARKDOWN_LIKE_UPLOAD_EXTS = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".text",
+}
+TEXTUAL_UPLOAD_FILENAMES = set(CODE_PREVIEW_FILENAMES) | {
+    ".env",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    ".dockerignore",
+    ".npmrc",
+    ".nvmrc",
+    ".prettierrc",
+    ".eslintrc",
+    ".babelrc",
+    ".stylelintrc",
+    ".yamllint",
+    ".pylintrc",
+    ".flake8",
+    ".coveragerc",
+    ".clang-format",
+    ".clang-tidy",
+    ".tool-versions",
+}
+TEXTUAL_UPLOAD_FILENAME_PREFIXES = (
+    ".env.",
+    ".prettierrc.",
+    ".eslintrc.",
+    ".babelrc.",
+    ".stylelintrc.",
+)
 MEDIA_CAPABILITY_KEYS = {
     "input_image",
     "input_audio",
@@ -705,6 +992,16 @@ def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC
     if fallback in EXECUTION_MODE_CHOICES:
         return fallback
     return EXECUTION_MODE_SYNC
+
+
+def normalize_on_off_mode(raw: str | None, default: str = "off") -> str:
+    key = str(raw or "").strip().lower().replace("_", "-")
+    if key in {"on", "1", "true", "yes", "enable", "enabled"}:
+        return "on"
+    if key in {"off", "0", "false", "no", "disable", "disabled"}:
+        return "off"
+    fallback = str(default or "off").strip().lower()
+    return "on" if fallback == "on" else "off"
 
 
 def model_language_instruction(lang: str) -> str:
@@ -2059,8 +2356,67 @@ def looks_like_llm_config(config: dict) -> bool:
         "custom_video_endpoint",
         "temperature",
         "request_timeout",
+        "session_compression_level",
+        "memory_compression_level",
+        "compression_level",
     }
     return bool(keys & markers)
+
+def normalize_session_compression_level(
+    raw: object,
+    default: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
+) -> int:
+    try:
+        level = int(raw if raw is not None else default)
+    except Exception:
+        level = int(default)
+    if level not in SESSION_COMPRESSION_LEVEL_CHOICES:
+        try:
+            fallback = int(default)
+        except Exception:
+            fallback = DEFAULT_SESSION_COMPRESSION_LEVEL
+        return (
+            fallback
+            if fallback in SESSION_COMPRESSION_LEVEL_CHOICES
+            else DEFAULT_SESSION_COMPRESSION_LEVEL
+        )
+    return level
+
+def session_compression_profile(level: object) -> dict[str, object]:
+    resolved = normalize_session_compression_level(level, DEFAULT_SESSION_COMPRESSION_LEVEL)
+    row = SESSION_COMPRESSION_PROFILES.get(
+        resolved,
+        SESSION_COMPRESSION_PROFILES[DEFAULT_SESSION_COMPRESSION_LEVEL],
+    )
+    return dict(row)
+
+def session_compression_level_from_config(
+    config: object,
+    *,
+    default: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
+) -> int:
+    src = config if isinstance(config, dict) else {}
+    for key in SESSION_COMPRESSION_LEVEL_CONFIG_KEYS:
+        if key in src:
+            return normalize_session_compression_level(src.get(key), default=default)
+    return normalize_session_compression_level(default, default=DEFAULT_SESSION_COMPRESSION_LEVEL)
+
+def with_session_compression_level(config: object, level: object) -> dict:
+    out = dict(config or {}) if isinstance(config, dict) else {}
+    out["session_compression_level"] = normalize_session_compression_level(
+        level,
+        default=session_compression_level_from_config(out, default=DEFAULT_SESSION_COMPRESSION_LEVEL),
+    )
+    return out
+
+def session_compression_level_guide() -> str:
+    parts: list[str] = []
+    for level in SESSION_COMPRESSION_LEVEL_CHOICES:
+        row = session_compression_profile(level)
+        parts.append(
+            f"{level}={row.get('label', '')} ({row.get('description', '')})"
+        )
+    return "; ".join(parts)
 
 def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
@@ -2452,7 +2808,7 @@ def preview_kind_for_path(path_text: str) -> str:
         return ""
     if rel.endswith((".html", ".htm")):
         return "html"
-    if rel.endswith((".md", ".markdown")):
+    if rel.endswith((".md", ".markdown", ".txt", ".text")):
         return "markdown"
     if is_code_preview_candidate(rel):
         return "code"
@@ -3433,12 +3789,60 @@ def _module_exists(name: str) -> bool:
     except Exception:
         return False
 
+def ensure_pdfminer_available(auto_install: bool = True) -> bool:
+    if _module_exists("pdfminer"):
+        with _PDFMINER_BOOTSTRAP_LOCK:
+            _PDFMINER_BOOTSTRAP_STATE["ready"] = True
+            _PDFMINER_BOOTSTRAP_STATE["checked_at"] = float(now_ts())
+            _PDFMINER_BOOTSTRAP_STATE["error"] = ""
+        return True
+    if not auto_install:
+        return False
+    with _PDFMINER_BOOTSTRAP_LOCK:
+        attempts = int(_PDFMINER_BOOTSTRAP_STATE.get("attempts", 0) or 0)
+        last_checked = float(_PDFMINER_BOOTSTRAP_STATE.get("checked_at", 0.0) or 0.0)
+        if attempts >= 1 and (now_ts() - last_checked) < 3600:
+            return False
+        _PDFMINER_BOOTSTRAP_STATE["attempts"] = attempts + 1
+        _PDFMINER_BOOTSTRAP_STATE["checked_at"] = float(now_ts())
+        _PDFMINER_BOOTSTRAP_STATE["error"] = ""
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--quiet",
+                "--user",
+                "--break-system-packages",
+                "pdfminer.six",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PDFMINER_BOOTSTRAP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        with _PDFMINER_BOOTSTRAP_LOCK:
+            _PDFMINER_BOOTSTRAP_STATE["ready"] = False
+            _PDFMINER_BOOTSTRAP_STATE["checked_at"] = float(now_ts())
+            _PDFMINER_BOOTSTRAP_STATE["error"] = trim(str(exc), 240)
+        return False
+    ready = _module_exists("pdfminer")
+    with _PDFMINER_BOOTSTRAP_LOCK:
+        _PDFMINER_BOOTSTRAP_STATE["ready"] = bool(ready)
+        _PDFMINER_BOOTSTRAP_STATE["checked_at"] = float(now_ts())
+        _PDFMINER_BOOTSTRAP_STATE["error"] = ""
+    return ready
+
 def detect_upload_parser_capabilities() -> dict:
     return {
         "openpyxl": _module_exists("openpyxl"),
         "xlrd": _module_exists("xlrd"),
         "python_docx": _module_exists("docx"),
         "python_pptx": _module_exists("pptx"),
+        "pdfminer": _module_exists("pdfminer"),
         "pymupdf": _module_exists("fitz"),
         "pdftotext": bool(shutil.which("pdftotext")),
         "xls2csv": bool(shutil.which("xls2csv")),
@@ -3453,7 +3857,11 @@ def _render_cap_markdown(caps: dict) -> str:
         ("xlsx", "openpyxl or zip/xml fallback", bool(caps.get("openpyxl"))),
         ("xls", "xlrd or xls2csv/strings fallback", bool(caps.get("xlrd") or caps.get("xls2csv"))),
         ("csv", "builtin csv parser", True),
-        ("pdf", "PyMuPDF or pdftotext/strings fallback", bool(caps.get("pymupdf") or caps.get("pdftotext"))),
+        (
+            "pdf",
+            "pdfminer or PyMuPDF or pdftotext/strings fallback",
+            bool(caps.get("pdfminer") or caps.get("pymupdf") or caps.get("pdftotext")),
+        ),
         ("docx", "python-docx or zip/xml fallback", bool(caps.get("python_docx"))),
         ("doc", "antiword/catdoc/textutil/strings fallback", bool(caps.get("antiword") or caps.get("catdoc") or caps.get("textutil"))),
         ("pptx", "python-pptx or zip/xml fallback", bool(caps.get("python_pptx"))),
@@ -3470,6 +3878,207 @@ def _write_text_if_changed(path: Path, content: str):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+def _write_bytes_if_changed(path: Path, content: bytes):
+    try:
+        old = path.read_bytes() if path.exists() else None
+    except Exception:
+        old = None
+    if old == content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+def is_textual_upload_candidate(path_text: str) -> bool:
+    name = Path(str(path_text or "")).name.lower()
+    if not name:
+        return False
+    if name in TEXTUAL_UPLOAD_FILENAMES:
+        return True
+    if any(name.startswith(prefix) for prefix in TEXTUAL_UPLOAD_FILENAME_PREFIXES):
+        return True
+    suffixes = [str(s or "").lower() for s in Path(name).suffixes]
+    return any(ext in TEXTUAL_UPLOAD_EXTS for ext in suffixes)
+
+def is_markdown_like_upload_candidate(path_text: str) -> bool:
+    name = Path(str(path_text or "")).name.lower()
+    if not name:
+        return False
+    suffixes = [str(s or "").lower() for s in Path(name).suffixes]
+    return any(ext in MARKDOWN_LIKE_UPLOAD_EXTS for ext in suffixes)
+
+def looks_like_textual_bytes(data: bytes, sample_size: int = 16384) -> bool:
+    raw = bytes(data or b"")[: max(256, int(sample_size or 16384))]
+    if not raw:
+        return False
+    if b"\x00" in raw:
+        return False
+    printable = 0
+    total = len(raw)
+    for b in raw:
+        if b in (9, 10, 13):
+            printable += 1
+            continue
+        if 32 <= b <= 126:
+            printable += 1
+            continue
+        if b >= 128:
+            printable += 1
+            continue
+    return (printable / max(1, total)) >= 0.88
+
+def upload_code_fence_language(path_text: str) -> str:
+    name = Path(str(path_text or "")).name.lower()
+    suffixes = [str(s or "").lower() for s in Path(name).suffixes]
+    ext = suffixes[-1] if suffixes else ""
+    mapping = {
+        ".py": "python",
+        ".pyi": "python",
+        ".js": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".jsx": "javascript",
+        ".java": "java",
+        ".c": "c",
+        ".cc": "cpp",
+        ".cpp": "cpp",
+        ".cxx": "cpp",
+        ".h": "c",
+        ".hh": "cpp",
+        ".hpp": "cpp",
+        ".hxx": "cpp",
+        ".go": "go",
+        ".rs": "rust",
+        ".rb": "ruby",
+        ".php": "php",
+        ".swift": "swift",
+        ".kt": "kotlin",
+        ".kts": "kotlin",
+        ".scala": "scala",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".zsh": "bash",
+        ".fish": "fish",
+        ".ps1": "powershell",
+        ".psm1": "powershell",
+        ".psd1": "powershell",
+        ".bat": "bat",
+        ".sql": "sql",
+        ".json": "json",
+        ".jsonc": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".toml": "toml",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".conf": "ini",
+        ".xml": "xml",
+        ".xsd": "xml",
+        ".xsl": "xml",
+        ".cs": "csharp",
+        ".m": "objectivec",
+        ".mm": "objectivec",
+        ".r": "r",
+        ".pl": "perl",
+        ".lua": "lua",
+        ".dart": "dart",
+        ".scss": "scss",
+        ".sass": "sass",
+        ".less": "less",
+        ".styl": "stylus",
+        ".astro": "astro",
+        ".qml": "qml",
+        ".f": "fortran",
+        ".for": "fortran",
+        ".f77": "fortran",
+        ".f90": "fortran",
+        ".f95": "fortran",
+        ".f03": "fortran",
+        ".f08": "fortran",
+        ".asm": "asm",
+        ".s": "asm",
+        ".pas": "pascal",
+        ".pp": "pascal",
+        ".lpr": "pascal",
+        ".dpr": "pascal",
+        ".nim": "nim",
+        ".nimble": "nim",
+        ".zig": "zig",
+        ".jl": "julia",
+        ".proto": "proto",
+        ".graphql": "graphql",
+        ".gql": "graphql",
+        ".rego": "rego",
+        ".hcl": "hcl",
+        ".tf": "hcl",
+        ".tfvars": "hcl",
+        ".bzl": "python",
+        ".bazel": "python",
+        ".ml": "ocaml",
+        ".mli": "ocaml",
+        ".fs": "fsharp",
+        ".fsi": "fsharp",
+        ".fsx": "fsharp",
+        ".vb": "vbnet",
+        ".vbs": "vb",
+        ".tcl": "tcl",
+        ".awk": "awk",
+        ".sed": "sed",
+        ".groovy": "groovy",
+        ".gvy": "groovy",
+        ".gy": "groovy",
+        ".gsh": "groovy",
+        ".clj": "clojure",
+        ".cljs": "clojure",
+        ".cljc": "clojure",
+        ".edn": "clojure",
+        ".erl": "erlang",
+        ".hrl": "erlang",
+        ".ex": "elixir",
+        ".exs": "elixir",
+        ".eex": "eex",
+        ".heex": "heex",
+        ".leex": "eex",
+        ".sol": "solidity",
+        ".vy": "python",
+        ".v": "verilog",
+        ".sv": "systemverilog",
+        ".svh": "systemverilog",
+        ".vhd": "vhdl",
+        ".vhdl": "vhdl",
+        ".adb": "ada",
+        ".ads": "ada",
+        ".ada": "ada",
+        ".elm": "elm",
+        ".purs": "purescript",
+        ".hs": "haskell",
+        ".lhs": "haskell",
+        ".cu": "cpp",
+        ".cuh": "cpp",
+        ".feature": "gherkin",
+        ".robot": "robotframework",
+        ".http": "http",
+        ".rest": "http",
+        ".vue": "vue",
+        ".svelte": "svelte",
+        ".gradle": "groovy",
+        ".properties": "properties",
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".txt": "markdown",
+        ".rst": "rst",
+        ".adoc": "asciidoc",
+        ".asciidoc": "asciidoc",
+    }
+    if name in {"dockerfile", "containerfile"}:
+        return "dockerfile"
+    if name in {"makefile", "gnumakefile", "justfile"}:
+        return "makefile"
+    if name == "cmakelists.txt":
+        return "cmake"
+    return mapping.get(ext, ext.lstrip("."))
 
 def ensure_generated_document_skills(skills_root: Path):
     caps = detect_upload_parser_capabilities()
@@ -4308,6 +4917,183 @@ if __name__ == "__main__":
         ),
     )
 
+def ensure_generated_uniform_agent_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+    repo_root = generated_root / "repo-grounding-lite"
+    split_root = generated_root / "task-splitting-lite"
+    impl_root = generated_root / "implementation-loop-lite"
+    review_root = generated_root / "review-loop-lite"
+    summary_root = generated_root / "final-summary-synthesis-lite"
+
+    repo_skill = """---
+name: repo-grounding-lite
+description: Ground an agent in an unfamiliar repository quickly by extracting structure, constraints, entrypoints, and likely change surfaces.
+---
+
+# Repo Grounding Lite
+
+Use this skill when the repository is unfamiliar and the model needs a fast, reliable mental map before changing code.
+
+## Workflow
+1. Identify root structure first: list top-level files and folders.
+2. Find execution/config anchors:
+   - README, package/pyproject/cargo/go mod files,
+   - app entrypoints,
+   - test/validation/spec folders and files,
+   - config/env files.
+3. When validate.py, test_* or spec/contract files exist, read them before planning edits and treat them as the acceptance contract.
+4. Read only the smallest files that explain architecture.
+5. Write concise blackboard notes:
+   - what this project does,
+   - where the requested change likely belongs,
+   - what must not be broken.
+
+## Output Contract
+Return:
+1. project shape,
+2. key files,
+3. likely edit targets,
+4. immediate next action.
+"""
+
+    split_skill = """---
+name: task-splitting-lite
+description: Split a broad coding request into small executable slices with clear ownership, evidence, and stop conditions.
+---
+
+# Task Splitting Lite
+
+Use this skill when a request is too broad to execute safely in one shot.
+
+## Split Rules
+1. Make 3-6 steps only.
+2. Each step must produce one verifiable artifact:
+   - a read result,
+   - a file edit,
+   - a command output,
+   - a pass/fix verdict.
+3. Prefer sequence:
+   - ground scope,
+   - inspect target files,
+   - make one implementation batch,
+   - validate,
+   - summarize.
+4. If a step is still too large, split again before coding.
+
+## Output Contract
+Return:
+1. ordered micro-steps,
+2. owner per step,
+3. evidence expected from each step,
+4. explicit finish condition.
+"""
+
+    impl_skill = """---
+name: implementation-loop-lite
+description: Drive a minimal but robust code-change loop: inspect, patch, verify, and record evidence without drifting into over-planning.
+---
+
+# Implementation Loop Lite
+
+Use this skill for normal coding tasks that should stay compact and execution-first.
+
+## Loop
+1. Confirm target file/function.
+2. Read acceptance-contract files first when present: validate.py, tests, specs, or example outputs.
+3. Read only the required local context.
+4. Make the smallest useful patch.
+5. Run one focused verification command if available.
+6. Record:
+   - changed files,
+   - why the patch works,
+   - what still needs checking.
+
+## Rules
+- Prefer incremental edits over full-file rewrites.
+- One implementation batch per round.
+- If blocked, report the blocker exactly and stop retry spam.
+"""
+
+    review_skill = """---
+name: review-loop-lite
+description: Perform a fast verification pass focused on regressions, evidence, and clear pass/fix handoff.
+---
+
+# Review Loop Lite
+
+Use this skill when implementation exists and a reviewer-style verification pass is needed.
+
+## Workflow
+1. Compare requested outcome vs current patch.
+2. Inspect changed files and command outputs.
+3. Decide one of:
+   - pass,
+   - fix required,
+   - blocked by missing evidence.
+4. If fix is required, send a narrow fix request with exact evidence.
+
+## Output Contract
+Return:
+1. pass/fix verdict,
+2. evidence,
+3. specific gap or risk,
+4. next owner.
+"""
+
+    summary_skill = """---
+name: final-summary-synthesis-lite
+description: Build a structured final summary from blackboard evidence, changed files, validation output, and residual risks.
+---
+
+# Final Summary Synthesis Lite
+
+Use this skill when execution is effectively done and a clean closing summary is required.
+
+## Required Sections
+1. Changes made
+2. Validation or evidence
+3. Residual risks / next steps
+
+## Workflow
+1. Read blackboard sections first:
+   - code_artifacts,
+   - execution_logs,
+   - review_feedback,
+   - status.
+2. Keep the summary concrete and file-aware.
+3. Do not invent tests or guarantees that were not actually observed.
+"""
+
+    _write_text_if_changed(repo_root / "SKILL.md", repo_skill)
+    _write_text_if_changed(split_root / "SKILL.md", split_skill)
+    _write_text_if_changed(impl_root / "SKILL.md", impl_skill)
+    _write_text_if_changed(review_root / "SKILL.md", review_skill)
+    _write_text_if_changed(summary_root / "SKILL.md", summary_skill)
+    _write_text_if_changed(
+        generated_root / "uniform-agent-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "kernel_version": UNIFORM_KERNEL_VERSION,
+                "skills": [
+                    "repo-grounding-lite",
+                    "task-splitting-lite",
+                    "implementation-loop-lite",
+                    "review-loop-lite",
+                    "final-summary-synthesis-lite",
+                ],
+                "focus": [
+                    "uniform-repo-grounding",
+                    "task-splitting",
+                    "incremental-implementation",
+                    "review-handoff",
+                    "final-summary",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
 def ensure_generated_runtime_skills_manifest(skills_root: Path):
     generated_root = skills_root / "generated"
     tracked = [
@@ -4325,6 +5111,11 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
         "generated/offline-html-js-bundling/SKILL.md",
+        "generated/repo-grounding-lite/SKILL.md",
+        "generated/task-splitting-lite/SKILL.md",
+        "generated/implementation-loop-lite/SKILL.md",
+        "generated/review-loop-lite/SKILL.md",
+        "generated/final-summary-synthesis-lite/SKILL.md",
     ]
     present = [rel for rel in tracked if (skills_root / rel).exists()]
     payload = {
@@ -4631,6 +5422,7 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_execution_recovery_skill(skills_root)
     ensure_generated_html_frontend_report_skills(skills_root)
     ensure_generated_deep_research_skills(skills_root)
+    ensure_generated_uniform_agent_skills(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -6854,44 +7646,8 @@ def canonicalize_tool_name(raw: object) -> str:
     return mapped or name
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
-    "explorer": {
-        "bash",
-        "read_file",
-        "TodoWrite",
-        "TodoWriteRescue",
-        "list_skills",
-        "load_skill",
-        "list_skill_providers",
-        "list_skill_protocols",
-        "scan_skills",
-        "context_recall",
-        "task_get",
-        "task_list",
-        "check_background",
-        "read_inbox",
-        "ask_colleague",
-        "read_from_blackboard",
-        "write_to_blackboard",
-        "compress",
-    },
-    "developer": {str(name) for name in TOOL_SPEC_BY_NAME.keys()},
-    "reviewer": {
-        "bash",
-        "read_file",
-        "TodoWrite",
-        "TodoWriteRescue",
-        "finish_task",
-        "finish_current_task",
-        "mark_done",
-        "context_recall",
-        "task_get",
-        "task_list",
-        "check_background",
-        "ask_colleague",
-        "read_from_blackboard",
-        "write_to_blackboard",
-        "compress",
-    },
+    role: {str(name) for name in TOOL_SPEC_BY_NAME.keys()}
+    for role in AGENT_ROLES
 }
 
 class SessionState:
@@ -6921,6 +7677,9 @@ class SessionState:
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
+        microtask_mode: str = "off",
+        small_model_microtask_mode: str = "off",
+        session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
         run_finished_callback=None,
     ):
         self.id = session_id
@@ -6966,6 +7725,7 @@ class SessionState:
         self.todo = TodoManager()
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
+        self.session_tool_usage: dict[str, int] = {}
         self.skills_last_refresh_ts = 0.0
         self.skills_runtime_prepared = False
         self.tasks = TaskManager(self.root / "tasks", crypto)
@@ -7072,6 +7832,20 @@ class SessionState:
         self.shutdown_requests: dict[str, dict] = {}
         self.plan_requests: dict[str, dict] = {}
         self.blackboard = self._new_blackboard("")
+        self.uniform_kernel_state: dict = self._new_uniform_kernel_state()
+        self.pending_agentbus_route: dict = {}
+        self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
+        self.small_model_microtask_mode = normalize_on_off_mode(
+            small_model_microtask_mode,
+            default="off",
+        )
+        self.session_compression_level = normalize_session_compression_level(
+            session_compression_level,
+            default=session_compression_level_from_config(
+                default_llm_config or {},
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            ),
+        )
         self._init_llm_profiles(default_llm_config or {})
         self._load_if_exists()
 
@@ -7742,6 +8516,13 @@ class SessionState:
 
     def load_llm_config(self, config: dict, source: str = "") -> dict:
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        self.session_compression_level = normalize_session_compression_level(
+            session_compression_level_from_config(
+                config,
+                default=self.session_compression_level,
+            ),
+            default=self.session_compression_level,
+        )
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
         self.ollama.clear_probe_cache()
@@ -7873,6 +8654,20 @@ class SessionState:
                             "updated_at": float(srow.get("updated_at", 0.0) or 0.0),
                         }
                     self.skill_load_cache = clean_skill_cache
+                raw_tool_usage = raw.get("session_tool_usage", {})
+                if isinstance(raw_tool_usage, dict):
+                    clean_tool_usage: dict[str, int] = {}
+                    for tkey, tcount in raw_tool_usage.items():
+                        key = str(tkey or "").strip()
+                        if not key:
+                            continue
+                        try:
+                            count = int(tcount or 0)
+                        except Exception:
+                            count = 0
+                        if count > 0:
+                            clean_tool_usage[key] = count
+                    self.session_tool_usage = clean_tool_usage
                 active = raw.get("active_profile_id")
                 if isinstance(active, str) and active.strip():
                     self.active_profile_id = self._sanitize_profile_id(active)
@@ -8017,6 +8812,21 @@ class SessionState:
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
                 self.active_agent_role = str(raw.get("active_agent_role", self.active_agent_role) or "").strip().lower()
+                self.uniform_kernel_state = self._normalize_uniform_kernel_state(
+                    raw.get("uniform_kernel_state", self.uniform_kernel_state)
+                )
+                self.microtask_mode = normalize_on_off_mode(
+                    raw.get("microtask_mode", self.microtask_mode),
+                    default="off",
+                )
+                self.small_model_microtask_mode = normalize_on_off_mode(
+                    raw.get("small_model_microtask_mode", self.small_model_microtask_mode),
+                    default="off",
+                )
+                self.session_compression_level = normalize_session_compression_level(
+                    raw.get("session_compression_level", self.session_compression_level),
+                    default=self.session_compression_level,
+                )
                 raw_contexts = raw.get("contexts", {})
                 if isinstance(raw_contexts, dict):
                     clean_contexts: dict[str, list[dict]] = {}
@@ -8101,6 +8911,7 @@ class SessionState:
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
+        self.blackboard = self._refresh_memory_capsule(self._normalize_blackboard(self.blackboard))
         data = {
             "id": self.id,
             "title": self.title,
@@ -8115,6 +8926,7 @@ class SessionState:
             "active_profile_id": self.active_profile_id,
             "multimodal_capability_cache": self.multimodal_capability_cache,
             "skill_load_cache": self.skill_load_cache,
+            "session_tool_usage": self.session_tool_usage,
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_token_upper_bound": self.context_token_upper_bound,
@@ -8157,9 +8969,19 @@ class SessionState:
             "runtime_reclassify_required": bool(self.runtime_reclassify_required),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
             "active_agent_role": str(self.active_agent_role or ""),
+            "uniform_kernel_state": self._normalize_uniform_kernel_state(self.uniform_kernel_state),
+            "microtask_mode": normalize_on_off_mode(self.microtask_mode, default="off"),
+            "small_model_microtask_mode": normalize_on_off_mode(
+                self.small_model_microtask_mode,
+                default="off",
+            ),
+            "session_compression_level": normalize_session_compression_level(
+                self.session_compression_level,
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            ),
             "contexts": {role: list(self.contexts.get(role, []))[-400:] for role in AGENT_ROLES},
             "manager_context": list(self.manager_context)[-400:],
-            "blackboard": self._normalize_blackboard(self.blackboard),
+            "blackboard": self.blackboard,
             "agent_bus_messages": list(self.agent_bus_messages)[-240:],
             "manager_routes": list(self.manager_routes)[-240:],
             "render_frame_seq": int(self.render_frame_seq),
@@ -8602,7 +9424,16 @@ class SessionState:
             if body_z and cached_fp and cached_fp == fp:
                 restored = decompress_text_blob(body_z)
                 if restored:
-                    return restored
+                    desc = self._skill_purpose_from_store(key, max_chars=220)
+                    return trim(
+                        (
+                            f"[skill-cache-hit] {key} is already loaded in this session. "
+                            "Reuse the earlier instructions instead of repeatedly loading the same skill. "
+                            "If this turn is mandatory, continue with a grounding/execution tool in the same turn."
+                            + (f" Purpose: {desc}" if desc else "")
+                        ),
+                        520,
+                    )
         text = self.skills.load(name)
         if text and not str(text).startswith("Error:"):
             self.skill_load_cache[key] = {
@@ -8615,14 +9446,108 @@ class SessionState:
             self._persist()
         return text
 
+    def _skill_purpose_from_store(self, name: str, *, max_chars: int = 180) -> str:
+        self._ensure_skills_ready(force=False)
+        key, err = self.skills._resolve_name(name)
+        if err or not key:
+            return ""
+        row = self.skills.skills.get(key, {}) if isinstance(getattr(self.skills, "skills", {}), dict) else {}
+        desc = trim(str(row.get("description", "") or "").strip(), max_chars)
+        if not desc or desc == "-":
+            return ""
+        return desc
+
+    def _skill_capability_brief(self, name: str, *, max_chars: int = 220) -> str:
+        self._ensure_skills_ready(force=False)
+        key, err = self.skills._resolve_name(name)
+        if err or not key:
+            return ""
+        row = self.skills.skills.get(key, {}) if isinstance(getattr(self.skills, "skills", {}), dict) else {}
+        skill_name = trim(str(row.get("name", name) or name).strip(), 80) or trim(str(name or "").strip(), 80)
+        desc = self._skill_purpose_from_store(key, max_chars=max(80, int(max_chars) - 40))
+        if not desc:
+            return skill_name
+        prefix = f"{skill_name}:"
+        if desc.lower().startswith(prefix.lower()):
+            return trim(desc, max_chars)
+        return trim(f"{prefix} {desc}", max_chars)
+
+    def _role_baseline_skill_names(self, role: str, board: dict | None = None) -> list[str]:
+        role_key = self._sanitize_agent_role(role)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        out: list[str] = []
+
+        def _push(name: str):
+            if name and name not in out:
+                out.append(name)
+
+        if role_key == "explorer":
+            _push("repo-grounding-lite")
+        elif role_key == "reviewer":
+            _push("review-loop-lite")
+        elif role_key == "developer":
+            _push("implementation-loop-lite")
+        if bool(dq.get("active", False)) or len(str(bb.get("original_goal", "") or "").strip()) >= 220:
+            _push("task-splitting-lite")
+        if int(wd.get("trigger_count", 0) or 0) > 0:
+            _push("execution-degradation-recovery")
+        return out[:2]
+
+    def _inject_role_baseline_skills(self, role: str, *, board: dict | None = None, reason: str = ""):
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        names = self._role_baseline_skill_names(role_key, bb)
+        if not names:
+            return
+        context_rows = self._agent_context(role_key)
+        for row in reversed(context_rows[-6:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "system":
+                continue
+            if "<runtime-capabilities>" in str(row.get("content", "") or ""):
+                return
+        blocks: list[str] = []
+        for name in names:
+            brief = self._skill_capability_brief(name, max_chars=240)
+            if not brief:
+                continue
+            blocks.append(f"- {brief}")
+        if not blocks:
+            return
+        header = "Baseline runtime capabilities are available for this role."
+        if reason:
+            header = f"{header} trigger={trim(str(reason or '').strip(), 80)}."
+        self._append_agent_context_message(
+            role_key,
+            {
+                "role": "system",
+                "content": self._apply_agent_language_policy(
+                    (
+                        f"{header}\n"
+                        "<runtime-capabilities>\n"
+                        + "\n".join(blocks)
+                        + "\n</runtime-capabilities>\n"
+                        "Load a skill only when the current step is blocked by a missing capability; otherwise continue execution."
+                    ),
+                    max_len=1200,
+                ),
+                "ts": now_ts(),
+                "agent_role": role_key,
+            },
+            mirror_to_global=False,
+        )
+
     def _system_prompt(self) -> str:
         try:
             self._ensure_skills_ready(force=False)
         except Exception:
             pass
         uploads_ctx = self._uploads_prompt_block()
-        html_hint = self._html_frontend_boost_instruction()
-        research_hint = self._deep_research_boost_instruction()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         runtime_assigned = self._sanitize_agent_role(self.runtime_assigned_expert) or "developer"
@@ -8658,8 +9583,6 @@ class SessionState:
                 "for compact reasoning and fast handoffs. "
                 "Budget controls thought depth only and must not be used as an early-stop user-facing reason."
             )
-        html_block = f"{html_hint}\n\n" if html_hint else ""
-        research_block = f"{research_hint}\n\n" if research_hint else ""
         return (
             f"You are a coding agent running in isolated session workspace {self.files_root}. "
             f"Session absolute writable root is {self.files_root}. "
@@ -8667,6 +9590,8 @@ class SessionState:
             "The '/workspace/...' form is only a virtual alias for path arguments; never create OS-level /workspace in shell. "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect files, execute commands, and edit code safely. "
+            "When validate.py, test files, spec docs, or example outputs exist or are referenced, read them first and treat them as the acceptance contract before editing. "
+            "Never translate or paraphrase required literals, headings, assertion needles, or example strings taken from validate/spec/test files; reproduce contract-critical strings verbatim. "
             f"{route_hint}"
             f"{budget_hint} "
             f"{todo_hint} "
@@ -8678,10 +9603,17 @@ class SessionState:
             "For multi-step work use task_create/task_update/task_list as needed. "
             "Use load_skill only when needed; use provider:name if skill name is ambiguous. "
             "Loaded skill content is cached per session; do not repeatedly call load_skill for the same skill unless needed. "
-            "If execution stalls (no tool calls / repeated failures), load_skill('execution-degradation-recovery') and follow it. "
+            "After one successful load_skill call, stop using skill discovery tools until you make grounded workspace progress or finish the pending validation loop. "
+            "Support/meta tools such as load_skill, list_skills, TodoWrite, or compress do not count as concrete execution by themselves; "
+            "after using them, continue in the same turn with a grounding, editing, validation, or collaboration tool. "
+            "Use the smallest relevant skill only when the current step is blocked by a missing capability. "
+            "Do not preload multiple skills or follow a fixed skill sequence. "
+            "If execution stalls (no tool calls / repeated failures), prefer load_skill('execution-degradation-recovery') and follow it. "
             "Use list_skill_providers and list_skill_protocols to inspect dynamic backend skill integrations. "
             "If user asks to save generated guidance/workflow as reusable skill, call write_skill to write SKILL.md under global ./skills. "
             "When changing files, prefer write_file/edit_file so the UI can render line-level diffs. "
+            "If the task capsule lists missing_artifacts, treat those exact paths as the primary contract and create/edit them before extra shell exploration. "
+            "Directory-only shell commands such as ls/find/mkdir do not satisfy a missing_artifacts contract by themselves. "
             "If a write_file/edit_file tool call fails due malformed or truncated arguments, regenerate and resend the complete JSON arguments. "
             "If output or tool arguments look truncated, split work into smaller subtasks and execute one subtask at a time. "
             "If context has been compacted, call context_recall to fetch exact archived messages by segment_id/query before guessing. "
@@ -8689,8 +9621,6 @@ class SessionState:
             f"Current context upper bound is ~{self.context_token_upper_bound} tokens; keep steps compact to stay under this limit. "
             "When user asks to modify uploaded content, prioritize files under the uploaded workspace paths.\n\n"
             "If user asks to generate image/audio/video, use generate_media when active model capability supports it.\n\n"
-            f"{html_block}"
-            f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploaded files context:\n{uploads_ctx}\n\n"
             f"Available skills:\n{self.skills.descriptions()}"
@@ -8713,12 +9643,25 @@ class SessionState:
             "used_percent": used_pct,
         }
 
+    def _session_compression_profile(self) -> dict[str, object]:
+        return session_compression_profile(
+            normalize_session_compression_level(
+                getattr(self, "session_compression_level", DEFAULT_SESSION_COMPRESSION_LEVEL),
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            )
+        )
+
     def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
         self._microcompact()
         metrics = self._context_budget_metrics()
         used = int(metrics.get("used", 0) or 0)
         limit = max(1, int(metrics.get("limit", 0) or 0))
-        if used < limit:
+        profile = self._session_compression_profile()
+        proactive_ratio = float(profile.get("proactive_trigger_ratio", 0.92) or 0.92)
+        proactive_limit = max(1, int(limit * proactive_ratio))
+        hard_trigger = used >= limit
+        proactive_trigger = used >= proactive_limit
+        if not hard_trigger and not proactive_trigger:
             return False
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
@@ -9483,6 +10426,7 @@ class SessionState:
     def _summarize_compact_rows(self, rows: list[dict]) -> str:
         if not rows:
             return "(no archived rows)"
+        profile = self._session_compression_profile()
         snippet = json_dumps(rows)[-96_000:]
         try:
             resp = self.ollama.chat(
@@ -9490,17 +10434,20 @@ class SessionState:
                     {
                         "role": "user",
                         "content": (
-                            "Summarize unfinished work, key decisions, and pending next actions in <= 10 bullets.\n"
+                            "Summarize archived context for future continuation.\n"
+                            "Keep unfinished goals, active plan links, recent concrete file/evidence changes, and pending next actions more detailed.\n"
+                            "Compress older completed work and stale details more aggressively.\n"
+                            "Return <= 10 bullets.\n"
                             f"{snippet}"
                         ),
                     }
                 ],
-                max_tokens=900,
+                max_tokens=max(320, int(profile.get("compact_summary_tokens", 860) or 860)),
                 think=False,
             )
             text = str(resp.get("content", "")).strip()
             if text:
-                return trim(text, 4000)
+                return trim(text, int(profile.get("summary_chars", 3800) or 3800))
         except Exception as exc:
             return f"(summary failed: {exc})"
         return "(summary unavailable)"
@@ -9562,13 +10509,37 @@ class SessionState:
         with transcript_path.open("w", encoding="utf-8") as handle:
             for msg in self.messages:
                 handle.write(json_dumps(msg) + "\n")
-        tail_budget = max(4500, min(16_000, int(self.context_token_upper_bound * 0.35)))
-        tail = self._select_compact_tail(tail_budget)
+        profile = self._session_compression_profile()
+        recent_chain_items = max(3, int(profile.get("recent_chain_items", 6) or 6))
+        tail_budget = max(
+            int(profile.get("tail_min", 5200) or 5200),
+            min(
+                int(profile.get("tail_max", 18000) or 18000),
+                int(self.context_token_upper_bound * float(profile.get("tail_ratio", 0.46) or 0.46)),
+            ),
+        )
+        tail = self._select_compact_tail(
+            tail_budget,
+            min_count=max(5, recent_chain_items),
+            max_count=max(18, recent_chain_items * 7),
+        )
         if len(tail) >= len(self.messages):
-            tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
+            tail = self._select_compact_tail(
+                max(2200, int(tail_budget * 0.62)),
+                min_count=max(4, recent_chain_items - 1),
+                max_count=max(14, recent_chain_items * 5),
+            )
         archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
         seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
         summary = self._summarize_compact_rows(archived_rows)
+        board = self._ensure_blackboard()
+        board = self._refresh_memory_capsule(
+            board,
+            archived_summary=summary,
+            archived_segment=seg,
+            archived_message_count=len(archived_rows),
+        )
+        self.blackboard = board
         seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
         seg_msg_count = int(seg.get("messages", 0) or 0) if isinstance(seg, dict) else 0
         seg_path = str(seg.get("path", "")) if isinstance(seg, dict) else ""
@@ -9577,26 +10548,42 @@ class SessionState:
             if seg_id
             else "If details are missing, call context_recall with recent_segments=2."
         )
+        memory_md = self._memory_capsule_markdown(
+            board,
+            max_items=max(4, int(profile.get("open_work_items", 6) or 6)),
+            include_history=True,
+        )
         compact_note = (
             "<compact-resume>\n"
             f"reason: {reason}\n"
+            f"compression_level: {normalize_session_compression_level(self.session_compression_level, default=DEFAULT_SESSION_COMPRESSION_LEVEL)} "
+            f"({trim(str(profile.get('label', '') or '').strip(), 40)})\n"
             f"transcript: {transcript_path}\n"
             f"archive_segment: {seg_id or 'none'} messages={seg_msg_count} path={seg_path or '-'}\n"
             f"{self._open_work_brief()}\n"
+            f"{memory_md}\n"
             f"summary:\n{summary}\n"
             f"{continuation}\n"
             "Continue exploring from current pending work; do not restart from scratch.\n"
             "</compact-resume>"
         )
         tail.append({"role": "user", "content": compact_note, "ts": now_ts()})
-        target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
-        while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
+        target_tokens = max(
+            3200,
+            min(
+                int(profile.get("tail_max", 18000) or 18000),
+                int(self.context_token_upper_bound * float(profile.get("target_ratio", 0.56) or 0.56)),
+            ),
+        )
+        while len(tail) > max(4, recent_chain_items) and self._estimate_messages_tokens(tail) > target_tokens:
             tail.pop(0)
         if self._estimate_messages_tokens(tail) > target_tokens:
             for msg in tail:
                 if msg.get("role") == "tool":
                     msg["content"] = trim(msg.get("content", ""), 1800)
-            while len(tail) > 2 and self._estimate_messages_tokens(tail) > target_tokens:
+                elif msg.get("role") == "system":
+                    msg["content"] = trim(msg.get("content", ""), 1200)
+            while len(tail) > 3 and self._estimate_messages_tokens(tail) > target_tokens:
                 tail.pop(0)
         self.messages = tail
         self.last_compact_reason = str(reason or "")
@@ -9672,9 +10659,15 @@ class SessionState:
             return rel or "."
         candidate = Path(raw)
         if candidate.is_absolute():
-            raise ValueError(
-                "illegal absolute path. use relative path or '/workspace/<relative>' only"
-            )
+            try:
+                resolved = candidate.resolve()
+                root = self.files_root.resolve()
+                rel = resolved.relative_to(root).as_posix()
+                return rel or "."
+            except Exception:
+                raise ValueError(
+                    "illegal absolute path. use relative path or '/workspace/<relative>' only"
+                )
         norm = candidate.as_posix().strip()
         if not norm:
             raise ValueError("path is required")
@@ -9689,6 +10682,11 @@ class SessionState:
         low = txt.lower()
         if low in {"/workspace", "/workspace/"} or low.startswith("/workspace/"):
             return ""
+        try:
+            Path(txt).resolve().relative_to(self.files_root.resolve())
+            return ""
+        except Exception:
+            pass
         return (
             "Error: illegal absolute path for agent tool call. "
             "Use relative path or '/workspace/<relative>' only."
@@ -10089,7 +11087,34 @@ class SessionState:
                 continue
         return data.decode("latin-1", errors="ignore")
 
-    def _extract_pdf_text(self, pdf_path: Path) -> str:
+    def _extract_pdf_text_details(self, pdf_path: Path) -> tuple[str, str]:
+        if ensure_pdfminer_available(auto_install=True):
+            try:
+                from pdfminer.high_level import extract_text as pdfminer_extract_text  # type: ignore
+
+                text = str(pdfminer_extract_text(str(pdf_path)) or "").strip()
+                if text:
+                    return trim(text, UPLOAD_PARSED_TEXT_MAX_CHARS), "pdfminer"
+            except Exception:
+                pass
+        if self._module_available("fitz"):
+            try:
+                import fitz  # type: ignore
+
+                doc = fitz.open(str(pdf_path))
+                try:
+                    parts: list[str] = []
+                    for page in doc:
+                        page_text = str(page.get_text("text") or "").strip()
+                        if page_text:
+                            parts.append(page_text)
+                    merged = "\n\n".join(parts).strip()
+                    if merged:
+                        return trim(merged, UPLOAD_PARSED_TEXT_MAX_CHARS), "pymupdf"
+                finally:
+                    doc.close()
+            except Exception:
+                pass
         tool = shutil.which("pdftotext")
         if tool:
             try:
@@ -10100,7 +11125,7 @@ class SessionState:
                     timeout=45,
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return r.stdout.strip()
+                    return trim(r.stdout.strip(), UPLOAD_PARSED_TEXT_MAX_CHARS), "pdftotext"
             except Exception:
                 pass
         try:
@@ -10108,9 +11133,12 @@ class SessionState:
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
             merged = "\n".join(chunks)
-            return trim(merged, 24_000)
+            return trim(merged, UPLOAD_PARSED_TEXT_MAX_CHARS), "latin1-strings"
         except Exception:
-            return ""
+            return "", "none"
+
+    def _extract_pdf_text(self, pdf_path: Path) -> str:
+        return self._extract_pdf_text_details(pdf_path)[0]
 
     def _module_available(self, name: str) -> bool:
         try:
@@ -10142,13 +11170,13 @@ class SessionState:
     def _extract_strings_fallback(self, fp: Path, min_len: int = 4) -> str:
         text = self._run_text_extractor_cmd(["strings", "-n", str(min_len), str(fp)], timeout=30)
         if text:
-            return trim(text, 24_000)
+            return trim(text, UPLOAD_PARSED_TEXT_MAX_CHARS)
         try:
             raw = fp.read_bytes().decode("latin-1", errors="ignore")
         except Exception:
             return ""
         chunks = re.findall(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff\s\-\_\.\,\:\;\(\)\[\]\/]{3,}", raw)
-        return trim("\n".join(chunks), 24_000)
+        return trim("\n".join(chunks), UPLOAD_PARSED_TEXT_MAX_CHARS)
 
     def _extract_xml_text_tokens(self, xml_text: str, local_names: tuple[str, ...] = ("t",)) -> list[str]:
         names = {x.lower() for x in local_names}
@@ -10199,7 +11227,7 @@ class SessionState:
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:180]
-        return trim("\n".join(table_lines), 24_000)
+        return trim("\n".join(table_lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
 
     def _extract_xlsx_text(self, fp: Path) -> str:
         if self._module_available("openpyxl"):
@@ -10221,7 +11249,7 @@ class SessionState:
                             break
                 wb.close()
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
             except Exception:
                 pass
         try:
@@ -10271,7 +11299,7 @@ class SessionState:
                     if len(lines) >= 600:
                         break
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -10297,12 +11325,12 @@ class SessionState:
                             lines.append("\t".join(vals))
                 wb.release_resources()
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
             except Exception:
                 pass
         xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
         if xls2csv_text:
-            return trim(xls2csv_text, 24_000)
+            return trim(xls2csv_text, UPLOAD_PARSED_TEXT_MAX_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_docx_text(self, fp: Path) -> str:
@@ -10323,7 +11351,7 @@ class SessionState:
                         if vals:
                             lines.append("\t".join(vals))
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
             except Exception:
                 pass
         try:
@@ -10339,7 +11367,7 @@ class SessionState:
                     if len(lines) >= 4000:
                         break
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -10352,7 +11380,7 @@ class SessionState:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 24_000)
+                return trim(out, UPLOAD_PARSED_TEXT_MAX_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_pptx_text(self, fp: Path) -> str:
@@ -10371,7 +11399,7 @@ class SessionState:
                         if text:
                             lines.append(text)
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
             except Exception:
                 pass
         try:
@@ -10385,7 +11413,7 @@ class SessionState:
                         lines.append(f"[Slide] {Path(name).stem}")
                         lines.extend(tokens[:600])
                 if lines:
-                    return trim("\n".join(lines), 24_000)
+                    return trim("\n".join(lines), UPLOAD_PARSED_TEXT_MAX_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -10397,8 +11425,162 @@ class SessionState:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 24_000)
+                return trim(out, UPLOAD_PARSED_TEXT_MAX_CHARS)
         return self._extract_strings_fallback(fp)
+
+    def _upload_parsed_dir(self, upload_id: str) -> Path:
+        target = self.files_root / "uploaded_parsed" / self._safe_upload_name(upload_id or "upload")
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _render_parsed_upload_markdown(
+        self,
+        *,
+        filename: str,
+        kind: str,
+        source_path: str,
+        parser: str,
+        parsed_text: str,
+        metadata: dict,
+    ) -> str:
+        name = Path(str(filename or "")).name.lower()
+        lines = [
+            f"# Parsed Upload: {filename}",
+            "",
+            f"- kind: {kind or 'file'}",
+            f"- source: {source_path or '(none)'}",
+            f"- parser: {parser or 'unknown'}",
+            f"- parsed_chars: {len(str(parsed_text or ''))}",
+            f"- metadata_path_hint: {metadata.get('metadata_path_hint', '')}",
+            "",
+            "## Content",
+            "",
+        ]
+        content = str(parsed_text or "").strip()
+        if not content:
+            lines.append("(no parsed text available)")
+        elif is_markdown_like_upload_candidate(name):
+            lines.append(content)
+        else:
+            lang = upload_code_fence_language(name) or "text"
+            lines.append(f"```{lang}")
+            lines.append(content)
+            lines.append("```")
+        return "\n".join(lines)
+
+    def _parse_upload_payload(self, stored: Path, raw: bytes, mime: str = "") -> dict:
+        ext = stored.suffix.lower()
+        lower_name = stored.name.lower()
+        mime_low = str(mime or "").strip().lower()
+        parsed_text = ""
+        kind = "binary"
+        parser = "none"
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            kind = "image"
+        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            kind = "video"
+        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            kind = "audio"
+        elif ext == ".pdf" or "pdf" in mime_low:
+            kind = "pdf"
+            parsed_text, parser = self._extract_pdf_text_details(stored)
+        elif ext == ".csv":
+            kind = "csv"
+            parser = "csv"
+            parsed_text = self._extract_csv_text(raw)
+        elif ext == ".xlsx":
+            kind = "excel"
+            parser = "xlsx"
+            parsed_text = self._extract_xlsx_text(stored)
+        elif ext == ".xls":
+            kind = "excel"
+            parser = "xls"
+            parsed_text = self._extract_xls_text(stored)
+        elif ext == ".pptx":
+            kind = "presentation"
+            parser = "pptx"
+            parsed_text = self._extract_pptx_text(stored)
+        elif ext == ".ppt":
+            kind = "presentation"
+            parser = "ppt"
+            parsed_text = self._extract_ppt_text(stored)
+        elif ext == ".docx":
+            kind = "document"
+            parser = "docx"
+            parsed_text = self._extract_docx_text(stored)
+        elif ext == ".doc":
+            kind = "document"
+            parser = "doc"
+            parsed_text = self._extract_doc_text(stored)
+        elif (
+            is_textual_upload_candidate(lower_name)
+            or mime_low.startswith("text/")
+            or "json" in mime_low
+            or looks_like_textual_bytes(raw)
+        ):
+            kind = "text"
+            parser = "markdown-text" if is_markdown_like_upload_candidate(lower_name) else "text"
+            parsed_text = trim(self._decode_text_bytes(raw), UPLOAD_PARSED_TEXT_MAX_CHARS)
+        return {
+            "ext": ext,
+            "kind": kind,
+            "parser": parser,
+            "parsed_text": trim(parsed_text, UPLOAD_PARSED_TEXT_MAX_CHARS),
+        }
+
+    def _write_upload_parsed_artifacts(
+        self,
+        *,
+        upload_id: str,
+        filename: str,
+        kind: str,
+        source_workspace_path: str,
+        parser: str,
+        mime: str,
+        parsed_text: str,
+    ) -> dict:
+        content = str(parsed_text or "")
+        if not content.strip():
+            return {
+                "parsed_text_path": "",
+                "parsed_markdown_path": "",
+                "parsed_metadata_path": "",
+                "parser": str(parser or "none"),
+            }
+        target_dir = self._upload_parsed_dir(upload_id)
+        text_path = target_dir / "content.txt"
+        md_path = target_dir / "content.md"
+        meta_path = target_dir / "metadata.json"
+        metadata = {
+            "upload_id": upload_id,
+            "filename": filename,
+            "kind": kind,
+            "mime": mime or guess_mime_from_name(filename, "application/octet-stream"),
+            "parser": str(parser or "unknown"),
+            "source_workspace_path": source_workspace_path,
+            "parsed_chars": len(content),
+            "parsed_at": float(now_ts()),
+            "metadata_path_hint": self._session_rel(meta_path),
+        }
+        _write_text_if_changed(text_path, content)
+        _write_text_if_changed(
+            md_path,
+            self._render_parsed_upload_markdown(
+                filename=filename,
+                kind=kind,
+                source_path=source_workspace_path,
+                parser=str(parser or "unknown"),
+                parsed_text=content,
+                metadata=metadata,
+            ),
+        )
+        _write_text_if_changed(meta_path, json_dumps(metadata, indent=2))
+        return {
+            "parsed_text_path": self._session_rel(text_path),
+            "parsed_markdown_path": self._session_rel(md_path),
+            "parsed_metadata_path": self._session_rel(meta_path),
+            "parser": str(parser or "unknown"),
+        }
 
     def _upload_workspace_target(self, safe_name: str) -> Path:
         base = self.files_root / "uploaded"
@@ -10415,7 +11597,7 @@ class SessionState:
                 return test
             i += 1
 
-    def _uploads_prompt_block(self, max_chars: int = 24_000) -> str:
+    def _uploads_prompt_block(self, max_chars: int = UPLOAD_PROMPT_EXCERPT_MAX_CHARS) -> str:
         with self.lock:
             items = list(self.uploads[-10:])
         if not items:
@@ -10423,15 +11605,28 @@ class SessionState:
         lines = []
         remaining = max_chars
         for item in items:
+            parsed_text_path = str(item.get("parsed_text_path", "") or "").strip()
+            parsed_md_path = str(item.get("parsed_markdown_path", "") or "").strip()
+            parsed_meta_path = str(item.get("parsed_metadata_path", "") or "").strip()
+            parser = str(item.get("parser", "") or "").strip()
             lines.append(
                 f"- {item.get('filename','')} => {item.get('workspace_path','')} "
                 f"({item.get('kind','file')}, {item.get('size',0)} bytes)"
             )
+            if parsed_text_path:
+                lines.append(f"  parsed_text: {parsed_text_path}")
+            if parsed_md_path:
+                lines.append(f"  parsed_markdown: {parsed_md_path}")
+            if parsed_meta_path:
+                lines.append(f"  parsed_metadata: {parsed_meta_path}")
+            if parser:
+                lines.append(f"  parser: {parser}")
             excerpt = str(item.get("parsed_excerpt", "")).strip()
             if not excerpt or remaining < 200:
                 continue
             chunk = excerpt[: min(len(excerpt), min(3000, remaining))]
-            lines.append(f"<uploaded_excerpt path=\"{item.get('workspace_path','')}\">")
+            preview_path = parsed_md_path or parsed_text_path or str(item.get("workspace_path", "") or "")
+            lines.append(f"<uploaded_excerpt path=\"{preview_path}\">")
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
@@ -10443,53 +11638,24 @@ class SessionState:
         stored = self.uploads_dir / f"{upload_id}_{safe_name}"
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_bytes(raw)
-        ext = stored.suffix.lower()
-        text_like_ext = {
-            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
-            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".sh", ".sql", ".html",
-            ".css", ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".cfg", ".md", ".txt",
-            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".csv",
-        }
-        parsed_excerpt = ""
-        kind = "binary"
-        mime_low = str(mime or "").strip().lower()
-        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
-            kind = "image"
-        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
-            kind = "video"
-        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
-            kind = "audio"
-        elif ext == ".pdf" or "pdf" in mime_low:
-            kind = "pdf"
-            parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
-        elif ext == ".csv":
-            kind = "csv"
-            parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
-        elif ext == ".xlsx":
-            kind = "excel"
-            parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
-        elif ext == ".xls":
-            kind = "excel"
-            parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
-        elif ext == ".pptx":
-            kind = "presentation"
-            parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
-        elif ext == ".ppt":
-            kind = "presentation"
-            parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
-        elif ext == ".docx":
-            kind = "document"
-            parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
-        elif ext == ".doc":
-            kind = "document"
-            parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
-        elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
-            kind = "text"
-            parsed_excerpt = trim(self._decode_text_bytes(raw), 24_000)
+        parsed = self._parse_upload_payload(stored, raw, mime)
+        kind = str(parsed.get("kind", "binary") or "binary")
+        parser = str(parsed.get("parser", "none") or "none")
+        parsed_text = str(parsed.get("parsed_text", "") or "")
+        parsed_excerpt = trim(parsed_text, UPLOAD_PROMPT_EXCERPT_MAX_CHARS)
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
         workspace_rel = self._session_rel(workspace_target)
+        parsed_artifacts = self._write_upload_parsed_artifacts(
+            upload_id=upload_id,
+            filename=safe_name,
+            kind=kind,
+            source_workspace_path=workspace_rel,
+            parser=parser,
+            mime=mime or "",
+            parsed_text=parsed_text,
+        )
         meta = {
             "id": upload_id,
             "filename": safe_name,
@@ -10501,8 +11667,56 @@ class SessionState:
             "stored_path": str(stored),
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
+            "parsed_text_path": parsed_artifacts.get("parsed_text_path", ""),
+            "parsed_markdown_path": parsed_artifacts.get("parsed_markdown_path", ""),
+            "parsed_metadata_path": parsed_artifacts.get("parsed_metadata_path", ""),
+            "parser": parsed_artifacts.get("parser", parser),
         }
         with self.lock:
+            if str(meta.get("parsed_text_path", "") or "").strip():
+                self._blackboard_upsert_linked_file(
+                    str(meta.get("parsed_text_path", "") or ""),
+                    label=f"parsed text: {safe_name}",
+                    kind="upload_parsed_text",
+                    source=workspace_rel,
+                    summary=f"Parsed text artifact for uploaded {kind} file {safe_name}",
+                    actor="system",
+                )
+            if str(meta.get("parsed_markdown_path", "") or "").strip():
+                self._blackboard_upsert_linked_file(
+                    str(meta.get("parsed_markdown_path", "") or ""),
+                    label=f"parsed markdown: {safe_name}",
+                    kind="upload_parsed_markdown",
+                    source=workspace_rel,
+                    summary=f"Parsed markdown artifact for uploaded {kind} file {safe_name}",
+                    actor="system",
+                )
+            if str(meta.get("parsed_metadata_path", "") or "").strip():
+                self._blackboard_upsert_linked_file(
+                    str(meta.get("parsed_metadata_path", "") or ""),
+                    label=f"parsed metadata: {safe_name}",
+                    kind="upload_parsed_metadata",
+                    source=workspace_rel,
+                    summary=f"Parser metadata for uploaded {kind} file {safe_name}",
+                    actor="system",
+                )
+            self._blackboard_append_section(
+                "research_notes",
+                "system",
+                (
+                    f"uploaded file linked: {safe_name} | source={workspace_rel}"
+                    + (
+                        f" | parsed_text={meta.get('parsed_text_path', '')}"
+                        if str(meta.get("parsed_text_path", "") or "").strip()
+                        else ""
+                    )
+                    + (
+                        f" | parsed_markdown={meta.get('parsed_markdown_path', '')}"
+                        if str(meta.get("parsed_markdown_path", "") or "").strip()
+                        else ""
+                    )
+                ),
+            )
             self.uploads.append(meta)
             self.uploads = self.uploads[-80:]
             self.updated_at = now_ts()
@@ -10510,18 +11724,23 @@ class SessionState:
         self._emit(
             "upload",
             {
+                "id": upload_id,
                 "filename": safe_name,
                 "workspace_path": workspace_rel,
                 "kind": kind,
                 "size": len(raw),
                 "summary": f"upload: {safe_name} -> {workspace_rel}",
-                "preview": trim(parsed_excerpt, 500),
+                "parser": str(meta.get("parser", "") or ""),
+                "parsed_text_path": str(meta.get("parsed_text_path", "") or ""),
+                "parsed_markdown_path": str(meta.get("parsed_markdown_path", "") or ""),
+                "parsed_metadata_path": str(meta.get("parsed_metadata_path", "") or ""),
+                "preview": trim(parsed_excerpt, min(500, UPLOAD_PREVIEW_MAX_CHARS)),
             },
         )
         loaded_config = None
         low_name = safe_name.lower()
         cfg_obj = {}
-        if ext == ".json" or "json" in (mime or "").lower() or "config" in low_name:
+        if str(parsed.get("ext", "") or "") == ".json" or "json" in (mime or "").lower() or "config" in low_name:
             cfg_text = self._decode_text_bytes(raw)
             cfg_obj = parse_json_object(cfg_text, {})
         named_config = (
@@ -10538,7 +11757,11 @@ class SessionState:
             "kind": kind,
             "size": len(raw),
             "uploaded_at": meta["uploaded_at"],
-            "preview": trim(parsed_excerpt, 1200),
+            "preview": trim(parsed_excerpt, UPLOAD_PREVIEW_MAX_CHARS),
+            "parsed_text_path": str(meta.get("parsed_text_path", "") or ""),
+            "parsed_markdown_path": str(meta.get("parsed_markdown_path", "") or ""),
+            "parsed_metadata_path": str(meta.get("parsed_metadata_path", "") or ""),
+            "parser": str(meta.get("parser", "") or ""),
             "model_catalog": loaded_config,
         }
 
@@ -11141,12 +12364,9 @@ class SessionState:
         t = (text or "").strip().lower()
         if not t:
             return False
-        if len(t) >= 120:
+        if len(t) >= 220:
             return True
         markers = [
-            "实现",
-            "修复",
-            "重构",
             "设计",
             "构建",
             "架构",
@@ -11163,128 +12383,58 @@ class SessionState:
             "decomposition",
             "workflow",
             "architecture",
-            "build",
-            "implement",
-            "refactor",
-            "fix",
-            "debug",
             "multi-step",
+            "orchestrator",
+            "blackboard",
+            "multi-agent",
         ]
         return any(x in t for x in markers)
 
     def _infer_task_profile(self, goal: str) -> dict:
         clean = strip_thinking_content(str(goal or "")).strip()
-        low = clean.lower()
         nontrivial = self._looks_nontrivial_request(clean)
         direct_question = self._looks_like_direct_question_request(clean)
-        code_markers = [
-            "代码",
-            "寫代碼",
-            "写代码",
-            "文件",
-            "脚本",
-            "模块",
-            "函数",
-            "class",
-            "bug",
-            "修复",
-            "实现",
-            "重构",
-            "app.py",
-            "crawler.py",
-            ".py",
-            ".js",
-            ".ts",
-            ".html",
-            "python",
-            "javascript",
-            "bash",
-            "terminal",
-            "tool",
-            "patch",
-            "edit",
-            "write_file",
-            "read_file",
-            "build",
-            "implement",
-            "fix",
-            "refactor",
-            "debug",
-        ]
-        research_markers = [
-            "分析",
-            "调研",
-            "研究",
-            "白皮书",
-            "论文",
-            "report",
-            "analysis",
-            "research",
-            "investigate",
-        ]
-        has_code_intent = any(x in low for x in code_markers)
-        has_research_intent = any(x in low for x in research_markers)
         length = len(clean)
-        if direct_question and (not nontrivial) and (not has_code_intent) and length <= 220:
+        direct_objective = self._primary_objective_text(goal=clean, preferred="", max_chars=800)
+        if direct_question and (not nontrivial) and length <= 180:
             return {
-                "task_type": "simple_qa",
+                "task_type": "general",
                 "complexity": "simple",
-                "direct_objective": (
-                    "Directly answer the user question in natural language. "
-                    "Do not create or edit files unless explicitly requested."
-                ),
+                "direct_objective": direct_objective,
                 "recommended_agents": ["developer"],
-                "round_budget": 2,
-                "reason": "short direct question with no code intent",
+                "round_budget": 3,
+                "reason": "short direct request",
                 "goal_chars": int(length),
                 "updated_at": float(now_ts()),
             }
-        if has_code_intent and (not nontrivial) and length <= 260:
+        if (not nontrivial) and length <= 240:
             return {
-                "task_type": "simple_code",
+                "task_type": "general",
                 "complexity": "simple",
-                "direct_objective": (
-                    "Deliver one minimal concrete code change, run one quick verification, then conclude."
-                ),
-                "recommended_agents": ["developer", "reviewer"],
-                "round_budget": 5,
-                "reason": "small scoped code-oriented request",
+                "direct_objective": direct_objective,
+                "recommended_agents": ["developer"],
+                "round_budget": 4,
+                "reason": "bounded lightweight request",
                 "goal_chars": int(length),
                 "updated_at": float(now_ts()),
             }
-        if has_research_intent and (not has_code_intent):
+        if nontrivial or length >= 240:
             return {
-                "task_type": "research",
-                "complexity": "complex" if (nontrivial or length >= 280) else "simple",
-                "direct_objective": "Collect evidence first, then synthesize a concise actionable answer.",
-                "recommended_agents": ["explorer", "developer", "reviewer"],
-                "round_budget": 10 if (nontrivial or length >= 280) else 6,
-                "reason": "research/evidence intent detected",
-                "goal_chars": int(length),
-                "updated_at": float(now_ts()),
-            }
-        if nontrivial or has_code_intent or length >= 280:
-            return {
-                "task_type": "engineering",
+                "task_type": "general",
                 "complexity": "complex",
-                "direct_objective": (
-                    "Use blackboard collaboration to implement, validate, and converge with concrete outputs."
-                ),
+                "direct_objective": direct_objective,
                 "recommended_agents": ["explorer", "developer", "reviewer"],
-                "round_budget": 14,
-                "reason": "multi-step engineering characteristics detected",
+                "round_budget": 12,
+                "reason": "broad or multi-step request",
                 "goal_chars": int(length),
                 "updated_at": float(now_ts()),
             }
         return {
             "task_type": "general",
             "complexity": "simple",
-            "direct_objective": (
-                "Provide the most direct useful response with minimal orchestration, "
-                "anchored to the current project context and user goal."
-            ),
+            "direct_objective": direct_objective,
             "recommended_agents": ["developer"],
-            "round_budget": 3,
+            "round_budget": 4,
             "reason": "default lightweight profile",
             "goal_chars": int(length),
             "updated_at": float(now_ts()),
@@ -11792,7 +12942,35 @@ class SessionState:
             "Use relative paths in session workspace, or use write_skill for skills."
         )
 
+    def _rewrite_shell_workspace_alias(self, command: str, cwd: Path) -> str:
+        raw = str(command or "")
+        base = cwd.resolve()
+        text = raw
+        if "/workspace" in text:
+            pattern = re.compile(r"/workspace(?P<suffix>(?:/[^\s\"'`;|&()<>]*)?)")
+
+            def _replace(match: re.Match) -> str:
+                suffix = str(match.group("suffix") or "")
+                target = (base / suffix.lstrip("/")).resolve() if suffix else base
+                return shlex.quote(str(target))
+
+            text = pattern.sub(_replace, text)
+        base_text = str(base)
+        if " " in base_text:
+            abs_pattern = re.compile(
+                rf"(?<![\"']){re.escape(base_text)}(?P<suffix>(?:/[^\s\"'`;|&()<>]*)?)"
+            )
+
+            def _replace_abs(match: re.Match) -> str:
+                suffix = str(match.group("suffix") or "")
+                target = f"{base_text}{suffix}"
+                return shlex.quote(target)
+
+            text = abs_pattern.sub(_replace_abs, text)
+        return text
+
     def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
+        command = self._rewrite_shell_workspace_alias(command, cwd)
         meta = {
             "command": command,
             "cwd": str(cwd),
@@ -12442,44 +13620,10 @@ class SessionState:
         return f"Plan {req['status']} for '{req['from']}'"
 
     def _is_html_frontend_goal(self, text: str) -> bool:
-        probe = str(text or "").strip().lower()
-        if not probe:
-            return False
-        for key in HTML_FRONTEND_REQUEST_KEYWORDS:
-            k = str(key or "").strip().lower()
-            if k and k in probe:
-                return True
         return False
 
     def _html_frontend_boost_instruction(self) -> str:
-        goal = self._latest_user_goal_text()
-        if not self._is_html_frontend_goal(goal):
-            return ""
-        index = load_offline_js_lib_index(self.js_lib_root)
-        available_rows = [
-            str(item.get("id", "")).strip()
-            for item in (index.get("libs", []) if isinstance(index, dict) else [])
-            if isinstance(item, dict) and bool(item.get("available", False))
-        ]
-        libs_hint = ", ".join([x for x in available_rows if x][:10]) if available_rows else "none"
-        return (
-            "Current task is likely frontend/html/report oriented. "
-            "Load specialized skills when needed: "
-            "load_skill('html-report-engineering'), "
-            "load_skill('frontend-composition-algorithm'), "
-            "load_skill('visualization-report-pipeline'), "
-            "load_skill('offline-html-js-bundling'). "
-            "Use this build algorithm: "
-            "1) define audience + acceptance criteria; "
-            "2) draft information architecture; "
-            "3) scaffold semantic HTML; "
-            "4) apply CSS tokens + responsive layout; "
-            "5) wire JS state/data interactions; "
-            "6) localize external JS dependencies to ./js from ./js_lib; "
-            "7) run QA loop for desktop/mobile/a11y/performance and iterate. "
-            f"Offline JS libs available now: {libs_hint}. "
-            "Final exported HTML should avoid unresolved CDN-only script src."
-        )
+        return ""
 
     def _contains_any_keyword(self, text: str, keywords: tuple[str, ...]) -> bool:
         probe = str(text or "").strip().lower()
@@ -12492,7 +13636,7 @@ class SessionState:
         return False
 
     def _is_deep_research_goal(self, text: str) -> bool:
-        return self._contains_any_keyword(text, DEEP_RESEARCH_REQUEST_KEYWORDS)
+        return False
 
     def _http_probe_ok(self, url: str, timeout: float = 4.0) -> bool:
         target = str(url or "").strip()
@@ -12552,45 +13696,10 @@ class SessionState:
         return payload
 
     def _detect_deep_research_mode(self, text: str) -> str:
-        goal = str(text or "").strip()
-        if not self._is_deep_research_goal(goal):
-            return ""
-        force_text_only = self._contains_any_keyword(goal, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS)
-        retrieval_requested = self._contains_any_keyword(goal, DEEP_RESEARCH_RETRIEVAL_KEYWORDS)
-        if force_text_only and (not retrieval_requested):
-            return "text_deep_analysis"
-        if retrieval_requested:
-            probe = self._probe_live_search_runtime(force=False)
-            return "retrieval_integrated_online" if bool(probe.get("search_ok", False)) else "retrieval_integrated_simulated"
-        return "text_deep_analysis"
+        return ""
 
     def _deep_research_boost_instruction(self) -> str:
-        goal = self._latest_user_goal_text()
-        mode = self._detect_deep_research_mode(goal)
-        if not mode:
-            return ""
-        probe = self._probe_live_search_runtime(force=False)
-        if mode == "text_deep_analysis":
-            mode_hint = "Mode=text_deep_analysis (independent text deep analysis)."
-        elif mode == "retrieval_integrated_online":
-            mode_hint = "Mode=retrieval_integrated_online (internet retrieval synthesis)."
-        else:
-            mode_hint = (
-                "Mode=retrieval_integrated_simulated (internet/search unavailable; use model-knowledge simulated retrieval cards)."
-            )
-        return (
-            "Current task is deep-research oriented. "
-            "Load specialized skills when needed: "
-            "load_skill('deep-research-orchestrator'), "
-            "load_skill('retrieval-synthesis-fallback'), "
-            "load_skill('pdf-vision-literature-integrator'). "
-            f"{mode_hint} "
-            f"Search runtime probe: online_ok={bool(probe.get('online_ok', False))}, "
-            f"search_ok={bool(probe.get('search_ok', False))}, reason={probe.get('reason', '')}. "
-            "If analyzing PDF literature and image capability is available, integrate extracted PDF figures with textual evidence. "
-            "If model image-input capability is false, skip figure extraction and stay in text-only evidence mode. "
-            "Final output must be a structured markdown deep-analysis report."
-        )
+        return ""
 
     def _latest_user_goal_text(self) -> str:
         for msg in reversed(self.messages):
@@ -12604,63 +13713,95 @@ class SessionState:
             return trim(text.replace("\n", " "), 220)
         return "current task"
 
-    def _compose_default_direct_objective(self, base_objective: str, goal: str, task_type: str) -> str:
-        base = trim(str(base_objective or "").strip(), 520)
-        goal_clean = trim(strip_thinking_content(str(goal or "")).replace("\n", " ").strip(), 220)
-        path_hits = re.findall(
-            r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|java|go|rs|md|json|yaml|yml|toml|ini|sh|html|css|c|cpp|h)",
-            goal_clean,
+    def _objective_text_is_weak(self, text: str) -> bool:
+        clean = trim(strip_thinking_content(str(text or "")).replace("\n", " ").strip(), 800)
+        if not clean:
+            return True
+        low = clean.lower()
+        generic_markers = (
+            "use blackboard collaboration to ground the task",
+            "provide a direct useful answer or one minimal concrete action",
+            "make one bounded concrete advance, verify if applicable",
+            "provide the most direct useful response with minimal orchestration",
+            "proceed with direct semantic objective and concrete progress",
+            "advance the current user request",
+            "current request",
+            "current task",
         )
-        uniq_paths: list[str] = []
-        for item in path_hits:
-            one = trim(str(item or "").strip(), 80)
-            if one and one not in uniq_paths:
-                uniq_paths.append(one)
-            if len(uniq_paths) >= 3:
-                break
-        if uniq_paths:
-            anchor = f" Project anchors: {', '.join(uniq_paths)}."
-        elif goal_clean:
-            anchor = f" Project anchor: {goal_clean}."
-        else:
-            anchor = " Project anchor: current repository context."
-        if task_type == "simple_qa":
-            postfix = " Keep orchestration lightweight and answer directly with project-aware specifics."
-        else:
-            postfix = (
-                " Keep orchestration lightweight and execution-first. "
-                "Use bounded creativity for ambiguous details while preserving existing architecture and constraints."
+        if any(marker in low for marker in generic_markers):
+            return True
+        if len(clean) <= 24:
+            continuation_only = {
+                "continue",
+                "go on",
+                "keep going",
+                "继续",
+                "继续。",
+                "继续修改",
+                "继续测试",
+                "继续你的修改",
+                "继续你的计划",
+            }
+            if low in continuation_only:
+                return True
+        return False
+
+    def _prune_satisfied_objective_prefixes(self, text: str, *, max_chars: int = 800) -> str:
+        clean = trim(strip_thinking_content(str(text or "")).replace("\n", " ").strip(), max_chars)
+        if not clean:
+            return ""
+        original = clean
+        if self._skill_discovery_already_satisfied():
+            patterns = (
+                r"(?is)^before editing files,\s*call load_skill[^.?!。！？]*[.?!。！？]\s*",
+                r"(?is)^在编辑文件之前[^。！？]*load_skill[^。！？]*[。！？]\s*",
             )
-        return trim(f"{base}{anchor}{postfix}", 800)
+            for pat in patterns:
+                clean = re.sub(pat, "", clean, count=1).strip()
+            clean = re.sub(r"(?is)^(then|然后)\s+", "", clean).strip()
+        return trim(clean or original, max_chars)
+
+    def _primary_objective_text(self, goal: str = "", preferred: str = "", *, max_chars: int = 800) -> str:
+        goal_clean = trim(strip_thinking_content(str(goal or "")).replace("\n", " ").strip(), max_chars)
+        preferred_clean = trim(strip_thinking_content(str(preferred or "")).replace("\n", " ").strip(), max_chars)
+        board_goal = ""
+        try:
+            board_goal = trim(
+                strip_thinking_content(str((self.blackboard or {}).get("original_goal", "") or "")).replace("\n", " ").strip(),
+                max_chars,
+            )
+        except Exception:
+            board_goal = ""
+        candidates: list[str] = []
+        for candidate in (goal_clean, preferred_clean, board_goal):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            if not self._objective_text_is_weak(candidate):
+                return self._prune_satisfied_objective_prefixes(candidate, max_chars=max_chars)
+        return self._prune_satisfied_objective_prefixes(
+            goal_clean or preferred_clean or board_goal or "current task",
+            max_chars=max_chars,
+        )
+
+    def _compose_default_direct_objective(self, base_objective: str, goal: str) -> str:
+        return self._primary_objective_text(goal=goal, preferred=base_objective, max_chars=800)
 
     def _normalize_task_profile(self, goal: str, raw: object) -> dict:
         base = self._infer_task_profile(goal)
         src = raw if isinstance(raw, dict) else {}
-        task_type = trim(
-            str(src.get("task_type", base.get("task_type", "general")) or "").strip().lower(),
-            40,
-        ) or str(base.get("task_type", "general"))
-        if task_type not in TASK_PROFILE_TYPES:
-            task_type = str(base.get("task_type", "general"))
+        task_type = self._normalize_task_type(
+            src.get("task_type", base.get("task_type", "general")),
+            default=str(base.get("task_type", "general") or "general"),
+        )
         complexity = str(src.get("complexity", base.get("complexity", "simple")) or "").strip().lower()
         if complexity not in TASK_COMPLEXITY_LEVELS:
             complexity = str(base.get("complexity", "simple"))
         src_direct_objective = trim(str(src.get("direct_objective", "") or "").strip(), 800)
-        legacy_objectives = {
-            "Provide the most direct useful response with minimal orchestration.",
-            (
-                "Provide the most direct useful response with minimal orchestration, "
-                "anchored to the current project context and user goal."
-            ),
-        }
-        if src_direct_objective and src_direct_objective not in legacy_objectives:
-            direct_objective = src_direct_objective
-        else:
-            direct_objective = self._compose_default_direct_objective(
-                str(base.get("direct_objective", "")),
-                goal,
-                task_type,
-            )
+        direct_objective = self._compose_default_direct_objective(
+            src_direct_objective or str(base.get("direct_objective", "")),
+            goal,
+        )
         rec_raw = src.get("recommended_agents", base.get("recommended_agents", []))
         recommended: list[str] = []
         if isinstance(rec_raw, list):
@@ -12676,14 +13817,13 @@ class SessionState:
         except Exception:
             raw_level = 0
         if raw_level not in TASK_LEVEL_CHOICES:
-            if task_type == "simple_qa":
-                raw_level = 1 if len(str(goal or "")) <= 180 else 2
-            elif task_type in {"simple_code", "research"} and complexity == "simple":
-                raw_level = 3
-            elif complexity == "complex":
+            goal_len = len(str(goal or "").strip())
+            if complexity == "complex":
                 raw_level = 4
-            else:
+            elif goal_len <= 180:
                 raw_level = 2
+            else:
+                raw_level = 3
         task_level = int(raw_level)
         level_policy = TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3])
         execution_mode = normalize_execution_mode(
@@ -12797,7 +13937,7 @@ class SessionState:
         gate_ok, _ = self._reviewer_approval_log_gate(bb)
         if not gate_ok:
             return False
-        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        feedback = self._actionable_review_feedback_rows(bb)
         if not feedback:
             return False
         txt = str((feedback[-1] or {}).get("content", "") if isinstance(feedback[-1], dict) else "").lower()
@@ -12814,17 +13954,83 @@ class SessionState:
             )
         )
 
+    def _review_feedback_row_is_pass_marker(self, text: str) -> bool:
+        low = trim(strip_thinking_content(str(text or "")).strip().lower(), 400)
+        if not low:
+            return False
+        if low.startswith("final_summary"):
+            return True
+        return any(
+            token in low
+            for token in (
+                "approved",
+                "review passed",
+                "tests passed",
+                "no issues found",
+                "验证通过",
+                "审核通过",
+                "已通过",
+            )
+        )
+
+    def _recent_execution_log_rows_since_latest_pass(
+        self,
+        board: dict | None = None,
+        *,
+        limit: int = 24,
+    ) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        tail = rows[-max(8, int(limit or 24)) :]
+        kept_rev: list[dict] = []
+        for row in reversed(tail):
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("content", "") or "").strip()
+            if not text:
+                continue
+            if self._execution_output_has_pass_marker(text):
+                break
+            kept_rev.append(row)
+        return list(reversed(kept_rev))
+
+    def _recent_review_feedback_rows_since_latest_pass(
+        self,
+        board: dict | None = None,
+        *,
+        limit: int = 24,
+    ) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        tail = rows[-max(8, int(limit or 24)) :]
+        kept_rev: list[dict] = []
+        for row in reversed(tail):
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("content", "") or "").strip()
+            if not text:
+                continue
+            if self._review_feedback_row_is_pass_marker(text):
+                break
+            kept_rev.append(row)
+        return list(reversed(kept_rev))
+
     def _manager_has_error_log(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        logs = self._recent_execution_log_rows_since_latest_pass(bb, limit=24)
         if not logs:
             return False
-        tail = "\n".join(
-            str((row or {}).get("content", "") or "")
-            for row in logs[-3:]
-            if isinstance(row, dict)
-        ).lower()
-        return any(tok in tail for tok in ("error", "failed", "traceback", "exception", "not found", "blocked"))
+        blockers = ("error", "failed", "traceback", "exception", "not found", "blocked")
+        for row in reversed(logs[-8:]):
+            if not isinstance(row, dict):
+                continue
+            text = str((row or {}).get("content", "") or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            if any(tok in low for tok in blockers):
+                return True
+        return False
 
     def _approval_is_stale_for_latest_user(
         self,
@@ -12924,16 +14130,6 @@ class SessionState:
         can_finish, _ = self._can_auto_finish_from_approval(bb)
         if can_finish:
             return "done"
-        profile = self._ensure_blackboard_task_profile(bb)
-        task_type = str(profile.get("task_type", "") or "")
-        if task_type == "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer")
-            if dev_text:
-                endpoint = self._detect_endpoint_intent(dev_text, None)
-                if bool(endpoint.get("matched", False)):
-                    return "almost_done"
-                return "in_progress"
-            return "initializing"
         if self._manager_has_error_log(bb):
             return "blocked"
         research_count = len(bb.get("research_notes", []) or [])
@@ -13017,7 +14213,7 @@ class SessionState:
         for idx, row in enumerate(rows[:WATCHDOG_MAX_DECOMPOSE_STEPS]):
             if not isinstance(row, dict):
                 continue
-            instruction = trim(
+            description = trim(
                 str(
                     row.get("description", "")
                     or row.get("instruction", "")
@@ -13027,6 +14223,7 @@ class SessionState:
                 ).strip(),
                 900,
             )
+            instruction = description
             if not instruction:
                 continue
             action_type = trim(str(row.get("action_type", "") or "").strip(), 80)
@@ -13034,27 +14231,39 @@ class SessionState:
                 row.get("target", row.get("owner", row.get("role", row.get("agent", ""))))
             )
             target = target or _infer_target(action_type, instruction)
-            if target == "developer" and "incremental" not in instruction.lower():
-                instruction = trim(
-                    (
-                        f"{instruction}\n"
-                        "Use incremental edits (append/targeted replace) instead of full-file overwrite unless unavoidable."
-                    ),
-                    1000,
-                )
             try:
                 step_no = int(row.get("step", idx + 1) or (idx + 1))
             except Exception:
                 step_no = idx + 1
+            try:
+                issued_at = float(
+                    row.get(
+                        "issued_at",
+                        row.get("created_at", row.get("updated_at", now_ts())),
+                    )
+                    or 0.0
+                )
+            except Exception:
+                issued_at = 0.0
+            if issued_at <= 0.0:
+                issued_at = float(now_ts())
+            try:
+                updated_at = float(row.get("updated_at", issued_at) or issued_at)
+            except Exception:
+                updated_at = issued_at
             out.append(
                 {
                     "step": max(1, step_no),
                     "target": target,
                     "action_type": action_type or "execute",
+                    "description": description,
                     "instruction": instruction,
                     "attempts": max(0, int(row.get("attempts", 0) or 0)),
+                    "reanchor_inserted": bool(row.get("reanchor_inserted", False)),
+                    "repair_inserted": bool(row.get("repair_inserted", False)),
                     "status": trim(str(row.get("status", "pending") or "pending").strip().lower(), 20) or "pending",
-                    "updated_at": float(now_ts()),
+                    "issued_at": issued_at,
+                    "updated_at": updated_at,
                 }
             )
         if not out:
@@ -13221,34 +14430,177 @@ class SessionState:
             str(board.get("original_goal", "") or "").strip(),
             280,
         )
+        direct_expected = self._goal_direct_expected_artifacts(str(board.get("original_goal", "") or ""))
+        missing_expected = list(self._goal_missing_expected_artifacts(board))[:3]
+        target_deliverables = list(missing_expected[:3] or direct_expected[:3])
+        feedback_rows = self._actionable_review_feedback_rows(board)
+        need_fix = bool(feedback_rows) and (not self._manager_feedback_passed_from_blackboard(board))
+        research_count = len(board.get("research_notes", []) or [])
+        code_count = len(board.get("code_artifacts", {}) or {})
+        has_material_outputs = bool(
+            code_count
+            or research_count
+            or len(board.get("execution_logs", []) or [])
+            or len(board.get("review_feedback", []) or [])
+        )
         raw = [
             {
                 "step": 1,
-                "action_type": "research",
+                "action_type": "ground",
                 "target": "explorer",
                 "description": (
-                    "Analyze the latest blocker quickly and write concrete constraints to blackboard "
-                    f"(trigger={trim(reason, 120)})."
-                ),
-            },
-            {
-                "step": 2,
-                "action_type": "implement",
-                "target": "developer",
-                "description": (
-                    "Implement one incremental fix for the current objective and provide verifiable tool output. "
-                    f"Objective: {objective}"
-                ),
-            },
-            {
-                "step": 3,
-                "action_type": "validate",
-                "target": "reviewer",
-                "description": (
-                    "Run one validation pass, provide pass/fix verdict with evidence, and handoff summary request if needed."
+                    "Analyze the latest blocker quickly, read validate/spec/tests if present, and write concrete "
+                    f"acceptance constraints to blackboard. Trigger: {trim(reason, 120)}."
                 ),
             },
         ]
+        if target_deliverables and (not need_fix):
+            for rel in target_deliverables:
+                raw.append(
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "implement",
+                        "target": "developer",
+                        "description": (
+                            f"Target path: {rel}. Create or update the current deliverable directly at that path and keep the objective explicit. "
+                            f"Objective: {objective}"
+                        ),
+                    }
+                )
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Validate the latest outputs with concrete evidence, run the nearest validator when present, "
+                            "and return pass/fix judgement."
+                        ),
+                    },
+                ]
+            )
+        elif need_fix:
+            fix_target = "developer" if (code_count > 0 or target_deliverables) else "explorer"
+            fix_target_prefix = f"Target path: {target_deliverables[0]}. " if target_deliverables else ""
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": ("implement" if fix_target == "developer" else "ground"),
+                        "target": fix_target,
+                        "description": (
+                            fix_target_prefix
+                            + (
+                                "Address the active review or validation gap with one concrete patch or output update."
+                                if fix_target == "developer"
+                                else "Address the active review or validation gap by refreshing the exact evidence set and narrowing the blocker."
+                            )
+                            + f" Objective: {objective}"
+                        ),
+                    },
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Review the updated outputs with concrete evidence and return one pass/fix judgement."
+                        ),
+                    },
+                ]
+            )
+        elif research_count > 0 and code_count == 0 and target_deliverables:
+            raw.append(
+                {
+                    "step": len(raw) + 1,
+                    "action_type": "implement",
+                    "target": "developer",
+                    "description": (
+                        f"Target path: {target_deliverables[0]}. Convert the grounded notes into a concrete deliverable update now. "
+                        f"Objective: {objective}"
+                    ),
+                }
+            )
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Validate the updated deliverable with concrete evidence and return pass/fix judgement."
+                        ),
+                    },
+                ]
+            )
+        elif research_count > 0 and code_count == 0:
+            raw.append(
+                {
+                    "step": len(raw) + 1,
+                    "action_type": "ground",
+                    "target": "explorer",
+                    "description": (
+                        "Turn the current grounded notes into one concise, executable support update with explicit constraints, "
+                        f"paths, or next-step guidance. Objective: {objective}"
+                    ),
+                }
+            )
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Review the latest grounded notes for coverage, consistency, and an executable next-step handoff."
+                        ),
+                    },
+                ]
+            )
+        elif has_material_outputs:
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "implement",
+                        "target": "developer",
+                        "description": (
+                            "Advance one concrete deliverable update for the current objective and keep the change easy to verify. "
+                            f"Objective: {objective}"
+                        ),
+                    },
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Validate the latest outputs with concrete evidence and return pass/fix judgement."
+                        ),
+                    },
+                ]
+            )
+        else:
+            raw.extend(
+                [
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "ground",
+                        "target": "explorer",
+                        "description": (
+                            "Turn the initial grounding into one narrowed execution plan with explicit acceptance notes and target paths. "
+                            f"Objective: {objective}"
+                        ),
+                    },
+                    {
+                        "step": len(raw) + 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            "Check that the narrowed plan is concrete, internally consistent, and ready for execution."
+                        ),
+                    },
+                ]
+            )
         return self._watchdog_normalize_steps(raw)
 
     def _watchdog_decompose_steps(self, board: dict, reason: str, *, pinned_selection: str) -> tuple[list[dict], str, str]:
@@ -13301,57 +14653,278 @@ class SessionState:
         step: dict | None,
         pinned_selection: str,
     ) -> bool:
-        dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
-        if bool(dq.get("active", False)):
-            return False
-        steps, snapshot, raw_text = self._watchdog_decompose_steps(
+        return self._adaptive_split_activate(
             board,
-            reason,
+            reason=reason,
             pinned_selection=pinned_selection,
+            source="watchdog",
+            role=role,
+            step=step,
         )
-        if not steps:
-            return False
-        dq = {
-            "active": True,
-            "trigger_reason": trim(str(reason or "").strip(), 200),
-            "created_at": float(now_ts()),
-            "cursor": 0,
-            "steps": steps,
-            "last_error": "",
-            "snapshot": trim(snapshot, 4000),
-            "decomposer_output": trim(raw_text, 2000),
-        }
-        wd = self._normalize_watchdog_state(board.get("watchdog", {}))
-        wd["trigger_count"] = max(0, int(wd.get("trigger_count", 0) or 0)) + 1
-        wd["last_trigger_reason"] = trim(str(reason or "").strip(), 200)
-        wd["last_trigger_ts"] = float(now_ts())
-        wd["intent_no_tool_streak"] = 0
-        wd["repeat_no_tool_streak"] = 0
-        board["watchdog"] = wd
-        board["decomposition_queue"] = dq
-        self.blackboard = board
-        self._blackboard_touch()
-        self._blackboard_history(
-            "manager",
-            trim(
-                (
-                    "watchdog triggered decomposition "
-                    f"(reason={reason}, role={self._sanitize_agent_role(role)}, "
-                    f"steps={len(steps)})"
-                ),
-                520,
-            ),
+
+    def _normalize_delegate_path_hint(self, path_text: str) -> str:
+        raw = str(path_text or "").strip().strip("'\"")
+        if not raw:
+            return ""
+        raw = raw.rstrip(".,;:!?)]}")
+        if not raw:
+            return ""
+        try:
+            norm = self._normalize_tool_path_text(raw)
+        except Exception:
+            norm = raw
+        return normalize_rel_preview_path(norm) or normalize_rel_preview_path(raw)
+
+    def _dedupe_delegate_instruction_text(
+        self,
+        text: str,
+        *,
+        trigger_reason: str = "",
+        action_type: str = "",
+        max_chars: int = 1200,
+    ) -> str:
+        src = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not src:
+            return ""
+        for tag in (
+            "manager-aim",
+            "task-capsule",
+            "blackboard-state",
+            "agent-message",
+            "manager-delegate",
+        ):
+            src = re.sub(
+                rf"(?is)<{tag}>\s*.*?\s*</{tag}>",
+                "",
+                src,
+            )
+        trigger = trim(str(trigger_reason or "").strip(), 180)
+        action = trim(str(action_type or "").strip(), 80)
+        trigger_pat = re.escape(trigger) if trigger else ""
+        action_pat = re.escape(action) if action else ""
+        capsule_prefixes = (
+            "- objective:",
+            "- current_status:",
+            "- work_mode:",
+            "- routing:",
+            "- delegated_step:",
+            "- memory_focus:",
+            "- next_action:",
+            "- recent_chain:",
+            "- active_files:",
+            "- pending_artifacts:",
+            "- contract_paths:",
+            "- latest_validation_failure:",
+            "- manager_judgement:",
         )
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    "watchdog triggered; switched to stateless executor queue "
-                    f"(reason={trim(reason, 90)}, steps={len(steps)})"
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in src.splitlines():
+            line = trim(re.sub(r"\s+", " ", str(raw_line or "").strip()), 1600)
+            if not line:
+                continue
+            low = line.lower()
+            if low.startswith("executor mode (stateless) step "):
+                continue
+            if trigger_pat:
+                line = re.sub(
+                    rf"\(\s*trigger\s*=\s*{trigger_pat}\s*\)",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
                 )
-            },
+                line = re.sub(
+                    rf"(?:(?<=^)|(?<=[\s,;(]))trigger\s*=\s*{trigger_pat}(?=$|[\s,.;:)])",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            if action_pat:
+                line = re.sub(
+                    rf"(?:(?<=^)|(?<=[\s,;(]))action_type\s*=\s*{action_pat}(?=$|[\s,.;:)])",
+                    "",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            line = re.sub(r"\(\s*\)", "", line)
+            line = re.sub(r"\s{2,}", " ", line)
+            line = re.sub(r"\s+([,.;:!?])", r"\1", line)
+            line = re.sub(r"([,;:]){2,}", r"\1", line)
+            line = trim(line.strip(" ,;"), 1200)
+            if not line:
+                continue
+            low = line.lower()
+            if low in {".", "-", ":"}:
+                continue
+            if low.startswith(capsule_prefixes):
+                continue
+            key = line.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+        return trim("\n".join(lines), max_chars)
+
+    def _delegate_display_compact_content(self, text: str, *, max_chars: int = 1200) -> str:
+        line = trim(re.sub(r"\s+", " ", str(text or "").strip()), max_chars * 2)
+        if not line:
+            return ""
+        line = re.sub(r"^\d+/\d+\s+\w+\s*->\s*\w+\s*\|\s*", "", line, flags=re.IGNORECASE)
+        for prefix in (
+            "current focus:",
+            "next action:",
+            "this turn:",
+            "direct objective:",
+        ):
+            if line.lower().startswith(prefix):
+                line = trim(line.split(":", 1)[1].strip(), max_chars * 2)
+                break
+        return trim(line, max_chars)
+
+    def _delegate_display_is_runtime_meta(self, text: str) -> bool:
+        low = self._delegate_display_compact_content(text, max_chars=800).lower()
+        if not low or low in {".", "-", ":"}:
+            return True
+        runtime_tokens = (
+            "write_to_blackboard",
+            "read_from_blackboard",
+            "load_skill",
+            "list_skills",
+            "list_skill_providers",
+            "list_skill_protocols",
+            "ask_colleague",
+            "tool_error",
+            "grounding budget",
+            "retry pending",
+            "retry note:",
+            "repeat-no-tool",
+            "intent-no-tool",
+            "state-stalled",
+            "keep scope narrow",
+            "one concrete tool call",
+            "update blackboard evidence",
+            "write concise acceptance notes to blackboard",
+            "write concrete acceptance constraints to blackboard",
+            "support/meta tools",
+            "suggestion-only text reply is forbidden",
         )
-        return True
+        return any(token in low for token in runtime_tokens)
+
+    def _delegate_instruction_display_text(
+        self,
+        text: str,
+        *,
+        objective: str = "",
+        max_chars: int = 900,
+    ) -> str:
+        src = self._dedupe_delegate_instruction_text(str(text or ""), max_chars=max_chars * 2)
+        if not src:
+            return ""
+        objective_clean = trim(str(objective or "").strip(), 800)
+        objective_low = objective_clean.lower()
+        hidden_prefixes = (
+            "executor mode (stateless) step ",
+            "retry note:",
+            "rules: execute one concrete tool call now",
+            "relevant runtime skills:",
+            "optional runtime skills if blocked:",
+            "skill discovery is already satisfied",
+            "runtime skill is already available for this run",
+            "use incremental edits (append/targeted replace)",
+            "mandatory execution:",
+            "stateless executor:",
+            "collaboration preference:",
+            "advance one concrete step and record evidence on the blackboard",
+            "return pass/fix judgement with evidence",
+            "exact contract literals that must remain verbatim when relevant:",
+            "expected deliverables are still missing:",
+        )
+        hidden_contains = (
+            "do not call load_skill/list_skills/list_skill_providers/list_skill_protocols again",
+            "support/meta tools alone",
+            "suggestion-only text reply is forbidden",
+        )
+        lines: list[str] = []
+        fallback_lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in src.splitlines():
+            line = trim(re.sub(r"\s+", " ", str(raw_line or "").strip()), 1600)
+            if not line:
+                continue
+            low = line.lower()
+            if low.startswith(hidden_prefixes):
+                continue
+            if any(token in low for token in hidden_contains):
+                continue
+            if low.startswith("objective:"):
+                continue
+            if low.startswith("direct objective:"):
+                line = self._delegate_display_compact_content(line, max_chars=1200)
+                low = line.lower()
+            if low.startswith(("blocking gap:", "latest validation failure:")):
+                blocker = self._delegate_display_compact_content(line, max_chars=1200)
+                if self._delegate_display_is_runtime_meta(blocker):
+                    continue
+                line = f"Latest blocker: {blocker}"
+                low = line.lower()
+            if low.startswith(("current focus:", "next action:", "this turn:")):
+                compact = self._delegate_display_compact_content(line, max_chars=1200)
+                if self._delegate_display_is_runtime_meta(compact):
+                    continue
+                line = compact
+                low = line.lower()
+            if low.startswith("exact target path(s) for this step:"):
+                line = "Target path: " + trim(line.split(":", 1)[1].strip(), 1200)
+                low = line.lower()
+            if low.startswith(("active paths:", "still missing:")):
+                target_paths = self._step_instruction_target_paths(line, limit=1)
+                if not target_paths:
+                    raw_hits = re.findall(
+                        r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h)",
+                        line,
+                    )
+                    for raw in raw_hits:
+                        rel = self._normalize_delegate_path_hint(str(raw or "").strip())
+                        if rel:
+                            target_paths.append(rel)
+                            break
+                if not target_paths:
+                    continue
+                line = f"Target path: {target_paths[0]}"
+                low = line.lower()
+            if objective_low and low == objective_low:
+                continue
+            if self._delegate_display_is_runtime_meta(line):
+                continue
+            key = line.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if low.startswith(
+                (
+                    "grounding is ready.",
+                    "implement one incremental patch.",
+                    "proceed with one concrete next step",
+                    "address review feedback with concrete code changes",
+                    "advance one concrete deliverable update",
+                    "take one bounded step only",
+                )
+            ):
+                fallback_lines.append(line)
+                continue
+            lines.append(line)
+        if not lines:
+            lines = fallback_lines[:2]
+        elif len(lines) < 2:
+            for item in fallback_lines:
+                if item.casefold() in seen:
+                    continue
+                lines.append(item)
+                if len(lines) >= 2:
+                    break
+        if not lines:
+            return trim(objective_clean, max_chars)
+        return trim("\n".join(lines[:3]), max_chars)
 
     def _watchdog_pick_executor_route(self, board: dict | None = None) -> tuple[dict, dict] | None:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -13378,26 +14951,80 @@ class SessionState:
         step_row = steps[cursor] if isinstance(steps[cursor], dict) else {}
         target = self._sanitize_agent_role(step_row.get("target", "")) or "developer"
         action_type = trim(str(step_row.get("action_type", "execute") or "execute").strip(), 80) or "execute"
-        step_instruction = trim(str(step_row.get("instruction", "") or "").strip(), 900)
+        step_instruction = self._dedupe_delegate_instruction_text(
+            trim(str(step_row.get("instruction", "") or "").strip(), 900),
+            trigger_reason="",
+            action_type="",
+            max_chars=900,
+        )
+        step_display = self._dedupe_delegate_instruction_text(
+            trim(
+                str(
+                    step_row.get("description", "")
+                    or step_row.get("instruction", "")
+                    or ""
+                ).strip(),
+                900,
+            ),
+            trigger_reason="",
+            action_type="",
+            max_chars=900,
+        )
         trigger_reason = trim(str(dq.get("trigger_reason", "") or "").strip(), 180)
+        retry_hint = trim(str(dq.get("last_error", "") or "").strip(), 280)
+        target_paths = self._step_instruction_target_paths(step_instruction, limit=3)
+        target_hint = (
+            "Exact target path(s) for this step: "
+            + ", ".join(target_paths[:3])
+            + ". Do not drift to another file or phase before these paths are satisfied."
+            if target_paths
+            else ""
+        )
         total = len(steps)
         current = cursor + 1
         profile = self._ensure_blackboard_task_profile(bb)
         task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = 3
+        instruction_lines: list[str] = []
+        step_marker = f"Current split step {current}/{total}."
+        if step_display and step_marker.lower() not in step_display.lower():
+            instruction_lines.append(step_marker)
+        if target_hint and target_hint.lower() not in step_instruction.lower():
+            instruction_lines.append(target_hint)
+        if retry_hint and retry_hint.lower() not in step_instruction.lower():
+            instruction_lines.append(f"Latest blocker: {retry_hint}")
+        if step_instruction:
+            instruction_lines.append(step_instruction)
+        direct_objective = self._primary_objective_text(
+            goal=str(bb.get("original_goal", "") or ""),
+            preferred=str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""),
+            max_chars=800,
+        )
+        if direct_objective and all(direct_objective.lower() not in str(line or "").lower() for line in instruction_lines):
+            instruction_lines.insert(0, f"Objective: {direct_objective}")
+        internal_instruction = self._dedupe_delegate_instruction_text(
+            "\n".join(line for line in instruction_lines if str(line or "").strip()),
+            trigger_reason=trigger_reason,
+            action_type=action_type,
+            max_chars=1200,
+        )
+        internal_instruction = self._merge_manager_live_instruction(
+            internal_instruction,
+            bb,
+            role=target,
+            require_check=bool(target == "reviewer"),
+            max_chars=1200,
+        ) or internal_instruction
         args = {
             "target": target,
-            "instruction": trim(
-                (
-                    f"Executor mode (stateless) step {current}/{total}. "
-                    f"trigger={trigger_reason or 'watchdog'}; action_type={action_type}.\n"
-                    f"{step_instruction}\n"
-                    "Rules: execute one concrete tool call now, keep scope narrow, "
-                    "and update blackboard evidence immediately."
-                ),
-                1200,
+            "instruction": internal_instruction,
+            "display_instruction": self._delegate_instruction_display_text(
+                step_display or internal_instruction,
+                objective=direct_objective,
+                max_chars=900,
             ),
+            "action_type": action_type,
             "task_level": int(task_level),
             "task_type": trim(str(profile.get("task_type", "general") or "general"), 40),
             "complexity": trim(str(profile.get("complexity", "simple") or "simple"), 20),
@@ -13407,7 +15034,7 @@ class SessionState:
                 200,
             ),
             "round_budget": int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0),
-            "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+            "direct_objective": direct_objective,
             "execution_mode": normalize_execution_mode(
                 profile.get("execution_mode", self._effective_execution_mode()),
                 default=self._effective_execution_mode(),
@@ -13430,10 +15057,71 @@ class SessionState:
         }
         return args, meta
 
+    def _step_instruction_target_paths(self, text: str, limit: int = 3) -> list[str]:
+        cap = max(1, min(8, int(limit or 3)))
+        src = str(text or "").strip()
+        if not src:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in re.findall(
+            r"target path:\s*([^\s\n]+)",
+            src,
+            flags=re.IGNORECASE,
+        ):
+            rel = self._normalize_delegate_path_hint(str(raw or "").strip())
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            out.append(rel)
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _target_paths_changed_since(
+        self,
+        paths: list[str],
+        since_ts: float,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        threshold = float(since_ts or 0.0)
+        if threshold <= 0.0:
+            return False
+        for raw in paths:
+            rel = self._normalize_delegate_path_hint(str(raw or "").strip())
+            if not rel:
+                continue
+            fp = self.files_root / rel
+            if not fp.exists():
+                return False
+            artifact_ts = 0.0
+            item = artifacts.get(rel)
+            if isinstance(item, dict):
+                try:
+                    artifact_ts = float(item.get("updated_at", 0.0) or 0.0)
+                except Exception:
+                    artifact_ts = 0.0
+            try:
+                file_ts = float(fp.stat().st_mtime or 0.0)
+            except Exception:
+                file_ts = 0.0
+            effective_ts = max(artifact_ts, file_ts)
+            if effective_ts + 1e-4 < threshold:
+                return False
+        return True
+
     def _watchdog_mark_step_progress(self, board: dict, role: str, step: dict | None) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
-        out = {"queue_active": bool(dq.get("active", False)), "step_advanced": False}
+        out = {
+            "queue_active": bool(dq.get("active", False)),
+            "step_advanced": False,
+            "queue_escalated": False,
+            "escalation_reason": "",
+        }
         if not bool(dq.get("active", False)):
             bb["decomposition_queue"] = dq
             self.blackboard = bb
@@ -13453,23 +15141,220 @@ class SessionState:
             bb["decomposition_queue"] = dq
             self.blackboard = bb
             return out
+        action_type = str(current.get("action_type", "") or "").strip().lower()
+        step_instruction = trim(
+            str(current.get("instruction", current.get("description", "")) or "").strip(),
+            1200,
+        )
         status = str((step or {}).get("status", "") or "").strip().lower()
         text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
         tool_results = (step or {}).get("tool_results", []) if isinstance((step or {}).get("tool_results"), list) else []
         has_ok_tool = any(isinstance(row, dict) and bool(row.get("ok", False)) for row in tool_results)
-        success = bool(status == "tools" and has_ok_tool)
-        if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
-            success = True
+        has_substantive_tools = self._tool_results_have_substantive_progress(tool_results)
+        success = False
+        target_paths = self._step_instruction_target_paths(step_instruction, limit=3)
+        has_target_delivery = False
+        has_delivery_tool = False
+        current_index = cursor
+        try:
+            issued_at = float(current.get("issued_at", current.get("updated_at", 0.0)) or 0.0)
+        except Exception:
+            issued_at = 0.0
+        for item in tool_results:
+            if not isinstance(item, dict) or not bool(item.get("ok", False)):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+            if name in {"write_file", "edit_file"}:
+                has_delivery_tool = True
+                rel = self._normalize_delegate_path_hint(str(args.get("path", "") or "").strip())
+                if rel and (not target_paths or rel in target_paths):
+                    has_target_delivery = True
+            elif name == "bash":
+                command = str(args.get("command", "") or "").strip()
+                if not self._bash_command_is_non_substantive(command):
+                    has_delivery_tool = True
+        target_recently_changed = bool(
+            target_paths
+            and self._target_paths_changed_since(target_paths, issued_at, board=bb)
+        )
+        latest_exec = self._latest_execution_log_text(bb)
+        validation_pass = self._execution_output_has_pass_marker(latest_exec)
+        if action_type in {"ground", "research"}:
+            success = bool(has_substantive_tools)
+            if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
+                success = True
+        elif action_type == "implement":
+            success = bool(has_target_delivery or target_recently_changed)
+            if (not success) and (not target_paths):
+                success = bool(has_delivery_tool and has_substantive_tools)
+        elif action_type == "validate":
+            if role_key == "reviewer":
+                success = bool(validation_pass or (bb.get("approval", {}) or {}).get("approved", False))
+            else:
+                success = bool(validation_pass and has_substantive_tools)
+        elif action_type == "summary":
+            success = bool(self._reviewer_final_summary_ready(bb))
+            if (not success) and status == "no-tools" and len(text) >= 120:
+                success = True
+        else:
+            success = bool(status == "tools" and has_ok_tool)
+            if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
+                success = True
         attempts = max(0, int(current.get("attempts", 0) or 0)) + 1
         current["attempts"] = attempts
+        current["issued_at"] = issued_at if issued_at > 0.0 else float(now_ts())
         current["updated_at"] = float(now_ts())
+        max_attempts = int(WATCHDOG_STEP_MAX_ATTEMPTS)
+        if action_type == "implement" and not target_paths:
+            max_attempts = max(max_attempts, 4)
+        hard_missing_target = bool(
+            action_type == "implement"
+            and target_paths
+            and (not has_target_delivery)
+            and (not target_recently_changed)
+        )
+        reanchor_inserted = bool(current.get("reanchor_inserted", False))
+        repair_inserted = bool(current.get("repair_inserted", False))
         if success:
             current["status"] = "done"
             dq["cursor"] = cursor + 1
             out["step_advanced"] = True
             dq["last_error"] = ""
         elif status in {"no-tools", "tools", "skip"}:
-            if attempts >= int(WATCHDOG_STEP_MAX_ATTEMPTS):
+            if hard_missing_target:
+                missing_msg = trim(
+                    "step "
+                    f"{cursor + 1} still missing exact target path(s): {', '.join(target_paths[:3])}",
+                    300,
+                )
+                if (not reanchor_inserted) and attempts >= 2:
+                    current["attempts"] = 0
+                    current["status"] = "pending"
+                    current["reanchor_inserted"] = True
+                    rows.insert(
+                        cursor,
+                        {
+                            "step": max(1, int(current.get("step", cursor + 1) or (cursor + 1))),
+                            "target": "explorer",
+                            "action_type": "ground",
+                            "instruction": trim(
+                                (
+                                    "Implementation is repeatedly missing the exact target path(s): "
+                                    + ", ".join(target_paths[:3])
+                                    + ". Read the nearest input/spec/validator files for those paths, capture concrete "
+                                    "constraints and required output shape to blackboard, then hand back to developer. "
+                                    "Keep scope narrow and do not restart the whole task."
+                                ),
+                                1000,
+                            ),
+                            "attempts": 0,
+                            "reanchor_inserted": False,
+                            "status": "pending",
+                            "issued_at": float(now_ts()),
+                            "updated_at": float(now_ts()),
+                        },
+                    )
+                    current_index = cursor + 1
+                    dq["last_error"] = trim(f"{missing_msg}; inserted targeted grounding step", 300)
+                elif reanchor_inserted and attempts >= int(max_attempts):
+                    current["status"] = "blocked"
+                    dq["active"] = False
+                    dq["cursor"] = cursor
+                    out["queue_active"] = False
+                    out["queue_escalated"] = True
+                    out["escalation_reason"] = "reanchor-exhausted"
+                    dq["last_error"] = trim(
+                        f"{missing_msg}; re-anchor exhausted after {attempts} attempts, escalated back to manager",
+                        300,
+                    )
+                else:
+                    current["status"] = "retry"
+                    dq["last_error"] = missing_msg
+            elif action_type == "validate" and role_key == "reviewer":
+                validation_hint = self._latest_validation_failure_hint(bb)
+                requirement_hint = self._validation_contract_requirement_hint(validation_hint)
+                review_hint = self._latest_review_feedback_hint(bb, max_chars=280)
+                has_fix_evidence = bool(validation_hint or review_hint)
+                repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+                if not repair_focus_paths:
+                    repair_focus_paths = self._current_deliverable_paths(bb, limit=2)
+                if not has_fix_evidence:
+                    current["status"] = "retry"
+                    dq["last_error"] = "validation evidence missing; reviewer must run validator or record concrete failure evidence"
+                elif (not repair_inserted) and attempts >= 1:
+                    current["attempts"] = 0
+                    current["status"] = "pending"
+                    current["repair_inserted"] = True
+                    rows.insert(
+                        cursor,
+                        {
+                            "step": max(1, int(current.get("step", cursor + 1) or (cursor + 1))),
+                            "target": "developer",
+                            "action_type": "implement",
+                            "instruction": trim(
+                                (
+                                    (
+                                        f"Target path: {repair_focus_paths[0]}. "
+                                        if repair_focus_paths
+                                        else ""
+                                    )
+                                    + "Fix the latest validator failure with one incremental patch, then hand back to reviewer. "
+                                    + (
+                                        requirement_hint + " "
+                                        if requirement_hint
+                                        else ""
+                                    )
+                                    + (
+                                        f"Latest validator failure: {validation_hint}. "
+                                        if validation_hint
+                                        else ""
+                                    )
+                                    + "Keep scope narrow and preserve already-correct outputs."
+                                ),
+                                1000,
+                            ),
+                            "attempts": 0,
+                            "reanchor_inserted": False,
+                            "repair_inserted": False,
+                            "status": "pending",
+                            "issued_at": float(now_ts()),
+                            "updated_at": float(now_ts()),
+                        },
+                    )
+                    current_index = cursor + 1
+                    dq["last_error"] = trim(
+                        (
+                            "validation failed; inserted focused repair step"
+                            + (f" ({requirement_hint})" if requirement_hint else "")
+                        ),
+                        300,
+                    )
+                elif repair_inserted and attempts >= int(max_attempts):
+                    current["status"] = "blocked"
+                    dq["active"] = False
+                    dq["cursor"] = cursor
+                    out["queue_active"] = False
+                    out["queue_escalated"] = True
+                    out["escalation_reason"] = "validation-repair-exhausted"
+                    dq["last_error"] = trim(
+                        (
+                            "validation repair exhausted after "
+                            f"{attempts} attempts"
+                            + (f"; latest failure: {validation_hint}" if validation_hint else "")
+                        ),
+                        300,
+                    )
+                else:
+                    current["status"] = "retry"
+                    dq["last_error"] = trim(
+                        (
+                            "validation retry pending"
+                            + (f"; latest failure: {validation_hint}" if validation_hint else "")
+                        ),
+                        300,
+                    )
+            elif attempts >= int(max_attempts):
                 current["status"] = "skipped"
                 dq["cursor"] = cursor + 1
                 out["step_advanced"] = True
@@ -13483,7 +15368,7 @@ class SessionState:
                     f"step {cursor + 1} retry pending ({status})",
                     300,
                 )
-        rows[cursor] = current
+        rows[current_index] = current
         dq["steps"] = rows
         if int(dq.get("cursor", 0) or 0) >= len(rows):
             dq["active"] = False
@@ -13520,15 +15405,20 @@ class SessionState:
             wd["last_no_tool_text"] = ""
             wd["last_no_tool_hash"] = ""
         elif status == "no-tools":
-            if self._watchdog_intent_without_action(text):
+            if not text:
+                wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0)) + 1
+                wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
+            elif self._watchdog_intent_without_action(text):
                 wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0)) + 1
             else:
                 wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             prev_text = str(wd.get("last_no_tool_text", "") or "")
             sim = self._watchdog_similarity(prev_text, text)
-            if sim >= float(WATCHDOG_REPEAT_SIMILARITY_THRESHOLD):
+            if (not text) and (not prev_text):
+                wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0))
+            elif sim >= float(WATCHDOG_REPEAT_SIMILARITY_THRESHOLD):
                 wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
-            else:
+            elif text:
                 wd["repeat_no_tool_streak"] = 0
             wd["last_no_tool_text"] = text
             wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
@@ -13542,8 +15432,23 @@ class SessionState:
         bb = self._ensure_blackboard()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         trigger_reason = ""
+        if bool(progress_row.get("queue_escalated", False)):
+            reason = trim(str(progress_row.get("escalation_reason", "") or "").strip(), 80) or "queue-escalated"
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"watchdog executor {reason} for {self._agent_display_name(role)}; "
+                        "returning control to manager"
+                    )
+                },
+            )
         if not bool(dq.get("active", False)):
-            if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
+            if bool(progress_row.get("queue_escalated", False)):
+                trigger_reason = ""
+            elif status == "no-tools" and self._current_delegate_is_mandatory_for(role):
+                trigger_reason = "mandatory-no-tool"
+            elif int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
                 trigger_reason = "intent-without-tool-call"
             elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
                 trigger_reason = "repeated-no-tool-reply"
@@ -13620,6 +15525,7 @@ class SessionState:
             state_changed=bool(board_after_fp != board_before_fp),
             pinned_selection=pinned_selection,
         )
+        self._auto_agentbus_handoff(role, safe_step, board=self._ensure_blackboard())
         status = str(safe_step.get("status", "") or "").strip().lower()
         interrupted = bool(status == "interrupted")
         stop_run = False
@@ -13657,14 +15563,2613 @@ class SessionState:
             "finish_gate_reason": finish_gate_reason,
         }
 
+    def _new_uniform_kernel_state(self) -> dict:
+        return {
+            "version": 1,
+            "kernel_version": UNIFORM_KERNEL_VERSION,
+            "manager_stride": int(UNIFORM_KERNEL_MANAGER_STRIDE),
+            "cycles_since_manager": 0,
+            "direct_bus_handoffs": 0,
+            "deterministic_handoffs": 0,
+            "manager_handoffs": 0,
+            "task_splits": 0,
+            "summary_generations": 0,
+            "autotune_events": 0,
+            "last_route_source": "",
+            "last_load_reason": "",
+            "last_load_score": 0,
+            "last_tuning_reason": "",
+            "last_tuning_ts": 0.0,
+            "summary_cache": "",
+            "summary_updated_at": 0.0,
+            "last_compare": {
+                "ts": 0.0,
+                "kernel_source": "",
+                "kernel_target": "",
+                "manager_source": "",
+                "manager_target": "",
+                "selected": "",
+            },
+        }
+
+    def _normalize_uniform_kernel_state(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        out = self._new_uniform_kernel_state()
+        out["version"] = max(1, int(src.get("version", out["version"]) or out["version"]))
+        out["kernel_version"] = trim(str(src.get("kernel_version", UNIFORM_KERNEL_VERSION) or "").strip(), 40)
+        try:
+            stride = int(src.get("manager_stride", out["manager_stride"]) or out["manager_stride"])
+        except Exception:
+            stride = int(UNIFORM_KERNEL_MANAGER_STRIDE)
+        out["manager_stride"] = max(1, min(12, stride))
+        for key in (
+            "cycles_since_manager",
+            "direct_bus_handoffs",
+            "deterministic_handoffs",
+            "manager_handoffs",
+            "task_splits",
+            "summary_generations",
+            "autotune_events",
+            "last_load_score",
+        ):
+            try:
+                out[key] = max(0, int(src.get(key, out[key]) or out[key]))
+            except Exception:
+                out[key] = int(out[key])
+        out["last_route_source"] = trim(str(src.get("last_route_source", "") or "").strip(), 80)
+        out["last_load_reason"] = trim(str(src.get("last_load_reason", "") or "").strip(), 220)
+        out["last_tuning_reason"] = trim(str(src.get("last_tuning_reason", "") or "").strip(), 220)
+        out["last_tuning_ts"] = float(src.get("last_tuning_ts", 0.0) or 0.0)
+        out["summary_cache"] = trim(str(src.get("summary_cache", "") or "").strip(), UNIFORM_KERNEL_MAX_SUMMARY_CHARS)
+        out["summary_updated_at"] = float(src.get("summary_updated_at", 0.0) or 0.0)
+        cmp_src = src.get("last_compare", {})
+        if isinstance(cmp_src, dict):
+            out["last_compare"] = {
+                "ts": float(cmp_src.get("ts", 0.0) or 0.0),
+                "kernel_source": trim(str(cmp_src.get("kernel_source", "") or "").strip(), 80),
+                "kernel_target": trim(str(cmp_src.get("kernel_target", "") or "").strip(), 40),
+                "manager_source": trim(str(cmp_src.get("manager_source", "") or "").strip(), 80),
+                "manager_target": trim(str(cmp_src.get("manager_target", "") or "").strip(), 40),
+                "selected": trim(str(cmp_src.get("selected", "") or "").strip(), 40),
+            }
+        return out
+
+    def _ensure_uniform_kernel_state(self) -> dict:
+        self.uniform_kernel_state = self._normalize_uniform_kernel_state(
+            getattr(self, "uniform_kernel_state", {})
+        )
+        return self.uniform_kernel_state
+
+    def _recent_agentbus_signal(self, *, max_age_seconds: float = UNIFORM_KERNEL_BUS_MAX_AGE_SECONDS) -> dict:
+        now_tick = float(now_ts())
+        max_age = max(3.0, float(max_age_seconds or UNIFORM_KERNEL_BUS_MAX_AGE_SECONDS))
+        count = 0
+        latest_ts = 0.0
+        intents: list[str] = []
+        targets: list[str] = []
+        sources: list[str] = []
+        for env in reversed(list(self.agent_bus_messages)[-24:]):
+            if not isinstance(env, dict):
+                continue
+            try:
+                ts = float(env.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0.0 or (now_tick - ts) > max_age:
+                continue
+            count += 1
+            latest_ts = max(latest_ts, ts)
+            src = self._sanitize_agent_role(env.get("from", ""))
+            dst = self._sanitize_agent_role(env.get("to", ""))
+            intent = trim(str(env.get("intent", "") or "").strip().lower(), 80)
+            if src and src not in sources:
+                sources.append(src)
+            if dst and dst not in targets:
+                targets.append(dst)
+            if intent and intent not in intents:
+                intents.append(intent)
+        return {
+            "fresh": bool(count > 0),
+            "count": int(count),
+            "latest_age_sec": (round(max(0.0, now_tick - latest_ts), 2) if latest_ts > 0.0 else 0.0),
+            "targets": targets[:4],
+            "sources": sources[:4],
+            "intents": intents[:6],
+        }
+
+    def _uniform_kernel_autotune(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        state = self._ensure_uniform_kernel_state()
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        progress = self._manager_progress_state(bb)
+        bus_signal = self._recent_agentbus_signal()
+        current_stride = max(1, int(state.get("manager_stride", UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE))
+        throughput = max(
+            0,
+            int(state.get("direct_bus_handoffs", 0) or 0) + int(state.get("deterministic_handoffs", 0) or 0),
+        )
+        manager_handoffs = max(0, int(state.get("manager_handoffs", 0) or 0))
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        research_count = len(bb.get("research_notes", []) or [])
+        review_count = len(bb.get("review_feedback", []) or [])
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        summary_pending = bool(approval.get("approved", False)) and (not self._reviewer_final_summary_ready(bb))
+        desired_stride = current_stride
+        reason = "stable"
+        if bool(dq.get("active", False)):
+            desired_stride = 1
+            reason = "split-active"
+        elif summary_pending:
+            desired_stride = 1
+            reason = "summary-closeout"
+        elif self._manager_has_error_log(bb) or int(wd.get("intent_no_tool_streak", 0) or 0) >= 1:
+            desired_stride = 1
+            reason = "tool-gap-or-error"
+        elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= 1 or int(wd.get("state_unchanged_streak", 0) or 0) >= 3:
+            desired_stride = 2
+            reason = "stalled-progress"
+        elif missing_expected and code_count <= 0:
+            desired_stride = 1
+            reason = "missing-expected-bootstrap"
+        elif int(bb.get("manager_cycles", 0) or 0) >= 2 and code_count <= 0 and research_count <= 0:
+            desired_stride = 1
+            reason = "bootstrap-stalled"
+        elif bool(approval.get("approved", False)) or progress in {"almost_done", "done"}:
+            desired_stride = 1
+            reason = "closeout"
+        elif bool(bus_signal.get("fresh", False)) and throughput >= max(2, manager_handoffs) and (
+            code_count > 0 or research_count > 0 or review_count > 0
+        ):
+            desired_stride = 5 if review_count > 0 else 4
+            reason = "agentbus-stable"
+        elif throughput >= max(2, manager_handoffs * 2) and (code_count > 0 or research_count > 0):
+            desired_stride = 4 if review_count > 0 else 3
+            reason = "bus-flow-stable"
+        elif code_count > 0 and research_count > 0:
+            desired_stride = 3
+            reason = "grounded-progress"
+        else:
+            desired_stride = 2
+            reason = "default-balanced"
+        desired_stride = max(1, min(12, int(desired_stride)))
+        if desired_stride != current_stride:
+            state["autotune_events"] = max(0, int(state.get("autotune_events", 0) or 0)) + 1
+            state["manager_stride"] = desired_stride
+            state["last_tuning_reason"] = trim(str(reason or "").strip(), 220)
+            state["last_tuning_ts"] = float(now_ts())
+            self.uniform_kernel_state = state
+        elif str(state.get("last_tuning_reason", "") or "").strip() != reason:
+            state["last_tuning_reason"] = trim(str(reason or "").strip(), 220)
+            state["last_tuning_ts"] = float(now_ts())
+            self.uniform_kernel_state = state
+        return state
+
+    def _adaptive_split_build_steps(
+        self,
+        board: dict,
+        reason: str,
+        *,
+        pinned_selection: str,
+        role: str = "",
+        step: dict | None = None,
+    ) -> tuple[list[dict], str, str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        reason_text = trim(str(reason or "").strip(), 220)
+        reason_low = reason_text.lower()
+        target_state = self._developer_target_step_state(bb, role="developer")
+        anchored_deliverables = bool(
+            target_state.get("explicit_target_step", False)
+            or self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+            or self._goal_missing_expected_artifacts(bb)
+        )
+        use_model_decomposer = bool(
+            any(tok in reason_low for tok in ("intent", "repeat", "stall", "context", "watchdog"))
+            and (not self._watchdog_context_near_limit())
+            and (not anchored_deliverables)
+        )
+        if use_model_decomposer:
+            steps, snapshot, raw_text = self._watchdog_decompose_steps(
+                bb,
+                reason_text,
+                pinned_selection=pinned_selection,
+            )
+            if steps:
+                return steps, snapshot, raw_text
+        snapshot = self._watchdog_snapshot_payload(
+            bb,
+            reason_text,
+            self._sanitize_agent_role(role) or str(bb.get("active_agent", "") or ""),
+            step,
+        )
+        steps = self._uniform_kernel_build_split_steps(bb, reason_text)
+        if not steps:
+            steps = self._watchdog_fallback_steps(bb, reason_text)
+        return steps, trim(snapshot, 4000), "adaptive-split-heuristic"
+
+    def _adaptive_split_activate(
+        self,
+        board: dict,
+        *,
+        reason: str,
+        pinned_selection: str,
+        source: str = "kernel",
+        role: str = "",
+        step: dict | None = None,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            return False
+        steps, snapshot, raw_text = self._adaptive_split_build_steps(
+            bb,
+            trim(str(reason or "").strip(), 220),
+            pinned_selection=pinned_selection,
+            role=role,
+            step=step,
+        )
+        if not steps:
+            return False
+        bb["decomposition_queue"] = {
+            "active": True,
+            "trigger_reason": trim(str(reason or "").strip(), 200),
+            "created_at": float(now_ts()),
+            "cursor": 0,
+            "steps": steps,
+            "last_error": "",
+            "snapshot": trim(snapshot, 4000),
+            "decomposer_output": trim(raw_text, 2000),
+        }
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        wd["trigger_count"] = max(0, int(wd.get("trigger_count", 0) or 0)) + 1
+        wd["last_trigger_reason"] = trim(str(reason or "").strip(), 200)
+        wd["last_trigger_ts"] = float(now_ts())
+        wd["intent_no_tool_streak"] = 0
+        wd["repeat_no_tool_streak"] = 0
+        bb["watchdog"] = wd
+        self.blackboard = bb
+        state = self._ensure_uniform_kernel_state()
+        state["task_splits"] = max(0, int(state.get("task_splits", 0) or 0)) + 1
+        state["last_load_reason"] = trim(str(reason or "").strip(), 220)
+        state["last_tuning_reason"] = trim(f"split:{source}", 220)
+        state["last_tuning_ts"] = float(now_ts())
+        self.uniform_kernel_state = state
+        self._blackboard_touch()
+        self._blackboard_history(
+            "manager",
+            trim(
+                (
+                    f"{source} adaptive split activated "
+                    f"(reason={reason}, role={self._sanitize_agent_role(role)}, steps={len(steps)})"
+                ),
+                520,
+            ),
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"{source} adaptive split active "
+                    f"(reason={trim(reason, 90)}, steps={len(steps)})"
+                )
+            },
+        )
+        return True
+
+    def _uniform_kernel_microtask_mode_enabled(self) -> bool:
+        return any(
+            normalize_on_off_mode(str(x or "").strip(), default="off") == "on"
+            for x in (
+                getattr(self, "microtask_mode", "off"),
+                getattr(self, "small_model_microtask_mode", "off"),
+            )
+        )
+
+    def _uniform_kernel_skill_suggestions(
+        self,
+        *,
+        role: str = "",
+        instruction: str = "",
+        goal: str = "",
+    ) -> list[str]:
+        role_key = self._sanitize_agent_role(role)
+        return self._role_baseline_skill_names(role_key or "developer")[:UNIFORM_KERNEL_SKILL_HINT_LIMIT]
+
+    def _uniform_kernel_skill_hint_block(
+        self,
+        *,
+        role: str = "",
+        instruction: str = "",
+        goal: str = "",
+    ) -> str:
+        return ""
+
+    def _goal_expected_artifact_specs(self, goal: str) -> list[dict]:
+        text = str(goal or "")
+        if not text:
+            return []
+        pattern = (
+            r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\."
+            r"(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h)"
+        )
+        output_verbs = (
+            "create",
+            "write",
+            "build",
+            "generate",
+            "implement",
+            "update",
+            "fix",
+            "edit",
+            "add",
+            "render",
+            "compose",
+            "produce",
+            "save",
+            "created",
+            "written",
+            "generated",
+            "创建",
+            "生成",
+            "编写",
+            "实现",
+            "更新",
+            "修复",
+            "编辑",
+            "构建",
+            "产出",
+            "输出",
+        )
+        touch_verbs = (
+            "update",
+            "fix",
+            "edit",
+            "modify",
+            "change",
+            "patch",
+            "repair",
+            "updated",
+            "fixed",
+            "edited",
+            "修改",
+            "更新",
+            "修复",
+            "编辑",
+        )
+        generated_prefixes = (
+            "writes ",
+            "write ",
+            "outputs ",
+            "output ",
+            "emits ",
+            "exports ",
+            "writes to ",
+            "写入",
+            "输出",
+        )
+        readonly_blockers = (
+            "do not edit",
+            "don't edit",
+            "do not modify",
+            "do not change",
+            "不要编辑",
+            "不要修改",
+        )
+        readonly_verbs = (
+            "read",
+            "study",
+            "inspect",
+            "analyze",
+            "analyse",
+            "review",
+            "阅读",
+            "研究",
+            "查看",
+            "分析",
+            "检查",
+        )
+        resource_prefixes = (
+            "using ",
+            "use ",
+            "from ",
+            "via ",
+            "based on ",
+            "according to ",
+            "guided by ",
+            "satisfying ",
+            "with values in ",
+            "values in ",
+            "data in ",
+            "evidence in ",
+            "refer to ",
+            "参考",
+            "基于",
+            "依据",
+            "根据",
+            "使用",
+            "来自",
+            "从",
+        )
+        output_location_prefixes = (
+            " at ",
+            " to ",
+            " into ",
+            " under ",
+            " inside ",
+            " as ",
+            " named ",
+            " path ",
+            " 路径",
+            " 到",
+            " 写到",
+            " 输出到",
+        )
+        scores: dict[str, int] = {}
+        modes: dict[str, str] = {}
+
+        def _last_token_pos(raw_text: str, low_text: str, tokens: tuple[str, ...]) -> int:
+            best = -1
+            for tok in tokens:
+                if tok.isascii():
+                    token_low = tok.lower()
+                    if re.fullmatch(r"[A-Za-z0-9_]+", token_low):
+                        pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(token_low)}(?![A-Za-z0-9_])")
+                        for row in pattern.finditer(low_text):
+                            pos = int(row.start())
+                            if pos > best:
+                                best = pos
+                    else:
+                        pos = low_text.rfind(token_low)
+                        if pos > best:
+                            best = pos
+                else:
+                    pos = raw_text.rfind(tok)
+                    if pos > best:
+                        best = pos
+            return best
+
+        sentence_boundary = re.compile(r"(?:[,;\n!?，；。！？])|(?:\.(?=\s|$))")
+
+        def _nearest_clause_bounds(raw_text: str, start: int, end: int) -> tuple[int, int]:
+            left = -1
+            for row in sentence_boundary.finditer(raw_text, 0, start):
+                left = int(row.start())
+            right = len(raw_text)
+            row = sentence_boundary.search(raw_text, end)
+            if row:
+                right = int(row.start())
+            if left < 0:
+                left = 0
+            else:
+                left += 1
+            return left, max(left, right)
+
+        for match in re.finditer(pattern, text):
+            path = str(match.group(0) or "").strip()
+            if not path:
+                continue
+            clause_start, clause_end = _nearest_clause_bounds(text, int(match.start()), int(match.end()))
+            clause = text[clause_start:clause_end]
+            rel_start = max(0, int(match.start()) - clause_start)
+            prefix = clause[:rel_start]
+            prefix_low = prefix.lower()
+            local_tail = prefix[-96:]
+            local_tail_low = prefix_low[-96:]
+            readonly_block_pos = _last_token_pos(prefix, prefix_low, readonly_blockers)
+            output_pos = _last_token_pos(prefix, prefix_low, output_verbs)
+            touch_pos = _last_token_pos(prefix, prefix_low, touch_verbs)
+            readonly_pos = _last_token_pos(prefix, prefix_low, readonly_verbs)
+            generated_pos = _last_token_pos(prefix, prefix_low, generated_prefixes)
+            resource_pos = _last_token_pos(prefix, prefix_low, resource_prefixes)
+            location_pos = _last_token_pos(local_tail, local_tail_low, output_location_prefixes)
+            score = 0
+            direct_output = max(output_pos, touch_pos, generated_pos)
+            if direct_output >= 0:
+                score += 2
+            if readonly_block_pos >= 0:
+                continue
+            if readonly_pos >= max(direct_output, resource_pos):
+                continue
+            if resource_pos > max(direct_output, location_pos):
+                continue
+            if direct_output < 0 and location_pos < 0:
+                continue
+            if generated_pos >= max(output_pos, touch_pos):
+                mode = "generated"
+            elif touch_pos >= max(output_pos, generated_pos):
+                mode = "touch"
+            else:
+                mode = "exist"
+            if score <= 0:
+                continue
+            scores[path] = max(int(scores.get(path, 0) or 0), score)
+            modes[path] = mode
+        out: list[dict] = []
+        for path, score in sorted(scores.items(), key=lambda item: (-int(item[1]), item[0])):
+            out.append(
+                {
+                    "path": path,
+                    "mode": modes.get(path, "exist"),
+                    "score": int(score),
+                }
+            )
+        return out[:8]
+
+    def _goal_missing_expected_artifacts(self, board: dict | None = None) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        specs = self._goal_expected_artifact_specs(str(bb.get("original_goal", "") or ""))
+        if not specs:
+            return []
+        art = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        missing: list[str] = []
+        for row in specs:
+            if not isinstance(row, dict):
+                continue
+            rel = str(row.get("path", "") or "").strip()
+            mode = str(row.get("mode", "exist") or "exist").strip().lower()
+            if not rel:
+                continue
+            fp = self.files_root / rel
+            if mode == "generated":
+                continue
+            if mode == "touch":
+                if rel in art or fp.exists():
+                    continue
+                if rel not in art:
+                    missing.append(rel)
+                continue
+            if rel in art or fp.exists():
+                continue
+            missing.append(rel)
+        return missing[:8]
+
+    def _goal_direct_expected_artifacts(self, goal: str) -> list[str]:
+        out: list[str] = []
+        for row in self._goal_expected_artifact_specs(goal):
+            if not isinstance(row, dict):
+                continue
+            rel = str(row.get("path", "") or "").strip()
+            mode = str(row.get("mode", "exist") or "exist").strip().lower()
+            if not rel or mode == "generated" or rel in out:
+                continue
+            out.append(rel)
+        return out[:8]
+
+    def _current_deliverable_paths(self, board: dict | None = None, *, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        paths: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path_text: str):
+            rel = normalize_rel_preview_path(str(path_text or "")) or trim(str(path_text or "").strip(), 280)
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            paths.append(rel)
+
+        ranked: list[tuple[float, str]] = []
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        linked = bb.get("linked_files", {}) if isinstance(bb.get("linked_files"), dict) else {}
+        for path, item in list(artifacts.items()):
+            if not isinstance(item, dict):
+                continue
+            try:
+                updated_at = float(item.get("updated_at", 0.0) or 0.0)
+            except Exception:
+                updated_at = 0.0
+            ranked.append((updated_at, str(path or "")))
+        for path, item in list(linked.items()):
+            if not isinstance(item, dict):
+                continue
+            try:
+                updated_at = float(item.get("updated_at", 0.0) or 0.0)
+            except Exception:
+                updated_at = 0.0
+            ranked.append((updated_at, str(path or "")))
+        for _, rel in sorted(ranked, key=lambda row: (float(row[0]), str(row[1])), reverse=True):
+            _add(rel)
+            if len(paths) >= max(1, int(limit)):
+                return paths[: max(1, int(limit))]
+        goal_text = str(bb.get("original_goal", "") or "")
+        for rel in self._goal_direct_expected_artifacts(goal_text):
+            _add(rel)
+            if len(paths) >= max(1, int(limit)):
+                return paths[: max(1, int(limit))]
+        for rel in self._goal_missing_expected_artifacts(bb):
+            _add(rel)
+            if len(paths) >= max(1, int(limit)):
+                return paths[: max(1, int(limit))]
+        return paths[: max(1, int(limit))]
+
+    def _actionable_review_feedback_rows(self, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            text = trim(strip_thinking_content(str(row.get("content", "") or "")).strip(), 2000)
+            if not text:
+                continue
+            low = text.lower()
+            if low.startswith("read_from_blackboard:") or low.startswith("write_to_blackboard:"):
+                continue
+            out.append(row)
+        return out
+
+    def _latest_review_feedback_hint(self, board: dict | None = None, *, max_chars: int = 280) -> str:
+        rows = self._recent_review_feedback_rows_since_latest_pass(board, limit=24)
+        for row in reversed(rows):
+            if not isinstance(row, dict):
+                continue
+            text = trim(strip_thinking_content(str(row.get("content", "") or "")).strip(), max_chars * 2)
+            if not text:
+                continue
+            low = text.lower()
+            if low.startswith("review passed") or low.startswith("final_summary"):
+                continue
+            if "pass" in low and len(low) <= 120:
+                continue
+            text = re.sub(r"\s+", " ", text).strip()
+            text = re.sub(r"^(review(?:er)?|feedback|fix)\s*[:：-]\s*", "", text, flags=re.IGNORECASE).strip()
+            if text:
+                return trim(text, max_chars)
+        return ""
+
+    def _compose_manager_live_instruction(
+        self,
+        board: dict | None = None,
+        *,
+        role: str = "",
+        require_check: bool = False,
+        max_chars: int = 1200,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        capsule = self._normalize_memory_capsule(bb.get("memory_capsule", {}))
+        plan = capsule.get("plan_anchor", {}) if isinstance(capsule.get("plan_anchor"), dict) else {}
+        objective = self._primary_objective_text(
+            goal=str(bb.get("original_goal", "") or ""),
+            preferred=str(profile.get("direct_objective", "") or ""),
+            max_chars=360,
+        )
+        focus = self._delegate_display_compact_content(
+            str(plan.get("current_focus", "") or "").strip(),
+            max_chars=280,
+        )
+        if self._delegate_display_is_runtime_meta(focus):
+            focus = ""
+        next_action = self._delegate_display_compact_content(
+            str(plan.get("next_action", "") or "").strip(),
+            max_chars=280,
+        )
+        if self._delegate_display_is_runtime_meta(next_action):
+            next_action = ""
+        validation_gap = trim(self._latest_validation_failure_hint(bb), 260)
+        validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+        paths = self._current_deliverable_paths(bb, limit=3)
+        missing = list(self._goal_missing_expected_artifacts(bb))[:3]
+        contract_paths = self._workspace_contract_paths(limit=3)
+        gap = self._latest_review_feedback_hint(bb, max_chars=280) or validation_gap
+        if self._delegate_display_is_runtime_meta(gap):
+            gap = ""
+        parts: list[str] = []
+        role_key = self._sanitize_agent_role(role)
+        if objective:
+            parts.append(f"Objective: {objective}")
+        anchor = focus or next_action
+        if anchor and anchor.lower() not in objective.lower():
+            parts.append(f"Current focus: {anchor}")
+        if gap and gap.lower() not in str(anchor or "").lower():
+            parts.append(f"Latest blocker: {gap}")
+        target_path = ""
+        ground_from = ""
+        if role_key == "developer":
+            target_path = self._developer_target_path_hint(bb)
+            if not target_path and missing:
+                target_path = missing[0]
+            if not target_path and paths:
+                target_path = paths[0]
+        elif role_key == "explorer" and contract_paths:
+            if self._explorer_grounding_pressure_active(role_key, bb) or self._recent_role_file_read_count(role_key, bb) <= 0:
+                ground_from = ", ".join(contract_paths[:3])
+        if target_path:
+            parts.append(f"Target path: {target_path}")
+        if ground_from:
+            parts.append(f"Ground from: {ground_from}")
+        if require_check and validation_cmd:
+            parts.append(f"Check command: {validation_cmd}")
+        return trim("\n".join(parts), max_chars)
+
+    def _merge_manager_live_instruction(
+        self,
+        instruction: str,
+        board: dict | None = None,
+        *,
+        role: str = "",
+        require_check: bool = False,
+        max_chars: int = 1200,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        objective = self._primary_objective_text(
+            goal=str(bb.get("original_goal", "") or ""),
+            preferred=str(self._ensure_blackboard_task_profile(bb).get("direct_objective", "") or ""),
+            max_chars=800,
+        )
+        live = self._compose_manager_live_instruction(
+            bb,
+            role=role,
+            require_check=require_check,
+            max_chars=max_chars,
+        )
+        specific = self._delegate_instruction_display_text(
+            str(instruction or ""),
+            objective=objective,
+            max_chars=max(260, min(560, int(max_chars * 0.45))),
+        )
+        if not live:
+            return trim(str(instruction or "").strip(), max_chars)
+        if not specific:
+            return live
+        live_norm = re.sub(r"\s+", " ", live).strip().lower()
+        specific_norm = re.sub(r"\s+", " ", specific).strip().lower()
+        if not specific_norm or specific_norm in live_norm:
+            return live
+        if live_norm and live_norm in specific_norm:
+            return trim(specific, max_chars)
+        return trim(f"{live}\nThis turn: {specific}", max_chars)
+
+    def _manager_first_deliverable_instruction(self, board: dict | None = None, *, max_chars: int = 1200) -> str:
+        return self._compose_manager_live_instruction(
+            board,
+            role="developer",
+            require_check=False,
+            max_chars=max_chars,
+        )
+
+    def _manager_feedback_fix_instruction(self, board: dict | None = None, *, max_chars: int = 1200) -> str:
+        return self._compose_manager_live_instruction(
+            board,
+            role="developer",
+            require_check=True,
+            max_chars=max_chars,
+        )
+
+    def _manager_review_deliverables_instruction(self, board: dict | None = None, *, max_chars: int = 1200) -> str:
+        return self._compose_manager_live_instruction(
+            board,
+            role="reviewer",
+            require_check=True,
+            max_chars=max_chars,
+        )
+
+    def _manager_continue_deliverable_instruction(self, board: dict | None = None, *, max_chars: int = 1200) -> str:
+        return self._compose_manager_live_instruction(
+            board,
+            role="developer",
+            require_check=False,
+            max_chars=max_chars,
+        )
+
+    def _execution_output_has_pass_marker(self, text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        if any(
+            tok in low
+            for tok in (
+                "traceback",
+                "assertionerror",
+                "error:",
+                " failed",
+                "exception",
+                "blocked",
+                "non-zero",
+                "exit=1",
+                "exit code 1",
+            )
+        ):
+            return False
+        return bool(re.search(r"\bpass(?:ed)?[_a-z0-9-]*\b", low))
+
+    def _workspace_contract_paths(self, limit: int = 6) -> list[str]:
+        cap = max(1, min(12, int(limit or 6)))
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _accept(fp: Path):
+            if len(out) >= cap or (not fp.exists()) or (not fp.is_file()):
+                return
+            rel = self._session_rel(fp)
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        for rel in ("validate.py", "docs/spec.md", "spec.md"):
+            _accept(self.files_root / rel)
+        if len(out) >= cap:
+            return out[:cap]
+        try:
+            for fp in self.files_root.rglob("*"):
+                if len(out) >= cap:
+                    break
+                if not fp.is_file():
+                    continue
+                rel = self._session_rel(fp)
+                low = rel.lower()
+                name = fp.name.lower()
+                if (
+                    name == "validate.py"
+                    or "spec" in name
+                    or low.startswith("tests/")
+                    or low.startswith("test/")
+                ):
+                    _accept(fp)
+        except Exception:
+            pass
+        return out[:cap]
+
+    def _workspace_contract_literal_hints(self, limit: int = 6) -> list[str]:
+        cap = max(1, min(10, int(limit or 6)))
+        out: list[str] = []
+        seen: set[str] = set()
+        for rel in self._workspace_contract_paths(limit=max(3, cap)):
+            fp = self.files_root / rel
+            text = try_read_text(fp, max_bytes=64 * 1024) or ""
+            if not text:
+                continue
+            in_literal_block = False
+            for line in text.splitlines()[:240]:
+                stripped = str(line or "").strip()
+                if not stripped:
+                    if in_literal_block:
+                        in_literal_block = False
+                    continue
+                low = stripped.lower()
+                candidates: list[str] = []
+                if any(tok in low for tok in ("expected", "needle", "literal", "heading", "title")) and any(
+                    ch in stripped for ch in "[("
+                ):
+                    in_literal_block = True
+                if stripped.startswith("#"):
+                    candidates.append(stripped)
+                if in_literal_block or any(tok in low for tok in ("assert", "needle", "literal", "heading", "title")):
+                    for _, literal in re.findall(r"([\"'])(.{1,160}?)\1", stripped):
+                        value = trim(str(literal or "").strip(), 120)
+                        if not value:
+                            continue
+                        if not (
+                            any(ch.isspace() for ch in value)
+                            or any(ch in value for ch in "#:()/%-")
+                            or len(value) >= 12
+                        ):
+                            continue
+                        candidates.append(value)
+                if in_literal_block and stripped in {"]", ")", "],", "),"}:
+                    in_literal_block = False
+                for candidate in candidates:
+                    value = trim(str(candidate or "").strip(), 120)
+                    if not value or value in seen:
+                        continue
+                    seen.add(value)
+                    out.append(value)
+                    if len(out) >= cap:
+                        return out[:cap]
+        return out[:cap]
+
+    def _latest_validation_failure_hint(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = self._recent_execution_log_rows_since_latest_pass(bb, limit=24)
+        needles = (
+            "validate.py",
+            "traceback",
+            "assertionerror",
+            "keyerror",
+            "filenotfounderror",
+            "modulenotfounderror",
+            "error:",
+            "failed",
+        )
+        for row in reversed(rows[-24:]):
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("content", "") or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            if not any(tok in low for tok in needles):
+                continue
+            lines = [trim(line, 220) for line in text.splitlines() if str(line).strip()]
+            focus = [
+                line
+                for line in lines[-6:]
+                if any(tok in line.lower() for tok in ("traceback", "assert", "error", "keyerror", "filenotfound", "module"))
+            ]
+            if not focus:
+                focus = lines[-3:]
+            hint = trim(" | ".join(focus), 360)
+            if hint:
+                return hint
+        return ""
+
+    def _workspace_validation_command_hint(self) -> str:
+        validate_py = self.files_root / "validate.py"
+        if validate_py.exists() and validate_py.is_file():
+            return "python3 validate.py"
+        try:
+            for fp in self.files_root.rglob("*"):
+                if not fp.is_file():
+                    continue
+                name = fp.name.lower()
+                rel = self._session_rel(fp).lower()
+                if name.startswith("test_") and name.endswith(".py"):
+                    return "pytest"
+                if rel.startswith("tests/") or rel.startswith("test/"):
+                    return "pytest"
+        except Exception:
+            return ""
+        return ""
+
+    def _validation_contract_requirement_hint(self, text: str) -> str:
+        hint = str(text or "").strip()
+        if not hint:
+            return ""
+        m = re.search(r"AssertionError:\s*(.+)$", hint, flags=re.IGNORECASE)
+        if m:
+            literal = trim(str(m.group(1) or "").strip().strip("'\""), 160)
+            if literal:
+                return f"Validator expects this literal verbatim: {literal}."
+        m = re.search(r"KeyError:\s*['\"]?([A-Za-z0-9_.-]+)['\"]?", hint, flags=re.IGNORECASE)
+        if m:
+            key = trim(str(m.group(1) or "").strip(), 120)
+            if key:
+                return f"Validator expects missing key '{key}' to be produced."
+        return ""
+
+    def _uniform_kernel_task_capsule(
+        self,
+        *,
+        role: str = "",
+        instruction: str = "",
+        board: dict | None = None,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        profile = self._ensure_blackboard_task_profile(bb)
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        objective = trim(
+            str(profile.get("direct_objective", "") or "").strip()
+            or str(bb.get("original_goal", "") or "").strip(),
+            320,
+        )
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        kernel_state = self._ensure_uniform_kernel_state()
+        expected_specs = self._goal_expected_artifact_specs(str(bb.get("original_goal", "") or ""))
+        missing_artifacts = self._goal_missing_expected_artifacts(bb)
+        contract_paths = self._workspace_contract_paths(limit=6)
+        contract_literals = self._workspace_contract_literal_hints(limit=6)
+        lines = [
+            f"- objective: {objective or '(empty)'}",
+            f"- current_status: {status}",
+            (
+                "- work_mode: "
+                f"{profile.get('execution_mode', self._effective_execution_mode())}"
+                f" | task={profile.get('task_type', 'general')}"
+                f" | complexity={profile.get('complexity', 'simple')}"
+            ),
+            (
+                "- routing: "
+                f"kernel={trim(str(kernel_state.get('last_route_source', '') or '').strip(), 40) or '-'}"
+                f" | split_active={bool(dq.get('active', False))}"
+                f" | microtask_mode={normalize_on_off_mode(self.microtask_mode, default='off')}"
+                f" | legacy_small_model_mode={normalize_on_off_mode(self.small_model_microtask_mode, default='off')}"
+            ),
+        ]
+        if instruction:
+            lines.append(f"- delegated_step: {trim(str(instruction or '').strip(), 220)}")
+        if expected_specs:
+            rendered_expected = ", ".join(
+                trim(str(row.get("path", "") or "").strip(), 80)
+                for row in expected_specs[:4]
+                if isinstance(row, dict)
+            )
+            if rendered_expected:
+                lines.append(f"- expected_artifacts: {rendered_expected}")
+        if contract_paths:
+            lines.append(f"- contract_paths: {', '.join(trim(path, 80) for path in contract_paths[:6])}")
+        if contract_literals:
+            lines.append(
+                "- contract_literals: "
+                + " | ".join(trim(str(item or ""), 60) for item in contract_literals[:6])
+            )
+        if missing_artifacts:
+            lines.append(f"- missing_artifacts: {', '.join(trim(path, 80) for path in missing_artifacts[:4])}")
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current_step = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(current_step, dict):
+                step_text = trim(
+                    str(
+                        current_step.get("description", "")
+                        or current_step.get("instruction", "")
+                        or ""
+                    ).strip(),
+                    220,
+                )
+                lines.append(
+                    "- active_split_step: "
+                    f"{cursor + 1}/{max(1, len(steps))} "
+                    f"{trim(str(current_step.get('action_type', '') or '').strip(), 24) or 'step'} "
+                    f"-> {trim(str(current_step.get('target', '') or '').strip(), 24) or 'agent'} "
+                    f"| {step_text}"
+                )
+        summary_cache = trim(
+            str(kernel_state.get("summary_cache", "") or "").strip(),
+            420,
+        )
+        if summary_cache:
+            lines.append(f"- latest_summary: {summary_cache}")
+        memory_capsule = self._normalize_memory_capsule(bb.get("memory_capsule", {}))
+        plan_anchor = memory_capsule.get("plan_anchor", {}) if isinstance(memory_capsule.get("plan_anchor"), dict) else {}
+        validation_focus = (
+            memory_capsule.get("validation_focus", {})
+            if isinstance(memory_capsule.get("validation_focus"), dict)
+            else {}
+        )
+        if str(plan_anchor.get("current_focus", "") or "").strip():
+            lines.append(
+                f"- memory_focus: {trim(str(plan_anchor.get('current_focus', '') or '').strip(), 220)}"
+            )
+        if str(plan_anchor.get("next_action", "") or "").strip():
+            lines.append(
+                f"- next_action: {trim(str(plan_anchor.get('next_action', '') or '').strip(), 220)}"
+            )
+        recent_chain = memory_capsule.get("recent_chain", []) if isinstance(memory_capsule.get("recent_chain"), list) else []
+        if recent_chain:
+            rendered_chain: list[str] = []
+            for row in recent_chain[-3:]:
+                if not isinstance(row, dict):
+                    continue
+                actor = trim(
+                    str(row.get("agent_role", "") or row.get("role", "") or "agent").strip(),
+                    20,
+                )
+                text = trim(str(row.get("text", "") or "").strip(), 120)
+                if text:
+                    rendered_chain.append(f"{actor}: {text}")
+            if rendered_chain:
+                lines.append(f"- recent_chain: {' || '.join(rendered_chain)}")
+        active_files = memory_capsule.get("active_files", []) if isinstance(memory_capsule.get("active_files"), list) else []
+        if active_files:
+            rendered_files: list[str] = []
+            for row in active_files[:3]:
+                if not isinstance(row, dict):
+                    continue
+                path = trim(str(row.get("path", "") or "").strip(), 80)
+                if path:
+                    rendered_files.append(path)
+            if rendered_files:
+                lines.append(f"- active_files_memory: {', '.join(rendered_files)}")
+        if str(validation_focus.get("latest_failure", "") or "").strip():
+            lines.append(
+                f"- latest_failure: {trim(str(validation_focus.get('latest_failure', '') or '').strip(), 180)}"
+            )
+
+        def _append_list_tail(title: str, rows: object, limit: int = 2):
+            arr = rows if isinstance(rows, list) else []
+            if not arr:
+                return
+            rendered: list[str] = []
+            for row in reversed(arr[-max(1, int(limit)) :]):
+                if not isinstance(row, dict):
+                    continue
+                actor = trim(str(row.get("actor", "") or "").strip(), 20)
+                content = trim(str(row.get("content", "") or "").strip(), 180)
+                if content:
+                    rendered.append(f"{actor or 'agent'}: {content}")
+            if rendered:
+                lines.append(f"- {title}: {' || '.join(reversed(rendered))}")
+
+        def _append_artifact_tail(limit: int = 2):
+            art = bb.get("code_artifacts", {})
+            if not isinstance(art, dict) or not art:
+                return
+            rows = sorted(
+                list(art.items()),
+                key=lambda item: float(
+                    (item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0
+                ),
+                reverse=True,
+            )
+            parts: list[str] = []
+            for path, item in rows[: max(1, int(limit))]:
+                info = item if isinstance(item, dict) else {}
+                note = trim(str(info.get("summary", "") or "").strip(), 140)
+                parts.append(f"{trim(path, 80)} | {note or '-'}")
+            if parts:
+                lines.append(f"- recent_artifacts: {' || '.join(parts)}")
+
+        if role_key == "reviewer":
+            _append_artifact_tail(limit=2)
+            _append_list_tail("recent_validation", bb.get("execution_logs", []), limit=2)
+            _append_list_tail("recent_feedback", bb.get("review_feedback", []), limit=2)
+        elif role_key == "developer":
+            _append_artifact_tail(limit=2)
+            _append_list_tail("recent_feedback", bb.get("review_feedback", []), limit=2)
+            _append_list_tail("recent_research", bb.get("research_notes", []), limit=2)
+        else:
+            _append_list_tail("recent_research", bb.get("research_notes", []), limit=2)
+            _append_artifact_tail(limit=1)
+            _append_list_tail("recent_feedback", bb.get("review_feedback", []), limit=1)
+        return trim("\n".join(lines).strip(), 1800)
+
+    def _uniform_kernel_summary_from_blackboard(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        code_rows = sorted(
+            list((bb.get("code_artifacts", {}) or {}).items()),
+            key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
+            reverse=True,
+        )
+        changes = []
+        for path, item in code_rows[:UNIFORM_KERNEL_SUMMARY_ITEM_LIMIT]:
+            row = item if isinstance(item, dict) else {}
+            note = trim(str(row.get("summary", "") or "").strip(), 180)
+            if note:
+                changes.append(f"- {path}: {note}")
+        if not changes:
+            changes.append("- No persistent code artifact was recorded on the blackboard.")
+
+        validation = []
+        feedback_rows = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        for row in reversed(feedback_rows[-UNIFORM_KERNEL_SUMMARY_ITEM_LIMIT:]):
+            if not isinstance(row, dict):
+                continue
+            txt = trim(str(row.get("content", "") or "").strip(), 180)
+            if txt:
+                validation.append(f"- Review: {txt}")
+        exec_rows = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        for row in reversed(exec_rows[-UNIFORM_KERNEL_SUMMARY_ITEM_LIMIT:]):
+            if len(validation) >= UNIFORM_KERNEL_SUMMARY_ITEM_LIMIT:
+                break
+            if not isinstance(row, dict):
+                continue
+            txt = trim(str(row.get("content", "") or "").strip(), 180)
+            if txt:
+                validation.append(f"- Validation evidence: {txt}")
+        if not validation:
+            validation.append("- Validation evidence was not explicitly recorded; rerun focused checks if stronger assurance is required.")
+
+        risks = []
+        if self._manager_has_error_log(bb):
+            risks.append("- Residual risk: the latest execution logs still contain blocking errors.")
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if not bool(approval.get("approved", False)):
+            risks.append("- Residual risk: fresh reviewer approval is still required.")
+        if not code_rows:
+            risks.append("- Next step: confirm the final edit surface before additional implementation.")
+        if not risks:
+            risks.append("- Next step: keep an eye on follow-up edge cases and add broader regression coverage if this change expands.")
+
+        summary = "\n".join(
+            [
+                "Changes made:",
+                *changes,
+                "",
+                "Validation evidence:",
+                *validation,
+                "",
+                "Residual risks / next steps:",
+                *risks,
+            ]
+        ).strip()
+        return trim(summary, UNIFORM_KERNEL_MAX_SUMMARY_CHARS)
+
+    def _uniform_kernel_ensure_summary(self, board: dict | None = None, *, force: bool = False) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        state = self._ensure_uniform_kernel_state()
+        cached = trim(str(state.get("summary_cache", "") or "").strip(), UNIFORM_KERNEL_MAX_SUMMARY_CHARS)
+        if cached and (not force) and self._final_summary_sufficient(cached, strict=True):
+            return cached
+        summary = self._uniform_kernel_summary_from_blackboard(bb)
+        if summary and self._final_summary_sufficient(summary, strict=True):
+            if summary != cached:
+                state["summary_generations"] = max(0, int(state.get("summary_generations", 0) or 0)) + 1
+                state["summary_cache"] = summary
+                state["summary_updated_at"] = float(now_ts())
+                self.uniform_kernel_state = state
+                self._emit("status", {"summary": "uniform kernel synthesized final summary from blackboard"})
+            return summary
+        return summary
+
+    def _new_memory_capsule(self) -> dict:
+        level = normalize_session_compression_level(
+            getattr(self, "session_compression_level", DEFAULT_SESSION_COMPRESSION_LEVEL),
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        )
+        profile = session_compression_profile(level)
+        return {
+            "version": 1,
+            "updated_at": float(now_ts()),
+            "compression_level": level,
+            "compression_label": trim(str(profile.get("label", "") or "").strip(), 40),
+            "goal_anchor": {
+                "goal": "",
+                "objective": "",
+                "status": "INITIALIZING",
+                "task_type": "general",
+                "complexity": "simple",
+            },
+            "plan_anchor": {
+                "progress": "initializing",
+                "current_focus": "",
+                "next_action": "",
+                "phase": "",
+                "tool": "",
+                "delegate_target": "",
+                "delegate_instruction": "",
+                "active_split": "",
+                "watchdog_hint": "",
+            },
+            "recent_chain": [],
+            "open_work": {
+                "focus": "",
+                "todos": [],
+                "tasks": [],
+                "completed_todos": 0,
+                "completed_tasks": 0,
+            },
+            "active_files": [],
+            "validation_focus": {
+                "missing_artifacts": [],
+                "latest_failure": "",
+                "contract_paths": [],
+                "contract_literals": [],
+                "approved": False,
+            },
+            "history_digest": {
+                "summary": "",
+                "completed_files": [],
+                "archive_segment": "",
+                "archived_messages": 0,
+                "archives_total": 0,
+            },
+        }
+
+    def _normalize_memory_capsule(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        capsule = self._new_memory_capsule()
+        capsule["updated_at"] = float(src.get("updated_at", now_ts()) or now_ts())
+        capsule["compression_level"] = normalize_session_compression_level(
+            src.get("compression_level", capsule["compression_level"]),
+            default=capsule["compression_level"],
+        )
+        capsule["compression_label"] = trim(
+            str(
+                src.get(
+                    "compression_label",
+                    session_compression_profile(capsule["compression_level"]).get("label", ""),
+                )
+                or ""
+            ).strip(),
+            40,
+        )
+        goal_anchor = src.get("goal_anchor", {}) if isinstance(src.get("goal_anchor"), dict) else {}
+        capsule["goal_anchor"] = {
+            "goal": trim(str(goal_anchor.get("goal", "") or "").strip(), 2200),
+            "objective": trim(str(goal_anchor.get("objective", "") or "").strip(), 800),
+            "status": self._normalize_blackboard_status(goal_anchor.get("status", "INITIALIZING")),
+            "task_type": trim(str(goal_anchor.get("task_type", "general") or "").strip(), 40),
+            "complexity": trim(str(goal_anchor.get("complexity", "simple") or "").strip(), 20),
+        }
+        plan_anchor = src.get("plan_anchor", {}) if isinstance(src.get("plan_anchor"), dict) else {}
+        capsule["plan_anchor"] = {
+            "progress": trim(str(plan_anchor.get("progress", "initializing") or "").strip(), 60),
+            "current_focus": trim(str(plan_anchor.get("current_focus", "") or "").strip(), 600),
+            "next_action": trim(str(plan_anchor.get("next_action", "") or "").strip(), 600),
+            "phase": trim(str(plan_anchor.get("phase", "") or "").strip(), 40),
+            "tool": trim(str(plan_anchor.get("tool", "") or "").strip(), 80),
+            "delegate_target": self._sanitize_agent_role(plan_anchor.get("delegate_target", "")),
+            "delegate_instruction": trim(str(plan_anchor.get("delegate_instruction", "") or "").strip(), 800),
+            "active_split": trim(str(plan_anchor.get("active_split", "") or "").strip(), 500),
+            "watchdog_hint": trim(str(plan_anchor.get("watchdog_hint", "") or "").strip(), 320),
+        }
+
+        def _clean_rows(rows: object, *, path_mode: bool = False) -> list[dict]:
+            out: list[dict] = []
+            arr = rows if isinstance(rows, list) else []
+            for row in arr[:32]:
+                if not isinstance(row, dict):
+                    continue
+                item = {
+                    "text": trim(str(row.get("text", "") or row.get("content", "") or "").strip(), 320),
+                    "status": trim(str(row.get("status", "") or "").strip(), 40),
+                    "role": trim(str(row.get("role", "") or "").strip(), 40),
+                    "agent_role": self._sanitize_agent_bubble_role(row.get("agent_role", "")),
+                    "owner": trim(str(row.get("owner", "") or "").strip(), 40),
+                    "path": (
+                        normalize_rel_preview_path(str(row.get("path", "") or ""))
+                        or trim(str(row.get("path", "") or "").strip(), 280)
+                    ),
+                    "kind": trim(str(row.get("kind", "") or "").strip(), 40),
+                    "summary": trim(str(row.get("summary", "") or row.get("text", "") or "").strip(), 220),
+                    "last_actor": trim(str(row.get("last_actor", "") or "").strip(), 40),
+                    "pressure": max(0, int(row.get("pressure", 0) or 0)),
+                    "ts": float(row.get("ts", 0.0) or 0.0),
+                    "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                }
+                if path_mode and not item["path"]:
+                    continue
+                if (not path_mode) and (not item["text"]):
+                    continue
+                out.append(item)
+            return out
+
+        open_work = src.get("open_work", {}) if isinstance(src.get("open_work"), dict) else {}
+        capsule["recent_chain"] = _clean_rows(src.get("recent_chain", []), path_mode=False)
+        capsule["open_work"] = {
+            "focus": trim(str(open_work.get("focus", "") or "").strip(), 400),
+            "todos": _clean_rows(open_work.get("todos", []), path_mode=False),
+            "tasks": _clean_rows(open_work.get("tasks", []), path_mode=False),
+            "completed_todos": max(0, int(open_work.get("completed_todos", 0) or 0)),
+            "completed_tasks": max(0, int(open_work.get("completed_tasks", 0) or 0)),
+        }
+        capsule["active_files"] = _clean_rows(src.get("active_files", []), path_mode=True)
+        validation_focus = src.get("validation_focus", {}) if isinstance(src.get("validation_focus"), dict) else {}
+        missing = validation_focus.get("missing_artifacts", [])
+        capsule["validation_focus"] = {
+            "missing_artifacts": [
+                normalize_rel_preview_path(str(x or "")) or trim(str(x or "").strip(), 280)
+                for x in (missing if isinstance(missing, list) else [])
+                if normalize_rel_preview_path(str(x or "")) or trim(str(x or "").strip(), 280)
+            ][:12],
+            "latest_failure": trim(str(validation_focus.get("latest_failure", "") or "").strip(), 600),
+            "contract_paths": [
+                normalize_rel_preview_path(str(x or "")) or trim(str(x or "").strip(), 280)
+                for x in (validation_focus.get("contract_paths", []) if isinstance(validation_focus.get("contract_paths"), list) else [])
+                if normalize_rel_preview_path(str(x or "")) or trim(str(x or "").strip(), 280)
+            ][:12],
+            "contract_literals": [
+                trim(str(x or "").strip(), 160)
+                for x in (
+                    validation_focus.get("contract_literals", [])
+                    if isinstance(validation_focus.get("contract_literals"), list)
+                    else []
+                )
+                if trim(str(x or "").strip(), 160)
+            ][:12],
+            "approved": bool(validation_focus.get("approved", False)),
+        }
+        history = src.get("history_digest", {}) if isinstance(src.get("history_digest"), dict) else {}
+        capsule["history_digest"] = {
+            "summary": trim(str(history.get("summary", "") or "").strip(), 5200),
+            "completed_files": _clean_rows(history.get("completed_files", []), path_mode=True),
+            "archive_segment": trim(str(history.get("archive_segment", "") or "").strip(), 120),
+            "archived_messages": max(0, int(history.get("archived_messages", 0) or 0)),
+            "archives_total": max(0, int(history.get("archives_total", 0) or 0)),
+        }
+        return capsule
+
+    def _memory_status_alias(self, raw: object, fallback: str) -> str:
+        alias = {
+            "todo": "pending",
+            "doing": "in_progress",
+            "inprogress": "in_progress",
+            "in-progress": "in_progress",
+            "done": "completed",
+            "finish": "completed",
+            "finished": "completed",
+        }
+        key = str(raw or "").strip().lower()
+        mapped = alias.get(key, key or fallback)
+        if mapped in {"pending", "in_progress", "completed", "blocked"}:
+            return mapped
+        return fallback
+
+    def _collect_memory_open_work_state(self, open_limit: int = 6) -> dict:
+        cap = max(1, min(12, int(open_limit or 6)))
+        todo_rows: list[dict] = []
+        task_rows: list[dict] = []
+        completed_todos = 0
+        completed_tasks = 0
+        focus = ""
+        for row in self.todo.snapshot():
+            if not isinstance(row, dict):
+                continue
+            status = self._memory_status_alias(row.get("status", ""), "pending")
+            content = normalize_work_text(row.get("content", ""), status) or str(row.get("content", "")).strip()
+            content = trim(content or "(empty todo)", 180)
+            if status in {"pending", "in_progress"}:
+                if status == "in_progress" and not focus:
+                    focus = content
+                if len(todo_rows) < cap:
+                    todo_rows.append({"status": status, "text": content})
+            elif status == "completed":
+                completed_todos += 1
+        for row in self.tasks.list_objects():
+            if not isinstance(row, dict):
+                continue
+            status = self._memory_status_alias(row.get("status", ""), "pending")
+            subject = normalize_work_text(row.get("subject", ""), status) or str(row.get("subject", "")).strip()
+            subject = trim(subject or "(empty task)", 180)
+            if status in {"pending", "in_progress", "blocked"}:
+                owner = trim(str(row.get("owner", "") or "").strip(), 24)
+                label = f"#{int(row.get('id', 0) or 0)} [{status}] {subject}"
+                if owner:
+                    label += f" @{owner}"
+                if status == "in_progress" and not focus:
+                    focus = subject
+                if len(task_rows) < cap:
+                    task_rows.append({"status": status, "text": label, "owner": owner})
+            elif status == "completed":
+                completed_tasks += 1
+        return {
+            "focus": trim(focus, 220),
+            "todos": todo_rows[:cap],
+            "tasks": task_rows[:cap],
+            "completed_todos": completed_todos,
+            "completed_tasks": completed_tasks,
+        }
+
+    def _collect_memory_recent_chain(self, limit: int = 6) -> list[dict]:
+        cap = max(1, min(12, int(limit or 6)))
+        rows: list[dict] = []
+        inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
+        for msg in reversed(self.messages):
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", "") or "").strip().lower()
+            if role == "tool":
+                continue
+            text = msg.get("content", "")
+            if isinstance(text, list):
+                text = json_dumps(text)
+            text = trim(str(text or "").strip(), 220)
+            if not text:
+                tool_calls = msg.get("tool_calls", [])
+                tool_names: list[str] = []
+                if isinstance(tool_calls, list):
+                    for item in tool_calls:
+                        if not isinstance(item, dict):
+                            continue
+                        fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+                        name = trim(str(fn.get("name", "") or "").strip(), 40)
+                        if name:
+                            tool_names.append(name)
+                if tool_names:
+                    text = f"[tool calls] {', '.join(tool_names[:4])}"
+            if not text:
+                continue
+            agent_role = self._sanitize_agent_bubble_role(msg.get("agent_role", ""))
+            if (not agent_role) and role == "assistant" and inferred_assistant_role:
+                agent_role = inferred_assistant_role
+            if agent_role and role == "assistant":
+                inferred_assistant_role = self._sanitize_agent_role(agent_role)
+            rows.append(
+                {
+                    "role": role,
+                    "agent_role": agent_role,
+                    "text": text,
+                    "ts": float(msg.get("ts", 0.0) or 0.0),
+                }
+            )
+            if len(rows) >= cap:
+                break
+        rows.reverse()
+        return rows[:cap]
+
+    def _memory_log_path_pressure(self, board: dict | None = None) -> dict[str, int]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        pressure: dict[str, int] = {}
+
+        def _add(path: str, amount: int):
+            rel = normalize_rel_preview_path(path) or trim(str(path or "").strip(), 280)
+            if not rel:
+                return
+            pressure[rel] = int(pressure.get(rel, 0) or 0) + int(amount)
+
+        for rel in self._goal_missing_expected_artifacts(bb):
+            _add(rel, 5)
+        for rel in self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or "")):
+            _add(rel, 3)
+        rows: list[dict] = []
+        for key in ("review_feedback", "execution_logs", "conversation_history"):
+            arr = bb.get(key, [])
+            if isinstance(arr, list):
+                rows.extend(arr[-18:])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("content", "") or "")
+            for hit in WORKSPACE_PATH_RE.findall(text):
+                _add(str(hit or ""), 2)
+        return pressure
+
+    def _collect_memory_file_state(
+        self,
+        board: dict | None = None,
+        *,
+        active_limit: int = 6,
+        history_limit: int = 6,
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        active_cap = max(1, min(12, int(active_limit or 6)))
+        history_cap = max(1, min(12, int(history_limit or 6)))
+        pressure = self._memory_log_path_pressure(bb)
+        merged: dict[str, dict] = {}
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        linked = bb.get("linked_files", {}) if isinstance(bb.get("linked_files"), dict) else {}
+
+        def _upsert(path: str, row: dict, *, kind: str):
+            rel = normalize_rel_preview_path(path) or trim(str(path or "").strip(), 280)
+            if not rel:
+                return
+            item = row if isinstance(row, dict) else {}
+            prev = merged.get(rel, {})
+            summary = trim(
+                str(item.get("summary", "") or prev.get("summary", "") or "").strip(),
+                220,
+            )
+            last_actor = trim(
+                str(item.get("last_actor", "") or prev.get("last_actor", "") or "").strip(),
+                40,
+            )
+            updated_at = max(
+                float(item.get("updated_at", 0.0) or 0.0),
+                float(prev.get("updated_at", 0.0) or 0.0),
+            )
+            merged[rel] = {
+                "path": rel,
+                "kind": kind if kind == "artifact" or not prev else prev.get("kind", kind),
+                "summary": summary,
+                "last_actor": last_actor,
+                "updated_at": updated_at,
+                "pressure": max(
+                    int(pressure.get(rel, 0) or 0),
+                    int(prev.get("pressure", 0) or 0),
+                ),
+            }
+
+        for path, row in artifacts.items():
+            _upsert(path, row, kind="artifact")
+        for path, row in linked.items():
+            _upsert(path, row, kind="linked_file")
+
+        ordered = sorted(
+            merged.values(),
+            key=lambda item: (
+                -int(item.get("pressure", 0) or 0),
+                -float(item.get("updated_at", 0.0) or 0.0),
+                str(item.get("path", "") or ""),
+            ),
+        )
+        active_files = [dict(x) for x in ordered[:active_cap]]
+        history_files = [dict(x) for x in ordered[active_cap : active_cap + history_cap]]
+        return {
+            "active_files": active_files,
+            "history_files": history_files,
+        }
+
+    def _merge_memory_history_summary(self, previous: str, latest: str, *, max_chars: int) -> str:
+        prev = trim(str(previous or "").strip(), max_chars)
+        current = trim(str(latest or "").strip(), max_chars)
+        if current and prev and current != prev:
+            return trim(
+                "Latest archived context:\n"
+                + current
+                + "\n\nEarlier archived context:\n"
+                + prev,
+                max_chars,
+            )
+        return current or prev
+
+    def _refresh_memory_capsule(
+        self,
+        board: dict | None = None,
+        *,
+        archived_summary: str = "",
+        archived_segment: dict | None = None,
+        archived_message_count: int = 0,
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._new_blackboard(self._latest_user_goal_text())
+        capsule = self._normalize_memory_capsule(bb.get("memory_capsule", {}))
+        level = normalize_session_compression_level(
+            getattr(self, "session_compression_level", capsule.get("compression_level", DEFAULT_SESSION_COMPRESSION_LEVEL)),
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        )
+        profile = session_compression_profile(level)
+        task_profile = self._ensure_blackboard_task_profile(bb)
+        judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
+        open_work = self._collect_memory_open_work_state(
+            open_limit=int(profile.get("open_work_items", 6) or 6),
+        )
+        file_state = self._collect_memory_file_state(
+            bb,
+            active_limit=int(profile.get("active_file_items", 6) or 6),
+            history_limit=int(profile.get("history_file_items", 6) or 6),
+        )
+        recent_chain = self._collect_memory_recent_chain(
+            limit=int(profile.get("recent_chain_items", 6) or 6),
+        )
+        current_split = ""
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            step_row = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(step_row, dict):
+                step_text = trim(
+                    str(
+                        step_row.get("description", "")
+                        or step_row.get("instruction", "")
+                        or ""
+                    ).strip(),
+                    260,
+                )
+                current_split = trim(
+                    (
+                        f"{cursor + 1}/{max(1, len(steps))} "
+                        f"{trim(str(step_row.get('action_type', '') or '').strip(), 32) or 'step'} "
+                        f"-> {trim(str(step_row.get('target', '') or '').strip(), 32) or 'agent'} | "
+                        f"{step_text}"
+                    ),
+                    420,
+                )
+        objective = trim(
+            str(task_profile.get("direct_objective", "") or "").strip()
+            or str(bb.get("original_goal", "") or "").strip(),
+            900,
+        )
+        latest_failure = trim(self._latest_validation_failure_hint(bb), 360)
+        missing_artifacts = list(self._goal_missing_expected_artifacts(bb))[:6]
+        contract_paths = self._workspace_contract_paths(limit=int(profile.get("contract_items", 5) or 5))
+        contract_literals = self._workspace_contract_literal_hints(limit=int(profile.get("contract_items", 5) or 5))
+        delegate_instruction = self._delegate_instruction_display_text(
+            trim(
+                str(delegate.get("display_instruction", "") or delegate.get("instruction", "") or "").strip(),
+                900,
+            ),
+            objective=objective,
+            max_chars=420,
+        )
+        watchdog_bits: list[str] = []
+        if int(wd.get("intent_no_tool_streak", 0) or 0) > 0:
+            watchdog_bits.append(f"intent_no_tool={int(wd.get('intent_no_tool_streak', 0) or 0)}")
+        if int(wd.get("repeat_no_tool_streak", 0) or 0) > 0:
+            watchdog_bits.append(f"repeat_no_tool={int(wd.get('repeat_no_tool_streak', 0) or 0)}")
+        if int(wd.get("state_unchanged_streak", 0) or 0) > 0:
+            watchdog_bits.append(f"state_stall={int(wd.get('state_unchanged_streak', 0) or 0)}")
+        watchdog_hint = ", ".join(watchdog_bits)
+        focus = trim(
+            current_split
+            or str(delegate.get("display_instruction", "") or delegate.get("instruction", "") or "")
+            or open_work.get("focus", "")
+            or latest_failure
+            or objective,
+            320,
+        )
+        next_action = ""
+        if current_split:
+            next_action = current_split
+        elif latest_failure:
+            next_action = f"repair validation issue: {latest_failure}"
+        elif missing_artifacts:
+            next_action = f"produce or update: {', '.join(missing_artifacts[:3])}"
+        elif focus:
+            next_action = focus
+        capsule["updated_at"] = float(now_ts())
+        capsule["compression_level"] = level
+        capsule["compression_label"] = trim(str(profile.get("label", "") or "").strip(), 40)
+        capsule["goal_anchor"] = {
+            "goal": trim(str(bb.get("original_goal", "") or "").strip(), 2200),
+            "objective": objective,
+            "status": status,
+            "task_type": trim(str(task_profile.get("task_type", "general") or "general").strip(), 40),
+            "complexity": trim(str(task_profile.get("complexity", "simple") or "simple").strip(), 20),
+        }
+        capsule["plan_anchor"] = {
+            "progress": trim(str(judgement.get("progress", "initializing") or "").strip(), 60),
+            "current_focus": focus,
+            "next_action": trim(next_action, 420),
+            "phase": trim(str(self.current_phase or "").strip(), 40),
+            "tool": trim(str(self.current_tool_name or "").strip(), 80),
+            "delegate_target": self._sanitize_agent_role(delegate.get("target", "")),
+            "delegate_instruction": delegate_instruction,
+            "active_split": current_split,
+            "watchdog_hint": trim(watchdog_hint, 320),
+        }
+        capsule["recent_chain"] = recent_chain
+        capsule["open_work"] = open_work
+        capsule["active_files"] = file_state.get("active_files", [])
+        capsule["validation_focus"] = {
+            "missing_artifacts": missing_artifacts,
+            "latest_failure": latest_failure,
+            "contract_paths": contract_paths,
+            "contract_literals": contract_literals,
+            "approved": bool((bb.get("approval", {}) or {}).get("approved", False)),
+        }
+        previous_history = capsule.get("history_digest", {}) if isinstance(capsule.get("history_digest"), dict) else {}
+        seg = archived_segment if isinstance(archived_segment, dict) else {}
+        capsule["history_digest"] = {
+            "summary": self._merge_memory_history_summary(
+                str(previous_history.get("summary", "") or ""),
+                trim(str(archived_summary or "").strip(), int(profile.get("summary_chars", 3800) or 3800)),
+                max_chars=int(profile.get("summary_chars", 3800) or 3800),
+            ),
+            "completed_files": file_state.get("history_files", []),
+            "archive_segment": trim(
+                str(seg.get("id", "") or previous_history.get("archive_segment", "") or "").strip(),
+                120,
+            ),
+            "archived_messages": max(
+                0,
+                int(
+                    archived_message_count
+                    or seg.get("messages", 0)
+                    or previous_history.get("archived_messages", 0)
+                    or 0
+                ),
+            ),
+            "archives_total": len(self.context_archives),
+        }
+        bb["memory_capsule"] = capsule
+        return bb
+
+    def _memory_capsule_markdown(
+        self,
+        board: dict | None = None,
+        *,
+        max_items: int = 6,
+        include_history: bool = True,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        capsule = self._normalize_memory_capsule(bb.get("memory_capsule", {}))
+        mx = max(1, min(12, int(max_items or 6)))
+        level = normalize_session_compression_level(
+            capsule.get("compression_level", DEFAULT_SESSION_COMPRESSION_LEVEL),
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        )
+        goal = capsule.get("goal_anchor", {}) if isinstance(capsule.get("goal_anchor"), dict) else {}
+        plan = capsule.get("plan_anchor", {}) if isinstance(capsule.get("plan_anchor"), dict) else {}
+        open_work = capsule.get("open_work", {}) if isinstance(capsule.get("open_work"), dict) else {}
+        validation = capsule.get("validation_focus", {}) if isinstance(capsule.get("validation_focus"), dict) else {}
+        history = capsule.get("history_digest", {}) if isinstance(capsule.get("history_digest"), dict) else {}
+        lines = [
+            "## Memory Capsule",
+            (
+                f"- compression: L{level} "
+                f"({trim(str(capsule.get('compression_label', '') or '').strip(), 40) or session_compression_profile(level).get('label', '')})"
+            ),
+            f"- goal_anchor: {trim(str(goal.get('goal', '') or '').strip(), 600)}",
+            f"- objective: {trim(str(goal.get('objective', '') or '').strip(), 260)}",
+            f"- plan_progress: {trim(str(plan.get('progress', '') or '').strip(), 120)}",
+        ]
+        if str(plan.get("current_focus", "") or "").strip():
+            lines.append(f"- current_focus: {trim(str(plan.get('current_focus', '') or '').strip(), 260)}")
+        if str(plan.get("next_action", "") or "").strip():
+            lines.append(f"- next_action: {trim(str(plan.get('next_action', '') or '').strip(), 260)}")
+        if str(plan.get("delegate_target", "") or "").strip() or str(plan.get("delegate_instruction", "") or "").strip():
+            lines.append(
+                "- delegate_anchor: "
+                f"{trim(str(plan.get('delegate_target', '') or '').strip(), 24) or '-'} | "
+                f"{trim(str(plan.get('delegate_instruction', '') or '').strip(), 220)}"
+            )
+        if str(plan.get("active_split", "") or "").strip():
+            lines.append(f"- active_split: {trim(str(plan.get('active_split', '') or '').strip(), 240)}")
+        if str(plan.get("watchdog_hint", "") or "").strip():
+            lines.append(f"- watchdog_hint: {trim(str(plan.get('watchdog_hint', '') or '').strip(), 200)}")
+        recent_chain = capsule.get("recent_chain", []) if isinstance(capsule.get("recent_chain"), list) else []
+        if recent_chain:
+            rendered = []
+            for row in recent_chain[-mx:]:
+                if not isinstance(row, dict):
+                    continue
+                role = trim(str(row.get("agent_role", "") or row.get("role", "") or "agent").strip(), 20)
+                text = trim(str(row.get("text", "") or "").strip(), 160)
+                if text:
+                    rendered.append(f"[{role}] {text}")
+            if rendered:
+                lines.append(f"- recent_chain: {' || '.join(rendered[:mx])}")
+        active_files = capsule.get("active_files", []) if isinstance(capsule.get("active_files"), list) else []
+        if active_files:
+            rendered = []
+            for row in active_files[:mx]:
+                if not isinstance(row, dict):
+                    continue
+                path = trim(str(row.get("path", "") or "").strip(), 80)
+                summary = trim(str(row.get("summary", "") or "").strip(), 120)
+                if path:
+                    rendered.append(f"{path}{' | ' + summary if summary else ''}")
+            if rendered:
+                lines.append(f"- active_files: {' || '.join(rendered)}")
+        todo_rows = open_work.get("todos", []) if isinstance(open_work.get("todos"), list) else []
+        task_rows = open_work.get("tasks", []) if isinstance(open_work.get("tasks"), list) else []
+        if todo_rows:
+            lines.append(
+                "- open_todos: "
+                + " || ".join(
+                    trim(str(row.get("text", "") or "").strip(), 140)
+                    for row in todo_rows[:mx]
+                    if isinstance(row, dict) and trim(str(row.get("text", "") or "").strip(), 140)
+                )
+            )
+        if task_rows:
+            lines.append(
+                "- open_tasks: "
+                + " || ".join(
+                    trim(str(row.get("text", "") or "").strip(), 140)
+                    for row in task_rows[:mx]
+                    if isinstance(row, dict) and trim(str(row.get("text", "") or "").strip(), 140)
+                )
+            )
+        missing = validation.get("missing_artifacts", []) if isinstance(validation.get("missing_artifacts"), list) else []
+        if missing:
+            lines.append(f"- missing_artifacts: {', '.join(trim(str(x or ''), 80) for x in missing[:mx])}")
+        latest_failure = trim(str(validation.get("latest_failure", "") or "").strip(), 240)
+        if latest_failure:
+            lines.append(f"- latest_failure: {latest_failure}")
+        contract_paths = validation.get("contract_paths", []) if isinstance(validation.get("contract_paths"), list) else []
+        if contract_paths:
+            lines.append(
+                "- contract_paths: "
+                + ", ".join(trim(str(x or ""), 80) for x in contract_paths[:mx] if trim(str(x or ""), 80))
+            )
+        if include_history:
+            history_summary = trim(
+                str(history.get("summary", "") or "").strip(),
+                int(session_compression_profile(level).get("history_chars", 2100) or 2100),
+            )
+            if history_summary:
+                lines.append(f"- history_digest: {history_summary}")
+            completed_files = history.get("completed_files", []) if isinstance(history.get("completed_files"), list) else []
+            if completed_files:
+                rendered = []
+                for row in completed_files[:mx]:
+                    if not isinstance(row, dict):
+                        continue
+                    path = trim(str(row.get("path", "") or "").strip(), 80)
+                    if path:
+                        rendered.append(path)
+                if rendered:
+                    lines.append(f"- background_files: {', '.join(rendered)}")
+        return trim("\n".join(line for line in lines if str(line or "").strip()), 4600)
+
+    def _uniform_kernel_load_probe(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        wd = bb.get("watchdog", {}) if isinstance(bb.get("watchdog"), dict) else {}
+        profile = self._ensure_blackboard_task_profile(bb)
+        state = self._ensure_uniform_kernel_state()
+        bus_signal = self._recent_agentbus_signal()
+        reasons: list[str] = []
+        score = 0
+        goal = str(bb.get("original_goal", "") or "").strip()
+        if len(goal) >= 260:
+            score += 1
+            reasons.append("goal-broad")
+        try:
+            limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
+            used = max(0, int(self._estimate_tokens()))
+        except Exception:
+            limit = TOKEN_THRESHOLD
+            used = 0
+        if used >= int(limit * 0.82):
+            score += 1
+            reasons.append("context-high")
+        if len(bb.get("research_notes", []) or []) == 0 and len(bb.get("code_artifacts", {}) or {}) == 0:
+            score += 1
+            reasons.append("no-grounded-progress")
+        if int(bb.get("manager_cycles", 0) or 0) >= 3 and len(bb.get("code_artifacts", {}) or {}) == 0:
+            score += 1
+            reasons.append("multi-cycle-no-artifact")
+        if int(wd.get("intent_no_tool_streak", 0) or 0) >= 1:
+            score += 2
+            reasons.append("intent-no-tool")
+        if int(wd.get("repeat_no_tool_streak", 0) or 0) >= 1:
+            score += 2
+            reasons.append("repeat-no-tool")
+        if int(wd.get("state_unchanged_streak", 0) or 0) >= 4:
+            score += 1
+            reasons.append("state-stalled")
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        if missing_expected:
+            score += 1
+            reasons.append("missing-expected")
+        contract_paths = self._workspace_contract_paths(limit=4)
+        if contract_paths:
+            score += 1
+            reasons.append("contract-present")
+        if len(missing_expected) >= 2 and contract_paths:
+            score += 2
+            reasons.append("multi-artifact-contract")
+        last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        if str(last_reply.get("role", "") or "").strip().lower() in AGENT_ROLES:
+            last_reply_text = trim(str(last_reply.get("text", "") or "").strip(), 1200)
+            if len(last_reply_text) >= 260 and self._watchdog_intent_without_action(last_reply_text):
+                score += 1
+                reasons.append("long-intent-reply")
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        delegate_instruction = trim(str(delegate.get("instruction", "") or "").strip(), 1200)
+        if len(delegate_instruction) >= 420:
+            score += 1
+            reasons.append("broad-delegate")
+        recent_targets = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-3:]]
+        if len(recent_targets) >= 3 and len(set(recent_targets)) == 1 and recent_targets[0] in AGENT_ROLES:
+            score += 1
+            reasons.append("route-oscillation")
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if bool(approval.get("approved", False)) and (not self._reviewer_final_summary_ready(bb)):
+            score += 1
+            reasons.append("summary-pending")
+        validate_contract_present = bool((self.files_root / "validate.py").exists())
+        latest_exec_low = self._latest_execution_log_text(bb).lower()
+        if (
+            validate_contract_present
+            and len(bb.get("code_artifacts", {}) or {}) > 0
+            and (not re.search(r"\bpass[_a-z0-9-]*\b", latest_exec_low))
+        ):
+            score += 1
+            reasons.append("validation-pending")
+        if str(profile.get("complexity", "simple") or "simple") == "complex":
+            score += 1
+            reasons.append("complex-task")
+        threshold = (
+            UNIFORM_KERNEL_LOAD_TRIGGER_SCORE
+            if self._uniform_kernel_microtask_mode_enabled()
+            else UNIFORM_KERNEL_PROACTIVE_SPLIT_SCORE
+        )
+        if int(wd.get("intent_no_tool_streak", 0) or 0) >= 1 or int(wd.get("repeat_no_tool_streak", 0) or 0) >= 1:
+            threshold = max(2, int(threshold) - 1)
+        elif int(state.get("manager_stride", UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE) >= 4:
+            threshold = int(threshold) + 1
+        if bool(bus_signal.get("fresh", False)) and not any(
+            token in reasons for token in ("intent-no-tool", "repeat-no-tool", "state-stalled")
+        ):
+            threshold = int(threshold) + 1
+        return {
+            "score": int(score),
+            "threshold": int(threshold),
+            "trigger": bool(score >= threshold),
+            "reason": ", ".join(reasons[:4]) or "none",
+        }
+
+    def _uniform_kernel_build_split_steps(self, board: dict, reason: str) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        objective = trim(str(profile.get("direct_objective", "") or "").strip(), 320) or trim(
+            str(bb.get("original_goal", "") or "").strip(),
+            320,
+        )
+        direct_expected = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+        file_hits = re.findall(
+            r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h)",
+            str(bb.get("original_goal", "") or ""),
+        )
+        anchor_text = ""
+        if file_hits:
+            uniq = []
+            for item in file_hits:
+                if item not in uniq:
+                    uniq.append(item)
+                if len(uniq) >= 3:
+                    break
+            if uniq:
+                anchor_text = f" Priority files: {', '.join(uniq)}."
+        feedback_rows = self._actionable_review_feedback_rows(bb)
+        need_fix = bool(feedback_rows) and (not self._manager_feedback_passed_from_blackboard(bb))
+        need_summary = bool((bb.get("approval", {}) or {}).get("approved", False)) and (
+            not self._reviewer_final_summary_ready(bb)
+        )
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        target_deliverables = list(missing_expected[:3] or direct_expected[:3])
+        research_count = len(bb.get("research_notes", []) or [])
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        has_grounding = bool(
+            research_count
+            or code_count
+            or len(bb.get("execution_logs", []) or [])
+            or len(bb.get("review_feedback", []) or [])
+        )
+        if target_deliverables and file_hits:
+            goal_path_order: dict[str, int] = {}
+            for idx, raw in enumerate(file_hits):
+                rel = normalize_rel_preview_path(str(raw or "").strip()) or str(raw or "").strip()
+                if rel and rel not in goal_path_order:
+                    goal_path_order[rel] = idx
+            target_deliverables = sorted(
+                target_deliverables,
+                key=lambda rel: (int(goal_path_order.get(rel, 10_000)), int(target_deliverables.index(rel))),
+            )
+        raw_steps: list[dict] = []
+        if not has_grounding:
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "ground",
+                    "target": "explorer",
+                    "description": (
+                        "Ground the repository quickly, read validate/spec/tests if present, identify exact edit surfaces, "
+                        "and write concise acceptance notes to blackboard."
+                        f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        if need_fix:
+            fix_target = "developer" if (code_count > 0 or target_deliverables) else "explorer"
+            fix_target_prefix = f"Target path: {target_deliverables[0]}. " if target_deliverables else ""
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": ("implement" if fix_target == "developer" else "ground"),
+                    "target": fix_target,
+                    "description": (
+                        fix_target_prefix
+                        + (
+                            "Address the active review or validation gap with one concrete update."
+                            if fix_target == "developer"
+                            else "Refresh the exact evidence set around the active review or validation gap and narrow the blocker."
+                        )
+                        + f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        elif target_deliverables:
+            for rel in target_deliverables[:3]:
+                raw_steps.append(
+                    {
+                        "step": len(raw_steps) + 1,
+                        "action_type": "implement",
+                        "target": "developer",
+                        "description": (
+                            f"Target path: {rel}. Create or update one current deliverable directly with an incremental patch. "
+                            "Do not only modify another file that might generate this artifact later. "
+                            f"Objective: {objective}.{anchor_text}"
+                        ),
+                    }
+                )
+        elif code_count > 0:
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "implement",
+                    "target": "developer",
+                    "description": (
+                        "Advance one concrete deliverable update for the current objective and keep the change easy to verify."
+                        f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        elif research_count > 0:
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "ground",
+                    "target": "explorer",
+                    "description": (
+                        "Turn the current grounded notes into one concise, executable support update with explicit constraints, "
+                        "paths, or next-step guidance."
+                        f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        else:
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "ground",
+                    "target": "explorer",
+                    "description": (
+                        "Turn the current grounding into one narrowed execution path with explicit acceptance notes and target paths."
+                        + f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        validate_description = (
+            "Validate the latest outputs with concrete evidence, run the nearest validator when present, and return pass/fix judgement."
+            if (code_count > 0 or target_deliverables or need_fix)
+            else (
+                "Review the latest grounded notes for coverage, consistency, and an executable next-step handoff."
+                if research_count > 0
+                else "Check that the current grounding is concrete, internally consistent, and ready for execution."
+            )
+        )
+        raw_steps.append(
+            {
+                "step": len(raw_steps) + 1,
+                "action_type": "validate",
+                "target": "reviewer",
+                "description": validate_description + f" Trigger: {trim(reason, 120)}.",
+            }
+        )
+        if need_summary or str(profile.get("complexity", "simple") or "simple") == "complex":
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "summary",
+                    "target": "explorer",
+                    "description": (
+                        "Read blackboard state and synthesize final summary covering changes, validation evidence, and residual risks."
+                    ),
+                }
+            )
+        return self._watchdog_normalize_steps(raw_steps)
+
+    def _uniform_kernel_activate_split(self, board: dict, reason: str, *, pinned_selection: str) -> bool:
+        return self._adaptive_split_activate(
+            board,
+            reason=reason,
+            pinned_selection=pinned_selection,
+            source="kernel",
+            role="manager",
+            step=None,
+        )
+
+    def _uniform_kernel_should_consult_manager(self, board: dict, route: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        row = route if isinstance(route, dict) else {}
+        source = str(row.get("source", "") or "").strip().lower()
+        if source == "kernel-queue":
+            dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+            steps = list(dq.get("steps", []) or [])
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current = steps[cursor] if cursor < len(steps) and isinstance(steps[cursor], dict) else {}
+            watchdog = self._normalize_watchdog_state(bb.get("watchdog", {}))
+            if bool(current.get("reanchor_inserted", False)) or bool(current.get("repair_inserted", False)):
+                return True
+            if int(watchdog.get("trigger_count", 0) or 0) >= 2:
+                return True
+            return False
+        if source == "kernel-bus-direct":
+            return False
+        if int(self.runtime_task_level or 0) == 5 or bool(self.runtime_requires_confirmation):
+            return True
+        if self._manager_has_error_log(bb):
+            return True
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        if status == "PAUSED":
+            return True
+        state = self._ensure_uniform_kernel_state()
+        if int(state.get("manager_handoffs", 0) or 0) <= 0:
+            return True
+        return bool(int(state.get("cycles_since_manager", 0) or 0) >= int(state.get("manager_stride", 3) or 3))
+
+    def _uniform_kernel_record_compare(
+        self,
+        *,
+        kernel_route: dict | None = None,
+        manager_route: dict | None = None,
+        selected: str = "",
+    ):
+        state = self._ensure_uniform_kernel_state()
+        krow = kernel_route if isinstance(kernel_route, dict) else {}
+        mrow = manager_route if isinstance(manager_route, dict) else {}
+        state["last_compare"] = {
+            "ts": float(now_ts()),
+            "kernel_source": trim(str(krow.get("source", "") or "").strip(), 80),
+            "kernel_target": trim(str(krow.get("target", "") or "").strip(), 40),
+            "manager_source": trim(str(mrow.get("source", "") or "").strip(), 80),
+            "manager_target": trim(str(mrow.get("target", "") or "").strip(), 40),
+            "selected": trim(str(selected or "").strip(), 40),
+        }
+        self.uniform_kernel_state = state
+
+    def _apply_coordinator_route(
+        self,
+        board: dict,
+        route: dict,
+        *,
+        emit_delegate_message: bool = True,
+        coordinator_label: str = "manager",
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        route = dict(route or {})
+        if coordinator_label != "manager":
+            has_grounded_outputs = bool(
+                len(bb.get("research_notes", []) or [])
+                or len(bb.get("code_artifacts", {}) or {})
+                or len(bb.get("execution_logs", []) or [])
+                or len(bb.get("review_feedback", []) or [])
+            )
+            target_hint = str(route.get("target", "") or "").strip().lower()
+            if (not has_grounded_outputs) and target_hint in AGENT_ROLES:
+                route["executor_mode"] = True
+                route["is_mandatory"] = True
+            route = self._manager_apply_anti_stall(route)
+            route = self._manager_apply_task_policy(route)
+            bb = self._ensure_blackboard()
+        active_profile = self._ensure_blackboard_task_profile(bb)
+        target = str(route.get("target", "") or "").strip().lower()
+        instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
+        display_instruction = self._delegate_instruction_display_text(
+            str(route.get("display_instruction", "") or instruction),
+            objective=str(route.get("direct_objective", active_profile.get("direct_objective", "")) or ""),
+            max_chars=900,
+        )
+        try:
+            task_level = int(route.get("task_level", active_profile.get("task_level", self.runtime_task_level or 3)) or 3)
+        except Exception:
+            task_level = int(self.runtime_task_level or 3)
+        if task_level not in TASK_LEVEL_CHOICES:
+            task_level = 3
+        execution_mode = normalize_execution_mode(
+            route.get("execution_mode", active_profile.get("execution_mode", self._effective_execution_mode())),
+            default=str(TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3]).get("execution_mode", EXECUTION_MODE_SYNC)),
+        )
+        task_type = trim(str(route.get("task_type", "") or "").strip().lower(), 40)
+        complexity = trim(str(route.get("complexity", "") or "").strip().lower(), 20)
+        scale_preference = trim(str(route.get("scale_preference", "") or "").strip().lower(), 20)
+        if scale_preference not in TASK_SCALE_PREFERENCES:
+            scale_preference = str(active_profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
+            if scale_preference not in TASK_SCALE_PREFERENCES:
+                scale_preference = "balanced"
+        judgement = trim(str(route.get("judgement", "") or "").strip(), 200)
+        objective = trim(str(route.get("direct_objective", "") or "").strip(), 800)
+        participants: list[str] = []
+        raw_participants = route.get("participants", active_profile.get("participants", []))
+        if isinstance(raw_participants, list):
+            for item in raw_participants:
+                role = self._sanitize_agent_role(item)
+                if role and role not in participants:
+                    participants.append(role)
+        assigned_expert = self._sanitize_agent_role(
+            route.get("assigned_expert", active_profile.get("assigned_expert", self.runtime_assigned_expert))
+        ) or (participants[0] if participants else "developer")
+        if execution_mode == EXECUTION_MODE_SINGLE:
+            participants = [assigned_expert]
+        if not participants:
+            participants = [assigned_expert]
+        if task_level == 5:
+            round_budget = 0
+        else:
+            try:
+                round_budget = int(route.get("round_budget", self._blackboard_round_budget(bb)) or 0)
+            except Exception:
+                round_budget = int(self._blackboard_round_budget(bb) or 0)
+            round_budget = max(1, min(int(self.max_agent_rounds or MAX_AGENT_ROUNDS), int(round_budget)))
+        remaining_rounds = (
+            -1
+            if int(round_budget) <= 0
+            else max(0, int(route.get("remaining_rounds", round_budget - int(bb.get("manager_cycles", 0) or 0)) or 0))
+        )
+        route_row = {
+            "ts": float(now_ts()),
+            "target": target,
+            "instruction": instruction,
+            "display_instruction": display_instruction,
+            "reason": trim(str(route.get("reason", "") or "").strip(), 600),
+            "source": trim(str(route.get("source", "") or "").strip(), 40),
+            "task_level": int(task_level),
+            "execution_mode": execution_mode,
+            "task_type": task_type,
+            "complexity": complexity,
+            "scale_preference": scale_preference,
+            "judgement": judgement,
+            "direct_objective": objective,
+            "participants": list(participants),
+            "assigned_expert": assigned_expert,
+            "is_mandatory": bool(route.get("is_mandatory", False)),
+            "executor_mode": bool(route.get("executor_mode", False)),
+            "requires_user_confirmation": bool(route.get("requires_user_confirmation", False)),
+            "round_budget": int(round_budget),
+            "remaining_rounds": int(remaining_rounds),
+        }
+        self.manager_routes.append(route_row)
+        self.manager_routes = self.manager_routes[-240:]
+        profile = self._ensure_blackboard_task_profile(bb)
+        profile["task_level"] = int(task_level)
+        profile["execution_mode"] = execution_mode
+        profile["participants"] = list(participants)
+        profile["assigned_expert"] = assigned_expert
+        profile["is_mandatory"] = bool(route_row.get("is_mandatory", False))
+        profile["executor_mode"] = bool(route_row.get("executor_mode", False))
+        profile["requires_user_confirmation"] = bool(route_row.get("requires_user_confirmation", False))
+        if task_type in TASK_PROFILE_TYPES:
+            profile["task_type"] = task_type
+        if complexity in TASK_COMPLEXITY_LEVELS:
+            profile["complexity"] = complexity
+        profile["scale_preference"] = scale_preference if scale_preference in TASK_SCALE_PREFERENCES else "balanced"
+        if objective:
+            profile["direct_objective"] = objective
+        profile["round_budget"] = int(round_budget) if int(round_budget) > 0 else 0
+        profile["recommended_agents"] = list(participants)
+        profile["updated_at"] = float(now_ts())
+        profile["reason"] = "manager-judged" if coordinator_label == "manager" else f"{coordinator_label}-judged"
+        bb["task_profile"] = profile
+        bb["manager_judgement"] = {
+            "task_type": str(profile.get("task_type", "")),
+            "complexity": str(profile.get("complexity", "")),
+            "scale_preference": str(profile.get("scale_preference", "balanced") or "balanced"),
+            "progress": judgement or self._manager_progress_state(bb),
+            "task_level": int(task_level),
+            "execution_mode": execution_mode,
+            "participants": list(participants),
+            "assigned_expert": assigned_expert,
+            "is_mandatory": bool(route_row.get("is_mandatory", False)),
+            "executor_mode": bool(route_row.get("executor_mode", False)),
+            "remaining_rounds": int(remaining_rounds),
+            "updated_at": float(now_ts()),
+        }
+        self.runtime_task_level = int(task_level)
+        self.runtime_execution_mode = execution_mode
+        self.runtime_participants = list(participants)
+        self.runtime_assigned_expert = assigned_expert
+        self.runtime_round_budget = int(round_budget)
+        self.runtime_task_judgement = judgement or self.runtime_task_judgement
+        self.runtime_task_type = str(profile.get("task_type", self.runtime_task_type) or "")
+        self.runtime_task_complexity = str(profile.get("complexity", self.runtime_task_complexity) or "")
+        self.runtime_scale_preference = str(profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
+        self.runtime_direct_objective = str(profile.get("direct_objective", self.runtime_direct_objective) or "")
+        self.runtime_requires_confirmation = bool(route_row.get("requires_user_confirmation", False))
+        self.runtime_confirmation_needed = bool(route_row.get("requires_user_confirmation", False))
+        bb["last_delegate"] = dict(route_row)
+        bb["active_agent"] = target if target in AGENT_ROLES else ""
+        self.blackboard = bb
+        self._sync_todos_from_blackboard(reason=f"{coordinator_label}-delegate:{target}", board=bb)
+        self._blackboard_touch()
+        self._blackboard_history(
+            "manager",
+            (
+                f"delegate {target}: {display_instruction or instruction} "
+                f"[level={profile.get('task_level', '-')}, mode={profile.get('execution_mode', '-')}, "
+                f"type={profile.get('task_type','general')}, complexity={profile.get('complexity','simple')}, "
+                f"judgement={bb['manager_judgement'].get('progress','')}, "
+                f"budget={profile.get('round_budget', self.max_agent_rounds)}]"
+            ),
+        )
+        if emit_delegate_message and target in AGENT_ROLES:
+            delegate_text, delegate_data = self._format_manager_delegate_message(route_row)
+            self.messages.append(
+                {
+                    "role": "system",
+                    "type": "manager_delegate",
+                    "content": delegate_text,
+                    "data": delegate_data,
+                    "agent_role": "manager",
+                    "ts": now_ts(),
+                }
+            )
+            self.messages = self.messages[-400:]
+            self._emit(
+                "message",
+                {
+                    "role": "system",
+                    "type": "manager_delegate",
+                    "text": delegate_text,
+                    "data": delegate_data,
+                    "agent_role": "manager",
+                    "summary": f"manager delegate -> {target}",
+                },
+            )
+        prefix = "manager" if coordinator_label == "manager" else coordinator_label
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"{prefix}[{profile.get('task_type','general')}/"
+                    f"{profile.get('complexity','simple')}/"
+                    f"{profile.get('scale_preference','balanced')}/"
+                    f"{bb['manager_judgement'].get('progress','initializing')}] "
+                    f"-> {target} (L{profile.get('task_level', '-')}/{profile.get('execution_mode', '-')}, "
+                    f"mandatory={bool(route_row.get('is_mandatory', False))}, "
+                    f"budget={('unlimited' if int(profile.get('round_budget', 0) or 0) <= 0 else profile.get('round_budget', self.max_agent_rounds))}, "
+                    f"remaining={remaining_rounds}, source={route_row['source']})"
+                )
+            },
+        )
+        state = self._ensure_uniform_kernel_state()
+        state["last_route_source"] = trim(str(route_row.get("source", "") or "").strip(), 80)
+        self.uniform_kernel_state = state
+        return route_row
+
+    def _uniform_kernel_delegate_turn(
+        self,
+        *,
+        pinned_selection: str,
+        media_inputs_round: list[dict] | None = None,
+    ) -> dict:
+        board = self._ensure_blackboard()
+        self._uniform_kernel_autotune(board)
+        latest_user_ts = self._latest_user_message_ts()
+        if self._invalidate_stale_approval_if_needed(
+            board,
+            latest_user_ts=latest_user_ts,
+            emit_status=True,
+        ):
+            board = self._ensure_blackboard()
+        if bool((board.get("approval", {}) or {}).get("approved", False)) and not self._reviewer_final_summary_ready(board):
+            self._uniform_kernel_ensure_summary(board, force=False)
+            board = self._ensure_blackboard()
+
+        load_probe = self._uniform_kernel_load_probe(board)
+        state = self._ensure_uniform_kernel_state()
+        state["last_load_reason"] = trim(str(load_probe.get("reason", "") or "").strip(), 220)
+        state["last_load_score"] = max(0, int(load_probe.get("score", 0) or 0))
+        self.uniform_kernel_state = state
+        if bool(load_probe.get("trigger", False)):
+            self._uniform_kernel_activate_split(
+                board,
+                str(load_probe.get("reason", "") or "uniform-kernel-load"),
+                pinned_selection=pinned_selection,
+            )
+            board = self._ensure_blackboard()
+
+        queue_pick = self._watchdog_pick_executor_route(board)
+        if queue_pick:
+            queue_args, queue_meta = queue_pick
+            queue_args = dict(queue_args or {})
+            queue_args["source"] = "kernel-queue"
+            queue_args["reason"] = trim(
+                (
+                    f"uniform kernel queue step {int(queue_meta.get('cursor', 0) or 0)}/"
+                    f"{int(queue_meta.get('total', 0) or 0)} "
+                    f"target={queue_meta.get('target', '?')} "
+                    f"trigger={queue_meta.get('trigger_reason', '')}"
+                ),
+                600,
+            )
+            if self._uniform_kernel_should_consult_manager(board, queue_args):
+                self._emit("status", {"summary": "queue stall detected; consulting manager for re-anchor"})
+                manager_row = self._manager_delegate_turn(
+                    pinned_selection=pinned_selection,
+                    media_inputs_round=media_inputs_round,
+                    allow_executor_shortcuts=False,
+                )
+                state = self._ensure_uniform_kernel_state()
+                state["manager_handoffs"] = max(0, int(state.get("manager_handoffs", 0) or 0)) + 1
+                state["cycles_since_manager"] = 0
+                self.uniform_kernel_state = state
+                self._uniform_kernel_record_compare(
+                    kernel_route=queue_args,
+                    manager_route=manager_row,
+                    selected="manager",
+                )
+                return manager_row
+            board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+            self.blackboard = board
+            hint = self._uniform_kernel_skill_hint_block(
+                role=str(queue_args.get("target", "") or ""),
+                instruction=str(queue_args.get("instruction", "") or ""),
+                goal=str(board.get("original_goal", "") or ""),
+            )
+            if hint:
+                queue_args["instruction"] = trim(f"{queue_args.get('instruction', '')}\n{hint}", 1200)
+            state = self._ensure_uniform_kernel_state()
+            state["deterministic_handoffs"] = max(0, int(state.get("deterministic_handoffs", 0) or 0)) + 1
+            state["cycles_since_manager"] = max(0, int(state.get("cycles_since_manager", 0) or 0)) + 1
+            self.uniform_kernel_state = state
+            self._uniform_kernel_record_compare(kernel_route=queue_args, selected="kernel")
+            return self._apply_coordinator_route(
+                board,
+                queue_args,
+                emit_delegate_message=True,
+                coordinator_label="kernel",
+            )
+
+        pending_bus_pick = self._consume_pending_agentbus_route(
+            board,
+            max_age_seconds=UNIFORM_KERNEL_BUS_MAX_AGE_SECONDS,
+        )
+        if pending_bus_pick:
+            fast_args, fast_meta = pending_bus_pick
+            board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+            self.blackboard = board
+            route = dict(fast_args or {})
+            route["source"] = "kernel-bus-direct"
+            route["reason"] = trim(
+                (
+                    f"uniform kernel pending bus relay {fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
+                    f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                ),
+                600,
+            )
+            hint = self._uniform_kernel_skill_hint_block(
+                role=str(route.get("target", "") or ""),
+                instruction=str(route.get("instruction", "") or ""),
+                goal=str(board.get("original_goal", "") or ""),
+            )
+            if hint:
+                route["instruction"] = trim(f"{route.get('instruction', '')}\n{hint}", 1200)
+            state = self._ensure_uniform_kernel_state()
+            state["direct_bus_handoffs"] = max(0, int(state.get("direct_bus_handoffs", 0) or 0)) + 1
+            state["cycles_since_manager"] = max(0, int(state.get("cycles_since_manager", 0) or 0)) + 1
+            self.uniform_kernel_state = state
+            self._uniform_kernel_record_compare(kernel_route=route, selected="kernel")
+            return self._apply_coordinator_route(
+                board,
+                route,
+                emit_delegate_message=True,
+                coordinator_label="kernel",
+            )
+
+        fast_pick = self._manager_pick_agentbus_fast_route(
+            board,
+            max_age_seconds=UNIFORM_KERNEL_BUS_MAX_AGE_SECONDS,
+        )
+        if fast_pick:
+            fast_args, fast_meta = fast_pick
+            board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+            self.blackboard = board
+            route = dict(fast_args or {})
+            route["source"] = "kernel-bus-direct"
+            route["reason"] = trim(
+                (
+                    f"uniform kernel direct bus relay {fast_meta.get('from', '?')}->{fast_meta.get('to', '?')} "
+                    f"intent={fast_meta.get('intent', 'message')} id={fast_meta.get('env_id', '-')}"
+                ),
+                600,
+            )
+            hint = self._uniform_kernel_skill_hint_block(
+                role=str(route.get("target", "") or ""),
+                instruction=str(route.get("instruction", "") or ""),
+                goal=str(board.get("original_goal", "") or ""),
+            )
+            if hint:
+                route["instruction"] = trim(f"{route.get('instruction', '')}\n{hint}", 1200)
+            state = self._ensure_uniform_kernel_state()
+            state["direct_bus_handoffs"] = max(0, int(state.get("direct_bus_handoffs", 0) or 0)) + 1
+            state["cycles_since_manager"] = max(0, int(state.get("cycles_since_manager", 0) or 0)) + 1
+            self.uniform_kernel_state = state
+            self._uniform_kernel_record_compare(kernel_route=route, selected="kernel")
+            return self._apply_coordinator_route(
+                board,
+                route,
+                emit_delegate_message=True,
+                coordinator_label="kernel",
+            )
+
+        kernel_route = self._manager_fallback_route()
+        kernel_route = dict(kernel_route or {})
+        kernel_route["source"] = "kernel-fallback"
+        hint = self._uniform_kernel_skill_hint_block(
+            role=str(kernel_route.get("target", "") or ""),
+            instruction=str(kernel_route.get("instruction", "") or ""),
+            goal=str(board.get("original_goal", "") or ""),
+        )
+        if hint:
+            kernel_route["instruction"] = trim(f"{kernel_route.get('instruction', '')}\n{hint}", 1200)
+        if self._uniform_kernel_should_consult_manager(board, kernel_route):
+            manager_row = self._manager_delegate_turn(
+                pinned_selection=pinned_selection,
+                media_inputs_round=media_inputs_round,
+            )
+            state = self._ensure_uniform_kernel_state()
+            state["manager_handoffs"] = max(0, int(state.get("manager_handoffs", 0) or 0)) + 1
+            state["cycles_since_manager"] = 0
+            self.uniform_kernel_state = state
+            self._uniform_kernel_record_compare(
+                kernel_route=kernel_route,
+                manager_route=manager_row,
+                selected="manager",
+            )
+            return manager_row
+
+        board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+        self.blackboard = board
+        state = self._ensure_uniform_kernel_state()
+        state["deterministic_handoffs"] = max(0, int(state.get("deterministic_handoffs", 0) or 0)) + 1
+        state["cycles_since_manager"] = max(0, int(state.get("cycles_since_manager", 0) or 0)) + 1
+        self.uniform_kernel_state = state
+        self._uniform_kernel_record_compare(kernel_route=kernel_route, selected="kernel")
+        return self._apply_coordinator_route(
+            board,
+            kernel_route,
+            emit_delegate_message=True,
+            coordinator_label="kernel",
+        )
+
     def _new_blackboard(self, goal: str = "") -> dict:
         profile = self._normalize_task_profile(goal, {})
-        progress = "done" if str(profile.get("task_type", "") or "") == "simple_qa" and not str(goal or "").strip() else "initializing"
+        progress = "initializing"
         return {
             "version": 1,
             "updated_at": float(now_ts()),
             "original_goal": trim(str(goal or "").strip(), 4000),
             "research_notes": [],
+            "linked_files": {},
             "code_artifacts": {},
             "execution_logs": [],
             "review_feedback": [],
@@ -13682,6 +18187,7 @@ class SessionState:
             "last_delegate": {
                 "target": "",
                 "instruction": "",
+                "display_instruction": "",
                 "reason": "",
                 "source": "",
                 "is_mandatory": False,
@@ -13705,6 +18211,7 @@ class SessionState:
                 "text": "",
                 "ts": 0.0,
             },
+            "memory_capsule": self._new_memory_capsule(),
             "watchdog": self._new_watchdog_state(),
             "decomposition_queue": self._new_decomposition_queue_state(),
         }
@@ -13723,9 +18230,15 @@ class SessionState:
         board["active_agent"] = self._sanitize_agent_role(src.get("active_agent", ""))
         raw_delegate = src.get("last_delegate", {})
         if isinstance(raw_delegate, dict):
+            delegate_instruction = trim(str(raw_delegate.get("instruction", "") or "").strip(), 1200)
             board["last_delegate"] = {
                 "target": str(raw_delegate.get("target", "") or "").strip().lower(),
-                "instruction": trim(str(raw_delegate.get("instruction", "") or "").strip(), 1200),
+                "instruction": delegate_instruction,
+                "display_instruction": trim(
+                    str(raw_delegate.get("display_instruction", "") or "").strip(),
+                    900,
+                )
+                or self._delegate_instruction_display_text(delegate_instruction, max_chars=900),
                 "reason": trim(str(raw_delegate.get("reason", "") or "").strip(), 600),
                 "source": trim(str(raw_delegate.get("source", "") or "").strip(), 40),
                 "is_mandatory": _to_bool_like(raw_delegate.get("is_mandatory", False), default=False),
@@ -13838,6 +18351,39 @@ class SessionState:
         board["execution_logs"] = _clean_rows(src.get("execution_logs", []), key="content", actor_key="actor")
         board["review_feedback"] = _clean_rows(src.get("review_feedback", []), key="content", actor_key="actor")
         board["conversation_history"] = _clean_rows(src.get("conversation_history", []), key="content", actor_key="actor")
+        raw_linked_files = src.get("linked_files", {})
+        linked_files: dict[str, dict] = {}
+        if isinstance(raw_linked_files, dict):
+            source_rows = list(raw_linked_files.items())
+        elif isinstance(raw_linked_files, list):
+            source_rows = []
+            for row in raw_linked_files:
+                if not isinstance(row, dict):
+                    continue
+                source_rows.append((str(row.get("path", "") or ""), row))
+        else:
+            source_rows = []
+        for p, row in source_rows[: (BLACKBOARD_LINKED_FILES_MAX * 2)]:
+            rel = normalize_rel_preview_path(str(p or "")) or trim(str(p or "").strip(), 280)
+            if not rel:
+                continue
+            item = row if isinstance(row, dict) else {}
+            linked_files[rel] = {
+                "label": trim(str(item.get("label", "") or "").strip(), 120),
+                "kind": trim(str(item.get("kind", "") or "").strip(), 60),
+                "source": normalize_rel_preview_path(str(item.get("source", "") or ""))
+                or trim(str(item.get("source", "") or "").strip(), 280),
+                "summary": trim(str(item.get("summary", "") or "").strip(), BLACKBOARD_MAX_TEXT),
+                "last_actor": trim(str(item.get("last_actor", "") or "").strip(), 40),
+                "updated_at": float(item.get("updated_at", now_ts()) or now_ts()),
+            }
+        if len(linked_files) > BLACKBOARD_LINKED_FILES_MAX:
+            linked_rows = sorted(
+                linked_files.items(),
+                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
+            )
+            linked_files = dict(linked_rows[-BLACKBOARD_LINKED_FILES_MAX:])
+        board["linked_files"] = linked_files
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
@@ -13856,6 +18402,7 @@ class SessionState:
                     "change_count": max(1, int(item.get("change_count", 1) or 1)),
                 }
         board["code_artifacts"] = artifacts
+        board["memory_capsule"] = self._normalize_memory_capsule(src.get("memory_capsule", {}))
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -13866,6 +18413,7 @@ class SessionState:
         if not isinstance(self.blackboard, dict) or not self.blackboard:
             self.blackboard = self._new_blackboard(self._latest_user_goal_text())
         self.blackboard = self._normalize_blackboard(self.blackboard)
+        self.blackboard = self._refresh_memory_capsule(self.blackboard)
         return self.blackboard
 
     def _blackboard_touch(self):
@@ -13901,6 +18449,40 @@ class SessionState:
         rows = list(board.get(key, []))
         rows.append({"ts": float(now_ts()), "actor": trim(str(actor or "").strip(), 40), "content": txt})
         board[key] = rows[-BLACKBOARD_MAX_LOG_ENTRIES:]
+        self._blackboard_touch()
+
+    def _blackboard_upsert_linked_file(
+        self,
+        rel_path: str,
+        *,
+        label: str = "",
+        kind: str = "",
+        source: str = "",
+        summary: str = "",
+        actor: str = "system",
+    ):
+        path = normalize_rel_preview_path(str(rel_path or "")) or trim(str(rel_path or "").strip(), 280)
+        if not path:
+            return
+        board = self._ensure_blackboard()
+        linked_files = dict(board.get("linked_files", {}))
+        prev = linked_files.get(path, {}) if isinstance(linked_files.get(path), dict) else {}
+        linked_files[path] = {
+            "label": trim(str(label or prev.get("label", "") or "").strip(), 120),
+            "kind": trim(str(kind or prev.get("kind", "") or "").strip(), 60),
+            "source": normalize_rel_preview_path(str(source or prev.get("source", "") or ""))
+            or trim(str(source or prev.get("source", "") or "").strip(), 280),
+            "summary": trim(str(summary or prev.get("summary", "") or "").strip(), BLACKBOARD_MAX_TEXT),
+            "last_actor": trim(str(actor or prev.get("last_actor", "") or "").strip(), 40),
+            "updated_at": float(now_ts()),
+        }
+        if len(linked_files) > BLACKBOARD_LINKED_FILES_MAX:
+            rows = sorted(
+                linked_files.items(),
+                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
+            )
+            linked_files = dict(rows[-BLACKBOARD_LINKED_FILES_MAX:])
+        board["linked_files"] = linked_files
         self._blackboard_touch()
 
     def _blackboard_upsert_artifact(self, rel_path: str, summary: str, actor: str):
@@ -14071,7 +18653,7 @@ class SessionState:
             if approval_ts + 1e-6 >= since:
                 return True
         return (
-            _rows_hit(bb.get("review_feedback", []), actor="reviewer")
+            _rows_hit(self._actionable_review_feedback_rows(bb), actor="reviewer")
             or _rows_hit(bb.get("execution_logs", []), actor="reviewer")
         )
 
@@ -14107,7 +18689,10 @@ class SessionState:
         anchor_id, anchor_ts, delegate = self._todo_node_anchor(bb)
         delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
         objective = trim(str(profile.get("direct_objective", "") or "").strip(), 220)
-        instruction = trim(str(delegate.get("instruction", "") or "").strip(), 220)
+        instruction = trim(
+            str(delegate.get("display_instruction", "") or delegate.get("instruction", "") or "").strip(),
+            220,
+        )
         node_topic = objective or instruction or trim(str(bb.get("original_goal", "") or "").strip(), 220)
 
         def _owner_desc(owner: str) -> str:
@@ -14142,8 +18727,6 @@ class SessionState:
                 done = bool(delegate_target) and anchor_ts > 0.0
             else:
                 done = self._todo_owner_has_node_evidence(owner, anchor_ts, bb)
-            if task_type == "simple_qa" and owner == "reviewer" and (not done):
-                done = self._todo_owner_has_node_evidence("developer", anchor_ts, bb)
             row_status = "completed" if bool(done) else "pending"
             rows.append(
                 {
@@ -14231,6 +18814,10 @@ class SessionState:
         }
         board["status"] = "COMPLETED"
         self._blackboard_touch()
+        try:
+            self._uniform_kernel_ensure_summary(board, force=False)
+        except Exception:
+            pass
         self._sync_todos_from_blackboard(reason="approved", board=board)
 
     def _blackboard_read_state_markdown(self, max_items: int = 6) -> str:
@@ -14246,6 +18833,9 @@ class SessionState:
         dq_steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
         dq_cursor = max(0, int(dq.get("cursor", 0) or 0))
         dq_total = len(dq_steps)
+        kernel_state = self._ensure_uniform_kernel_state()
+        compare = kernel_state.get("last_compare", {}) if isinstance(kernel_state.get("last_compare"), dict) else {}
+        memory_capsule = self._normalize_memory_capsule(board.get("memory_capsule", {}))
         lines = [
             "## Blackboard State",
             f"- status: {status}",
@@ -14282,6 +18872,28 @@ class SessionState:
                 f"trigger_reason={trim(str(dq.get('trigger_reason', '') or ''), 140)}"
             ),
             (
+                "- uniform_kernel: "
+                f"route={trim(str(kernel_state.get('last_route_source', '') or ''), 40) or '-'}, "
+                f"stride={int(kernel_state.get('manager_stride', UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE)}, "
+                f"direct_bus={int(kernel_state.get('direct_bus_handoffs', 0) or 0)}, "
+                f"deterministic={int(kernel_state.get('deterministic_handoffs', 0) or 0)}, "
+                f"manager={int(kernel_state.get('manager_handoffs', 0) or 0)}, "
+                f"splits={int(kernel_state.get('task_splits', 0) or 0)}"
+            ),
+            (
+                "- uniform_kernel_compare: "
+                f"kernel={trim(str(compare.get('kernel_target', '') or '').strip(), 24) or '-'} "
+                f"({trim(str(compare.get('kernel_source', '') or '').strip(), 32) or '-'}) | "
+                f"manager={trim(str(compare.get('manager_target', '') or '').strip(), 24) or '-'} "
+                f"({trim(str(compare.get('manager_source', '') or '').strip(), 32) or '-'}) | "
+                f"selected={trim(str(compare.get('selected', '') or '').strip(), 16) or '-'}"
+            ),
+            (
+                "- microtask_modes: "
+                f"microtask={normalize_on_off_mode(self.microtask_mode, default='off')}, "
+                f"legacy_small_model={normalize_on_off_mode(self.small_model_microtask_mode, default='off')}"
+            ),
+            (
                 "- manager_judgement: "
                 f"{trim(str(judgement.get('progress', 'initializing') or ''), 40)}"
                 f" | remaining="
@@ -14294,10 +18906,16 @@ class SessionState:
                 f"| mandatory={bool(delegate.get('is_mandatory', False))}"
             ),
             f"- research_notes: {len(board.get('research_notes', []) or [])}",
+            f"- linked_files: {len(board.get('linked_files', {}) or {})}",
             f"- code_artifacts: {len(board.get('code_artifacts', {}) or {})}",
             f"- execution_logs: {len(board.get('execution_logs', []) or [])}",
             f"- review_feedback: {len(board.get('review_feedback', []) or [])}",
             f"- collaboration_history: {len(board.get('conversation_history', []) or [])}",
+            (
+                "- session_memory: "
+                f"compression=L{normalize_session_compression_level(memory_capsule.get('compression_level', DEFAULT_SESSION_COMPRESSION_LEVEL), default=DEFAULT_SESSION_COMPRESSION_LEVEL)} "
+                f"({trim(str(memory_capsule.get('compression_label', '') or '').strip(), 40) or session_compression_profile(memory_capsule.get('compression_level', DEFAULT_SESSION_COMPRESSION_LEVEL)).get('label', '')})"
+            ),
         ]
         approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
         if bool(approval.get("approved", False)):
@@ -14327,6 +18945,35 @@ class SessionState:
 
         _render_tail("Recent Research Notes", board.get("research_notes", []))
         _render_tail("Recent Collaboration History", board.get("conversation_history", []))
+        lines.append("\n### Memory Capsule")
+        lines.append(self._memory_capsule_markdown(board, max_items=mx, include_history=True))
+        linked_files = board.get("linked_files", {})
+        lines.append("\n### Linked Files")
+        if isinstance(linked_files, dict) and linked_files:
+            rows = sorted(
+                list(linked_files.items()),
+                key=lambda item: float(
+                    (item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0
+                ),
+                reverse=True,
+            )
+            for path, item in rows[:mx]:
+                details = item if isinstance(item, dict) else {}
+                label = trim(str(details.get("label", "") or "").strip(), 80)
+                source = trim(str(details.get("source", "") or "").strip(), 140)
+                summary = trim(str(details.get("summary", "") or "").strip(), 180)
+                bits = [path]
+                if label:
+                    bits.append(f"label={label}")
+                if details.get("kind"):
+                    bits.append(f"kind={details.get('kind')}")
+                if source:
+                    bits.append(f"source={source}")
+                if summary:
+                    bits.append(summary)
+                lines.append(f"- {' | '.join(bits)}")
+        else:
+            lines.append("- (none)")
         art = board.get("code_artifacts", {})
         lines.append("\n### Recent Code Artifacts")
         if isinstance(art, dict) and art:
@@ -14358,7 +19005,7 @@ class SessionState:
                     "target": {"type": "string", "enum": list(MANAGER_ROUTE_TARGETS)},
                     "instruction": {"type": "string"},
                     "task_level": {"type": "integer", "enum": list(TASK_LEVEL_CHOICES)},
-                    "task_type": {"type": "string"},
+                    "task_type": {"type": "string", "enum": list(TASK_PROFILE_TYPES)},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
                     "judgement": {"type": "string"},
@@ -14385,7 +19032,7 @@ class SessionState:
                 ),
                 {
                     "level": {"type": "integer", "enum": list(TASK_LEVEL_CHOICES)},
-                    "task_type": {"type": "string"},
+                    "task_type": {"type": "string", "enum": list(TASK_PROFILE_TYPES)},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
                     "semantic_confidence": {"type": "string", "enum": list(SEMANTIC_CONFIDENCE_CHOICES)},
@@ -14412,6 +19059,12 @@ class SessionState:
             return False
         yes_tokens = ("继续", "确认", "开始", "执行", "同意", "go ahead", "proceed", "continue", "yes")
         return any(tok in low for tok in yes_tokens)
+
+    def _normalize_task_type(self, raw: object, *, default: str = "general") -> str:
+        return "general"
+
+    def _task_type_prefers_research_flow(self, board: dict | None = None, *, task_type: str = "") -> bool:
+        return False
 
     def _normalize_semantic_confidence(self, raw: object, *, default: str = "medium") -> str:
         value = str(raw or "").strip().lower()
@@ -14477,7 +19130,7 @@ class SessionState:
 
     def _fallback_task_level_decision(self, goal_text: str) -> dict:
         profile = self._infer_task_profile(goal_text)
-        task_type = str(profile.get("task_type", "general") or "general")
+        task_type = "general"
         complexity = str(profile.get("complexity", "simple") or "simple")
         low = str(goal_text or "").lower()
         inherit_previous_state = False
@@ -14582,10 +19235,9 @@ class SessionState:
                 "low_confidence_reason": "rule fallback inherited previous runtime state",
                 "source": "fallback",
             }
+        goal_len = len(str(goal_text or "").strip())
         level = 3
-        if task_type == "simple_qa":
-            level = 1 if len(str(goal_text or "")) <= 180 else 2
-        elif complexity == "simple" and task_type in {"general"}:
+        if complexity == "simple" and goal_len <= 180:
             level = 2
         elif complexity == "simple":
             level = 3
@@ -14642,6 +19294,8 @@ class SessionState:
             "they must not be treated as a user-visible early-stop reason. "
             "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
             "and semantic_confidence(high|medium|low). "
+            "Do not invent task-category templates; base the decision only on continuity, complexity, required collaboration, "
+            "and current evidence gaps. "
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly. "
             f"{model_language_instruction(self.ui_language)}"
         )
@@ -14752,43 +19406,41 @@ class SessionState:
         )
         if low_confidence_mode:
             rule_profile = self._infer_task_profile(goal_text)
-            fallback_task_type = str(rule_profile.get("task_type", "general") or "general")
             fallback_complexity = str(rule_profile.get("complexity", "simple") or "simple")
-            fallback_objective = trim(str(rule_profile.get("direct_objective", "") or ""), 800)
+            fallback_objective = self._primary_objective_text(
+                goal=goal_text,
+                preferred=str(rule_profile.get("direct_objective", "") or ""),
+                max_chars=800,
+            )
         else:
             board_now = self._ensure_blackboard()
             board_profile = board_now.get("task_profile", {}) if isinstance(board_now.get("task_profile"), dict) else {}
-            fallback_task_type = trim(
-                str(self.runtime_task_type or board_profile.get("task_type", "general") or "general"),
-                40,
-            )
-            if fallback_task_type not in TASK_PROFILE_TYPES:
-                fallback_task_type = "general"
             fallback_complexity = trim(
                 str(self.runtime_task_complexity or board_profile.get("complexity", "simple") or "simple"),
                 20,
             )
             if fallback_complexity not in TASK_COMPLEXITY_LEVELS:
                 fallback_complexity = "simple"
-            fallback_objective = trim(
-                str(self.runtime_direct_objective or board_profile.get("direct_objective", "") or "").strip(),
-                800,
+            fallback_objective = self._primary_objective_text(
+                goal=goal_text,
+                preferred=str(self.runtime_direct_objective or board_profile.get("direct_objective", "") or "").strip(),
+                max_chars=800,
             )
             if not fallback_objective:
-                fallback_objective = (
-                    "Proceed with direct semantic objective and concrete progress for the current request."
-                )
-        task_type = trim(str(row.get("task_type", "") or "").strip().lower(), 40)
-        if task_type not in TASK_PROFILE_TYPES:
-            task_type = fallback_task_type
+                fallback_objective = self._primary_objective_text(goal=goal_text, preferred="", max_chars=800)
+        board_now = self._ensure_blackboard()
+        board_profile = board_now.get("task_profile", {}) if isinstance(board_now.get("task_profile"), dict) else {}
+        task_type = "general"
         complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
         if complexity not in TASK_COMPLEXITY_LEVELS:
             complexity = fallback_complexity
         low_confidence_reason = trim(str(row.get("low_confidence_reason", "") or "").strip(), 220)
         judgement = trim(str(row.get("judgement", "") or "").strip(), 200) or "manager classified task level"
-        objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
-        if not objective:
-            objective = fallback_objective
+        objective = self._primary_objective_text(
+            goal=goal_text,
+            preferred=str(row.get("direct_objective", "") or fallback_objective or ""),
+            max_chars=800,
+        )
         self.runtime_task_level = int(level)
         self.runtime_execution_mode = mode
         self.runtime_assigned_expert = assigned
@@ -14810,7 +19462,7 @@ class SessionState:
         profile["participants"] = list(participants)
         profile["assigned_expert"] = assigned
         profile["requires_user_confirmation"] = bool(requires_confirmation)
-        profile["task_type"] = task_type
+        profile["task_type"] = "general"
         profile["complexity"] = complexity
         profile["scale_preference"] = scale_preference
         profile["direct_objective"] = objective
@@ -14823,7 +19475,7 @@ class SessionState:
         profile["updated_at"] = float(now_ts())
         board["task_profile"] = profile
         board["manager_judgement"] = {
-            "task_type": task_type,
+            "task_type": "general",
             "complexity": complexity,
             "scale_preference": scale_preference,
             "inherit_previous_state": bool(inherit_previous_state),
@@ -14875,7 +19527,8 @@ class SessionState:
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
             "Also decide inherit_previous_state by semantic continuity with prior blackboard state. "
-            "If this is pure continuation, keep current runtime policy unchanged."
+            "If this is pure continuation, keep current runtime policy unchanged. "
+            "Do not rely on task-category labels; rely on continuity, complexity, and collaboration needs."
         )
         with self.lock:
             self.current_phase = "manager:classify:model-call"
@@ -14915,6 +19568,29 @@ class SessionState:
                     merged = self._merge_task_decision_for_low_confidence(row, fallback_row)
                     return merged
                 row["source"] = "manager"
+                return row
+        raw_text = trim(str(response.get("content", "") or "").strip(), 2400) if isinstance(response, dict) else ""
+        text_row = extract_json_object_from_text(raw_text, {})
+        if isinstance(text_row, dict) and text_row:
+            row = dict(text_row)
+            row["inherit_previous_state"] = _to_bool_like(
+                row.get("inherit_previous_state", False),
+                default=False,
+            )
+            row["semantic_confidence"] = self._normalize_semantic_confidence(
+                row.get("semantic_confidence", "medium"),
+                default="medium",
+            )
+            if (
+                int(row.get("level", 0) or 0) in TASK_LEVEL_CHOICES
+                or str(row.get("judgement", "") or "").strip()
+            ):
+                if str(row.get("semantic_confidence", "medium")) == "low":
+                    fallback_row = self._fallback_task_level_decision(goal_text)
+                    merged = self._merge_task_decision_for_low_confidence(row, fallback_row)
+                    merged["source"] = "manager-text-json+fallback"
+                    return merged
+                row["source"] = "manager-text-json"
                 return row
         row = self._fallback_task_level_decision(goal_text)
         row["source"] = "fallback-no-toolcall"
@@ -14982,22 +19658,22 @@ class SessionState:
             "and treat '/workspace/...' only as a virtual alias for tool arguments. "
             "Read blackboard state and delegate one short next timeslice only. "
             "Use route_to_next_agent exactly once each turn. "
-            "Before delegating, classify task level/type/complexity by your own judgement, "
-            "and include task_level/task_type/complexity/judgement/(optional)round_budget/direct_objective "
+            "Before delegating, classify task level and complexity by your own judgement, "
+            "and include task_level/complexity/judgement/(optional)round_budget/direct_objective "
             "in route_to_next_agent arguments whenever possible. "
             "When concrete execution is required, set is_mandatory=true so worker must call at least one tool "
             "instead of replying with suggestion-only text. "
             "Round budget is an internal cadence control to reduce overthinking and idle loops. "
             "Never use budget as an early-stop reason shown to user before task completion. "
-            "Decision policy: missing facts/API -> explorer; implementation/update -> developer; "
-            "verification/gap check -> reviewer; only choose finish when review is approved and no blocking logs remain. "
+            "Route from current state, not task templates: missing grounding or blocker analysis -> explorer; "
+            "missing or stale deliverable -> developer; verification or disagreement on current outputs -> reviewer; "
+            "only choose finish when review is approved and no blocking logs remain. "
             "Prefer Manager+AgentBus co-management: when fresh agentbus handoff is available and aligned, "
             "follow that handoff to reduce orchestration latency instead of re-planning from scratch. "
             "If finish is blocked by missing final summary after review approval, instruct Reviewer to hand off Explorer "
             "via agentbus (intent=final_summary_request) instead of silently ending. "
             f"Current task level={level or '-'}, mode={mode}, scale_preference={scale_preference}, participants={participant_text}, "
-            f"Current task profile: type={profile.get('task_type','general')}, "
-            f"complexity={profile.get('complexity','simple')}, "
+            f"Current task profile: complexity={profile.get('complexity','simple')}, "
             f"progress={progress}, round_budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
             f"objective={trim(str(profile.get('direct_objective','') or ''), 220)}. "
             "Avoid assigning the same agent more than two consecutive turns unless strictly required. "
@@ -15017,8 +19693,6 @@ class SessionState:
             default=self._effective_execution_mode(),
         )
         if mode != EXECUTION_MODE_SYNC:
-            return None
-        if str(profile.get("task_type", "general") or "general") == "simple_qa":
             return None
         approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
         if bool(approval.get("approved", False)):
@@ -15066,14 +19740,17 @@ class SessionState:
             dst = self._sanitize_agent_role(env.get("to", ""))
             if (not src) or (not dst) or src == dst:
                 continue
-            if dst not in participants_norm:
-                continue
             intent = trim(str(env.get("intent", "") or "").strip().lower(), 80)
-            payload = trim(str(env.get("payload", "") or "").strip(), 1200)
+            payload = self._dedupe_delegate_instruction_text(
+                trim(str(env.get("payload", "") or "").strip(), 1200),
+                max_chars=1200,
+            )
             if not payload:
                 continue
             env_id = trim(str(env.get("id", "") or "").strip(), 80)
             score = _intent_rank(intent)
+            if dst in participants_norm:
+                score += 1
             if dst == "developer":
                 score += 1
             if dst == "explorer" and ("summary" in intent):
@@ -15090,6 +19767,11 @@ class SessionState:
                         "to": dst,
                         "intent": intent or "message",
                         "payload": payload,
+                        "display_payload": self._delegate_instruction_display_text(
+                            payload,
+                            objective=trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+                            max_chars=900,
+                        ),
                         "ts": ts,
                     },
                 )
@@ -15106,6 +19788,11 @@ class SessionState:
         args = {
             "target": best.get("to", assigned_expert),
             "instruction": trim(str(best.get("payload", "") or ""), 1200),
+            "display_instruction": self._delegate_instruction_display_text(
+                str(best.get("display_payload", "") or best.get("payload", "") or ""),
+                objective=trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+                max_chars=900,
+            ),
             "task_level": int(task_level),
             "task_type": trim(str(profile.get("task_type", self.runtime_task_type or "general") or "general"), 40),
             "complexity": trim(str(profile.get("complexity", self.runtime_task_complexity or "simple") or "simple"), 20),
@@ -15126,7 +19813,18 @@ class SessionState:
             "participants": list(participants_norm),
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
-            "is_mandatory": bool(best.get("to", "") in {"developer", "explorer"}),
+            "is_mandatory": bool(
+                best.get("to", "") in {"developer", "explorer"}
+                or (
+                    best.get("to", "") == "reviewer"
+                    and (
+                        str(best.get("intent", "") or "").strip().lower() in {"review_request", "verify_request", "final_summary_request"}
+                        or "review" in str(best.get("intent", "") or "").strip().lower()
+                        or "verify" in str(best.get("intent", "") or "").strip().lower()
+                        or "summary" in str(best.get("intent", "") or "").strip().lower()
+                    )
+                )
+            ),
         }
         meta = {
             "env_id": best.get("env_id", ""),
@@ -15136,6 +19834,161 @@ class SessionState:
             "age_sec": max(0.0, now_tick - float(best.get("ts", now_tick) or now_tick)),
         }
         return args, meta
+
+    def _consume_pending_agentbus_route(
+        self,
+        board: dict | None = None,
+        *,
+        max_age_seconds: float = 240.0,
+    ) -> tuple[dict, dict] | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        env = dict(self.pending_agentbus_route or {}) if isinstance(self.pending_agentbus_route, dict) else {}
+        if not env:
+            return None
+        self.pending_agentbus_route = {}
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC:
+            return None
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if bool(approval.get("approved", False)):
+            return None
+        last_delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        try:
+            last_delegate_ts = float(last_delegate.get("ts", 0.0) or 0.0)
+        except Exception:
+            last_delegate_ts = 0.0
+        try:
+            env_ts = float(env.get("ts", 0.0) or 0.0)
+        except Exception:
+            env_ts = 0.0
+        if env_ts <= 0.0:
+            return None
+        now_tick = float(now_ts())
+        if last_delegate_ts > 0.0 and env_ts + 1e-6 <= last_delegate_ts:
+            return None
+        if (now_tick - env_ts) > max(15.0, float(max_age_seconds or 240.0)):
+            return None
+        src = self._sanitize_agent_role(env.get("from", ""))
+        dst = self._sanitize_agent_role(env.get("to", ""))
+        if (not src) or (not dst) or src == dst:
+            return None
+        payload = self._dedupe_delegate_instruction_text(
+            trim(str(env.get("payload", "") or "").strip(), 1200),
+            max_chars=1200,
+        )
+        if not payload:
+            return None
+        participants = profile.get("participants", []) if isinstance(profile.get("participants"), list) else []
+        participants_norm = [self._sanitize_agent_role(x) for x in participants]
+        participants_norm = [x for x in participants_norm if x]
+        if dst not in participants_norm:
+            participants_norm.append(dst)
+        assigned_expert = self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"
+        task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
+        if task_level not in TASK_LEVEL_CHOICES:
+            task_level = 3
+        round_budget = int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0)
+        args = {
+            "target": dst,
+            "instruction": payload,
+            "display_instruction": self._delegate_instruction_display_text(
+                payload,
+                objective=trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+                max_chars=900,
+            ),
+            "task_level": int(task_level),
+            "task_type": trim(str(profile.get("task_type", self.runtime_task_type or "general") or "general"), 40),
+            "complexity": trim(str(profile.get("complexity", self.runtime_task_complexity or "simple") or "simple"), 20),
+            "scale_preference": trim(
+                str(profile.get("scale_preference", self.runtime_scale_preference or "balanced") or "balanced"),
+                20,
+            ),
+            "judgement": trim(
+                (
+                    f"agentbus relay {src}->{dst} "
+                    f"intent={trim(str(env.get('intent', '') or '').strip().lower(), 80) or 'message'} "
+                    f"id={trim(str(env.get('id', '') or '').strip(), 80) or '-'}"
+                ),
+                200,
+            ),
+            "round_budget": int(round_budget),
+            "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
+            "execution_mode": mode,
+            "participants": list(participants_norm),
+            "assigned_expert": assigned_expert,
+            "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
+            "is_mandatory": bool(
+                dst in {"developer", "explorer"}
+                or (
+                    dst == "reviewer"
+                    and (
+                        trim(str(env.get("intent", "") or "").strip().lower(), 80) in {"review_request", "verify_request", "final_summary_request"}
+                        or "review" in trim(str(env.get("intent", "") or "").strip().lower(), 80)
+                        or "verify" in trim(str(env.get("intent", "") or "").strip().lower(), 80)
+                        or "summary" in trim(str(env.get("intent", "") or "").strip().lower(), 80)
+                    )
+                )
+            ),
+        }
+        meta = {
+            "env_id": trim(str(env.get("id", "") or "").strip(), 80),
+            "from": src,
+            "to": dst,
+            "intent": trim(str(env.get("intent", "") or "").strip().lower(), 80) or "message",
+            "age_sec": max(0.0, now_tick - env_ts),
+        }
+        return args, meta
+
+    def _agentbus_manager_aim_brief(
+        self,
+        board: dict | None = None,
+        *,
+        max_chars: int = 520,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        capsule = self._normalize_memory_capsule(bb.get("memory_capsule", {}))
+        goal = capsule.get("goal_anchor", {}) if isinstance(capsule.get("goal_anchor"), dict) else {}
+        plan = capsule.get("plan_anchor", {}) if isinstance(capsule.get("plan_anchor"), dict) else {}
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        active_files = capsule.get("active_files", []) if isinstance(capsule.get("active_files"), list) else []
+        objective = trim(
+            str(goal.get("objective", "") or goal.get("goal", "") or "").strip(),
+            220,
+        )
+        focus = trim(str(plan.get("current_focus", "") or "").strip(), 160)
+        next_action = trim(str(plan.get("next_action", "") or "").strip(), 160)
+        delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
+        delegate_instruction = self._delegate_instruction_display_text(
+            trim(
+                str(delegate.get("display_instruction", "") or delegate.get("instruction", "") or "").strip(),
+                260,
+            ),
+            objective=objective,
+            max_chars=180,
+        )
+        files = [
+            trim(str(row.get("path", "") or "").strip(), 60)
+            for row in active_files[:3]
+            if isinstance(row, dict) and trim(str(row.get("path", "") or "").strip(), 60)
+        ]
+        parts: list[str] = []
+        if objective:
+            parts.append(f"objective={objective}")
+        if focus:
+            parts.append(f"focus={focus}")
+        if next_action:
+            parts.append(f"next={next_action}")
+        if delegate_target:
+            parts.append(f"owner={delegate_target}")
+        if delegate_instruction and "direct objective:" not in delegate_instruction.lower():
+            parts.append(f"handoff={delegate_instruction}")
+        if files:
+            parts.append("files=" + ", ".join(files))
+        return trim(" | ".join(parts), max_chars)
 
     def _manager_fallback_route(self) -> dict:
         board = self._ensure_blackboard()
@@ -15147,13 +20000,12 @@ class SessionState:
         )
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
-        task_type = str(profile.get("task_type", "general") or "general")
         complexity = str(profile.get("complexity", "simple") or "simple")
         progress = self._manager_progress_state(board)
         status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
         research_count = len(board.get("research_notes", []) or [])
         code_count = len(board.get("code_artifacts", {}) or {})
-        feedback = board.get("review_feedback", []) if isinstance(board.get("review_feedback"), list) else []
+        feedback = self._actionable_review_feedback_rows(board)
         approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
         can_finish_from_approval, finish_gate_reason = self._can_auto_finish_from_approval(
             board,
@@ -15164,6 +20016,48 @@ class SessionState:
         cycles = int(board.get("manager_cycles", 0) or 0)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
+        missing_expected = self._goal_missing_expected_artifacts(board)
+        direct_expected = self._goal_direct_expected_artifacts(str(board.get("original_goal", "") or ""))
+        has_material_outputs = bool(
+            code_count
+            or research_count
+            or len(board.get("execution_logs", []) or [])
+            or len(board.get("review_feedback", []) or [])
+        )
+
+        dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
+
+        def _queue_anchor_route() -> dict | None:
+            if not bool(dq.get("active", False)):
+                return None
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            while cursor < len(steps):
+                row = steps[cursor] if isinstance(steps[cursor], dict) else {}
+                status_value = str(row.get("status", "") or "").strip().lower()
+                if status_value not in {"done", "skipped"}:
+                    break
+                cursor += 1
+            if cursor >= len(steps):
+                return None
+            row = steps[cursor] if isinstance(steps[cursor], dict) else {}
+            target = self._sanitize_agent_role(row.get("target", ""))
+            if target not in AGENT_ROLES:
+                return None
+            instruction = trim(
+                str(row.get("instruction", row.get("description", "")) or "").strip(),
+                1200,
+            )
+            if not instruction:
+                return None
+            return {
+                "target": target,
+                "instruction": instruction,
+                "reason": "queue-anchor",
+                "source": "fallback",
+                "is_mandatory": True,
+            }
+
         if cycles >= max_budget:
             self._emit("status", {"summary": "Max cycles reached; forcing finish."})
             return {
@@ -15243,82 +20137,14 @@ class SessionState:
                     "reason": "approval-blocked-by-error",
                     "source": "fallback",
                 }
-        if task_type == "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer")
-            if dev_text:
-                done_probe = self._detect_endpoint_intent(dev_text, None)
-                if bool(done_probe.get("matched", False)):
-                    return {
-                        "target": "finish",
-                        "instruction": "Simple question already answered clearly; stop now.",
-                        "reason": "simple-qa-answered",
-                        "source": "fallback",
-                    }
-            return {
-                "target": "developer",
-                "instruction": (
-                    "Answer user question directly with concise final text. "
-                    "Do not create/edit files unless explicitly requested."
-                ),
-                "reason": "simple-qa-direct-answer",
-                "source": "fallback",
-            }
-        if complexity == "simple" and task_type == "simple_code":
-            if has_error_log:
-                return {
-                    "target": "developer",
-                    "instruction": "Fix the latest concrete runtime/tool error and verify once.",
-                    "reason": "simple-code-error-fix",
-                    "source": "fallback",
-                }
-            if code_count <= 0:
-                return {
-                    "target": "developer",
-                    "instruction": "Implement the minimal code change needed for the request.",
-                    "reason": "simple-code-implement",
-                    "source": "fallback",
-                }
-            if feedback_pass and can_finish_from_approval:
-                return {
-                    "target": "finish",
-                    "instruction": "Quick review passed for simple code task; finish now.",
-                    "reason": "simple-code-pass",
-                    "source": "fallback",
-                }
-            if feedback_pass and (not can_finish_from_approval):
-                if finish_gate_reason == "reviewer-summary-missing":
-                    board["manager_summary_attempts"] = summary_attempts + 1
-                    self.blackboard = board
-                    return {
-                        "target": "reviewer",
-                        "instruction": (
-                            "Quick review passed but final summary is missing. Produce concise final summary "
-                            "covering changed files and validation evidence, then finish."
-                        ),
-                        "reason": "simple-code-summary-request",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                return {
-                    "target": "reviewer",
-                    "instruction": "Re-check latest implementation against newest user requirements and provide fresh pass/fix verdict.",
-                    "reason": "simple-code-pass-stale-approval",
-                    "source": "fallback",
-                }
-            return {
-                "target": "reviewer",
-                "instruction": "Run one quick validation and output pass/fix verdict with evidence.",
-                "reason": "simple-code-review",
-                "source": "fallback",
-            }
-        if feedback_pass and code_count > 0 and can_finish_from_approval:
+        if feedback_pass and has_material_outputs and can_finish_from_approval:
             return {
                 "target": "finish",
                 "instruction": "Reviewer already approved. End this run.",
                 "reason": "feedback-pass",
                 "source": "fallback",
             }
-        if feedback_pass and code_count > 0 and (not can_finish_from_approval):
+        if feedback_pass and has_material_outputs and (not can_finish_from_approval):
             if finish_gate_reason == "reviewer-summary-missing":
                 board["manager_summary_attempts"] = summary_attempts + 1
                 self.blackboard = board
@@ -15338,42 +20164,68 @@ class SessionState:
                 "reason": "feedback-pass-stale-approval",
                 "source": "fallback",
             }
-        if research_count == 0:
+        queue_anchor = _queue_anchor_route()
+        if queue_anchor is not None:
+            return queue_anchor
+        if not has_material_outputs:
             return {
                 "target": "explorer",
-                "instruction": "Inspect repository and gather required APIs/constraints before coding.",
-                "reason": "missing-research",
+                "instruction": self._compose_manager_live_instruction(board, role="explorer"),
+                "reason": "bootstrap-grounding",
                 "source": "fallback",
             }
         if has_error_log and status in {"CODING", "TESTING", "REVIEWING"}:
             return {
                 "target": "explorer",
-                "instruction": "Analyze latest execution error log and provide a concrete fix strategy.",
+                "instruction": "Analyze the latest blocking log and hand back one concrete unblock path.",
                 "reason": "execution-error",
                 "source": "fallback",
             }
-        if code_count == 0:
+        if missing_expected:
             return {
                 "target": "developer",
-                "instruction": "Implement the first executable version based on current research notes.",
-                "reason": "missing-code",
+                "instruction": self._manager_first_deliverable_instruction(board),
+                "reason": "missing-expected",
+                "source": "fallback",
+            }
+        if direct_expected and code_count == 0 and research_count > 0:
+            return {
+                "target": "developer",
+                "instruction": self._manager_continue_deliverable_instruction(board),
+                "reason": "grounded-direct-deliverable",
                 "source": "fallback",
             }
         if feedback and (not feedback_pass):
+            fix_target = "developer" if code_count > 0 else "explorer"
             return {
-                "target": "developer",
-                "instruction": "Address review feedback with concrete code changes and rerun checks.",
-                "reason": "feedback-fix",
+                "target": fix_target,
+                "instruction": self._compose_manager_live_instruction(
+                    board,
+                    role=fix_target,
+                    require_check=bool(fix_target == "developer"),
+                ),
+                "reason": ("feedback-fix" if fix_target == "developer" else "grounding-fix"),
                 "source": "fallback",
             }
-        if status in {"CODING", "TESTING"}:
+        if code_count > 0 or research_count > 0:
             return {
                 "target": "reviewer",
-                "instruction": "Review current implementation, run validation, and report pass/fix with evidence.",
+                "instruction": self._compose_manager_live_instruction(
+                    board,
+                    role="reviewer",
+                    require_check=bool(code_count > 0),
+                ),
                 "reason": "need-review",
                 "source": "fallback",
             }
-        if cycles > 10 and (code_count > 0 or research_count > 0):
+        if complexity == "complex" and cycles <= 2:
+            return {
+                "target": "explorer",
+                "instruction": self._compose_manager_live_instruction(board, role="explorer"),
+                "reason": "complex-task-refine-scope",
+                "source": "fallback",
+            }
+        if cycles > 10 and has_material_outputs:
             self._emit("status", {"summary": "Fallback default with progress; forcing finish."})
             return {
                 "target": "finish",
@@ -15386,7 +20238,7 @@ class SessionState:
             }
         return {
             "target": "developer",
-            "instruction": "Continue implementation and produce concrete file/tool changes.",
+            "instruction": self._manager_continue_deliverable_instruction(board),
             "reason": "default-developer",
             "source": "fallback",
         }
@@ -15395,33 +20247,68 @@ class SessionState:
         row = dict(route or {})
         if bool(row.get("executor_mode", False)):
             return row
-        if str(row.get("task_type", "") or "").strip().lower() == "simple_qa":
-            return row
         target = str(row.get("target", "") or "").strip().lower()
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-4:]]
         if len(recent) >= 2 and recent[-1] == target and recent[-2] == target:
             board = self._ensure_blackboard()
+            code_count = len(board.get("code_artifacts", {}) or {})
+            research_count = len(board.get("research_notes", []) or [])
+            missing_expected = self._goal_missing_expected_artifacts(board)
+            has_outputs = bool(
+                code_count
+                or research_count
+                or len(board.get("execution_logs", []) or [])
+                or len(board.get("review_feedback", []) or [])
+            )
             low_reason = str(row.get("reason", "") or "").strip().lower()
-            if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
+            if "summary" in low_reason and has_outputs:
                 row["target"] = "finish"
                 row["instruction"] = "Anti-stall: summary generation loop detected, forcing finish."
                 row["reason"] = f"{row.get('reason', '')}|anti-stall-summary-loop-finish"
                 row["source"] = "anti-stall"
                 return row
-            if target != "reviewer" and len(board.get("code_artifacts", {}) or {}) > 0:
+            if target != "reviewer" and has_outputs:
                 row["target"] = "reviewer"
-                row["instruction"] = "Parallel-check current changes and provide immediate fix/pass guidance."
+                row["instruction"] = (
+                    self._compose_manager_live_instruction(
+                        board,
+                        role="reviewer",
+                        require_check=bool(code_count > 0),
+                    )
+                    or "Check the current outputs and return one concrete pass/fix or next-gap judgement."
+                )
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer"
-            elif target != "developer":
+            elif target != "developer" and (code_count > 0 or missing_expected):
                 row["target"] = "developer"
-                row["instruction"] = "Execute one concrete implementation step using tools now."
+                row["instruction"] = (
+                    self._compose_manager_live_instruction(
+                        board,
+                        role="developer",
+                        require_check=bool(code_count > 0),
+                    )
+                    or "Advance one concrete deliverable change and record evidence."
+                )
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->developer"
-            else:
+            elif target != "explorer":
                 row["target"] = "explorer"
-                row["instruction"] = "Run a focused search/read step to unblock the next coding move."
+                row["instruction"] = (
+                    self._compose_manager_live_instruction(board, role="explorer")
+                    or "Refresh grounding from the latest blocker and record one concrete constraint or unblock path."
+                )
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->explorer"
+            else:
+                row["target"] = "developer"
+                row["instruction"] = (
+                    self._compose_manager_live_instruction(
+                        board,
+                        role="developer",
+                        require_check=bool(code_count > 0),
+                    )
+                    or "Convert the current objective and blackboard state into one concrete output now."
+                )
+                row["reason"] = f"{row.get('reason', '')}|anti-stall->developer"
             row["source"] = "anti-stall"
             return row
         if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
@@ -15495,9 +20382,8 @@ class SessionState:
         instruction = trim(str(row.get("instruction", "") or "").strip(), 1200)
         if not instruction:
             instruction = "Proceed with one concrete next step and report evidence."
-        task_type = trim(str(row.get("task_type", default_type) or "").strip().lower(), 40) or default_type
-        if task_type not in TASK_PROFILE_TYPES:
-            task_type = default_type
+        action_type = trim(str(row.get("action_type", "") or "").strip().lower(), 80)
+        task_type = self._normalize_task_type(row.get("task_type", default_type), default=default_type)
         complexity = trim(str(row.get("complexity", default_complexity) or "").strip().lower(), 20) or default_complexity
         if complexity not in TASK_COMPLEXITY_LEVELS:
             complexity = default_complexity
@@ -15508,9 +20394,10 @@ class SessionState:
         if scale_preference not in TASK_SCALE_PREFERENCES:
             scale_preference = "balanced"
         judgement = trim(str(row.get("judgement", progress) or "").strip(), 200) or progress
-        objective = trim(
-            str(row.get("direct_objective", profile.get("direct_objective", "")) or "").strip(),
-            800,
+        objective = self._primary_objective_text(
+            goal=str(board.get("original_goal", "") or ""),
+            preferred=str(row.get("direct_objective", profile.get("direct_objective", "")) or ""),
+            max_chars=800,
         )
         max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
         if task_level == 5:
@@ -15545,9 +20432,185 @@ class SessionState:
         board_status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
         code_count = len(board.get("code_artifacts", {}) or {})
         research_count = len(board.get("research_notes", []) or [])
+        has_grounded_outputs = bool(
+            code_count
+            or research_count
+            or len(board.get("execution_logs", []) or [])
+            or len(board.get("review_feedback", []) or [])
+        )
+        contract_paths = self._workspace_contract_paths(limit=4)
+        goal_text = str(board.get("original_goal", "") or "")
+        direct_expected = self._goal_direct_expected_artifacts(goal_text)
+        missing_expected = self._goal_missing_expected_artifacts(board)
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
+        if target in AGENT_ROLES and not has_grounded_outputs:
+            executor_mode_flag = True
+        if (
+            target in AGENT_ROLES
+            and mode == EXECUTION_MODE_SYNC
+            and not has_grounded_outputs
+            and research_count <= 0
+            and contract_paths
+        ):
+            target = "explorer"
+            executor_mode_flag = True
+            instruction = trim(
+                (
+                    "Bootstrap from the nearest contract or validator files: "
+                    + ", ".join(contract_paths[:4])
+                    + ". Capture exact acceptance constraints, required outputs, and target paths on the blackboard, then hand off the narrowed execution path."
+                ),
+                1200,
+            )
+            row["reason"] = "contract-grounding-bootstrap"
+            row["source"] = "policy"
+        if (
+            missing_expected
+            and code_count == 0
+            and target != "developer"
+            and action_type not in {"ground", "research"}
+            and str(row.get("reason", "") or "").strip() != "contract-grounding-bootstrap"
+        ):
+            target = "developer"
+            executor_mode_flag = True
+            instruction = trim(
+                (
+                    (
+                        f"Target path: {missing_expected[0]}. "
+                        if missing_expected
+                        else ""
+                    )
+                    + "Expected deliverables are still missing: "
+                    + ", ".join(missing_expected[:4])
+                    + ". Prioritize creating or updating that exact path now. "
+                    "If minimal grounding is still needed, do only the smallest read required first, then produce the missing artifact and continue toward validation."
+                ),
+                1200,
+            )
+            row["reason"] = "missing-direct-artifacts-bootstrap"
+            row["source"] = "policy"
+        elif target in {"reviewer", "finish"} and missing_expected:
+            target = "developer"
+            executor_mode_flag = True
+            instruction = trim(
+                (
+                    (
+                        f"Target path: {missing_expected[0]}. "
+                        if missing_expected
+                        else ""
+                    )
+                    + "Expected deliverables are still missing: "
+                    + ", ".join(missing_expected[:4])
+                    + ". Prioritize that exact path before review or finish."
+                ),
+                1200,
+            )
+            row["reason"] = "missing-direct-artifacts"
+            row["source"] = "policy"
+        elif target == "developer" and missing_expected:
+            executor_mode_flag = True
+            missing_note = (
+                (
+                    f"Target path: {missing_expected[0]}. "
+                    if missing_expected
+                    else ""
+                )
+                + "Expected deliverables are still missing: "
+                + ", ".join(missing_expected[:4])
+                + ". Prioritize that exact path before moving on."
+            )
+            if missing_note.lower() not in instruction.lower():
+                instruction = trim(f"{missing_note}\n{instruction}", 1200)
+        latest_exec_log = self._latest_execution_log_text(board)
+        latest_exec_low = latest_exec_log.lower()
+        validate_contract_present = bool((self.files_root / "validate.py").exists())
+        validate_pass_marker = bool(re.search(r"\bpass[_a-z0-9-]*\b", latest_exec_low))
+        validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+        validation_failure_hint = self._latest_validation_failure_hint(board)
+        validation_requirement_hint = self._validation_contract_requirement_hint(validation_failure_hint)
+        repair_targets = list(direct_expected[:4] or missing_expected[:4])
+        if not repair_targets:
+            repair_targets = self._current_deliverable_paths(board, limit=2)
+        contract_literals = self._workspace_contract_literal_hints(limit=6)
+        if target in {"developer", "reviewer"} and contract_literals:
+            contract_note = (
+                "Exact contract literals that must remain verbatim when relevant: "
+                + " | ".join(trim(str(item or ""), 60) for item in contract_literals[:6])
+                + "."
+            )
+            if contract_note.lower() not in instruction.lower():
+                instruction = trim(f"{contract_note}\n{instruction}", 1200)
+        skill_guard_note = self._skill_discovery_guard_note(role=target)
+        if skill_guard_note and skill_guard_note.lower() not in instruction.lower():
+            instruction = trim(f"{skill_guard_note}\n{instruction}", 1200)
+        if (
+            validate_contract_present
+            and code_count > 0
+            and (not missing_expected)
+            and (not validate_pass_marker)
+        ):
+            if target == "reviewer":
+                review_validation_note = "Validation is still pending. "
+                if validation_cmd:
+                    review_validation_note += f"Run `{validation_cmd}` first, then return a pass/fix verdict with concrete evidence. "
+                else:
+                    review_validation_note += "Run the nearest validation command first, then return a pass/fix verdict with concrete evidence. "
+                review_validation_note += "If it fails, point developer only to the specific failing gap."
+                if validation_failure_hint:
+                    review_validation_note += f" Latest validator failure: {validation_failure_hint}."
+                if review_validation_note.lower() not in instruction.lower():
+                    instruction = trim(f"{review_validation_note}\n{instruction}", 1200)
+            else:
+                target = "developer"
+                executor_mode_flag = True
+                parts = [
+                    (
+                        f"Validation is still pending. Run `{validation_cmd}` now."
+                        if validation_cmd
+                        else "Validation is still pending. Run the nearest validation command now."
+                    ),
+                    "If it fails, repair only the reported gap and continue until the validator passes or the blocker is explicit.",
+                ]
+                if repair_targets:
+                    parts.append(f"Target path: {repair_targets[0]}.")
+                if validation_failure_hint:
+                    parts.append(f"Latest validator failure: {validation_failure_hint}.")
+                if validation_requirement_hint:
+                    parts.append(validation_requirement_hint)
+                if repair_targets:
+                    parts.append(
+                        "Focus the repair on the most relevant deliverable path: "
+                        + ", ".join(repair_targets[:4])
+                        + "."
+                    )
+                parts.append("Do not hand off to review or finish before validation passes.")
+                instruction = trim(" ".join(parts), 1200)
+                row["reason"] = "contract-validation-loop"
+                row["source"] = "policy"
+        goal_low = goal_text.strip().lower()
+        explicit_load_skill_request = ("load_skill" in goal_low) or ("call load skill" in goal_low)
+        if target == "developer" and explicit_load_skill_request and (not self._tool_was_used_in_session("load_skill")):
+            executor_mode_flag = True
+            skill_note = (
+                "User explicitly required one minimal runtime skill before editing. "
+                "Load exactly one relevant built-in skill first, then continue the same implementation step without extra skill churn."
+            )
+            if missing_expected:
+                skill_note += (
+                    " After that skill call, return directly to the missing deliverable path: "
+                    + ", ".join(missing_expected[:4])
+                    + "."
+                )
+            if skill_note.lower() not in instruction.lower():
+                instruction = trim(f"{skill_note}\n{instruction}", 1200)
+        if target == "reviewer":
+            review_hint = "Before giving pass/fix, ground the judgement in execution evidence or the nearest validation command."
+            if validation_cmd:
+                review_hint += f" Prefer `{validation_cmd}` when it matches the workspace contract."
+            if review_hint.lower() not in instruction.lower():
+                instruction = trim(f"{review_hint}\n{instruction}", 1200)
         if bool((board.get("approval", {}) or {}).get("approved", False)) and can_finish_from_approval:
             target = "finish"
             if not instruction:
@@ -15597,7 +20660,7 @@ class SessionState:
                 elif len(board.get("code_artifacts", {}) or {}) > 0:
                     target = "reviewer"
                 elif len(board.get("research_notes", []) or []) > 0:
-                    target = "developer"
+                    target = "explorer"
                 else:
                     target = "explorer"
             if finish_gate_reason == "approval-stale-new-user-input":
@@ -15655,14 +20718,46 @@ class SessionState:
                         )
                     },
                 )
+        if target == "developer":
+            candidate_paths: list[str] = []
+            for rel in repair_targets:
+                clean_rel = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+                if clean_rel and clean_rel not in candidate_paths:
+                    candidate_paths.append(clean_rel)
+            for rel in missing_expected:
+                clean_rel = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+                if clean_rel and clean_rel not in candidate_paths:
+                    candidate_paths.append(clean_rel)
+            for rel in self._current_deliverable_paths(board, limit=3):
+                clean_rel = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+                if clean_rel and clean_rel not in candidate_paths:
+                    candidate_paths.append(clean_rel)
+            if candidate_paths and "target path:" not in instruction.lower():
+                instruction = trim(f"Target path: {candidate_paths[0]}.\n{instruction}", 1200)
         if target not in {"finish", "reviewer"} and finish_gate_reason != "reviewer-summary-missing":
             board["manager_summary_attempts"] = 0
             self.blackboard = board
-        if target != "finish" and objective:
-            low_instruction = instruction.lower()
-            low_objective = objective.lower()
-            if low_objective not in low_instruction:
-                instruction = trim(f"Direct objective: {objective}\n{instruction}", 1200)
+        policy_reason = trim(str(row.get("reason", "") or "").strip(), 80)
+        preserve_live_instruction_reasons = {
+            "approval-stale-reroute",
+            "approval-missing-summary-handoff-explorer",
+            "approval-missing-reviewer-summary-request",
+            "approval-blocked-by-error",
+            "feedback-pass-summary-request",
+            "finish-blocked-summary-request",
+            "finish-blocked-summary-handoff-explorer",
+            "forced-finish-summary-max-retry",
+            "finish-blocked-completed-auto-summary-close",
+            "finish-blocked-feedback-pass-auto-close",
+        }
+        if target in AGENT_ROLES and policy_reason not in preserve_live_instruction_reasons:
+            instruction = self._merge_manager_live_instruction(
+                instruction,
+                board,
+                role=target,
+                require_check=bool(target == "reviewer" or (validate_contract_present and target == "developer")),
+                max_chars=1200,
+            ) or instruction
         if target in AGENT_ROLES:
             instruction = self._apply_agent_language_policy(instruction, max_len=1200)
         has_mandatory_field = isinstance(row, dict) and ("is_mandatory" in row)
@@ -15670,7 +20765,7 @@ class SessionState:
         if finish_gate_reason == "reviewer-summary-missing" and target == "reviewer":
             is_mandatory = True
             has_mandatory_field = True
-        if (not has_mandatory_field) and target in AGENT_ROLES and task_type != "simple_qa":
+        if (not has_mandatory_field) and target in AGENT_ROLES:
             is_mandatory = True
         if target == "finish":
             is_mandatory = False
@@ -15679,6 +20774,11 @@ class SessionState:
             {
                 "target": target,
                 "instruction": instruction,
+                "display_instruction": self._delegate_instruction_display_text(
+                    instruction,
+                    objective=objective,
+                    max_chars=900,
+                ),
                 "task_type": task_type,
                 "complexity": complexity,
                 "scale_preference": scale_preference,
@@ -15741,6 +20841,34 @@ class SessionState:
             }
             break
         if parsed is None:
+            text_args = extract_json_object_from_text(text, {})
+            if isinstance(text_args, dict) and text_args:
+                target = str(text_args.get("target", "") or "").strip().lower()
+                instruction = trim(str(text_args.get("instruction", "") or "").strip(), 1200)
+                if target in MANAGER_ROUTE_TARGETS and instruction:
+                    parsed = {
+                        "target": target,
+                        "instruction": instruction,
+                        "task_level": text_args.get("task_level", 0),
+                        "task_type": trim(str(text_args.get("task_type", "") or "").strip().lower(), 40),
+                        "complexity": trim(str(text_args.get("complexity", "") or "").strip().lower(), 20),
+                        "scale_preference": trim(str(text_args.get("scale_preference", "") or "").strip().lower(), 20),
+                        "judgement": trim(
+                            str(text_args.get("judgement", "") or text_args.get("reason", "") or "").strip(),
+                            200,
+                        ),
+                        "direct_objective": trim(str(text_args.get("direct_objective", "") or "").strip(), 800),
+                        "execution_mode": trim(str(text_args.get("execution_mode", "") or "").strip().lower(), 20),
+                        "participants": text_args.get("participants", []),
+                        "assigned_expert": trim(str(text_args.get("assigned_expert", "") or "").strip().lower(), 20),
+                        "requires_user_confirmation": bool(text_args.get("requires_user_confirmation", False)),
+                        "is_mandatory": _to_bool_like(text_args.get("is_mandatory", False), default=False),
+                        "executor_mode": _to_bool_like(text_args.get("executor_mode", False), default=False),
+                        "round_budget": text_args.get("round_budget", 0),
+                        "reason": trim(str(text or "").strip(), 600),
+                        "source": "tool-text-json",
+                    }
+        if parsed is None:
             parsed = self._manager_fallback_route()
             if str(text or "").strip():
                 parsed["reason"] = trim(str(text or "").strip(), 600)
@@ -15760,8 +20888,16 @@ class SessionState:
         scale = trim(str(row.get("scale_preference", "balanced") or "balanced"), 20)
         objective_raw = trim(str(row.get("direct_objective", "") or ""), 800)
         instruction_raw = trim(str(row.get("instruction", "") or ""), 1200)
+        display_instruction_raw = trim(str(row.get("display_instruction", "") or ""), 1200)
         objective, _ = self._split_language_policy_from_text(objective_raw, max_len=800)
         instruction, _ = self._split_language_policy_from_text(instruction_raw, max_len=1200)
+        instruction = self._dedupe_delegate_instruction_text(instruction, max_chars=1200)
+        display_instruction, _ = self._split_language_policy_from_text(display_instruction_raw, max_len=1200)
+        display_instruction = self._delegate_instruction_display_text(
+            display_instruction or instruction,
+            objective=objective,
+            max_chars=900,
+        )
         is_mandatory = bool(row.get("is_mandatory", False))
         is_executor = bool(row.get("executor_mode", False))
         round_budget = int(row.get("round_budget", 0) or 0)
@@ -15769,9 +20905,17 @@ class SessionState:
         budget_text = "unlimited" if round_budget <= 0 else str(round_budget)
         remaining_text = "unlimited" if remaining < 0 else str(remaining)
         target_label = self._agent_display_name(target)
+        detail_parts = [
+            f"L{task_level if task_level in TASK_LEVEL_CHOICES else '-'}",
+            mode,
+        ]
+        if task_type and task_type != "general":
+            detail_parts.append(f"phase={task_type}")
+        detail_parts.append(f"complexity={complexity}")
+        detail_parts.append(f"scale={scale}")
         lines = [
             f"Manager -> {target_label}",
-            f"L{task_level if task_level in TASK_LEVEL_CHOICES else '-'} | {mode} | {task_type}/{complexity} | scale={scale}",
+            " | ".join(detail_parts),
             (
                 f"mandatory={'yes' if is_mandatory else 'no'}"
                 f" | executor={'yes' if is_executor else 'no'}"
@@ -15780,8 +20924,8 @@ class SessionState:
         ]
         if objective:
             lines.append(f"objective: {objective}")
-        if instruction:
-            lines.append(f"instruction: {instruction}")
+        if display_instruction:
+            lines.append(f"instruction: {display_instruction}")
         text = "\n".join(lines)
         data = {
             "target": target,
@@ -15796,7 +20940,8 @@ class SessionState:
             "round_budget": round_budget,
             "remaining_rounds": remaining,
             "direct_objective": objective,
-            "instruction": instruction,
+            "instruction": display_instruction,
+            "worker_instruction": instruction,
         }
         return text, data
 
@@ -15805,6 +20950,7 @@ class SessionState:
         *,
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
+        allow_executor_shortcuts: bool = True,
     ) -> dict:
         board = self._ensure_blackboard()
         latest_user_ts = self._latest_user_message_ts()
@@ -15819,7 +20965,7 @@ class SessionState:
         tool_calls: list[dict] = []
         used_watchdog_executor = False
         watchdog_meta: dict = {}
-        watchdog_pick = self._watchdog_pick_executor_route(board)
+        watchdog_pick = self._watchdog_pick_executor_route(board) if allow_executor_shortcuts else None
         used_agentbus_fast = False
         fast_meta: dict = {}
         if watchdog_pick:
@@ -15872,7 +21018,7 @@ class SessionState:
                 },
             )
         else:
-            fast_pick = self._manager_pick_agentbus_fast_route(board)
+            fast_pick = self._manager_pick_agentbus_fast_route(board) if allow_executor_shortcuts else None
             if fast_pick:
                 used_agentbus_fast = True
                 fast_args, fast_meta = fast_pick
@@ -16031,190 +21177,12 @@ class SessionState:
                 ),
                 600,
             )
-        active_profile = self._ensure_blackboard_task_profile(board)
-        target = str(route.get("target", "") or "").strip().lower()
-        instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
-        try:
-            task_level = int(route.get("task_level", active_profile.get("task_level", self.runtime_task_level or 3)) or 3)
-        except Exception:
-            task_level = int(self.runtime_task_level or 3)
-        if task_level not in TASK_LEVEL_CHOICES:
-            task_level = 3
-        execution_mode = normalize_execution_mode(
-            route.get("execution_mode", active_profile.get("execution_mode", self._effective_execution_mode())),
-            default=str(TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3]).get("execution_mode", EXECUTION_MODE_SYNC)),
+        return self._apply_coordinator_route(
+            board,
+            route,
+            emit_delegate_message=True,
+            coordinator_label="manager",
         )
-        task_type = trim(str(route.get("task_type", "") or "").strip().lower(), 40)
-        complexity = trim(str(route.get("complexity", "") or "").strip().lower(), 20)
-        scale_preference = trim(str(route.get("scale_preference", "") or "").strip().lower(), 20)
-        if scale_preference not in TASK_SCALE_PREFERENCES:
-            scale_preference = str(active_profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
-            if scale_preference not in TASK_SCALE_PREFERENCES:
-                scale_preference = "balanced"
-        judgement = trim(str(route.get("judgement", "") or "").strip(), 200)
-        objective = trim(str(route.get("direct_objective", "") or "").strip(), 800)
-        participants: list[str] = []
-        raw_participants = route.get("participants", active_profile.get("participants", []))
-        if isinstance(raw_participants, list):
-            for item in raw_participants:
-                role = self._sanitize_agent_role(item)
-                if role and role not in participants:
-                    participants.append(role)
-        assigned_expert = self._sanitize_agent_role(
-            route.get("assigned_expert", active_profile.get("assigned_expert", self.runtime_assigned_expert))
-        ) or (participants[0] if participants else "developer")
-        if execution_mode == EXECUTION_MODE_SINGLE:
-            participants = [assigned_expert]
-        if not participants:
-            participants = [assigned_expert]
-        if task_level == 5:
-            round_budget = 0
-        else:
-            try:
-                round_budget = int(route.get("round_budget", self._blackboard_round_budget(board)) or 0)
-            except Exception:
-                round_budget = int(self._blackboard_round_budget(board) or 0)
-            round_budget = max(1, min(int(self.max_agent_rounds or MAX_AGENT_ROUNDS), int(round_budget)))
-        remaining_rounds = (
-            -1
-            if int(round_budget) <= 0
-            else max(0, int(route.get("remaining_rounds", round_budget - int(board.get("manager_cycles", 0) or 0)) or 0))
-        )
-        route_row = {
-            "ts": float(now_ts()),
-            "target": target,
-            "instruction": instruction,
-            "reason": trim(str(route.get("reason", "") or "").strip(), 600),
-            "source": trim(str(route.get("source", "") or "").strip(), 40),
-            "task_level": int(task_level),
-            "execution_mode": execution_mode,
-            "task_type": task_type,
-            "complexity": complexity,
-            "scale_preference": scale_preference,
-            "judgement": judgement,
-            "direct_objective": objective,
-            "participants": list(participants),
-            "assigned_expert": assigned_expert,
-            "is_mandatory": bool(route.get("is_mandatory", False)),
-            "executor_mode": bool(route.get("executor_mode", False)),
-            "requires_user_confirmation": bool(route.get("requires_user_confirmation", False)),
-            "round_budget": int(round_budget),
-            "remaining_rounds": int(remaining_rounds),
-        }
-        self.manager_routes.append(route_row)
-        self.manager_routes = self.manager_routes[-240:]
-        profile = self._ensure_blackboard_task_profile(board)
-        profile["task_level"] = int(task_level)
-        profile["execution_mode"] = execution_mode
-        profile["participants"] = list(participants)
-        profile["assigned_expert"] = assigned_expert
-        profile["is_mandatory"] = bool(route_row.get("is_mandatory", False))
-        profile["executor_mode"] = bool(route_row.get("executor_mode", False))
-        profile["requires_user_confirmation"] = bool(route_row.get("requires_user_confirmation", False))
-        if task_type in TASK_PROFILE_TYPES:
-            profile["task_type"] = task_type
-        if complexity in TASK_COMPLEXITY_LEVELS:
-            profile["complexity"] = complexity
-        profile["scale_preference"] = scale_preference if scale_preference in TASK_SCALE_PREFERENCES else "balanced"
-        if objective:
-            profile["direct_objective"] = objective
-        if round_budget > 0:
-            profile["round_budget"] = int(
-                max(
-                    1,
-                    min(
-                        int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS),
-                        int(round_budget),
-                    ),
-                )
-            )
-        else:
-            profile["round_budget"] = 0
-        profile["recommended_agents"] = list(participants)
-        profile["updated_at"] = float(now_ts())
-        profile["reason"] = "manager-judged"
-        board["task_profile"] = profile
-        board["manager_judgement"] = {
-            "task_type": str(profile.get("task_type", "")),
-            "complexity": str(profile.get("complexity", "")),
-            "scale_preference": str(profile.get("scale_preference", "balanced") or "balanced"),
-            "progress": judgement or self._manager_progress_state(board),
-            "task_level": int(task_level),
-            "execution_mode": execution_mode,
-            "participants": list(participants),
-            "assigned_expert": assigned_expert,
-            "is_mandatory": bool(route_row.get("is_mandatory", False)),
-            "executor_mode": bool(route_row.get("executor_mode", False)),
-            "remaining_rounds": int(remaining_rounds),
-            "updated_at": float(now_ts()),
-        }
-        self.runtime_task_level = int(task_level)
-        self.runtime_execution_mode = execution_mode
-        self.runtime_participants = list(participants)
-        self.runtime_assigned_expert = assigned_expert
-        self.runtime_round_budget = int(round_budget)
-        self.runtime_task_judgement = judgement or self.runtime_task_judgement
-        self.runtime_task_type = str(profile.get("task_type", self.runtime_task_type) or "")
-        self.runtime_task_complexity = str(profile.get("complexity", self.runtime_task_complexity) or "")
-        self.runtime_scale_preference = str(profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
-        self.runtime_direct_objective = str(profile.get("direct_objective", self.runtime_direct_objective) or "")
-        self.runtime_requires_confirmation = bool(route_row.get("requires_user_confirmation", False))
-        self.runtime_confirmation_needed = bool(route_row.get("requires_user_confirmation", False))
-        board["last_delegate"] = dict(route_row)
-        board["active_agent"] = target if target in AGENT_ROLES else ""
-        self._sync_todos_from_blackboard(reason=f"manager-delegate:{target}", board=board)
-        self._blackboard_touch()
-        self._blackboard_history(
-            "manager",
-            (
-                f"delegate {target}: {instruction} "
-                f"[level={profile.get('task_level', '-')}, mode={profile.get('execution_mode', '-')}, "
-                f"type={profile.get('task_type','general')}, "
-                f"complexity={profile.get('complexity','simple')}, "
-                f"judgement={board['manager_judgement'].get('progress','')}, "
-                f"budget={profile.get('round_budget', self.max_agent_rounds)}]"
-            ),
-        )
-        if target in AGENT_ROLES:
-            delegate_text, delegate_data = self._format_manager_delegate_message(route_row)
-            self.messages.append(
-                {
-                    "role": "system",
-                    "type": "manager_delegate",
-                    "content": delegate_text,
-                    "data": delegate_data,
-                    "agent_role": "manager",
-                    "ts": now_ts(),
-                }
-            )
-            self.messages = self.messages[-400:]
-            self._emit(
-                "message",
-                {
-                    "role": "system",
-                    "type": "manager_delegate",
-                    "text": delegate_text,
-                    "data": delegate_data,
-                    "agent_role": "manager",
-                    "summary": f"manager delegate -> {target}",
-                },
-            )
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    f"manager[{profile.get('task_type','general')}/"
-                    f"{profile.get('complexity','simple')}/"
-                    f"{profile.get('scale_preference','balanced')}/"
-                    f"{board['manager_judgement'].get('progress','initializing')}] "
-                    f"-> {target} (L{profile.get('task_level', '-')}/{profile.get('execution_mode', '-')}, "
-                    f"mandatory={bool(route_row.get('is_mandatory', False))}, "
-                    f"budget={('unlimited' if int(profile.get('round_budget', 0) or 0) <= 0 else profile.get('round_budget', self.max_agent_rounds))}, "
-                    f"remaining={remaining_rounds}, source={route_row['source']})"
-                )
-            },
-        )
-        return route_row
 
     def _inject_manager_instruction(
         self,
@@ -16227,6 +21195,32 @@ class SessionState:
         if not role_key:
             return
         if bool(executor_mode):
+            board = self._ensure_blackboard()
+            preserved_rows: list[dict] = []
+            if role_key == "developer":
+                target_state = self._developer_target_step_state(board, role=role_key)
+                if bool(target_state.get("target_read_done", False)) and not bool(target_state.get("target_touched", False)):
+                    for row in reversed(self._agent_context(role_key)[-24:]):
+                        if not isinstance(row, dict):
+                            continue
+                        if str(row.get("role", "") or "").strip().lower() != "tool":
+                            continue
+                        if str(row.get("name", "") or "").strip() != "read_file":
+                            continue
+                        content = str(row.get("content", "") or "").strip()
+                        if not content or content.startswith("Error:"):
+                            continue
+                        preserved_rows.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": str(row.get("tool_call_id", "") or ""),
+                                "name": "read_file",
+                                "content": trim(content, 6000),
+                                "ts": float(row.get("ts", now_ts()) or now_ts()),
+                                "agent_role": role_key,
+                            }
+                        )
+                        break
             executor_seed = {
                 "role": "system",
                 "content": self._apply_agent_language_policy(
@@ -16240,7 +21234,22 @@ class SessionState:
                 "ts": now_ts(),
                 "agent_role": role_key,
             }
-            self.contexts[role_key] = [executor_seed]
+            self.contexts[role_key] = [executor_seed] + list(reversed(preserved_rows))
+            self._inject_role_baseline_skills(
+                role_key,
+                board=board,
+                reason="executor-hot-swap",
+            )
+            if preserved_rows:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"executor hot-swap preserved {len(preserved_rows)} recent "
+                            f"{self._agent_display_name(role_key)} workspace read"
+                        )
+                    },
+                )
             self._emit(
                 "status",
                 {
@@ -16250,54 +21259,41 @@ class SessionState:
                     )
                 },
             )
-        instruction_with_policy = self._apply_agent_language_policy(
+        sanitized_instruction = self._dedupe_delegate_instruction_text(
             trim(str(instruction or "").strip(), 1400),
+            max_chars=1400,
+        )
+        instruction_with_policy = self._apply_agent_language_policy(
+            sanitized_instruction,
             max_len=1400,
         )
-        instruction_text, embedded_policy = self._split_language_policy_from_text(
+        instruction_text, _embedded_policy = self._split_language_policy_from_text(
             instruction_with_policy,
             max_len=1400,
         )
-        language_note = embedded_policy or self._agent_language_policy_note()
-        mandatory_note = (
-            (
-                "MANDATORY EXECUTION: this delegate is hard-push. "
-                "You must call at least one concrete tool in this turn "
-                "(e.g. write_file/edit_file/bash/read_file) and produce verifiable progress. "
-                "Suggestion-only text reply is forbidden."
-            )
-            if bool(is_mandatory)
-            else ""
+        board = self._ensure_blackboard()
+        objective = self._primary_objective_text(
+            goal=str(board.get("original_goal", "") or ""),
+            preferred=str(self._ensure_blackboard_task_profile(board).get("direct_objective", "") or ""),
+            max_chars=800,
         )
-        executor_note = (
-            (
-                "STATELESS EXECUTOR: do not re-plan globally; "
-                "complete only this delegated step and return concrete tool evidence."
-            )
-            if bool(executor_mode)
-            else ""
-        )
-        collaboration_note = (
-            "COLLABORATION PREFERENCE: if your current step needs another specialty, "
-            "use ask_colleague immediately with explicit intent and concise payload; "
-            "do not wait for another manager cycle."
-        )
-        board_md = self._blackboard_read_state_markdown(max_items=5)
-        payload = (
-            "<manager-delegate>\n"
-            f"target={role_key}\n"
-            f"is_mandatory={bool(is_mandatory)}\n"
-            f"executor_mode={bool(executor_mode)}\n"
-            f"instruction={instruction_text}\n"
-            f"language_policy={language_note}\n"
-            f"{mandatory_note}\n"
-            f"{executor_note}\n"
-            f"{collaboration_note}\n"
-            "</manager-delegate>\n"
-            "<blackboard-state>\n"
-            f"{trim(board_md, 6000)}\n"
-            "</blackboard-state>"
-        )
+        payload_lines = ["[manager-delegate]"]
+        if objective and objective.lower() not in instruction_text.lower():
+            payload_lines.append(f"Objective: {objective}")
+        if instruction_text:
+            payload_lines.append(instruction_text)
+        if role_key == "developer":
+            target_paths = self._step_instruction_target_paths(instruction_text, limit=1)
+            if target_paths:
+                payload_lines.append(
+                    "Execution rule: if that target file already exists, read that exact file at most once, "
+                    "then use edit_file/write_file on the same path before any unrelated reads, bash, or ask_colleague."
+                )
+        if bool(is_mandatory):
+            payload_lines.append("Mode: mandatory")
+        if bool(executor_mode):
+            payload_lines.append("Scope: local delegated step only")
+        payload = trim("\n".join(line for line in payload_lines if str(line or "").strip()), 2200)
         self._append_agent_context_message(
             role_key,
             {
@@ -16315,11 +21311,8 @@ class SessionState:
                 peer,
                 {
                     "role": "system",
-                    "content": (
-                        "[manager-update] "
-                        f"active={role_key}; keep monitoring blackboard and prepare targeted advice.\n"
-                        f"{language_note}"
-                    ),
+                    "content": "[manager-update] "
+                    f"active={role_key}; keep monitoring blackboard and prepare only targeted advice.",
                     "ts": now_ts(),
                     "agent_role": peer,
                 },
@@ -16358,8 +21351,42 @@ class SessionState:
             if output:
                 line = f"{line}\n{output}".strip()
             self._blackboard_append_section("execution_logs", role_key, line)
-            if role_key in {"reviewer"}:
+            if role_key == "explorer" and output:
+                self._blackboard_append_section("research_notes", role_key, line)
+                self._blackboard_set_status("RESEARCHING")
+            elif role_key in {"reviewer"}:
                 self._blackboard_set_status("TESTING")
+                if bool(ok) and self._execution_output_has_pass_marker(output or line):
+                    approval_note = trim(output or line, 1000) or "review passed"
+                    self._blackboard_append_section("review_feedback", role_key, f"review passed\n{approval_note}")
+                    approval = (
+                        (self._ensure_blackboard().get("approval", {}) or {})
+                        if isinstance(self._ensure_blackboard().get("approval"), dict)
+                        else {}
+                    )
+                    if not bool(approval.get("approved", False)):
+                        gate_ok, gate_reason = self._reviewer_approval_log_gate()
+                        if gate_ok:
+                            self._blackboard_mark_approved(approval_note, role_key)
+                        else:
+                            self._blackboard_append_section(
+                                "review_feedback",
+                                role_key,
+                                (
+                                    "approval blocked: reviewer cannot approve because "
+                                    f"{gate_reason}"
+                                ),
+                            )
+                elif output:
+                    failure_note = trim(self._latest_validation_failure_hint(), 800)
+                    if not failure_note:
+                        failure_note = trim(output or line, 800)
+                    if failure_note:
+                        self._blackboard_append_section(
+                            "review_feedback",
+                            role_key,
+                            f"review fix\n{failure_note}",
+                        )
         elif name == "read_file":
             p = trim(str(args.get("path", "") or "").strip(), 240)
             note = f"read_file: {p}"
@@ -16368,6 +21395,24 @@ class SessionState:
             self._blackboard_append_section("research_notes", role_key, note)
             if role_key == "explorer":
                 self._blackboard_set_status("RESEARCHING")
+        elif name == "read_from_blackboard":
+            sections = args.get("sections", []) if isinstance(args.get("sections"), list) else []
+            clean_sections = [trim(str(item or "").strip(), 60) for item in sections if trim(str(item or "").strip(), 60)]
+            note = "read_from_blackboard:"
+            if clean_sections:
+                note += " " + ", ".join(clean_sections[:8])
+            if role_key == "explorer":
+                self._blackboard_append_section("research_notes", role_key, note)
+                self._blackboard_set_status("RESEARCHING")
+            elif role_key == "reviewer":
+                self._blackboard_append_section("review_feedback", role_key, note)
+                self._blackboard_set_status("REVIEWING")
+            else:
+                self._blackboard_append_section("execution_logs", role_key, note)
+                self._blackboard_set_status("CODING")
+            return
+        elif name == "write_to_blackboard":
+            return
         elif name in {"finish_task", "finish_current_task", "mark_done"} and ok:
             summary_arg = trim(str(args.get("summary", "") or "").strip(), BLACKBOARD_MAX_TEXT)
             if summary_arg:
@@ -16429,6 +21474,402 @@ class SessionState:
                 continue
             self._blackboard_update_from_tool_result(role_key, item)
         self._sync_todos_from_blackboard(reason=f"worker-step:{role_key}:{status}")
+
+    def _tool_name_is_non_substantive(self, name: str) -> bool:
+        return str(name or "").strip() in NON_SUBSTANTIVE_TOOL_NAMES
+
+    def _bash_command_is_non_substantive(self, command: object) -> bool:
+        text = str(command or "").strip()
+        if not text:
+            return True
+        low = re.sub(r"\s+", " ", text.lower()).strip()
+        if not low:
+            return True
+        if self._bash_command_invokes_agent_tool(text):
+            return True
+        if re.match(r"^(ls|pwd|find|rg|grep|cat|head|tail|tree|stat|wc|which|type)\b", low):
+            return True
+        if re.match(r"^sed\s+-n\b", low):
+            return True
+        if re.match(r"^mkdir(?:\s+-p)?\b", low):
+            return True
+        return False
+
+    def _bash_command_invokes_agent_tool(self, command: object) -> str:
+        text = str(command or "").strip()
+        if not text:
+            return ""
+        try:
+            parts = shlex.split(text, posix=True)
+        except Exception:
+            parts = text.split()
+        if not parts:
+            return ""
+        head = str(parts[0] or "").strip()
+        if (not head) or any(sep in head for sep in ("/", "\\")):
+            return ""
+        name = canonicalize_tool_name(Path(head).name.strip())
+        if name and name in TOOL_SPEC_BY_NAME:
+            return name
+        return ""
+
+    def _tool_call_is_substantive(self, name: str, args: object | None = None) -> bool:
+        tool_name = str(name or "").strip()
+        if not tool_name or self._tool_name_is_non_substantive(tool_name):
+            return False
+        params = args if isinstance(args, dict) else {}
+        if tool_name == "bash" and self._bash_command_is_non_substantive(params.get("command", "")):
+            return False
+        return True
+
+    def _tool_result_is_substantive(self, item: object) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if not bool(item.get("ok", False)):
+            return False
+        name = str(item.get("name", "") or "").strip()
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        return self._tool_call_is_substantive(name, args)
+
+    def _tool_results_have_substantive_progress(self, rows: object) -> bool:
+        if not isinstance(rows, list):
+            return False
+        return any(self._tool_result_is_substantive(row) for row in rows)
+
+    def _recent_blackboard_read_count(self, role: str, board: dict | None = None, limit: int = 24) -> int:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return 0
+        cap = max(1, min(80, int(limit or 24)))
+        count = 0
+        for section in ("research_notes", "execution_logs", "review_feedback"):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-cap:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("actor", "") or "").strip().lower() != role_key:
+                    continue
+                content = str(row.get("content", "") or "").strip().lower()
+                if content.startswith("read_from_blackboard:"):
+                    count += 1
+        return count
+
+    def _recent_role_file_read_count(self, role: str, board: dict | None = None, limit: int = 24) -> int:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return 0
+        cap = max(1, min(80, int(limit or 24)))
+        count = 0
+        for section in ("research_notes", "execution_logs"):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-cap:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("actor", "") or "").strip().lower() != role_key:
+                    continue
+                content = str(row.get("content", "") or "").strip().lower()
+                if content.startswith("read_file:"):
+                    count += 1
+        return count
+
+    def _recent_role_file_read_since(
+        self,
+        role: str,
+        since_ts: float,
+        board: dict | None = None,
+        limit: int = 36,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return False
+        threshold = float(since_ts or 0.0)
+        cap = max(1, min(80, int(limit or 36)))
+        for section in ("research_notes", "execution_logs"):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-cap:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("actor", "") or "").strip().lower() != role_key:
+                    continue
+                try:
+                    row_ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    row_ts = 0.0
+                if threshold > 0.0 and row_ts > 0.0 and row_ts + 1e-4 < threshold:
+                    continue
+                content = str(row.get("content", "") or "").strip().lower()
+                if content.startswith("read_file:"):
+                    return True
+        return False
+
+    def _recent_role_target_file_read_since(
+        self,
+        role: str,
+        target_path: str,
+        since_ts: float,
+        board: dict | None = None,
+        limit: int = 36,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        target_rel = normalize_rel_preview_path(str(target_path or "")) or trim(str(target_path or "").strip(), 280)
+        if (not role_key) or (not target_rel):
+            return False
+        target_low = target_rel.lower()
+        threshold = float(since_ts or 0.0)
+        cap = max(1, min(80, int(limit or 36)))
+        for section in ("research_notes", "execution_logs"):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-cap:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("actor", "") or "").strip().lower() != role_key:
+                    continue
+                try:
+                    row_ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    row_ts = 0.0
+                if threshold > 0.0 and row_ts > 0.0 and row_ts + 1e-4 < threshold:
+                    continue
+                content = str(row.get("content", "") or "").strip()
+                if not content.lower().startswith("read_file:"):
+                    continue
+                head = trim(content.splitlines()[0].split(":", 1)[1].strip(), 280)
+                head_rel = normalize_rel_preview_path(head) or head
+                if str(head_rel or "").strip().lower() == target_low:
+                    return True
+        return False
+
+    def _recent_role_target_artifact_touch_since(
+        self,
+        role: str,
+        target_path: str,
+        since_ts: float,
+        board: dict | None = None,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        target_rel = normalize_rel_preview_path(str(target_path or "")) or trim(str(target_path or "").strip(), 280)
+        if (not role_key) or (not target_rel):
+            return False
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        item = artifacts.get(target_rel, {}) if isinstance(artifacts.get(target_rel), dict) else {}
+        if not item:
+            return False
+        if str(item.get("last_actor", "") or "").strip().lower() != role_key:
+            return False
+        try:
+            updated_at = float(item.get("updated_at", 0.0) or 0.0)
+        except Exception:
+            updated_at = 0.0
+        threshold = float(since_ts or 0.0)
+        return bool(updated_at > 0.0 and (threshold <= 0.0 or updated_at + 1e-4 >= threshold))
+
+    def _record_tool_usage(self, tool_name: str):
+        name = str(tool_name or "").strip()
+        if not name:
+            return
+        usage = self.session_tool_usage if isinstance(self.session_tool_usage, dict) else {}
+        usage[name] = max(0, int(usage.get(name, 0) or 0)) + 1
+        self.session_tool_usage = usage
+
+    def _developer_target_path_hint(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current_step = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(current_step, dict) and self._sanitize_agent_role(current_step.get("target", "")) == "developer":
+                text = str(current_step.get("instruction", current_step.get("description", "")) or "")
+                paths = self._step_instruction_target_paths(text, limit=1)
+                if paths:
+                    return paths[0]
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        if self._sanitize_agent_role(delegate.get("target", "")) == "developer":
+            text = str(delegate.get("instruction", delegate.get("display_instruction", "")) or "")
+            paths = self._step_instruction_target_paths(text, limit=1)
+            if paths:
+                return paths[0]
+        paths = self._current_deliverable_paths(bb, limit=2)
+        if not paths:
+            return ""
+        if self._current_delegate_is_mandatory_for("developer"):
+            return paths[0]
+        if paths and (
+            len(bb.get("research_notes", []) or []) > 0
+            or len(bb.get("code_artifacts", {}) or {}) > 0
+            or self._latest_validation_failure_hint(bb)
+            or self._latest_review_feedback_hint(bb, max_chars=200)
+        ):
+            return paths[0]
+        return ""
+
+    def _developer_target_step_state(
+        self,
+        board: dict | None = None,
+        *,
+        role: str = "developer",
+    ) -> dict[str, object]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role) or "developer"
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        target_path = self._developer_target_path_hint(bb)
+        explicit_target_step = bool(target_path)
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        try:
+            delegate_ts = float(delegate.get("ts", 0.0) or 0.0)
+        except Exception:
+            delegate_ts = 0.0
+        target_touch_ts = 0.0
+        if explicit_target_step:
+            artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            item = artifacts.get(target_path, {}) if isinstance(artifacts.get(target_path), dict) else {}
+            if str(item.get("last_actor", "") or "").strip().lower() == role_key:
+                try:
+                    target_touch_ts = float(item.get("updated_at", 0.0) or 0.0)
+                except Exception:
+                    target_touch_ts = 0.0
+        target_exists = bool(target_path and (self.files_root / target_path).exists())
+        recent_delegate_read = bool(
+            explicit_target_step
+            and self._recent_role_file_read_since(
+                role_key,
+                max(delegate_ts, target_touch_ts),
+                bb,
+                limit=60,
+            )
+        )
+        target_read_done = bool(
+            explicit_target_step
+            and (
+                self._recent_role_target_file_read_since(role_key, target_path, target_touch_ts, bb, limit=60)
+                or (target_exists and recent_delegate_read)
+            )
+        )
+        target_touched = bool(
+            explicit_target_step
+            and target_touch_ts > 0.0
+            and (delegate_ts <= 0.0 or target_touch_ts + 1e-4 >= delegate_ts)
+        )
+        validation_targeted_repair = bool(
+            explicit_target_step
+            and (not missing_expected)
+            and len(bb.get("code_artifacts", {}) or {}) > 0
+            and self._latest_validation_failure_hint(bb)
+        )
+        return {
+            "missing_expected": list(missing_expected),
+            "target_path": target_path,
+            "explicit_target_step": bool(explicit_target_step),
+            "delegate_ts": float(delegate_ts),
+            "target_touch_ts": float(target_touch_ts),
+            "target_exists": bool(target_exists),
+            "recent_delegate_read": bool(recent_delegate_read),
+            "target_read_done": bool(target_read_done),
+            "target_touched": bool(target_touched),
+            "validation_targeted_repair": bool(validation_targeted_repair),
+        }
+
+    def _tool_was_used_in_session(self, tool_name: str) -> bool:
+        target = str(tool_name or "").strip()
+        if not target:
+            return False
+        if int((self.session_tool_usage or {}).get(target, 0) or 0) > 0:
+            return True
+        if target == "load_skill" and isinstance(self.skill_load_cache, dict) and self.skill_load_cache:
+            return True
+        pools: list[object] = [self.messages, self.manager_context]
+        if isinstance(self.contexts, dict):
+            pools.extend(list(self.contexts.values()))
+        for rows in pools:
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("role", "") or "").strip().lower() != "tool":
+                    continue
+                if str(row.get("name", "") or "").strip() == target:
+                    return True
+        return False
+
+    def _skill_discovery_already_satisfied(self) -> bool:
+        return bool(self._tool_was_used_in_session("load_skill"))
+
+    def _skill_discovery_guard_note(self, *, role: str = "") -> str:
+        return ""
+
+    def _tool_error_recovery_hint(
+        self,
+        *,
+        role: str = "",
+        name: str = "",
+        args: dict | None = None,
+        output: str = "",
+    ) -> str:
+        role_key = self._sanitize_agent_role(role)
+        if (not role_key) or (not str(output or "").startswith("Error:")):
+            return ""
+        tool_name = str(name or "").strip()
+        params = args if isinstance(args, dict) else {}
+        requested_path = str(params.get("path", "") or "").strip()
+        bb = self._ensure_blackboard()
+        target_state = self._developer_target_step_state(bb, role=role_key) if role_key == "developer" else {}
+        target_path = str(target_state.get("target_path", "") or "")
+        target_touched = bool(target_state.get("target_touched", False))
+        validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        contract_paths = self._workspace_contract_paths(limit=6)
+        missing_expected = self._goal_missing_expected_artifacts()
+        hints: list[str] = []
+        if role_key == "developer" and target_path and tool_name in {"read_file", "bash", "ask_colleague", "read_from_blackboard"}:
+            if not validation_targeted_repair and not target_touched:
+                hints.append(
+                    f"Current implementation step is narrowed to exact target path: {target_path}. "
+                    "Use edit_file/write_file on that path now."
+                )
+        if requested_path and tool_name in {"read_file", "write_file", "edit_file"}:
+            requested_name = Path(requested_path).name.strip().lower()
+            basename_matches: list[str] = []
+            candidate_paths = contract_paths + [path for path in missing_expected if path not in contract_paths]
+            seen: set[str] = set()
+            for rel in candidate_paths:
+                clean_rel = str(rel or "").strip()
+                if not clean_rel or clean_rel in seen:
+                    continue
+                seen.add(clean_rel)
+                if requested_name and Path(clean_rel).name.strip().lower() == requested_name:
+                    basename_matches.append(clean_rel)
+            if basename_matches:
+                hints.append(
+                    "Exact workspace path matches for that filename: "
+                    + ", ".join(basename_matches[:4])
+                    + "."
+                )
+            elif contract_paths:
+                hints.append(
+                    "Ground only from these exact contract paths: "
+                    + ", ".join(contract_paths[:4])
+                    + "."
+                )
+        if missing_expected:
+            hints.append(
+                "Required deliverables still missing: "
+                + ", ".join(missing_expected[:4])
+                + ". Prefer write_file/edit_file on one of those exact paths now."
+            )
+        elif contract_paths:
+            hints.append(
+                "Use an exact existing relative path before exploring deeper: "
+                + ", ".join(contract_paths[:4])
+                + "."
+            )
+        if not hints:
+            return ""
+        return trim("[tool-error-recovery] " + " ".join(hints), 520)
 
     def _sanitize_agent_role(self, raw: str) -> str:
         role = str(raw or "").strip().lower()
@@ -16582,10 +22023,6 @@ class SessionState:
         if not role_key:
             return False
         bb = self._ensure_blackboard()
-        profile = self._ensure_blackboard_task_profile(bb)
-        task_type = str(profile.get("task_type", "general") or "general")
-        if task_type == "simple_qa":
-            return False
         delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
         delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
         delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
@@ -16637,6 +22074,280 @@ class SessionState:
                 return True
         return False
 
+    def _developer_delivery_pressure_active(self, role: str, board: dict | None = None) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if role_key != "developer":
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if self._current_delegate_is_mandatory_for(role_key):
+            return True
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        if len(missing_expected) != 1:
+            return False
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current_step = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(current_step, dict):
+                target = self._sanitize_agent_role(current_step.get("target", ""))
+                action_type = str(current_step.get("action_type", "") or "").strip().lower()
+                if target == role_key and action_type in {"implement", "validate"}:
+                    return True
+        has_grounding = bool(
+            len(bb.get("research_notes", []) or [])
+            or len(bb.get("code_artifacts", {}) or [])
+        )
+        return bool(has_grounding and self._workspace_contract_paths(limit=4))
+
+    def _explorer_grounding_pressure_active(self, role: str, board: dict | None = None) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if role_key != "explorer":
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if not self._workspace_contract_paths(limit=4):
+            return False
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current_step = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(current_step, dict):
+                target = self._sanitize_agent_role(current_step.get("target", ""))
+                action_type = str(current_step.get("action_type", "") or "").strip().lower()
+                if target == role_key and action_type in {"ground", "research"}:
+                    return True
+        if not self._current_delegate_is_mandatory_for(role_key):
+            return False
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        try:
+            delegate_ts = float(delegate.get("ts", 0.0) or 0.0)
+        except Exception:
+            delegate_ts = 0.0
+        return not self._recent_role_file_read_since(role_key, delegate_ts, bb, limit=36)
+
+    def _reviewer_validation_pressure_active(self, role: str, board: dict | None = None) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if role_key != "reviewer":
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
+            cursor = max(0, int(dq.get("cursor", 0) or 0))
+            current_step = steps[cursor] if cursor < len(steps) else {}
+            if isinstance(current_step, dict):
+                target = self._sanitize_agent_role(current_step.get("target", ""))
+                action_type = str(current_step.get("action_type", "") or "").strip().lower()
+                if target == role_key and action_type == "validate":
+                    return True
+        return bool(
+            self._current_delegate_is_mandatory_for(role_key)
+            and self._workspace_validation_command_hint()
+            and len(bb.get("code_artifacts", {}) or {}) > 0
+        )
+
+    def _dynamic_tool_suppressions(self, role: str) -> set[str]:
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return set()
+        suppressed: set[str] = set()
+        if self._skill_discovery_already_satisfied():
+            suppressed.update(SKILL_DISCOVERY_TOOL_NAMES)
+        if role_key == "explorer":
+            bb = self._ensure_blackboard()
+            if not self._explorer_grounding_pressure_active(role_key, bb):
+                return suppressed
+            suppressed.update({"read_from_blackboard", "bash", "ask_colleague"})
+            return suppressed
+        if role_key == "reviewer":
+            bb = self._ensure_blackboard()
+            if not self._reviewer_validation_pressure_active(role_key, bb):
+                return suppressed
+            if self._workspace_validation_command_hint():
+                suppressed.add("read_file")
+                suppressed.add("read_from_blackboard")
+            elif self._recent_blackboard_read_count(role_key, bb) >= 1:
+                suppressed.add("read_from_blackboard")
+            return suppressed
+        if role_key != "developer":
+            return suppressed
+        bb = self._ensure_blackboard()
+        if not self._developer_delivery_pressure_active(role_key, bb):
+            return suppressed
+        target_state = self._developer_target_step_state(bb, role=role_key)
+        missing_expected = list(target_state.get("missing_expected", []) or [])
+        target_path = str(target_state.get("target_path", "") or "")
+        explicit_target_step = bool(target_state.get("explicit_target_step", False))
+        blackboard_reads = self._recent_blackboard_read_count(role_key, bb)
+        target_exists = bool(target_state.get("target_exists", False))
+        target_read_done = bool(target_state.get("target_read_done", False))
+        target_touched = bool(target_state.get("target_touched", False))
+        validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        if not missing_expected:
+            if validation_targeted_repair:
+                pass
+            else:
+                if explicit_target_step and blackboard_reads >= 1:
+                    suppressed.add("read_from_blackboard")
+                if explicit_target_step and target_read_done:
+                    suppressed.add("read_file")
+                if explicit_target_step and (not target_touched):
+                    suppressed.add("bash")
+                return suppressed
+            if explicit_target_step and blackboard_reads >= 1:
+                suppressed.add("read_from_blackboard")
+        if not self._workspace_contract_paths(limit=4):
+            if explicit_target_step and blackboard_reads >= 1:
+                suppressed.add("read_from_blackboard")
+            if explicit_target_step and target_read_done:
+                suppressed.add("read_file")
+            if explicit_target_step and (not validation_targeted_repair) and (not target_touched):
+                suppressed.add("bash")
+            return suppressed
+        if len(missing_expected) == 1:
+            suppressed.add("read_file")
+        elif explicit_target_step and (not target_exists):
+            suppressed.add("read_file")
+        read_attempts = 0
+        failed_read_attempts = 0
+        research_rows = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
+        for row in reversed(research_rows[-24:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("actor", "") or "").strip().lower() != role_key:
+                continue
+            content = str(row.get("content", "") or "").strip()
+            if not content.lower().startswith("read_file:"):
+                continue
+            read_attempts += 1
+            low = content.lower()
+            if "error:" in low or "filenotfounderror" in low:
+                failed_read_attempts += 1
+        exec_rows = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        for row in reversed(exec_rows[-24:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("actor", "") or "").strip().lower() != role_key:
+                continue
+            content = str(row.get("content", "") or "").strip().lower()
+            if content.startswith("tool_error read_file:"):
+                failed_read_attempts += 1
+        if explicit_target_step and blackboard_reads >= 1:
+            suppressed.add("read_from_blackboard")
+        elif blackboard_reads >= 3:
+            suppressed.add("read_from_blackboard")
+        if self._current_delegate_is_mandatory_for(role_key):
+            suppressed.add("ask_colleague")
+        if explicit_target_step and target_read_done:
+            suppressed.add("read_file")
+        if explicit_target_step and (not validation_targeted_repair) and (not target_touched):
+            suppressed.add("bash")
+        if validation_targeted_repair and read_attempts >= 1:
+            suppressed.add("read_file")
+        if read_attempts >= 3 or failed_read_attempts >= 2:
+            suppressed.add("read_file")
+        return suppressed
+
+    def _delivery_pressure_tool_allowlist(self, role: str) -> set[str]:
+        role_key = self._sanitize_agent_role(role)
+        if role_key == "explorer":
+            bb = self._ensure_blackboard()
+            if not self._explorer_grounding_pressure_active(role_key, bb):
+                return set()
+            base = {
+                "read_file",
+            }
+            goal_low = str(bb.get("original_goal", "") or "").strip().lower()
+            explicit_load_skill_request = ("load_skill" in goal_low) or ("call load skill" in goal_low)
+            if explicit_load_skill_request and not self._tool_was_used_in_session("load_skill"):
+                base.add("load_skill")
+            return base
+        if role_key == "reviewer":
+            bb = self._ensure_blackboard()
+            if not self._reviewer_validation_pressure_active(role_key, bb):
+                return set()
+            base = {
+                "bash",
+                "finish_task",
+                "finish_current_task",
+                "mark_done",
+            }
+            if not self._workspace_validation_command_hint():
+                base.add("read_file")
+                if self._recent_blackboard_read_count(role_key, bb) <= 0:
+                    base.add("read_from_blackboard")
+            elif self._recent_blackboard_read_count(role_key, bb) <= 0:
+                base.add("read_from_blackboard")
+            return base
+        if role_key != "developer":
+            return set()
+        bb = self._ensure_blackboard()
+        if not self._developer_delivery_pressure_active(role_key, bb):
+            return set()
+        target_state = self._developer_target_step_state(bb, role=role_key)
+        missing_expected = list(target_state.get("missing_expected", []) or [])
+        target_path = str(target_state.get("target_path", "") or "")
+        explicit_target_step = bool(target_state.get("explicit_target_step", False))
+        if len(missing_expected) != 1 and not explicit_target_step:
+            return set()
+        read_attempts = 0
+        blackboard_reads = self._recent_blackboard_read_count(role_key, bb)
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        research_count = len(bb.get("research_notes", []) or {})
+        target_exists = bool(target_state.get("target_exists", False))
+        target_read_done = bool(target_state.get("target_read_done", False))
+        target_touched = bool(target_state.get("target_touched", False))
+        validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        focused_missing = bool(len(missing_expected) == 1)
+        research_rows = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
+        for row in reversed(research_rows[-24:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("actor", "") or "").strip().lower() != role_key:
+                continue
+            content = str(row.get("content", "") or "").strip().lower()
+            if content.startswith("read_file:"):
+                read_attempts += 1
+        base = {
+            "write_file",
+            "edit_file",
+            "finish_task",
+            "finish_current_task",
+            "mark_done",
+        }
+        if focused_missing:
+            pass
+        elif not explicit_target_step:
+            base.update({"bash", "read_from_blackboard", "ask_colleague"})
+        elif validation_targeted_repair or target_touched:
+            base.add("bash")
+        goal_low = str(bb.get("original_goal", "") or "").strip().lower()
+        explicit_load_skill_request = ("load_skill" in goal_low) or ("call load skill" in goal_low)
+        if (
+            explicit_target_step
+            and (not validation_targeted_repair)
+            and target_exists
+            and (not target_read_done)
+        ):
+            base.add("read_file")
+            if explicit_load_skill_request and not self._tool_was_used_in_session("load_skill"):
+                base.add("load_skill")
+        if explicit_target_step:
+            base.discard("read_from_blackboard")
+            base.discard("ask_colleague")
+        if explicit_target_step and (not target_exists):
+            base.discard("read_file")
+        if explicit_target_step and target_read_done:
+            base.discard("read_file")
+        if explicit_target_step and (not validation_targeted_repair) and (not target_touched):
+            base.discard("bash")
+        if explicit_target_step and blackboard_reads > 0:
+            base.discard("read_from_blackboard")
+        elif blackboard_reads > 2:
+            base.discard("read_from_blackboard")
+        return base
+
     def _reviewer_final_summary_ready(self, board: dict | None = None) -> bool:
         def _text_good(text: str) -> bool:
             return self._final_summary_sufficient(text, strict=True)
@@ -16646,8 +22357,9 @@ class SessionState:
         if not bool(approval.get("approved", False)):
             return False
         profile = self._ensure_blackboard_task_profile(bb)
-        task_type = str(profile.get("task_type", "general") or "general")
-        if task_type == "simple_qa":
+        kernel_state = self._ensure_uniform_kernel_state()
+        kernel_summary = trim(str(kernel_state.get("summary_cache", "") or "").strip(), UNIFORM_KERNEL_MAX_SUMMARY_CHARS)
+        if kernel_summary and _text_good(kernel_summary):
             return True
         mode = normalize_execution_mode(
             profile.get("execution_mode", self._effective_execution_mode()),
@@ -16790,11 +22502,13 @@ class SessionState:
         if not role_key:
             return TOOLS
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
+        suppressed = self._dynamic_tool_suppressions(role_key)
+        delivery_allowlist = self._delivery_pressure_tool_allowlist(role_key)
         filtered = []
         for tool in TOOLS:
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
-            if name in allowed:
+            if name in allowed and name not in suppressed and (not delivery_allowlist or name in delivery_allowlist):
                 filtered.append(tool)
         return filtered or TOOLS
 
@@ -16816,6 +22530,8 @@ class SessionState:
             row["ts"] = now_ts()
         ctx = self._agent_context(role_key)
         ctx.append(row)
+        self._compact_agent_control_context(role_key)
+        ctx = self._agent_context(role_key)
         if len(ctx) > 400:
             self.contexts[role_key] = ctx[-400:]
             ctx = self.contexts[role_key]
@@ -16837,6 +22553,47 @@ class SessionState:
             self.messages.append(mirror)
             self.messages = self.messages[-400:]
         return row
+
+    def _agent_context_control_tag(self, row: dict) -> str:
+        if not isinstance(row, dict):
+            return ""
+        content = str(row.get("content", "") or "").strip().lower()
+        if "<manager-delegate>" in content or content.startswith("[manager-delegate]"):
+            return "manager_delegate"
+        if content.startswith("[manager-update]"):
+            return "manager_update"
+        if "<agent-message>" in content:
+            return "agent_message"
+        if "[mandatory-reminder]" in content:
+            return "mandatory_reminder"
+        return ""
+
+    def _compact_agent_control_context(self, role: str):
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return
+        ctx = self._agent_context(role_key)
+        limits = {
+            "manager_delegate": 2,
+            "manager_update": 1,
+            "agent_message": 6,
+            "mandatory_reminder": 1,
+        }
+        tagged: dict[str, list[int]] = {}
+        for idx, row in enumerate(ctx):
+            tag = self._agent_context_control_tag(row if isinstance(row, dict) else {})
+            if tag:
+                tagged.setdefault(tag, []).append(idx)
+        drop: set[int] = set()
+        for tag, indexes in tagged.items():
+            keep = max(0, int(limits.get(tag, 0)))
+            if keep <= 0 or len(indexes) <= keep:
+                continue
+            drop.update(indexes[:-keep])
+        if drop:
+            self.contexts[role_key] = [
+                row for idx, row in enumerate(ctx) if idx not in drop
+            ]
 
     def _agent_display_name(self, role: str) -> str:
         return AGENT_ROLE_LABELS.get(self._sanitize_agent_role(role), str(role or "").strip().title() or "Agent")
@@ -16868,17 +22625,30 @@ class SessionState:
         dst = self._sanitize_agent_role(to_role)
         if not src or not dst:
             raise ValueError("invalid agent roles for bus envelope")
+        board = self._ensure_blackboard()
+        manager_aim = self._agentbus_manager_aim_brief(board)
+        payload_text = trim(str(payload or "").strip(), 3400 if manager_aim else 4000)
+        if manager_aim and "<manager-aim>" not in payload_text.lower():
+            payload_text = trim(
+                "<manager-aim>\n"
+                + manager_aim
+                + "\n</manager-aim>\n"
+                + payload_text,
+                4000,
+            )
         envelope = {
             "id": make_id("agentmsg"),
             "ts": now_ts(),
             "from": src,
             "to": dst,
             "intent": trim(str(intent or "").strip(), 80) or "message",
-            "payload": trim(str(payload or "").strip(), 4000),
+            "payload": payload_text,
             "importance": str(importance or "normal").strip().lower() or "normal",
         }
+        display_payload = self._delegate_instruction_display_text(payload_text, max_chars=600)
         self.agent_bus_messages.append(envelope)
         self.agent_bus_messages = self.agent_bus_messages[-240:]
+        self.pending_agentbus_route = dict(envelope)
         language_note = self._agent_language_policy_note()
         inject = (
             "<agent-message>\n"
@@ -16904,9 +22674,12 @@ class SessionState:
                 "agent_role": src,
                 "content": (
                     f"[agent_bus] {self._agent_display_name(src)} -> {self._agent_display_name(dst)} "
-                    f"({envelope['intent']}): {trim(envelope['payload'], 260)}"
+                    f"({envelope['intent']}): {trim(display_payload or envelope['payload'], 260)}"
                 ),
-                "data": dict(envelope),
+                "data": {
+                    **dict(envelope),
+                    "payload": display_payload or envelope["payload"],
+                },
                 "ts": envelope["ts"],
             }
         )
@@ -16928,12 +22701,154 @@ class SessionState:
             trim(
                 (
                     f"agentbus {src}->{dst} ({envelope['intent']}, id={envelope['id']}): "
-                    f"{trim(envelope['payload'], 320)}"
+                    f"{trim(display_payload or envelope['payload'], 320)}"
                 ),
                 520,
             ),
         )
         return envelope
+
+    def _recent_agentbus_duplicate(
+        self,
+        from_role: str,
+        to_role: str,
+        intent: str,
+        payload: str,
+        *,
+        max_age_seconds: float = 18.0,
+    ) -> bool:
+        src = self._sanitize_agent_role(from_role)
+        dst = self._sanitize_agent_role(to_role)
+        want_intent = trim(str(intent or "").strip().lower(), 80)
+        want_payload = trim(str(payload or "").strip(), 700)
+        if (not src) or (not dst) or (not want_intent) or (not want_payload):
+            return False
+        now_tick = float(now_ts())
+        for env in reversed(list(self.agent_bus_messages)[-12:]):
+            if not isinstance(env, dict):
+                continue
+            try:
+                ts = float(env.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0.0 or (now_tick - ts) > max(3.0, float(max_age_seconds or 18.0)):
+                continue
+            if self._sanitize_agent_role(env.get("from", "")) != src:
+                continue
+            if self._sanitize_agent_role(env.get("to", "")) != dst:
+                continue
+            if trim(str(env.get("intent", "") or "").strip().lower(), 80) != want_intent:
+                continue
+            prev_payload = trim(str(env.get("payload", "") or "").strip(), 700)
+            if prev_payload == want_payload:
+                return True
+            if self._watchdog_similarity(prev_payload, want_payload) >= 0.9:
+                return True
+        return False
+
+    def _auto_agentbus_handoff(self, role: str, step: dict | None, board: dict | None = None) -> dict | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if not self._is_multi_agent_mode():
+            return None
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC:
+            return None
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            return None
+        role_key = self._sanitize_agent_role(role)
+        safe_step = step if isinstance(step, dict) else {}
+        status = str(safe_step.get("status", "") or "").strip().lower()
+        clean_text = trim(strip_thinking_content(str(safe_step.get("text", "") or "").strip()), 260)
+        tool_results = safe_step.get("tool_results", []) if isinstance(safe_step.get("tool_results"), list) else []
+        has_substantive_tools = self._tool_results_have_substantive_progress(tool_results)
+        has_delivery_tool = False
+        for item in tool_results:
+            if not isinstance(item, dict) or not bool(item.get("ok", False)):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if name in {"write_file", "edit_file"}:
+                has_delivery_tool = True
+                break
+            if name == "bash":
+                args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+                if not self._bash_command_is_non_substantive(args.get("command", "")):
+                    has_delivery_tool = True
+                    break
+        if status == "tools" and (not has_substantive_tools) and role_key != "reviewer":
+            return None
+        if status == "no-tools" and (role_key not in {"explorer", "reviewer"} or len(clean_text) < 120):
+            return None
+        if status not in {"tools", "no-tools"}:
+            return None
+
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        validate_contract_present = bool((self.files_root / "validate.py").exists())
+        validation_hint = self._latest_validation_failure_hint(bb)
+        validation_requirement_hint = self._validation_contract_requirement_hint(validation_hint)
+        repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+        if not repair_focus_paths:
+            repair_focus_paths = self._current_deliverable_paths(bb, limit=2)
+        latest_exec_low = self._latest_execution_log_text(bb).lower()
+        validation_pass_marker = bool(re.search(r"\bpass[_a-z0-9-]*\b", latest_exec_low))
+        target = ""
+        intent = ""
+        lead = ""
+        importance = "normal"
+
+        if role_key == "explorer":
+            target = "developer"
+            intent = "execute_plan"
+            lead = "Grounding is ready. Implement the next concrete increment now."
+        elif role_key == "developer":
+            target = "reviewer"
+            intent = "review_request"
+            lead = "Implementation batch is ready for validation. Run the nearest validator or test entrypoint now and return pass/fix evidence."
+            if (not has_delivery_tool) and (not validation_pass_marker):
+                return None
+        elif role_key == "reviewer":
+            if bool(approval.get("approved", False)) or self._manager_feedback_passed_from_blackboard(bb):
+                if self._reviewer_final_summary_ready(bb):
+                    return None
+                target = "explorer"
+                intent = "final_summary_request"
+                lead = "Approval is already in place. Synthesize the final summary from blackboard evidence now."
+                importance = "high"
+            else:
+                target = "developer"
+                intent = "fix_request"
+                lead = "Latest review found concrete gaps. Fix only the current validated issues and rerun the relevant checks."
+                importance = "high"
+                if (not validation_hint) and len(clean_text) < 80 and (not has_substantive_tools):
+                    return None
+        if (not target) or (not intent) or (not lead):
+            return None
+
+        parts = [lead]
+        if clean_text and role_key in {"explorer", "reviewer"}:
+            parts.append(f"Latest {role_key} note: {clean_text}")
+        if target == "developer" and repair_focus_paths:
+            parts.append(f"Target path: {repair_focus_paths[0]}.")
+        if target == "developer" and validation_hint:
+            parts.append(f"Latest validation failure: {validation_hint}.")
+        if target == "developer" and validation_requirement_hint:
+            parts.append(validation_requirement_hint)
+        if target == "reviewer" and validate_contract_present and (not validation_pass_marker):
+            parts.append("Validator contract exists; prefer running `python3 validate.py` before deciding.")
+        payload = trim("\n".join(part for part in parts if str(part or "").strip()), 1200)
+        if self._recent_agentbus_duplicate(role_key, target, intent, payload):
+            return None
+        return self._agent_send_bus(
+            role_key,
+            target,
+            intent,
+            payload,
+            importance=importance,
+        )
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
@@ -16956,26 +22871,38 @@ class SessionState:
             return (
                 base
                 + "Role objective: analyze user goals, inspect codebase, and produce actionable research notes. "
+                + "When validation/spec files exist, read them early and capture exact acceptance constraints on the blackboard before handoff. "
                 + "Prefer read/search/check commands; avoid direct large code modifications. "
+                + "If blocked by unfamiliar scope or broad task surface, load only the minimal grounding or splitting skill needed. "
+                + "A skill load by itself is not sufficient progress; follow it immediately with workspace evidence such as read_file, read_from_blackboard, or ask_colleague. "
                 + "When new evidence appears, write concise research updates to blackboard and hand off actionable insights. "
-                + "Proactively use ask_colleague when your findings can unblock developer/reviewer immediately. "
-                + "If reviewer sends final_summary_request, produce final wrap-up summary from blackboard evidence and finish."
+                + "Proactively use ask_colleague when your findings can unblock developer/reviewer immediately."
             )
         if role_key == "reviewer":
             return (
                 base
-                + "Role objective: verify developer output against goal, run checks/tests, and issue pass/fix decisions. "
+                + "Role objective: verify the current deliverables against the live objective, run checks/tests, and issue pass/fix decisions. "
+                + "Treat exact literals, headings, assertion needles, and example strings from validate/spec/tests as binding; if implementation changes or translates them, fail review. "
+                + "If blocked by missing validation procedure or closeout structure, load only the minimal review or summary skill needed. "
+                + "A skill load by itself is not sufficient progress; follow it immediately with blackboard reads, validation commands, or reviewer feedback evidence. "
+                + "If validate.py or a clear test entrypoint exists, run that validation command before giving a verdict; reading files alone is not enough review evidence. "
                 + "If gaps remain, send fix_request to developer with concrete failure evidence and write review_feedback to blackboard. "
                 + "If manager requests final summary, first call read_from_blackboard "
                 + "(sections: code_artifacts, execution_logs, review_feedback, status), then generate a structured summary "
                 + "covering changes, validation evidence, and residual risks/next steps. "
-                + "When finishing, pass this summary in finish_task.summary; empty or vague summary is invalid. "
-                + "If you cannot produce summary from current evidence, hand off Explorer via ask_colleague "
-                + "intent=final_summary_request with explicit missing evidence."
+                + "When finishing, pass this summary in finish_task.summary; empty or vague summary is invalid."
             )
         return (
             base
-            + "Role objective: implement code changes based on explorer/reviewer inputs. "
+            + "Role objective: update the current deliverables based on explorer/reviewer inputs. "
+            + "Before editing, read validate/test/spec files when present or mentioned, and treat them as the active contract. "
+            + "If validate/spec/tests require exact strings, headings, or literals, reproduce those contract strings verbatim instead of translating or paraphrasing them. "
+            + "If the task capsule or manager instruction names missing_artifacts, use write_file/edit_file on those exact paths before extra shell exploration; ls/find/mkdir alone are not enough. "
+            + "If the delegated step names `Target path: ...`, treat that exact file as the required deliverable for this round and materialize or edit it directly before changing upstream generator files. "
+            + "When `Target path: ...` points to an existing file, read that exact file at most once if its current contents are still unknown, then move directly to edit_file/write_file on the same path. "
+            + "Do not read unrelated files, do not call ask_colleague, and do not use bash before making that target-file edit. "
+            + "If blocked by multi-step execution uncertainty, load only the minimal implementation skill needed. "
+            + "A skill load by itself is not sufficient progress; follow it immediately with read_file, write_file, edit_file, bash, or ask_colleague. "
             + "Perform concrete file edits and command execution. "
             + "Continuously record progress and blockers to blackboard. "
             + "When blocked or uncertain, immediately call ask_colleague to explorer/reviewer with focused intent. "
@@ -17004,6 +22931,7 @@ class SessionState:
                 },
                 mirror_to_global=False,
             )
+            self._inject_role_baseline_skills("explorer", board=self._ensure_blackboard(), reason="goal-seed")
         if not self.manager_context:
             self.manager_context = [
                 {
@@ -17029,6 +22957,7 @@ class SessionState:
                 },
                 mirror_to_global=False,
             )
+            self._inject_role_baseline_skills("developer", board=self._ensure_blackboard(), reason="seed")
         if not self._agent_context("reviewer"):
             self._append_agent_context_message(
                 "reviewer",
@@ -17043,6 +22972,7 @@ class SessionState:
                 },
                 mirror_to_global=False,
             )
+            self._inject_role_baseline_skills("reviewer", board=self._ensure_blackboard(), reason="seed")
 
     def _todo_write_rescue(self, args: dict) -> str:
         raw_items = args.get("items", [])
@@ -17308,6 +23238,12 @@ class SessionState:
         streak = int(diagnosis.get("streak", 0) or 0)
         causes = ", ".join(str(x) for x in (diagnosis.get("causes") or []) if str(x).strip()) or "unknown"
         actions = [str(x).strip() for x in (diagnosis.get("actions") or []) if str(x).strip()]
+        missing_expected = self._goal_missing_expected_artifacts()
+        if missing_expected:
+            actions.insert(
+                0,
+                "write_file/edit_file the exact missing_artifacts path now: " + ", ".join(missing_expected[:4]),
+            )
         action_text = " | ".join(actions[:4]) if actions else "run one concrete tool call"
         recall_hint = ""
         if self.context_archives:
@@ -17654,6 +23590,135 @@ class SessionState:
         role_key = self._sanitize_agent_role(agent_role)
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
+        delivery_allowlist = self._delivery_pressure_tool_allowlist(role_key) if role_key else set()
+        if role_key and delivery_allowlist and name not in delivery_allowlist:
+            allowed_text = ", ".join(sorted(delivery_allowlist))
+            return (
+                f"Error: tool '{name}' is blocked by current execution pressure for agent role '{role_key}'. "
+                f"Allowed tools now: {allowed_text}"
+            )
+        suppressed = self._dynamic_tool_suppressions(role_key) if role_key else set()
+        if role_key and name in suppressed:
+            missing_expected = self._goal_missing_expected_artifacts()
+            if name in SKILL_DISCOVERY_TOOL_NAMES:
+                note = "Runtime skill loading is already satisfied for this run. Do not call skill discovery tools again. "
+                if missing_expected:
+                    note += (
+                        "Continue the current deliverable work on: "
+                        + ", ".join(missing_expected[:4])
+                        + "."
+                    )
+                else:
+                    note += "Continue the current grounded execution step."
+                return f"Error: {trim(note, 420)}"
+            if name == "read_file":
+                note = (
+                    "Grounding budget for this mandatory step is exhausted. "
+                    "Do not keep reading more files before delivery. "
+                )
+                if missing_expected:
+                    note += (
+                        "Required deliverables still missing: "
+                        + ", ".join(missing_expected[:4])
+                        + ". Use write_file/edit_file on one of those exact paths now, or run the validator/bash on the current implementation."
+                    )
+                else:
+                    note += "Use write_file, edit_file, bash, read_from_blackboard, or ask_colleague now."
+                return f"Error: {trim(note, 420)}"
+            generic_note = f"Tool '{name}' is temporarily suppressed for this step. "
+            if missing_expected:
+                generic_note += (
+                    "Continue the current deliverable work on: "
+                    + ", ".join(missing_expected[:4])
+                    + "."
+                )
+            else:
+                generic_note += "Use a delivery or validation tool instead."
+            return f"Error: {trim(generic_note, 420)}"
+        if role_key and name == "bash":
+            misused_tool = self._bash_command_invokes_agent_tool(args.get("command", ""))
+            if misused_tool:
+                return (
+                    "Error: shell command starts with agent tool "
+                    f"'{misused_tool}'. Use the real tool call instead of invoking it through bash."
+                )
+        if role_key and name in SKILL_DISCOVERY_TOOL_NAMES and self._skill_discovery_already_satisfied():
+            missing_expected = self._goal_missing_expected_artifacts()
+            note = "Runtime skill loading is already satisfied for this run. Do not call skill discovery tools again. "
+            if missing_expected:
+                note += (
+                    "Continue the current deliverable work on: "
+                    + ", ".join(missing_expected[:4])
+                    + "."
+                )
+            else:
+                note += "Continue the current grounded execution step."
+            return f"Error: {trim(note, 420)}"
+        if role_key == "developer" and name == "read_file":
+            bb = self._ensure_blackboard()
+            if self._developer_delivery_pressure_active(role_key, bb):
+                target_state = self._developer_target_step_state(bb, role=role_key)
+                target_path = str(target_state.get("target_path", "") or "")
+                explicit_target_step = bool(target_state.get("explicit_target_step", False))
+                target_exists = bool(target_state.get("target_exists", False))
+                target_read_done = bool(target_state.get("target_read_done", False))
+                target_touched = bool(target_state.get("target_touched", False))
+                recent_delegate_read = bool(target_state.get("recent_delegate_read", False))
+                validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+                delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+                try:
+                    delegate_ts = float(delegate.get("ts", 0.0) or 0.0)
+                except Exception:
+                    delegate_ts = 0.0
+                fallback_candidates = self._current_deliverable_paths(bb, limit=1)
+                fallback_target = target_path or (fallback_candidates[0] if fallback_candidates else "")
+                fallback_recent_read = bool(
+                    fallback_target
+                    and self._recent_role_file_read_since(role_key, delegate_ts, bb, limit=60)
+                )
+                fallback_touched = bool(
+                    fallback_target
+                    and self._recent_role_target_artifact_touch_since(
+                        role_key,
+                        fallback_target,
+                        delegate_ts,
+                        bb,
+                    )
+                )
+                if explicit_target_step and (not validation_targeted_repair):
+                    requested_rel = ""
+                    try:
+                        requested_rel = self._normalize_tool_path_text(args.get("path", ""))
+                    except Exception:
+                        requested_rel = normalize_rel_preview_path(str(args.get("path", "") or ""))
+                    requested_rel = normalize_rel_preview_path(requested_rel) or trim(str(requested_rel or "").strip(), 280)
+                    if requested_rel and target_path and requested_rel != target_path:
+                        args["path"] = target_path
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "developer read_file auto-grounded "
+                                    f"{requested_rel}->{target_path}"
+                                )
+                            },
+                        )
+                    if target_path and target_read_done and (not target_touched):
+                        return (
+                            "Error: target-file grounding is already complete for this step. "
+                            f"Do not reread `{target_path}` before making an edit. Use edit_file/write_file now."
+                        )
+                    if target_exists and recent_delegate_read and (not target_touched):
+                        return (
+                            "Error: mandatory target-file grounding was already completed in this delegate step. "
+                            f"Do not read more files before editing `{target_path}`. Use edit_file/write_file now."
+                        )
+                if fallback_target and fallback_recent_read and (not fallback_touched):
+                    return (
+                        "Error: grounding for the current deliverable is already complete in this delegate step. "
+                        f"Do not keep reading files before editing `{fallback_target}`. Use edit_file/write_file now."
+                    )
+        self._record_tool_usage(name)
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""))
             if guard_error:
@@ -17942,6 +24007,8 @@ class SessionState:
             from_role = role_key or "developer"
             if not to_role:
                 return "Error: ask_colleague.to must be explorer/developer/reviewer"
+            if to_role == from_role:
+                return "Error: ask_colleague.to must target a different agent role"
             if not intent:
                 return "Error: ask_colleague.intent is required"
             if not content:
@@ -17962,6 +24029,13 @@ class SessionState:
             if section == "status":
                 wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
                 dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
+                memory_capsule = self._normalize_memory_capsule(board.get("memory_capsule", {}))
+                kernel_state = self._ensure_uniform_kernel_state()
+                compare = (
+                    kernel_state.get("last_compare", {})
+                    if isinstance(kernel_state.get("last_compare"), dict)
+                    else {}
+                )
                 return json_dumps(
                     {
                         "status": board.get("status", "INITIALIZING"),
@@ -17984,9 +24058,66 @@ class SessionState:
                             "total": len(dq.get("steps", []) or []),
                             "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
                         },
+                        "uniform_kernel": {
+                            "kernel_version": str(kernel_state.get("kernel_version", UNIFORM_KERNEL_VERSION) or UNIFORM_KERNEL_VERSION),
+                            "last_route_source": trim(str(kernel_state.get("last_route_source", "") or "").strip(), 80),
+                            "manager_stride": int(kernel_state.get("manager_stride", UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE),
+                            "cycles_since_manager": int(kernel_state.get("cycles_since_manager", 0) or 0),
+                            "direct_bus_handoffs": int(kernel_state.get("direct_bus_handoffs", 0) or 0),
+                            "deterministic_handoffs": int(kernel_state.get("deterministic_handoffs", 0) or 0),
+                            "manager_handoffs": int(kernel_state.get("manager_handoffs", 0) or 0),
+                            "task_splits": int(kernel_state.get("task_splits", 0) or 0),
+                            "autotune_events": int(kernel_state.get("autotune_events", 0) or 0),
+                            "last_load_reason": trim(str(kernel_state.get("last_load_reason", "") or "").strip(), 160),
+                            "last_load_score": int(kernel_state.get("last_load_score", 0) or 0),
+                            "last_tuning_reason": trim(str(kernel_state.get("last_tuning_reason", "") or "").strip(), 160),
+                            "last_compare": {
+                                "kernel_source": trim(str(compare.get("kernel_source", "") or "").strip(), 80),
+                                "kernel_target": trim(str(compare.get("kernel_target", "") or "").strip(), 40),
+                                "manager_source": trim(str(compare.get("manager_source", "") or "").strip(), 80),
+                                "manager_target": trim(str(compare.get("manager_target", "") or "").strip(), 40),
+                                "selected": trim(str(compare.get("selected", "") or "").strip(), 40),
+                            },
+                        },
+                        "microtask_mode": normalize_on_off_mode(self.microtask_mode, default="off"),
+                        "small_model_microtask_mode": normalize_on_off_mode(
+                            self.small_model_microtask_mode,
+                            default="off",
+                        ),
+                        "session_compression_level": normalize_session_compression_level(
+                            memory_capsule.get("compression_level", self.session_compression_level),
+                            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                        ),
+                        "memory_capsule": {
+                            "current_focus": trim(
+                                str(
+                                    ((memory_capsule.get("plan_anchor", {}) if isinstance(memory_capsule.get("plan_anchor"), dict) else {})).get("current_focus", "")
+                                    or ""
+                                ).strip(),
+                                220,
+                            ),
+                            "next_action": trim(
+                                str(
+                                    ((memory_capsule.get("plan_anchor", {}) if isinstance(memory_capsule.get("plan_anchor"), dict) else {})).get("next_action", "")
+                                    or ""
+                                ).strip(),
+                                220,
+                            ),
+                            "active_files": [
+                                trim(str(row.get("path", "") or "").strip(), 120)
+                                for row in (
+                                    memory_capsule.get("active_files", [])
+                                    if isinstance(memory_capsule.get("active_files"), list)
+                                    else []
+                                )[:4]
+                                if isinstance(row, dict) and trim(str(row.get("path", "") or "").strip(), 120)
+                            ],
+                        },
                     },
                     indent=2,
                 )
+            if section == "memory_capsule":
+                return self._memory_capsule_markdown(board, max_items=limit, include_history=True)
             if section == "code_artifacts":
                 artifacts = board.get("code_artifacts", {})
                 if not isinstance(artifacts, dict):
@@ -18300,6 +24431,17 @@ class SessionState:
             return False, "latest execution log indicates error/failure"
         return True, "ok"
 
+    def _latest_execution_log_text(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        for row in reversed(logs):
+            if not isinstance(row, dict):
+                continue
+            txt = str(row.get("content", "") or "").strip()
+            if txt:
+                return txt
+        return ""
+
     def _reviewer_deems_done(self, text: str) -> bool:
         clean = strip_thinking_content(str(text or "")).strip()
         if not clean:
@@ -18372,6 +24514,42 @@ class SessionState:
             reason = str(text_filter_meta.get("reason", "") or "").strip()
             if reason == "oversized_raw_toolcall":
                 self._inject_toolcall_overflow_hint(role_key)
+        empty_action = bool((not str(text or "").strip()) and (not tool_calls))
+        if empty_action:
+            missing_expected = self._goal_missing_expected_artifacts()
+            skill_discovery_note = self._skill_discovery_guard_note(role=role_key)
+            reminder = (
+                "[empty-action-recovery] You returned no usable text or tool calls. "
+                "Your next reply must contain exactly one concrete tool call. "
+            )
+            if skill_discovery_note:
+                reminder += f"{skill_discovery_note} "
+            if missing_expected:
+                reminder += (
+                    "Missing deliverables remain: "
+                    + ", ".join(missing_expected[:4])
+                    + ". Use write_file or edit_file on one of those exact paths now. "
+                )
+            self._append_agent_context_message(
+                role_key,
+                {
+                    "role": "system",
+                    "content": self._apply_agent_language_policy(reminder, max_len=1200),
+                    "ts": now_ts(),
+                    "agent_role": role_key,
+                },
+                mirror_to_global=False,
+            )
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{self._agent_display_name(role_key)} returned empty action; "
+                        "empty-action recovery injected"
+                    )
+                },
+            )
+            return {"status": "no-tools", "role": role_key, "text": "", "thinking": ""}
         assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": role_key}
         if thinking_text:
             assistant["thinking"] = thinking_text
@@ -18393,6 +24571,10 @@ class SessionState:
             self._emit_agent_message(role_key, emit_text, summary=f"{self._agent_display_name(role_key)} response")
         if not tool_calls:
             if self._current_delegate_is_mandatory_for(role_key):
+                missing_expected = self._goal_missing_expected_artifacts()
+                repeated_skill_note = self._skill_discovery_guard_note(role=role_key)
+                if repeated_skill_note:
+                    repeated_skill_note += " "
                 self._append_agent_context_message(
                     role_key,
                     {
@@ -18400,7 +24582,15 @@ class SessionState:
                         "content": self._apply_agent_language_policy(
                             "[mandatory-reminder] Manager marked this turn as mandatory execution. "
                             "You must call at least one concrete tool in your next reply; "
-                            "text-only advice is not allowed.",
+                            "text-only advice is not allowed. "
+                            + repeated_skill_note
+                            + (
+                                "Missing deliverables remain: "
+                                + ", ".join(missing_expected[:4])
+                                + ". Use write_file or edit_file on one of those exact paths now. "
+                                if missing_expected
+                                else ""
+                            ),
                             max_len=1000,
                         ),
                         "ts": now_ts(),
@@ -18470,6 +24660,31 @@ class SessionState:
                 },
                 mirror_to_global=False,
             )
+            recovery_hint = self._tool_error_recovery_hint(
+                role=role_key,
+                name=name,
+                args=args if isinstance(args, dict) else {},
+                output=str(output or ""),
+            )
+            if recovery_hint:
+                self._append_agent_context_message(
+                    role_key,
+                    {
+                        "role": "system",
+                        "content": self._apply_agent_language_policy(recovery_hint, max_len=1400),
+                        "ts": now_ts(),
+                        "agent_role": role_key,
+                    },
+                    mirror_to_global=False,
+                )
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} tool recovery injected after {name}"
+                        )
+                    },
+                )
             self._emit(
                 "tool_result",
                 {
@@ -18495,6 +24710,82 @@ class SessionState:
         with self.lock:
             self.current_phase = f"agent:{role_key}:post-tools"
             self.current_tool_name = ""
+        has_substantive_progress = self._tool_results_have_substantive_progress(tool_results)
+        if tool_results and (not has_substantive_progress):
+            missing_expected = self._goal_missing_expected_artifacts()
+            target_state = self._developer_target_step_state(self._ensure_blackboard(), role=role_key) if role_key == "developer" else {}
+            target_path = str(target_state.get("target_path", "") or "")
+            target_touched = bool(target_state.get("target_touched", False))
+            validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+            repeated_skill_note = ""
+            validation_pressure_note = ""
+            if role_key == "reviewer" and self._reviewer_validation_pressure_active(role_key, self._ensure_blackboard()):
+                validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+                validation_pressure_note = (
+                    (
+                        f"Validation phase is active. Run `{validation_cmd}` next and base the verdict on that output. "
+                        if validation_cmd
+                        else "Validation phase is active. Run the nearest validator or test command next and base the verdict on that output. "
+                    )
+                    + "Shell reads such as `cat`, `head`, or `grep` do not count as validation evidence. "
+                )
+            if any(str((row or {}).get("name", "") or "").strip() in SKILL_DISCOVERY_TOOL_NAMES for row in tool_results):
+                repeated_skill_note = self._skill_discovery_guard_note(role=role_key)
+                if repeated_skill_note:
+                    repeated_skill_note += " "
+            developer_target_note = ""
+            if role_key == "developer" and target_path and (not validation_targeted_repair) and (not target_touched):
+                developer_target_note = (
+                    f"Current step is narrowed to `{target_path}`. "
+                    "Do not read other files, do not call bash, and do not ask colleagues. "
+                    "Use exactly one `edit_file` or `write_file` action on that path next. "
+                )
+            reminder = (
+                "[mandatory-reminder] Support/meta tools alone did not create grounded progress. "
+                + repeated_skill_note
+                + validation_pressure_note
+                + developer_target_note
+                + (
+                    "In your next reply, use a workspace action such as read_file/read_from_blackboard/"
+                    "write_file/edit_file/bash/ask_colleague and produce verifiable evidence. "
+                    if not developer_target_note
+                    else ""
+                )
+                + (
+                    "Primary missing deliverables: "
+                    + ", ".join(missing_expected[:4])
+                    + ". Prefer write_file/edit_file on those exact paths now. "
+                    "Do not spend the next round on load_skill/list_skills/ask_colleague/read_file-only unless the target file already exists and you are preparing an edit."
+                    if missing_expected
+                    else ""
+                )
+            )
+            self._append_agent_context_message(
+                role_key,
+                {
+                    "role": "system",
+                    "content": self._apply_agent_language_policy(reminder, max_len=1200),
+                    "ts": now_ts(),
+                    "agent_role": role_key,
+                },
+                mirror_to_global=False,
+            )
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{self._agent_display_name(role_key)} used support/meta tools only; "
+                        "treating round as no-progress"
+                    )
+                },
+            )
+            return {
+                "status": "no-tools",
+                "role": role_key,
+                "text": "",
+                "thinking": thinking_text,
+                "tool_results": tool_results,
+            }
         return {
             "status": "tools",
             "role": role_key,
@@ -18694,7 +24985,7 @@ class SessionState:
                 media_inputs_pool=media_inputs_pool,
                 media_seen_ts_by_role=media_seen_ts_by_role,
             )
-            route = self._manager_delegate_turn(
+            route = self._uniform_kernel_delegate_turn(
                 pinned_selection=pinned_selection,
                 media_inputs_round=manager_media_inputs,
             )
@@ -18747,6 +25038,7 @@ class SessionState:
                 state_changed=bool(board_after_fp != board_before_fp),
                 pinned_selection=pinned_selection,
             )
+            self._auto_agentbus_handoff(role, step if isinstance(step, dict) else {}, board=self._ensure_blackboard())
             status = str(step.get("status", "") or "")
             if bool(wd_event.get("triggered", False)):
                 idle_counts[role] = 0
@@ -18795,18 +25087,6 @@ class SessionState:
             elif status == "no-tools":
                 idle_counts[role] = int(idle_counts.get(role, 0) or 0) + 1
                 clean_text = strip_thinking_content(str(step.get("text", "") or "")).strip()
-                active_profile = self._ensure_blackboard_task_profile()
-                task_type = str(active_profile.get("task_type", "") or "")
-                if role == "developer" and task_type == "simple_qa" and clean_text:
-                    endpoint = self._detect_endpoint_intent(clean_text, None)
-                    if bool(endpoint.get("matched", False)) or (
-                        len(clean_text) >= 40 and (not self._looks_like_incomplete_reply(clean_text))
-                    ):
-                        note = "developer provided direct answer for simple task"
-                        self._blackboard_mark_approved(note, role)
-                        self._mark_all_done_silently(note)
-                        self._emit("status", {"summary": "simple task answered; run paused"})
-                        break
                 if role == "reviewer" and self._reviewer_deems_done(clean_text):
                     done_note = clean_text or "review approved"
                     self._blackboard_mark_approved(done_note, role)
@@ -18933,6 +25213,7 @@ class SessionState:
                 state_changed=bool(board_after_fp != board_before_fp),
                 pinned_selection=pinned_selection,
             )
+            self._auto_agentbus_handoff(role, safe_step, board=self._ensure_blackboard())
             if bool(wd_event.get("triggered", False)):
                 idle_counts[role] = 0
                 continue
@@ -19632,6 +25913,7 @@ class SessionState:
                 with self.lock:
                     self.current_phase = "tool-dispatch"
                     self.current_tool_name = ""
+                prior_no_tool_rounds = no_tool_rounds
                 no_tool_rounds = 0
                 arbiter_planning_rounds = 0
                 used_todo = False
@@ -19799,6 +26081,26 @@ class SessionState:
                                             f"missing args persisted: {', '.join(missing)}",
                                         )
                                         retry_requested_this_round = True
+                    if not skip_dispatch and int(prior_no_tool_rounds or 0) >= 1:
+                        explicit_load_skill_request = False
+                        if name in SKILL_DISCOVERY_TOOL_NAMES:
+                            goal_low = str(self._ensure_blackboard().get("original_goal", "") or "").strip().lower()
+                            explicit_load_skill_request = ("load_skill" in goal_low) or ("call load skill" in goal_low)
+                        if (not explicit_load_skill_request) and (not self._tool_call_is_substantive(name, args)):
+                            output = (
+                                "Error: repeated no-progress recovery is active. "
+                                "Use one concrete workspace change, validation command, or collaborator action "
+                                "instead of another inspection-only tool."
+                            )
+                            skip_dispatch = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "inspection-only tool suppressed during repeated no-progress recovery"
+                                    )
+                                },
+                            )
                     if not skip_dispatch:
                         try:
                             output = self._dispatch_tool(name, args)
@@ -19876,18 +26178,60 @@ class SessionState:
                     self.current_phase = "post-tools"
                 if interrupted_in_tools:
                     break
+                has_substantive_progress = self._tool_results_have_substantive_progress(single_round_tool_results)
                 single_watchdog_after_board = self._ensure_blackboard()
                 single_watchdog_after_fp = self._watchdog_state_fingerprint(single_watchdog_after_board)
                 self._watchdog_process_worker_step(
                     single_watchdog_after_board,
                     role=single_role,
                     step={
-                        "status": "tools",
+                        "status": "tools" if has_substantive_progress else "no-tools",
+                        "text": "" if has_substantive_progress else "support/meta tool-only round",
                         "tool_results": single_round_tool_results,
                     },
                     state_changed=bool(single_watchdog_after_fp != single_watchdog_before_fp),
                     pinned_selection=pinned_selection,
                 )
+                if single_round_tool_results and (not has_substantive_progress):
+                    support_actions = [
+                        "read the exact contract or blackboard evidence first",
+                        "then execute one concrete workspace action",
+                    ]
+                    missing_expected = self._goal_missing_expected_artifacts()
+                    if missing_expected:
+                        support_actions = [
+                            "use write_file/edit_file on the exact missing_artifacts path now: "
+                            + ", ".join(missing_expected[:4]),
+                            "if one grounding read is still needed, do at most one read_file first",
+                        ]
+                    no_tool_rounds = max(1, int(prior_no_tool_rounds) + 1)
+                    diagnosis = {
+                        "streak": int(no_tool_rounds),
+                        "causes": ["support/meta tools were used without grounded progress"],
+                        "actions": support_actions,
+                        "work_pending": True,
+                    }
+                    self._inject_no_tool_recovery_hint(diagnosis)
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                    if auto_continue_budget > 0:
+                        auto_continue_budget -= 1
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "support/meta tool-only round detected; forcing concrete follow-up "
+                                    f"(streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                )
+                            },
+                        )
+                        continue
+                    self._emit(
+                        "status",
+                        {
+                            "summary": "stop: support/meta tool-only rounds exhausted auto-continue budget"
+                        },
+                    )
+                    break
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
@@ -20134,12 +26478,443 @@ class SessionState:
                 except Exception:
                     pass
 
+    def _format_export_ts(self, value: object) -> str:
+        try:
+            ts = float(value or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            return "-"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except Exception:
+            return "-"
+
+    def _session_export_rows(self) -> dict:
+        with self.lock:
+            messages = list(self.messages)
+            operations = list(self.operations)
+            uploads = list(self.uploads)
+            blackboard = self._normalize_blackboard(self.blackboard)
+        rows: list[dict] = []
+        seq = 0
+        for msg in messages:
+            role = str((msg or {}).get("role", "") or "").strip().lower()
+            if role == "tool":
+                continue
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if isinstance(content, list):
+                content = json_dumps(content)
+            text = str(content or "")
+            tool_calls = msg.get("tool_calls", []) if isinstance(msg, dict) else []
+            tool_names: list[str] = []
+            if isinstance(tool_calls, list):
+                for item in tool_calls:
+                    if not isinstance(item, dict):
+                        continue
+                    fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+                    name = str(fn.get("name", "") or "").strip()
+                    if name:
+                        tool_names.append(name)
+            if not text.strip() and tool_names:
+                text = f"[tool calls] {', '.join(tool_names)}"
+            thinking = str(msg.get("thinking", "") if isinstance(msg, dict) else "").strip()
+            if thinking:
+                text = f"{text}\n\n[thinking]\n{thinking}".strip()
+            if not text.strip():
+                continue
+            agent_role = self._sanitize_agent_bubble_role(msg.get("agent_role", "") if isinstance(msg, dict) else "")
+            label = AGENT_ROLE_LABELS.get(agent_role, "")
+            if not label:
+                label = {
+                    "user": "User",
+                    "assistant": "Assistant",
+                    "system": "System",
+                }.get(role, role.title() if role else "Message")
+            rows.append(
+                {
+                    "seq": seq,
+                    "ts": float((msg or {}).get("ts", 0.0) or 0.0),
+                    "role": role or "message",
+                    "kind": trim(str((msg or {}).get("type", "message") or "message"), 40),
+                    "label": label,
+                    "text": trim(text, 120_000),
+                }
+            )
+            seq += 1
+        for op in operations:
+            typ = str((op or {}).get("type", "") or "").strip().lower()
+            data = op.get("data", {}) if isinstance(op, dict) and isinstance(op.get("data"), dict) else {}
+            if typ == "command":
+                text = (
+                    f"[command] {data.get('name','')}\n"
+                    f"$ {data.get('command','')}\n"
+                    f"cwd: {data.get('cwd','')}\n"
+                    f"exit: {data.get('exit_code','-')}  duration: {data.get('duration_ms','-')}ms\n"
+                    f"changed: {', '.join(data.get('changed_files', []) or [])}\n"
+                    f"{trim(str(data.get('output', '') or ''), 80_000)}"
+                )
+                label = "Command"
+            elif typ == "file_patch":
+                text = (
+                    f"[file_patch] {data.get('path','')}\n"
+                    f"location: {data.get('session_rel_path', data.get('path',''))}\n"
+                    f"session_root: {data.get('session_root','')}\n"
+                    f"+{data.get('added',0)} / -{data.get('deleted',0)}\n"
+                    f"{trim(str(data.get('diff_numbered') or data.get('diff') or ''), 80_000)}"
+                )
+                label = "File Patch"
+            elif typ == "upload":
+                text = (
+                    f"[upload] {data.get('filename','')}\n"
+                    f"path: {data.get('workspace_path','')}\n"
+                    f"parsed_text: {data.get('parsed_text_path','')}\n"
+                    f"parsed_markdown: {data.get('parsed_markdown_path','')}\n"
+                    f"parsed_metadata: {data.get('parsed_metadata_path','')}\n"
+                    f"parser: {data.get('parser','')}\n"
+                    f"kind: {data.get('kind','')} size: {data.get('size',0)}\n"
+                    f"{trim(str(data.get('preview', '') or ''), 24_000)}"
+                )
+                label = "Upload"
+            else:
+                continue
+            rows.append(
+                {
+                    "seq": seq,
+                    "ts": float((op or {}).get("ts", 0.0) or 0.0),
+                    "role": "system",
+                    "kind": typ,
+                    "label": label,
+                    "text": text,
+                }
+            )
+            seq += 1
+        rows.sort(key=lambda item: (float(item.get("ts", 0.0) or 0.0), int(item.get("seq", 0) or 0)))
+        return {
+            "rows": rows,
+            "uploads": uploads,
+            "blackboard": blackboard,
+        }
+
+    def _render_session_markdown_export(self) -> str:
+        payload = self._session_export_rows()
+        rows = payload.get("rows", []) if isinstance(payload.get("rows"), list) else []
+        uploads = payload.get("uploads", []) if isinstance(payload.get("uploads"), list) else []
+        blackboard = payload.get("blackboard", {}) if isinstance(payload.get("blackboard"), dict) else {}
+        lines = [
+            f"# Session Export: {self.title or self.id}",
+            "",
+            f"- session_id: {self.id}",
+            f"- title: {self.title or self.id}",
+            f"- model: {self.ollama.model}",
+            f"- provider: {self.ollama.provider}",
+            f"- exported_at: {self._format_export_ts(now_ts())}",
+            f"- session_updated_at: {self._format_export_ts(self.updated_at)}",
+            f"- conversation_rows: {len(rows)}",
+            "",
+            "## Uploaded Files",
+        ]
+        if uploads:
+            for item in uploads:
+                if not isinstance(item, dict):
+                    continue
+                lines.append("")
+                lines.append(f"### {item.get('filename','upload')}")
+                lines.append(f"- source: {item.get('workspace_path','')}")
+                if str(item.get("parsed_text_path", "") or "").strip():
+                    lines.append(f"- parsed_text: {item.get('parsed_text_path','')}")
+                if str(item.get("parsed_markdown_path", "") or "").strip():
+                    lines.append(f"- parsed_markdown: {item.get('parsed_markdown_path','')}")
+                if str(item.get("parsed_metadata_path", "") or "").strip():
+                    lines.append(f"- parsed_metadata: {item.get('parsed_metadata_path','')}")
+                if str(item.get("parser", "") or "").strip():
+                    lines.append(f"- parser: {item.get('parser','')}")
+                lines.append(f"- kind: {item.get('kind','')} size: {item.get('size',0)}")
+                preview = trim(str(item.get("parsed_excerpt", "") or ""), 3_500)
+                if preview:
+                    lines.append("")
+                    lines.append("```text")
+                    lines.append(preview)
+                    lines.append("```")
+        else:
+            lines.append("")
+            lines.append("(none)")
+        linked_files = blackboard.get("linked_files", {}) if isinstance(blackboard.get("linked_files"), dict) else {}
+        lines.append("")
+        lines.append("## Blackboard Linked Files")
+        if linked_files:
+            rows_sorted = sorted(
+                list(linked_files.items()),
+                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
+                reverse=True,
+            )
+            for path, item in rows_sorted:
+                details = item if isinstance(item, dict) else {}
+                label = trim(str(details.get("label", "") or "").strip(), 120)
+                source = trim(str(details.get("source", "") or "").strip(), 180)
+                summary = trim(str(details.get("summary", "") or "").strip(), 220)
+                parts = [x for x in [path, label, str(details.get("kind", "") or "").strip(), source, summary] if x]
+                lines.append("- " + " | ".join(parts))
+        else:
+            lines.append("(none)")
+        lines.append("")
+        lines.append("## Conversation")
+        if not rows:
+            lines.append("")
+            lines.append("(empty)")
+        for idx, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("label", "Message") or "Message")
+            timestamp = self._format_export_ts(row.get("ts", 0.0))
+            lines.append("")
+            lines.append(f"### {idx}. {label} | {timestamp}")
+            lines.append(f"- role: {row.get('role','message')}")
+            lines.append(f"- type: {row.get('kind','message')}")
+            lines.append("")
+            text = str(row.get("text", "") or "").rstrip()
+            if not text:
+                lines.append("(empty)")
+            else:
+                lines.append("```text")
+                lines.append(text)
+                lines.append("```")
+        return "\n".join(lines).strip() + "\n"
+
+    def _render_session_svg_export(self, markdown_text: str) -> str:
+        raw = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n")
+        width = 1400
+        margin = 56
+        header_height = 86
+        in_code = False
+        rows: list[dict] = []
+        for raw_line in raw.splitlines():
+            if raw_line.startswith("```"):
+                in_code = not in_code
+                continue
+            display = raw_line
+            font_family = "Menlo, Monaco, ui-monospace, monospace"
+            font_size = SESSION_EXPORT_BODY_FONT_SIZE
+            font_weight = "400"
+            fill = "#0f172a"
+            wrap_width = SESSION_EXPORT_WRAP_COLUMNS
+            if raw_line.startswith("# "):
+                display = raw_line[2:].strip()
+                font_family = "-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+                font_size = SESSION_EXPORT_HEADING_FONT_SIZE
+                font_weight = "700"
+                fill = "#f8fafc"
+                wrap_width = 52
+            elif raw_line.startswith("## "):
+                display = raw_line[3:].strip()
+                font_family = "-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+                font_size = SESSION_EXPORT_SECTION_FONT_SIZE
+                font_weight = "700"
+                fill = "#0f172a"
+                wrap_width = 76
+            elif raw_line.startswith("### "):
+                display = raw_line[4:].strip()
+                font_family = "-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+                font_size = SESSION_EXPORT_SUBSECTION_FONT_SIZE
+                font_weight = "650"
+                fill = "#1d4ed8"
+                wrap_width = 84
+            elif in_code:
+                fill = "#065f46"
+            elif raw_line.startswith("- "):
+                fill = "#334155"
+            if not display:
+                rows.append(
+                    {
+                        "text": "",
+                        "font_size": font_size,
+                        "font_weight": font_weight,
+                        "fill": fill,
+                        "font_family": font_family,
+                        "line_height": max(12, int(font_size * 0.9)),
+                    }
+                )
+                continue
+            wrapped = textwrap.wrap(
+                display,
+                width=max(24, int(wrap_width)),
+                replace_whitespace=False,
+                drop_whitespace=False,
+                break_long_words=True,
+                break_on_hyphens=False,
+            ) or [display]
+            line_height = max(SESSION_EXPORT_LINE_HEIGHT, int(font_size * 1.45))
+            for seg in wrapped:
+                rows.append(
+                    {
+                        "text": seg,
+                        "font_size": font_size,
+                        "font_weight": font_weight,
+                        "fill": fill,
+                        "font_family": font_family,
+                        "line_height": line_height,
+                    }
+                )
+        content_height = sum(
+            int(row.get("line_height", SESSION_EXPORT_LINE_HEIGHT) or SESSION_EXPORT_LINE_HEIGHT)
+            for row in rows
+        )
+        height = max(720, header_height + content_height + margin)
+        title = html.escape(self.title or self.id)
+        generated = html.escape(f"session={self.id} | exported_at={self._format_export_ts(now_ts())}")
+        svg_lines = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            f'<rect width="{width}" height="{height}" fill="#f8fafc"/>',
+            f'<rect x="0" y="0" width="{width}" height="{header_height}" fill="#0f172a"/>',
+            f'<text x="{margin}" y="38" font-family="-apple-system, BlinkMacSystemFont, \'Helvetica Neue\', Arial, sans-serif" font-size="30" font-weight="700" fill="#f8fafc">{title}</text>',
+            f'<text x="{margin}" y="63" font-family="Menlo, Monaco, ui-monospace, monospace" font-size="13" fill="#cbd5e1">{generated}</text>',
+        ]
+        y = header_height + 28
+        for row in rows:
+            text = str(row.get("text", "") or "")
+            if not text:
+                y += int(row.get("line_height", SESSION_EXPORT_LINE_HEIGHT) or SESSION_EXPORT_LINE_HEIGHT)
+                continue
+            safe = html.escape(text)
+            svg_lines.append(
+                f'<text x="{margin}" y="{y}" xml:space="preserve" '
+                f'font-family="{row.get("font_family", "Menlo, Monaco, ui-monospace, monospace")}" '
+                f'font-size="{int(row.get("font_size", SESSION_EXPORT_BODY_FONT_SIZE) or SESSION_EXPORT_BODY_FONT_SIZE)}" '
+                f'font-weight="{row.get("font_weight", "400")}" '
+                f'fill="{row.get("fill", "#0f172a")}">{safe}</text>'
+            )
+            y += int(row.get("line_height", SESSION_EXPORT_LINE_HEIGHT) or SESSION_EXPORT_LINE_HEIGHT)
+        svg_lines.append("</svg>")
+        return "\n".join(svg_lines)
+
+    def _export_cache_dir(self) -> Path:
+        target = self.files_root / "session_exports" / "current"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _convert_svg_with_sips(self, svg_path: Path, target_format: str) -> bytes:
+        tool = shutil.which("sips")
+        if (not tool) or (not svg_path.exists()):
+            return b""
+        fmt = str(target_format or "").strip().lower()
+        if fmt not in {"png", "pdf"}:
+            return b""
+        out_path = svg_path.with_suffix(f".{fmt}")
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                [tool, "-s", "format", fmt, str(svg_path), "--out", str(out_path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                return out_path.read_bytes()
+        except Exception:
+            return b""
+        return b""
+
+    def _convert_text_file_to_pdf(self, source_path: Path) -> bytes:
+        tool = shutil.which("cupsfilter")
+        if (not tool) or (not source_path.exists()):
+            return b""
+        try:
+            result = subprocess.run(
+                [tool, "-m", "application/pdf", str(source_path)],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and result.stdout:
+                return bytes(result.stdout)
+        except Exception:
+            return b""
+        return b""
+
+    def ensure_session_export_files(self) -> dict:
+        export_dir = self._export_cache_dir()
+        md_path = export_dir / "conversation.md"
+        svg_path = export_dir / "conversation.svg"
+        png_path = export_dir / "conversation.png"
+        pdf_path = export_dir / "conversation.pdf"
+        txt_path = export_dir / "conversation.txt"
+        manifest_path = export_dir / "manifest.json"
+        markdown_text = self._render_session_markdown_export()
+        _write_text_if_changed(md_path, markdown_text)
+        _write_text_if_changed(txt_path, markdown_text)
+        svg_text = self._render_session_svg_export(markdown_text)
+        _write_text_if_changed(svg_path, svg_text)
+        png_bytes = self._convert_svg_with_sips(svg_path, "png")
+        if png_bytes:
+            _write_bytes_if_changed(png_path, png_bytes)
+        else:
+            try:
+                if png_path.exists():
+                    png_path.unlink()
+            except Exception:
+                pass
+        pdf_bytes = self._convert_svg_with_sips(svg_path, "pdf")
+        if not pdf_bytes:
+            pdf_bytes = self._convert_text_file_to_pdf(txt_path)
+        if pdf_bytes:
+            _write_bytes_if_changed(pdf_path, pdf_bytes)
+        else:
+            try:
+                if pdf_path.exists():
+                    pdf_path.unlink()
+            except Exception:
+                pass
+        manifest = {
+            "session_id": self.id,
+            "title": self.title,
+            "generated_at": float(now_ts()),
+            "markdown_path": self._session_rel(md_path),
+            "svg_path": self._session_rel(svg_path),
+            "image_path": self._session_rel(png_path) if png_path.exists() else self._session_rel(svg_path),
+            "pdf_path": self._session_rel(pdf_path) if pdf_path.exists() else "",
+            "text_path": self._session_rel(txt_path),
+        }
+        _write_text_if_changed(manifest_path, json_dumps(manifest, indent=2))
+        return manifest
+
+    def export_artifact(self, fmt: str) -> tuple[bytes, str, str]:
+        normalized = str(fmt or "all").strip().lower() or "all"
+        if normalized in {"all", "zip"}:
+            return self.export_bundle(), "application/zip", f"{self.id}_session_export.zip"
+        manifest = self.ensure_session_export_files()
+        rel = ""
+        if normalized in {"md", "markdown"}:
+            rel = str(manifest.get("markdown_path", "") or "")
+        elif normalized == "svg":
+            rel = str(manifest.get("svg_path", "") or "")
+        elif normalized in {"image", "img", "png"}:
+            rel = str(manifest.get("image_path", "") or "")
+        elif normalized == "pdf":
+            rel = str(manifest.get("pdf_path", "") or "")
+        if not rel:
+            raise FileNotFoundError(f"export format unavailable: {normalized}")
+        fp = safe_path(rel, self.files_root)
+        data = fp.read_bytes()
+        content_type = guess_mime_from_name(fp.name, "application/octet-stream")
+        return data, content_type, f"{self.id}_{fp.name}"
+
     def snapshot(self, include_model_catalog: bool = False, lite: bool = False) -> dict:
         with self.lock:
-            msg_window = 120 if lite else 200
-            op_feed_window = 80 if lite else 240
+            if lite:
+                # Keep lite snapshots compact by trimming heavy payload bodies, but do not drop
+                # already-recorded chat bubbles from the feed. The chat renderer relies on this
+                # sequence to preserve message continuity while scrolling.
+                msg_window = max(200, len(self.messages))
+                op_feed_window = max(120, len(self.operations))
+                conversation_window = max(400, msg_window + op_feed_window + 8)
+            else:
+                msg_window = 400
+                op_feed_window = 500
+                conversation_window = 960
             upload_window = 16 if lite else 40
-            conversation_window = 160 if lite else 400
             activity_window = 40 if lite else 100
             ops_window = 60 if lite else 200
             visible_messages = []
@@ -20304,6 +27079,10 @@ class SessionState:
                     text = (
                         f"[upload] {d.get('filename','')}\n"
                         f"path: {d.get('workspace_path','')}\n"
+                        f"parsed_text: {d.get('parsed_text_path','')}\n"
+                        f"parsed_markdown: {d.get('parsed_markdown_path','')}\n"
+                        f"parsed_metadata: {d.get('parsed_metadata_path','')}\n"
+                        f"parser: {d.get('parser','')}\n"
                         f"kind: {d.get('kind','')} size: {d.get('size',0)}\n"
                         f"{preview}"
                     )
@@ -20321,6 +27100,10 @@ class SessionState:
                         "kind": item.get("kind"),
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
+                        "parsed_text_path": item.get("parsed_text_path"),
+                        "parsed_markdown_path": item.get("parsed_markdown_path"),
+                        "parsed_metadata_path": item.get("parsed_metadata_path"),
+                        "parser": item.get("parser"),
                         "preview": trim(item.get("parsed_excerpt", ""), 1200),
                     }
                 )
@@ -20343,7 +27126,7 @@ class SessionState:
                 operations_view.append(row)
             ctx = self._context_budget_metrics()
             model_catalog = self.model_catalog() if include_model_catalog else None
-            blackboard = self._normalize_blackboard(self.blackboard)
+            blackboard = self._refresh_memory_capsule(self._normalize_blackboard(self.blackboard))
             blackboard_view = (
                 {
                     "status": blackboard.get("status", "INITIALIZING"),
@@ -20355,9 +27138,36 @@ class SessionState:
                     "task_profile": blackboard.get("task_profile", {}),
                     "manager_judgement": blackboard.get("manager_judgement", {}),
                     "research_notes_count": len(blackboard.get("research_notes", []) or []),
+                    "linked_files_count": len(blackboard.get("linked_files", {}) or {}),
                     "code_artifacts_count": len(blackboard.get("code_artifacts", {}) or {}),
                     "execution_logs_count": len(blackboard.get("execution_logs", []) or []),
                     "review_feedback_count": len(blackboard.get("review_feedback", []) or []),
+                    "memory_capsule": {
+                        "compression_level": normalize_session_compression_level(
+                            ((blackboard.get("memory_capsule", {}) if isinstance(blackboard.get("memory_capsule"), dict) else {})).get(
+                                "compression_level",
+                                self.session_compression_level,
+                            ),
+                            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                        ),
+                        "current_focus": trim(
+                            str(
+                                (
+                                    (
+                                        (blackboard.get("memory_capsule", {}) if isinstance(blackboard.get("memory_capsule"), dict) else {})
+                                        .get("plan_anchor", {})
+                                        if isinstance(
+                                            (blackboard.get("memory_capsule", {}) if isinstance(blackboard.get("memory_capsule"), dict) else {}).get("plan_anchor", {}),
+                                            dict,
+                                        )
+                                        else {}
+                                    ).get("current_focus", "")
+                                )
+                                or ""
+                            ).strip(),
+                            220,
+                        ),
+                    },
                 }
                 if lite
                 else blackboard
@@ -20400,6 +27210,16 @@ class SessionState:
                 "agent_phase": str(self.current_phase or "idle"),
                 "agent_active_tool": str(self.current_tool_name or ""),
                 "blackboard": blackboard_view,
+                "uniform_kernel": self._normalize_uniform_kernel_state(self.uniform_kernel_state),
+                "microtask_mode": normalize_on_off_mode(self.microtask_mode, default="off"),
+                "small_model_microtask_mode": normalize_on_off_mode(
+                    self.small_model_microtask_mode,
+                    default="off",
+                ),
+                "session_compression_level": normalize_session_compression_level(
+                    self.session_compression_level,
+                    default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                ),
                 "queued_user_inputs_count": len(self.pending_user_inputs),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
                 "context_token_limit_config": int(self.max_context_token_limit),
@@ -20435,6 +27255,10 @@ class SessionState:
             }
 
     def export_bundle(self) -> bytes:
+        try:
+            self.ensure_session_export_files()
+        except Exception:
+            pass
         bio = io.BytesIO()
         with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("snapshot_decrypted.json", json_dumps(self.snapshot(), indent=2))
@@ -20471,6 +27295,9 @@ class SessionManager:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        microtask_mode: str = "off",
+        small_model_microtask_mode: str = "off",
+        session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
         run_finished_callback=None,
     ):
         self.root = root
@@ -20506,6 +27333,18 @@ class SessionManager:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
+        self.small_model_microtask_mode = normalize_on_off_mode(
+            small_model_microtask_mode,
+            default="off",
+        )
+        self.session_compression_level = normalize_session_compression_level(
+            session_compression_level,
+            default=session_compression_level_from_config(
+                self.default_llm_config,
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            ),
+        )
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -20623,6 +27462,10 @@ class SessionManager:
             "ollama_base": self.ollama_base,
             "thinking": self.thinking,
             "ui_language": self.user_language,
+            "session_compression_level": normalize_session_compression_level(
+                self.session_compression_level,
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            ),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -20671,6 +27514,16 @@ class SessionManager:
         if self.user_prefs_path.exists():
             raw = self.crypto.read_json(self.user_prefs_path, {})
             self.user_language = normalize_ui_language(raw.get("ui_language", self.user_language))
+            self.session_compression_level = normalize_session_compression_level(
+                raw.get(
+                    "session_compression_level",
+                    session_compression_level_from_config(
+                        self.default_llm_config,
+                        default=self.session_compression_level,
+                    ),
+                ),
+                default=self.session_compression_level,
+            )
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -20772,6 +27625,10 @@ class SessionManager:
             min(1.0, float(self.arbiter_temperature if self.arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)),
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
+        sess.session_compression_level = normalize_session_compression_level(
+            self.session_compression_level,
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
         sess._persist()
@@ -20797,6 +27654,10 @@ class SessionManager:
         self._sync_ollama_defaults(active_profile)
         self.thinking = False
         self.user_language = normalize_ui_language(getattr(sess, "ui_language", self.user_language))
+        self.session_compression_level = normalize_session_compression_level(
+            getattr(sess, "session_compression_level", self.session_compression_level),
+            default=self.session_compression_level,
+        )
         self._persist_user_prefs()
         if not apply_to_all:
             return
@@ -20842,6 +27703,9 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                microtask_mode=self.microtask_mode,
+                small_model_microtask_mode=self.small_model_microtask_mode,
+                session_compression_level=self.session_compression_level,
                 run_finished_callback=self.run_finished_callback,
             )
             desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
@@ -20882,6 +27746,9 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                microtask_mode=self.microtask_mode,
+                small_model_microtask_mode=self.small_model_microtask_mode,
+                session_compression_level=self.session_compression_level,
                 run_finished_callback=self.run_finished_callback,
             )
             self._apply_user_defaults_to_session(sess)
@@ -21188,6 +28055,13 @@ class SessionManager:
                     item["source"] = source
                 normalized[item["id"]] = item
             self.default_llm_config = cfg
+            self.session_compression_level = normalize_session_compression_level(
+                session_compression_level_from_config(
+                    cfg,
+                    default=self.session_compression_level,
+                ),
+                default=self.session_compression_level,
+            )
             self.user_model_profiles = normalized or self.user_model_profiles
             if active in self.user_model_profiles:
                 self.user_active_profile_id = active
@@ -21381,7 +28255,7 @@ window.MathJax={
 """
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
-:root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
+:root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b;--chat-bubble-gutter:clamp(64px,9vw,160px);--chat-bubble-max:calc(100% - var(--chat-bubble-gutter))}
 *{box-sizing:border-box}
 body{margin:0;font-family:'Space Grotesk','Noto Sans SC',sans-serif;background:var(--bg);color:var(--fg)}
 .bg-layer{position:fixed;inset:0;background:radial-gradient(1200px 520px at 0% 0%,#dbe9ff 0,#f3f5f8 55%),radial-gradient(1000px 520px at 100% 100%,#d9fff2 0,#f3f5f8 55%);z-index:-1}
@@ -21459,10 +28333,10 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-preview-row{margin-top:6px}
 .msg-preview-btn{border:1px solid #c8d8ee;background:#f5f9ff;color:#204a7a;padding:4px 8px;border-radius:999px;font-size:.75rem;cursor:pointer}
 .msg-preview-btn:hover{background:#eaf2ff}
-.msg{padding:10px 12px;border-radius:12px;max-width:88%;white-space:normal}
-.msg.user{align-self:flex-end;background:#e6f0ff}
-.msg.assistant{align-self:flex-start;background:#eefdf6}
-.msg.system{align-self:stretch;max-width:100%;background:#f6f8fa;color:#334155;border:1px solid #e5e7eb}
+.msg{padding:10px 12px;border-radius:12px;max-width:var(--chat-bubble-max);white-space:normal}
+.msg.user{align-self:flex-end;margin-left:var(--chat-bubble-gutter);background:#e6f0ff}
+.msg.assistant{align-self:flex-start;margin-right:var(--chat-bubble-gutter);background:#eefdf6}
+.msg.system{align-self:flex-start;margin-right:var(--chat-bubble-gutter);background:#f6f8fa;color:#334155;border:1px solid #e5e7eb}
 .msg.assistant.agent-explorer,.msg.system.agent-explorer{background:#ffe9f3;border:1px solid #ffbfd8}
 .msg.assistant.agent-developer,.msg.system.agent-developer{background:#e9fbea;border:1px solid #bde6c4}
 .msg.assistant.agent-reviewer,.msg.system.agent-reviewer{background:#fff6de;border:1px solid #f1d89a}
@@ -21519,8 +28393,8 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-thinking pre{margin:0;max-height:140px;overflow:auto;font-size:.72rem;line-height:1.35;color:#4b5563;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
 .msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
 .msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
-.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
-.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-code-shell{margin:0;max-height:min(42vh,360px);overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable both-edges;overflow-anchor:none}
+.msg-diff-shell{max-height:min(42vh,360px);overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable both-edges;overflow-anchor:none}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
 .composer textarea{width:100%;min-height:100px;border:1px solid var(--line);border-radius:12px;padding:10px;resize:vertical}
 .upload-drop{margin-top:8px;border:1px dashed #8aa8d1;border-radius:10px;background:#f7fbff;padding:8px 10px;font-size:.84rem;color:#375076;cursor:pointer}
@@ -21604,6 +28478,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
   100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}
 }
 @media (max-width:1180px){
+  :root{--chat-bubble-gutter:clamp(20px,7vw,56px)}
   .status-cards{grid-template-columns:repeat(2,minmax(0,1fr))}
   main{grid-template-columns:1fr;height:auto;max-height:none;min-height:0}
   .panel{min-height:280px}
@@ -21651,8 +28526,8 @@ const RENDER={queue:[],raf:0,canvas:null,ctx:null,lastSeq:0,lastPaintAt:0,lastMe
 const CODE_PREVIEW_VIRT_THRESHOLD=1800;
 const CODE_PREVIEW_VIRT_EST_ROW_PX=24;
 const CODE_PREVIEW_VIRT_OVERSCAN=160;
-const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties']);
-const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt']);
+const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.scss','.sass','.less','.styl','.astro','.qml','.f','.for','.f77','.f90','.f95','.f03','.f08','.asm','.s','.pas','.pp','.lpr','.dpr','.nim','.nimble','.zig','.jl','.proto','.graphql','.gql','.rego','.hcl','.tf','.tfvars','.bzl','.bazel','.ml','.mli','.fs','.fsi','.fsx','.vb','.vbs','.tcl','.awk','.sed','.groovy','.gvy','.gy','.gsh','.clj','.cljs','.cljc','.edn','.erl','.hrl','.ex','.exs','.eex','.heex','.leex','.sol','.vy','.v','.sv','.svh','.vhd','.vhdl','.adb','.ads','.ada','.elm','.purs','.hs','.lhs','.cu','.cuh','.feature','.robot','.http','.rest','.psm1','.psd1','.vue','.svelte','.gradle','.properties']);
+const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','containerfile','makefile','gnumakefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','procfile','brewfile','vagrantfile','jenkinsfile','tiltfile','meson.build','meson_options.txt','build.bazel','workspace.bazel','buck','buckconfig','requirements.txt']);
 const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini'};
 const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini'};
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
@@ -21847,7 +28722,7 @@ function _deltaConversationTextByType(type,data){
     return `[file_patch] ${String(d.path||'')}\nlocation: ${String(d.session_rel_path||d.path||'')}\nsession_root: ${String(d.session_root||'')}\n+${String(d.added??0)} / -${String(d.deleted??0)}\n${String(d.diff_numbered||d.diff||'')}`;
   }
   if(type==='upload'){
-    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}\n${String(d.preview||'')}`;
+    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nparsed_text: ${String(d.parsed_text_path||'')}\nparsed_markdown: ${String(d.parsed_markdown_path||'')}\nparsed_metadata: ${String(d.parsed_metadata_path||'')}\nparser: ${String(d.parser||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}\n${String(d.preview||'')}`;
   }
   return String(d.text||'');
 }
@@ -21873,21 +28748,20 @@ function _deltaScheduleRender(flags={}){
       return;
     }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
     if(needChat){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('delta'));}
-        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');renderChat('delta');}
+        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');
+        renderChat('delta');
       }
     }
     if(needBoards){
       const boardSig=boardsSignature(S.snap||{});
       if(boardSig!==S.lastBoardsSig){
         S.lastBoardsSig=boardSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);}
-        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
+        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');
+        renderBoards();
       }
     }
   });
@@ -21994,7 +28868,7 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaAppendConversationRow(row);
     _deltaAppendActivity(typ,data,ts);
     if(typ==='upload'){
-      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||'')};
+      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||''),parsed_text_path:String(data.parsed_text_path||''),parsed_markdown_path:String(data.parsed_markdown_path||''),parsed_metadata_path:String(data.parsed_metadata_path||''),parser:String(data.parser||'')};
       _deltaPushLimited(S.snap.uploads,uploadRow,DELTA_MAX_UPLOADS);
     }
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
@@ -22118,7 +28992,9 @@ function _centerDiffShellToHotspot(root){
   if(msgKey&&S.diffCenteredDone[msgKey])return;
   const lines=Array.from(shell.children||[]);
   if(!lines.length)return;
-  const hot=lines.map(node=>(node.classList.contains('diff-line-add')||node.classList.contains('diff-line-del'))?1:0);
+  const hot=lines.map(node=>{
+    return (node.classList.contains('diff-line-add')||node.classList.contains('diff-line-del'))?1:0;
+  });
   let bestCenter=-1;
   let bestScore=0;
   const radius=12;
@@ -22451,7 +29327,7 @@ function _mdWorkerQueue(text,key){
 }
 function renderMarkdownCached(text,key){const src=String(text||'');const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const jobId=_mdWorkerQueue(src,k);if(jobId>0){return `<div class=\"md-async-slot\" data-md-job=\"${jobId}\">${esc(src).replace(/\\n/g,'<br>')}</div>`}const html=renderMarkdown(src);if(k){_mdCacheSet(k,html)}return html}
 function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
-function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown')||rel.endsWith('.txt')||rel.endsWith('.text'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
 function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='code')return '{}';return '📄'}
 function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
 function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
@@ -23151,6 +30027,46 @@ function _stripDirectObjectivePrefix(raw){
   txt=txt.replace(/^Direct objective:\\s*/i,'').trim();
   return txt;
 }
+function _compactWorkerInstructionLine(raw){
+  let line=String(raw||'').replace(/\\s+/g,' ').trim();
+  if(!line)return'';
+  line=line.replace(/^\\d+\\/\\d+\\s+\\w+\\s*->\\s*\\w+\\s*\\|\\s*/i,'').trim();
+  for(const prefix of ['current focus:','next action:','this turn:','direct objective:']){
+    if(line.toLowerCase().startsWith(prefix)){
+      line=line.split(':').slice(1).join(':').trim();
+      break;
+    }
+  }
+  return line.trim();
+}
+function _isRuntimeMetaWorkerLine(raw){
+  const low=_compactWorkerInstructionLine(raw).toLowerCase();
+  if(!low||low==='.'||low==='-'||low===':')return true;
+  const runtimeTokens=[
+    'write_to_blackboard',
+    'read_from_blackboard',
+    'load_skill',
+    'list_skills',
+    'list_skill_providers',
+    'list_skill_protocols',
+    'ask_colleague',
+    'tool_error',
+    'grounding budget',
+    'retry pending',
+    'retry note:',
+    'repeat-no-tool',
+    'intent-no-tool',
+    'state-stalled',
+    'keep scope narrow',
+    'one concrete tool call',
+    'update blackboard evidence',
+    'write concise acceptance notes to blackboard',
+    'write concrete acceptance constraints to blackboard',
+    'support/meta tools',
+    'suggestion-only text reply is forbidden'
+  ];
+  return runtimeTokens.some(token=>low.includes(token));
+}
 function _stripObjectiveInstructionForWorker(raw){
   let txt=_stripLanguagePolicyLines(String(raw||'').trim());
   if(!txt)return'';
@@ -23158,6 +30074,80 @@ function _stripObjectiveInstructionForWorker(raw){
   if(block&&block[1])txt=String(block[1]||'').trim();
   txt=txt.replace(/^Direct objective:\\s*[^\\n]*(?:\\n|$)/i,'').trim();
   txt=_stripLanguagePolicyLines(txt);
+  const hiddenPrefixes=[
+    'executor mode (stateless) step ',
+    'retry note:',
+    'rules: execute one concrete tool call now',
+    'relevant runtime skills:',
+    'skill discovery is already satisfied',
+    'use incremental edits (append/targeted replace)',
+    'mandatory execution:',
+    'stateless executor:',
+    'collaboration preference:',
+    'exact target path(s) for this step:',
+    'validator contract exists; prefer running'
+  ];
+  const hiddenContains=[
+    'do not call load_skill/list_skills/list_skill_providers/list_skill_protocols again',
+    'support/meta tools alone',
+    'suggestion-only text reply is forbidden'
+  ];
+  const kept=[];
+  const fallback=[];
+  const seen=new Set();
+  for(const rawLine of String(txt||'').split(/\\n+/)){
+    let line=String(rawLine||'').replace(/\\s+/g,' ').trim();
+    if(!line)continue;
+    let low=line.toLowerCase();
+    if(hiddenPrefixes.some(prefix=>low.startsWith(prefix)))continue;
+    if(hiddenContains.some(token=>low.includes(token)))continue;
+    if(low.startsWith('blocking gap:')||low.startsWith('latest validation failure:')){
+      const blocker=_compactWorkerInstructionLine(line);
+      if(_isRuntimeMetaWorkerLine(blocker))continue;
+      line=`Latest blocker: ${blocker}`;
+      low=line.toLowerCase();
+    }
+    if(low.startsWith('active paths:')||low.startsWith('still missing:')){
+      const match=line.match(/(?:[A-Za-z0-9_.-]+\\/)*[A-Za-z0-9_.-]+\\.(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h)/i);
+      if(!match)continue;
+      line=`Target path: ${String(match[0]||'').trim()}`;
+      low=line.toLowerCase();
+    }else if(
+      low.startsWith('current focus:')||
+      low.startsWith('next action:')||
+      low.startsWith('this turn:')||
+      low.startsWith('direct objective:')
+    ){
+      line=_compactWorkerInstructionLine(line);
+      low=line.toLowerCase();
+    }
+    if(_isRuntimeMetaWorkerLine(line))continue;
+    if(seen.has(low))continue;
+    seen.add(low);
+    if(
+      low.startsWith('grounding is ready.')||
+      low.startsWith('implement one incremental patch.')||
+      low.startsWith('proceed with one concrete next step')||
+      low.startsWith('address review feedback with concrete code changes')||
+      low.startsWith('advance one concrete deliverable update')||
+      low.startsWith('take one bounded step only')
+    ){
+      fallback.push(line);
+      continue;
+    }
+    kept.push(line);
+  }
+  if(!kept.length&&fallback.length)kept.push(...fallback.slice(0,2));
+  else if(kept.length<2){
+    for(const line of fallback){
+      const low=line.toLowerCase();
+      if(seen.has(low))continue;
+      seen.add(low);
+      kept.push(line);
+      if(kept.length>=2)break;
+    }
+  }
+  txt=kept.join('\\n').trim();
   return txt;
 }
 function _chatVirtBuildMessageNode(m){
@@ -23253,8 +30243,10 @@ function _chatVirtBuildMessageNode(m){
   if(m.type==='upload'&&m.data){
     const u=m.data;
     const upath=u.workspace_path||'';
-    const preview=previewButtonHtml(upath);
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">path: ${esc(upath)} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    const parsedPath=u.parsed_markdown_path||u.parsed_text_path||'';
+    const preview=previewButtonHtml(parsedPath||upath);
+    const metaLine=`path: ${esc(upath)} | parsed=${esc(parsedPath||'-')} | parser=${esc(u.parser||'-')} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}`;
+    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">${metaLine}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
     return d;
   }
   if(m.type==='command'&&m.data){
@@ -23315,7 +30307,70 @@ function _chatVirtBuildMessageNode(m){
   }
   return d;
 }
+function _chatVirtFindRenderedNode(chatEl,key){
+  if(!chatEl||!key)return null;
+  for(const node of chatEl.querySelectorAll('.msg[data-vk]')){
+    if(String(node.getAttribute('data-vk')||'')===String(key||''))return node;
+  }
+  return null;
+}
+function _chatVirtCaptureAnchor(chatEl){
+  if(!chatEl)return null;
+  const viewportTop=Number(chatEl.getBoundingClientRect().top||0);
+  let fallback=null;
+  for(const node of chatEl.querySelectorAll('.msg[data-vk]')){
+    const key=String(node.getAttribute('data-vk')||'').trim();
+    if(!key)continue;
+    const rect=node.getBoundingClientRect();
+    const top=Number(rect.top||0)-viewportTop;
+    const bottom=Number(rect.bottom||0)-viewportTop;
+    const anchor={key:key,offset:top};
+    if(!fallback)fallback=anchor;
+    if(bottom>1)return anchor;
+  }
+  return fallback;
+}
+function _chatVirtRestoreAnchor(chatEl,anchor){
+  if(!chatEl||!anchor||!anchor.key)return false;
+  const node=_chatVirtFindRenderedNode(chatEl,anchor.key);
+  if(!node)return false;
+  const viewportTop=Number(chatEl.getBoundingClientRect().top||0);
+  const rect=node.getBoundingClientRect();
+  const currentOffset=Number(rect.top||0)-viewportTop;
+  const delta=currentOffset-Number(anchor.offset||0);
+  if(Math.abs(delta)<0.75)return true;
+  const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
+  const target=Math.max(0,Math.min(Number(chatEl.scrollTop||0)+delta,maxTop));
+  if(Math.abs(target-Number(chatEl.scrollTop||0))<0.75)return true;
+  chatEl.scrollTop=target;
+  return true;
+}
 function _chatVirtFindWindow(rows,top,bottom){const startTarget=Math.max(0,top-CHAT_VIRT.overscanPx);const endTarget=Math.max(0,bottom+CHAT_VIRT.overscanPx);let start=0;let acc=0;while(start<rows.length){const h=_chatVirtEstimatedHeight(rows[start]);if((acc+h)>=startTarget)break;acc+=h;start+=1}let end=start;let accEnd=acc;while(end<rows.length&&accEnd<=endTarget){accEnd+=_chatVirtEstimatedHeight(rows[end]);end+=1}end=Math.min(rows.length,end+2);return {start,end,topOffset:acc,endOffset:accEnd}}
+function _chatVirtReuseWindow(chatEl,rows,top,bottom){
+  if(!chatEl||!Array.isArray(rows)||!rows.length)return null;
+  const prevRows=Array.isArray(chatEl._virtLastRows)?chatEl._virtLastRows:[];
+  const prevStart=Number(chatEl._virtLastWinStart||-1);
+  const prevEnd=Number(chatEl._virtLastWinEnd||-1);
+  const prevTopOffset=Number(chatEl._virtLastTopOffset);
+  const prevEndOffset=Number(chatEl._virtLastEndOffset);
+  if(prevStart<0||prevEnd<=prevStart)return null;
+  if(!Number.isFinite(prevTopOffset)||!Number.isFinite(prevEndOffset)||prevEndOffset<=prevTopOffset)return null;
+  if(prevRows.length!==rows.length)return null;
+  const prevFirstKey=String(prevRows[prevStart]?._vk||'');
+  const nextFirstKey=String(rows[prevStart]?._vk||'');
+  const prevLastKey=String(prevRows[Math.max(0,prevEnd-1)]?._vk||'');
+  const nextLastKey=String(rows[Math.max(0,prevEnd-1)]?._vk||'');
+  if(prevFirstKey!==nextFirstKey||prevLastKey!==nextLastKey)return null;
+  const viewport=Math.max(0,bottom-top);
+  const innerPad=Math.max(120,Math.min(Math.round(CHAT_VIRT.overscanPx*0.45),Math.round(viewport*0.35)));
+  if((prevEndOffset-prevTopOffset)<(viewport+(innerPad*2)))return null;
+  const safeTop=prevTopOffset+innerPad;
+  const safeBottom=prevEndOffset-innerPad;
+  if(top>=safeTop&&bottom<=safeBottom){
+    return {start:prevStart,end:prevEnd,topOffset:prevTopOffset,endOffset:prevEndOffset};
+  }
+  return null;
+}
 function _chatVirtBindScroll(chatEl){
   if(chatEl._virtBound)return;
   chatEl._virtBound=true;
@@ -23385,28 +30440,11 @@ function _chatVirtBindScroll(chatEl){
     const now=Date.now();
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
-    chatEl._virtInputUnlockTs=Math.max(
-      Number(chatEl._virtInputUnlockTs||0),
-      now+CHAT_SCROLL_INPUT_LOCK_MS
-    );
-    const atBottomBefore=nearBottom(chatEl,6);
     if(dy<0){
-      markManual(CHAT_SCROLL_LOCK_MS);
       S.follow.chat=false;
       return;
     }
-    if(!atBottomBefore){
-      markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.45));
-      S.follow.chat=false;
-      return;
-    }
-    S.follow.chat=true;
-    chatEl._virtManualUnlockTs=0;
-    chatEl._virtInputUnlockTs=0;
-    chatEl._virtTouchUnlockTs=0;
-    if(atBottomBefore){
-      chatEl._virtAutoFollowPaused=false;
-    }
+    if(nearBottom(chatEl,6))S.follow.chat=true;
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -23420,9 +30458,7 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtScrollDirection=(curTop>prevTop)?1:((curTop<prevTop)?-1:0);
     chatEl._virtLastScrollTop=curTop;
     const atBottom=nearBottom(chatEl,6);
-    const manualLock=Number(chatEl._virtManualUnlockTs||0)>now;
-    const recentUpIntent=(now-Number(chatEl._virtLastWheelTs||0))<220&&Number(chatEl._virtLastWheelDy||0)<0;
-    if(atBottom&&!manualLock&&!recentUpIntent){
+    if(atBottom){
       S.follow.chat=true;
       chatEl._virtManualUnlockTs=0;
       chatEl._virtInputUnlockTs=0;
@@ -23432,9 +30468,6 @@ function _chatVirtBindScroll(chatEl){
       S.follow.chat=false;
       if(S.snap?.running){
         chatEl._virtAutoFollowPaused=true;
-      }
-      if(!atBottom||recentUpIntent){
-        chatEl._virtManualUnlockTs=Math.max(Number(chatEl._virtManualUnlockTs||0),now+CHAT_SCROLL_LOCK_MS);
       }
     }
     scheduleScrollRender();
@@ -23453,12 +30486,9 @@ function renderChat(reason='snapshot'){
   if((!S.snap?.running)&&atBottomNow){
     c._virtAutoFollowPaused=false;
   }
-  const now=Date.now();
-  const manualLock=Number(c._virtManualUnlockTs||0)>now;
-  const autoPaused=Boolean(c._virtAutoFollowPaused);
-  const scrolling=_chatVirtIsUserScrolling(c);
-  const keep=first||(!manualLock&&!autoPaused&&!scrolling&&(atBottomNow||Boolean(S.follow.chat)));
+  const keep=first||Boolean(S.follow.chat)||atBottomNow;
   const oldScrollTop=Number(c.scrollTop||0);
+  const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
   const feedSig=String(S.lastFeedSig||feedSignature(S.snap||{}));
   let rows=[];
   if(reason==='scroll'&&Array.isArray(c._virtRowsCacheRows)&&String(c._virtRowsCacheSig||'')===feedSig){
@@ -23474,7 +30504,7 @@ function renderChat(reason='snapshot'){
   const prevWinEnd=Number(c._virtLastWinEnd||-1);
   const top=Math.max(0,c.scrollTop);
   const bottom=top+Math.max(0,c.clientHeight||0);
-  const win=_chatVirtFindWindow(rows,top,bottom);
+  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom);
   const totalKey=`${feedSig}|hv=${Number(CHAT_VIRT.heightVersion||0)}|rows=${rows.length}`;
   let totalEstimated=0;
   if(reason==='scroll'&&String(c._virtTotalKey||'')===totalKey){
@@ -23592,19 +30622,19 @@ function renderChat(reason='snapshot'){
       CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
     }
   }
-  if(reason!=='scroll'){
-    const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
-    if(keep){
-      c.scrollTop=maxTop;
-    }else{
-      c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
-    }
+  const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
+  if(keep){
+    c.scrollTop=maxTop;
+  }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
+    c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
   }
   c._chatHasRendered=true;
   c._virtRendering=false;
   c._virtLastRows=rows;
   c._virtLastWinStart=win.start;
   c._virtLastWinEnd=win.end;
+  c._virtLastTopOffset=Number(win.topOffset||0);
+  c._virtLastEndOffset=Number(win.endOffset||0);
   if(hasHeightChange&&reason!=='scroll'){
     if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
     c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
@@ -23652,7 +30682,7 @@ setPanelHtml('catalog',protocols+providers+skills+tools||`<div class=\"mono\">${
 renderFileExplorer();
 refreshFileExplorer(false).catch(()=>{});
 const uploads=(S.snap?.uploads||[]).slice(-8).reverse();
-E('uploadList').innerHTML=uploads.map(u=>`<div>${esc(u.filename)} → ${esc(u.workspace_path||'')} (${esc(u.kind||'')}, ${esc(u.size||0)}B)</div>`).join('')||`<div>${esc(t('no_uploads'))}</div>`;
+E('uploadList').innerHTML=uploads.map(u=>`<div>${esc(u.filename)} → ${esc(u.parsed_markdown_path||u.parsed_text_path||u.workspace_path||'')} (${esc(u.kind||'')}, ${esc(u.size||0)}B)</div>`).join('')||`<div>${esc(t('no_uploads'))}</div>`;
 const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';
 const dl1=E('downloadSessionBtn');
 if(S.activeId){dl1.classList.remove('disabled');dl1.href=sessionZip}else{dl1.classList.add('disabled');dl1.href='#'}
@@ -23799,26 +30829,17 @@ async function refreshSnapshot(opt={}){
       applyMainI18n();
     }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
     const feedSig=feedSignature(S.snap);
     if(forceFull||feedSig!==S.lastFeedSig){
       S.lastFeedSig=feedSig;
-      if(scrolling&&chatEl){
-        _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('snapshot'));
-      }else{
-        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');
-        renderChat();
-      }
+      if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');
+      renderChat();
     }
     const boardSig=boardsSignature(S.snap);
     if(forceFull||boardSig!==S.lastBoardsSig){
       S.lastBoardsSig=boardSig;
-      if(scrolling&&chatEl){
-        _chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);
-      }else{
-        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');
-        renderBoards();
-      }
+      if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');
+      renderBoards();
     }
     renderActivePreview(false);
     S.bootRendered=true;
@@ -23908,7 +30929,7 @@ window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','se
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
 type Msg={role:string;text:string;thinking?:string;agent_role?:string};
-type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
+type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string;parsed_text_path?:string;parsed_markdown_path?:string;parsed_metadata_path?:string;parser?:string};
 type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;agent_active_role?:string;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
 type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
 type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
@@ -24322,6 +31343,9 @@ class AppContext:
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_user: int = 0,
         max_user_sessions: int = 0,
+        microtask_mode: str = "off",
+        small_model_microtask_mode: str = "off",
+        session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
     ):
         self.workspace = workspace
         self.base_url = base_url
@@ -24364,11 +31388,23 @@ class AppContext:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
+        self.small_model_microtask_mode = normalize_on_off_mode(
+            small_model_microtask_mode,
+            default="off",
+        )
         self.skills_root = skills_root
         ensure_runtime_skills(self.skills_root)
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
         self.default_llm_config = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
+        self.session_compression_level = normalize_session_compression_level(
+            session_compression_level_from_config(
+                self.default_llm_config,
+                default=session_compression_level,
+            ),
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        )
         self.global_profiles_payload = parse_llm_config_profiles(
             self.default_llm_config, self.base_url, self.model
         )
@@ -24832,6 +31868,9 @@ class AppContext:
                 self.arbiter_max_tokens,
                 self.arbiter_temperature,
                 self.execution_mode,
+                self.microtask_mode,
+                self.small_model_microtask_mode,
+                self.session_compression_level,
                 run_finished_callback=self._on_session_run_finished,
             )
             self._session_mgrs[user_id] = mgr
@@ -24900,10 +31939,23 @@ class AppContext:
         return out
 
     def apply_global_llm_config(self, config: dict, source: str = "") -> dict:
-        cfg = dict(config or {})
+        cfg = with_session_compression_level(
+            config,
+            session_compression_level_from_config(
+                config,
+                default=self.session_compression_level,
+            ),
+        )
         OllamaClient.clear_global_probe_cache()
         parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
         self.default_llm_config = cfg
+        self.session_compression_level = normalize_session_compression_level(
+            session_compression_level_from_config(
+                cfg,
+                default=self.session_compression_level,
+            ),
+            default=self.session_compression_level,
+        )
         self.global_profiles_payload = parsed
         self.global_profiles = {str(p.get("id")): dict(p) for p in parsed.get("profiles", [])}
         self.global_active_profile_id = str(
@@ -25006,6 +32058,10 @@ class AppContext:
                     "ollama_base": base_text,
                     "thinking": False,
                     "ui_language": ui_lang,
+                    "session_compression_level": normalize_session_compression_level(
+                        self.session_compression_level,
+                        default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                    ),
                     "updated_at": now_ts(),
                 }
                 self.crypto.write_json(user_prefs_path, user_prefs_payload)
@@ -25021,6 +32077,10 @@ class AppContext:
                             sraw["model_profiles"] = profiles_map
                             sraw["active_profile_id"] = active_id
                             sraw["multimodal_capability_cache"] = {}
+                            sraw["session_compression_level"] = normalize_session_compression_level(
+                                self.session_compression_level,
+                                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                            )
                             sraw["updated_at"] = now_ts()
                             self.crypto.write_json(state_file, sraw)
                             disk_sessions += 1
@@ -25875,6 +32935,12 @@ class Handler(BaseHTTPRequestHandler):
                     "arbiter_temperature": float(mgr.arbiter_temperature),
                     "timeout_min": int(MIN_RUN_TIMEOUT_SECONDS),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
+                    "session_compression_level": normalize_session_compression_level(
+                        getattr(mgr, "session_compression_level", DEFAULT_SESSION_COMPRESSION_LEVEL),
+                        default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+                    ),
+                    "session_compression_levels": list(SESSION_COMPRESSION_LEVEL_CHOICES),
+                    "session_compression_guide": session_compression_level_guide(),
                     "scheduler": scheduler_state,
                     "max_user": int(scheduler_state.get("max_user", 0)),
                     "max_user_sessions": int(scheduler_state.get("max_user_sessions", 0)),
@@ -26001,6 +33067,19 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             return self._send_json(sess.model_catalog(force_probe=refresh_probe))
+        m = re.match(r"^/api/sessions/([^/]+)/export$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            export_format = str((query.get("format", ["all"]) or ["all"])[0] or "all").strip().lower() or "all"
+            try:
+                data, content_type, filename = sess.export_artifact(export_format)
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            return self._send_bytes(data, content_type, filename)
         m = re.match(r"^/api/sessions/([^/]+)/export.zip$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -26444,6 +33523,1092 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
+
+def _selftest_latest_assistant_text(sess: SessionState) -> str:
+    for row in reversed(getattr(sess, "messages", [])):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("role", "") or "").strip().lower() != "assistant":
+            continue
+        if str(row.get("agent_role", "") or "").strip().lower() == "manager":
+            continue
+        text = strip_thinking_content(str(row.get("content", "") or "")).strip()
+        if text:
+            return text
+    for row in reversed(getattr(sess, "messages", [])):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("role", "") or "").strip().lower() != "assistant":
+            continue
+        text = strip_thinking_content(str(row.get("content", "") or "")).strip()
+        if text:
+            return text
+    return ""
+
+
+def _selftest_used_tool(sess: SessionState, tool_name: str) -> bool:
+    target = str(tool_name or "").strip()
+    if not target:
+        return False
+    if int((getattr(sess, "session_tool_usage", {}) or {}).get(target, 0) or 0) > 0:
+        return True
+    if target == "load_skill" and isinstance(getattr(sess, "skill_load_cache", {}), dict):
+        if bool(getattr(sess, "skill_load_cache", {})):
+            return True
+    pools = []
+    pools.append(getattr(sess, "messages", []))
+    pools.extend(list(getattr(sess, "contexts", {}).values()) if isinstance(getattr(sess, "contexts", {}), dict) else [])
+    pools.append(getattr(sess, "manager_context", []))
+    for rows in pools:
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "tool":
+                continue
+            if str(row.get("name", "") or "").strip() == target:
+                return True
+    return False
+
+
+def _selftest_tool_outputs(sess: SessionState, tool_name: str = "") -> list[str]:
+    target = str(tool_name or "").strip()
+    out: list[str] = []
+    pools = []
+    pools.append(getattr(sess, "messages", []))
+    pools.extend(list(getattr(sess, "contexts", {}).values()) if isinstance(getattr(sess, "contexts", {}), dict) else [])
+    pools.append(getattr(sess, "manager_context", []))
+    for rows in pools:
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "tool":
+                continue
+            name = str(row.get("name", "") or "").strip()
+            if target and name != target:
+                continue
+            text = str(row.get("content", "") or "").strip()
+            if text:
+                out.append(text)
+    return out
+
+
+def _selftest_latest_execution_log(sess: SessionState) -> str:
+    board = sess._ensure_blackboard()
+    rows = board.get("execution_logs", []) if isinstance(board.get("execution_logs"), list) else []
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        text = str(row.get("content", "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _selftest_wait_until_idle(
+    sess: SessionState,
+    timeout_seconds: float,
+    *,
+    on_event=None,
+    on_poll=None,
+) -> tuple[bool, float]:
+    start = time.time()
+    deadline = start + max(5.0, float(timeout_seconds or 0.0))
+    sub = sess.events.subscribe()
+    try:
+        while time.time() < deadline:
+            try:
+                event = sub.get(timeout=0.25)
+                if callable(on_event):
+                    on_event(event)
+                while True:
+                    try:
+                        event = sub.get_nowait()
+                    except queue.Empty:
+                        break
+                    if callable(on_event):
+                        on_event(event)
+            except queue.Empty:
+                pass
+            if callable(on_poll):
+                on_poll(sess)
+            if not bool(getattr(sess, "running", False)):
+                return True, max(0.0, time.time() - start)
+        try:
+            sess.interrupt()
+        except Exception:
+            pass
+        grace = time.time() + 5.0
+        while time.time() < grace:
+            while True:
+                try:
+                    event = sub.get_nowait()
+                except queue.Empty:
+                    break
+                if callable(on_event):
+                    on_event(event)
+            if callable(on_poll):
+                on_poll(sess)
+            if not bool(getattr(sess, "running", False)):
+                break
+            time.sleep(0.2)
+        return (not bool(getattr(sess, "running", False))), max(0.0, time.time() - start)
+    finally:
+        sess.events.unsubscribe(sub)
+
+
+def run_local_architecture_selftests(
+    *,
+    base_url: str,
+    model: str,
+    max_rounds: int = 18,
+    timeout_seconds: float = 120.0,
+    keep_root: bool = False,
+    session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
+) -> dict:
+    tags = list_ollama_models(base_url)
+    selected_model = str(model or "").strip()
+    if selected_model:
+        if tags and selected_model not in tags:
+            raise RuntimeError(f"requested selftest model unavailable: {selected_model}")
+    elif tags:
+        selected_model = tags[0]
+    if not selected_model:
+        raise RuntimeError("no local Ollama model available for selftest")
+
+    root = (WORKDIR / ".selftests" / make_id("arch")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    skills_root = ensure_embedded_skills(root)
+    ensure_runtime_skills(skills_root)
+    sessions_root = root / "sessions"
+    sessions_root.mkdir(parents=True, exist_ok=True)
+    js_lib_root = offline_js_lib_root(root)
+    js_lib_root.mkdir(parents=True, exist_ok=True)
+    reports_root = root / "reports"
+    reports_root.mkdir(parents=True, exist_ok=True)
+    crypto = CryptoBox(root / "codes")
+    suite_version = "arch-regression-v4"
+
+    def _new_session(case_name: str) -> SessionState:
+        return SessionState(
+            session_id=make_id("selftest"),
+            title=case_name,
+            root=sessions_root,
+            ollama_base=base_url,
+            model=selected_model,
+            skills_root=skills_root,
+            crypto=crypto,
+            repo_root=root,
+            thinking=False,
+            default_llm_config={},
+            context_token_limit=TOKEN_THRESHOLD,
+            context_limit_locked=False,
+            max_rounds=max_rounds,
+            max_run_seconds=int(max(30, timeout_seconds)),
+            auto_model_switch=False,
+            arbiter_enabled=True,
+            arbiter_model="",
+            arbiter_timeout_seconds=ARBITER_DEFAULT_TIMEOUT_SECONDS,
+            arbiter_max_tokens=ARBITER_DEFAULT_MAX_TOKENS,
+            arbiter_temperature=ARBITER_DEFAULT_TEMPERATURE,
+            execution_mode=EXECUTION_MODE_SYNC,
+            ui_language=DEFAULT_UI_LANGUAGE,
+            js_lib_root=js_lib_root,
+            owner_user_id="selftest",
+            microtask_mode="off",
+            small_model_microtask_mode="off",
+            session_compression_level=session_compression_level,
+        )
+
+    def _write_seed_files(sess: SessionState, files: dict[str, str]):
+        for rel, content in files.items():
+            fp = sess.files_root / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(str(content), encoding="utf-8")
+
+    def _sha1_bytes(data: bytes) -> str:
+        return hashlib.sha1(data).hexdigest()
+
+    def _file_sha1(fp: Path) -> str:
+        if not fp.exists() or (not fp.is_file()):
+            return ""
+        return _sha1_bytes(fp.read_bytes())
+
+    def _artifact_fingerprint(sess: SessionState, rel_paths: list[str]) -> str:
+        h = hashlib.sha1()
+        hit = False
+        for rel in rel_paths:
+            fp = sess.files_root / rel
+            if not fp.exists() or (not fp.is_file()):
+                continue
+            hit = True
+            h.update(rel.encode("utf-8"))
+            h.update(b"\x00")
+            h.update(fp.read_bytes())
+            h.update(b"\x00")
+        return h.hexdigest() if hit else ""
+
+    def _run_validation(sess: SessionState, command: str, timeout: int = 40) -> dict:
+        meta = sess._run_shell_meta(command, sess.files_root, timeout)
+        output = trim(str(meta.get("output", "") or "").strip(), 2000)
+        return {
+            "command": str(command or "").strip(),
+            "exit_code": int(meta.get("exit_code", 0) or 0),
+            "ok": int(meta.get("exit_code", 0) or 0) == 0,
+            "output": output,
+            "changed_files": list(meta.get("changed_files", []) or [])[:24],
+        }
+
+    def _trace_event_row(event: object) -> dict:
+        src = event if isinstance(event, dict) else {}
+        data = src.get("data", {}) if isinstance(src.get("data"), dict) else {}
+        row = {
+            "seq": int(src.get("seq", 0) or 0),
+            "ts": float(src.get("ts", 0.0) or 0.0),
+            "type": trim(str(src.get("type", "") or "").strip(), 40),
+            "summary": trim(
+                str(data.get("summary", "") or data.get("text", "") or data.get("name", "") or "").strip(),
+                320,
+            ),
+            "agent_role": trim(str(data.get("agent_role", "") or "").strip(), 20),
+            "role": trim(str(data.get("role", "") or "").strip(), 20),
+            "from": trim(str(data.get("from", "") or "").strip(), 20),
+            "to": trim(str(data.get("to", "") or "").strip(), 20),
+            "intent": trim(str(data.get("intent", "") or "").strip(), 80),
+            "text": trim(str(data.get("text", "") or "").strip(), 500),
+        }
+        return row
+
+    def _state_digest(sess: SessionState, *, elapsed_seconds: float = 0.0) -> dict:
+        snap = sess.snapshot(lite=True)
+        board = sess._ensure_blackboard()
+        memory_capsule = sess._normalize_memory_capsule(board.get("memory_capsule", {}))
+        kernel_state = sess._ensure_uniform_kernel_state()
+        watchdog = sess._normalize_watchdog_state(board.get("watchdog", {}))
+        dq = sess._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
+        compare = kernel_state.get("last_compare", {}) if isinstance(kernel_state.get("last_compare"), dict) else {}
+        delegate = board.get("last_delegate", {}) if isinstance(board.get("last_delegate"), dict) else {}
+        bus_signal = sess._recent_agentbus_signal()
+        plan_anchor = memory_capsule.get("plan_anchor", {}) if isinstance(memory_capsule.get("plan_anchor"), dict) else {}
+        return {
+            "elapsed_seconds": round(float(elapsed_seconds), 2),
+            "round": int(snap.get("agent_round_index", 0) or 0),
+            "phase": trim(str(snap.get("agent_phase", "") or "").strip(), 80),
+            "running": bool(snap.get("running", False)),
+            "status": trim(str(board.get("status", "") or "").strip(), 40),
+            "active_agent": trim(str(board.get("active_agent", "") or "").strip(), 20),
+            "manager_cycles": int(board.get("manager_cycles", 0) or 0),
+            "manager_routes": len(getattr(sess, "manager_routes", []) or []),
+            "manager_stride": int(kernel_state.get("manager_stride", UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE),
+            "direct_bus_handoffs": int(kernel_state.get("direct_bus_handoffs", 0) or 0),
+            "deterministic_handoffs": int(kernel_state.get("deterministic_handoffs", 0) or 0),
+            "manager_handoffs": int(kernel_state.get("manager_handoffs", 0) or 0),
+            "task_splits": int(kernel_state.get("task_splits", 0) or 0),
+            "autotune_events": int(kernel_state.get("autotune_events", 0) or 0),
+            "last_route_source": trim(str(kernel_state.get("last_route_source", "") or "").strip(), 80),
+            "last_tuning_reason": trim(str(kernel_state.get("last_tuning_reason", "") or "").strip(), 160),
+            "last_load_reason": trim(str(kernel_state.get("last_load_reason", "") or "").strip(), 160),
+            "last_compare_selected": trim(str(compare.get("selected", "") or "").strip(), 40),
+            "last_delegate_target": trim(str(delegate.get("target", "") or "").strip(), 20),
+            "last_delegate_source": trim(str(delegate.get("source", "") or "").strip(), 40),
+            "code_artifacts": len(board.get("code_artifacts", {}) or {}),
+            "research_notes": len(board.get("research_notes", []) or []),
+            "review_feedback": len(board.get("review_feedback", []) or []),
+            "execution_logs": len(board.get("execution_logs", []) or []),
+            "approval": bool((board.get("approval", {}) or {}).get("approved", False)),
+            "summary_ready": bool(sess._reviewer_final_summary_ready(board)),
+            "watchdog_trigger_count": int(watchdog.get("trigger_count", 0) or 0),
+            "watchdog_last_reason": trim(str(watchdog.get("last_trigger_reason", "") or "").strip(), 160),
+            "dq_active": bool(dq.get("active", False)),
+            "dq_cursor": int(dq.get("cursor", 0) or 0),
+            "dq_total": len(dq.get("steps", []) or []),
+            "agentbus_recent_count": int(bus_signal.get("count", 0) or 0),
+            "agentbus_recent_targets": list(bus_signal.get("targets", []) or [])[:4],
+            "session_compression_level": normalize_session_compression_level(
+                memory_capsule.get("compression_level", session_compression_level),
+                default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+            ),
+            "memory_focus": trim(str(plan_anchor.get("current_focus", "") or "").strip(), 180),
+            "memory_next_action": trim(str(plan_anchor.get("next_action", "") or "").strip(), 180),
+            "context_used_percent": round(float(snap.get("context_used_percent", 0.0) or 0.0), 2),
+            "latest_execution_log": trim(_selftest_latest_execution_log(sess), 240),
+            "latest_assistant_text": trim(_selftest_latest_assistant_text(sess), 240),
+        }
+
+    def _state_digest_fp(row: dict) -> str:
+        payload = {
+            "round": int(row.get("round", 0) or 0),
+            "phase": str(row.get("phase", "") or ""),
+            "status": str(row.get("status", "") or ""),
+            "active_agent": str(row.get("active_agent", "") or ""),
+            "manager_cycles": int(row.get("manager_cycles", 0) or 0),
+            "manager_stride": int(row.get("manager_stride", 0) or 0),
+            "direct_bus_handoffs": int(row.get("direct_bus_handoffs", 0) or 0),
+            "deterministic_handoffs": int(row.get("deterministic_handoffs", 0) or 0),
+            "manager_handoffs": int(row.get("manager_handoffs", 0) or 0),
+            "task_splits": int(row.get("task_splits", 0) or 0),
+            "code_artifacts": int(row.get("code_artifacts", 0) or 0),
+            "research_notes": int(row.get("research_notes", 0) or 0),
+            "review_feedback": int(row.get("review_feedback", 0) or 0),
+            "approval": bool(row.get("approval", False)),
+            "summary_ready": bool(row.get("summary_ready", False)),
+            "dq_active": bool(row.get("dq_active", False)),
+            "dq_cursor": int(row.get("dq_cursor", 0) or 0),
+            "agentbus_recent_count": int(row.get("agentbus_recent_count", 0) or 0),
+            "last_delegate_target": str(row.get("last_delegate_target", "") or ""),
+            "last_delegate_source": str(row.get("last_delegate_source", "") or ""),
+            "last_route_source": str(row.get("last_route_source", "") or ""),
+            "last_tuning_reason": str(row.get("last_tuning_reason", "") or ""),
+            "watchdog_trigger_count": int(row.get("watchdog_trigger_count", 0) or 0),
+            "session_compression_level": int(row.get("session_compression_level", 0) or 0),
+            "memory_focus": str(row.get("memory_focus", "") or ""),
+            "memory_next_action": str(row.get("memory_next_action", "") or ""),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _render_case_trace_md(trace: dict, result: dict) -> str:
+        final_state = trace.get("final_state", {}) if isinstance(trace.get("final_state"), dict) else {}
+        validator = result.get("validator", {}) if isinstance(result.get("validator"), dict) else {}
+        lines = [
+            f"# Selftest Trace: {result.get('name', 'case')}",
+            "",
+            f"- model: {result.get('model', '')}",
+            f"- direction: {result.get('direction', '')}",
+            f"- passed: {bool(result.get('passed', False))}",
+            f"- elapsed_seconds: {result.get('elapsed_seconds', 0)}",
+            f"- session_root: {result.get('session_root', '')}",
+            f"- files_root: {result.get('files_root', '')}",
+            f"- trace_events: {trace.get('event_count', 0)}",
+            f"- state_samples: {trace.get('state_sample_count', 0)}",
+            "",
+            "## Validation",
+            f"- command: {validator.get('command', '')}",
+            f"- exit_code: {validator.get('exit_code', 0)}",
+            "",
+            "```text",
+            str(validator.get("output", "") or "(empty)").strip() or "(empty)",
+            "```",
+            "",
+            "## Final State",
+            f"- round: {final_state.get('round', 0)}",
+            f"- phase: {final_state.get('phase', '')}",
+            f"- status: {final_state.get('status', '')}",
+            f"- active_agent: {final_state.get('active_agent', '')}",
+            f"- manager_cycles: {final_state.get('manager_cycles', 0)}",
+            f"- manager_stride: {final_state.get('manager_stride', 0)}",
+            f"- direct_bus_handoffs: {final_state.get('direct_bus_handoffs', 0)}",
+            f"- deterministic_handoffs: {final_state.get('deterministic_handoffs', 0)}",
+            f"- manager_handoffs: {final_state.get('manager_handoffs', 0)}",
+            f"- task_splits: {final_state.get('task_splits', 0)}",
+            f"- session_compression_level: {final_state.get('session_compression_level', 0)}",
+            f"- memory_focus: {final_state.get('memory_focus', '')}",
+            f"- memory_next_action: {final_state.get('memory_next_action', '')}",
+            f"- code_artifacts: {final_state.get('code_artifacts', 0)}",
+            f"- research_notes: {final_state.get('research_notes', 0)}",
+            f"- review_feedback: {final_state.get('review_feedback', 0)}",
+            f"- approval: {bool(final_state.get('approval', False))}",
+            f"- summary_ready: {bool(final_state.get('summary_ready', False))}",
+            f"- watchdog_trigger_count: {final_state.get('watchdog_trigger_count', 0)}",
+            f"- watchdog_last_reason: {final_state.get('watchdog_last_reason', '')}",
+            "",
+            "## State Samples",
+        ]
+        for row in (trace.get("state_samples", []) or [])[-24:]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                (
+                    f"- t={float(row.get('elapsed_seconds', 0.0) or 0.0):.1f}s "
+                    f"| round={int(row.get('round', 0) or 0)} "
+                    f"| phase={row.get('phase', '')} "
+                    f"| status={row.get('status', '')} "
+                    f"| active={row.get('active_agent', '') or '-'} "
+                    f"| stride={int(row.get('manager_stride', 0) or 0)} "
+                    f"| bus={int(row.get('direct_bus_handoffs', 0) or 0)} "
+                    f"| split={int(row.get('task_splits', 0) or 0)} "
+                    f"| mem=L{int(row.get('session_compression_level', 0) or 0)} "
+                    f"| artifacts={int(row.get('code_artifacts', 0) or 0)} "
+                    f"| review={int(row.get('review_feedback', 0) or 0)}"
+                )
+            )
+        lines.extend(["", "## Recent Events"])
+        for row in (trace.get("events", []) or [])[-30:]:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("summary", "") or row.get("text", "") or "").strip()
+            if not text:
+                continue
+            lines.append(
+                f"- #{int(row.get('seq', 0) or 0)} | {row.get('type', '')} | {text}"
+            )
+        if result.get("errors"):
+            lines.extend(["", "## Errors"])
+            for item in result.get("errors", []) or []:
+                lines.append(f"- {item}")
+        return "\n".join(lines).strip() + "\n"
+
+    def _render_suite_md(summary: dict) -> str:
+        agg = summary.get("aggregate", {}) if isinstance(summary.get("aggregate"), dict) else {}
+        lines = [
+            "# Architecture Selftest Summary",
+            "",
+            f"- model: {summary.get('model', '')}",
+            f"- session_compression_level: {summary.get('session_compression_level', DEFAULT_SESSION_COMPRESSION_LEVEL)}",
+            f"- suite_version: {summary.get('suite_version', '')}",
+            f"- work_root: {summary.get('work_root', '')}",
+            f"- ok: {bool(summary.get('ok', False))}",
+            f"- passed: {agg.get('passed', 0)}",
+            f"- failed: {agg.get('failed', 0)}",
+            f"- elapsed_seconds_total: {agg.get('elapsed_seconds_total', 0)}",
+            f"- task_splits_total: {agg.get('task_splits_total', 0)}",
+            f"- autotune_events_total: {agg.get('autotune_events_total', 0)}",
+            "",
+            "| # | case | direction | pass | elapsed_s | splits | direct_bus | manager | tuning |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for row in summary.get("results", []) or []:
+            if not isinstance(row, dict):
+                continue
+            kernel = row.get("uniform_kernel", {}) if isinstance(row.get("uniform_kernel"), dict) else {}
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(row.get("index", "")),
+                        str(row.get("name", "")),
+                        str(row.get("direction", "")),
+                        ("PASS" if bool(row.get("passed", False)) else "FAIL"),
+                        str(row.get("elapsed_seconds", 0)),
+                        str(kernel.get("task_splits", 0)),
+                        str(kernel.get("direct_bus_handoffs", 0)),
+                        str(kernel.get("manager_handoffs", 0)),
+                        str(kernel.get("last_tuning_reason", "") or "-"),
+                    ]
+                )
+                + " |"
+            )
+        return "\n".join(lines).strip() + "\n"
+
+    cases = [
+        {
+            "name": "repo_bugfix_patch",
+            "direction": "existing code repair",
+            "seed_files": {
+                "README.md": (
+                    "# Mini Repo\n\n"
+                    "Fix the existing implementation bug in `pkg/ops.py`.\n"
+                    "Do not edit `validate.py`.\n"
+                ),
+                "pkg/__init__.py": "",
+                "pkg/ops.py": (
+                    "def add(a, b):\n"
+                    "    return a - b\n\n"
+                    "def mul(a, b):\n"
+                    "    return a * b\n"
+                ),
+                "validate.py": (
+                    "from pkg.ops import add, mul\n\n"
+                    "assert add(2, 3) == 5, add(2, 3)\n"
+                    "assert add(-1, 4) == 3, add(-1, 4)\n"
+                    "assert mul(4, 5) == 20, mul(4, 5)\n"
+                    "print('PASS_REPO_FIX')\n"
+                ),
+            },
+            "locked_paths": ["README.md", "validate.py"],
+            "expected_paths": ["pkg/ops.py"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_REPO_FIX",
+            "prompt": (
+                "Inspect this mini project, fix the implementation bug in pkg/ops.py, "
+                "do not edit README.md or validate.py, run `python3 validate.py` until it prints "
+                "PASS_REPO_FIX, then finish."
+            ),
+        },
+        {
+            "name": "data_research_report",
+            "direction": "data analysis and report synthesis",
+            "seed_files": {
+                "sales.csv": (
+                    "region,units,revenue\n"
+                    "east,5,50\n"
+                    "west,3,45\n"
+                    "east,7,84\n"
+                    "north,4,48\n"
+                    "west,2,20\n"
+                    "east,4,44\n"
+                ),
+                "validate.py": (
+                    "import json\n"
+                    "from pathlib import Path\n\n"
+                    "data = json.loads(Path('summary.json').read_text(encoding='utf-8'))\n"
+                    "assert data['total_units'] == 25, data\n"
+                    "assert data['best_region'] == 'east', data\n"
+                    "assert data['region_totals']['east'] == 16, data\n"
+                    "report = Path('report.md').read_text(encoding='utf-8')\n"
+                    "for needle in ('# Findings', '## Totals', '## Best Region', 'Total units: 25', 'Best region: east (16)'):\n"
+                    "    assert needle in report, needle\n"
+                    "print('PASS_DATA_REPORT')\n"
+                ),
+            },
+            "locked_paths": ["sales.csv", "validate.py"],
+            "expected_paths": ["summary.json", "report.md"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_DATA_REPORT",
+            "prompt": (
+                "Study sales.csv, create summary.json with keys total_units, best_region, and region_totals, "
+                "where region_totals must be total units per region (not revenue), "
+                "create report.md with sections exactly `# Findings`, `## Totals`, and `## Best Region`, "
+                "do not edit sales.csv or validate.py, run `python3 validate.py` until it prints "
+                "PASS_DATA_REPORT, then finish."
+            ),
+        },
+        {
+            "name": "spec_driven_feature",
+            "direction": "docs to code implementation",
+            "seed_files": {
+                "docs/spec.md": (
+                    "# Feature Spec\n\n"
+                    "Implement `normalize_title(text)` in `app/text_tools.py`.\n"
+                    "Rules:\n"
+                    "- trim leading/trailing whitespace\n"
+                    "- collapse internal whitespace runs to a single space\n"
+                    "- title-case each word\n"
+                    "- empty/blank input should return an empty string\n"
+                    "Do not edit validate.py.\n"
+                ),
+                "app/__init__.py": "",
+                "app/text_tools.py": (
+                    "def normalize_title(text):\n"
+                    "    return str(text)\n"
+                ),
+                "validate.py": (
+                    "from app.text_tools import normalize_title\n\n"
+                    "assert normalize_title('  multi   agent  runtime ') == 'Multi Agent Runtime'\n"
+                    "assert normalize_title('branch    coder') == 'Branch Coder'\n"
+                    "assert normalize_title('   ') == ''\n"
+                    "print('PASS_SPEC_FEATURE')\n"
+                ),
+            },
+            "locked_paths": ["docs/spec.md", "validate.py"],
+            "expected_paths": ["app/text_tools.py"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_SPEC_FEATURE",
+            "prompt": (
+                "Read docs/spec.md, update app/text_tools.py to satisfy the spec, do not edit docs/spec.md "
+                "or validate.py, run `python3 validate.py` until it prints PASS_SPEC_FEATURE, then finish."
+            ),
+        },
+        {
+            "name": "offline_frontend_dashboard",
+            "direction": "offline frontend composition",
+            "seed_files": {
+                "metrics.json": json_dumps(
+                    {
+                        "title": "Release Health",
+                        "kpis": [
+                            {"label": "Builds", "value": 12},
+                            {"label": "Failures", "value": 2},
+                            {"label": "Coverage", "value": "91%"},
+                        ],
+                        "services": [
+                            {"name": "api", "status": "green"},
+                            {"name": "worker", "status": "yellow"},
+                        ],
+                    },
+                    indent=2,
+                ),
+                "validate.py": (
+                    "from pathlib import Path\n\n"
+                    "html = Path('dashboard/index.html').read_text(encoding='utf-8')\n"
+                    "low = html.lower()\n"
+                    "for needle in ('Release Health', 'Builds', '12', 'Failures', '2', 'Coverage', '91%', 'Service', 'Status'):\n"
+                    "    assert needle in html, needle\n"
+                    "assert '<style' in low, 'missing inline style'\n"
+                    "assert 'http://' not in low and 'https://' not in low, 'external network reference found'\n"
+                    "print('PASS_OFFLINE_UI')\n"
+                ),
+            },
+            "locked_paths": ["metrics.json", "validate.py"],
+            "expected_paths": ["dashboard/index.html"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_OFFLINE_UI",
+            "prompt": (
+                "Build a self-contained offline dashboard at dashboard/index.html using the values in metrics.json. "
+                "The page must show Release Health, KPI cards for Builds 12, Failures 2, Coverage 91%, and a small "
+                "service/status table. Do not edit metrics.json or validate.py. Do not use external network assets. "
+                "Run `python3 validate.py` until it prints PASS_OFFLINE_UI, then finish."
+            ),
+        },
+        {
+            "name": "skill_backfill_parser",
+            "direction": "skill-assisted workflow automation",
+            "seed_files": {
+                "workflow/__init__.py": "",
+                "workflow/input.txt": (
+                    "note: gather baseline\n"
+                    "TODO: add retry logic\n"
+                    "comment: keep context compact\n"
+                    "TODO: tighten tests\n"
+                    "TODO: ship release notes\n"
+                ),
+                "validate.py": (
+                    "from pathlib import Path\n"
+                    "from workflow.parser import extract_todos\n\n"
+                    "source = Path('workflow/input.txt').read_text(encoding='utf-8')\n"
+                    "rows = extract_todos(source)\n"
+                    "expected = [\n"
+                    "    'TODO: add retry logic',\n"
+                    "    'TODO: tighten tests',\n"
+                    "    'TODO: ship release notes',\n"
+                    "]\n"
+                    "assert rows == expected, rows\n"
+                    "rendered = Path('workflow/output.txt').read_text(encoding='utf-8').strip().splitlines()\n"
+                    "assert rendered == expected, rendered\n"
+                    "print('PASS_SKILL_WORKFLOW')\n"
+                ),
+            },
+            "locked_paths": ["workflow/input.txt", "validate.py"],
+            "expected_paths": ["workflow/parser.py", "workflow/output.txt"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_SKILL_WORKFLOW",
+            "require_load_skill": True,
+            "prompt": (
+                "Before editing files, call load_skill on exactly one minimal built-in runtime skill you judge useful. "
+                "Then create workflow/parser.py exposing extract_todos(text), and create workflow/output.txt containing "
+                "only the TODO lines from workflow/input.txt in order. Do not edit workflow/input.txt or validate.py. "
+                "Run `python3 validate.py` until it prints PASS_SKILL_WORKFLOW, then finish."
+            ),
+        },
+        {
+            "name": "generalization_incident_synthesis",
+            "direction": "generalized research synthesis",
+            "seed_files": {
+                "observations.txt": (
+                    "Build latency spiked because cache warming was disabled.\n"
+                    "Once cache warming returned, success rate improved.\n"
+                    "The remaining blocker is flaky integration tests.\n"
+                    "The next step is to isolate flaky test suite.\n"
+                ),
+                "validate.py": (
+                    "import json\n"
+                    "import subprocess\n"
+                    "import sys\n"
+                    "from pathlib import Path\n\n"
+                    "subprocess.run([sys.executable, 'analysis/extract.py'], check=True)\n"
+                    "data = json.loads(Path('analysis/insight_map.json').read_text(encoding='utf-8'))\n"
+                    "assert data['primary_issue'] == 'cache warming disabled', data\n"
+                    "assert data['secondary_issue'] == 'flaky integration tests', data\n"
+                    "assert data['recommended_next_step'] == 'isolate flaky test suite', data\n"
+                    "summary = Path('analysis/summary.md').read_text(encoding='utf-8').lower()\n"
+                    "for needle in ('cache warming disabled', 'flaky integration tests', 'isolate flaky test suite'):\n"
+                    "    assert needle in summary, needle\n"
+                    "print('PASS_GENERALIZATION')\n"
+                ),
+            },
+            "locked_paths": ["observations.txt", "validate.py"],
+            "expected_paths": ["analysis/extract.py", "analysis/insight_map.json", "analysis/summary.md"],
+            "validator_command": "python3 validate.py",
+            "validator_token": "PASS_GENERALIZATION",
+            "prompt": (
+                "Study observations.txt and create analysis/extract.py that writes analysis/insight_map.json plus "
+                "analysis/summary.md satisfying validate.py. This is a generic analysis task; rely on the workspace "
+                "evidence instead of task-specific routing. Do not edit observations.txt or validate.py. Run "
+                "`python3 validate.py` until it prints PASS_GENERALIZATION, then finish."
+            ),
+        },
+    ]
+
+    results: list[dict] = []
+    print(
+        f"[selftest][{selected_model}] suite_start | cases={len(cases)} | root={root}",
+        flush=True,
+    )
+    for index, case in enumerate(cases, start=1):
+        name = str(case.get("name", "") or "case")
+        direction = str(case.get("direction", "") or "general")
+        prompt = str(case.get("prompt", "") or "").strip()
+        case_slug = f"{int(index):02d}_{name}"
+        case_root = reports_root / case_slug
+        case_root.mkdir(parents=True, exist_ok=True)
+        sess = _new_session(name)
+        _write_seed_files(sess, case.get("seed_files", {}))
+        locked_hashes: dict[str, str] = {}
+        for rel in case.get("locked_paths", []) or []:
+            locked_hashes[str(rel)] = _file_sha1(sess.files_root / str(rel))
+        trace_started = time.time()
+        trace_events: list[dict] = []
+        state_samples: list[dict] = []
+        progress_state = {
+            "last_state_fp": "",
+            "last_state_emit_ts": 0.0,
+            "last_event_fp": "",
+        }
+
+        def _case_print(message: str):
+            print(
+                f"[selftest][{selected_model}][{index}/{len(cases)}][{name}] {message}",
+                flush=True,
+            )
+
+        def _on_event(event: object):
+            row = _trace_event_row(event)
+            trace_events.append(row)
+            kind = str(row.get("type", "") or "")
+            if kind not in {"status", "agent_bus", "error"}:
+                return
+            summary_text = str(row.get("summary", "") or row.get("text", "") or "").strip()
+            if not summary_text:
+                return
+            fp = f"{kind}:{summary_text}"
+            if fp == str(progress_state.get("last_event_fp", "") or ""):
+                return
+            progress_state["last_event_fp"] = fp
+            _case_print(f"{kind} | {summary_text}")
+
+        def _on_poll(active_sess: SessionState):
+            elapsed_now = max(0.0, time.time() - trace_started)
+            row = _state_digest(active_sess, elapsed_seconds=elapsed_now)
+            state_fp = _state_digest_fp(row)
+            should_emit = False
+            if state_fp != str(progress_state.get("last_state_fp", "") or ""):
+                should_emit = True
+            elif elapsed_now - float(progress_state.get("last_state_emit_ts", 0.0) or 0.0) >= 8.0:
+                should_emit = True
+            if not should_emit:
+                return
+            progress_state["last_state_fp"] = state_fp
+            progress_state["last_state_emit_ts"] = elapsed_now
+            state_samples.append(row)
+            _case_print(
+                (
+                    f"state | t={float(row.get('elapsed_seconds', 0.0) or 0.0):.1f}s "
+                    f"round={int(row.get('round', 0) or 0)} "
+                    f"phase={row.get('phase', '') or '-'} "
+                    f"status={row.get('status', '') or '-'} "
+                    f"active={row.get('active_agent', '') or '-'} "
+                    f"stride={int(row.get('manager_stride', 0) or 0)} "
+                    f"bus={int(row.get('direct_bus_handoffs', 0) or 0)} "
+                    f"split={int(row.get('task_splits', 0) or 0)} "
+                    f"routes={int(row.get('manager_routes', 0) or 0)} "
+                    f"art={int(row.get('code_artifacts', 0) or 0)} "
+                    f"res={int(row.get('research_notes', 0) or 0)} "
+                    f"rev={int(row.get('review_feedback', 0) or 0)} "
+                    f"wd={int(row.get('watchdog_trigger_count', 0) or 0)}"
+                )
+            )
+
+        _case_print(f"start | direction={direction}")
+        submit_out = sess.submit_user_message(prompt)
+        completed, elapsed = _selftest_wait_until_idle(
+            sess,
+            timeout_seconds,
+            on_event=_on_event,
+            on_poll=_on_poll,
+        )
+        snap = sess.snapshot(lite=True)
+        board = sess._ensure_blackboard()
+        kernel_state = sess._ensure_uniform_kernel_state()
+        latest_text = _selftest_latest_assistant_text(sess)
+        latest_log = _selftest_latest_execution_log(sess)
+        tool_outputs = _selftest_tool_outputs(sess)
+        validation = _run_validation(
+            sess,
+            str(case.get("validator_command", "") or "").strip(),
+            timeout=max(20, min(90, int(timeout_seconds))),
+        )
+        errors = []
+        if not bool(submit_out.get("ok", False)):
+            errors.append("submit_failed")
+        if not completed:
+            errors.append("timeout")
+        if not bool(validation.get("ok", False)):
+            errors.append("validator_nonzero_exit")
+        if str(case.get("validator_token", "") or "").strip() not in str(validation.get("output", "") or ""):
+            errors.append("validator_token_missing")
+        expected_paths = [str(x) for x in (case.get("expected_paths", []) or []) if str(x).strip()]
+        missing_paths = [rel for rel in expected_paths if not (sess.files_root / rel).exists()]
+        if missing_paths:
+            errors.append("missing_expected_files")
+        locked_drift = []
+        for rel, expected_hash in locked_hashes.items():
+            if _file_sha1(sess.files_root / rel) != expected_hash:
+                locked_drift.append(rel)
+        if locked_drift:
+            errors.append("locked_inputs_modified")
+        if bool(case.get("require_load_skill", False)) and not _selftest_used_tool(sess, "load_skill"):
+            errors.append("load_skill_missing")
+
+        artifact_fingerprint = _artifact_fingerprint(sess, expected_paths)
+        watchdog = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
+        final_state = _state_digest(sess, elapsed_seconds=elapsed)
+        state_samples.append(final_state)
+        case_trace = {
+            "index": int(index),
+            "name": name,
+            "direction": direction,
+            "prompt": prompt,
+            "submit_ok": bool(submit_out.get("ok", False)),
+            "completed": bool(completed),
+            "elapsed_seconds": round(float(elapsed), 2),
+            "event_count": len(trace_events),
+            "state_sample_count": len(state_samples),
+            "events": trace_events[-800:],
+            "state_samples": state_samples[-400:],
+            "final_state": final_state,
+            "session_root": str(sess.root),
+            "files_root": str(sess.files_root),
+        }
+        trace_json_path = case_root / "trace.json"
+        trace_md_path = case_root / "trace.md"
+        passed = not errors
+        row = {
+            "index": int(index),
+            "name": name,
+            "direction": direction,
+            "prompt": prompt,
+            "passed": bool(passed),
+            "errors": errors,
+            "elapsed_seconds": round(float(elapsed), 2),
+            "model": selected_model,
+            "suite_version": suite_version,
+            "session_id": str(sess.id),
+            "session_root": str(sess.root),
+            "files_root": str(sess.files_root),
+            "case_report_root": str(case_root),
+            "trace_json_path": str(trace_json_path),
+            "trace_md_path": str(trace_md_path),
+            "latest_assistant_text": trim(latest_text, 500),
+            "latest_execution_log": trim(latest_log, 500),
+            "tool_outputs": [trim(x, 240) for x in tool_outputs[-4:]],
+            "validator": validation,
+            "expected_paths": expected_paths,
+            "missing_paths": missing_paths,
+            "locked_paths": list(locked_hashes.keys()),
+            "locked_drift": locked_drift,
+            "artifact_fingerprint": artifact_fingerprint,
+            "blackboard_status": str(board.get("status", "")),
+            "code_artifacts_count": len(board.get("code_artifacts", {}) or {}),
+            "research_notes_count": len(board.get("research_notes", []) or []),
+            "review_feedback_count": len(board.get("review_feedback", []) or []),
+            "manager_routes_count": len(getattr(sess, "manager_routes", []) or []),
+            "agentbus_messages_count": len(getattr(sess, "agent_bus_messages", []) or []),
+            "used_load_skill": bool(_selftest_used_tool(sess, "load_skill")),
+            "used_tools": {
+                "bash": bool(_selftest_used_tool(sess, "bash")),
+                "read_file": bool(_selftest_used_tool(sess, "read_file")),
+                "write_file": bool(_selftest_used_tool(sess, "write_file")),
+                "edit_file": bool(_selftest_used_tool(sess, "edit_file")),
+                "load_skill": bool(_selftest_used_tool(sess, "load_skill")),
+            },
+            "trace_metrics": {
+                "event_count": len(trace_events),
+                "state_sample_count": len(state_samples),
+            },
+            "uniform_kernel": {
+                "manager_stride": int(kernel_state.get("manager_stride", UNIFORM_KERNEL_MANAGER_STRIDE) or UNIFORM_KERNEL_MANAGER_STRIDE),
+                "cycles_since_manager": int(kernel_state.get("cycles_since_manager", 0) or 0),
+                "direct_bus_handoffs": int(kernel_state.get("direct_bus_handoffs", 0) or 0),
+                "deterministic_handoffs": int(kernel_state.get("deterministic_handoffs", 0) or 0),
+                "manager_handoffs": int(kernel_state.get("manager_handoffs", 0) or 0),
+                "task_splits": int(kernel_state.get("task_splits", 0) or 0),
+                "autotune_events": int(kernel_state.get("autotune_events", 0) or 0),
+                "last_load_reason": trim(str(kernel_state.get("last_load_reason", "") or "").strip(), 200),
+                "last_load_score": int(kernel_state.get("last_load_score", 0) or 0),
+                "last_tuning_reason": trim(str(kernel_state.get("last_tuning_reason", "") or "").strip(), 200),
+            },
+            "watchdog": {
+                "intent_no_tool_streak": int(watchdog.get("intent_no_tool_streak", 0) or 0),
+                "repeat_no_tool_streak": int(watchdog.get("repeat_no_tool_streak", 0) or 0),
+                "state_unchanged_streak": int(watchdog.get("state_unchanged_streak", 0) or 0),
+                "trigger_count": int(watchdog.get("trigger_count", 0) or 0),
+                "last_trigger_reason": trim(str(watchdog.get("last_trigger_reason", "") or "").strip(), 200),
+            },
+            "snapshot": {
+                "running": bool(snap.get("running", False)),
+                "execution_mode": str(snap.get("execution_mode", "")),
+                "microtask_mode": str(snap.get("microtask_mode", "")),
+                "small_model_microtask_mode": str(snap.get("small_model_microtask_mode", "")),
+                "session_compression_level": int(snap.get("session_compression_level", 0) or 0),
+                "agent_round_index": int(snap.get("agent_round_index", 0) or 0),
+            },
+        }
+        trace_json_path.write_text(json_dumps(case_trace, indent=2), encoding="utf-8")
+        trace_md_path.write_text(_render_case_trace_md(case_trace, row), encoding="utf-8")
+        results.append(row)
+        verdict = "PASS" if passed else "FAIL"
+        details = (
+            f"validator_exit={int(validation.get('exit_code', 0) or 0)} "
+            f"splits={int(((row.get('uniform_kernel', {}) or {}).get('task_splits', 0) or 0))} "
+            f"direct_bus={int(((row.get('uniform_kernel', {}) or {}).get('direct_bus_handoffs', 0) or 0))} "
+            f"manager={int(((row.get('uniform_kernel', {}) or {}).get('manager_handoffs', 0) or 0))}"
+        )
+        if errors:
+            details += f" errors={','.join(errors)}"
+        _case_print(f"end | {verdict} | elapsed={round(float(elapsed), 2)}s | {details}")
+
+    summary = {
+        "ok": all(bool(row.get("passed", False)) for row in results),
+        "suite_version": suite_version,
+        "base_url": str(base_url),
+        "model": str(selected_model),
+        "session_compression_level": normalize_session_compression_level(
+            session_compression_level,
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        ),
+        "available_models": tags[:24],
+        "work_root": str(root),
+        "reports_root": str(reports_root),
+        "case_count": len(results),
+        "aggregate": {
+            "passed": sum(1 for row in results if bool(row.get("passed", False))),
+            "failed": sum(1 for row in results if not bool(row.get("passed", False))),
+            "elapsed_seconds_total": round(sum(float(row.get("elapsed_seconds", 0.0) or 0.0) for row in results), 2),
+            "task_splits_total": sum(
+                int(((row.get("uniform_kernel", {}) or {}).get("task_splits", 0) or 0))
+                for row in results
+            ),
+            "autotune_events_total": sum(
+                int(((row.get("uniform_kernel", {}) or {}).get("autotune_events", 0) or 0))
+                for row in results
+            ),
+            "load_skill_cases": sum(1 for row in results if bool(row.get("used_load_skill", False))),
+        },
+        "results": results,
+    }
+    summary_json_path = root / "selftest_summary.json"
+    summary_md_path = root / "selftest_summary.md"
+    summary_json_path.write_text(json_dumps(summary, indent=2), encoding="utf-8")
+    summary_md_path.write_text(_render_suite_md(summary), encoding="utf-8")
+    summary["summary_json_path"] = str(summary_json_path)
+    summary["summary_md_path"] = str(summary_md_path)
+    summary_json_path.write_text(json_dumps(summary, indent=2), encoding="utf-8")
+    print(
+        (
+            f"[selftest][{selected_model}] suite_end | "
+            f"passed={int((summary.get('aggregate', {}) or {}).get('passed', 0) or 0)}/"
+            f"{len(results)} | "
+            f"elapsed={float((summary.get('aggregate', {}) or {}).get('elapsed_seconds_total', 0.0) or 0.0):.2f}s | "
+            f"ok={bool(summary.get('ok', False))}"
+        ),
+        flush=True,
+    )
+    if (not keep_root) and bool(summary.get("ok", False)):
+        try:
+            shutil.rmtree(root)
+            summary["work_root_removed"] = True
+        except Exception as exc:
+            summary["work_root_removed"] = False
+            summary["cleanup_error"] = trim(str(exc), 220)
+    else:
+        summary["work_root_removed"] = False
+    return summary
+
+
+def run_local_architecture_selftest_matrix(
+    *,
+    base_url: str,
+    models: list[str],
+    max_rounds: int = 18,
+    timeout_seconds: float = 120.0,
+    keep_root: bool = False,
+    session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
+) -> dict:
+    requested_models = [str(x or "").strip() for x in models if str(x or "").strip()]
+    if not requested_models:
+        raise RuntimeError("no models specified for selftest matrix")
+    tags = list_ollama_models(base_url)
+    missing = [model_name for model_name in requested_models if tags and model_name not in tags]
+    if missing:
+        raise RuntimeError(f"requested selftest models unavailable: {', '.join(missing)}")
+    summaries: list[dict] = []
+    for model_name in requested_models:
+        summaries.append(
+            run_local_architecture_selftests(
+                base_url=base_url,
+                model=model_name,
+                max_rounds=max_rounds,
+                timeout_seconds=timeout_seconds,
+                keep_root=keep_root,
+                session_compression_level=session_compression_level,
+            )
+        )
+    case_order: list[str] = []
+    if summaries:
+        case_order = [str(row.get("name", "") or "") for row in summaries[0].get("results", []) if str(row.get("name", "") or "").strip()]
+    comparisons: list[dict] = []
+    for case_name in case_order:
+        rows = []
+        for summary in summaries:
+            for row in summary.get("results", []) or []:
+                if str(row.get("name", "") or "") == case_name:
+                    rows.append(row)
+                    break
+        if not rows:
+            continue
+        pass_map = {str(row.get("model", "") or ""): bool(row.get("passed", False)) for row in rows}
+        elapsed_map = {str(row.get("model", "") or ""): float(row.get("elapsed_seconds", 0.0) or 0.0) for row in rows}
+        split_map = {
+            str(row.get("model", "") or ""): int(((row.get("uniform_kernel", {}) or {}).get("task_splits", 0) or 0))
+            for row in rows
+        }
+        stride_map = {
+            str(row.get("model", "") or ""): int(((row.get("uniform_kernel", {}) or {}).get("manager_stride", 0) or 0))
+            for row in rows
+        }
+        tuning_map = {
+            str(row.get("model", "") or ""): trim(
+                str(((row.get("uniform_kernel", {}) or {}).get("last_tuning_reason", "") or "")).strip(),
+                120,
+            )
+            for row in rows
+        }
+        comparisons.append(
+            {
+                "name": case_name,
+                "all_passed": all(pass_map.values()),
+                "pass_map": pass_map,
+                "elapsed_seconds": elapsed_map,
+                "split_map": split_map,
+                "manager_stride_map": stride_map,
+                "last_tuning_reason_map": tuning_map,
+                "artifact_fingerprint_map": {
+                    str(row.get("model", "") or ""): str(row.get("artifact_fingerprint", "") or "")
+                    for row in rows
+                },
+            }
+        )
+    total_cases = len(comparisons)
+    aligned_cases = sum(1 for row in comparisons if len(set(row.get("pass_map", {}).values())) <= 1)
+    totals = {
+        str(summary.get("model", "") or ""): round(
+            float(((summary.get("aggregate", {}) or {}).get("elapsed_seconds_total", 0.0) or 0.0)),
+            2,
+        )
+        for summary in summaries
+    }
+    return {
+        "ok": all(bool(summary.get("ok", False)) for summary in summaries),
+        "suite_version": str((summaries[0].get("suite_version", "") if summaries else "") or "arch-regression-v4"),
+        "base_url": str(base_url),
+        "session_compression_level": normalize_session_compression_level(
+            session_compression_level,
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        ),
+        "requested_models": requested_models,
+        "available_models": tags[:24],
+        "totals_by_model": totals,
+        "case_outcome_alignment": (
+            round(float(aligned_cases) / float(total_cases), 4) if total_cases > 0 else 0.0
+        ),
+        "comparisons": comparisons,
+        "summaries": summaries,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
     parser.add_argument("--host", default="0.0.0.0")
@@ -26581,7 +34746,10 @@ def main():
     parser.add_argument(
         "--config",
         default="",
-        help="LLM config source (URL or local file path)",
+        help=(
+            "LLM config source (URL or local file path). "
+            "JSON may also include `session_compression_level` (1-5) for dynamic session memory compression."
+        ),
     )
     parser.add_argument("--ollama-base-url", default=DEFAULT_OLLAMA_BASE_URL)
     parser.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
@@ -26641,6 +34809,56 @@ def main():
         help="Agent execution mode (single|sequential|sync). Empty means read from startup config, then fallback to sync.",
     )
     parser.add_argument(
+        "--microtask-mode",
+        default="off",
+        choices=["on", "off"],
+        help="Enable uniform-kernel proactive task splitting sensitivity (default: off).",
+    )
+    parser.add_argument(
+        "--small-model-microtask-mode",
+        default="off",
+        choices=["on", "off"],
+        help="Legacy compatibility alias for microtask sensitivity (default: off).",
+    )
+    parser.add_argument(
+        "--session-compression-level",
+        default=None,
+        type=int,
+        help=(
+            "Dynamic session memory compression level [1-5]. "
+            "1=minimal compression, 3=default balanced, 5=strong compression. "
+            "This maps to config key `session_compression_level`. "
+            f"Levels: {session_compression_level_guide()}."
+        ),
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Run built-in local architecture regression tests with the configured Ollama model and exit.",
+    )
+    parser.add_argument(
+        "--selftest-models",
+        default="",
+        help="Comma-separated Ollama model list for sequential multi-model selftest matrix.",
+    )
+    parser.add_argument(
+        "--selftest-timeout",
+        default=180.0,
+        type=float,
+        help="Per-case timeout in seconds for --selftest.",
+    )
+    parser.add_argument(
+        "--selftest-max-rounds",
+        default=24,
+        type=int,
+        help="Per-case max agent rounds for --selftest.",
+    )
+    parser.add_argument(
+        "--selftest-keep-root",
+        action="store_true",
+        help="Keep the generated .selftests workspace after --selftest completes.",
+    )
+    parser.add_argument(
         "--max_user",
         default=None,
         type=int,
@@ -26684,6 +34902,7 @@ def main():
     bootstrap_base_url = args.ollama_base_url
     bootstrap_model = args.model
     external_default_provider = ""
+    existing_startup_config = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
     if str(args.config or "").strip():
         try:
             external_config, external_config_source = load_llm_config_from_source(
@@ -26703,6 +34922,37 @@ def main():
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
             sys.exit(2)
+    requested_session_compression_level = getattr(args, "session_compression_level", None)
+    resolved_session_compression_level = session_compression_level_from_config(
+        external_config if external_config else existing_startup_config,
+        default=session_compression_level_from_config(
+            existing_startup_config,
+            default=DEFAULT_SESSION_COMPRESSION_LEVEL,
+        ),
+    )
+    if requested_session_compression_level is not None:
+        normalized_requested_session_compression_level = normalize_session_compression_level(
+            requested_session_compression_level,
+            default=resolved_session_compression_level,
+        )
+        if normalized_requested_session_compression_level != int(requested_session_compression_level):
+            print(
+                "[web-agent] session_compression_level adjusted "
+                f"{requested_session_compression_level}->{normalized_requested_session_compression_level} "
+                "(allowed range 1-5)"
+            )
+        resolved_session_compression_level = normalized_requested_session_compression_level
+        external_config = with_session_compression_level(
+            external_config if external_config else existing_startup_config,
+            resolved_session_compression_level,
+        )
+        if not external_config_source:
+            external_config_source = str(LLM_CONFIG_PATH) if LLM_CONFIG_PATH.exists() else "cli:session_compression_level"
+    elif external_config:
+        external_config = with_session_compression_level(
+            external_config,
+            resolved_session_compression_level,
+        )
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
@@ -26884,6 +35134,37 @@ def main():
                 f"{requested_max_user_sessions}->{resolved_max_user_sessions} (minimum 0)"
             )
     resolved_language = normalize_ui_language(getattr(args, "language", DEFAULT_UI_LANGUAGE))
+    resolved_microtask_mode = normalize_on_off_mode(
+        getattr(args, "microtask_mode", "off"),
+        default="off",
+    )
+    resolved_small_model_microtask_mode = normalize_on_off_mode(
+        getattr(args, "small_model_microtask_mode", "off"),
+        default="off",
+    )
+    if bool(getattr(args, "selftest", False)):
+        raw_selftest_models = str(getattr(args, "selftest_models", "") or "").strip()
+        requested_models = [part.strip() for part in raw_selftest_models.split(",") if part.strip()]
+        if requested_models:
+            summary = run_local_architecture_selftest_matrix(
+                base_url=bootstrap_base_url,
+                models=requested_models,
+                max_rounds=max(4, int(getattr(args, "selftest_max_rounds", 24) or 24)),
+                timeout_seconds=max(20.0, float(getattr(args, "selftest_timeout", 180.0) or 180.0)),
+                keep_root=bool(getattr(args, "selftest_keep_root", False)),
+                session_compression_level=resolved_session_compression_level,
+            )
+        else:
+            summary = run_local_architecture_selftests(
+                base_url=bootstrap_base_url,
+                model=str(getattr(args, "model", resolved_model) or resolved_model),
+                max_rounds=max(4, int(getattr(args, "selftest_max_rounds", 24) or 24)),
+                timeout_seconds=max(20.0, float(getattr(args, "selftest_timeout", 180.0) or 180.0)),
+                keep_root=bool(getattr(args, "selftest_keep_root", False)),
+                session_compression_level=resolved_session_compression_level,
+            )
+        print(json_dumps(summary, indent=2))
+        return 0 if bool(summary.get("ok", False)) else 1
     skills_root = ensure_embedded_skills(WORKDIR)
     ensure_runtime_skills(skills_root)
     app = AppContext(
@@ -26906,6 +35187,9 @@ def main():
         resolved_execution_mode,
         resolved_max_user,
         resolved_max_user_sessions,
+        resolved_microtask_mode,
+        resolved_small_model_microtask_mode,
+        resolved_session_compression_level,
     )
     config_apply_result: dict = {}
     if external_config:
@@ -26955,6 +35239,11 @@ def main():
     print(f"[web-agent] skills_root={skills_root}")
     print(f"[web-agent] web_ui_config={web_ui_config_path}")
     print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
+    print(
+        "[web-agent] session_compression_level="
+        f"{normalize_session_compression_level(app.session_compression_level, default=DEFAULT_SESSION_COMPRESSION_LEVEL)} "
+        f"({session_compression_profile(app.session_compression_level).get('label', '')})"
+    )
     print(
         "[web-agent] web_ui_mode="
         f"{web_ui_state.get('mode', 'builtin')} "
@@ -27087,4 +35376,4 @@ def main():
         server.server_close()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
