@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import ast
 import argparse
 import base64
 from collections import deque
@@ -311,19 +312,19 @@ SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
-        "execution_mode": EXECUTION_MODE_SYNC,
+        "execution_mode": EXECUTION_MODE_SINGLE,
         "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 6,
+        "round_budget": 3,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
     2: {
         "name": "simple_multi_turn_qa",
-        "execution_mode": EXECUTION_MODE_SYNC,
-        "participants": ["explorer", "developer"],
+        "execution_mode": EXECUTION_MODE_SINGLE,
+        "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 10,
+        "round_budget": 6,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -332,7 +333,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SYNC,
         "participants": ["explorer", "developer"],
         "assigned_expert": "developer",
-        "round_budget": 12,
+        "round_budget": 10,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -341,7 +342,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SYNC,
         "participants": ["explorer", "developer", "reviewer"],
         "assigned_expert": "developer",
-        "round_budget": 36,
+        "round_budget": 24,
         "requires_user_confirmation": False,
         "complexity": "complex",
     },
@@ -7540,7 +7541,7 @@ TOOLS = [
     tool_def("list_teammates", "List teammates.", {}),
     tool_def(
         "ask_colleague",
-        "Send a structured request to explorer/developer/reviewer via internal agent bus.",
+        "Send a structured request to explorer/developer/reviewer. In single-agent mode this becomes one bounded inline support call and returns the result immediately.",
         {
             "to": {"type": "string", "enum": ["explorer", "developer", "reviewer"]},
             "intent": {"type": "string"},
@@ -7674,6 +7675,7 @@ class SessionState:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        execution_mode_locked: bool = False,
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
@@ -7713,6 +7715,7 @@ class SessionState:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.execution_mode_locked = bool(execution_mode_locked)
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -7834,6 +7837,7 @@ class SessionState:
         self.blackboard = self._new_blackboard("")
         self.uniform_kernel_state: dict = self._new_uniform_kernel_state()
         self.pending_agentbus_route: dict = {}
+        self.inline_support_mode_depth = 0
         self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
         self.small_model_microtask_mode = normalize_on_off_mode(
             small_model_microtask_mode,
@@ -8756,6 +8760,9 @@ class SessionState:
                     raw.get("execution_mode", self.execution_mode),
                     default=self.execution_mode,
                 )
+                self.execution_mode_locked = bool(
+                    raw.get("execution_mode_locked", self.execution_mode_locked)
+                )
                 try:
                     lvl = int(raw.get("runtime_task_level", self.runtime_task_level) or 0)
                 except Exception:
@@ -8943,6 +8950,7 @@ class SessionState:
             "current_phase": str(self.current_phase or "idle"),
             "current_tool_name": str(self.current_tool_name or ""),
             "execution_mode": normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC),
+            "execution_mode_locked": bool(self.execution_mode_locked),
             "runtime_task_level": int(self.runtime_task_level or 0),
             "runtime_execution_mode": (
                 normalize_execution_mode(self.runtime_execution_mode, default="")
@@ -9161,6 +9169,8 @@ class SessionState:
             return int(self.event_seq)
 
     def _emit(self, kind: str, data: dict):
+        if int(getattr(self, "inline_support_mode_depth", 0) or 0) > 0:
+            return
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -9183,6 +9193,8 @@ class SessionState:
         self.activity = self.activity[-300:]
 
     def _emit_transient(self, kind: str, data: dict):
+        if int(getattr(self, "inline_support_mode_depth", 0) or 0) > 0:
+            return
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -9560,6 +9572,10 @@ class SessionState:
                 "Do not create Todo/task scaffolding unless user explicitly asks for project management. "
                 "Prioritize direct final response or one concrete minimal tool action."
             )
+            ask_colleague_hint = (
+                "If you use ask_colleague in single-agent mode, it is a one-turn support request and control returns to you immediately. "
+                "Use it only for a bounded unblock, then continue the main task yourself."
+            )
         else:
             todo_hint = (
                 "For non-trivial tasks, call TodoWrite early with 3-7 concise items "
@@ -9567,6 +9583,7 @@ class SessionState:
                 "Avoid redundant TodoWrite calls. "
                 "If TodoWrite fails or repeats with no changes, call TodoWriteRescue with simple string items."
             )
+            ask_colleague_hint = ""
         route_hint = (
             f"Runtime manager classification: level={runtime_level or '-'}, mode={runtime_mode}, "
             f"scale_preference={self.runtime_scale_preference or 'balanced'}, "
@@ -9609,6 +9626,7 @@ class SessionState:
             "Use the smallest relevant skill only when the current step is blocked by a missing capability. "
             "Do not preload multiple skills or follow a fixed skill sequence. "
             "If execution stalls (no tool calls / repeated failures), prefer load_skill('execution-degradation-recovery') and follow it. "
+            f"{ask_colleague_hint} "
             "Use list_skill_providers and list_skill_protocols to inspect dynamic backend skill integrations. "
             "If user asks to save generated guidance/workflow as reusable skill, call write_skill to write SKILL.md under global ./skills. "
             "When changing files, prefer write_file/edit_file so the UI can render line-level diffs. "
@@ -10100,6 +10118,22 @@ class SessionState:
                     "recovery hint injected for next model turn"
                 )
             },
+        )
+
+    def _looks_like_structured_output_parse_error(self, error_text: str) -> bool:
+        low = str(error_text or "").strip().lower()
+        if not low:
+            return False
+        return any(
+            token in low
+            for token in (
+                "failed to parse json",
+                "unexpected end of json input",
+                "invalid character",
+                "malformed json",
+                "after object key:value pair",
+                "cannot unmarshal",
+            )
         )
 
     def _recover_tool_args_from_malformed(
@@ -12364,8 +12398,6 @@ class SessionState:
         t = (text or "").strip().lower()
         if not t:
             return False
-        if len(t) >= 220:
-            return True
         markers = [
             "设计",
             "构建",
@@ -12390,6 +12422,27 @@ class SessionState:
         ]
         return any(x in t for x in markers)
 
+    def _heuristic_task_level(self, goal_text: str, *, complexity: str = "") -> int:
+        clean = strip_thinking_content(str(goal_text or "")).strip()
+        direct_question = self._looks_like_direct_question_request(clean)
+        nontrivial = self._looks_nontrivial_request(clean)
+        length = len(clean)
+        complexity_key = trim(str(complexity or "").strip().lower(), 20)
+        if complexity_key not in TASK_COMPLEXITY_LEVELS:
+            complexity_key = "complex" if nontrivial else "simple"
+        if complexity_key == "simple":
+            if direct_question and length <= 120:
+                return 1
+            if length <= 320:
+                return 2
+            return 3
+        goal_low = clean.lower()
+        if any(tok in goal_low for tok in ("system-level", "系统级", "blackboard", "orchestrator", "内核", "基础设施")):
+            return 5
+        if nontrivial and length >= 1200:
+            return 5
+        return 4
+
     def _infer_task_profile(self, goal: str) -> dict:
         clean = strip_thinking_content(str(goal or "")).strip()
         nontrivial = self._looks_nontrivial_request(clean)
@@ -12407,18 +12460,18 @@ class SessionState:
                 "goal_chars": int(length),
                 "updated_at": float(now_ts()),
             }
-        if (not nontrivial) and length <= 240:
+        if (not nontrivial) and length <= 480:
             return {
                 "task_type": "general",
                 "complexity": "simple",
                 "direct_objective": direct_objective,
                 "recommended_agents": ["developer"],
-                "round_budget": 4,
+                "round_budget": 5,
                 "reason": "bounded lightweight request",
                 "goal_chars": int(length),
                 "updated_at": float(now_ts()),
             }
-        if nontrivial or length >= 240:
+        if nontrivial or length >= 640:
             return {
                 "task_type": "general",
                 "complexity": "complex",
@@ -12774,6 +12827,7 @@ class SessionState:
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
         wake_attempted = False
+        structured_recovery_injected = False
         for attempt in range(1, retry_budget + 2):
             try:
                 return self._call_interruptible(
@@ -12794,7 +12848,33 @@ class SessionState:
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
                 wake_note = ""
+                err_text = trim(str(exc), 320)
                 status = int(getattr(exc, "status", 0) or 0)
+                if (not structured_recovery_injected) and self._looks_like_structured_output_parse_error(err_text):
+                    structured_recovery_injected = True
+                    try:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "<structured-output-recovery>"
+                                    "上一轮结构化输出被截断或格式损坏。请立刻重发：只输出一个更短、更紧凑的工具调用。"
+                                    "如果目标文件还不存在，先写入最小可验证版本，不要一次性内联超长代码、HTML 或 JSON。"
+                                    "只有在验证或明确反馈要求时再扩展内容。"
+                                    "</structured-output-recovery>"
+                                ),
+                            }
+                        )
+                    except Exception:
+                        pass
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                f"{context_label} structured-output recovery injected after parse failure"
+                            )
+                        },
+                    )
                 if (
                     not wake_attempted
                     and str(self.ollama.provider or "").lower() == "ollama"
@@ -13761,6 +13841,28 @@ class SessionState:
             clean = re.sub(r"(?is)^(then|然后)\s+", "", clean).strip()
         return trim(clean or original, max_chars)
 
+    def _goal_requires_runtime_skill_load(self, goal_text: str = "") -> bool:
+        goal = trim(
+            strip_thinking_content(str(goal_text or self.runtime_reclassify_goal or "")).replace("\n", " ").strip(),
+            2400,
+        )
+        if not goal:
+            try:
+                goal = trim(
+                    strip_thinking_content(str((self.blackboard or {}).get("original_goal", "") or "")).replace("\n", " ").strip(),
+                    2400,
+                )
+            except Exception:
+                goal = ""
+        low = goal.lower()
+        if "load_skill" in low:
+            return True
+        return bool(
+            re.search(r"\bcall\s+load\s+skill\b", low)
+            or re.search(r"在编辑文件之前[^。！？]*load_skill", goal, flags=re.IGNORECASE)
+            or re.search(r"before editing files[^.?!。！？]*load_skill", goal, flags=re.IGNORECASE)
+        )
+
     def _primary_objective_text(self, goal: str = "", preferred: str = "", *, max_chars: int = 800) -> str:
         goal_clean = trim(strip_thinking_content(str(goal or "")).replace("\n", " ").strip(), max_chars)
         preferred_clean = trim(strip_thinking_content(str(preferred or "")).replace("\n", " ").strip(), max_chars)
@@ -13817,16 +13919,10 @@ class SessionState:
         except Exception:
             raw_level = 0
         if raw_level not in TASK_LEVEL_CHOICES:
-            goal_len = len(str(goal or "").strip())
-            if complexity == "complex":
-                raw_level = 4
-            elif goal_len <= 180:
-                raw_level = 2
-            else:
-                raw_level = 3
+            raw_level = self._heuristic_task_level(goal, complexity=complexity)
         task_level = int(raw_level)
         level_policy = TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3])
-        execution_mode = normalize_execution_mode(
+        execution_mode = self._resolve_task_execution_mode(
             src.get("execution_mode", level_policy.get("execution_mode", EXECUTION_MODE_SYNC)),
             default=str(level_policy.get("execution_mode", EXECUTION_MODE_SYNC)),
         )
@@ -14027,6 +14123,8 @@ class SessionState:
             text = str((row or {}).get("content", "") or "").strip()
             if not text:
                 continue
+            if self._is_internal_runtime_control_error(text):
+                continue
             low = text.lower()
             if any(tok in low for tok in blockers):
                 return True
@@ -14200,6 +14298,33 @@ class SessionState:
         if not isinstance(rows, list):
             return []
         out: list[dict] = []
+        board_hint = getattr(self, "blackboard", {})
+        profile_hint = self._ensure_blackboard_task_profile(board_hint if isinstance(board_hint, dict) else {})
+        collapse_target = ""
+        if normalize_execution_mode(
+            profile_hint.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        ) == EXECUTION_MODE_SINGLE:
+            collapse_target = self._single_mode_executor_role(board_hint if isinstance(board_hint, dict) else None)
+        board_goal = (
+            str((board_hint or {}).get("original_goal", "") or "").strip()
+            if isinstance(board_hint, dict)
+            else ""
+        )
+        deliverable_hints = list(self._implementation_step_targets(board_hint, limit=WATCHDOG_MAX_DECOMPOSE_STEPS))
+        if not deliverable_hints:
+            deliverable_hints = list(self._goal_direct_expected_artifacts(board_goal))
+        expected_specs = self._goal_expected_artifact_specs(board_goal)
+        generated_hint_paths = {
+            normalize_rel_preview_path(str((row or {}).get("path", "") or "").strip())
+            or trim(str((row or {}).get("path", "") or "").strip(), 280)
+            for row in expected_specs
+            if isinstance(row, dict) and str((row or {}).get("mode", "exist") or "exist").strip().lower() == "generated"
+        }
+        generated_hint_paths = {rel for rel in generated_hint_paths if rel}
+        primary_deliverable = deliverable_hints[0] if deliverable_hints else ""
+        hinted_paths: set[str] = set()
+        next_deliverable_idx = 0
 
         def _infer_target(action_type: str, instruction: str, fallback: str = "developer") -> str:
             raw = self._sanitize_agent_role(fallback) or "developer"
@@ -14231,6 +14356,8 @@ class SessionState:
                 row.get("target", row.get("owner", row.get("role", row.get("agent", ""))))
             )
             target = target or _infer_target(action_type, instruction)
+            if collapse_target:
+                target = collapse_target
             try:
                 step_no = int(row.get("step", idx + 1) or (idx + 1))
             except Exception:
@@ -14251,6 +14378,39 @@ class SessionState:
                 updated_at = float(row.get("updated_at", issued_at) or issued_at)
             except Exception:
                 updated_at = issued_at
+            if target == "developer" and action_type in {"implement", "execute"}:
+                explicit_paths = self._step_instruction_target_paths(instruction, limit=1)
+                if (
+                    explicit_paths
+                    and primary_deliverable
+                    and explicit_paths[0] in generated_hint_paths
+                    and explicit_paths[0] != primary_deliverable
+                ):
+                    if primary_deliverable in hinted_paths:
+                        continue
+                    instruction = re.sub(
+                        r"(?i)target path:\s*[^\s\n]+",
+                        f"Target path: {primary_deliverable}",
+                        instruction,
+                        count=1,
+                    )
+                    description = instruction
+                    explicit_paths = [primary_deliverable]
+                if explicit_paths:
+                    hinted_paths.update(explicit_paths)
+                elif deliverable_hints:
+                    while next_deliverable_idx < len(deliverable_hints):
+                        candidate = normalize_rel_preview_path(str(deliverable_hints[next_deliverable_idx] or "").strip()) or trim(
+                            str(deliverable_hints[next_deliverable_idx] or "").strip(),
+                            280,
+                        )
+                        next_deliverable_idx += 1
+                        if not candidate or candidate in hinted_paths:
+                            continue
+                        instruction = trim(f"Target path: {candidate}. {instruction}", 900)
+                        description = instruction
+                        hinted_paths.add(candidate)
+                        break
             out.append(
                 {
                     "step": max(1, step_no),
@@ -14430,19 +14590,36 @@ class SessionState:
             str(board.get("original_goal", "") or "").strip(),
             280,
         )
-        direct_expected = self._goal_direct_expected_artifacts(str(board.get("original_goal", "") or ""))
-        missing_expected = list(self._goal_missing_expected_artifacts(board))[:3]
-        target_deliverables = list(missing_expected[:3] or direct_expected[:3])
+        target_deliverables = self._implementation_step_targets(board, limit=3)
         feedback_rows = self._actionable_review_feedback_rows(board)
         need_fix = bool(feedback_rows) and (not self._manager_feedback_passed_from_blackboard(board))
         research_count = len(board.get("research_notes", []) or [])
         code_count = len(board.get("code_artifacts", {}) or {})
+        last_worker = board.get("last_worker_reply", {}) if isinstance(board.get("last_worker_reply"), dict) else {}
+        last_worker_role = self._sanitize_agent_role(last_worker.get("role", "")) or self._sanitize_agent_role(board.get("active_agent", ""))
+        validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+        validation_ready = bool(validation_cmd and code_count > 0)
         has_material_outputs = bool(
             code_count
             or research_count
             or len(board.get("execution_logs", []) or [])
             or len(board.get("review_feedback", []) or [])
         )
+        if validation_ready and (not need_fix):
+            return self._watchdog_normalize_steps(
+                [
+                    {
+                        "step": 1,
+                        "action_type": "validate",
+                        "target": "reviewer",
+                        "description": (
+                            f"Check command: {validation_cmd}. "
+                            "Run the validator now and return pass/fix with concrete evidence. "
+                            f"Objective: {objective}"
+                        ),
+                    },
+                ]
+            )
         raw = [
             {
                 "step": 1,
@@ -14662,7 +14839,54 @@ class SessionState:
             step=step,
         )
 
-    def _normalize_delegate_path_hint(self, path_text: str) -> str:
+    def _workspace_hint_candidate_paths(
+        self,
+        board: dict | None = None,
+        *,
+        limit: int = 48,
+    ) -> list[str]:
+        bb = board if isinstance(board, dict) else (
+            self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        )
+        cap = max(8, min(128, int(limit or 48)))
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path_text: object):
+            rel = normalize_rel_preview_path(str(path_text or "").strip()) or trim(
+                str(path_text or "").strip(),
+                280,
+            )
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        for rel in self._workspace_contract_paths(limit=cap):
+            _add(rel)
+        for rel in self._goal_protected_paths(str(bb.get("original_goal", "") or "")):
+            _add(rel)
+        for rel in self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or "")):
+            _add(rel)
+        for rel in self._goal_missing_expected_artifacts(bb):
+            _add(rel)
+        for rel in self._current_deliverable_paths(bb, limit=cap):
+            _add(rel)
+        for row in self._workspace_validation_expectation_rows(limit=max(24, cap * 3)):
+            if not isinstance(row, dict):
+                continue
+            _add(row.get("path", ""))
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _canonicalize_workspace_hint_path(
+        self,
+        path_text: object,
+        *,
+        board: dict | None = None,
+        limit: int = 48,
+    ) -> str:
         raw = str(path_text or "").strip().strip("'\"")
         if not raw:
             return ""
@@ -14673,7 +14897,50 @@ class SessionState:
             norm = self._normalize_tool_path_text(raw)
         except Exception:
             norm = raw
-        return normalize_rel_preview_path(norm) or normalize_rel_preview_path(raw)
+        rel = normalize_rel_preview_path(norm) or normalize_rel_preview_path(raw)
+        if rel:
+            try:
+                if (self.files_root / rel).exists():
+                    return rel
+            except Exception:
+                pass
+        bb = board if isinstance(board, dict) else (
+            self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        )
+        candidates = self._workspace_hint_candidate_paths(bb, limit=limit)
+        if rel and rel in candidates:
+            return rel
+        raw_low = str(raw).replace("\\", "/").lower()
+        if rel:
+            rel_low = rel.lower()
+        else:
+            rel_low = ""
+        suffix_matches: list[str] = []
+        for candidate in candidates:
+            cand_low = candidate.lower()
+            if (
+                raw_low.endswith(cand_low)
+                or raw_low.endswith("/" + cand_low)
+                or ("/" + cand_low) in raw_low
+                or (rel_low and (rel_low.endswith(cand_low) or rel_low.endswith("/" + cand_low)))
+            ):
+                suffix_matches.append(candidate)
+        if suffix_matches:
+            suffix_matches.sort(key=lambda item: (-len(item), item))
+            return suffix_matches[0]
+        basename = PurePosixPath(rel or raw.replace("\\", "/")).name.strip().lower()
+        if basename:
+            basename_matches = [
+                candidate
+                for candidate in candidates
+                if PurePosixPath(candidate).name.strip().lower() == basename
+            ]
+            if len(basename_matches) == 1:
+                return basename_matches[0]
+        return rel
+
+    def _normalize_delegate_path_hint(self, path_text: str) -> str:
+        return self._canonicalize_workspace_hint_path(path_text, limit=48)
 
     def _dedupe_delegate_instruction_text(
         self,
@@ -14717,6 +14984,11 @@ class SessionState:
             "- latest_validation_failure:",
             "- manager_judgement:",
         )
+        canonical_constraints = {
+            "constraint: stay on the target path in this turn.": "Constraint: stay on the target path in this turn.",
+            "constraint: act directly on the target path in this turn.": "Constraint: act directly on the target path in this turn.",
+            "constraint: create the target path directly in this turn.": "Constraint: create the target path directly in this turn.",
+        }
         lines: list[str] = []
         seen: set[str] = set()
         for raw_line in src.splitlines():
@@ -14725,6 +14997,10 @@ class SessionState:
                 continue
             low = line.lower()
             if low.startswith("executor mode (stateless) step "):
+                continue
+            if low.startswith("current split step "):
+                continue
+            if low.startswith("[language-policy]"):
                 continue
             if trigger_pat:
                 line = re.sub(
@@ -14754,9 +15030,107 @@ class SessionState:
             if not line:
                 continue
             low = line.lower()
+            if low.startswith("bootstrap from the nearest contract or validator files:"):
+                ground_from = trim(line.split(":", 1)[1].strip(), 1200)
+                if ground_from:
+                    line = f"Ground from: {ground_from}"
+                    low = line.lower()
+            elif low.startswith("validation is still pending."):
+                cmd_match = re.search(r"`([^`]+)`", line)
+                if cmd_match:
+                    line = f"Check command: {trim(cmd_match.group(1), 240)}"
+                    low = line.lower()
+            elif low.startswith("retry note:"):
+                detail = trim(line.split(":", 1)[1].strip(), 1200) if ":" in line else ""
+                if not detail:
+                    continue
+                if re.match(r"^step\s+\d+\s+retry pending\b", detail, flags=re.IGNORECASE):
+                    continue
+                line = f"Latest blocker: {detail}"
+                low = line.lower()
+            elif low.startswith("latest validator failure:"):
+                detail = trim(line.split(":", 1)[1].strip(), 1200)
+                if detail:
+                    line = f"Latest blocker: {detail}"
+                    low = line.lower()
+            elif low.startswith("expected deliverables are still missing:"):
+                detail = trim(line.split(":", 1)[1].strip(), 1200)
+                if detail:
+                    line = f"Missing artifacts: {detail}"
+                    low = line.lower()
+            elif low.startswith("user explicitly required one minimal runtime skill before editing."):
+                line = "Skill requirement: load one minimal relevant skill before editing."
+                low = line.lower()
+            elif low.startswith("target grounding is already complete for this delegate."):
+                line = canonical_constraints["constraint: act directly on the target path in this turn."]
+                low = line.lower()
+            elif low.startswith("this target file does not exist yet for the current step."):
+                line = canonical_constraints["constraint: create the target path directly in this turn."]
+                low = line.lower()
+            elif low.startswith(("do not reread files", "do not call read_file", "do not call read_from_blackboard", "do not call bash", "do not ask colleagues")):
+                line = canonical_constraints["constraint: stay on the target path in this turn."]
+                low = line.lower()
+            elif low.startswith("before giving pass/fix, ground the judgement in execution evidence"):
+                continue
+            elif low.startswith("generate final summary report from blackboard evidence."):
+                line = "Summary: compile final summary from blackboard before finish."
+                low = line.lower()
+            elif low.startswith("reviewer summary is still missing."):
+                line = "Summary: final summary is still missing."
+                low = line.lower()
+            elif low.startswith("summary generation was attempted in previous cycle."):
+                line = "Summary: previous summary attempt exists; compile the final summary from current evidence."
+                low = line.lower()
+            elif low.startswith("do not finish yet."):
+                detail = trim(line.split(".", 1)[1].strip(), 1200) if "." in line else ""
+                line = f"Finish blocked: {detail}" if detail else "Finish blocked."
+                low = line.lower()
+            elif low.startswith("if it fails, repair only the reported gap"):
+                continue
+            elif low.startswith("focus the repair on the most relevant deliverable path:"):
+                detail = trim(line.split(":", 1)[1].strip(), 1200)
+                if detail:
+                    line = f"Repair focus: {detail}"
+                    low = line.lower()
+            elif low.startswith("do not hand off to review or finish before validation passes."):
+                line = "Constraint: do not hand off before validation passes."
+                low = line.lower()
+            elif low.startswith("if it fails, point developer only to the specific failing gap."):
+                line = "Constraint: point only to the specific failing gap."
+                low = line.lower()
+            elif low.startswith("if minimal grounding is still needed, do only the smallest read required first"):
+                line = "Constraint: if grounding is still needed, do only the smallest required read first."
+                low = line.lower()
+            elif low.startswith("use incremental edits"):
+                line = "Constraint: keep edits incremental."
+                low = line.lower()
+            elif low.startswith("relevant runtime skills:"):
+                continue
+            elif low.startswith("skill discovery is already satisfied"):
+                continue
+            elif low.startswith("runtime skill is already available for this run"):
+                continue
+            elif low.startswith("rules: execute one concrete tool call now"):
+                continue
+            elif low.startswith("execution rule:"):
+                line = canonical_constraints["constraint: stay on the target path in this turn."]
+                low = line.lower()
+            elif low.startswith("delivery lock:"):
+                if "does not exist yet" in low:
+                    line = canonical_constraints["constraint: create the target path directly in this turn."]
+                else:
+                    line = canonical_constraints["constraint: act directly on the target path in this turn."]
+                low = line.lower()
+            elif low.startswith("recovery mode:"):
+                line = canonical_constraints["constraint: stay on the target path in this turn."]
+                low = line.lower()
+            elif low.startswith(("mode:", "scope:")):
+                continue
             if low in {".", "-", ":"}:
                 continue
             if low.startswith(capsule_prefixes):
+                continue
+            if re.match(r"^step\s+\d+\s+retry pending\b", low):
                 continue
             key = line.casefold()
             if key in seen:
@@ -14769,6 +15143,7 @@ class SessionState:
         line = trim(re.sub(r"\s+", " ", str(text or "").strip()), max_chars * 2)
         if not line:
             return ""
+        line = re.sub(r"^\[[^\]]+\]\s*", "", line).strip()
         line = re.sub(r"^\d+/\d+\s+\w+\s*->\s*\w+\s*\|\s*", "", line, flags=re.IGNORECASE)
         for prefix in (
             "current focus:",
@@ -14805,8 +15180,33 @@ class SessionState:
             "update blackboard evidence",
             "write concise acceptance notes to blackboard",
             "write concrete acceptance constraints to blackboard",
+            "bootstrap from the nearest contract or validator files",
+            "capture exact acceptance constraints, required outputs, and target paths on the blackboard",
             "support/meta tools",
             "suggestion-only text reply is forbidden",
+            "implement one incremental patch",
+            "address review feedback with concrete code changes",
+            "advance one concrete deliverable update",
+            "take one bounded step only",
+            "proceed with one concrete next step",
+            "use exactly one edit_file or write_file",
+            "use exactly one write_file",
+            "do not reread files",
+            "do not call read_file",
+            "do not call read_from_blackboard",
+            "do not call bash",
+            "do not ask colleagues",
+            "delivery lock:",
+            "recovery mode:",
+            "execution rule:",
+            "plan route and coordinate current node handoff",
+            "gather constraints/evidence for current node",
+            "provide research support and risk notes for current node",
+            "implement concrete outputs and file/tool changes for current node",
+            "prepare and deliver implementation updates for current node",
+            "review outputs and keep quality gate updated for current node",
+            "validate current node and provide pass/fix judgement",
+            "handle current node work",
         )
         return any(token in low for token in runtime_tokens)
 
@@ -14838,14 +15238,21 @@ class SessionState:
             "return pass/fix judgement with evidence",
             "exact contract literals that must remain verbatim when relevant:",
             "expected deliverables are still missing:",
+            "execution rule:",
+            "delivery lock:",
+            "recovery mode:",
+            "mode:",
+            "scope:",
         )
         hidden_contains = (
             "do not call load_skill/list_skills/list_skill_providers/list_skill_protocols again",
             "support/meta tools alone",
             "suggestion-only text reply is forbidden",
+            "retry pending",
+            "[language-policy]",
+            "默认使用简体中文完成计划",
         )
         lines: list[str] = []
-        fallback_lines: list[str] = []
         seen: set[str] = set()
         for raw_line in src.splitlines():
             line = trim(re.sub(r"\s+", " ", str(raw_line or "").strip()), 1600)
@@ -14900,30 +15307,32 @@ class SessionState:
             if key in seen:
                 continue
             seen.add(key)
-            if low.startswith(
-                (
-                    "grounding is ready.",
-                    "implement one incremental patch.",
-                    "proceed with one concrete next step",
-                    "address review feedback with concrete code changes",
-                    "advance one concrete deliverable update",
-                    "take one bounded step only",
-                )
-            ):
-                fallback_lines.append(line)
-                continue
             lines.append(line)
+        if lines:
+            def _line_priority(text: str) -> tuple[int, str]:
+                low = text.lower()
+                if low.startswith("target path:"):
+                    return (0, low)
+                if low.startswith("tool mode:"):
+                    return (1, low)
+                if low.startswith("latest blocker:"):
+                    return (2, low)
+                if low.startswith("required facts:"):
+                    return (3, low)
+                if low.startswith("constraint:"):
+                    return (4, low)
+                return (5, low)
+
+            ranked = sorted(
+                list(enumerate(lines)),
+                key=lambda item: (_line_priority(item[1])[0], item[0]),
+            )
+            lines = [line for _, line in ranked]
         if not lines:
-            lines = fallback_lines[:2]
-        elif len(lines) < 2:
-            for item in fallback_lines:
-                if item.casefold() in seen:
-                    continue
-                lines.append(item)
-                if len(lines) >= 2:
-                    break
-        if not lines:
-            return trim(objective_clean, max_chars)
+            target_paths = self._step_instruction_target_paths(src, limit=1)
+            if objective_clean and target_paths:
+                return trim(f"Objective: {objective_clean}\nTarget path: {target_paths[0]}", max_chars)
+            return trim(objective_clean or self._delegate_display_compact_content(src, max_chars=max_chars), max_chars)
         return trim("\n".join(lines[:3]), max_chars)
 
     def _watchdog_pick_executor_route(self, board: dict | None = None) -> tuple[dict, dict] | None:
@@ -14960,8 +15369,8 @@ class SessionState:
         step_display = self._dedupe_delegate_instruction_text(
             trim(
                 str(
-                    step_row.get("description", "")
-                    or step_row.get("instruction", "")
+                    step_row.get("instruction", "")
+                    or step_row.get("description", "")
                     or ""
                 ).strip(),
                 900,
@@ -14972,7 +15381,17 @@ class SessionState:
         )
         trigger_reason = trim(str(dq.get("trigger_reason", "") or "").strip(), 180)
         retry_hint = trim(str(dq.get("last_error", "") or "").strip(), 280)
+        if re.match(r"^step\s+\d+\s+retry pending\b", retry_hint, flags=re.IGNORECASE):
+            retry_hint = ""
         target_paths = self._step_instruction_target_paths(step_instruction, limit=3)
+        if target == "developer" and (not target_paths):
+            target_hint_path = self._developer_target_path_hint(bb)
+            if not target_hint_path:
+                missing_expected = self._goal_missing_expected_artifacts(bb)
+                target_hint_path = missing_expected[0] if missing_expected else ""
+            if target_hint_path and f"target path: {target_hint_path}".lower() not in step_instruction.lower():
+                step_instruction = trim(f"Target path: {target_hint_path}\n{step_instruction}", 1000)
+                target_paths = [target_hint_path]
         target_hint = (
             "Exact target path(s) for this step: "
             + ", ".join(target_paths[:3])
@@ -14987,15 +15406,10 @@ class SessionState:
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = 3
         instruction_lines: list[str] = []
-        step_marker = f"Current split step {current}/{total}."
-        if step_display and step_marker.lower() not in step_display.lower():
-            instruction_lines.append(step_marker)
         if target_hint and target_hint.lower() not in step_instruction.lower():
             instruction_lines.append(target_hint)
         if retry_hint and retry_hint.lower() not in step_instruction.lower():
             instruction_lines.append(f"Latest blocker: {retry_hint}")
-        if step_instruction:
-            instruction_lines.append(step_instruction)
         direct_objective = self._primary_objective_text(
             goal=str(bb.get("original_goal", "") or ""),
             preferred=str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""),
@@ -15003,6 +15417,13 @@ class SessionState:
         )
         if direct_objective and all(direct_objective.lower() not in str(line or "").lower() for line in instruction_lines):
             instruction_lines.insert(0, f"Objective: {direct_objective}")
+        focus_line = self._delegate_instruction_display_text(
+            step_display or step_instruction,
+            objective=direct_objective,
+            max_chars=480,
+        )
+        if focus_line and focus_line.lower() not in "\n".join(instruction_lines).lower():
+            instruction_lines.append(focus_line)
         internal_instruction = self._dedupe_delegate_instruction_text(
             "\n".join(line for line in instruction_lines if str(line or "").strip()),
             trigger_reason=trigger_reason,
@@ -15016,11 +15437,17 @@ class SessionState:
             require_check=bool(target == "reviewer"),
             max_chars=1200,
         ) or internal_instruction
+        display_source = trim(
+            "\n".join(
+                part for part in (internal_instruction, step_display) if str(part or "").strip()
+            ),
+            1400,
+        )
         args = {
             "target": target,
             "instruction": internal_instruction,
             "display_instruction": self._delegate_instruction_display_text(
-                step_display or internal_instruction,
+                display_source or internal_instruction,
                 objective=direct_objective,
                 max_chars=900,
             ),
@@ -15153,6 +15580,10 @@ class SessionState:
         has_substantive_tools = self._tool_results_have_substantive_progress(tool_results)
         success = False
         target_paths = self._step_instruction_target_paths(step_instruction, limit=3)
+        target_state = self._developer_target_step_state(bb, role=role_key) if role_key == "developer" else {}
+        edit_only_window = bool(target_state.get("edit_only_window", False))
+        create_only_window = bool(target_state.get("create_only_window", False))
+        target_materialized = bool(target_state.get("target_materialized", False))
         has_target_delivery = False
         has_delivery_tool = False
         current_index = cursor
@@ -15211,6 +15642,7 @@ class SessionState:
         hard_missing_target = bool(
             action_type == "implement"
             and target_paths
+            and (not target_materialized)
             and (not has_target_delivery)
             and (not target_recently_changed)
         )
@@ -15222,7 +15654,35 @@ class SessionState:
             out["step_advanced"] = True
             dq["last_error"] = ""
         elif status in {"no-tools", "tools", "skip"}:
-            if hard_missing_target:
+            if hard_missing_target and (edit_only_window or create_only_window):
+                if attempts >= 2:
+                    current["status"] = "blocked"
+                    dq["active"] = False
+                    dq["cursor"] = cursor
+                    out["queue_active"] = False
+                    out["queue_escalated"] = True
+                    out["escalation_reason"] = "create-only-window" if create_only_window else "edit-only-window"
+                    dq["last_error"] = trim(
+                        (
+                            "current target path is already explicit and does not need re-anchor; "
+                            + (
+                                "manager must send developer back to the exact target path for write_file now"
+                                if create_only_window
+                                else "manager must send developer back to the exact target path for edit_file/write_file now"
+                            )
+                        ),
+                        300,
+                    )
+                else:
+                    current["status"] = "retry"
+                    dq["last_error"] = trim(
+                        (
+                            "exact target path already explicit; retry the same developer step once more with the current target lock: "
+                            + ", ".join(target_paths[:3])
+                        ),
+                        300,
+                    )
+            elif hard_missing_target:
                 missing_msg = trim(
                     "step "
                     f"{cursor + 1} still missing exact target path(s): {', '.join(target_paths[:3])}",
@@ -15273,10 +15733,16 @@ class SessionState:
                     dq["last_error"] = missing_msg
             elif action_type == "validate" and role_key == "reviewer":
                 validation_hint = self._latest_validation_failure_hint(bb)
-                requirement_hint = self._validation_contract_requirement_hint(validation_hint)
+                repair_focus_paths = self._preferred_validation_target_paths(bb, limit=3)
+                requirement_hint = self._validation_contract_requirement_hint(
+                    validation_hint,
+                    board=bb,
+                    target_path=(repair_focus_paths[0] if repair_focus_paths else ""),
+                )
                 review_hint = self._latest_review_feedback_hint(bb, max_chars=280)
                 has_fix_evidence = bool(validation_hint or review_hint)
-                repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+                if not repair_focus_paths:
+                    repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
                 if not repair_focus_paths:
                     repair_focus_paths = self._current_deliverable_paths(bb, limit=2)
                 if not has_fix_evidence:
@@ -15390,6 +15856,10 @@ class SessionState:
         pinned_selection: str,
     ) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        target_state = self._developer_target_step_state(bb, role=role_key) if role_key == "developer" else {}
+        edit_only_window = bool(target_state.get("edit_only_window", False))
+        create_only_window = bool(target_state.get("create_only_window", False))
         wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         status = str((step or {}).get("status", "") or "").strip().lower()
@@ -15405,23 +15875,29 @@ class SessionState:
             wd["last_no_tool_text"] = ""
             wd["last_no_tool_hash"] = ""
         elif status == "no-tools":
-            if not text:
+            if edit_only_window or create_only_window:
+                wd["intent_no_tool_streak"] = 0
+                wd["repeat_no_tool_streak"] = 0
+                wd["last_no_tool_text"] = ""
+                wd["last_no_tool_hash"] = ""
+            elif not text:
                 wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0)) + 1
                 wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
             elif self._watchdog_intent_without_action(text):
                 wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0)) + 1
             else:
                 wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
-            prev_text = str(wd.get("last_no_tool_text", "") or "")
-            sim = self._watchdog_similarity(prev_text, text)
-            if (not text) and (not prev_text):
-                wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0))
-            elif sim >= float(WATCHDOG_REPEAT_SIMILARITY_THRESHOLD):
-                wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
-            elif text:
-                wd["repeat_no_tool_streak"] = 0
-            wd["last_no_tool_text"] = text
-            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
+            if not (edit_only_window or create_only_window):
+                prev_text = str(wd.get("last_no_tool_text", "") or "")
+                sim = self._watchdog_similarity(prev_text, text)
+                if (not text) and (not prev_text):
+                    wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0))
+                elif sim >= float(WATCHDOG_REPEAT_SIMILARITY_THRESHOLD):
+                    wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0)) + 1
+                elif text:
+                    wd["repeat_no_tool_streak"] = 0
+                wd["last_no_tool_text"] = text
+                wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
         else:
             wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
@@ -15446,8 +15922,13 @@ class SessionState:
         if not bool(dq.get("active", False)):
             if bool(progress_row.get("queue_escalated", False)):
                 trigger_reason = ""
+            elif edit_only_window or create_only_window:
+                trigger_reason = ""
             elif status == "no-tools" and self._current_delegate_is_mandatory_for(role):
-                trigger_reason = "mandatory-no-tool"
+                if bool(target_state.get("target_read_done", False)) and not bool(target_state.get("target_touched", False)):
+                    trigger_reason = ""
+                else:
+                    trigger_reason = "mandatory-no-tool"
             elif int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
                 trigger_reason = "intent-without-tool-call"
             elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
@@ -15759,8 +16240,10 @@ class SessionState:
         reason_text = trim(str(reason or "").strip(), 220)
         reason_low = reason_text.lower()
         target_state = self._developer_target_step_state(bb, role="developer")
+        code_count = len(bb.get("code_artifacts", {}) or {})
         anchored_deliverables = bool(
             target_state.get("explicit_target_step", False)
+            or code_count > 0
             or self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
             or self._goal_missing_expected_artifacts(bb)
         )
@@ -15891,7 +16374,7 @@ class SessionState:
             return []
         pattern = (
             r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\."
-            r"(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h)"
+            r"(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h|hpp|cc|cxx|php|rb|swift|kt|scala|sql|xml|xsd|xsl|f90|f95|f03|f08)"
         )
         output_verbs = (
             "create",
@@ -16112,6 +16595,9 @@ class SessionState:
                 continue
             fp = self.files_root / rel
             if mode == "generated":
+                if rel in art or fp.exists():
+                    continue
+                missing.append(rel)
                 continue
             if mode == "touch":
                 if rel in art or fp.exists():
@@ -16130,11 +16616,97 @@ class SessionState:
             if not isinstance(row, dict):
                 continue
             rel = str(row.get("path", "") or "").strip()
-            mode = str(row.get("mode", "exist") or "exist").strip().lower()
-            if not rel or mode == "generated" or rel in out:
+            if not rel or rel in out:
                 continue
             out.append(rel)
         return out[:8]
+
+    def _goal_protected_paths(self, goal: str) -> list[str]:
+        text = str(goal or "")
+        if not text:
+            return []
+        pattern = (
+            r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\."
+            r"(?:json|yaml|toml|html|tsx|jsx|cpp|csv|txt|yml|css|ini|md|py|ts|js|java|go|rs|sh|c|h|hpp|cc|cxx|php|rb|swift|kt|scala|sql|xml|xsd|xsl|f90|f95|f03|f08)"
+        )
+        blockers = (
+            "do not edit",
+            "don't edit",
+            "do not modify",
+            "do not change",
+            "不要编辑",
+            "不要修改",
+            "不要更改",
+        )
+        sentence_boundary = re.compile(r"(?:[,;\n!?，；。！？])|(?:\.(?=\s|$))")
+
+        def _nearest_clause_bounds(raw_text: str, start: int, end: int) -> tuple[int, int]:
+            left = -1
+            for row in sentence_boundary.finditer(raw_text, 0, start):
+                left = int(row.start())
+            right = len(raw_text)
+            row = sentence_boundary.search(raw_text, end)
+            if row:
+                right = int(row.start())
+            if left < 0:
+                left = 0
+            else:
+                left += 1
+            return left, max(left, right)
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(pattern, text):
+            raw_path = str(match.group(0) or "").strip()
+            if not raw_path:
+                continue
+            clause_start, clause_end = _nearest_clause_bounds(text, int(match.start()), int(match.end()))
+            prefix = text[clause_start:int(match.start())]
+            prefix_low = prefix.lower()
+            if not any(blocker in prefix_low[-160:] for blocker in blockers):
+                continue
+            rel = normalize_rel_preview_path(raw_path) or trim(raw_path, 280)
+            if not rel or rel in seen:
+                continue
+            seen.add(rel)
+            out.append(rel)
+        return out[:12]
+
+    def _validate_agent_write_target(self, role: str, rel_path: str, *, board: dict | None = None) -> str:
+        role_key = self._sanitize_agent_role(role)
+        rel = normalize_rel_preview_path(str(rel_path or "").strip()) or trim(str(rel_path or "").strip(), 280)
+        if not rel:
+            return ""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        protected = self._goal_protected_paths(str(bb.get("original_goal", "") or ""))
+        if rel in protected:
+            return (
+                f"Error: `{rel}` is protected by the current goal and must remain unchanged. "
+                "Write only to allowed deliverable paths."
+            )
+        if role_key != "developer":
+            return ""
+        if not self._developer_delivery_pressure_active(role_key, bb):
+            return ""
+        target_state = self._developer_target_step_state(bb, role=role_key)
+        target_path = normalize_rel_preview_path(str(target_state.get("target_path", "") or "")) or trim(
+            str(target_state.get("target_path", "") or "").strip(),
+            280,
+        )
+        validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        target_touched = bool(target_state.get("target_touched", False))
+        if target_path and rel != target_path and (not validation_targeted_repair) and (not target_touched):
+            derived_outputs = self._target_derived_output_paths(target_path, board=bb, limit=4)
+            if rel in derived_outputs:
+                return (
+                    f"Error: current implementation step is locked to exact target path `{target_path}`. "
+                    f"`{rel}` is a derived output of that source. Repair `{target_path}` so it regenerates `{rel}` correctly instead of writing the derived file directly."
+                )
+            return (
+                f"Error: current implementation step is locked to exact target path `{target_path}`. "
+                f"Do not write `{rel}` in this turn."
+            )
+        return ""
 
     def _current_deliverable_paths(self, board: dict | None = None, *, limit: int = 4) -> list[str]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -16213,6 +16785,10 @@ class SessionState:
                 continue
             text = re.sub(r"\s+", " ", text).strip()
             text = re.sub(r"^(review(?:er)?|feedback|fix)\s*[:：-]\s*", "", text, flags=re.IGNORECASE).strip()
+            if re.search(r"(?:^|\s)[-d][rwx-]{9}\s+\d+\s+\S+\s+\S+\s+\d+\s+\w+\s+\d+\s+\d{2}:\d{2}\s+\S+", text):
+                continue
+            if re.search(r"(?:^|\s)[-d][rwx-]{9}\s+\d+\s+\S+\s+\S+\s+\d+\s+\w+\s+\d+\s+\d{4}\s+\S+", text):
+                continue
             if text:
                 return trim(text, max_chars)
         return ""
@@ -16251,33 +16827,59 @@ class SessionState:
         paths = self._current_deliverable_paths(bb, limit=3)
         missing = list(self._goal_missing_expected_artifacts(bb))[:3]
         contract_paths = self._workspace_contract_paths(limit=3)
+        validation_targets = self._preferred_validation_target_paths(bb, limit=3) if validation_gap else []
         gap = self._latest_review_feedback_hint(bb, max_chars=280) or validation_gap
         if self._delegate_display_is_runtime_meta(gap):
             gap = ""
         parts: list[str] = []
         role_key = self._sanitize_agent_role(role)
-        if objective:
-            parts.append(f"Objective: {objective}")
-        anchor = focus or next_action
-        if anchor and anchor.lower() not in objective.lower():
-            parts.append(f"Current focus: {anchor}")
-        if gap and gap.lower() not in str(anchor or "").lower():
-            parts.append(f"Latest blocker: {gap}")
         target_path = ""
         ground_from = ""
         if role_key == "developer":
-            target_path = self._developer_target_path_hint(bb)
-            if not target_path and missing:
-                target_path = missing[0]
-            if not target_path and paths:
-                target_path = paths[0]
+            target_path = (
+                self._developer_target_path_hint(bb)
+                or (validation_targets[0] if validation_targets else "")
+                or trim(str(plan.get("target_path", "") or "").strip(), 280)
+                or (missing[0] if missing else "")
+                or (paths[0] if paths else "")
+            )
+            if target_path and not self._path_is_materialized(target_path, bb):
+                support_paths = self._implementation_support_paths(target_path, board=bb, limit=3)
+                if support_paths:
+                    ground_from = ", ".join(support_paths[:3])
         elif role_key == "explorer" and contract_paths:
             if self._explorer_grounding_pressure_active(role_key, bb) or self._recent_role_file_read_count(role_key, bb) <= 0:
                 ground_from = ", ".join(contract_paths[:3])
         if target_path:
             parts.append(f"Target path: {target_path}")
+        source_guard = ""
+        if role_key == "developer" and target_path:
+            source_guard = self._source_output_guard_line(target_path, board=bb, max_chars=260)
+        if objective:
+            parts.append(f"Objective: {objective}")
+        if source_guard:
+            parts.append(source_guard)
+        anchor = focus or next_action
+        anchor_low = str(anchor or "").lower()
+        if role_key == "developer" and target_path:
+            if anchor_low.startswith("target path:") or target_path.lower() in anchor_low:
+                anchor = ""
+        if anchor and anchor.lower() not in objective.lower():
+            parts.append(f"Current focus: {anchor}")
+        if gap and gap.lower() not in str(anchor or "").lower():
+            parts.append(f"Latest blocker: {gap}")
         if ground_from:
             parts.append(f"Ground from: {ground_from}")
+        requirement_line = ""
+        if role_key == "developer" and target_path:
+            requirement_line = self._validation_requirement_summary(
+                target_path,
+                board=bb,
+                max_items=5,
+                max_chars=360,
+            )
+        if requirement_line and requirement_line.lower() not in "\n".join(parts).lower():
+            parts.append(requirement_line)
         if require_check and validation_cmd:
             parts.append(f"Check command: {validation_cmd}")
         return trim("\n".join(parts), max_chars)
@@ -16318,7 +16920,19 @@ class SessionState:
             return live
         if live_norm and live_norm in specific_norm:
             return trim(specific, max_chars)
-        return trim(f"{live}\nThis turn: {specific}", max_chars)
+        merged: list[str] = []
+        seen: set[str] = set()
+        for block in (live, specific):
+            for raw_line in str(block or "").splitlines():
+                line = trim(re.sub(r"\s+", " ", str(raw_line or "").strip()), 600)
+                if not line:
+                    continue
+                key = line.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(line)
+        return trim("\n".join(merged), max_chars)
 
     def _manager_first_deliverable_instruction(self, board: dict | None = None, *, max_chars: int = 1200) -> str:
         return self._compose_manager_live_instruction(
@@ -16373,10 +16987,233 @@ class SessionState:
             return False
         return bool(re.search(r"\bpass(?:ed)?[_a-z0-9-]*\b", low))
 
+    def _goal_existing_workspace_paths(self, goal: str, limit: int = 8) -> list[str]:
+        cap = max(1, min(20, int(limit or 8)))
+        text = str(goal or "")
+        if not text:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in WORKSPACE_PATH_RE.findall(text):
+            rel = normalize_rel_preview_path(str(raw or "").strip()) or trim(str(raw or "").strip(), 280)
+            if not rel or rel in seen:
+                continue
+            fp = self.files_root / rel
+            if not fp.exists() or (not fp.is_file()):
+                continue
+            seen.add(rel)
+            out.append(rel)
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _implementation_priority_paths(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(12, int(limit or 4)))
+        goal_text = str(bb.get("original_goal", "") or "")
+        direct_expected = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._goal_direct_expected_artifacts(goal_text)
+        ]
+        missing_expected = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._goal_missing_expected_artifacts(bb)
+        ]
+        current_paths = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._current_deliverable_paths(bb, limit=max(cap * 2, 6))
+        ]
+        executable_sources = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._validation_executable_source_paths(bb, limit=max(cap * 2, 6))
+        ]
+        deliverable_pool = {
+            rel
+            for rel in (direct_expected + missing_expected + current_paths)
+            if rel
+        }
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str):
+            rel = normalize_rel_preview_path(str(candidate or "").strip()) or trim(str(candidate or "").strip(), 280)
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        exec_targets = [rel for rel in executable_sources if rel in deliverable_pool]
+        for rel in exec_targets or executable_sources[:1]:
+            _add(rel)
+        for rel in missing_expected:
+            _add(rel)
+        for rel in direct_expected:
+            _add(rel)
+        for rel in current_paths:
+            _add(rel)
+        return out[:cap]
+
+    def _implementation_step_targets(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(12, int(limit or 4)))
+        goal_text = str(bb.get("original_goal", "") or "")
+        specs = self._goal_expected_artifact_specs(goal_text)
+        generated_paths: list[str] = []
+        code_like_paths: list[str] = []
+        code_exts = {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".rb", ".go", ".rs",
+            ".java", ".kt", ".scala", ".php", ".pl", ".lua", ".swift", ".c",
+            ".cc", ".cpp", ".cxx", ".h", ".hpp", ".m", ".mm", ".f90", ".f",
+        }
+        for row in specs:
+            if not isinstance(row, dict):
+                continue
+            rel = normalize_rel_preview_path(str(row.get("path", "") or "").strip()) or trim(
+                str(row.get("path", "") or "").strip(),
+                280,
+            )
+            if not rel:
+                continue
+            mode = str(row.get("mode", "exist") or "exist").strip().lower()
+            if mode == "generated":
+                if rel not in generated_paths:
+                    generated_paths.append(rel)
+                continue
+            if PurePosixPath(rel).suffix.lower() in code_exts and rel not in code_like_paths:
+                code_like_paths.append(rel)
+        executable_sources = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._validation_executable_source_paths(bb, limit=max(cap * 2, 6))
+        ]
+        validation_focus_active = bool(
+            self._latest_validation_failure_hint(bb)
+            or self._latest_review_feedback_hint(bb, max_chars=200)
+        )
+        validation_targets = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (
+                self._preferred_validation_target_paths(bb, limit=max(cap * 2, 6))
+                if validation_focus_active
+                else []
+            )
+        ]
+        priority_paths = self._implementation_priority_paths(bb, limit=max(cap * 2, 6))
+        if not priority_paths:
+            return []
+        prefer_source_targets = bool(executable_sources or (generated_paths and code_like_paths))
+        generated_set = {rel for rel in generated_paths if rel}
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str):
+            rel = normalize_rel_preview_path(str(candidate or "").strip()) or trim(str(candidate or "").strip(), 280)
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        for rel in validation_targets:
+            _add(rel)
+        if prefer_source_targets:
+            for rel in executable_sources:
+                _add(rel)
+            for rel in code_like_paths:
+                _add(rel)
+        for rel in priority_paths:
+            clean = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            if not clean:
+                continue
+            if prefer_source_targets and generated_set and clean in generated_set:
+                continue
+            _add(clean)
+        if not out:
+            for rel in priority_paths:
+                _add(rel)
+        return out[:cap]
+
+    def _blocking_missing_expected_artifacts(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(12, int(limit or 4)))
+        missing_expected = [
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._goal_missing_expected_artifacts(bb)
+        ]
+        missing_expected = [rel for rel in missing_expected if rel]
+        if not missing_expected:
+            return []
+        step_targets = self._implementation_step_targets(bb, limit=max(cap * 2, 6))
+        out: list[str] = []
+        seen: set[str] = set()
+        for rel in step_targets:
+            clean = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            if not clean or clean in seen or clean not in missing_expected:
+                continue
+            seen.add(clean)
+            out.append(clean)
+            if len(out) >= cap:
+                return out[:cap]
+        if out:
+            return out[:cap]
+        mode_map: dict[str, str] = {}
+        for row in self._goal_expected_artifact_specs(str(bb.get("original_goal", "") or "")):
+            if not isinstance(row, dict):
+                continue
+            rel = normalize_rel_preview_path(str(row.get("path", "") or "").strip()) or trim(
+                str(row.get("path", "") or "").strip(),
+                280,
+            )
+            if rel:
+                mode_map[rel] = str(row.get("mode", "exist") or "exist").strip().lower()
+        for rel in missing_expected:
+            if mode_map.get(rel) == "generated":
+                continue
+            out.append(rel)
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _implementation_support_paths(
+        self,
+        target_path: str = "",
+        *,
+        board: dict | None = None,
+        limit: int = 3,
+    ) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(6, int(limit or 3)))
+        goal_text = str(bb.get("original_goal", "") or "")
+        target_rel = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str):
+            rel = normalize_rel_preview_path(str(candidate or "").strip()) or trim(str(candidate or "").strip(), 280)
+            if not rel or rel == target_rel or rel in seen:
+                return
+            fp = self.files_root / rel
+            if not fp.exists() or (not fp.is_file()):
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        for rel in self._implementation_priority_paths(bb, limit=max(cap * 2, 4)):
+            if self._path_is_materialized(rel, bb):
+                _add(rel)
+        for rel in self._goal_existing_workspace_paths(goal_text, limit=max(cap * 2, 4)):
+            _add(rel)
+        for rel in self._workspace_contract_paths(limit=max(cap * 2, 4)):
+            _add(rel)
+        for rel in self._current_deliverable_paths(bb, limit=max(cap * 2, 4)):
+            if self._path_is_materialized(rel, bb):
+                _add(rel)
+        return out[:cap]
+
     def _workspace_contract_paths(self, limit: int = 6) -> list[str]:
         cap = max(1, min(12, int(limit or 6)))
         out: list[str] = []
         seen: set[str] = set()
+        board = self.blackboard if isinstance(self.blackboard, dict) else {}
+        goal_text = str(board.get("original_goal", "") or "")
 
         def _accept(fp: Path):
             if len(out) >= cap or (not fp.exists()) or (not fp.is_file()):
@@ -16388,6 +17225,10 @@ class SessionState:
             out.append(rel)
 
         for rel in ("validate.py", "docs/spec.md", "spec.md"):
+            _accept(self.files_root / rel)
+        for rel in self._goal_protected_paths(goal_text):
+            _accept(self.files_root / rel)
+        for rel in self._goal_existing_workspace_paths(goal_text, limit=max(4, cap * 2)):
             _accept(self.files_root / rel)
         if len(out) >= cap:
             return out[:cap]
@@ -16409,6 +17250,708 @@ class SessionState:
                     _accept(fp)
         except Exception:
             pass
+        return out[:cap]
+
+    def _validation_literal_binding_value(
+        self,
+        node: object,
+        bindings: dict[str, object] | None = None,
+    ) -> tuple[object, bool]:
+        env = bindings if isinstance(bindings, dict) else {}
+        if isinstance(node, ast.Name) and node.id in env:
+            return env[node.id], True
+        if not isinstance(node, ast.AST):
+            return None, False
+        try:
+            value = ast.literal_eval(node)
+        except Exception:
+            return None, False
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value, True
+        if isinstance(value, (list, tuple)):
+            if len(value) <= 8 and all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+                return list(value), True
+            return None, False
+        if isinstance(value, dict):
+            if (
+                len(value) <= 6
+                and all(isinstance(k, (str, int, float, bool)) or k is None for k in value.keys())
+                and all(isinstance(v, (str, int, float, bool)) or v is None for v in value.values())
+            ):
+                return value, True
+        return None, False
+
+    def _validation_literal_text(self, value: object, *, max_chars: int = 160) -> str:
+        if isinstance(value, str):
+            return trim(repr(value), max_chars)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return trim(repr(value), max_chars)
+        if isinstance(value, list):
+            try:
+                return trim(json_dumps(value, ensure_ascii=False), max_chars)
+            except Exception:
+                return trim(repr(value), max_chars)
+        if isinstance(value, dict):
+            try:
+                return trim(json_dumps(value, ensure_ascii=False, sort_keys=True), max_chars)
+            except Exception:
+                return trim(repr(value), max_chars)
+        return trim(repr(value), max_chars)
+
+    def _validation_source_path_from_ast(self, node: object) -> str:
+        if not isinstance(node, ast.AST):
+            return ""
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            func = sub.func
+            if not isinstance(func, ast.Attribute) or func.attr not in {"read_text", "read_bytes"}:
+                continue
+            base = func.value
+            if not isinstance(base, ast.Call):
+                continue
+            base_fn = base.func
+            if not isinstance(base_fn, ast.Name) or base_fn.id != "Path":
+                continue
+            if not base.args:
+                continue
+            head = base.args[0]
+            if not isinstance(head, ast.Constant) or not isinstance(head.value, str):
+                continue
+            rel = normalize_rel_preview_path(str(head.value or "").strip()) or trim(str(head.value or "").strip(), 280)
+            if rel:
+                return rel
+        return ""
+
+    def _validation_expr_source_paths(self, node: object, var_sources: dict[str, str] | None = None) -> list[str]:
+        if not isinstance(node, ast.AST):
+            return []
+        mapping = var_sources if isinstance(var_sources, dict) else {}
+        out: list[str] = []
+        seen: set[str] = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                rel = normalize_rel_preview_path(str(mapping.get(sub.id, "") or "").strip())
+                if rel and rel not in seen:
+                    seen.add(rel)
+                    out.append(rel)
+            rel = self._validation_source_path_from_ast(sub)
+            if rel and rel not in seen:
+                seen.add(rel)
+                out.append(rel)
+        return out
+
+    def _workspace_validation_expectation_rows(self, limit: int = 48) -> list[dict]:
+        cap = max(1, min(96, int(limit or 48)))
+        out: list[dict] = []
+        seen: set[tuple[str, int, str]] = set()
+        contract_files = [rel for rel in self._workspace_contract_paths(limit=8) if str(rel or "").lower().endswith(".py")]
+
+        def _record(path: str, line_no: int, text: str, *, source: str):
+            rel = normalize_rel_preview_path(str(path or "").strip()) or trim(str(path or "").strip(), 280)
+            summary = trim(re.sub(r"\s+", " ", str(text or "").strip()), 220)
+            if not rel or not summary:
+                return
+            key = (rel, int(line_no or 0), summary.casefold())
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(
+                {
+                    "path": rel,
+                    "line": int(line_no or 0),
+                    "text": summary,
+                    "source": trim(str(source or "").strip(), 120),
+                }
+            )
+
+        def _visit_block(
+            statements: list[ast.stmt],
+            *,
+            contract_rel: str,
+            var_sources: dict[str, str],
+            bindings: dict[str, object],
+        ):
+            for stmt in statements:
+                if len(out) >= cap:
+                    return
+                if isinstance(stmt, ast.Assign):
+                    if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                        target_name = stmt.targets[0].id
+                        source_path = self._validation_source_path_from_ast(stmt.value)
+                        if source_path:
+                            var_sources[target_name] = source_path
+                        value, ok = self._validation_literal_binding_value(stmt.value, bindings)
+                        if ok:
+                            bindings[target_name] = value
+                    continue
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    source_path = self._validation_source_path_from_ast(stmt.value)
+                    if source_path:
+                        var_sources[stmt.target.id] = source_path
+                    value, ok = self._validation_literal_binding_value(stmt.value, bindings)
+                    if ok:
+                        bindings[stmt.target.id] = value
+                    continue
+                if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
+                    iter_value, ok = self._validation_literal_binding_value(stmt.iter, bindings)
+                    items = list(iter_value) if ok and isinstance(iter_value, list) else []
+                    if items:
+                        for item in items[:8]:
+                            nested_bindings = dict(bindings)
+                            nested_bindings[stmt.target.id] = item
+                            _visit_block(
+                                list(stmt.body),
+                                contract_rel=contract_rel,
+                                var_sources=dict(var_sources),
+                                bindings=nested_bindings,
+                            )
+                    else:
+                        _visit_block(
+                            list(stmt.body),
+                            contract_rel=contract_rel,
+                            var_sources=dict(var_sources),
+                            bindings=dict(bindings),
+                        )
+                    if stmt.orelse:
+                        _visit_block(
+                            list(stmt.orelse),
+                            contract_rel=contract_rel,
+                            var_sources=dict(var_sources),
+                            bindings=dict(bindings),
+                        )
+                    continue
+                if isinstance(stmt, ast.Assert):
+                    test = stmt.test
+                    if isinstance(test, ast.Compare) and len(test.ops) == 1 and len(test.comparators) == 1:
+                        left = test.left
+                        right = test.comparators[0]
+                        left_paths = self._validation_expr_source_paths(left, var_sources)
+                        right_paths = self._validation_expr_source_paths(right, var_sources)
+                        left_value, left_ok = self._validation_literal_binding_value(left, bindings)
+                        right_value, right_ok = self._validation_literal_binding_value(right, bindings)
+                        op = test.ops[0]
+                        if isinstance(op, ast.Eq):
+                            path = left_paths[0] if left_paths else (right_paths[0] if right_paths else "")
+                            value = None
+                            expr = None
+                            if path and right_ok and not right_paths:
+                                value = right_value
+                                expr = left
+                            elif path and left_ok and not left_paths:
+                                value = left_value
+                                expr = right
+                            if path and expr is not None:
+                                expr_text = trim(ast.unparse(expr), 140)
+                                value_text = self._validation_literal_text(value, max_chars=140)
+                                if expr_text and value_text:
+                                    _record(
+                                        path,
+                                        int(getattr(stmt, "lineno", 0) or 0),
+                                        f"{expr_text} == {value_text}",
+                                        source=contract_rel,
+                                    )
+                        elif isinstance(op, ast.In):
+                            if right_paths and left_ok:
+                                value_text = self._validation_literal_text(left_value, max_chars=140)
+                                if value_text:
+                                    _record(
+                                        right_paths[0],
+                                        int(getattr(stmt, "lineno", 0) or 0),
+                                        f"contains {value_text}",
+                                        source=contract_rel,
+                                    )
+                            elif left_paths and right_ok:
+                                value_text = self._validation_literal_text(right_value, max_chars=140)
+                                if value_text:
+                                    _record(
+                                        left_paths[0],
+                                        int(getattr(stmt, "lineno", 0) or 0),
+                                        f"contained in {value_text}",
+                                        source=contract_rel,
+                                    )
+                    continue
+                for attr in ("body", "orelse", "finalbody"):
+                    nested = getattr(stmt, attr, None)
+                    if isinstance(nested, list) and nested:
+                        _visit_block(
+                            nested,
+                            contract_rel=contract_rel,
+                            var_sources=dict(var_sources),
+                            bindings=dict(bindings),
+                        )
+                handlers = getattr(stmt, "handlers", None)
+                if isinstance(handlers, list):
+                    for handler in handlers:
+                        if not isinstance(handler, ast.ExceptHandler):
+                            continue
+                        if isinstance(handler.body, list) and handler.body:
+                            _visit_block(
+                                handler.body,
+                                contract_rel=contract_rel,
+                                var_sources=dict(var_sources),
+                                bindings=dict(bindings),
+                            )
+
+        for rel in contract_files:
+            fp = self.files_root / rel
+            text = try_read_text(fp, max_bytes=96 * 1024) or ""
+            if not text:
+                continue
+            try:
+                tree = ast.parse(text, filename=rel)
+            except Exception:
+                continue
+            _visit_block(
+                list(tree.body),
+                contract_rel=rel,
+                var_sources={},
+                bindings={},
+            )
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _validation_failure_target_paths(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(8, int(limit or 4)))
+        hint = trim(self._latest_validation_failure_hint(bb), 400)
+        direct_expected = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+        current_paths = self._current_deliverable_paths(bb, limit=4)
+        deliverable_set = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (list(direct_expected) + list(current_paths))
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        }
+        contract_set = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (
+                list(self._workspace_contract_paths(limit=8))
+                + list(self._goal_protected_paths(str(bb.get("original_goal", "") or "")))
+            )
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        }
+        out: list[str] = []
+        seen: set[str] = set()
+        deferred_hint_paths: list[str] = []
+
+        def _add(path_text: str):
+            rel = self._canonicalize_workspace_hint_path(path_text, board=bb, limit=32)
+            if not rel or rel in seen:
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        for raw in WORKSPACE_PATH_RE.findall(hint):
+            rel = self._canonicalize_workspace_hint_path(raw, board=bb, limit=32)
+            if not rel:
+                continue
+            if deliverable_set and rel in contract_set and rel not in deliverable_set:
+                if rel not in deferred_hint_paths:
+                    deferred_hint_paths.append(rel)
+                continue
+            _add(rel)
+        line_no = 0
+        m = re.search(r"line\s+(\d+)\s*,\s*in\b", hint, flags=re.IGNORECASE)
+        if m:
+            try:
+                line_no = int(m.group(1) or 0)
+            except Exception:
+                line_no = 0
+        if line_no > 0:
+            rows = self._workspace_validation_expectation_rows(limit=96)
+            for delta in (0, -1, 1, -2, 2):
+                want = int(line_no + delta)
+                if want <= 0:
+                    continue
+                for row in rows:
+                    if int(row.get("line", 0) or 0) == want:
+                        _add(str(row.get("path", "") or ""))
+                if len(out) >= cap:
+                    return out[:cap]
+        for rel in direct_expected:
+            _add(rel)
+            if len(out) >= cap:
+                return out[:cap]
+        for rel in current_paths:
+            _add(rel)
+            if len(out) >= cap:
+                return out[:cap]
+        if not out:
+            for rel in deferred_hint_paths:
+                _add(rel)
+                if len(out) >= cap:
+                    return out[:cap]
+        return out[:cap]
+
+    def _validation_executable_source_paths(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(8, int(limit or 4)))
+        contract_files = self._workspace_contract_paths(limit=8)
+        protected = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in self._goal_protected_paths(str(bb.get("original_goal", "") or ""))
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        }
+        code_exts = {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".rb", ".go", ".rs",
+            ".java", ".kt", ".scala", ".php", ".pl", ".lua", ".swift", ".c",
+            ".cc", ".cpp", ".cxx", ".h", ".hpp", ".m", ".mm", ".f90", ".f",
+        }
+        expected_paths = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (
+                list(self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or "")))
+                + list(self._goal_missing_expected_artifacts(bb))
+                + list(self._current_deliverable_paths(bb, limit=8))
+            )
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        }
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str):
+            rel = self._canonicalize_workspace_hint_path(candidate, board=bb, limit=32)
+            if not rel or rel in seen or rel in protected:
+                return
+            if Path(rel).suffix.lower() not in code_exts:
+                return
+            if rel not in expected_paths and not (self.files_root / rel).exists():
+                return
+            seen.add(rel)
+            out.append(rel)
+
+        def _push_from_text(text: str):
+            raw = trim(str(text or "").strip(), 600)
+            if not raw:
+                return
+            for hit in WORKSPACE_PATH_RE.findall(raw):
+                _add(str(hit or ""))
+
+        def _visit_call(node: ast.AST):
+            if not isinstance(node, ast.Call):
+                return
+            func = node.func
+            name = ""
+            if isinstance(func, ast.Attribute):
+                name = str(func.attr or "").strip()
+            elif isinstance(func, ast.Name):
+                name = str(func.id or "").strip()
+            if name not in {"run", "call", "check_call", "check_output", "Popen"}:
+                return
+            if not node.args:
+                return
+            first = node.args[0]
+            call_parts: list[str] = []
+            if isinstance(first, (ast.List, ast.Tuple)):
+                for item in list(first.elts or [])[:8]:
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                        call_parts.append(str(item.value))
+            elif isinstance(first, ast.Constant) and isinstance(first.value, str):
+                call_parts.append(str(first.value))
+            for value in call_parts:
+                _push_from_text(value)
+
+        def _visit_import(node: ast.AST):
+            if isinstance(node, ast.ImportFrom):
+                module = str(node.module or "").strip()
+                if module:
+                    _add(module.replace(".", "/") + ".py")
+                parent_prefix = ""
+                if module:
+                    parent_prefix = module.replace(".", "/").rstrip("/")
+                for alias in list(node.names or [])[:8]:
+                    name = str(getattr(alias, "name", "") or "").strip()
+                    if not name or name == "*":
+                        continue
+                    if parent_prefix:
+                        _add(parent_prefix + "/" + name.replace(".", "/") + ".py")
+            elif isinstance(node, ast.Import):
+                for alias in list(node.names or [])[:8]:
+                    name = str(getattr(alias, "name", "") or "").strip()
+                    if not name:
+                        continue
+                    _add(name.replace(".", "/") + ".py")
+
+        for rel in contract_files:
+            if not str(rel or "").strip().lower().endswith(".py"):
+                continue
+            text = try_read_text(self.files_root / rel, max_bytes=96 * 1024) or ""
+            if not text:
+                continue
+            try:
+                tree = ast.parse(text, filename=rel)
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                _visit_call(node)
+                _visit_import(node)
+                if len(out) >= cap:
+                    return out[:cap]
+        return out[:cap]
+
+    def _preferred_validation_target_paths(self, board: dict | None = None, limit: int = 4) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        cap = max(1, min(8, int(limit or 4)))
+        paths = self._validation_failure_target_paths(bb, limit=max(cap * 2, 4))
+        if not paths:
+            return []
+        deliverable_set = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (
+                list(self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or "")))
+                + list(self._goal_missing_expected_artifacts(bb))
+                + list(self._current_deliverable_paths(bb, limit=8))
+            )
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        }
+        contract_only = {
+            normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+            for rel in (
+                list(self._workspace_contract_paths(limit=8))
+                + list(self._goal_protected_paths(str(bb.get("original_goal", "") or "")))
+            )
+            if normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+        } - deliverable_set
+        executable_sources = [
+            rel
+            for rel in self._validation_executable_source_paths(bb, limit=max(cap * 2, 4))
+            if rel in deliverable_set
+        ]
+        if executable_sources:
+            ordered_exec: list[str] = []
+            seen_exec: set[str] = set()
+            for rel in executable_sources + paths:
+                clean = normalize_rel_preview_path(str(rel or "").strip()) or trim(str(rel or "").strip(), 280)
+                if not clean or clean in seen_exec:
+                    continue
+                seen_exec.add(clean)
+                ordered_exec.append(clean)
+                if len(ordered_exec) >= cap:
+                    break
+            if ordered_exec:
+                return ordered_exec[:cap]
+        preferred = [rel for rel in paths if rel in deliverable_set]
+        if preferred:
+            return preferred[:cap]
+        filtered = [rel for rel in paths if rel not in contract_only]
+        if filtered:
+            return filtered[:cap]
+        return paths[:cap]
+
+    def _validation_target_requirement_line(
+        self,
+        target_path: str,
+        *,
+        board: dict | None = None,
+        max_items: int = 5,
+        max_chars: int = 360,
+    ) -> str:
+        rel = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        if not rel:
+            return ""
+        rows = self._workspace_validation_expectation_rows(limit=96)
+        hints = [
+            trim(str(row.get("text", "") or "").strip(), 180)
+            for row in rows
+            if normalize_rel_preview_path(str(row.get("path", "") or "").strip()) == rel
+            and trim(str(row.get("text", "") or "").strip(), 180)
+        ]
+        if not hints:
+            return ""
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for item in hints:
+            key = item.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(item)
+            if len(uniq) >= max(1, int(max_items or 5)):
+                break
+        if not uniq:
+            return ""
+        return trim("Required facts: " + " ; ".join(uniq), max_chars)
+
+    def _target_derived_output_paths(
+        self,
+        target_path: str,
+        *,
+        board: dict | None = None,
+        limit: int = 4,
+    ) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        if not rel:
+            return []
+        specs = self._goal_expected_artifact_specs(str(bb.get("original_goal", "") or ""))
+        if not specs:
+            return []
+        cap = max(1, min(8, int(limit or 4)))
+        code_exts = {
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".sh", ".rb", ".go", ".rs",
+            ".java", ".kt", ".scala", ".php", ".pl", ".lua", ".swift", ".c",
+            ".cc", ".cpp", ".cxx", ".h", ".hpp", ".m", ".mm", ".f90", ".f",
+        }
+        generated_paths: list[str] = []
+        code_like_paths: list[str] = []
+        for row in specs:
+            if not isinstance(row, dict):
+                continue
+            path = normalize_rel_preview_path(str(row.get("path", "") or "").strip()) or trim(
+                str(row.get("path", "") or "").strip(),
+                280,
+            )
+            if not path:
+                continue
+            mode = str(row.get("mode", "exist") or "exist").strip().lower()
+            if mode == "generated":
+                if path not in generated_paths:
+                    generated_paths.append(path)
+                continue
+            if PurePosixPath(path).suffix.lower() in code_exts and path not in code_like_paths:
+                code_like_paths.append(path)
+        if not generated_paths:
+            return []
+        executable_sources = [
+            normalize_rel_preview_path(str(item or "").strip()) or trim(str(item or "").strip(), 280)
+            for item in self._validation_executable_source_paths(bb, limit=max(cap * 2, 6))
+        ]
+        executable_sources = [item for item in executable_sources if item]
+        source_like = bool(
+            rel in executable_sources
+            or (rel in code_like_paths and len(code_like_paths) == 1)
+            or (rel in self._implementation_step_targets(bb, limit=max(cap * 2, 6)) and len(executable_sources) == 1)
+        )
+        if not source_like:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in generated_paths:
+            clean = normalize_rel_preview_path(str(item or "").strip()) or trim(str(item or "").strip(), 280)
+            if not clean or clean == rel or clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+            if len(out) >= cap:
+                break
+        return out[:cap]
+
+    def _validation_requirement_summary(
+        self,
+        target_path: str,
+        *,
+        board: dict | None = None,
+        max_items: int = 5,
+        max_chars: int = 360,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        if not rel:
+            return ""
+        scope_paths = [rel]
+        for item in self._target_derived_output_paths(rel, board=bb, limit=max(1, int(max_items or 5))):
+            clean = normalize_rel_preview_path(str(item or "").strip()) or trim(str(item or "").strip(), 280)
+            if clean and clean not in scope_paths:
+                scope_paths.append(clean)
+        rows = self._workspace_validation_expectation_rows(limit=96)
+        focus_literal = ""
+        validation_hint = trim(self._latest_validation_failure_hint(bb), 280)
+        m = re.search(r"AssertionError:\s*(.+)$", validation_hint, flags=re.IGNORECASE)
+        if m:
+            focus_literal = trim(str(m.group(1) or "").strip().strip("'\""), 160)
+        seen: set[str] = set()
+        hits: list[tuple[str, str]] = []
+        per_path_limit = 4 if len(scope_paths) == 1 else (2 if len(scope_paths) == 2 else 1)
+        total_limit = max(1, int(max_items or 5))
+        for path in scope_paths:
+            path_rows: list[tuple[int, str]] = []
+            row_index = 0
+            local_count = 0
+            for row in rows:
+                row_path = normalize_rel_preview_path(str(row.get("path", "") or "").strip()) or trim(
+                    str(row.get("path", "") or "").strip(),
+                    280,
+                )
+                if row_path != path:
+                    continue
+                text = trim(str(row.get("text", "") or "").strip(), 180)
+                if not text:
+                    continue
+                path_rows.append((row_index, text))
+                row_index += 1
+            if focus_literal:
+                focus_low = focus_literal.lower()
+                path_rows = sorted(
+                    path_rows,
+                    key=lambda item: (
+                        0 if focus_low and focus_low in item[1].lower() else 1,
+                        -len(item[1]),
+                        int(item[0]),
+                    ),
+                )
+            for _, text in path_rows:
+                key = f"{path}\n{text}".casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append((path, text))
+                local_count += 1
+                if len(hits) >= total_limit or local_count >= per_path_limit:
+                    break
+            if len(hits) >= total_limit:
+                break
+        if not hits:
+            return ""
+        if len(scope_paths) == 1:
+            return trim("Required facts: " + " ; ".join(text for _, text in hits), max_chars)
+        segments: list[str] = []
+        for path, text in hits:
+            if path == rel:
+                segments.append(text)
+            else:
+                segments.append(f"{path}: {text}")
+        return trim("Required facts: " + " ; ".join(segments), max_chars)
+
+    def _source_output_guard_line(
+        self,
+        target_path: str,
+        *,
+        board: dict | None = None,
+        max_chars: int = 260,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        if not rel:
+            return ""
+        derived = self._target_derived_output_paths(rel, board=bb, limit=3)
+        if not derived:
+            return ""
+        return trim(
+            "Derived outputs: "
+            + ", ".join(derived[:3])
+            + ". Repair this source so it regenerates those outputs correctly; do not patch the derived files directly.",
+            max_chars,
+        )
+
+    def _workspace_validation_requirement_lines(self, limit: int = 8) -> list[str]:
+        cap = max(1, min(16, int(limit or 8)))
+        rows = self._workspace_validation_expectation_rows(limit=max(24, cap * 6))
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            rel = normalize_rel_preview_path(str(row.get("path", "") or "").strip()) or trim(str(row.get("path", "") or "").strip(), 280)
+            text = trim(str(row.get("text", "") or "").strip(), 180)
+            if not rel or not text:
+                continue
+            line = trim(f"{rel}: {text}", 240)
+            key = line.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+            if len(out) >= cap:
+                break
         return out[:cap]
 
     def _workspace_contract_literal_hints(self, limit: int = 6) -> list[str]:
@@ -16459,6 +18002,49 @@ class SessionState:
                         return out[:cap]
         return out[:cap]
 
+    def _text_looks_like_directory_listing(self, text: str) -> bool:
+        lines = [str(line or "").rstrip() for line in str(text or "").splitlines() if str(line or "").strip()]
+        if not lines:
+            return False
+        if str(lines[0]).strip().lower().startswith(
+            ("bash ls", "bash find", "bash tree", "bash stat", "bash wc", "bash pwd")
+        ):
+            return True
+        listing_hits = 0
+        for line in lines[:12]:
+            if re.search(
+                r"(?:^|\s)[-d][rwx-]{9}\s+\d+\s+\S+\s+\S+\s+\d+\s+\w+\s+\d+\s+(?:\d{2}:\d{2}|\d{4})\s+\S+",
+                line,
+            ):
+                listing_hits += 1
+        return listing_hits >= 2
+
+    def _is_internal_runtime_control_error(self, text: str) -> bool:
+        low = trim(strip_thinking_content(str(text or "")).strip().lower(), 1200)
+        if not low:
+            return False
+        if "blocked by current execution pressure" in low:
+            return True
+        if "validation phase is active for reviewer" in low:
+            return True
+        if "shell command starts with agent tool" in low:
+            return True
+        if "runtime skill loading is already satisfied for this run" in low:
+            return True
+        if "grounding budget for this mandatory step is exhausted" in low:
+            return True
+        if "is not allowed for agent role" in low:
+            return True
+        if "current implementation step is locked to exact target path" in low:
+            return True
+        if "non-substantive bash inspection is blocked during targeted repair" in low:
+            return True
+        if "must remain unchanged. write only to allowed deliverable paths." in low:
+            return True
+        if "is temporarily suppressed for this step" in low and "tool '" in low:
+            return True
+        return False
+
     def _latest_validation_failure_hint(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         rows = self._recent_execution_log_rows_since_latest_pass(bb, limit=24)
@@ -16479,6 +18065,14 @@ class SessionState:
             if not text:
                 continue
             low = text.lower()
+            if low.startswith("tool_error read_file:") or low.startswith("tool_error read_from_blackboard:"):
+                continue
+            if "blocked by current execution pressure" in low:
+                continue
+            if self._text_looks_like_directory_listing(text):
+                continue
+            if self._is_internal_runtime_control_error(text):
+                continue
             if not any(tok in low for tok in needles):
                 continue
             lines = [trim(line, 220) for line in text.splitlines() if str(line).strip()]
@@ -16512,20 +18106,45 @@ class SessionState:
             return ""
         return ""
 
-    def _validation_contract_requirement_hint(self, text: str) -> str:
+    def _validation_contract_requirement_hint(
+        self,
+        text: str,
+        *,
+        board: dict | None = None,
+        target_path: str = "",
+    ) -> str:
         hint = str(text or "").strip()
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        focus_path = normalize_rel_preview_path(str(target_path or "").strip()) or trim(str(target_path or "").strip(), 280)
+        if not focus_path:
+            repair_targets = self._preferred_validation_target_paths(bb, limit=2)
+            focus_path = repair_targets[0] if repair_targets else ""
+        if focus_path:
+            requirement_line = self._validation_requirement_summary(
+                focus_path,
+                board=bb,
+                max_items=5,
+                max_chars=360,
+            )
+            if requirement_line:
+                return requirement_line
         if not hint:
             return ""
         m = re.search(r"AssertionError:\s*(.+)$", hint, flags=re.IGNORECASE)
         if m:
             literal = trim(str(m.group(1) or "").strip().strip("'\""), 160)
-            if literal:
+            if literal and not re.match(r"^[\[{(]", literal) and "':" not in literal and '":' not in literal:
                 return f"Validator expects this literal verbatim: {literal}."
         m = re.search(r"KeyError:\s*['\"]?([A-Za-z0-9_.-]+)['\"]?", hint, flags=re.IGNORECASE)
         if m:
             key = trim(str(m.group(1) or "").strip(), 120)
             if key:
                 return f"Validator expects missing key '{key}' to be produced."
+        m = re.search(r"FileNotFoundError:\s*.*?['\"]([^'\"]+)['\"]", hint, flags=re.IGNORECASE)
+        if m:
+            rel = normalize_rel_preview_path(str(m.group(1) or "").strip()) or trim(str(m.group(1) or "").strip(), 180)
+            if rel:
+                return f"Required file is missing: {rel}."
         return ""
 
     def _uniform_kernel_task_capsule(
@@ -16806,6 +18425,7 @@ class SessionState:
                 "progress": "initializing",
                 "current_focus": "",
                 "next_action": "",
+                "target_path": "",
                 "phase": "",
                 "tool": "",
                 "delegate_target": "",
@@ -16869,6 +18489,7 @@ class SessionState:
             "progress": trim(str(plan_anchor.get("progress", "initializing") or "").strip(), 60),
             "current_focus": trim(str(plan_anchor.get("current_focus", "") or "").strip(), 600),
             "next_action": trim(str(plan_anchor.get("next_action", "") or "").strip(), 600),
+            "target_path": trim(str(plan_anchor.get("target_path", "") or "").strip(), 280),
             "phase": trim(str(plan_anchor.get("phase", "") or "").strip(), 40),
             "tool": trim(str(plan_anchor.get("tool", "") or "").strip(), 80),
             "delegate_target": self._sanitize_agent_role(plan_anchor.get("delegate_target", "")),
@@ -16936,9 +18557,18 @@ class SessionState:
                 for x in (
                     validation_focus.get("contract_literals", [])
                     if isinstance(validation_focus.get("contract_literals"), list)
-                    else []
+                else []
                 )
                 if trim(str(x or "").strip(), 160)
+            ][:12],
+            "contract_requirements": [
+                trim(str(x or "").strip(), 220)
+                for x in (
+                    validation_focus.get("contract_requirements", [])
+                    if isinstance(validation_focus.get("contract_requirements"), list)
+                    else []
+                )
+                if trim(str(x or "").strip(), 220)
             ][:12],
             "approved": bool(validation_focus.get("approved", False)),
         }
@@ -17205,8 +18835,8 @@ class SessionState:
             if isinstance(step_row, dict):
                 step_text = trim(
                     str(
-                        step_row.get("description", "")
-                        or step_row.get("instruction", "")
+                        step_row.get("instruction", "")
+                        or step_row.get("description", "")
                         or ""
                     ).strip(),
                     260,
@@ -17229,6 +18859,8 @@ class SessionState:
         missing_artifacts = list(self._goal_missing_expected_artifacts(bb))[:6]
         contract_paths = self._workspace_contract_paths(limit=int(profile.get("contract_items", 5) or 5))
         contract_literals = self._workspace_contract_literal_hints(limit=int(profile.get("contract_items", 5) or 5))
+        contract_requirements = self._workspace_validation_requirement_lines(limit=int(profile.get("contract_items", 5) or 5))
+        target_path = self._developer_target_path_hint(bb)
         delegate_instruction = self._delegate_instruction_display_text(
             trim(
                 str(delegate.get("display_instruction", "") or delegate.get("instruction", "") or "").strip(),
@@ -17276,6 +18908,7 @@ class SessionState:
             "progress": trim(str(judgement.get("progress", "initializing") or "").strip(), 60),
             "current_focus": focus,
             "next_action": trim(next_action, 420),
+            "target_path": trim(target_path, 280),
             "phase": trim(str(self.current_phase or "").strip(), 40),
             "tool": trim(str(self.current_tool_name or "").strip(), 80),
             "delegate_target": self._sanitize_agent_role(delegate.get("target", "")),
@@ -17291,6 +18924,7 @@ class SessionState:
             "latest_failure": latest_failure,
             "contract_paths": contract_paths,
             "contract_literals": contract_literals,
+            "contract_requirements": contract_requirements,
             "approved": bool((bb.get("approval", {}) or {}).get("approved", False)),
         }
         previous_history = capsule.get("history_digest", {}) if isinstance(capsule.get("history_digest"), dict) else {}
@@ -17353,6 +18987,8 @@ class SessionState:
             lines.append(f"- current_focus: {trim(str(plan.get('current_focus', '') or '').strip(), 260)}")
         if str(plan.get("next_action", "") or "").strip():
             lines.append(f"- next_action: {trim(str(plan.get('next_action', '') or '').strip(), 260)}")
+        if str(plan.get("target_path", "") or "").strip():
+            lines.append(f"- target_path: {trim(str(plan.get('target_path', '') or '').strip(), 180)}")
         if str(plan.get("delegate_target", "") or "").strip() or str(plan.get("delegate_instruction", "") or "").strip():
             lines.append(
                 "- delegate_anchor: "
@@ -17419,6 +19055,20 @@ class SessionState:
                 "- contract_paths: "
                 + ", ".join(trim(str(x or ""), 80) for x in contract_paths[:mx] if trim(str(x or ""), 80))
             )
+        contract_requirements = (
+            validation.get("contract_requirements", [])
+            if isinstance(validation.get("contract_requirements"), list)
+            else []
+        )
+        if contract_requirements:
+            lines.append(
+                "- contract_requirements: "
+                + " || ".join(
+                    trim(str(x or "").strip(), 180)
+                    for x in contract_requirements[:mx]
+                    if trim(str(x or "").strip(), 180)
+                )
+            )
         if include_history:
             history_summary = trim(
                 str(history.get("summary", "") or "").strip(),
@@ -17445,6 +19095,18 @@ class SessionState:
         profile = self._ensure_blackboard_task_profile(bb)
         state = self._ensure_uniform_kernel_state()
         bus_signal = self._recent_agentbus_signal()
+        developer_target_state = self._developer_target_step_state(bb, role="developer")
+        if bool(developer_target_state.get("edit_only_window", False)):
+            return {
+                "score": 0,
+                "threshold": int(
+                    UNIFORM_KERNEL_LOAD_TRIGGER_SCORE
+                    if self._uniform_kernel_microtask_mode_enabled()
+                    else UNIFORM_KERNEL_PROACTIVE_SPLIT_SCORE
+                ),
+                "trigger": False,
+                "reason": "developer-edit-only-window",
+            }
         reasons: list[str] = []
         score = 0
         goal = str(bb.get("original_goal", "") or "").strip()
@@ -17565,9 +19227,14 @@ class SessionState:
             not self._reviewer_final_summary_ready(bb)
         )
         missing_expected = self._goal_missing_expected_artifacts(bb)
-        target_deliverables = list(missing_expected[:3] or direct_expected[:3])
+        target_deliverables = self._implementation_step_targets(bb, limit=3)
+        validation_repair_targets = self._preferred_validation_target_paths(bb, limit=3) if (
+            self._latest_validation_failure_hint(bb) or need_fix
+        ) else []
         research_count = len(bb.get("research_notes", []) or [])
         code_count = len(bb.get("code_artifacts", {}) or {})
+        validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+        validation_ready = bool(validation_cmd and code_count > 0)
         has_grounding = bool(
             research_count
             or code_count
@@ -17580,10 +19247,16 @@ class SessionState:
                 rel = normalize_rel_preview_path(str(raw or "").strip()) or str(raw or "").strip()
                 if rel and rel not in goal_path_order:
                     goal_path_order[rel] = idx
-            target_deliverables = sorted(
-                target_deliverables,
+            repair_front = [
+                rel for rel in validation_repair_targets
+                if rel in target_deliverables
+            ]
+            tail = [rel for rel in target_deliverables if rel not in repair_front]
+            tail = sorted(
+                tail,
                 key=lambda rel: (int(goal_path_order.get(rel, 10_000)), int(target_deliverables.index(rel))),
             )
+            target_deliverables = (repair_front + tail)[:3]
         raw_steps: list[dict] = []
         if not has_grounding:
             raw_steps.append(
@@ -17598,7 +19271,20 @@ class SessionState:
                     ),
                 }
             )
-        if need_fix:
+        if validation_ready and (not need_fix):
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "validate",
+                    "target": "reviewer",
+                    "description": (
+                        f"Check command: {validation_cmd}. "
+                        "Run the validator now and return pass/fix with concrete evidence."
+                        f" Objective: {objective}.{anchor_text}"
+                    ),
+                }
+            )
+        elif need_fix:
             fix_target = "developer" if (code_count > 0 or target_deliverables) else "explorer"
             fix_target_prefix = f"Target path: {target_deliverables[0]}. " if target_deliverables else ""
             raw_steps.append(
@@ -17677,14 +19363,15 @@ class SessionState:
                 else "Check that the current grounding is concrete, internally consistent, and ready for execution."
             )
         )
-        raw_steps.append(
-            {
-                "step": len(raw_steps) + 1,
-                "action_type": "validate",
-                "target": "reviewer",
-                "description": validate_description + f" Trigger: {trim(reason, 120)}.",
-            }
-        )
+        if not validation_ready or need_fix:
+            raw_steps.append(
+                {
+                    "step": len(raw_steps) + 1,
+                    "action_type": "validate",
+                    "target": "reviewer",
+                    "description": validate_description + f" Trigger: {trim(reason, 120)}.",
+                }
+            )
         if need_summary or str(profile.get("complexity", "simple") or "simple") == "complex":
             raw_steps.append(
                 {
@@ -17711,6 +19398,9 @@ class SessionState:
     def _uniform_kernel_should_consult_manager(self, board: dict, route: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         row = route if isinstance(route, dict) else {}
+        developer_target_state = self._developer_target_step_state(bb, role="developer")
+        if bool(developer_target_state.get("edit_only_window", False)):
+            return False
         source = str(row.get("source", "") or "").strip().lower()
         if source == "kernel-queue":
             dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
@@ -17784,6 +19474,12 @@ class SessionState:
         active_profile = self._ensure_blackboard_task_profile(bb)
         target = str(route.get("target", "") or "").strip().lower()
         instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
+        if target == "developer" and not self._step_instruction_target_paths(instruction, limit=1):
+            anchor = self._execution_anchor_for_role(bb, role="developer")
+            anchor_path = trim(str(anchor.get("path", "") or "").strip(), 280)
+            if anchor_path:
+                instruction = trim(f"Target path: {anchor_path}. {instruction}", 1200)
+                route["instruction"] = instruction
         display_instruction = self._delegate_instruction_display_text(
             str(route.get("display_instruction", "") or instruction),
             objective=str(route.get("direct_objective", active_profile.get("direct_objective", "")) or ""),
@@ -17795,7 +19491,7 @@ class SessionState:
             task_level = int(self.runtime_task_level or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = 3
-        execution_mode = normalize_execution_mode(
+        execution_mode = self._resolve_task_execution_mode(
             route.get("execution_mode", active_profile.get("execution_mode", self._effective_execution_mode())),
             default=str(TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3]).get("execution_mode", EXECUTION_MODE_SYNC)),
         )
@@ -17905,6 +19601,18 @@ class SessionState:
         self.runtime_direct_objective = str(profile.get("direct_objective", self.runtime_direct_objective) or "")
         self.runtime_requires_confirmation = bool(route_row.get("requires_user_confirmation", False))
         self.runtime_confirmation_needed = bool(route_row.get("requires_user_confirmation", False))
+        if target == "developer":
+            target_paths = self._step_instruction_target_paths(instruction, limit=1)
+            if target_paths:
+                bb["execution_anchor"] = self._normalize_execution_anchor(
+                    {
+                        "role": "developer",
+                        "path": target_paths[0],
+                        "source": trim(str(route_row.get("source", "") or coordinator_label).strip(), 80),
+                        "note": display_instruction or instruction,
+                        "ts": float(now_ts()),
+                    }
+                )
         bb["last_delegate"] = dict(route_row)
         bb["active_agent"] = target if target in AGENT_ROLES else ""
         self.blackboard = bb
@@ -18211,6 +19919,13 @@ class SessionState:
                 "text": "",
                 "ts": 0.0,
             },
+            "execution_anchor": {
+                "role": "",
+                "path": "",
+                "source": "",
+                "note": "",
+                "ts": 0.0,
+            },
             "memory_capsule": self._new_memory_capsule(),
             "watchdog": self._new_watchdog_state(),
             "decomposition_queue": self._new_decomposition_queue_state(),
@@ -18327,6 +20042,7 @@ class SessionState:
                 "text": trim(str(raw_last_reply.get("text", "") or "").strip(), 3000),
                 "ts": float(raw_last_reply.get("ts", 0.0) or 0.0),
             }
+        board["execution_anchor"] = self._normalize_execution_anchor(src.get("execution_anchor", {}))
 
         def _clean_rows(rows: object, *, key: str = "content", actor_key: str = "actor") -> list[dict]:
             out: list[dict] = []
@@ -18836,6 +20552,7 @@ class SessionState:
         kernel_state = self._ensure_uniform_kernel_state()
         compare = kernel_state.get("last_compare", {}) if isinstance(kernel_state.get("last_compare"), dict) else {}
         memory_capsule = self._normalize_memory_capsule(board.get("memory_capsule", {}))
+        execution_anchor = self._execution_anchor_for_role(board, role="developer")
         lines = [
             "## Blackboard State",
             f"- status: {status}",
@@ -18900,6 +20617,15 @@ class SessionState:
                 f"{('unlimited' if int(judgement.get('remaining_rounds', 0) or 0) < 0 else int(judgement.get('remaining_rounds', profile.get('round_budget', self.max_agent_rounds)) or 0))}"
             ),
             (
+                "- execution_anchor: "
+                + (
+                    f"{trim(str(execution_anchor.get('path', '') or '').strip(), 180)} "
+                    f"({trim(str(execution_anchor.get('source', '') or '').strip(), 40) or '-'})"
+                    if execution_anchor
+                    else "(none)"
+                )
+            ),
+            (
                 "- last_delegate: "
                 f"{delegate.get('target', '') or '(none)'} | "
                 f"{trim(str(delegate.get('instruction', '') or '').strip(), 240)} "
@@ -18927,6 +20653,16 @@ class SessionState:
         last_text = trim(str(last_worker_reply.get("text", "") or "").strip(), 220)
         if last_role and last_text:
             lines.append(f"- last_worker_reply: [{last_role}] {last_text}")
+        bus_signal = self._recent_agentbus_signal()
+        if bool(bus_signal.get("fresh", False)):
+            lines.append(
+                "- recent_agentbus: "
+                + f"count={int(bus_signal.get('count', 0) or 0)} "
+                + f"sources={','.join(bus_signal.get('sources', []) or []) or '-'} "
+                + f"targets={','.join(bus_signal.get('targets', []) or []) or '-'} "
+                + f"intents={','.join(bus_signal.get('intents', []) or []) or '-'} "
+                + f"age={float(bus_signal.get('latest_age_sec', 0.0) or 0.0):.1f}s"
+            )
 
         def _render_tail(title: str, rows: object):
             lines.append(f"\n### {title}")
@@ -19092,7 +20828,7 @@ class SessionState:
         scale = trim(str(row.get("scale_preference", "") or "").strip().lower(), 20)
         if scale in TASK_SCALE_PREFERENCES:
             merged["scale_preference"] = scale
-        mode = normalize_execution_mode(row.get("execution_mode", ""), default="")
+        mode = self._resolve_task_execution_mode(row.get("execution_mode", ""), default="")
         if mode in EXECUTION_MODE_CHOICES:
             merged["execution_mode"] = mode
         assigned = self._sanitize_agent_role(row.get("assigned_expert", ""))
@@ -19158,7 +20894,7 @@ class SessionState:
                 inherited_level = TASK_LEVEL_CHOICES[0]
             if inherited_level not in TASK_LEVEL_CHOICES:
                 inherited_level = TASK_LEVEL_CHOICES[0]
-            inherited_mode = normalize_execution_mode(
+            inherited_mode = self._resolve_task_execution_mode(
                 self.runtime_execution_mode or current_profile.get("execution_mode", self._effective_execution_mode()),
                 default=self._effective_execution_mode(),
             )
@@ -19235,20 +20971,15 @@ class SessionState:
                 "low_confidence_reason": "rule fallback inherited previous runtime state",
                 "source": "fallback",
             }
-        goal_len = len(str(goal_text or "").strip())
-        level = 3
-        if complexity == "simple" and goal_len <= 180:
-            level = 2
-        elif complexity == "simple":
-            level = 3
-        elif any(tok in low for tok in ("system-level", "系统级", "blackboard", "orchestrator", "内核", "基础设施")):
-            level = 5
-        else:
-            level = 4
+        level = self._heuristic_task_level(goal_text, complexity=complexity)
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         participants = [self._sanitize_agent_role(x) for x in policy.get("participants", []) if self._sanitize_agent_role(x)]
         assigned = self._sanitize_agent_role(policy.get("assigned_expert", "developer")) or "developer"
-        if str(policy.get("execution_mode", "")) == EXECUTION_MODE_SINGLE:
+        policy_mode = self._resolve_task_execution_mode(
+            policy.get("execution_mode", EXECUTION_MODE_SYNC),
+            default=EXECUTION_MODE_SYNC,
+        )
+        if policy_mode == EXECUTION_MODE_SINGLE:
             participants = [assigned]
         if not participants:
             participants = [assigned]
@@ -19264,7 +20995,7 @@ class SessionState:
             "judgement": trim(str(profile.get("reason", "") or "manager fallback classification"), 200),
             "round_budget": int(policy.get("round_budget", profile.get("round_budget", self.max_agent_rounds)) or 0),
             "direct_objective": trim(str(profile.get("direct_objective", "") or ""), 800),
-            "execution_mode": str(policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+            "execution_mode": str(policy_mode),
             "participants": participants,
             "assigned_expert": assigned,
             "requires_user_confirmation": bool(requires_confirmation),
@@ -19274,6 +21005,11 @@ class SessionState:
         }
 
     def _manager_classification_system_prompt(self) -> str:
+        mode_lock_note = (
+            f"Execution mode is locked to {self.execution_mode}; keep that mode unchanged unless the user explicitly changes startup config. "
+            if bool(getattr(self, "execution_mode_locked", False))
+            else ""
+        )
         return (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates. "
             "Decide whether this latest turn should inherit the previous blackboard/task state. "
@@ -19292,6 +21028,7 @@ class SessionState:
             "If user clearly indicates speed vs completeness preference, that preference has higher priority than your default strategy. "
             "Budgets are internal efficiency controls to reduce overthinking and idle loops; "
             "they must not be treated as a user-visible early-stop reason. "
+            f"{mode_lock_note}"
             "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
             "and semantic_confidence(high|medium|low). "
             "Do not invent task-category templates; base the decision only on continuity, complexity, required collaboration, "
@@ -19320,7 +21057,10 @@ class SessionState:
         if level not in TASK_LEVEL_CHOICES:
             level = 3
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
-        mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
+        mode = self._resolve_task_execution_mode(
+            row.get("execution_mode", policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+            default=str(policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+        )
         assigned = self._sanitize_agent_role(
             row.get("assigned_expert", policy.get("assigned_expert", "developer"))
         ) or self._sanitize_agent_role(policy.get("assigned_expert", "developer")) or "developer"
@@ -19640,6 +21380,7 @@ class SessionState:
         profile = self._ensure_blackboard_task_profile(board)
         progress = self._manager_progress_state(board)
         budget = self._blackboard_round_budget(board)
+        bus_signal = self._recent_agentbus_signal()
         level = int(profile.get("task_level", self.runtime_task_level or 0) or 0)
         mode = normalize_execution_mode(profile.get("execution_mode", self._effective_execution_mode()), default=self._effective_execution_mode())
         scale_preference = str(profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
@@ -19651,7 +21392,17 @@ class SessionState:
         participant_text = ",".join(
             [role for role in [self._sanitize_agent_role(x) for x in participants] if role][:3]
         ) or "-"
-        return (
+        last_reply = board.get("last_worker_reply", {}) if isinstance(board.get("last_worker_reply"), dict) else {}
+        last_role = self._sanitize_agent_role(last_reply.get("role", ""))
+        last_text = trim(str(last_reply.get("text", "") or "").strip(), 180)
+        bus_summary = (
+            f"agentbus_recent={int(bus_signal.get('count', 0) or 0)} "
+            f"sources={','.join(bus_signal.get('sources', []) or []) or '-'} "
+            f"targets={','.join(bus_signal.get('targets', []) or []) or '-'} "
+            f"intents={','.join(bus_signal.get('intents', []) or []) or '-'} "
+            f"age={float(bus_signal.get('latest_age_sec', 0.0) or 0.0):.1f}s"
+        )
+        parts = [
             "You are Manager in a blackboard-driven multi-agent coding system. "
             "Do not write code and do not call worker tools directly. "
             f"Session absolute writable root is {self.files_root}; instruct workers to use relative paths, "
@@ -19672,6 +21423,11 @@ class SessionState:
             "follow that handoff to reduce orchestration latency instead of re-planning from scratch. "
             "If finish is blocked by missing final summary after review approval, instruct Reviewer to hand off Explorer "
             "via agentbus (intent=final_summary_request) instead of silently ending. "
+            f"Live team sync: {bus_summary}. "
+        ]
+        if last_role and last_text:
+            parts.append(f"Last worker reply=[{last_role}] {last_text}. ")
+        parts.append(
             f"Current task level={level or '-'}, mode={mode}, scale_preference={scale_preference}, participants={participant_text}, "
             f"Current task profile: complexity={profile.get('complexity','simple')}, "
             f"progress={progress}, round_budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
@@ -19679,6 +21435,7 @@ class SessionState:
             "Avoid assigning the same agent more than two consecutive turns unless strictly required. "
             f"{model_language_instruction(self.ui_language)}"
         )
+        return "".join(parts)
 
     def _manager_pick_agentbus_fast_route(
         self,
@@ -19780,13 +21537,18 @@ class SessionState:
             return None
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
         best = candidates[0][2]
-        assigned_expert = self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"
+        assigned_expert = (
+            self._sanitize_agent_role(best.get("to", ""))
+            or self._sanitize_agent_role(profile.get("assigned_expert", "developer"))
+            or "developer"
+        )
         task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = 3
         round_budget = int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0)
+        participant_order = [assigned_expert] + [role for role in participants_norm if role and role != assigned_expert]
         args = {
-            "target": best.get("to", assigned_expert),
+            "target": assigned_expert,
             "instruction": trim(str(best.get("payload", "") or ""), 1200),
             "display_instruction": self._delegate_instruction_display_text(
                 str(best.get("display_payload", "") or best.get("payload", "") or ""),
@@ -19810,7 +21572,7 @@ class SessionState:
             "round_budget": int(round_budget),
             "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
             "execution_mode": mode,
-            "participants": list(participants_norm),
+            "participants": list(participant_order[:3]),
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
             "is_mandatory": bool(
@@ -19887,11 +21649,12 @@ class SessionState:
         participants_norm = [x for x in participants_norm if x]
         if dst not in participants_norm:
             participants_norm.append(dst)
-        assigned_expert = self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"
+        assigned_expert = dst or self._sanitize_agent_role(profile.get("assigned_expert", "developer")) or "developer"
         task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = 3
         round_budget = int(profile.get("round_budget", self.runtime_round_budget or self.max_agent_rounds) or 0)
+        participant_order = [assigned_expert] + [role for role in participants_norm if role and role != assigned_expert]
         args = {
             "target": dst,
             "instruction": payload,
@@ -19918,7 +21681,7 @@ class SessionState:
             "round_budget": int(round_budget),
             "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or ""), 800),
             "execution_mode": mode,
-            "participants": list(participants_norm),
+            "participants": list(participant_order[:3]),
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
             "is_mandatory": bool(
@@ -19961,6 +21724,7 @@ class SessionState:
         )
         focus = trim(str(plan.get("current_focus", "") or "").strip(), 160)
         next_action = trim(str(plan.get("next_action", "") or "").strip(), 160)
+        target_path = trim(str(plan.get("target_path", "") or "").strip(), 120)
         delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
         delegate_instruction = self._delegate_instruction_display_text(
             trim(
@@ -19982,6 +21746,8 @@ class SessionState:
             parts.append(f"focus={focus}")
         if next_action:
             parts.append(f"next={next_action}")
+        if target_path:
+            parts.append(f"target={target_path}")
         if delegate_target:
             parts.append(f"owner={delegate_target}")
         if delegate_instruction and "direct objective:" not in delegate_instruction.lower():
@@ -20167,6 +21933,22 @@ class SessionState:
         queue_anchor = _queue_anchor_route()
         if queue_anchor is not None:
             return queue_anchor
+        developer_target_state = self._developer_target_step_state(board, role="developer")
+        developer_target_path = str(developer_target_state.get("target_path", "") or "")
+        if developer_target_path and bool(developer_target_state.get("edit_only_window", False)):
+            return {
+                "target": "developer",
+                "instruction": (
+                    f"Target path: {developer_target_path}. "
+                    "Grounding on that file is already complete for the current step. "
+                    "Use exactly one edit_file or write_file action on that target now. "
+                    "Do not reread files, do not call read_from_blackboard, do not call bash, and do not ask colleagues in this turn."
+                ),
+                "reason": "target-grounding-complete-edit-only",
+                "source": "fallback",
+                "is_mandatory": True,
+                "executor_mode": True,
+            }
         if not has_material_outputs:
             return {
                 "target": "explorer",
@@ -20247,6 +22029,8 @@ class SessionState:
         row = dict(route or {})
         if bool(row.get("executor_mode", False)):
             return row
+        if self._route_is_agentbus_driven(row):
+            return row
         target = str(row.get("target", "") or "").strip().lower()
         if target not in AGENT_ROLES:
             return row
@@ -20280,7 +22064,7 @@ class SessionState:
                     or "Check the current outputs and return one concrete pass/fix or next-gap judgement."
                 )
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer"
-            elif target != "developer" and (code_count > 0 or missing_expected):
+            elif target != "developer" and (code_count > 0 or self._blocking_missing_expected_artifacts(board, limit=4)):
                 row["target"] = "developer"
                 row["instruction"] = (
                     self._compose_manager_live_instruction(
@@ -20324,6 +22108,7 @@ class SessionState:
     def _manager_apply_task_policy(self, route: dict) -> dict:
         row = dict(route or {})
         executor_mode_flag = _to_bool_like(row.get("executor_mode", False), default=False)
+        agentbus_driven = self._route_is_agentbus_driven(row)
         board = self._ensure_blackboard()
         latest_user_ts = self._latest_user_message_ts()
         self._invalidate_stale_approval_if_needed(
@@ -20345,7 +22130,10 @@ class SessionState:
             if task_level not in TASK_LEVEL_CHOICES:
                 task_level = 3
         level_policy = dict(TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3]))
-        mode = str(level_policy.get("execution_mode", EXECUTION_MODE_SYNC))
+        mode = self._resolve_task_execution_mode(
+            row.get("execution_mode", level_policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+            default=str(level_policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+        )
         assigned_expert = self._sanitize_agent_role(
             row.get("assigned_expert", profile.get("assigned_expert", level_policy.get("assigned_expert", "developer")))
         ) or self._sanitize_agent_role(level_policy.get("assigned_expert", "developer")) or "developer"
@@ -20356,6 +22144,10 @@ class SessionState:
                 role = self._sanitize_agent_role(item)
                 if role and role not in participants:
                     participants.append(role)
+        target = str(row.get("target", "") or "").strip().lower()
+        if agentbus_driven and target in AGENT_ROLES:
+            participants = [target] + [role for role in participants if role != target]
+            assigned_expert = target
         if mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
         else:
@@ -20368,11 +22160,13 @@ class SessionState:
             if assigned_expert not in participants:
                 assigned_expert = participants[0] if participants else assigned_expert
         participants = participants[:3] or [assigned_expert]
-        target = str(row.get("target", "") or "").strip().lower()
         if target not in MANAGER_ROUTE_TARGETS:
             target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
         if target in AGENT_ROLES and target not in participants:
-            if executor_mode_flag:
+            if agentbus_driven:
+                participants = [target] + [role for role in participants if role != target]
+                assigned_expert = target
+            elif executor_mode_flag:
                 if len(participants) < 3:
                     participants.append(target)
                 else:
@@ -20442,12 +22236,15 @@ class SessionState:
         goal_text = str(board.get("original_goal", "") or "")
         direct_expected = self._goal_direct_expected_artifacts(goal_text)
         missing_expected = self._goal_missing_expected_artifacts(board)
+        blocking_missing_expected = self._blocking_missing_expected_artifacts(board, limit=4)
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
         if target in AGENT_ROLES and not has_grounded_outputs:
             executor_mode_flag = True
         if (
+            (not agentbus_driven)
+            and
             target in AGENT_ROLES
             and mode == EXECUTION_MODE_SYNC
             and not has_grounded_outputs
@@ -20467,7 +22264,9 @@ class SessionState:
             row["reason"] = "contract-grounding-bootstrap"
             row["source"] = "policy"
         if (
-            missing_expected
+            (not agentbus_driven)
+            and
+            blocking_missing_expected
             and code_count == 0
             and target != "developer"
             and action_type not in {"ground", "research"}
@@ -20478,12 +22277,12 @@ class SessionState:
             instruction = trim(
                 (
                     (
-                        f"Target path: {missing_expected[0]}. "
-                        if missing_expected
+                        f"Target path: {blocking_missing_expected[0]}. "
+                        if blocking_missing_expected
                         else ""
                     )
                     + "Expected deliverables are still missing: "
-                    + ", ".join(missing_expected[:4])
+                    + ", ".join(blocking_missing_expected[:4])
                     + ". Prioritize creating or updating that exact path now. "
                     "If minimal grounding is still needed, do only the smallest read required first, then produce the missing artifact and continue toward validation."
                 ),
@@ -20491,18 +22290,18 @@ class SessionState:
             )
             row["reason"] = "missing-direct-artifacts-bootstrap"
             row["source"] = "policy"
-        elif target in {"reviewer", "finish"} and missing_expected:
+        elif (not agentbus_driven) and target in {"reviewer", "finish"} and blocking_missing_expected:
             target = "developer"
             executor_mode_flag = True
             instruction = trim(
                 (
                     (
-                        f"Target path: {missing_expected[0]}. "
-                        if missing_expected
+                        f"Target path: {blocking_missing_expected[0]}. "
+                        if blocking_missing_expected
                         else ""
                     )
                     + "Expected deliverables are still missing: "
-                    + ", ".join(missing_expected[:4])
+                    + ", ".join(blocking_missing_expected[:4])
                     + ". Prioritize that exact path before review or finish."
                 ),
                 1200,
@@ -20511,28 +22310,75 @@ class SessionState:
             row["source"] = "policy"
         elif target == "developer" and missing_expected:
             executor_mode_flag = True
+            existing_target_paths = self._step_instruction_target_paths(instruction, limit=3)
+            current_target = existing_target_paths[0] if existing_target_paths else ""
             missing_note = (
                 (
-                    f"Target path: {missing_expected[0]}. "
-                    if missing_expected
-                    else ""
+                    f"Target path: {current_target}. "
+                    if current_target
+                    else (
+                        f"Target path: {missing_expected[0]}. "
+                        if missing_expected
+                        else ""
+                    )
                 )
                 + "Expected deliverables are still missing: "
                 + ", ".join(missing_expected[:4])
-                + ". Prioritize that exact path before moving on."
+                + ". "
+                + (
+                    "Prioritize the current target before moving on."
+                    if current_target
+                    else "Prioritize that exact path before moving on."
+                )
             )
             if missing_note.lower() not in instruction.lower():
                 instruction = trim(f"{missing_note}\n{instruction}", 1200)
+        route_target_paths = self._step_instruction_target_paths(instruction, limit=1) if target == "developer" else []
+        route_target_path = route_target_paths[0] if route_target_paths else ""
+        route_target_exists = bool(route_target_path and (self.files_root / route_target_path).exists())
+        if target == "developer" and route_target_path and (not route_target_exists):
+            concise_lines = [f"Target path: {route_target_path}"]
+            if objective:
+                concise_lines.append(f"Objective: {objective}")
+            source_guard = self._source_output_guard_line(route_target_path, board=board, max_chars=260)
+            if source_guard:
+                concise_lines.append(source_guard)
+            support_paths = self._implementation_support_paths(route_target_path, board=board, limit=3)
+            if support_paths:
+                concise_lines.append("Ground from: " + ", ".join(support_paths[:3]))
+            requirement_line = self._validation_requirement_summary(
+                route_target_path,
+                board=board,
+                max_items=5,
+                max_chars=360,
+            )
+            if requirement_line:
+                concise_lines.append(requirement_line)
+            concise_lines.append("Constraint: create the target path directly in this turn.")
+            concise_lines.append("Delivery rule: materialize the smallest validator-satisfying version first.")
+            instruction = trim("\n".join(concise_lines), 1200)
         latest_exec_log = self._latest_execution_log_text(board)
         latest_exec_low = latest_exec_log.lower()
         validate_contract_present = bool((self.files_root / "validate.py").exists())
         validate_pass_marker = bool(re.search(r"\bpass[_a-z0-9-]*\b", latest_exec_low))
         validation_cmd = trim(self._workspace_validation_command_hint(), 120)
         validation_failure_hint = self._latest_validation_failure_hint(board)
-        validation_requirement_hint = self._validation_contract_requirement_hint(validation_failure_hint)
-        repair_targets = list(direct_expected[:4] or missing_expected[:4])
+        validation_repair_targets = self._preferred_validation_target_paths(board, limit=4) if validation_failure_hint else []
+        validation_requirement_hint = self._validation_contract_requirement_hint(
+            validation_failure_hint,
+            board=board,
+            target_path=(validation_repair_targets[0] if validation_repair_targets else ""),
+        )
+        actionable_review_gap = trim(self._latest_review_feedback_hint(board, max_chars=280), 280)
+        repair_targets = list(validation_repair_targets[:4] or direct_expected[:4] or missing_expected[:4])
         if not repair_targets:
             repair_targets = self._current_deliverable_paths(board, limit=2)
+        developer_target_state = self._developer_target_step_state(board, role="developer")
+        developer_edit_only_window = bool(developer_target_state.get("edit_only_window", False))
+        developer_create_only_window = bool(developer_target_state.get("create_only_window", False))
+        developer_validation_targeted_repair = bool(developer_target_state.get("validation_targeted_repair", False))
+        developer_target_path = str(developer_target_state.get("target_path", "") or "")
+        developer_restricted_tool_errors = int(developer_target_state.get("recent_restricted_tool_errors", 0) or 0)
         contract_literals = self._workspace_contract_literal_hints(limit=6)
         if target in {"developer", "reviewer"} and contract_literals:
             contract_note = (
@@ -20546,12 +22392,15 @@ class SessionState:
         if skill_guard_note and skill_guard_note.lower() not in instruction.lower():
             instruction = trim(f"{skill_guard_note}\n{instruction}", 1200)
         if (
+            (not agentbus_driven)
+            and
             validate_contract_present
             and code_count > 0
-            and (not missing_expected)
+            and (not blocking_missing_expected)
             and (not validate_pass_marker)
         ):
-            if target == "reviewer":
+            if target == "reviewer" or (not validation_failure_hint and not actionable_review_gap):
+                target = "reviewer"
                 review_validation_note = "Validation is still pending. "
                 if validation_cmd:
                     review_validation_note += f"Run `{validation_cmd}` first, then return a pass/fix verdict with concrete evidence. "
@@ -20605,6 +22454,95 @@ class SessionState:
                 )
             if skill_note.lower() not in instruction.lower():
                 instruction = trim(f"{skill_note}\n{instruction}", 1200)
+        if target == "developer" and developer_edit_only_window and developer_target_path:
+            executor_mode_flag = True
+            write_only_recovery = bool(
+                developer_restricted_tool_errors >= 2
+                or (developer_validation_targeted_repair and developer_restricted_tool_errors >= 1)
+            )
+            edit_only_note = (
+                f"Target path: {developer_target_path}. "
+                "Target grounding is already complete for this delegate. "
+                + (
+                    "Use exactly one write_file on that path now. "
+                    if write_only_recovery
+                    else "Use exactly one edit_file or write_file on that path now. "
+                )
+                + "Do not call read_file, read_from_blackboard, bash, ask_colleague, or finish tools in this turn."
+            )
+            if edit_only_note.lower() not in instruction.lower():
+                instruction = trim(f"{edit_only_note}\n{instruction}", 1200)
+            if not str(row.get("reason", "") or "").strip():
+                row["reason"] = "developer-edit-only-window"
+            if not str(row.get("source", "") or "").strip():
+                row["source"] = "policy"
+        elif target == "developer" and developer_create_only_window and developer_target_path:
+            executor_mode_flag = True
+            create_only_note = (
+                f"Target path: {developer_target_path}. "
+                "This target file does not exist yet for the current step. "
+                "Use exactly one write_file on that path now. "
+                "Do not call read_file, read_from_blackboard, bash, ask_colleague, or finish tools in this turn."
+            )
+            if create_only_note.lower() not in instruction.lower():
+                instruction = trim(f"{create_only_note}\n{instruction}", 1200)
+            if not str(row.get("reason", "") or "").strip():
+                row["reason"] = "developer-create-only-window"
+            if not str(row.get("source", "") or "").strip():
+                row["source"] = "policy"
+        if target == "developer":
+            concise_target = developer_target_path or (missing_expected[0] if missing_expected else "")
+            if developer_create_only_window and concise_target:
+                concise_lines = [
+                    f"Target path: {concise_target}",
+                ]
+                if objective:
+                    concise_lines.append(f"Objective: {objective}")
+                source_guard = self._source_output_guard_line(concise_target, board=board, max_chars=260)
+                if source_guard:
+                    concise_lines.append(source_guard)
+                requirement_line = self._validation_requirement_summary(
+                    concise_target,
+                    board=board,
+                    max_items=5,
+                    max_chars=360,
+                )
+                if requirement_line:
+                    concise_lines.append(requirement_line)
+                concise_lines.append("Tool mode: write_file only.")
+                concise_lines.append("Constraint: create the target path directly in this turn.")
+                concise_lines.append("Delivery rule: materialize the smallest validator-satisfying version first.")
+                instruction = trim("\n".join(concise_lines), 1200)
+            elif developer_edit_only_window and concise_target:
+                write_only_recovery = bool(
+                    developer_restricted_tool_errors >= 2
+                    or (developer_validation_targeted_repair and developer_restricted_tool_errors >= 1)
+                )
+                concise_lines = [
+                    f"Target path: {concise_target}",
+                ]
+                if objective:
+                    concise_lines.append(f"Objective: {objective}")
+                source_guard = self._source_output_guard_line(concise_target, board=board, max_chars=260)
+                if source_guard:
+                    concise_lines.append(source_guard)
+                if validation_failure_hint:
+                    concise_lines.append(f"Latest blocker: {validation_failure_hint}")
+                requirement_line = self._validation_requirement_summary(
+                    concise_target,
+                    board=board,
+                    max_items=5,
+                    max_chars=360,
+                )
+                if requirement_line:
+                    concise_lines.append(requirement_line)
+                concise_lines.append(
+                    "Tool mode: write_file only."
+                    if write_only_recovery
+                    else "Tool mode: edit_file or write_file only."
+                )
+                concise_lines.append("Constraint: act directly on the target path in this turn.")
+                instruction = trim("\n".join(concise_lines), 1200)
         if target == "reviewer":
             review_hint = "Before giving pass/fix, ground the judgement in execution evidence or the nearest validation command."
             if validation_cmd:
@@ -20718,6 +22656,34 @@ class SessionState:
                         )
                     },
                 )
+        has_outputs = bool(
+            code_count
+            or research_count
+            or len(board.get("execution_logs", []) or [])
+            or len(board.get("review_feedback", []) or [])
+        )
+        if feedback_pass and has_outputs:
+            if can_finish_from_approval:
+                target = "finish"
+                instruction = "Reviewer already passed the current outputs. Finish now."
+                row["reason"] = "feedback-pass-auto-close"
+                row["source"] = "policy"
+            elif target == "developer":
+                target = "reviewer"
+                if finish_gate_reason == "reviewer-summary-missing":
+                    instruction = (
+                        "Review already passed but final summary is still missing. "
+                        "Read blackboard evidence, produce the final summary, and close the task."
+                    )
+                    row["reason"] = "feedback-pass-summary-request"
+                else:
+                    instruction = (
+                        "Review evidence already indicates pass for the current outputs. "
+                        "Do not send work back to developer unless you can cite a concrete failing gap. "
+                        "Reconfirm approval or produce the required closeout summary now."
+                    )
+                    row["reason"] = "feedback-pass-reroute-reviewer"
+                row["source"] = "policy"
         if target == "developer":
             candidate_paths: list[str] = []
             for rel in repair_targets:
@@ -20755,9 +22721,22 @@ class SessionState:
                 instruction,
                 board,
                 role=target,
-                require_check=bool(target == "reviewer" or (validate_contract_present and target == "developer")),
+                require_check=bool(
+                    target == "reviewer"
+                    or (
+                        target == "developer"
+                        and validate_contract_present
+                        and (not missing_expected)
+                        and bool(validation_failure_hint or actionable_review_gap)
+                    )
+                ),
                 max_chars=1200,
             ) or instruction
+        instruction = self._dedupe_delegate_instruction_text(
+            instruction,
+            action_type=action_type,
+            max_chars=1200,
+        )
         if target in AGENT_ROLES:
             instruction = self._apply_agent_language_policy(instruction, max_len=1200)
         has_mandatory_field = isinstance(row, dict) and ("is_mandatory" in row)
@@ -21194,40 +23173,66 @@ class SessionState:
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return
+        edit_only_window = False
+        create_only_window = False
+        edit_only_target_path = ""
+        developer_tool_mode = ""
         if bool(executor_mode):
             board = self._ensure_blackboard()
             preserved_rows: list[dict] = []
             if role_key == "developer":
                 target_state = self._developer_target_step_state(board, role=role_key)
-                if bool(target_state.get("target_read_done", False)) and not bool(target_state.get("target_touched", False)):
-                    for row in reversed(self._agent_context(role_key)[-24:]):
-                        if not isinstance(row, dict):
-                            continue
-                        if str(row.get("role", "") or "").strip().lower() != "tool":
-                            continue
-                        if str(row.get("name", "") or "").strip() != "read_file":
-                            continue
-                        content = str(row.get("content", "") or "").strip()
-                        if not content or content.startswith("Error:"):
-                            continue
-                        preserved_rows.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": str(row.get("tool_call_id", "") or ""),
-                                "name": "read_file",
-                                "content": trim(content, 6000),
-                                "ts": float(row.get("ts", now_ts()) or now_ts()),
-                                "agent_role": role_key,
-                            }
-                        )
-                        break
+                edit_only_window = bool(target_state.get("edit_only_window", False))
+                create_only_window = bool(target_state.get("create_only_window", False))
+                validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+                edit_only_target_path = str(target_state.get("target_path", "") or "")
+                target_exists = bool(target_state.get("target_exists", False))
+                recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
+                if create_only_window and edit_only_target_path:
+                    developer_tool_mode = "write_file only"
+                elif edit_only_window and edit_only_target_path:
+                    developer_tool_mode = (
+                        "write_file only"
+                        if (recent_restricted_tool_errors >= 2 or (validation_targeted_repair and recent_restricted_tool_errors >= 1))
+                        else "edit_file or write_file only"
+                    )
+                if edit_only_target_path and target_exists:
+                    snapshot_row = self._executor_target_snapshot_message(
+                        role=role_key,
+                        target_path=edit_only_target_path,
+                        max_chars=6200,
+                    )
+                    if isinstance(snapshot_row, dict) and snapshot_row:
+                        preserved_rows.append(snapshot_row)
+                elif edit_only_target_path:
+                    support_row = self._executor_support_snapshot_message(
+                        role=role_key,
+                        target_path=edit_only_target_path,
+                        board=board,
+                        max_chars=6200,
+                    )
+                    if isinstance(support_row, dict) and support_row:
+                        preserved_rows.append(support_row)
             executor_seed = {
                 "role": "system",
                 "content": self._apply_agent_language_policy(
-                    (
-                        "Executor mode is enabled by watchdog. You are stateless for this step: "
-                        "ignore old conversational plans, execute only the delegated step, call concrete tools, "
-                        "and write verifiable evidence to blackboard."
+                    trim(
+                        "\n".join(
+                            line
+                            for line in (
+                                (
+                                    "Executor mode is enabled by watchdog. Ignore stale conversational branches, "
+                                    "execute only the current delegated step, and record concrete evidence."
+                                ),
+                                (
+                                    f"Active target: {edit_only_target_path}. Tool mode: {developer_tool_mode}."
+                                    if role_key == "developer" and edit_only_target_path and developer_tool_mode
+                                    else ""
+                                ),
+                            )
+                            if str(line or "").strip()
+                        ),
+                        800,
                     ),
                     max_len=800,
                 ),
@@ -21245,8 +23250,8 @@ class SessionState:
                     "status",
                     {
                         "summary": (
-                            f"executor hot-swap preserved {len(preserved_rows)} recent "
-                            f"{self._agent_display_name(role_key)} workspace read"
+                            f"executor hot-swap preserved {len(preserved_rows)} grounded "
+                            f"{self._agent_display_name(role_key)} target snapshot"
                         )
                     },
                 )
@@ -21280,20 +23285,17 @@ class SessionState:
         payload_lines = ["[manager-delegate]"]
         if objective and objective.lower() not in instruction_text.lower():
             payload_lines.append(f"Objective: {objective}")
+        if role_key == "developer" and edit_only_target_path and not self._step_instruction_target_paths(instruction_text, limit=1):
+            payload_lines.append(f"Target path: {edit_only_target_path}")
+        if role_key == "developer":
+            if developer_tool_mode:
+                payload_lines.append(f"Tool mode: {developer_tool_mode}.")
         if instruction_text:
             payload_lines.append(instruction_text)
-        if role_key == "developer":
-            target_paths = self._step_instruction_target_paths(instruction_text, limit=1)
-            if target_paths:
-                payload_lines.append(
-                    "Execution rule: if that target file already exists, read that exact file at most once, "
-                    "then use edit_file/write_file on the same path before any unrelated reads, bash, or ask_colleague."
-                )
-        if bool(is_mandatory):
-            payload_lines.append("Mode: mandatory")
-        if bool(executor_mode):
-            payload_lines.append("Scope: local delegated step only")
-        payload = trim("\n".join(line for line in payload_lines if str(line or "").strip()), 2200)
+        payload = self._dedupe_delegate_instruction_text(
+            "\n".join(line for line in payload_lines if str(line or "").strip()),
+            max_chars=2200,
+        )
         self._append_agent_context_message(
             role_key,
             {
@@ -21304,6 +23306,23 @@ class SessionState:
             },
             mirror_to_global=False,
         )
+        if role_key == "developer" and edit_only_target_path:
+            injected_target_snapshot = self._inject_target_snapshot_context(
+                role_key,
+                target_path=edit_only_target_path,
+                board=board,
+                max_chars=6200,
+            )
+            needs_support_snapshot = bool(
+                self._target_derived_output_paths(edit_only_target_path, board=board, limit=2)
+            )
+            if (not injected_target_snapshot) or needs_support_snapshot:
+                self._inject_support_snapshot_context(
+                    role_key,
+                    target_path=edit_only_target_path,
+                    board=board,
+                    max_chars=6200,
+                )
         for peer in AGENT_ROLES:
             if peer == role_key:
                 continue
@@ -21343,7 +23362,15 @@ class SessionState:
         if name in {"write_file", "edit_file"}:
             rel_path = str(args.get("path", "") or "").strip()
             summary = output if output else f"{name} executed"
-            self._blackboard_upsert_artifact(rel_path, summary, role_key)
+            if ok:
+                self._blackboard_upsert_artifact(rel_path, summary, role_key)
+                if role_key == "developer" and rel_path:
+                    self._set_execution_anchor(
+                        rel_path,
+                        role=role_key,
+                        source=name,
+                        note=summary,
+                    )
             self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "background_run"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
@@ -21377,7 +23404,15 @@ class SessionState:
                                     f"{gate_reason}"
                                 ),
                             )
-                elif output:
+                elif output and self._shell_tool_result_has_validation_evidence(
+                    {
+                        "name": name,
+                        "args": dict(args),
+                        "output": output,
+                        "ok": bool(ok),
+                    },
+                    board=self._ensure_blackboard(),
+                ):
                     failure_note = trim(self._latest_validation_failure_hint(), 800)
                     if not failure_note:
                         failure_note = trim(output or line, 800)
@@ -21513,22 +23548,76 @@ class SessionState:
             return name
         return ""
 
+    def _shell_tool_result_has_validation_evidence(
+        self,
+        item: object,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(item, dict):
+            return False
+        name = str(item.get("name", "") or "").strip()
+        if name not in {"bash", "worktree_run", "background_run"}:
+            return False
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        command = trim(str(args.get("command", "") or "").strip(), 240)
+        output = trim(str(item.get("output", "") or "").strip(), 2000)
+        validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+        command_low = re.sub(r"\s+", " ", command.lower()).strip()
+        validation_low = re.sub(r"\s+", " ", validation_cmd.lower()).strip()
+        combined = f"{command}\n{output}".strip().lower()
+        if self._is_internal_runtime_control_error(combined):
+            return False
+        if validation_low and command_low:
+            if command_low == validation_low or command_low.startswith(validation_low + " "):
+                return True
+        if self._execution_output_has_pass_marker(output or combined):
+            return True
+        if any(
+            token in combined
+            for token in (
+                "traceback",
+                "assertionerror",
+                "error:",
+                "exception",
+                "failed",
+            )
+        ):
+            return True
+        return False
+
+    def _tool_results_have_validation_evidence(
+        self,
+        rows: object,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(rows, list):
+            return False
+        return any(self._shell_tool_result_has_validation_evidence(row, board=board) for row in rows)
+
     def _tool_call_is_substantive(self, name: str, args: object | None = None) -> bool:
         tool_name = str(name or "").strip()
         if not tool_name or self._tool_name_is_non_substantive(tool_name):
             return False
         params = args if isinstance(args, dict) else {}
-        if tool_name == "bash" and self._bash_command_is_non_substantive(params.get("command", "")):
+        if tool_name in {"bash", "worktree_run", "background_run"} and self._bash_command_is_non_substantive(params.get("command", "")):
             return False
         return True
 
     def _tool_result_is_substantive(self, item: object) -> bool:
         if not isinstance(item, dict):
             return False
-        if not bool(item.get("ok", False)):
-            return False
         name = str(item.get("name", "") or "").strip()
         args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        if self._shell_tool_result_has_validation_evidence(item):
+            return True
+        if name in {"bash", "worktree_run", "background_run"}:
+            command = str(args.get("command", "") or "").strip()
+            if not self._bash_command_is_non_substantive(command):
+                return True
+        if not bool(item.get("ok", False)):
+            return False
         return self._tool_call_is_substantive(name, args)
 
     def _tool_results_have_substantive_progress(self, rows: object) -> bool:
@@ -21668,6 +23757,65 @@ class SessionState:
         threshold = float(since_ts or 0.0)
         return bool(updated_at > 0.0 and (threshold <= 0.0 or updated_at + 1e-4 >= threshold))
 
+    def _normalize_execution_anchor(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        try:
+            ts = float(src.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        path_raw = str(src.get("path", "") or "").strip()
+        path = normalize_rel_preview_path(path_raw) or trim(path_raw, 280)
+        return {
+            "role": self._sanitize_agent_role(src.get("role", "")),
+            "path": path,
+            "source": trim(str(src.get("source", "") or "").strip(), 80),
+            "note": trim(str(src.get("note", "") or "").strip(), 280),
+            "ts": ts,
+        }
+
+    def _execution_anchor_for_role(
+        self,
+        board: dict | None = None,
+        *,
+        role: str = "",
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        anchor = self._normalize_execution_anchor(bb.get("execution_anchor", {}))
+        role_key = self._sanitize_agent_role(role)
+        if role_key and anchor.get("role") and anchor.get("role") != role_key:
+            return {}
+        if not str(anchor.get("path", "") or "").strip():
+            return {}
+        return anchor
+
+    def _set_execution_anchor(
+        self,
+        path: str,
+        *,
+        role: str = "developer",
+        source: str = "",
+        note: str = "",
+        board: dict | None = None,
+    ) -> dict:
+        role_key = self._sanitize_agent_role(role) or "developer"
+        rel = normalize_rel_preview_path(str(path or "").strip()) or trim(str(path or "").strip(), 280)
+        if not rel:
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        anchor = self._normalize_execution_anchor(
+            {
+                "role": role_key,
+                "path": rel,
+                "source": source,
+                "note": note,
+                "ts": float(now_ts()),
+            }
+        )
+        bb["execution_anchor"] = dict(anchor)
+        self.blackboard = bb
+        self._blackboard_touch()
+        return anchor
+
     def _record_tool_usage(self, tool_name: str):
         name = str(tool_name or "").strip()
         if not name:
@@ -21678,6 +23826,9 @@ class SessionState:
 
     def _developer_target_path_hint(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        missing_expected = self._goal_missing_expected_artifacts(bb)
+        validation_targets = self._preferred_validation_target_paths(bb, limit=2)
+        implementation_targets = self._implementation_step_targets(bb, limit=2)
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         if bool(dq.get("active", False)):
             steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
@@ -21694,10 +23845,24 @@ class SessionState:
             paths = self._step_instruction_target_paths(text, limit=1)
             if paths:
                 return paths[0]
+        if implementation_targets:
+            return implementation_targets[0]
+        if validation_targets:
+            return validation_targets[0]
+        anchor = self._execution_anchor_for_role(bb, role="developer")
+        if str(anchor.get("path", "") or "").strip():
+            return str(anchor.get("path", "") or "").strip()
+        if missing_expected:
+            return missing_expected[0]
         paths = self._current_deliverable_paths(bb, limit=2)
         if not paths:
             return ""
-        if self._current_delegate_is_mandatory_for("developer"):
+        delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
+        delegate_mandatory = bool(
+            bool(delegate.get("is_mandatory", False))
+            and (not delegate_target or delegate_target == "developer")
+        )
+        if delegate_mandatory:
             return paths[0]
         if paths and (
             len(bb.get("research_notes", []) or []) > 0
@@ -21707,6 +23872,22 @@ class SessionState:
         ):
             return paths[0]
         return ""
+
+    def _path_is_materialized(self, rel_path: str, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = normalize_rel_preview_path(str(rel_path or "").strip()) or trim(str(rel_path or "").strip(), 280)
+        if not rel:
+            return False
+        fp = self.files_root / rel
+        if fp.exists():
+            return True
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        if isinstance(artifacts.get(rel), dict):
+            return True
+        linked_files = bb.get("linked_files", {}) if isinstance(bb.get("linked_files"), dict) else {}
+        if isinstance(linked_files.get(rel), dict):
+            return True
+        return False
 
     def _developer_target_step_state(
         self,
@@ -21733,7 +23914,37 @@ class SessionState:
                     target_touch_ts = float(item.get("updated_at", 0.0) or 0.0)
                 except Exception:
                     target_touch_ts = 0.0
+        anchor = self._execution_anchor_for_role(bb, role=role_key) if explicit_target_step else {}
+        anchor_path = trim(str(anchor.get("path", "") or "").strip(), 280) if isinstance(anchor, dict) else ""
+        anchor_source = trim(str(anchor.get("source", "") or "").strip().lower(), 80) if isinstance(anchor, dict) else ""
+        try:
+            anchor_ts = float(anchor.get("ts", 0.0) or 0.0) if isinstance(anchor, dict) else 0.0
+        except Exception:
+            anchor_ts = 0.0
         target_exists = bool(target_path and (self.files_root / target_path).exists())
+        target_materialized = bool(
+            explicit_target_step
+            and self._path_is_materialized(target_path, bb)
+        )
+        repair_anchor_grounded = bool(
+            explicit_target_step
+            and target_exists
+            and anchor_path == target_path
+            and anchor_source in {"write_file", "edit_file"}
+            and anchor_ts > 0.0
+            and (target_touch_ts <= 0.0 or anchor_ts + 1e-4 >= target_touch_ts)
+        )
+        anchor_grounded = bool(
+            explicit_target_step
+            and target_exists
+            and anchor_path == target_path
+            and (
+                anchor_source in {"read-file-auto-ground", "read_file", "grounding-checkpoint"}
+                or repair_anchor_grounded
+            )
+            and anchor_ts > 0.0
+            and (target_touch_ts <= 0.0 or anchor_ts + 1e-4 >= target_touch_ts)
+        )
         recent_delegate_read = bool(
             explicit_target_step
             and self._recent_role_file_read_since(
@@ -21748,6 +23959,7 @@ class SessionState:
             and (
                 self._recent_role_target_file_read_since(role_key, target_path, target_touch_ts, bb, limit=60)
                 or (target_exists and recent_delegate_read)
+                or anchor_grounded
             )
         )
         target_touched = bool(
@@ -21757,9 +23969,50 @@ class SessionState:
         )
         validation_targeted_repair = bool(
             explicit_target_step
-            and (not missing_expected)
-            and len(bb.get("code_artifacts", {}) or {}) > 0
+            and target_materialized
             and self._latest_validation_failure_hint(bb)
+        )
+        recent_restricted_tool_errors = 0
+        if explicit_target_step:
+            threshold = (
+                float(target_touch_ts)
+                if (validation_targeted_repair and target_touch_ts > 0.0)
+                else max(delegate_ts, target_touch_ts)
+            )
+            exec_rows = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+            for row in reversed(exec_rows[-36:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("actor", "") or "").strip().lower() != role_key:
+                    continue
+                try:
+                    row_ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    row_ts = 0.0
+                if threshold > 0.0 and row_ts > 0.0 and row_ts + 1e-4 < threshold:
+                    continue
+                content = str(row.get("content", "") or "").strip().lower()
+                if not content.startswith("tool_error "):
+                    continue
+                if any(
+                    content.startswith(f"tool_error {name}:")
+                    for name in ("read_file", "read_from_blackboard", "ask_colleague", "bash", "edit_file", "write_file")
+                ):
+                    recent_restricted_tool_errors += 1
+                    if recent_restricted_tool_errors >= 8:
+                        break
+        edit_only_window = bool(
+            explicit_target_step
+            and target_read_done
+            and (
+                ((not target_touched) and (not validation_targeted_repair))
+                or (validation_targeted_repair and repair_anchor_grounded)
+            )
+        )
+        create_only_window = bool(
+            explicit_target_step
+            and (not target_exists)
+            and (not validation_targeted_repair)
         )
         return {
             "missing_expected": list(missing_expected),
@@ -21768,11 +24021,201 @@ class SessionState:
             "delegate_ts": float(delegate_ts),
             "target_touch_ts": float(target_touch_ts),
             "target_exists": bool(target_exists),
+            "target_materialized": bool(target_materialized),
+            "anchor_grounded": bool(anchor_grounded),
             "recent_delegate_read": bool(recent_delegate_read),
             "target_read_done": bool(target_read_done),
             "target_touched": bool(target_touched),
             "validation_targeted_repair": bool(validation_targeted_repair),
+            "recent_restricted_tool_errors": int(recent_restricted_tool_errors),
+            "edit_only_window": bool(edit_only_window),
+            "create_only_window": bool(create_only_window),
         }
+
+    def _executor_target_snapshot_message(
+        self,
+        *,
+        role: str,
+        target_path: str,
+        max_chars: int = 6200,
+    ) -> dict | None:
+        role_key = self._sanitize_agent_role(role)
+        rel = self._normalize_delegate_path_hint(target_path)
+        if (not role_key) or (not rel):
+            return None
+        ctx = self._agent_context(role_key)
+        wanted = (
+            f"grounded target snapshot for {rel.lower()}:",
+            "grounded target snapshot for current target file:",
+        )
+        for row in reversed(ctx[-48:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "system":
+                continue
+            content = str(row.get("content", "") or "").strip()
+            if not content:
+                continue
+            low = content.lower()
+            if not any(tok in low for tok in wanted):
+                continue
+            return {
+                "role": "system",
+                "content": self._apply_agent_language_policy(trim(content, max_chars), max_len=max_chars),
+                "ts": float(row.get("ts", now_ts()) or now_ts()),
+                "agent_role": role_key,
+            }
+        fp = self.files_root / rel
+        if (not fp.exists()) or (not fp.is_file()):
+            return None
+        raw = try_read_text(fp, max_bytes=96 * 1024) or ""
+        if not raw:
+            return None
+        body_cap = max(800, int(max_chars) - 260)
+        body = trim(raw, body_cap)
+        if not body:
+            return None
+        if len(raw) > len(body):
+            body = trim(f"{body}\n[truncated snapshot]", body_cap)
+        content = self._apply_agent_language_policy(
+            (
+                f"Grounded target snapshot for {rel}:\n"
+                f"{body}\n"
+                "Use this snapshot to edit directly. Do not call read_file again for this target."
+            ),
+            max_len=max_chars,
+        )
+        return {
+            "role": "system",
+            "content": content,
+            "ts": now_ts(),
+            "agent_role": role_key,
+        }
+
+    def _executor_support_snapshot_message(
+        self,
+        *,
+        role: str,
+        target_path: str,
+        board: dict | None = None,
+        max_chars: int = 6200,
+    ) -> dict | None:
+        role_key = self._sanitize_agent_role(role)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = self._normalize_delegate_path_hint(target_path)
+        if (not role_key) or (not rel):
+            return None
+        support_paths = self._implementation_support_paths(rel, board=bb, limit=2)
+        if not support_paths:
+            return None
+        sections: list[str] = []
+        remaining = max(1200, int(max_chars) - 260)
+        per_file_cap = max(480, min(1800, int(remaining / max(1, len(support_paths)))))
+        for support_rel in support_paths[:2]:
+            raw = try_read_text(self.files_root / support_rel, max_bytes=96 * 1024) or ""
+            if not raw:
+                continue
+            body = trim(raw, per_file_cap)
+            if len(raw) > len(body):
+                body = trim(f"{body}\n[truncated]", per_file_cap)
+            sections.append(f"[{support_rel}]\n{body}")
+        if not sections:
+            return None
+        content = self._apply_agent_language_policy(
+            trim(
+                (
+                    f"Grounded support snapshot for {rel}:\n"
+                    + "\n\n".join(sections)
+                    + "\nUse these grounded materials to write or repair the target directly. "
+                    + "If the target path is missing, write_file can create missing parent directories automatically. "
+                    + "Materialize the smallest validator-satisfying version first; keep the first write compact. "
+                    + "Do not reread these support files unless a new validator blocker appears."
+                ),
+                max_chars,
+            ),
+            max_len=max_chars,
+        )
+        return {
+            "role": "system",
+            "content": content,
+            "ts": now_ts(),
+            "agent_role": role_key,
+        }
+
+    def _inject_target_snapshot_context(
+        self,
+        role: str,
+        *,
+        target_path: str = "",
+        board: dict | None = None,
+        max_chars: int = 6200,
+    ) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = self._normalize_delegate_path_hint(target_path) or self._developer_target_path_hint(bb)
+        if (not role_key) or (not rel) or (not self._path_is_materialized(rel, bb)):
+            return False
+        ctx = self._agent_context(role_key)
+        rel_low = rel.lower()
+        for row in reversed(ctx[-16:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "system":
+                continue
+            content = str(row.get("content", "") or "").strip().lower()
+            if f"grounded target snapshot for {rel_low}:" in content:
+                return False
+        snapshot_row = self._executor_target_snapshot_message(
+            role=role_key,
+            target_path=rel,
+            max_chars=max_chars,
+        )
+        if not isinstance(snapshot_row, dict) or not snapshot_row:
+            return False
+        self._append_agent_context_message(
+            role_key,
+            snapshot_row,
+            mirror_to_global=False,
+        )
+        return True
+
+    def _inject_support_snapshot_context(
+        self,
+        role: str,
+        *,
+        target_path: str = "",
+        board: dict | None = None,
+        max_chars: int = 6200,
+    ) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rel = self._normalize_delegate_path_hint(target_path) or self._developer_target_path_hint(bb)
+        if (not role_key) or (not rel):
+            return False
+        ctx = self._agent_context(role_key)
+        rel_low = rel.lower()
+        for row in reversed(ctx[-16:]):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role", "") or "").strip().lower() != "system":
+                continue
+            content = str(row.get("content", "") or "").strip().lower()
+            if f"grounded support snapshot for {rel_low}:" in content:
+                return False
+        snapshot_row = self._executor_support_snapshot_message(
+            role=role_key,
+            target_path=rel,
+            board=bb,
+            max_chars=max_chars,
+        )
+        if not isinstance(snapshot_row, dict) or not snapshot_row:
+            return False
+        self._append_agent_context_message(
+            role_key,
+            snapshot_row,
+            mirror_to_global=False,
+        )
+        return True
 
     def _tool_was_used_in_session(self, tool_name: str) -> bool:
         target = str(tool_name or "").strip()
@@ -21822,15 +24265,39 @@ class SessionState:
         target_path = str(target_state.get("target_path", "") or "")
         target_touched = bool(target_state.get("target_touched", False))
         validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        create_only_window = bool(target_state.get("create_only_window", False))
+        recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
         contract_paths = self._workspace_contract_paths(limit=6)
         missing_expected = self._goal_missing_expected_artifacts()
         hints: list[str] = []
-        if role_key == "developer" and target_path and tool_name in {"read_file", "bash", "ask_colleague", "read_from_blackboard"}:
-            if not validation_targeted_repair and not target_touched:
+        if role_key == "developer" and target_path and tool_name in {"read_file", "bash", "ask_colleague", "read_from_blackboard", "edit_file", "write_file"}:
+            if create_only_window and not validation_targeted_repair:
+                hints.append(
+                    f"Current implementation step is narrowed to exact target path: {target_path}. "
+                    "That file does not exist yet. Use write_file on that path now; write_file can create missing parent directories automatically."
+                )
+            elif not validation_targeted_repair and not target_touched:
                 hints.append(
                     f"Current implementation step is narrowed to exact target path: {target_path}. "
                     "Use edit_file/write_file on that path now."
                 )
+            elif validation_targeted_repair:
+                hints.append(
+                    f"Current repair step is still narrowed to exact target path: {target_path}. "
+                    + (
+                        "Use write_file on that path now."
+                        if recent_restricted_tool_errors >= 1 or tool_name == "edit_file"
+                        else "Use edit_file/write_file on that path now."
+                    )
+                )
+            if tool_name == "edit_file":
+                hints.append(
+                    f"If edit_file keeps failing on `{target_path}`, switch to write_file on the same path with the full corrected contents."
+                )
+                if bool(target_state.get("target_materialized", False)):
+                    hints.append(
+                        "Treat the current target file as already grounded. Prefer a direct full-file rewrite over another speculative edit diff."
+                    )
         if requested_path and tool_name in {"read_file", "write_file", "edit_file"}:
             requested_name = Path(requested_path).name.strip().lower()
             basename_matches: list[str] = []
@@ -22131,6 +24598,8 @@ class SessionState:
         if role_key != "reviewer":
             return False
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        validation_cmd = self._workspace_validation_command_hint()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         if bool(dq.get("active", False)):
             steps = dq.get("steps", []) if isinstance(dq.get("steps"), list) else []
@@ -22141,10 +24610,17 @@ class SessionState:
                 action_type = str(current_step.get("action_type", "") or "").strip().lower()
                 if target == role_key and action_type == "validate":
                     return True
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        if (
+            self._sanitize_agent_role(delegate.get("target", "")) == role_key
+            and validation_cmd
+            and code_count > 0
+        ):
+            return True
         return bool(
             self._current_delegate_is_mandatory_for(role_key)
-            and self._workspace_validation_command_hint()
-            and len(bb.get("code_artifacts", {}) or {}) > 0
+            and validation_cmd
+            and code_count > 0
         )
 
     def _dynamic_tool_suppressions(self, role: str) -> set[str]:
@@ -22152,6 +24628,27 @@ class SessionState:
         if not role_key:
             return set()
         suppressed: set[str] = set()
+        if self._single_mode_support_active():
+            suppressed.update(
+                {
+                    "ask_colleague",
+                    "finish_task",
+                    "finish_current_task",
+                    "mark_done",
+                    "TodoWrite",
+                    "TodoWriteRescue",
+                    "task",
+                    "task_create",
+                    "task_get",
+                    "task_list",
+                    "task_update",
+                    "claim_task",
+                    "spawn_teammate",
+                    "list_teammates",
+                    "read_inbox",
+                    "compress",
+                }
+            )
         if self._skill_discovery_already_satisfied():
             suppressed.update(SKILL_DISCOVERY_TOOL_NAMES)
         if role_key == "explorer":
@@ -22184,6 +24681,14 @@ class SessionState:
         target_read_done = bool(target_state.get("target_read_done", False))
         target_touched = bool(target_state.get("target_touched", False))
         validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        edit_only_window = bool(target_state.get("edit_only_window", False))
+        create_only_window = bool(target_state.get("create_only_window", False))
+        recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
+        repair_write_only = bool(
+            explicit_target_step
+            and validation_targeted_repair
+            and recent_restricted_tool_errors >= 1
+        )
         if not missing_expected:
             if validation_targeted_repair:
                 pass
@@ -22239,6 +24744,16 @@ class SessionState:
             suppressed.add("read_from_blackboard")
         if self._current_delegate_is_mandatory_for(role_key):
             suppressed.add("ask_colleague")
+        if edit_only_window:
+            suppressed.update({"finish_task", "finish_current_task", "mark_done"})
+        if create_only_window:
+            suppressed.update({"edit_file", "finish_task", "finish_current_task", "mark_done"})
+        if explicit_target_step and validation_targeted_repair:
+            suppressed.add("bash")
+        if repair_write_only:
+            suppressed.add("edit_file")
+        if edit_only_window and recent_restricted_tool_errors >= 2:
+            suppressed.add("edit_file")
         if explicit_target_step and target_read_done:
             suppressed.add("read_file")
         if explicit_target_step and (not validation_targeted_repair) and (not target_touched):
@@ -22277,8 +24792,6 @@ class SessionState:
                 base.add("read_file")
                 if self._recent_blackboard_read_count(role_key, bb) <= 0:
                     base.add("read_from_blackboard")
-            elif self._recent_blackboard_read_count(role_key, bb) <= 0:
-                base.add("read_from_blackboard")
             return base
         if role_key != "developer":
             return set()
@@ -22299,6 +24812,14 @@ class SessionState:
         target_read_done = bool(target_state.get("target_read_done", False))
         target_touched = bool(target_state.get("target_touched", False))
         validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+        edit_only_window = bool(target_state.get("edit_only_window", False))
+        create_only_window = bool(target_state.get("create_only_window", False))
+        recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
+        repair_write_only = bool(
+            explicit_target_step
+            and validation_targeted_repair
+            and recent_restricted_tool_errors >= 1
+        )
         focused_missing = bool(len(missing_expected) == 1)
         research_rows = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
         for row in reversed(research_rows[-24:]):
@@ -22316,14 +24837,28 @@ class SessionState:
             "finish_current_task",
             "mark_done",
         }
+        if edit_only_window:
+            base.discard("finish_task")
+            base.discard("finish_current_task")
+            base.discard("mark_done")
+        if create_only_window:
+            base = {"write_file"}
+        elif repair_write_only:
+            base = {"write_file"}
+        if edit_only_window and recent_restricted_tool_errors >= 2:
+            base = {"write_file"}
         if focused_missing:
             pass
         elif not explicit_target_step:
             base.update({"bash", "read_from_blackboard", "ask_colleague"})
-        elif validation_targeted_repair or target_touched:
+        elif (validation_targeted_repair or target_touched) and not explicit_target_step:
             base.add("bash")
         goal_low = str(bb.get("original_goal", "") or "").strip().lower()
         explicit_load_skill_request = ("load_skill" in goal_low) or ("call load skill" in goal_low)
+        if self._goal_requires_runtime_skill_load(str(bb.get("original_goal", "") or "")) and (
+            not self._tool_was_used_in_session("load_skill")
+        ):
+            explicit_load_skill_request = True
         if (
             explicit_target_step
             and (not validation_targeted_repair)
@@ -22336,6 +24871,8 @@ class SessionState:
         if explicit_target_step:
             base.discard("read_from_blackboard")
             base.discard("ask_colleague")
+        if explicit_target_step and validation_targeted_repair:
+            base.discard("bash")
         if explicit_target_step and (not target_exists):
             base.discard("read_file")
         if explicit_target_step and target_read_done:
@@ -22346,6 +24883,8 @@ class SessionState:
             base.discard("read_from_blackboard")
         elif blackboard_reads > 2:
             base.discard("read_from_blackboard")
+        if explicit_load_skill_request and not self._tool_was_used_in_session("load_skill"):
+            base.add("load_skill")
         return base
 
     def _reviewer_final_summary_ready(self, board: dict | None = None) -> bool:
@@ -22480,11 +25019,192 @@ class SessionState:
             return "", ""
         return self._sanitize_agent_role(m.group(1)), self._sanitize_agent_role(m.group(2))
 
+    def _resolve_task_execution_mode(self, requested: object, *, default: object = EXECUTION_MODE_SYNC) -> str:
+        if bool(getattr(self, "execution_mode_locked", False)):
+            return normalize_execution_mode(
+                getattr(self, "execution_mode", EXECUTION_MODE_SYNC),
+                default=EXECUTION_MODE_SYNC,
+            )
+        requested_mode = normalize_execution_mode(requested, default="")
+        if requested_mode in EXECUTION_MODE_CHOICES:
+            return requested_mode
+        return normalize_execution_mode(default, default=EXECUTION_MODE_SYNC)
+
+    def _route_is_agentbus_driven(self, route: dict | None) -> bool:
+        row = route if isinstance(route, dict) else {}
+        source = trim(str(row.get("source", "") or "").strip().lower(), 80)
+        if "agentbus" in source or source == "kernel-bus-direct":
+            return True
+        reason = trim(str(row.get("reason", "") or "").strip().lower(), 240)
+        return "agentbus relay" in reason or "pending bus relay" in reason or "direct bus relay" in reason
+
     def _effective_execution_mode(self) -> str:
         runtime_mode = normalize_execution_mode(self.runtime_execution_mode, default="")
         if runtime_mode in {EXECUTION_MODE_SINGLE, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
             return runtime_mode
         return normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
+
+    def _single_mode_executor_role(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        for candidate in (
+            bb.get("active_agent", ""),
+            profile.get("assigned_expert", ""),
+            getattr(self, "runtime_assigned_expert", ""),
+            getattr(self, "active_agent_role", ""),
+            "developer",
+        ):
+            role = self._sanitize_agent_role(candidate)
+            if role:
+                return role
+        return "developer"
+
+    def _single_mode_support_active(self) -> bool:
+        return int(getattr(self, "inline_support_mode_depth", 0) or 0) > 0
+
+    def _agent_output_token_budget(self, role: str = "", *, board: dict | None = None) -> int:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        role_key = self._sanitize_agent_role(role) or self._single_mode_executor_role(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        try:
+            level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
+        except Exception:
+            level = int(self.runtime_task_level or 3)
+        if level not in TASK_LEVEL_CHOICES:
+            level = 3
+        budget = int(AGENT_MAX_OUTPUT_TOKENS)
+        if mode == EXECUTION_MODE_SINGLE and level <= 2:
+            budget = min(budget, 780 if level == 1 else 980)
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            budget = min(budget, 1100)
+        if self._single_mode_support_active():
+            budget = min(budget, 720)
+        if role_key == "reviewer":
+            validation_cmd = self._workspace_validation_command_hint()
+            code_count = len(bb.get("code_artifacts", {}) or {})
+            if validation_cmd and code_count > 0:
+                budget = min(budget, 680)
+            elif self._reviewer_validation_pressure_active(role_key, bb):
+                budget = min(budget, 900)
+        elif role_key == "explorer":
+            if self._explorer_grounding_pressure_active(role_key, bb):
+                budget = min(budget, 900)
+        elif role_key == "developer":
+            target_state = self._developer_target_step_state(bb, role=role_key)
+            if bool(target_state.get("explicit_target_step", False)):
+                budget = min(budget, 1050)
+        return max(320, min(int(AGENT_MAX_OUTPUT_TOKENS), int(budget)))
+
+    def _inline_support_request_text(self, from_role: str, to_role: str, intent: str, content: str) -> str:
+        board = self._ensure_blackboard()
+        objective = self._primary_objective_text(
+            goal=str(board.get("original_goal", "") or ""),
+            preferred=str(self._ensure_blackboard_task_profile(board).get("direct_objective", "") or ""),
+            max_chars=800,
+        )
+        requester = self._agent_display_name(from_role)
+        helper = self._agent_display_name(to_role)
+        parts: list[str] = []
+        if objective and objective.lower() not in content.lower():
+            parts.append(f"Objective: {objective}")
+        parts.append(f"Requester: {requester}")
+        parts.append(f"Support role: {helper}")
+        parts.append(f"Intent: {trim(intent, 120)}")
+        parts.append(trim(content, 1200))
+        parts.append(
+            "This is a one-turn inline support call inside single-agent mode. "
+            "Take one bounded step only, return concise evidence, do not call ask_colleague, "
+            "do not create todo/task scaffolding, and do not finish the run."
+        )
+        return self._apply_agent_language_policy(
+            trim("\n".join(part for part in parts if str(part or "").strip()), 1800),
+            max_len=1800,
+        )
+
+    def _extract_inline_support_result(self, role: str, step: dict | None, ctx_rows: list[dict] | None = None) -> str:
+        safe_step = step if isinstance(step, dict) else {}
+        direct_text = trim(
+            strip_thinking_content(str(safe_step.get("text", "") or "").strip()),
+            900,
+        )
+        if direct_text:
+            return direct_text
+        tool_results = safe_step.get("tool_results", []) if isinstance(safe_step.get("tool_results"), list) else []
+        for item in reversed(tool_results[-4:]):
+            if not isinstance(item, dict):
+                continue
+            output = trim(str(item.get("output", "") or "").strip(), 900)
+            if output and output != "(no output)":
+                return output
+        rows = list(ctx_rows or [])
+        for row in reversed(rows[-10:]):
+            if not isinstance(row, dict):
+                continue
+            row_role = str(row.get("role", "") or "").strip().lower()
+            content = trim(strip_thinking_content(str(row.get("content", "") or "").strip()), 900)
+            if row_role == "assistant" and content:
+                return content
+            if row_role == "tool" and content and content != "(no output)":
+                return content
+        status = trim(str(safe_step.get("status", "") or "").strip().lower(), 40) or "unknown"
+        return f"{self._agent_display_name(role)} support completed with status={status}."
+
+    def _run_inline_colleague_support(self, from_role: str, to_role: str, intent: str, content: str) -> str:
+        src = self._sanitize_agent_role(from_role) or "developer"
+        dst = self._sanitize_agent_role(to_role)
+        if not dst:
+            return "Error: inline colleague support requires a valid target role"
+        board = self._ensure_blackboard()
+        saved_ctx = list(self._agent_context(dst))
+        saved_messages_len = len(self.messages)
+        saved_active_role = str(getattr(self, "active_agent_role", "") or "")
+        saved_phase = str(getattr(self, "current_phase", "") or "")
+        saved_tool_name = str(getattr(self, "current_tool_name", "") or "")
+        previous_depth = int(getattr(self, "inline_support_mode_depth", 0) or 0)
+        pinned_selection = self._active_runtime_selection()
+        support_text = self._inline_support_request_text(src, dst, intent, content)
+        temp_ctx_rows: list[dict] = []
+        safe_step: dict = {"status": "skip", "role": dst, "text": ""}
+        try:
+            self.contexts[dst] = []
+            self.inline_support_mode_depth = previous_depth + 1
+            self._inject_role_baseline_skills(
+                dst,
+                board=board,
+                reason="single-inline-support",
+            )
+            self._append_agent_context_message(
+                dst,
+                {
+                    "role": "user",
+                    "content": support_text,
+                    "ts": now_ts(),
+                    "agent_role": dst,
+                },
+                mirror_to_global=False,
+            )
+            step = self._multi_agent_turn(
+                dst,
+                pinned_selection=pinned_selection,
+                media_inputs_round=None,
+            )
+            safe_step = step if isinstance(step, dict) else safe_step
+            temp_ctx_rows = list(self._agent_context(dst))
+        finally:
+            self.inline_support_mode_depth = previous_depth
+            self.messages = self.messages[:saved_messages_len]
+            self.contexts[dst] = saved_ctx
+            with self.lock:
+                self.active_agent_role = saved_active_role
+                self.current_phase = saved_phase
+                self.current_tool_name = saved_tool_name
+        summary = self._extract_inline_support_result(dst, safe_step, temp_ctx_rows)
+        return trim(f"{self._agent_display_name(dst)} support: {summary}", 1200)
 
     def _is_multi_agent_mode(self) -> bool:
         mode = self._effective_execution_mode()
@@ -22504,13 +25224,62 @@ class SessionState:
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
         suppressed = self._dynamic_tool_suppressions(role_key)
         delivery_allowlist = self._delivery_pressure_tool_allowlist(role_key)
+        if role_key == "developer":
+            bb = self._ensure_blackboard()
+            require_load_skill_first = bool(
+                self._goal_requires_runtime_skill_load(str(bb.get("original_goal", "") or ""))
+                and (not self._tool_was_used_in_session("load_skill"))
+            )
+            target_state = self._developer_target_step_state(bb, role=role_key)
+            explicit_target_step = bool(target_state.get("explicit_target_step", False))
+            target_exists = bool(target_state.get("target_exists", False))
+            target_read_done = bool(target_state.get("target_read_done", False))
+            target_touched = bool(target_state.get("target_touched", False))
+            validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+            edit_only_window = bool(target_state.get("edit_only_window", False))
+            create_only_window = bool(target_state.get("create_only_window", False))
+            recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
+            if create_only_window or (explicit_target_step and (not target_exists) and (not validation_targeted_repair)):
+                delivery_allowlist = {"write_file"}
+            elif explicit_target_step and validation_targeted_repair and target_exists:
+                delivery_allowlist = {"write_file"} if recent_restricted_tool_errors >= 1 else {"edit_file", "write_file"}
+            elif edit_only_window or (
+                explicit_target_step
+                and target_read_done
+                and (not target_touched)
+                and (not validation_targeted_repair)
+            ):
+                delivery_allowlist = {"edit_file", "write_file"}
+            if require_load_skill_first:
+                delivery_allowlist = set(delivery_allowlist or set())
+                delivery_allowlist.add("load_skill")
+        elif role_key == "reviewer":
+            bb = self._ensure_blackboard()
+            if self._reviewer_validation_pressure_active(role_key, bb) and self._workspace_validation_command_hint():
+                delivery_allowlist = {
+                    "bash",
+                    "finish_task",
+                    "finish_current_task",
+                    "mark_done",
+                }
         filtered = []
         for tool in TOOLS:
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
             if name in allowed and name not in suppressed and (not delivery_allowlist or name in delivery_allowlist):
                 filtered.append(tool)
-        return filtered or TOOLS
+        if filtered:
+            return filtered
+        if suppressed or delivery_allowlist:
+            constrained = []
+            for tool in TOOLS:
+                fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+                name = str(fn.get("name", "")).strip()
+                if name in allowed and (not delivery_allowlist or name in delivery_allowlist):
+                    constrained.append(tool)
+            if constrained:
+                return constrained
+        return TOOLS
 
     def _agent_context(self, role: str) -> list[dict]:
         role_key = self._sanitize_agent_role(role)
@@ -22746,6 +25515,97 @@ class SessionState:
                 return True
         return False
 
+    def _compose_agentbus_handoff_payload(
+        self,
+        *,
+        from_role: str,
+        to_role: str,
+        intent: str,
+        note: str = "",
+        board: dict | None = None,
+        max_chars: int = 1200,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        src = self._sanitize_agent_role(from_role)
+        dst = self._sanitize_agent_role(to_role)
+        intent_low = trim(str(intent or "").strip().lower(), 80)
+        if not dst:
+            return trim(str(note or "").strip(), max_chars)
+        objective = self._primary_objective_text(
+            goal=str(bb.get("original_goal", "") or ""),
+            preferred=str(self._ensure_blackboard_task_profile(bb).get("direct_objective", "") or ""),
+            max_chars=800,
+        )
+        require_check = bool(
+            dst == "reviewer"
+            or (
+                dst == "developer"
+                and (
+                    intent_low in {"fix_request", "review_request"}
+                    or bool(self._latest_validation_failure_hint(bb))
+                )
+            )
+        )
+        if dst == "explorer" and "summary" in intent_low:
+            base = "Approval is already in place. Synthesize the final summary from blackboard evidence now."
+        elif dst == "reviewer" and intent_low in {"review_request", "verify_request"}:
+            base = (
+                self._compose_manager_live_instruction(bb, role="reviewer", require_check=True, max_chars=max_chars)
+                or "Validate the latest outputs with concrete evidence and return pass/fix judgement."
+            )
+        elif dst == "developer":
+            base = (
+                self._compose_manager_live_instruction(bb, role="developer", require_check=require_check, max_chars=max_chars)
+                or "Implement the next concrete increment now."
+            )
+        else:
+            base = (
+                self._compose_manager_live_instruction(bb, role=dst, require_check=require_check, max_chars=max_chars)
+                or "Refresh grounding from the latest blocker and return one concrete unblock path."
+            )
+        note_clean = self._delegate_instruction_display_text(
+            trim(str(note or "").strip(), 900),
+            objective=objective,
+            max_chars=min(360, max_chars),
+        )
+        parts: list[str] = [base] if base else []
+        if note_clean and not self._delegate_display_is_runtime_meta(note_clean):
+            existing = "\n".join(parts).lower()
+            if note_clean.lower() not in existing:
+                label = f"Latest {src} note: " if src else "Latest note: "
+                parts.append(f"{label}{note_clean}")
+        joined = "\n".join(parts).lower()
+        if dst == "developer":
+            validation_hint = trim(self._latest_validation_failure_hint(bb), 320)
+            focus_paths = self._preferred_validation_target_paths(bb, limit=3) if validation_hint else []
+            if not focus_paths:
+                focus_paths = self._implementation_step_targets(bb, limit=3)
+            if not focus_paths:
+                focus_paths = self._current_deliverable_paths(bb, limit=2)
+            if not focus_paths:
+                focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+            if focus_paths and "target path:" not in joined:
+                parts.append(f"Target path: {focus_paths[0]}.")
+            requirement_hint = trim(
+                self._validation_contract_requirement_hint(
+                    validation_hint,
+                    board=bb,
+                    target_path=(focus_paths[0] if focus_paths else ""),
+                ),
+                220,
+            )
+            joined = "\n".join(parts).lower()
+            if validation_hint and "latest validation failure:" not in joined and intent_low in {"fix_request", "review_request"}:
+                parts.append(f"Latest validation failure: {validation_hint}.")
+            joined = "\n".join(parts).lower()
+            if requirement_hint and requirement_hint.lower() not in joined:
+                parts.append(requirement_hint)
+        elif dst == "reviewer":
+            validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+            if validation_cmd and "check command:" not in joined:
+                parts.append(f"Check command: {validation_cmd}")
+        return trim("\n".join(part for part in parts if str(part or "").strip()), max_chars)
+
     def _auto_agentbus_handoff(self, role: str, step: dict | None, board: dict | None = None) -> dict | None:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if not self._is_multi_agent_mode():
@@ -22789,25 +25649,28 @@ class SessionState:
         approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
         validate_contract_present = bool((self.files_root / "validate.py").exists())
         validation_hint = self._latest_validation_failure_hint(bb)
-        validation_requirement_hint = self._validation_contract_requirement_hint(validation_hint)
-        repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
+        repair_focus_paths = self._preferred_validation_target_paths(bb, limit=3)
+        validation_requirement_hint = self._validation_contract_requirement_hint(
+            validation_hint,
+            board=bb,
+            target_path=(repair_focus_paths[0] if repair_focus_paths else ""),
+        )
+        if not repair_focus_paths:
+            repair_focus_paths = self._goal_direct_expected_artifacts(str(bb.get("original_goal", "") or ""))
         if not repair_focus_paths:
             repair_focus_paths = self._current_deliverable_paths(bb, limit=2)
         latest_exec_low = self._latest_execution_log_text(bb).lower()
         validation_pass_marker = bool(re.search(r"\bpass[_a-z0-9-]*\b", latest_exec_low))
         target = ""
         intent = ""
-        lead = ""
         importance = "normal"
 
         if role_key == "explorer":
             target = "developer"
             intent = "execute_plan"
-            lead = "Grounding is ready. Implement the next concrete increment now."
         elif role_key == "developer":
             target = "reviewer"
             intent = "review_request"
-            lead = "Implementation batch is ready for validation. Run the nearest validator or test entrypoint now and return pass/fix evidence."
             if (not has_delivery_tool) and (not validation_pass_marker):
                 return None
         elif role_key == "reviewer":
@@ -22816,30 +25679,23 @@ class SessionState:
                     return None
                 target = "explorer"
                 intent = "final_summary_request"
-                lead = "Approval is already in place. Synthesize the final summary from blackboard evidence now."
                 importance = "high"
             else:
                 target = "developer"
                 intent = "fix_request"
-                lead = "Latest review found concrete gaps. Fix only the current validated issues and rerun the relevant checks."
                 importance = "high"
                 if (not validation_hint) and len(clean_text) < 80 and (not has_substantive_tools):
                     return None
-        if (not target) or (not intent) or (not lead):
+        if (not target) or (not intent):
             return None
-
-        parts = [lead]
-        if clean_text and role_key in {"explorer", "reviewer"}:
-            parts.append(f"Latest {role_key} note: {clean_text}")
-        if target == "developer" and repair_focus_paths:
-            parts.append(f"Target path: {repair_focus_paths[0]}.")
-        if target == "developer" and validation_hint:
-            parts.append(f"Latest validation failure: {validation_hint}.")
-        if target == "developer" and validation_requirement_hint:
-            parts.append(validation_requirement_hint)
-        if target == "reviewer" and validate_contract_present and (not validation_pass_marker):
-            parts.append("Validator contract exists; prefer running `python3 validate.py` before deciding.")
-        payload = trim("\n".join(part for part in parts if str(part or "").strip()), 1200)
+        payload = self._compose_agentbus_handoff_payload(
+            from_role=role_key,
+            to_role=target,
+            intent=intent,
+            note=clean_text,
+            board=bb,
+            max_chars=1200,
+        )
         if self._recent_agentbus_duplicate(role_key, target, intent, payload):
             return None
         return self._agent_send_bus(
@@ -22852,6 +25708,12 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
+        support_note = ""
+        if self._single_mode_support_active():
+            support_note = (
+                "This is a one-turn inline support request inside single-agent mode. "
+                "Take one bounded step, do not call ask_colleague, and do not finish the run. "
+            )
         base = (
             f"You are {self._agent_display_name(role_key)} in a blackboard-driven multi-agent coding system. "
             f"Workspace root: {self.files_root}. "
@@ -22864,6 +25726,7 @@ class SessionState:
             "You must stay within your role boundary and use only provided tools. "
             "Use read_from_blackboard/write_to_blackboard to keep the shared state accurate. "
             "When communicating with other agents, use ask_colleague with structured intent/content. "
+            f"{support_note}"
             "Always keep outputs concise and action-oriented. "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -22886,6 +25749,7 @@ class SessionState:
                 + "If blocked by missing validation procedure or closeout structure, load only the minimal review or summary skill needed. "
                 + "A skill load by itself is not sufficient progress; follow it immediately with blackboard reads, validation commands, or reviewer feedback evidence. "
                 + "If validate.py or a clear test entrypoint exists, run that validation command before giving a verdict; reading files alone is not enough review evidence. "
+                + "When validation pressure is active, keep the reply short and default to a concrete validator/test command first. "
                 + "If gaps remain, send fix_request to developer with concrete failure evidence and write review_feedback to blackboard. "
                 + "If manager requests final summary, first call read_from_blackboard "
                 + "(sections: code_artifacts, execution_logs, review_feedback, status), then generate a structured summary "
@@ -22899,13 +25763,16 @@ class SessionState:
             + "If validate/spec/tests require exact strings, headings, or literals, reproduce those contract strings verbatim instead of translating or paraphrasing them. "
             + "If the task capsule or manager instruction names missing_artifacts, use write_file/edit_file on those exact paths before extra shell exploration; ls/find/mkdir alone are not enough. "
             + "If the delegated step names `Target path: ...`, treat that exact file as the required deliverable for this round and materialize or edit it directly before changing upstream generator files. "
+            + "If that target file does not exist yet, `read_file` on it is invalid; use `write_file` directly. "
+            + "`write_file` can create the missing parent directories automatically, so do not spend a turn on bash mkdir/touch/cp first. "
+            + "When the target file is still missing, write the smallest validator-satisfying version first and expand only after validation or concrete reviewer feedback. "
             + "When `Target path: ...` points to an existing file, read that exact file at most once if its current contents are still unknown, then move directly to edit_file/write_file on the same path. "
             + "Do not read unrelated files, do not call ask_colleague, and do not use bash before making that target-file edit. "
             + "If blocked by multi-step execution uncertainty, load only the minimal implementation skill needed. "
             + "A skill load by itself is not sufficient progress; follow it immediately with read_file, write_file, edit_file, bash, or ask_colleague. "
             + "Perform concrete file edits and command execution. "
             + "Continuously record progress and blockers to blackboard. "
-            + "When blocked or uncertain, immediately call ask_colleague to explorer/reviewer with focused intent. "
+            + "Only call ask_colleague when the current step is not narrowed to an exact target path and no direct edit or validation action can advance the task. "
             + "When implementation batch is ready, send review_request to reviewer via ask_colleague."
         )
 
@@ -23590,6 +26457,15 @@ class SessionState:
         role_key = self._sanitize_agent_role(agent_role)
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
+        if role_key == "developer" and name in {"write_file", "edit_file"}:
+            bb_for_skill_guard = self._ensure_blackboard()
+            if self._goal_requires_runtime_skill_load(str(bb_for_skill_guard.get("original_goal", "") or "")) and (
+                not self._tool_was_used_in_session("load_skill")
+            ):
+                return (
+                    "Error: user explicitly required one `load_skill` call before editing files in this task. "
+                    "Call `load_skill` now with one minimal built-in runtime skill, then continue the same implementation step."
+                )
         delivery_allowlist = self._delivery_pressure_tool_allowlist(role_key) if role_key else set()
         if role_key and delivery_allowlist and name not in delivery_allowlist:
             allowed_text = ", ".join(sorted(delivery_allowlist))
@@ -23636,6 +26512,44 @@ class SessionState:
                 generic_note += "Use a delivery or validation tool instead."
             return f"Error: {trim(generic_note, 420)}"
         if role_key and name == "bash":
+            if role_key == "developer":
+                bb = self._ensure_blackboard()
+                if self._developer_delivery_pressure_active(role_key, bb):
+                    target_state = self._developer_target_step_state(bb, role=role_key)
+                    target_path = str(target_state.get("target_path", "") or "")
+                    explicit_target_step = bool(target_state.get("explicit_target_step", False))
+                    validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+                    validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+                    if (
+                        explicit_target_step
+                        and validation_targeted_repair
+                        and self._bash_command_is_non_substantive(args.get("command", ""))
+                    ):
+                        note = (
+                            f"Non-substantive bash inspection is blocked during targeted repair for `{target_path}`. "
+                            "Use edit_file/write_file on that path now."
+                        )
+                        if validation_cmd:
+                            note += f" If you need shell evidence, run exactly `{validation_cmd}`."
+                        return f"Error: {trim(note, 420)}"
+            if role_key == "reviewer":
+                bb = self._ensure_blackboard()
+                validation_cmd = trim(self._workspace_validation_command_hint(), 120)
+                if self._reviewer_validation_pressure_active(role_key, bb) and validation_cmd:
+                    cmd_norm = re.sub(r"\s+", " ", str(args.get("command", "") or "").strip().lower())
+                    validation_norm = re.sub(r"\s+", " ", validation_cmd.lower()).strip()
+                    if validation_norm and cmd_norm != validation_norm:
+                        original = trim(str(args.get("command", "") or "").strip(), 120)
+                        args["command"] = validation_cmd
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "reviewer bash auto-grounded "
+                                    f"{original or '(empty)'}->{validation_cmd}"
+                                )
+                            },
+                        )
             misused_tool = self._bash_command_invokes_agent_tool(args.get("command", ""))
             if misused_tool:
                 return (
@@ -23694,6 +26608,13 @@ class SessionState:
                     requested_rel = normalize_rel_preview_path(requested_rel) or trim(str(requested_rel or "").strip(), 280)
                     if requested_rel and target_path and requested_rel != target_path:
                         args["path"] = target_path
+                        self._set_execution_anchor(
+                            target_path,
+                            role=role_key,
+                            source="read-file-auto-ground",
+                            note=f"{requested_rel}->{target_path}",
+                            board=bb,
+                        )
                         self._emit(
                             "status",
                             {
@@ -23761,6 +26682,37 @@ class SessionState:
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            if role_key == "developer":
+                bb = self._ensure_blackboard()
+                if self._developer_delivery_pressure_active(role_key, bb):
+                    target_state = self._developer_target_step_state(bb, role=role_key)
+                    target_path = str(target_state.get("target_path", "") or "")
+                    explicit_target_step = bool(target_state.get("explicit_target_step", False))
+                    if explicit_target_step and target_path and rel != target_path:
+                        derived_outputs = self._target_derived_output_paths(target_path, board=bb, limit=4)
+                        if rel in derived_outputs:
+                            return (
+                                "Error: current implementation step is narrowed to exact target path "
+                                f"`{target_path}`. `{rel}` is a derived output of that source. "
+                                f"Repair `{target_path}` so it regenerates `{rel}` correctly instead. "
+                                + (
+                                    "Use write_file on the exact target path; it can create missing parent directories automatically."
+                                    if not bool(target_state.get("target_exists", False))
+                                    else "Use write_file on the exact target path instead."
+                                )
+                            )
+                        return (
+                            "Error: current implementation step is narrowed to exact target path "
+                            f"`{target_path}`. Do not write `{rel}` in this turn. "
+                            + (
+                                "Use write_file on the exact target path; it can create missing parent directories automatically."
+                                if not bool(target_state.get("target_exists", False))
+                                else "Use write_file on the exact target path instead."
+                            )
+                        )
+            write_guard = self._validate_agent_write_target(role_key, rel)
+            if write_guard:
+                return write_guard
             existed = fp.exists()
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
@@ -23815,6 +26767,28 @@ class SessionState:
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            if role_key == "developer":
+                bb = self._ensure_blackboard()
+                if self._developer_delivery_pressure_active(role_key, bb):
+                    target_state = self._developer_target_step_state(bb, role=role_key)
+                    target_path = str(target_state.get("target_path", "") or "")
+                    explicit_target_step = bool(target_state.get("explicit_target_step", False))
+                    if explicit_target_step and target_path and rel != target_path:
+                        derived_outputs = self._target_derived_output_paths(target_path, board=bb, limit=4)
+                        if rel in derived_outputs:
+                            return (
+                                "Error: current implementation step is narrowed to exact target path "
+                                f"`{target_path}`. `{rel}` is a derived output of that source. "
+                                f"Repair `{target_path}` so it regenerates `{rel}` correctly instead of editing the derived file directly."
+                            )
+                        return (
+                            "Error: current implementation step is narrowed to exact target path "
+                            f"`{target_path}`. Do not edit `{rel}` in this turn. "
+                            "Use edit_file/write_file on the exact target path instead."
+                        )
+            write_guard = self._validate_agent_write_target(role_key, rel)
+            if write_guard:
+                return write_guard
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_edit(rel, args["old_text"], args["new_text"])
             if not out.startswith("Error"):
@@ -24013,6 +26987,8 @@ class SessionState:
                 return "Error: ask_colleague.intent is required"
             if not content:
                 return "Error: ask_colleague.content is required"
+            if self._effective_execution_mode() == EXECUTION_MODE_SINGLE:
+                return self._run_inline_colleague_support(from_role, to_role, intent, content)
             env = self._agent_send_bus(from_role, to_role, intent, content)
             return (
                 f"agent_bus sent ({env.get('from')} -> {env.get('to')}, "
@@ -24411,6 +27387,8 @@ class SessionState:
                 continue
             txt = str(row.get("content", "") or "").strip()
             if txt:
+                if self._is_internal_runtime_control_error(txt):
+                    continue
                 latest = txt
                 break
         if not latest:
@@ -24486,34 +27464,177 @@ class SessionState:
             self.current_phase = f"agent:{role_key}:model-call"
             self.current_tool_name = ""
             self.active_agent_role = role_key
-        response = self._chat_with_same_model_retry(
-            ctx,
-            tools=self._tools_for_agent(role_key),
-            system=self._agent_role_system_prompt(role_key),
-            max_tokens=AGENT_MAX_OUTPUT_TOKENS,
-            think=False,
-            stream_thinking=False,
-            on_thinking_chunk=self._append_live_thinking,
-            pinned_selection=pinned_selection,
-            context_label=f"{role_key} turn",
-            retries=MODEL_OUTPUT_RETRY_TIMES,
-            media_inputs=media_inputs_round,
-        )
-        text = str(response.get("content") or "")
-        thinking_text = str(response.get("thinking") or "").strip()
-        text_main, embedded_thinking = split_thinking_content(text)
-        if embedded_thinking:
-            if thinking_text:
-                thinking_text = trim(f"{thinking_text}\n\n{embedded_thinking}", 24_000)
-            else:
-                thinking_text = embedded_thinking
-        text = text_main
-        tool_calls = response.get("tool_calls", [])
-        text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
-        if bool(text_filter_meta.get("filtered", False)):
-            reason = str(text_filter_meta.get("reason", "") or "").strip()
-            if reason == "oversized_raw_toolcall":
-                self._inject_toolcall_overflow_hint(role_key)
+        offered_tools = self._tools_for_agent(role_key)
+        offered_tool_names = {
+            canonicalize_tool_name(((tool or {}).get("function", {}) or {}).get("name", ""))
+            for tool in offered_tools
+            if isinstance(tool, dict)
+        }
+        offered_tool_names.discard("")
+        off_list_retry_used = False
+        while True:
+            response = self._chat_with_same_model_retry(
+                ctx,
+                tools=offered_tools,
+                system=self._agent_role_system_prompt(role_key),
+                max_tokens=self._agent_output_token_budget(role_key),
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label=f"{role_key} turn",
+                retries=MODEL_OUTPUT_RETRY_TIMES,
+                media_inputs=media_inputs_round,
+            )
+            text = str(response.get("content") or "")
+            thinking_text = str(response.get("thinking") or "").strip()
+            text_main, embedded_thinking = split_thinking_content(text)
+            if embedded_thinking:
+                if thinking_text:
+                    thinking_text = trim(f"{thinking_text}\n\n{embedded_thinking}", 24_000)
+                else:
+                    thinking_text = embedded_thinking
+            text = text_main
+            tool_calls = response.get("tool_calls", [])
+            text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
+            if bool(text_filter_meta.get("filtered", False)):
+                reason = str(text_filter_meta.get("reason", "") or "").strip()
+                if reason == "oversized_raw_toolcall":
+                    self._inject_toolcall_overflow_hint(role_key)
+            off_list_calls = [
+                tc
+                for tc in tool_calls
+                if canonicalize_tool_name(((tc or {}).get("function", {}) or {}).get("name", "")) not in offered_tool_names
+            ]
+            if tool_calls and off_list_calls and not off_list_retry_used:
+                available_text = ", ".join(sorted(offered_tool_names)) if offered_tool_names else "(none)"
+                target_state_retry = self._developer_target_step_state(self._ensure_blackboard(), role=role_key) if role_key == "developer" else {}
+                target_path_retry = str(target_state_retry.get("target_path", "") or "")
+                create_only_retry = bool(target_state_retry.get("create_only_window", False))
+                validation_retry = bool(target_state_retry.get("validation_targeted_repair", False))
+                target_read_done_retry = bool(target_state_retry.get("target_read_done", False))
+                exact_target_retry = bool(target_state_retry.get("explicit_target_step", False))
+                narrowed_target_note = ""
+                if role_key == "developer" and exact_target_retry and target_path_retry:
+                    if create_only_retry:
+                        narrowed_target_note = (
+                            f" Current step is narrowed to `{target_path_retry}` and that file does not exist yet. "
+                            "Use exactly one `write_file` call on that path now. "
+                            "`write_file` can create missing parent directories automatically."
+                        )
+                    elif validation_retry:
+                        narrowed_target_note = (
+                            f" Current repair step is narrowed to `{target_path_retry}`. "
+                            "Use exactly one `edit_file` or `write_file` call on that path now."
+                        )
+                    elif target_read_done_retry:
+                        narrowed_target_note = (
+                            f" Current step is narrowed to `{target_path_retry}` and grounding is already complete. "
+                            "Use exactly one `edit_file` or `write_file` call on that path now."
+                        )
+                self._append_agent_context_message(
+                    role_key,
+                    {
+                        "role": "system",
+                        "content": self._apply_agent_language_policy(
+                            "[tool-availability] Your last tool call was not offered in this turn. "
+                            f"Use only these tools now: {available_text}. "
+                            "Regenerate exactly one allowed tool call for the current step."
+                            + narrowed_target_note,
+                            max_len=1200,
+                        ),
+                        "ts": now_ts(),
+                        "agent_role": role_key,
+                    },
+                    mirror_to_global=False,
+                )
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} used an off-list tool; "
+                            "requesting same-turn retry with currently allowed tools"
+                        )
+                    },
+                )
+                if role_key == "developer" and exact_target_retry and (create_only_retry or validation_retry or target_read_done_retry):
+                    if create_only_retry:
+                        self._inject_support_snapshot_context(
+                            role_key,
+                            target_path=target_path_retry,
+                            board=self._ensure_blackboard(),
+                            max_chars=6200,
+                        )
+                    else:
+                        self._inject_target_snapshot_context(
+                            role_key,
+                            target_path=target_path_retry,
+                            board=self._ensure_blackboard(),
+                            max_chars=6200,
+                        )
+                off_list_retry_used = True
+                ctx = self._agent_context(role_key)
+                with self.lock:
+                    self.current_phase = f"agent:{role_key}:model-retry"
+                    self.current_tool_name = ""
+                continue
+            break
+        final_off_list_calls = [
+            tc
+            for tc in (tool_calls or [])
+            if canonicalize_tool_name(((tc or {}).get("function", {}) or {}).get("name", "")) not in offered_tool_names
+        ]
+        if tool_calls and final_off_list_calls:
+            available_text = ", ".join(sorted(offered_tool_names)) if offered_tool_names else "(none)"
+            target_state_retry = self._developer_target_step_state(self._ensure_blackboard(), role=role_key) if role_key == "developer" else {}
+            target_path_retry = str(target_state_retry.get("target_path", "") or "")
+            narrowed_target_note = ""
+            if role_key == "developer" and target_path_retry:
+                if bool(target_state_retry.get("create_only_window", False)):
+                    narrowed_target_note = (
+                        f" Current target is `{target_path_retry}` and it does not exist yet. "
+                        "Use exactly one `write_file` call on that path."
+                    )
+                elif bool(target_state_retry.get("validation_targeted_repair", False)):
+                    narrowed_target_note = (
+                        f" Current repair target is `{target_path_retry}`. "
+                        "Use exactly one `edit_file` or `write_file` call on that path."
+                    )
+                elif bool(target_state_retry.get("target_read_done", False)):
+                    narrowed_target_note = (
+                        f" Current target is `{target_path_retry}` and grounding is already complete. "
+                        "Use exactly one `edit_file` or `write_file` call on that path."
+                    )
+            self._append_agent_context_message(
+                role_key,
+                {
+                    "role": "system",
+                    "content": self._apply_agent_language_policy(
+                        "[tool-availability-final] You again called a tool that is not offered in this turn. "
+                        f"Allowed tools are: {available_text}. Treat this as a failed execution attempt and use only the allowed tool on the next turn."
+                        + narrowed_target_note,
+                        max_len=1200,
+                    ),
+                    "ts": now_ts(),
+                    "agent_role": role_key,
+                },
+                mirror_to_global=False,
+            )
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{self._agent_display_name(role_key)} repeated an off-list tool after retry; "
+                        "treating the turn as no-tools"
+                    )
+                },
+            )
+            return {
+                "status": "no-tools",
+                "role": role_key,
+                "text": trim(text, 400),
+                "thinking": trim(thinking_text, 2000),
+            }
         empty_action = bool((not str(text or "").strip()) and (not tool_calls))
         if empty_action:
             missing_expected = self._goal_missing_expected_artifacts()
@@ -24530,6 +27651,14 @@ class SessionState:
                     + ", ".join(missing_expected[:4])
                     + ". Use write_file or edit_file on one of those exact paths now. "
                 )
+            if role_key == "developer":
+                target_state = self._developer_target_step_state(self._ensure_blackboard(), role=role_key)
+                target_path = str(target_state.get("target_path", "") or "")
+                if bool(target_state.get("create_only_window", False)) and target_path:
+                    reminder += (
+                        f"Current target is `{target_path}`. "
+                        "`write_file` can create missing parent directories automatically. "
+                    )
             self._append_agent_context_message(
                 role_key,
                 {
@@ -24612,6 +27741,7 @@ class SessionState:
             self.current_phase = f"agent:{role_key}:tool-dispatch"
             self.current_tool_name = ""
         stop_due_to_finish = False
+        stop_due_to_focus_checkpoint = False
         tool_results: list[dict] = []
         for tc in tool_calls:
             if self.cancel_requested:
@@ -24685,6 +27815,24 @@ class SessionState:
                         )
                     },
                 )
+            if role_key == "developer" and str(output or "").startswith("Error:"):
+                target_state_after_tool = self._developer_target_step_state(self._ensure_blackboard(), role=role_key)
+                if bool(target_state_after_tool.get("explicit_target_step", False)):
+                    target_path_after = str(target_state_after_tool.get("target_path", "") or "")
+                    if bool(target_state_after_tool.get("target_materialized", False)):
+                        self._inject_target_snapshot_context(
+                            role_key,
+                            target_path=target_path_after,
+                            board=self._ensure_blackboard(),
+                            max_chars=6200,
+                        )
+                    else:
+                        self._inject_support_snapshot_context(
+                            role_key,
+                            target_path=target_path_after,
+                            board=self._ensure_blackboard(),
+                            max_chars=6200,
+                        )
             self._emit(
                 "tool_result",
                 {
@@ -24704,6 +27852,32 @@ class SessionState:
             self._blackboard_update_from_tool_result(role_key, item)
             item["bb_applied"] = True
             tool_results.append(item)
+            if role_key == "developer" and name == "read_file" and not str(output).startswith("Error:"):
+                target_state_after = self._developer_target_step_state(self._ensure_blackboard(), role=role_key)
+                if (
+                    bool(target_state_after.get("explicit_target_step", False))
+                    and bool(target_state_after.get("target_read_done", False))
+                    and not bool(target_state_after.get("target_touched", False))
+                ):
+                    target_path_after = trim(str(target_state_after.get("target_path", "") or "").strip(), 280)
+                    if target_path_after:
+                        self._set_execution_anchor(
+                            target_path_after,
+                            role=role_key,
+                            source="grounding-checkpoint",
+                            note="next round: edit_file/write_file only",
+                        )
+                    stop_due_to_focus_checkpoint = True
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "developer grounding checkpoint reached; "
+                                "ending tool chain early so the next round can edit the same target directly"
+                            )
+                        },
+                    )
+                    break
             if name in {"finish_task", "finish_current_task", "mark_done"} and (not str(output).startswith("Error:")):
                 stop_due_to_finish = True
                 break
@@ -24711,12 +27885,19 @@ class SessionState:
             self.current_phase = f"agent:{role_key}:post-tools"
             self.current_tool_name = ""
         has_substantive_progress = self._tool_results_have_substantive_progress(tool_results)
+        if (not has_substantive_progress) and role_key == "reviewer":
+            has_substantive_progress = self._tool_results_have_validation_evidence(
+                tool_results,
+                board=self._ensure_blackboard(),
+            )
         if tool_results and (not has_substantive_progress):
             missing_expected = self._goal_missing_expected_artifacts()
             target_state = self._developer_target_step_state(self._ensure_blackboard(), role=role_key) if role_key == "developer" else {}
             target_path = str(target_state.get("target_path", "") or "")
             target_touched = bool(target_state.get("target_touched", False))
             validation_targeted_repair = bool(target_state.get("validation_targeted_repair", False))
+            create_only_window = bool(target_state.get("create_only_window", False))
+            recent_restricted_tool_errors = int(target_state.get("recent_restricted_tool_errors", 0) or 0)
             repeated_skill_note = ""
             validation_pressure_note = ""
             if role_key == "reviewer" and self._reviewer_validation_pressure_active(role_key, self._ensure_blackboard()):
@@ -24734,12 +27915,40 @@ class SessionState:
                 if repeated_skill_note:
                     repeated_skill_note += " "
             developer_target_note = ""
-            if role_key == "developer" and target_path and (not validation_targeted_repair) and (not target_touched):
-                developer_target_note = (
-                    f"Current step is narrowed to `{target_path}`. "
-                    "Do not read other files, do not call bash, and do not ask colleagues. "
-                    "Use exactly one `edit_file` or `write_file` action on that path next. "
-                )
+            if role_key == "developer" and target_path:
+                if create_only_window and (not validation_targeted_repair):
+                    developer_target_note = (
+                        f"Current step is narrowed to `{target_path}`. "
+                        "That file does not exist yet. "
+                        "Do not read other files, do not call bash, and do not ask colleagues. "
+                        "Use exactly one `write_file` action on that path next. "
+                        "`write_file` can create missing parent directories automatically. "
+                    )
+                elif validation_targeted_repair:
+                    developer_target_note = (
+                        f"Current repair step is narrowed to `{target_path}`. "
+                        "Do not read other files, do not call bash, and do not ask colleagues. "
+                        + (
+                            "Use exactly one `write_file` action on that path next. "
+                            if recent_restricted_tool_errors >= 1
+                            else "Use exactly one `edit_file` or `write_file` action on that path next. "
+                        )
+                    )
+                elif not target_touched:
+                    developer_target_note = (
+                        f"Current step is narrowed to `{target_path}`. "
+                        "Do not read other files, do not call bash, and do not ask colleagues. "
+                        + (
+                            "Use exactly one `write_file` action on that path next. "
+                            if recent_restricted_tool_errors >= 2
+                            else "Use exactly one `edit_file` or `write_file` action on that path next. "
+                        )
+                    )
+                if (not create_only_window) and recent_restricted_tool_errors >= 2:
+                    developer_target_note += (
+                        f"Further `read_file` attempts are invalid for this step "
+                        f"(recent blocked attempts={recent_restricted_tool_errors}). "
+                    )
             reminder = (
                 "[mandatory-reminder] Support/meta tools alone did not create grounded progress. "
                 + repeated_skill_note
@@ -24847,13 +28056,27 @@ class SessionState:
         if mode == EXECUTION_MODE_SEQUENTIAL:
             if role_key == "explorer":
                 payload = _lang_payload(
-                    clean_text or "Proceed with implementation by user goal, and refine Todo first when necessary."
+                    self._compose_agentbus_handoff_payload(
+                        from_role="explorer",
+                        to_role="developer",
+                        intent="execute_plan",
+                        note=clean_text or "Proceed with implementation by user goal, and refine Todo first when necessary.",
+                        board=self._ensure_blackboard(),
+                        max_chars=1200,
+                    )
                 )
                 self._agent_send_bus("explorer", "developer", "execute_plan", payload)
                 return False, "developer"
             if role_key == "developer":
                 payload = _lang_payload(
-                    clean_text or "Developer completed this implementation batch. Please run review now."
+                    self._compose_agentbus_handoff_payload(
+                        from_role="developer",
+                        to_role="reviewer",
+                        intent="review_request",
+                        note=clean_text or "Developer completed this implementation batch. Please run review now.",
+                        board=self._ensure_blackboard(),
+                        max_chars=1200,
+                    )
                 )
                 self._agent_send_bus("developer", "reviewer", "review_request", payload)
                 return False, "reviewer"
@@ -24878,17 +28101,42 @@ class SessionState:
                     )
                     return False, "reviewer"
                 payload = _lang_payload(
-                    clean_text or "Review did not pass. Please fix based on diffs and resubmit."
+                    self._compose_agentbus_handoff_payload(
+                        from_role="reviewer",
+                        to_role="developer",
+                        intent="fix_request",
+                        note=clean_text or "Review did not pass. Please fix based on diffs and resubmit.",
+                        board=self._ensure_blackboard(),
+                        max_chars=1200,
+                    )
                 )
                 self._agent_send_bus("reviewer", "developer", "fix_request", payload)
                 return False, "developer"
             return False, "explorer"
         # sync mode relay
         if role_key == "explorer":
-            payload = _lang_payload(clean_text or "Explorer tip: continue implementation aligned with the objective.")
+            payload = _lang_payload(
+                self._compose_agentbus_handoff_payload(
+                    from_role="explorer",
+                    to_role="developer",
+                    intent="tip",
+                    note=clean_text or "Explorer tip: continue implementation aligned with the objective.",
+                    board=self._ensure_blackboard(),
+                    max_chars=1200,
+                )
+            )
             self._agent_send_bus("explorer", "developer", "tip", payload)
         elif role_key == "developer":
-            payload = _lang_payload(clean_text or "Development output for this step is ready. Please review.")
+            payload = _lang_payload(
+                self._compose_agentbus_handoff_payload(
+                    from_role="developer",
+                    to_role="reviewer",
+                    intent="review_request",
+                    note=clean_text or "Development output for this step is ready. Please review.",
+                    board=self._ensure_blackboard(),
+                    max_chars=1200,
+                )
+            )
             self._agent_send_bus("developer", "reviewer", "review_request", payload)
         elif role_key == "reviewer":
             if self._reviewer_deems_done(clean_text):
@@ -24910,7 +28158,16 @@ class SessionState:
                     },
                 )
                 return False, role_key
-            payload = _lang_payload(clean_text or "Issues detected. Please fix and submit again.")
+            payload = _lang_payload(
+                self._compose_agentbus_handoff_payload(
+                    from_role="reviewer",
+                    to_role="developer",
+                    intent="fix_request",
+                    note=clean_text or "Issues detected. Please fix and submit again.",
+                    board=self._ensure_blackboard(),
+                    max_chars=1200,
+                )
+            )
             self._agent_send_bus("reviewer", "developer", "fix_request", payload)
         # Prevent indefinite silent loops.
         if max(idle_counts.values() or [0]) >= 6:
@@ -25486,7 +28743,7 @@ class SessionState:
                     self.messages,
                     tools=TOOLS,
                     system=self._system_prompt(),
-                    max_tokens=AGENT_MAX_OUTPUT_TOKENS,
+                    max_tokens=self._agent_output_token_budget(single_role),
                     think=False,
                     stream_thinking=False,
                     on_thinking_chunk=self._append_live_thinking,
@@ -27295,6 +30552,7 @@ class SessionManager:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        execution_mode_locked: bool = False,
         microtask_mode: str = "off",
         small_model_microtask_mode: str = "off",
         session_compression_level: int = DEFAULT_SESSION_COMPRESSION_LEVEL,
@@ -27333,6 +30591,7 @@ class SessionManager:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.execution_mode_locked = bool(execution_mode_locked)
         self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
         self.small_model_microtask_mode = normalize_on_off_mode(
             small_model_microtask_mode,
@@ -27625,6 +30884,7 @@ class SessionManager:
             min(1.0, float(self.arbiter_temperature if self.arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)),
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
+        sess.execution_mode_locked = bool(self.execution_mode_locked)
         sess.session_compression_level = normalize_session_compression_level(
             self.session_compression_level,
             default=DEFAULT_SESSION_COMPRESSION_LEVEL,
@@ -27700,6 +30960,7 @@ class SessionManager:
                 arbiter_max_tokens=self.arbiter_max_tokens,
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
+                execution_mode_locked=self.execution_mode_locked,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -27711,6 +30972,10 @@ class SessionManager:
             desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
             if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
                 sess.execution_mode = desired_mode
+                sess.updated_at = now_ts()
+                sess._persist()
+            elif bool(getattr(sess, "execution_mode_locked", False)) != bool(self.execution_mode_locked):
+                sess.execution_mode_locked = bool(self.execution_mode_locked)
                 sess.updated_at = now_ts()
                 sess._persist()
             self.sessions[sid] = sess
@@ -27743,6 +31008,7 @@ class SessionManager:
                 arbiter_max_tokens=self.arbiter_max_tokens,
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
+                execution_mode_locked=self.execution_mode_locked,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -30030,6 +33296,7 @@ function _stripDirectObjectivePrefix(raw){
 function _compactWorkerInstructionLine(raw){
   let line=String(raw||'').replace(/\\s+/g,' ').trim();
   if(!line)return'';
+  line=line.replace(/^\\[[^\\]]+\\]\\s*/,'').trim();
   line=line.replace(/^\\d+\\/\\d+\\s+\\w+\\s*->\\s*\\w+\\s*\\|\\s*/i,'').trim();
   for(const prefix of ['current focus:','next action:','this turn:','direct objective:']){
     if(line.toLowerCase().startsWith(prefix)){
@@ -30062,8 +33329,33 @@ function _isRuntimeMetaWorkerLine(raw){
     'update blackboard evidence',
     'write concise acceptance notes to blackboard',
     'write concrete acceptance constraints to blackboard',
+    'bootstrap from the nearest contract or validator files',
+    'capture exact acceptance constraints, required outputs, and target paths on the blackboard',
     'support/meta tools',
-    'suggestion-only text reply is forbidden'
+    'suggestion-only text reply is forbidden',
+    'implement one incremental patch',
+    'address review feedback with concrete code changes',
+    'advance one concrete deliverable update',
+    'take one bounded step only',
+    'proceed with one concrete next step',
+    'use exactly one edit_file or write_file',
+    'use exactly one write_file',
+    'do not reread files',
+    'do not call read_file',
+    'do not call read_from_blackboard',
+    'do not call bash',
+    'do not ask colleagues',
+    'delivery lock:',
+    'recovery mode:',
+    'execution rule:',
+    'plan route and coordinate current node handoff',
+    'gather constraints/evidence for current node',
+    'provide research support and risk notes for current node',
+    'implement concrete outputs and file/tool changes for current node',
+    'prepare and deliver implementation updates for current node',
+    'review outputs and keep quality gate updated for current node',
+    'validate current node and provide pass/fix judgement',
+    'handle current node work'
   ];
   return runtimeTokens.some(token=>low.includes(token));
 }
@@ -30079,13 +33371,20 @@ function _stripObjectiveInstructionForWorker(raw){
     'retry note:',
     'rules: execute one concrete tool call now',
     'relevant runtime skills:',
+    'optional runtime skills if blocked:',
     'skill discovery is already satisfied',
     'use incremental edits (append/targeted replace)',
     'mandatory execution:',
     'stateless executor:',
     'collaboration preference:',
     'exact target path(s) for this step:',
-    'validator contract exists; prefer running'
+    'validator contract exists; prefer running',
+    'expected deliverables are still missing:',
+    'execution rule:',
+    'delivery lock:',
+    'recovery mode:',
+    'mode:',
+    'scope:'
   ];
   const hiddenContains=[
     'do not call load_skill/list_skills/list_skill_providers/list_skill_protocols again',
@@ -31341,6 +34640,7 @@ class AppContext:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        execution_mode_locked: bool = False,
         max_user: int = 0,
         max_user_sessions: int = 0,
         microtask_mode: str = "off",
@@ -31388,6 +34688,7 @@ class AppContext:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.execution_mode_locked = bool(execution_mode_locked)
         self.microtask_mode = normalize_on_off_mode(microtask_mode, default="off")
         self.small_model_microtask_mode = normalize_on_off_mode(
             small_model_microtask_mode,
@@ -31868,6 +35169,7 @@ class AppContext:
                 self.arbiter_max_tokens,
                 self.arbiter_temperature,
                 self.execution_mode,
+                self.execution_mode_locked,
                 self.microtask_mode,
                 self.small_model_microtask_mode,
                 self.session_compression_level,
@@ -32927,6 +36229,7 @@ class Handler(BaseHTTPRequestHandler):
                     "run_timeout": int(mgr.max_run_seconds),
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
+                    "execution_mode_locked": bool(getattr(mgr, "execution_mode_locked", False)),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
                     "arbiter_enabled": bool(mgr.arbiter_enabled),
                     "arbiter_model": str(mgr.arbiter_model or ""),
@@ -35108,6 +38411,7 @@ def main():
             or ""
         ).strip()
     resolved_execution_mode = normalize_execution_mode(raw_execution_mode, default=EXECUTION_MODE_SYNC)
+    resolved_execution_mode_locked = bool(str(raw_execution_mode or "").strip())
     if raw_execution_mode:
         normalized_raw = str(raw_execution_mode).strip().lower()
         if normalized_raw != resolved_execution_mode:
@@ -35185,6 +38489,7 @@ def main():
         resolved_arbiter_max_tokens,
         resolved_arbiter_temperature,
         resolved_execution_mode,
+        resolved_execution_mode_locked,
         resolved_max_user,
         resolved_max_user_sessions,
         resolved_microtask_mode,
