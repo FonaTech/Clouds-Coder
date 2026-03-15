@@ -774,7 +774,3 @@ flowchart TD
 ## 13. License
 
 This project is released under the MIT License. See [LICENSE](./LICENSE).
-
----
-
-If you plan to publish on GitHub, recommended next step is to add a small `CHANGELOG.md` and one architecture diagram image under `docs/` for faster onboarding.
