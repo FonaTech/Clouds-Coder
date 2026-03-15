@@ -71,7 +71,8 @@ DEFAULT_TIMEOUT_SECONDS = max(
 )
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
-AGENT_MAX_OUTPUT_TOKENS = 2200
+AGENT_MAX_OUTPUT_TOKENS = 16384
+OLLAMA_THINKING_TOOL_BUFFER = 4096
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD = 2
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD = 2
 WATCHDOG_STATE_STALL_THRESHOLD = 6
@@ -202,7 +203,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SINGLE,
         "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 4,
+        "round_budget": 2,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -211,7 +212,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SINGLE,
         "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 10,
+        "round_budget": 6,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -220,7 +221,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SYNC,
         "participants": ["explorer", "developer"],
         "assigned_expert": "developer",
-        "round_budget": 12,
+        "round_budget": 10,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -229,7 +230,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "execution_mode": EXECUTION_MODE_SYNC,
         "participants": ["explorer", "developer", "reviewer"],
         "assigned_expert": "developer",
-        "round_budget": 36,
+        "round_budget": 24,
         "requires_user_confirmation": False,
         "complexity": "complex",
     },
@@ -485,6 +486,30 @@ CODE_PREVIEW_EXTS = {
     ".svelte",
     ".gradle",
     ".properties",
+    # Fortran
+    ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
+    # Haskell
+    ".hs", ".lhs",
+    # Erlang / Elixir
+    ".erl", ".hrl", ".ex", ".exs",
+    # OCaml
+    ".ml", ".mli",
+    # HDL
+    ".vhd", ".vhdl", ".v", ".sv",
+    # Assembly
+    ".asm", ".s",
+    # Infra / Schema
+    ".proto", ".tf", ".tfvars", ".prisma", ".graphql", ".gql",
+    # Modern systems
+    ".zig", ".nim", ".jl", ".cr", ".d",
+    # Lisp family
+    ".clj", ".cljs", ".cljc", ".lisp", ".cl", ".el", ".rkt",
+    # Pascal
+    ".pas", ".pp",
+    # Shader
+    ".wgsl", ".glsl", ".hlsl",
+    # Misc
+    ".groovy", ".cmake", ".dockerfile",
 }
 CODE_PREVIEW_FILENAMES = {
     "dockerfile",
@@ -1309,6 +1334,117 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
 def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
+
+
+def _fmt_export_ts(ts: float | int) -> str:
+    v = float(ts or 0)
+    if v <= 0:
+        return ""
+    try:
+        from datetime import datetime
+        return datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _html_esc(text: str) -> str:
+    return html.escape(str(text or ""))
+
+
+def _text_to_minimal_pdf(text: str) -> bytes:
+    """纯 Python 最小 PDF 生成器，无外部依赖。"""
+    raw = str(text or "")
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    font_size = 10
+    leading = font_size * 1.35
+    margin_top, margin_bottom, margin_left, margin_right = 50, 50, 50, 50
+    page_w, page_h = 595, 842  # A4
+    usable_w = page_w - margin_left - margin_right
+    max_chars_per_line = max(20, int(usable_w / (font_size * 0.52)))
+    usable_h = page_h - margin_top - margin_bottom
+    lines_per_page = max(1, int(usable_h / leading))
+
+    # 折行
+    wrapped: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        while len(line) > max_chars_per_line:
+            wrapped.append(line[:max_chars_per_line])
+            line = line[max_chars_per_line:]
+        wrapped.append(line)
+
+    # 分页
+    pages: list[list[str]] = []
+    for i in range(0, len(wrapped), lines_per_page):
+        pages.append(wrapped[i:i + lines_per_page])
+    if not pages:
+        pages = [[""]]
+
+    def _pdf_escape(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    def _safe_latin1(s: str) -> str:
+        return s.encode("latin-1", errors="replace").decode("latin-1")
+
+    objects: list[bytes] = []
+    offsets: list[int] = []
+    buf = b"%PDF-1.4\n"
+
+    def add_obj(content: str) -> int:
+        nonlocal buf
+        idx = len(objects) + 1
+        offsets.append(len(buf))
+        obj_bytes = f"{idx} 0 obj\n{content}\nendobj\n".encode("latin-1")
+        buf += obj_bytes
+        objects.append(obj_bytes)
+        return idx
+
+    catalog_id = add_obj("<< /Type /Catalog /Pages 2 0 R >>")
+    pages_id = add_obj("PAGES_PLACEHOLDER")
+    font_id = add_obj("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")
+
+    page_ids: list[int] = []
+    for page_lines in pages:
+        stream_lines = [f"BT /F1 {font_size} Tf"]
+        y = page_h - margin_top
+        stream_lines.append(f"{margin_left} {y} Td")
+        for pl in page_lines:
+            safe = _safe_latin1(_pdf_escape(pl))
+            stream_lines.append(f"({safe}) Tj")
+            stream_lines.append(f"0 -{leading:.1f} Td")
+        stream_lines.append("ET")
+        stream = "\n".join(stream_lines)
+        stream_bytes = stream.encode("latin-1")
+        content_id = add_obj(f"<< /Length {len(stream_bytes)} >>\nstream\n{stream}\nendstream")
+        page_id = add_obj(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w} {page_h}] "
+            f"/Contents {content_id} 0 R /Resources << /Font << /F1 {font_id} 0 R >> >> >>"
+        )
+        page_ids.append(page_id)
+
+    kids = " ".join(f"{pid} 0 R" for pid in page_ids)
+    pages_content = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>"
+    pages_bytes = f"2 0 obj\n{pages_content}\nendobj\n".encode("latin-1")
+    old_pages = objects[1]
+    buf = buf.replace(b"2 0 obj\nPAGES_PLACEHOLDER\nendobj\n", pages_bytes)
+    size_diff = len(pages_bytes) - len(old_pages)
+    for i in range(2, len(offsets)):
+        offsets[i] += size_diff
+
+    xref_offset = len(buf)
+    buf += b"xref\n"
+    buf += f"0 {len(objects) + 1}\n".encode("latin-1")
+    buf += b"0000000000 65535 f \n"
+    for off in offsets:
+        buf += f"{off:010d} 00000 n \n".encode("latin-1")
+    buf += b"trailer\n"
+    buf += f"<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n".encode("latin-1")
+    buf += b"startxref\n"
+    buf += f"{xref_offset}\n".encode("latin-1")
+    buf += b"%%EOF\n"
+    return buf
 
 def compress_text_blob(text: str) -> str:
     src = str(text or "")
@@ -3435,6 +3571,7 @@ def _module_exists(name: str) -> bool:
 
 def detect_upload_parser_capabilities() -> dict:
     return {
+        "pdfminer": _module_exists("pdfminer"),
         "openpyxl": _module_exists("openpyxl"),
         "xlrd": _module_exists("xlrd"),
         "python_docx": _module_exists("docx"),
@@ -3446,6 +3583,7 @@ def detect_upload_parser_capabilities() -> dict:
         "catdoc": bool(shutil.which("catdoc")),
         "catppt": bool(shutil.which("catppt")),
         "textutil": bool(shutil.which("textutil")),
+        "playwright": _module_exists("playwright"),
     }
 
 def _render_cap_markdown(caps: dict) -> str:
@@ -4671,6 +4809,96 @@ SKILL_PROTOCOL_SPECS = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Built-in skill guides (injected into SkillStore on reload)
+# ---------------------------------------------------------------------------
+_BUILTIN_SKILLS: dict[str, dict] = {
+    "workspace-paths": {
+        "description": "File path rules, virtual path mapping, relative path conventions",
+        "body": (
+            "# Workspace Paths Guide\n"
+            "- Always use relative paths (e.g. src/main.py) for file tools.\n"
+            "- Runtime maps relative paths to session absolute root automatically.\n"
+            "- '/workspace/...' is a virtual alias for tool arguments only; never create OS-level /workspace.\n"
+            "- When user references uploaded files, prioritize workspace uploads directory.\n"
+            "- For shell commands, use relative paths or $PWD-based references.\n"
+        ),
+    },
+    "task-management": {
+        "description": "Todo/Task creation, updates, and best practices",
+        "body": (
+            "# Task Management Guide\n"
+            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response.\n"
+            "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
+            "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
+            "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
+            "- Use task_create/task_update/task_list for multi-step structured work.\n"
+        ),
+    },
+    "tool-best-practices": {
+        "description": "write_file vs edit_file, bash usage, error handling conventions",
+        "body": (
+            "# Tool Best Practices\n"
+            "- Prefer write_file/edit_file for code changes (UI renders line-level diffs).\n"
+            "- If write_file/edit_file fails due to malformed arguments, regenerate complete JSON.\n"
+            "- If output looks truncated, split into smaller subtasks.\n"
+            "- For shell commands: use bash_command for execution, not file tools.\n"
+            "- Always end thinking sections with either a final answer or one tool call.\n"
+            "- Never stop at thinking-only content without an action.\n"
+        ),
+    },
+    "context-management": {
+        "description": "Context compaction triggers, context_recall usage, step sizing",
+        "body": (
+            "# Context Management Guide\n"
+            "- Context has a token upper bound; keep steps compact.\n"
+            "- When <compact-resume> hint appears, inherit pending todos and continue immediately.\n"
+            "- After compaction, use context_recall to fetch archived messages by segment_id/query.\n"
+            "- Do not guess content that was compacted away—recall it first.\n"
+            "- For large tasks, break into subtasks to avoid context overflow.\n"
+        ),
+    },
+    "multi-agent-guide": {
+        "description": "Blackboard read/write norms, ask_colleague usage, handoff format",
+        "body": (
+            "# Multi-Agent Guide\n"
+            "- Use read_from_blackboard to check shared state before acting.\n"
+            "- Use write_to_blackboard to record progress, artifacts, and blockers.\n"
+            "- Use ask_colleague with structured intent for inter-agent communication:\n"
+            "  - explorer->developer: 'handoff' with research findings\n"
+            "  - developer->reviewer: 'review_request' with changed files list\n"
+            "  - reviewer->developer: 'fix_request' with concrete failure evidence\n"
+            "- Handoffs should include enough context for the target agent to act independently.\n"
+            "- Keep blackboard updates atomic and concise.\n"
+        ),
+    },
+    "code-review-checklist": {
+        "description": "Reviewer role checklist for code verification",
+        "body": (
+            "# Code Review Checklist\n"
+            "1. Does the implementation match the original goal?\n"
+            "2. Are there syntax errors? Run linting/type checks if available.\n"
+            "3. Are there obvious logic bugs or edge cases missed?\n"
+            "4. Do tests pass? If no tests exist, verify manually.\n"
+            "5. Are there security issues (injection, XSS, hardcoded secrets)?\n"
+            "6. Write review_feedback to blackboard with pass/fail and evidence.\n"
+            "7. If fail: send fix_request via ask_colleague with specific issues.\n"
+        ),
+    },
+    "finish-protocol": {
+        "description": "When and how to call finish_current_task correctly",
+        "body": (
+            "# Finish Protocol\n"
+            "- Call finish_current_task when all required work is complete.\n"
+            "- Include a concise summary of what was done.\n"
+            "- For multi-agent mode: finish triggers auto-summary from blackboard state.\n"
+            "- Do not finish if there are known failing tests or unresolved blockers.\n"
+            "- If todos have stale pending items but work is done, finish anyway—stale items are cleared automatically.\n"
+            "- Summary format: list modified files, key changes, and validation status.\n"
+        ),
+    },
+}
+
 class SkillStore:
     def __init__(self, skills_root: Path):
         self.skills_root = skills_root
@@ -5075,8 +5303,33 @@ class SkillStore:
         self._load_local_skills()
         self._load_manifest_providers()
         self._load_clawhub_autodetect()
+        self._inject_builtin_skills()
         self.fingerprint = fp
         self.last_reload_ts = now
+
+    def _inject_builtin_skills(self):
+        """Register built-in skill guides for small-model support."""
+        provider_id = "builtin"
+        if not self._provider_exists(provider_id):
+            self._register_provider(
+                provider_id, "builtin", "1.0",
+                "Built-in skill guides for agent operation",
+            )
+        for skill_name, data in _BUILTIN_SKILLS.items():
+            key = f"{provider_id}:{skill_name}"
+            if key in self.skills:
+                continue
+            self._register_skill(
+                provider_id=provider_id,
+                protocol="builtin",
+                protocol_version="1.0",
+                name=skill_name,
+                description=data["description"],
+                meta={"builtin": True},
+                body=data["body"],
+                skill_path="(builtin)",
+                attachments=[],
+            )
 
     def descriptions(self, max_items: int = SKILL_PROMPT_MAX_ITEMS, max_chars: int = SKILL_PROMPT_MAX_CHARS) -> str:
         if not self.skills:
@@ -6486,11 +6739,14 @@ class OllamaClient:
         think: bool = False,
         on_thinking_chunk=None,
     ) -> dict:
+        effective_max = max_tokens
+        if tools:
+            effective_max = max(max_tokens, max_tokens + OLLAMA_THINKING_TOOL_BUFFER)
         payload = {
             "model": self.model,
             "messages": req_messages,
             "stream": True,
-            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "options": {"temperature": temperature, "num_predict": effective_max},
         }
         if tools:
             payload["tools"] = tools
@@ -6503,6 +6759,7 @@ class OllamaClient:
         full_content: list[str] = []
         full_thinking: list[str] = []
         tool_calls: list[dict] = []
+        done_reason = ""
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 while True:
@@ -6542,6 +6799,7 @@ class OllamaClient:
                     if tcs:
                         tool_calls = self._normalize_tool_calls(tcs)
                     if part.get("done"):
+                        done_reason = str(part.get("done_reason") or "").strip().lower()
                         break
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
@@ -6554,7 +6812,7 @@ class OllamaClient:
             "content": content,
             "thinking": thinking_content,
             "tool_calls": tool_calls,
-            "raw": {"streamed": True},
+            "raw": {"streamed": True, "done_reason": done_reason},
         }
 
     def chat(
@@ -6618,11 +6876,14 @@ class OllamaClient:
             fallback_status = {0, 400, 404, 405, 500, 501, 502, 503, 504}
             if status not in fallback_status:
                 raise
+        effective_max_native = max_tokens
+        if tools:
+            effective_max_native = max(max_tokens, max_tokens + OLLAMA_THINKING_TOOL_BUFFER)
         native_payload = {
             "model": self.model,
             "messages": req_messages,
             "stream": False,
-            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
         if tools:
             native_payload["tools"] = tools
@@ -6918,6 +7179,7 @@ class SessionState:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
@@ -6973,8 +7235,9 @@ class SessionState:
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
         self.messages: list[dict] = []
-        self.contexts: dict[str, list[dict]] = {role: [] for role in AGENT_ROLES}
-        self.manager_context: list[dict] = []
+        self.agent_messages: list[dict] = []  # unified agent context (replaces contexts + manager_context)
+        self.contexts: dict[str, list[dict]] = {role: [] for role in AGENT_ROLES}  # kept as view caches
+        self.manager_context: list[dict] = []  # kept as view cache
         self.blackboard: dict = {}
         self.agent_bus_messages: list[dict] = []
         self.manager_routes: list[dict] = []
@@ -7055,6 +7318,7 @@ class SessionState:
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
         )
+        self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
         self.max_run_seconds = normalize_timeout_seconds(
             max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS,
             minimum=MIN_RUN_TIMEOUT_SECONDS,
@@ -8037,6 +8301,13 @@ class SessionState:
                         if isinstance(row, dict):
                             clean_manager_context.append(dict(row))
                     self.manager_context = clean_manager_context[-400:]
+                raw_agent_messages = raw.get("agent_messages", [])
+                if isinstance(raw_agent_messages, list):
+                    clean_am: list[dict] = []
+                    for row in raw_agent_messages[-1200:]:
+                        if isinstance(row, dict):
+                            clean_am.append(dict(row))
+                    self.agent_messages = clean_am[-800:]
                 raw_blackboard = raw.get("blackboard", {})
                 self.blackboard = self._normalize_blackboard(raw_blackboard)
                 raw_bus = raw.get("agent_bus_messages", [])
@@ -8159,6 +8430,7 @@ class SessionState:
             "active_agent_role": str(self.active_agent_role or ""),
             "contexts": {role: list(self.contexts.get(role, []))[-400:] for role in AGENT_ROLES},
             "manager_context": list(self.manager_context)[-400:],
+            "agent_messages": list(self.agent_messages)[-800:],
             "blackboard": self._normalize_blackboard(self.blackboard),
             "agent_bus_messages": list(self.agent_bus_messages)[-240:],
             "manager_routes": list(self.manager_routes)[-240:],
@@ -8625,75 +8897,25 @@ class SessionState:
         research_hint = self._deep_research_boost_instruction()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
-        runtime_assigned = self._sanitize_agent_role(self.runtime_assigned_expert) or "developer"
-        runtime_participants = [
-            role for role in [self._sanitize_agent_role(x) for x in self.runtime_participants] if role
-        ][:3]
-        if runtime_level in {1, 2} or runtime_mode == EXECUTION_MODE_SINGLE:
-            todo_hint = (
-                "Current run is direct single-agent mode. "
-                "Do not create Todo/task scaffolding unless user explicitly asks for project management. "
-                "Prioritize direct final response or one concrete minimal tool action."
-            )
-        else:
-            todo_hint = (
-                "For non-trivial tasks, call TodoWrite early with 3-7 concise items "
-                "(exactly one in_progress), then update only when plan/status changes. "
-                "Avoid redundant TodoWrite calls. "
-                "If TodoWrite fails or repeats with no changes, call TodoWriteRescue with simple string items."
-            )
-        route_hint = (
-            f"Runtime manager classification: level={runtime_level or '-'}, mode={runtime_mode}, "
-            f"scale_preference={self.runtime_scale_preference or 'balanced'}, "
-            f"assigned_expert={runtime_assigned}, participants={','.join(runtime_participants) or runtime_assigned}. "
-        )
-        if int(self.runtime_round_budget or 0) <= 0:
-            budget_hint = (
-                "Runtime budget policy: unlimited tier budget; keep each step compact and action-oriented; "
-                "never stall on long planning text."
-            )
-        else:
-            budget_hint = (
-                f"Runtime budget policy: internal cadence budget={int(self.runtime_round_budget)} "
-                "for compact reasoning and fast handoffs. "
-                "Budget controls thought depth only and must not be used as an early-stop user-facing reason."
-            )
+        budget = int(self.runtime_round_budget or 0)
         html_block = f"{html_hint}\n\n" if html_hint else ""
         research_block = f"{research_hint}\n\n" if research_hint else ""
         return (
-            f"You are a coding agent running in isolated session workspace {self.files_root}. "
-            f"Session absolute writable root is {self.files_root}. "
-            "For file tools, prefer relative paths like hello.txt; runtime will map them to the absolute session root. "
-            "The '/workspace/...' form is only a virtual alias for path arguments; never create OS-level /workspace in shell. "
+            f"You are a coding agent. Workspace: {self.files_root}. "
+            f"Task level={runtime_level}, mode={runtime_mode}, "
+            f"budget={'unlimited' if budget <= 0 else budget}. "
+            f"Context limit ~{self.context_token_upper_bound} tokens. "
             f"{_detect_os_shell_instruction()} "
-            "Use tools to inspect files, execute commands, and edit code safely. "
-            f"{route_hint}"
-            f"{budget_hint} "
-            f"{todo_hint} "
-            "When all required work is complete, call finish_current_task (or finish_task / mark_done) "
-            "to end execution cleanly "
-            "(especially when todos may still contain stale pending items). "
-            "If you output internal reasoning/thinking, always end that section and then output either "
-            "a final answer or one concrete tool call; never stop at thinking-only content. "
-            "For multi-step work use task_create/task_update/task_list as needed. "
-            "Use load_skill only when needed; use provider:name if skill name is ambiguous. "
-            "Loaded skill content is cached per session; do not repeatedly call load_skill for the same skill unless needed. "
-            "If execution stalls (no tool calls / repeated failures), load_skill('execution-degradation-recovery') and follow it. "
-            "Use list_skill_providers and list_skill_protocols to inspect dynamic backend skill integrations. "
-            "If user asks to save generated guidance/workflow as reusable skill, call write_skill to write SKILL.md under global ./skills. "
-            "When changing files, prefer write_file/edit_file so the UI can render line-level diffs. "
-            "If a write_file/edit_file tool call fails due malformed or truncated arguments, regenerate and resend the complete JSON arguments. "
-            "If output or tool arguments look truncated, split work into smaller subtasks and execute one subtask at a time. "
-            "If context has been compacted, call context_recall to fetch exact archived messages by segment_id/query before guessing. "
-            "When a <compact-resume> hint appears, inherit pending todos/tasks and continue exploration immediately. "
-            f"Current context upper bound is ~{self.context_token_upper_bound} tokens; keep steps compact to stay under this limit. "
-            "When user asks to modify uploaded content, prioritize files under the uploaded workspace paths.\n\n"
-            "If user asks to generate image/audio/video, use generate_media when active model capability supports it.\n\n"
+            "Use tools to inspect, edit, and execute. "
+            "Call finish_current_task when done. "
+            "Use load_skill for guidance on specific topics "
+            "(workspace-paths, task-management, tool-best-practices, context-management). "
+            "If execution stalls, load_skill('execution-degradation-recovery'). "
             f"{html_block}"
             f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
-            f"Uploaded files context:\n{uploads_ctx}\n\n"
-            f"Available skills:\n{self.skills.descriptions()}"
+            f"Uploads:\n{uploads_ctx}\n\n"
+            f"Skills:\n{self.skills.descriptions()}"
         )
 
     def _estimate_tokens(self) -> int:
@@ -9261,7 +9483,7 @@ class SessionState:
         if tool_calls:
             return False
 
-        near_limit = output_tokens >= int(AGENT_MAX_OUTPUT_TOKENS * 0.90)
+        near_limit = output_tokens >= int(self.max_output_tokens * 0.90)
         # Mid-size outputs (e.g. planning text ending with a Chinese colon) should not be
         # treated as truncation unless close to max tokens or JSON-like unfinished payload.
         json_like_tail = bool(
@@ -9406,17 +9628,108 @@ class SessionState:
         task_ids = self._create_truncation_subtasks(reason)
         self._inject_truncation_rescue_hint(reason, output_tokens, task_ids)
 
-    def _microcompact(self):
+    def _find_tool_name_by_id(self, messages: list[dict], tool_use_id: str) -> str:
+        """Find tool name from preceding assistant message by tool_use_id."""
+        if not tool_use_id:
+            return ""
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls", []):
+                if isinstance(tc, dict) and tc.get("id") == tool_use_id:
+                    fn = tc.get("function", {})
+                    return str(fn.get("name", "")) if isinstance(fn, dict) else ""
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
+                        return str(block.get("name", ""))
+        return ""
+
+    def _microcompact(self, keep_recent: int = 3):
+        """Replace old tool results with compact placeholders to save tokens.
+
+        Handles both OpenAI-style (role=tool) and Anthropic-style (tool_result blocks)
+        messages. Keeps the most recent `keep_recent` tool interactions intact.
+        """
+        # Phase 1: OpenAI-style role=tool messages
         tool_messages = [m for m in self.messages if m.get("role") == "tool"]
-        if len(tool_messages) <= 3:
+        if len(tool_messages) > keep_recent:
+            kept = tool_messages[-keep_recent:]
+            keep_ids = {id(x) for x in kept}
+            for msg in self.messages:
+                if msg.get("role") == "tool" and id(msg) not in keep_ids:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 120:
+                        msg["content"] = "[cleared by microcompact]"
+
+        # Phase 2: Anthropic-style tool_result blocks in user messages
+        assistant_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "assistant"]
+        if len(assistant_indices) <= keep_recent:
             return
-        kept = tool_messages[-3:]
-        keep_ids = {id(x) for x in kept}
-        for msg in self.messages:
-            if msg.get("role") == "tool" and id(msg) not in keep_ids:
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 120:
-                    msg["content"] = "[cleared by microcompact]"
+        cutoff = assistant_indices[-keep_recent]
+        for i in range(cutoff):
+            msg = self.messages[i]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                changed = False
+                new_content = []
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        block_content = block.get("content", "")
+                        if isinstance(block_content, str) and len(block_content) > 120:
+                            tool_id = block.get("tool_use_id", "")
+                            tool_name = self._find_tool_name_by_id(self.messages[:i], tool_id) or "tool"
+                            new_content.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": f"[Previous: used {tool_name}]",
+                            })
+                            changed = True
+                        else:
+                            new_content.append(block)
+                    else:
+                        new_content.append(block)
+                if changed:
+                    msg["content"] = new_content
+
+    def _microcompact_agent_messages(self, messages: list[dict], keep_recent: int = 3):
+        """Apply microcompact to an agent-specific message list (e.g. agent_messages filtered by role)."""
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        if len(tool_messages) > keep_recent:
+            kept = tool_messages[-keep_recent:]
+            keep_ids = {id(x) for x in kept}
+            for msg in messages:
+                if msg.get("role") == "tool" and id(msg) not in keep_ids:
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 120:
+                        msg["content"] = "[cleared by microcompact]"
+        assistant_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+        if len(assistant_indices) <= keep_recent:
+            return
+        cutoff = assistant_indices[-keep_recent]
+        for i in range(cutoff):
+            msg = messages[i]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                changed = False
+                new_content = []
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        block_content = block.get("content", "")
+                        if isinstance(block_content, str) and len(block_content) > 120:
+                            tool_id = block.get("tool_use_id", "")
+                            tool_name = self._find_tool_name_by_id(messages[:i], tool_id) or "tool"
+                            new_content.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_id,
+                                "content": f"[Previous: used {tool_name}]",
+                            })
+                            changed = True
+                        else:
+                            new_content.append(block)
+                    else:
+                        new_content.append(block)
+                if changed:
+                    msg["content"] = new_content
 
     def _estimate_messages_tokens(self, rows: list[dict]) -> int:
         try:
@@ -10090,6 +10403,17 @@ class SessionState:
         return data.decode("latin-1", errors="ignore")
 
     def _extract_pdf_text(self, pdf_path: Path) -> str:
+        # 优先使用 pdfminer.six（纯 Python，无外部依赖）
+        try:
+            from pdfminer.high_level import extract_text
+            text = extract_text(str(pdf_path))
+            if text and text.strip():
+                return text.strip()
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        # 降级：pdftotext CLI
         tool = shutil.which("pdftotext")
         if tool:
             try:
@@ -10103,6 +10427,7 @@ class SessionState:
                     return r.stdout.strip()
             except Exception:
                 pass
+        # 最终降级：regex 提取
         try:
             raw = pdf_path.read_bytes()
             text = raw.decode("latin-1", errors="ignore")
@@ -10435,6 +10760,16 @@ class SessionState:
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
+            # 提示模型可直接读取 .parsed.md 文件获取完整解析文本
+            item_kind = item.get("kind", "file")
+            if item_kind not in ("text", "code"):
+                wp = item.get("workspace_path", "")
+                if wp:
+                    from pathlib import PurePosixPath
+                    stem = PurePosixPath(wp).stem
+                    parent = str(PurePosixPath(wp).parent)
+                    parsed_rel = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+                    lines.append(f"  (parsed text available at: {parsed_rel} — use read_file to access full content)")
         return "\n".join(lines)
 
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
@@ -10445,10 +10780,42 @@ class SessionState:
         stored.write_bytes(raw)
         ext = stored.suffix.lower()
         text_like_ext = {
-            ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".h", ".hpp",
-            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".sh", ".sql", ".html",
-            ".css", ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".cfg", ".md", ".txt",
-            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".csv",
+            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
+            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
+            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
+            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
+            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
+            # Fortran
+            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
+            # 更多语言
+            ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
+            ".asm", ".s",
+            ".bas", ".vb", ".vbs", ".vba",
+            ".bat", ".cmd", ".ps1", ".psm1",
+            ".clj", ".cljs", ".cljc", ".edn",
+            ".coffee", ".cr", ".dart",
+            ".dockerfile",
+            ".erl", ".hrl", ".ex", ".exs",
+            ".fs", ".fsi", ".fsx",
+            ".gradle", ".groovy", ".gvy",
+            ".hs", ".lhs",
+            ".jl", ".lua",
+            ".lisp", ".cl", ".el", ".scm", ".rkt",
+            ".mk", ".cmake",
+            ".ml", ".mli", ".nix",
+            ".pas", ".pp", ".inc",
+            ".pde", ".ino",
+            ".proto", ".purs",
+            ".raku", ".p6",
+            ".sol",
+            ".sv", ".svh", ".vh", ".vhd", ".vhdl",
+            ".tcl", ".tk",
+            ".tf", ".tfvars", ".hcl",
+            ".tex", ".bib", ".sty", ".cls", ".typ",
+            ".wat",
+            ".diff", ".patch",
+            ".graphql", ".gql",
+            ".prisma", ".svg",
         }
         parsed_excerpt = ""
         kind = "binary"
@@ -10489,6 +10856,15 @@ class SessionState:
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
+        # 当 parsed_excerpt 非空且原始文件不是纯文本时，保存解析结果为 .parsed.md
+        parsed_target: Path | None = None
+        if parsed_excerpt and kind not in ("text", "code"):
+            parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
+            try:
+                header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
+                parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
+            except Exception:
+                parsed_target = None  # 解析文件保存失败不影响主流程
         workspace_rel = self._session_rel(workspace_target)
         meta = {
             "id": upload_id,
@@ -10507,6 +10883,9 @@ class SessionState:
             self.uploads = self.uploads[-80:]
             self.updated_at = now_ts()
             self._persist()
+        if parsed_excerpt:
+            bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
+            self._blackboard_append_section("research_notes", "system", bb_content)
         self._emit(
             "upload",
             {
@@ -10514,7 +10893,10 @@ class SessionState:
                 "workspace_path": workspace_rel,
                 "kind": kind,
                 "size": len(raw),
-                "summary": f"upload: {safe_name} -> {workspace_rel}",
+                "summary": (
+                    f"upload: {safe_name} -> {workspace_rel}"
+                    + (f" (parsed text: {self._session_rel(parsed_target)})" if parsed_target else "")
+                ),
                 "preview": trim(parsed_excerpt, 500),
             },
         )
@@ -10611,6 +10993,12 @@ class SessionState:
             "completed",
             "finished",
             "all set",
+            # 明确表示拒绝/无法完成也应视为终结
+            "抱歉",
+            "sorry",
+            "无法",
+            "cannot",
+            "unable",
         ]
         if any(x in t for x in done_markers):
             return False
@@ -10692,6 +11080,17 @@ class SessionState:
             "that's all",
             "that is all",
             "as requested",
+            # 明确表示无法完成的标记
+            "抱歉，我无法",
+            "无法直接获取",
+            "无法完成",
+            "cannot be done",
+            "unable to",
+            "not possible",
+            "建议您通过",
+            "建议你通过",
+            "i cannot",
+            "i'm unable",
         ]
         return any(x in t for x in done_markers)
 
@@ -11098,7 +11497,7 @@ class SessionState:
             return False
         if not str(thinking_text or "").strip():
             return False
-        threshold = int(max(1, AGENT_MAX_OUTPUT_TOKENS) * float(THINKING_BUDGET_FORCE_RATIO))
+        threshold = int(max(1, self.max_output_tokens) * float(THINKING_BUDGET_FORCE_RATIO))
         return int(output_tokens or 0) >= max(1, threshold)
 
     def _is_thinking_only_dead_turn(self, text: str, thinking_text: str, tool_calls: list | None = None) -> bool:
@@ -12229,11 +12628,47 @@ class SessionState:
             fp = self._session_path(rel)
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
-                return f"Error: text not found in {rel}"
+                diag = self._edit_mismatch_diagnostic(content, old_text)
+                return f"Error: text not found in {rel}. {diag}"
             fp.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
             return f"Edited {rel}"
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
+
+    def _edit_mismatch_diagnostic(self, content: str, old_text: str) -> str:
+        """为 edit_file 匹配失败提供诊断信息"""
+        lines = content.splitlines()
+        first_line = old_text.strip().splitlines()[0].strip() if old_text.strip() else ""
+        if not first_line:
+            return "The old_text is empty or whitespace-only."
+        # 搜索 old_text 的第一行在文件中的位置
+        matches = []
+        for i, line in enumerate(lines, 1):
+            if first_line in line:
+                matches.append(i)
+        if matches:
+            loc = ", ".join(str(m) for m in matches[:5])
+            return (
+                f"The first line of old_text was found at line(s) {loc}, "
+                f"but the full multi-line match failed. "
+                f"Likely cause: whitespace or indentation mismatch. "
+                f"Tip: use read_file to get the exact content, then copy it precisely."
+            )
+        # 尝试空白规范化匹配
+        norm_first = " ".join(first_line.split())
+        for i, line in enumerate(lines, 1):
+            norm_line = " ".join(line.split())
+            if norm_first and norm_first in norm_line:
+                return (
+                    f"A whitespace-normalized partial match was found near line {i}. "
+                    f"The old_text likely has wrong indentation or extra/missing spaces. "
+                    f"Use read_file to get exact content."
+                )
+        return (
+            f"No match found. The file has {len(lines)} lines. "
+            f"The old_text first line '{first_line[:60]}' does not appear in the file. "
+            f"The content may have changed since last read. Use read_file to refresh."
+        )
 
     def _write_global_skill(self, args: dict) -> str:
         rel_raw = str(args.get("path", "") or "").strip().replace("\\", "/")
@@ -12861,15 +13296,13 @@ class SessionState:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if bool(self.runtime_goal_reset_pending):
             return False, "goal-reset-pending"
-        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
-        if not bool(approval.get("approved", False)):
-            return False, "approval-false"
-        if self._approval_is_stale_for_latest_user(bb, latest_user_ts=latest_user_ts):
-            return False, "approval-stale-new-user-input"
-        if self._manager_has_error_log(bb):
-            return False, "blocking-error-log"
-        if not self._reviewer_final_summary_ready(bb):
-            return False, "reviewer-summary-missing"
+        # Project todo gate: coding tasks must pass compile + test
+        profile = self._ensure_blackboard_task_profile(bb)
+        task_type = str(profile.get("task_type", "general") or "general")
+        if task_type in ("simple_code", "engineering"):
+            for todo in bb.get("project_todos", []):
+                if todo.get("category") in ("compile_test", "min_test") and todo.get("status") != "completed":
+                    return False, f"project-todo-incomplete:{todo.get('category', '')}"
         return True, "ok"
 
     def _invalidate_stale_approval_if_needed(
@@ -13322,9 +13755,6 @@ class SessionState:
             "decomposer_output": trim(raw_text, 2000),
         }
         wd = self._normalize_watchdog_state(board.get("watchdog", {}))
-        wd["trigger_count"] = max(0, int(wd.get("trigger_count", 0) or 0)) + 1
-        wd["last_trigger_reason"] = trim(str(reason or "").strip(), 200)
-        wd["last_trigger_ts"] = float(now_ts())
         wd["intent_no_tool_streak"] = 0
         wd["repeat_no_tool_streak"] = 0
         board["watchdog"] = wd
@@ -13352,6 +13782,39 @@ class SessionState:
             },
         )
         return True
+
+    def _watchdog_escalate_to_single_developer(self, board: dict, *, reason: str = ""):
+        """Watchdog 连续 stall 升级：强制降级到 Single+Developer 模式。"""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        self.runtime_execution_mode = EXECUTION_MODE_SINGLE
+        self.runtime_participants = ["developer"]
+        self.runtime_assigned_expert = "developer"
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        dq["active"] = False
+        bb["decomposition_queue"] = dq
+        profile = self._ensure_blackboard_task_profile(bb)
+        profile["execution_mode"] = EXECUTION_MODE_SINGLE
+        profile["participants"] = ["developer"]
+        profile["assigned_expert"] = "developer"
+        bb["task_profile"] = profile
+        self.blackboard = bb
+        self._blackboard_touch()
+        self._blackboard_history(
+            "manager",
+            trim(
+                f"watchdog escalation: forced Single+Developer (trigger_count={int(bb.get('watchdog', {}).get('trigger_count', 0))}, reason={reason})",
+                520,
+            ),
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "watchdog escalation: multi-agent stall detected, "
+                    "downgrading to Single+Developer mode"
+                )
+            },
+        )
 
     def _watchdog_pick_executor_route(self, board: dict | None = None) -> tuple[dict, dict] | None:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -13564,13 +14027,22 @@ class SessionState:
             except Exception:
                 last_trigger_ts = 0.0
             if now_ts() - last_trigger_ts >= 1.0:
-                triggered = self._watchdog_activate_decomposition(
-                    bb,
-                    reason=trigger_reason,
-                    role=role,
-                    step=step,
-                    pinned_selection=pinned_selection,
-                )
+                wd["trigger_count"] = max(0, int(wd.get("trigger_count", 0) or 0)) + 1
+                wd["last_trigger_reason"] = trim(str(trigger_reason or "").strip(), 200)
+                wd["last_trigger_ts"] = float(now_ts())
+                bb["watchdog"] = wd
+                self.blackboard = bb
+                self._blackboard_touch()
+                if int(wd["trigger_count"]) >= 2:
+                    self._watchdog_escalate_to_single_developer(bb, reason=trigger_reason)
+                else:
+                    triggered = self._watchdog_activate_decomposition(
+                        bb,
+                        reason=trigger_reason,
+                        role=role,
+                        step=step,
+                        pinned_selection=pinned_selection,
+                    )
                 bb = self._ensure_blackboard()
         bb["watchdog"] = self._normalize_watchdog_state(bb.get("watchdog", wd))
         bb["decomposition_queue"] = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", dq))
@@ -13705,6 +14177,7 @@ class SessionState:
                 "text": "",
                 "ts": 0.0,
             },
+            "project_todos": [],
             "watchdog": self._new_watchdog_state(),
             "decomposition_queue": self._new_decomposition_queue_state(),
         }
@@ -13856,6 +14329,24 @@ class SessionState:
                     "change_count": max(1, int(item.get("change_count", 1) or 1)),
                 }
         board["code_artifacts"] = artifacts
+        if not isinstance(bb_src_todos := src.get("project_todos"), list):
+            board["project_todos"] = []
+        else:
+            clean_todos = []
+            for pt in bb_src_todos[:20]:
+                if not isinstance(pt, dict):
+                    continue
+                clean_todos.append({
+                    "id": trim(str(pt.get("id", "") or ""), 20),
+                    "content": trim(str(pt.get("content", "") or ""), 400),
+                    "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
+                    "category": trim(str(pt.get("category", "") or ""), 40),
+                    "created_at": float(pt.get("created_at", 0.0) or 0.0),
+                    "completed_at": float(pt.get("completed_at", 0.0) or 0.0) if pt.get("completed_at") else None,
+                    "completed_by": trim(str(pt.get("completed_by", "") or ""), 40),
+                    "evidence": trim(str(pt.get("evidence", "") or ""), 200),
+                })
+            board["project_todos"] = clean_todos
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -13876,6 +14367,7 @@ class SessionState:
     def _blackboard_reset_for_goal(self, goal: str):
         self.blackboard = self._new_blackboard(goal)
         self.manager_context = []
+        self.agent_messages = [m for m in self.agent_messages if m.get("agent_role") != "manager"]
         self.manager_routes = []
         self._blackboard_history("manager", f"new goal accepted: {trim(goal, 300)}")
         self._sync_todos_from_blackboard(reason="goal-reset", board=self.blackboard)
@@ -14186,13 +14678,150 @@ class SessionState:
                 row["activeForm"] = f"Pending ({label}): {text}"
         return rows
 
+    # ── Project-based todo generation & status tracking ──────────────
+
+    def _generate_project_todos_from_profile(self, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        task_type = str(profile.get("task_type", "general") or "general")
+        objective = trim(str(profile.get("direct_objective", "") or ""), 200)
+
+        if task_type == "simple_qa":
+            return [{"content": f"回答: {objective}" if objective else "回答用户问题", "category": "implement"}]
+
+        if task_type in ("simple_code", "engineering"):
+            return [
+                {"content": "分析需求和项目结构", "category": "setup"},
+                {"content": f"实现: {objective}" if objective else "实现编码任务", "category": "implement"},
+                {"content": "编译/语法检查", "category": "compile_test"},
+                {"content": "最小功能测试", "category": "min_test"},
+            ]
+
+        if task_type == "research":
+            return [
+                {"content": f"调研: {objective}" if objective else "执行调研任务", "category": "implement"},
+                {"content": "整理调研结果", "category": "review"},
+            ]
+
+        return [{"content": f"执行: {objective}" if objective else "执行任务", "category": "implement"}]
+
+    def _init_project_todos(self, board: dict | None = None):
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if bb.get("project_todos"):
+            return
+        raw = self._generate_project_todos_from_profile(bb)
+        bb["project_todos"] = [
+            {
+                "id": f"pt:{i:03d}",
+                "content": t["content"],
+                "status": "pending",
+                "category": t["category"],
+                "created_at": float(now_ts()),
+                "completed_at": None,
+                "completed_by": "",
+                "evidence": "",
+            }
+            for i, t in enumerate(raw)
+        ]
+        self.blackboard = bb
+        self._blackboard_touch()
+
+    def _has_compile_pass_evidence(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        if not logs:
+            return False
+        positive = ("compiled successfully", "build successful", "0 error", "编译成功",
+                     "syntax ok", "no errors", "build succeeded", "compilation successful")
+        negative = ("error:", "fatal error", "syntax error", "compile error", "build failed")
+        for entry in reversed(logs[-6:]):
+            txt = str((entry or {}).get("content", "") or "").lower() if isinstance(entry, dict) else str(entry or "").lower()
+            if not txt:
+                continue
+            if any(neg in txt for neg in negative):
+                continue
+            if any(pos in txt for pos in positive):
+                return True
+        return False
+
+    def _has_test_pass_evidence(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        positive = ("test passed", "tests passed", "测试通过", "运行正常",
+                     "all tests pass", "ok", "passed", "test succeeded")
+        negative = ("failed", "error", "failure", "测试失败")
+        combined = list(logs[-6:]) + list(feedback[-4:])
+        for entry in reversed(combined[-8:]):
+            txt = str((entry or {}).get("content", "") or "").lower() if isinstance(entry, dict) else str(entry or "").lower()
+            if not txt:
+                continue
+            if any(neg in txt for neg in negative):
+                continue
+            if any(pos in txt for pos in positive):
+                return True
+        return False
+
+    def _update_project_todo_status(self, board: dict | None = None):
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not todos:
+            return
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        research_count = len(bb.get("research_notes", []) or [])
+        feedback_pass = self._manager_feedback_passed_from_blackboard(bb)
+
+        for todo in todos:
+            if todo.get("status") == "completed":
+                continue
+            cat = todo.get("category", "")
+            if cat == "setup" and (research_count > 0 or code_count > 0):
+                todo.update(status="completed", completed_at=float(now_ts()), evidence="结构已分析")
+            elif cat == "implement" and code_count > 0:
+                todo.update(status="completed", completed_at=float(now_ts()),
+                            completed_by="developer", evidence=f"{code_count} 文件已产出")
+            elif cat == "compile_test" and self._has_compile_pass_evidence(bb):
+                todo.update(status="completed", completed_at=float(now_ts()), evidence="编译通过")
+            elif cat == "min_test" and self._has_test_pass_evidence(bb):
+                todo.update(status="completed", completed_at=float(now_ts()), evidence="测试通过")
+            elif cat == "review" and feedback_pass:
+                todo.update(status="completed", completed_at=float(now_ts()), evidence="审查通过")
+
+        if not any(t.get("status") == "in_progress" for t in todos):
+            for t in todos:
+                if t.get("status") == "pending":
+                    t["status"] = "in_progress"
+                    break
+
+        bb["project_todos"] = todos
+        self.blackboard = bb
+
+    def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not todos:
+            return self._todo_owner_rows_from_blackboard(bb)
+        rows = []
+        for todo in todos:
+            s = todo.get("status", "pending")
+            c = todo.get("content", "")
+            ev = todo.get("evidence", "")
+            af = {
+                "in_progress": f"Working on: {c}",
+                "completed": f"Done: {c}" + (f" ({ev})" if ev else ""),
+            }.get(s, f"Pending: {c}")
+            rows.append({"key": f"bb:proj:{todo.get('id', '')}", "content": c, "status": s, "activeForm": af})
+        return rows
+
     def _sync_todos_from_blackboard(self, reason: str = "", board: dict | None = None):
         if bool(self.runtime_reclassify_required):
             return
         if not self._is_multi_agent_mode():
             return
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        system_rows = self._todo_owner_rows_from_blackboard(bb)
+        self._init_project_todos(bb)
+        self._update_project_todo_status(bb)
+        system_rows = self._todo_project_rows_from_blackboard(bb)
         existing = self.todo.snapshot()
         non_system_rows: list[dict] = []
         for row in existing:
@@ -14200,18 +14829,17 @@ class SessionState:
                 continue
             key = str(row.get("key", "") or "").strip()
             owner = str(row.get("owner", "") or "").strip().lower()
-            if key.startswith("bb:owner:") or key.startswith("bb:node:") or owner in {"manager", "explorer", "developer", "reviewer"}:
+            if key.startswith(("bb:owner:", "bb:node:", "bb:proj:")) or owner in {"manager", "explorer", "developer", "reviewer"}:
                 continue
             non_system_rows.append(dict(row))
         remaining_cap = max(0, 20 - len(system_rows))
         merged = list(system_rows) + non_system_rows[:remaining_cap]
         try:
             todo_out = self.todo.update(merged)
-        except Exception as exc:
-            self._emit("status", {"summary": f"owner todo sync skipped: {trim(str(exc), 180)}"})
+        except Exception:
             return
         if todo_out != "No todo changes." and reason:
-            self._emit("status", {"summary": f"owner todos synced ({trim(reason, 120)})"})
+            self._emit("status", {"summary": f"project todos synced ({trim(reason, 120)})"})
 
     def _blackboard_set_status(self, status: str, note: str = ""):
         board = self._ensure_blackboard()
@@ -14232,6 +14860,43 @@ class SessionState:
         board["status"] = "COMPLETED"
         self._blackboard_touch()
         self._sync_todos_from_blackboard(reason="approved", board=board)
+
+    def _auto_summary_on_finish(self) -> str:
+        """Generate concise summary from blackboard state when run ends."""
+        bb = self._ensure_blackboard()
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        summary_parts = []
+        if artifacts:
+            file_list = ", ".join(list(artifacts.keys())[:10])
+            summary_parts.append(f"Modified files: {file_list}")
+        if feedback:
+            last_fb = feedback[-1] if feedback else {}
+            fb_content = str(last_fb.get("content", "") or "") if isinstance(last_fb, dict) else str(last_fb)
+            if fb_content:
+                summary_parts.append(f"Review: {trim(fb_content, 200)}")
+        if logs:
+            recent_logs = logs[-3:]
+            log_strs = []
+            for log_entry in recent_logs:
+                if isinstance(log_entry, dict):
+                    log_strs.append(trim(str(log_entry.get("content", "") or ""), 80))
+                elif isinstance(log_entry, str):
+                    log_strs.append(trim(log_entry, 80))
+            if log_strs:
+                summary_parts.append(f"Logs: {'; '.join(log_strs)}")
+        summary = "; ".join(summary_parts) or "Task completed."
+        bb["status"] = "COMPLETED"
+        bb["approval"] = {
+            "approved": True,
+            "by": "auto",
+            "note": summary,
+            "ts": float(now_ts()),
+        }
+        self._blackboard_touch()
+        self._emit("status", {"summary": f"[auto-summary] {trim(summary, 400)}"})
+        return summary
 
     def _blackboard_read_state_markdown(self, max_items: int = 6) -> str:
         board = self._ensure_blackboard()
@@ -14347,6 +15012,23 @@ class SessionState:
             lines.append("- (none)")
         _render_tail("Recent Execution Logs", board.get("execution_logs", []))
         _render_tail("Recent Review Feedback", board.get("review_feedback", []))
+
+        proj_todos = board.get("project_todos", [])
+        if proj_todos:
+            lines.append("\n### Project Tasks")
+            for pt in proj_todos:
+                s = pt.get("status", "pending")
+                c = trim(str(pt.get("content", "") or ""), 200)
+                ev = trim(str(pt.get("evidence", "") or ""), 100)
+                if s == "completed":
+                    mark = "[x]"
+                elif s == "in_progress":
+                    mark = "[>]"
+                else:
+                    mark = "[ ]"
+                suffix = f" — {ev}" if ev else ""
+                lines.append(f"- {mark} {c}{suffix}")
+
         return "\n".join(lines)
 
     def _manager_route_tools(self) -> list[dict]:
@@ -14612,7 +15294,7 @@ class SessionState:
             "judgement": trim(str(profile.get("reason", "") or "manager fallback classification"), 200),
             "round_budget": int(policy.get("round_budget", profile.get("round_budget", self.max_agent_rounds)) or 0),
             "direct_objective": trim(str(profile.get("direct_objective", "") or ""), 800),
-            "execution_mode": str(policy.get("execution_mode", EXECUTION_MODE_SYNC)),
+            "execution_mode": (EXECUTION_MODE_SINGLE if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE else str(policy.get("execution_mode", EXECUTION_MODE_SYNC))),
             "participants": participants,
             "assigned_expert": assigned,
             "requires_user_confirmation": bool(requires_confirmation),
@@ -14622,7 +15304,7 @@ class SessionState:
         }
 
     def _manager_classification_system_prompt(self) -> str:
-        return (
+        base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates. "
             "Decide whether this latest turn should inherit the previous blackboard/task state. "
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
@@ -14645,6 +15327,12 @@ class SessionState:
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly. "
             f"{model_language_instruction(self.ui_language)}"
         )
+        if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
+            base += (
+                " NOTE: User has configured Single-agent mode. "
+                "Favor level 1-2 for straightforward tasks; only assign level 3+ when genuine multi-step complexity demands it."
+            )
+        return base
 
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
         row = dict(decision or {})
@@ -14666,7 +15354,12 @@ class SessionState:
         if level not in TASK_LEVEL_CHOICES:
             level = 3
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
-        mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
+        policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
+        config_mode = normalize_execution_mode(self.execution_mode, default="")
+        if config_mode == EXECUTION_MODE_SINGLE:
+            mode = EXECUTION_MODE_SINGLE
+        else:
+            mode = policy_mode
         assigned = self._sanitize_agent_role(
             row.get("assigned_expert", policy.get("assigned_expert", "developer"))
         ) or self._sanitize_agent_role(policy.get("assigned_expert", "developer")) or "developer"
@@ -14697,6 +15390,9 @@ class SessionState:
             except Exception:
                 budget_raw = int(policy.get("round_budget", self.max_agent_rounds) or self.max_agent_rounds)
             round_budget = max(1, min(int(self.max_agent_rounds or MAX_AGENT_ROUNDS), int(budget_raw)))
+        if mode == EXECUTION_MODE_SINGLE and policy_mode != EXECUTION_MODE_SINGLE:
+            policy_budget = int(policy.get("round_budget", 10) or 10)
+            round_budget = min(round_budget, max(4, policy_budget // 2))
         requires_confirmation = bool(row.get("requires_user_confirmation", policy.get("requires_user_confirmation", False)))
         if level == 5 and self._looks_like_positive_confirmation(goal_text):
             requires_confirmation = False
@@ -14875,8 +15571,14 @@ class SessionState:
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
             "Also decide inherit_previous_state by semantic continuity with prior blackboard state. "
-            "If this is pure continuation, keep current runtime policy unchanged."
+            "If this is pure continuation, keep current runtime policy unchanged.\n"
+            f"User configured execution mode: {self.execution_mode}\n"
         )
+        if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
+            prompt += (
+                "IMPORTANT: User has configured Single-agent mode. "
+                "Prefer level 1-2 for simple tasks. Only escalate to level 3+ if truly complex.\n"
+            )
         with self.lock:
             self.current_phase = "manager:classify:model-call"
             self.current_tool_name = ""
@@ -14959,6 +15661,22 @@ class SessionState:
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
 
+    def _project_todo_hint_for_manager(self) -> str:
+        bb = self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not todos:
+            return ""
+        pending = [t for t in todos if t.get("status") != "completed"]
+        if not pending:
+            return "All project tasks completed. Route to finish. "
+        cur = pending[0]
+        cat = cur.get("category", "")
+        if cat == "compile_test":
+            return "NEXT: compile/syntax check required. Route to Developer for build. "
+        if cat == "min_test":
+            return "NEXT: minimal test required. Route to Developer to run tests. "
+        return f"NEXT: {trim(str(cur.get('content', '') or ''), 120)}. "
+
     def _manager_system_prompt(self) -> str:
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
@@ -14966,41 +15684,30 @@ class SessionState:
         budget = self._blackboard_round_budget(board)
         level = int(profile.get("task_level", self.runtime_task_level or 0) or 0)
         mode = normalize_execution_mode(profile.get("execution_mode", self._effective_execution_mode()), default=self._effective_execution_mode())
-        scale_preference = str(profile.get("scale_preference", self.runtime_scale_preference) or "balanced")
-        if scale_preference not in TASK_SCALE_PREFERENCES:
-            scale_preference = "balanced"
-        participants = profile.get("participants", self.runtime_participants)
-        if not isinstance(participants, list):
-            participants = []
-        participant_text = ",".join(
-            [role for role in [self._sanitize_agent_role(x) for x in participants] if role][:3]
-        ) or "-"
+        task_type = str(profile.get("task_type", "general") or "general").strip().lower()
+        coding_hint = ""
+        if task_type in ("simple_code", "engineering"):
+            coding_hint = (
+                "CODING TASK: skip lengthy exploration/design phases. "
+                "Route to Developer early for implementation. "
+                "Explorer should only be used for specific file/API lookups, not broad analysis. "
+            )
+        project_todo_hint = self._project_todo_hint_for_manager()
         return (
-            "You are Manager in a blackboard-driven multi-agent coding system. "
-            "Do not write code and do not call worker tools directly. "
-            f"Session absolute writable root is {self.files_root}; instruct workers to use relative paths, "
-            "and treat '/workspace/...' only as a virtual alias for tool arguments. "
-            "Read blackboard state and delegate one short next timeslice only. "
-            "Use route_to_next_agent exactly once each turn. "
-            "Before delegating, classify task level/type/complexity by your own judgement, "
-            "and include task_level/task_type/complexity/judgement/(optional)round_budget/direct_objective "
-            "in route_to_next_agent arguments whenever possible. "
-            "When concrete execution is required, set is_mandatory=true so worker must call at least one tool "
-            "instead of replying with suggestion-only text. "
-            "Round budget is an internal cadence control to reduce overthinking and idle loops. "
-            "Never use budget as an early-stop reason shown to user before task completion. "
-            "Decision policy: missing facts/API -> explorer; implementation/update -> developer; "
-            "verification/gap check -> reviewer; only choose finish when review is approved and no blocking logs remain. "
-            "Prefer Manager+AgentBus co-management: when fresh agentbus handoff is available and aligned, "
-            "follow that handoff to reduce orchestration latency instead of re-planning from scratch. "
-            "If finish is blocked by missing final summary after review approval, instruct Reviewer to hand off Explorer "
-            "via agentbus (intent=final_summary_request) instead of silently ending. "
-            f"Current task level={level or '-'}, mode={mode}, scale_preference={scale_preference}, participants={participant_text}, "
-            f"Current task profile: type={profile.get('task_type','general')}, "
-            f"complexity={profile.get('complexity','simple')}, "
-            f"progress={progress}, round_budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
+            "You are Manager in a multi-agent coding system. "
+            "Read blackboard, delegate one short timeslice via route_to_next_agent. "
+            "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
+            "all done->finish. Set is_mandatory=true when concrete execution is required. "
+            "Role capabilities: "
+            "Explorer=read-only (bash/read_file/search/blackboard, NO write_file/edit_file); "
+            "Developer=all tools (write_file/edit_file/bash/read_file/etc); "
+            "Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). "
+            "NEVER delegate file-writing tasks to Explorer or Reviewer. "
+            f"{coding_hint}"
+            f"{project_todo_hint}"
+            f"Level={level}, mode={mode}, progress={progress}, "
+            f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
             f"objective={trim(str(profile.get('direct_objective','') or ''), 220)}. "
-            "Avoid assigning the same agent more than two consecutive turns unless strictly required. "
             f"{model_language_instruction(self.ui_language)}"
         )
 
@@ -15243,6 +15950,24 @@ class SessionState:
                     "reason": "approval-blocked-by-error",
                     "source": "fallback",
                 }
+            if finish_gate_reason.startswith("project-todo-incomplete:"):
+                missing_cat = finish_gate_reason.split(":", 1)[-1] if ":" in finish_gate_reason else ""
+                if missing_cat == "compile_test":
+                    return {
+                        "target": "developer",
+                        "instruction": "编译/语法检查尚未完成。请编译项目并确认无错误。",
+                        "reason": "project-todo-compile-pending",
+                        "source": "fallback",
+                        "is_mandatory": True,
+                    }
+                if missing_cat == "min_test":
+                    return {
+                        "target": "developer",
+                        "instruction": "最小功能测试尚未完成。请运行基本测试验证核心功能。",
+                        "reason": "project-todo-test-pending",
+                        "source": "fallback",
+                        "is_mandatory": True,
+                    }
         if task_type == "simple_qa":
             dev_text = self._latest_agent_assistant_text("developer")
             if dev_text:
@@ -15263,6 +15988,29 @@ class SessionState:
                 "reason": "simple-qa-direct-answer",
                 "source": "fallback",
             }
+        # ── 通用 endpoint 检测：非 simple_qa 的 developer 结论性回复也能触发 finish ──
+        if task_type != "simple_qa":
+            dev_text = self._latest_agent_assistant_text("developer")
+            if dev_text:
+                done_probe = self._detect_endpoint_intent(dev_text, None)
+                if bool(done_probe.get("matched", False)) and not has_error_log:
+                    return {
+                        "target": "finish",
+                        "instruction": "Developer has provided a conclusive response; stop now.",
+                        "reason": "general-endpoint-detected",
+                        "source": "fallback",
+                    }
+        # 通用检查：如果最近的 assistant 消息是结论性回复，且没有待办事项，直接 finish
+        if not has_error_log:
+            for _role in ("developer", "explorer", "reviewer"):
+                _last = self._latest_agent_assistant_text(_role)
+                if _last and self._looks_like_conclusive_reply(_last) and not self.todo.has_open_items():
+                    return {
+                        "target": "finish",
+                        "instruction": "Agent already provided a conclusive reply with no open tasks; stop now.",
+                        "reason": "conclusive-reply-detected",
+                        "source": "fallback",
+                    }
         if complexity == "simple" and task_type == "simple_code":
             if has_error_log:
                 return {
@@ -15398,6 +16146,24 @@ class SessionState:
         if str(row.get("task_type", "") or "").strip().lower() == "simple_qa":
             return row
         target = str(row.get("target", "") or "").strip().lower()
+        task_type_low = str(row.get("task_type", "") or "").strip().lower()
+        if task_type_low in ("simple_code", "engineering") and target == "explorer":
+            board = self._ensure_blackboard()
+            progress = self._manager_progress_state(board)
+            if progress in ("initializing", "in_progress"):
+                explorer_count = sum(
+                    1 for x in self.manager_routes[-8:]
+                    if str(x.get("target", "") or "").strip().lower() == "explorer"
+                )
+                if explorer_count >= 2:
+                    row["target"] = "developer"
+                    row["instruction"] = (
+                        "Coding task: Explorer has been used enough. "
+                        "Start implementation now using write_file/edit_file."
+                    )
+                    row["reason"] = f"{row.get('reason', '')}|coding-fast-track->developer"
+                    row["source"] = "anti-stall"
+                    return row
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-4:]]
@@ -15492,6 +16258,11 @@ class SessionState:
                     participants[-1] = target
             else:
                 target = participants[0]
+        # ── Single 模式硬约束：无论 executor_mode_flag 如何，只允许 assigned_expert ──
+        if mode == EXECUTION_MODE_SINGLE:
+            participants = [assigned_expert]
+            if target in AGENT_ROLES and target != assigned_expert:
+                target = assigned_expert
         instruction = trim(str(row.get("instruction", "") or "").strip(), 1200)
         if not instruction:
             instruction = "Proceed with one concrete next step and report evidence."
@@ -15548,6 +16319,24 @@ class SessionState:
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
+        # ── 结论性回复截断：当 Agent 已回复结论且无待办/无错误时，强制 finish ──
+        if target in AGENT_ROLES and target != "finish":
+            for _check_role in ("developer", "explorer", "reviewer"):
+                _last_text = self._latest_agent_assistant_text(_check_role)
+                if (
+                    _last_text
+                    and self._looks_like_conclusive_reply(_last_text)
+                    and not self.todo.has_open_items()
+                    and not self._manager_has_error_log(board)
+                ):
+                    target = "finish"
+                    instruction = (
+                        f"Agent '{_check_role}' already provided a conclusive reply. "
+                        "No open tasks remain. Finishing now."
+                    )
+                    row["reason"] = f"conclusive-reply-override:{_check_role}"
+                    row["source"] = "policy"
+                    break
         if bool((board.get("approval", {}) or {}).get("approved", False)) and can_finish_from_approval:
             target = "finish"
             if not instruction:
@@ -15616,6 +16405,44 @@ class SessionState:
                     "Do not finish yet. Latest execution logs still contain blocking errors. "
                     "Resolve errors and provide verifiable evidence."
                 )
+            elif finish_gate_reason.startswith("project-todo-incomplete:"):
+                missing_cat = finish_gate_reason.split(":", 1)[-1] if ":" in finish_gate_reason else ""
+                target = "developer"
+                if missing_cat == "compile_test":
+                    instruction = (
+                        "编译/语法检查尚未完成。请编译项目并确认无错误。"
+                        "Run build/compile and confirm zero errors before finishing."
+                    )
+                elif missing_cat == "min_test":
+                    instruction = (
+                        "最小功能测试尚未完成。请运行基本测试验证核心功能。"
+                        "Run minimal tests to verify core functionality before finishing."
+                    )
+                else:
+                    instruction = (
+                        "Project todo not yet completed. Execute the pending step and report evidence."
+                    )
+                # Force-finish fallback: if blocked > 3 cycles, mark as done to avoid deadloop
+                summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
+                if summary_attempts >= 3:
+                    force_finish_override = True
+                    target = "finish"
+                    for pt in board.get("project_todos", []):
+                        if pt.get("category") in ("compile_test", "min_test") and pt.get("status") != "completed":
+                            pt.update(status="completed", completed_at=float(now_ts()),
+                                      evidence="force-finish fallback")
+                    self.blackboard = board
+                    instruction = (
+                        "Compile/test gate exceeded retry limit. Force finishing with available evidence. "
+                        "Generate final summary and finish now."
+                    )
+                    row["reason"] = "finish-blocked-project-todo-force-close"
+                    row["source"] = "policy"
+                else:
+                    board["manager_summary_attempts"] = summary_attempts + 1
+                    self.blackboard = board
+                    row["reason"] = f"finish-blocked-{missing_cat}"
+                    row["source"] = "policy"
             else:
                 has_outputs = bool(code_count > 0 or research_count > 0)
                 if board_status == "COMPLETED" and has_outputs:
@@ -15848,7 +16675,7 @@ class SessionState:
                     },
                 }
             ]
-            self.manager_context.append(
+            self._append_manager_context(
                 {
                     "role": "system",
                     "content": (
@@ -15858,7 +16685,6 @@ class SessionState:
                     "ts": now_ts(),
                 }
             )
-            self.manager_context = self.manager_context[-400:]
             self._emit(
                 "status",
                 {
@@ -15898,7 +16724,7 @@ class SessionState:
                         },
                     }
                 ]
-                self.manager_context.append(
+                self._append_manager_context(
                     {
                         "role": "system",
                         "content": (
@@ -15908,7 +16734,6 @@ class SessionState:
                         "ts": now_ts(),
                     }
                 )
-                self.manager_context = self.manager_context[-400:]
                 self._emit(
                     "status",
                     {
@@ -15926,8 +16751,8 @@ class SessionState:
                     "Return only one route_to_next_agent call.\n\n"
                     f"{self._blackboard_read_state_markdown(max_items=6)}"
                 )
-                self.manager_context.append({"role": "user", "content": prompt, "ts": now_ts()})
-                self.manager_context = self.manager_context[-400:]
+                self._append_manager_context({"role": "user", "content": prompt, "ts": now_ts()})
+                self._microcompact_agent_messages(self.manager_context)
                 with self.lock:
                     self.current_phase = "manager:model-call"
                     self.current_tool_name = ""
@@ -15963,8 +16788,7 @@ class SessionState:
                         }
                         for tc in tool_calls
                     ]
-                self.manager_context.append(assistant)
-                self.manager_context = self.manager_context[-400:]
+                self._append_manager_context(assistant)
                 route_only_tool_calls = False
                 if isinstance(tool_calls, list) and tool_calls:
                     tool_names = [
@@ -16241,6 +17065,9 @@ class SessionState:
                 "agent_role": role_key,
             }
             self.contexts[role_key] = [executor_seed]
+            # Also filter old messages for this role from agent_messages and add the seed
+            self.agent_messages = [m for m in self.agent_messages if m.get("agent_role") != role_key]
+            self.agent_messages.append(executor_seed)
             self._emit(
                 "status",
                 {
@@ -16259,11 +17086,22 @@ class SessionState:
             max_len=1400,
         )
         language_note = embedded_policy or self._agent_language_policy_note()
+        role_capability_note = {
+            "explorer": "YOUR TOOLS: read-only (bash/read_file/search/blackboard). You CANNOT write_file or edit_file.",
+            "developer": "YOUR TOOLS: all tools available (write_file/edit_file/bash/read_file/etc).",
+            "reviewer": "YOUR TOOLS: read+verify (bash/read_file/finish_task). You CANNOT write_file or edit_file.",
+        }.get(role_key, "")
+        if role_key == "explorer":
+            tool_examples = "bash/read_file/read_from_blackboard"
+        elif role_key == "reviewer":
+            tool_examples = "bash/read_file/finish_task"
+        else:
+            tool_examples = "write_file/edit_file/bash/read_file"
         mandatory_note = (
             (
                 "MANDATORY EXECUTION: this delegate is hard-push. "
                 "You must call at least one concrete tool in this turn "
-                "(e.g. write_file/edit_file/bash/read_file) and produce verifiable progress. "
+                f"(e.g. {tool_examples}) and produce verifiable progress. "
                 "Suggestion-only text reply is forbidden."
             )
             if bool(is_mandatory)
@@ -16293,6 +17131,7 @@ class SessionState:
             f"{mandatory_note}\n"
             f"{executor_note}\n"
             f"{collaboration_note}\n"
+            f"{role_capability_note}\n"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
             f"{trim(board_md, 6000)}\n"
@@ -16802,10 +17641,17 @@ class SessionState:
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return self.messages
+        # Build filtered view from unified agent_messages
+        filtered = [
+            m for m in self.agent_messages
+            if m.get("agent_role") == role_key
+            or m.get("agent_role") == "shared"
+            or (m.get("role") == "user" and not m.get("agent_role"))
+        ]
+        # Update legacy cache for backward compatibility (serialization, etc.)
         if not isinstance(self.contexts, dict):
             self.contexts = {r: [] for r in AGENT_ROLES}
-        if role_key not in self.contexts or not isinstance(self.contexts.get(role_key), list):
-            self.contexts[role_key] = []
+        self.contexts[role_key] = filtered[-400:]
         return self.contexts[role_key]
 
     def _append_agent_context_message(self, role: str, message: dict, *, mirror_to_global: bool = False) -> dict:
@@ -16814,11 +17660,10 @@ class SessionState:
         row["agent_role"] = role_key
         if "ts" not in row:
             row["ts"] = now_ts()
-        ctx = self._agent_context(role_key)
-        ctx.append(row)
-        if len(ctx) > 400:
-            self.contexts[role_key] = ctx[-400:]
-            ctx = self.contexts[role_key]
+        # Write to unified agent_messages
+        self.agent_messages.append(row)
+        if len(self.agent_messages) > 1200:
+            self.agent_messages = self.agent_messages[-800:]
         if mirror_to_global:
             mirror = dict(row)
             if "tool_calls" in mirror and isinstance(mirror.get("tool_calls"), list):
@@ -16837,6 +17682,19 @@ class SessionState:
             self.messages.append(mirror)
             self.messages = self.messages[-400:]
         return row
+
+    def _append_manager_context(self, message: dict):
+        """Append to manager_context and agent_messages in sync."""
+        row = dict(message or {})
+        if "agent_role" not in row:
+            row["agent_role"] = "manager"
+        if "ts" not in row:
+            row["ts"] = now_ts()
+        self.manager_context.append(row)
+        self.manager_context = self.manager_context[-400:]
+        self.agent_messages.append(row)
+        if len(self.agent_messages) > 1200:
+            self.agent_messages = self.agent_messages[-800:]
 
     def _agent_display_name(self, role: str) -> str:
         return AGENT_ROLE_LABELS.get(self._sanitize_agent_role(role), str(role or "").strip().title() or "Agent")
@@ -16935,52 +17793,69 @@ class SessionState:
         )
         return envelope
 
+    def _drain_agentbus_fast_route(self) -> dict | None:
+        """Check agent_bus_messages for an unprocessed handoff that can skip manager.
+
+        Returns route dict with 'to' and 'payload' if a valid fast-route is found,
+        otherwise returns None (fall back to manager delegation).
+        """
+        if not self.agent_bus_messages:
+            return None
+        now = now_ts()
+        valid_intents = {
+            "handoff", "review_request", "fix_request",
+            "final_summary_request", "implementation_ready",
+        }
+        for env in reversed(self.agent_bus_messages[-20:]):
+            if not isinstance(env, dict):
+                continue
+            if env.get("_fast_routed"):
+                continue
+            intent = str(env.get("intent", "") or "").strip().lower()
+            if intent not in valid_intents:
+                continue
+            to_role = self._sanitize_agent_role(env.get("to", ""))
+            if not to_role or to_role not in AGENT_ROLES:
+                continue
+            age = max(0.0, now - float(env.get("ts", 0.0) or 0.0))
+            if age > 180.0:
+                continue
+            env["_fast_routed"] = True
+            payload = trim(str(env.get("payload", "") or ""), 1400)
+            from_role = str(env.get("from", "") or "")
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"agentbus fast-route: {from_role}->{to_role} "
+                        f"intent={intent} (skipping manager)"
+                    )
+                },
+            )
+            return {
+                "to": to_role,
+                "payload": payload,
+                "intent": intent,
+                "from": from_role,
+                "env_id": env.get("id", ""),
+            }
+        return None
+
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
         base = (
-            f"You are {self._agent_display_name(role_key)} in a blackboard-driven multi-agent coding system. "
-            f"Workspace root: {self.files_root}. "
-            "**You are in a restricted container; your virtual root is /workspace. "
-            "Never use or access absolute host paths such as /Users/...** "
-            f"Session absolute writable root is {self.files_root}. "
-            "Use relative file paths (for example hello.txt); runtime maps them to session absolute paths. "
-            "If '/workspace/...' appears, treat it as a virtual alias only; never create OS-level /workspace in shell. "
-            f"{_detect_os_shell_instruction()} "
-            "You must stay within your role boundary and use only provided tools. "
-            "Use read_from_blackboard/write_to_blackboard to keep the shared state accurate. "
-            "When communicating with other agents, use ask_colleague with structured intent/content. "
-            "Always keep outputs concise and action-oriented. "
+            f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
+            f"Workspace: {self.files_root}. Use relative paths. "
+            "Use blackboard for shared state, ask_colleague for inter-agent communication. "
+            "Keep outputs concise and action-oriented. "
+            "Use load_skill for detailed guidance (multi-agent-guide, code-review-checklist, finish-protocol). "
             f"{model_language_instruction(self.ui_language)} "
         )
         if role_key == "explorer":
-            return (
-                base
-                + "Role objective: analyze user goals, inspect codebase, and produce actionable research notes. "
-                + "Prefer read/search/check commands; avoid direct large code modifications. "
-                + "When new evidence appears, write concise research updates to blackboard and hand off actionable insights. "
-                + "Proactively use ask_colleague when your findings can unblock developer/reviewer immediately. "
-                + "If reviewer sends final_summary_request, produce final wrap-up summary from blackboard evidence and finish."
-            )
+            return base + "Role: analyze goals, inspect codebase, produce research notes. Prefer read/search. "
         if role_key == "reviewer":
-            return (
-                base
-                + "Role objective: verify developer output against goal, run checks/tests, and issue pass/fix decisions. "
-                + "If gaps remain, send fix_request to developer with concrete failure evidence and write review_feedback to blackboard. "
-                + "If manager requests final summary, first call read_from_blackboard "
-                + "(sections: code_artifacts, execution_logs, review_feedback, status), then generate a structured summary "
-                + "covering changes, validation evidence, and residual risks/next steps. "
-                + "When finishing, pass this summary in finish_task.summary; empty or vague summary is invalid. "
-                + "If you cannot produce summary from current evidence, hand off Explorer via ask_colleague "
-                + "intent=final_summary_request with explicit missing evidence."
-            )
-        return (
-            base
-            + "Role objective: implement code changes based on explorer/reviewer inputs. "
-            + "Perform concrete file edits and command execution. "
-            + "Continuously record progress and blockers to blackboard. "
-            + "When blocked or uncertain, immediately call ask_colleague to explorer/reviewer with focused intent. "
-            + "When implementation batch is ready, send review_request to reviewer via ask_colleague."
-        )
+            return base + "Role: verify output, run checks, issue pass/fix decisions. Write review_feedback to blackboard. "
+        return base + "Role: implement code changes, execute tools, record progress to blackboard. "
 
     def _seed_multi_agent_contexts_if_needed(self, user_text: str = ""):
         if not self._is_multi_agent_mode():
@@ -17005,16 +17880,17 @@ class SessionState:
                 mirror_to_global=False,
             )
         if not self.manager_context:
-            self.manager_context = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Manager context initialized. Delegate by reading blackboard and assigning short slices.\n"
-                        f"{language_note}"
-                    ),
-                    "ts": now_ts(),
-                }
-            ]
+            init_msg = {
+                "role": "system",
+                "content": (
+                    "Manager context initialized. Delegate by reading blackboard and assigning short slices.\n"
+                    f"{language_note}"
+                ),
+                "ts": now_ts(),
+                "agent_role": "manager",
+            }
+            self.manager_context = [init_msg]
+            self.agent_messages.append(init_msg)
         if not self._agent_context("developer"):
             self._append_agent_context_message(
                 "developer",
@@ -18340,6 +19216,7 @@ class SessionState:
         ctx = self._agent_context(role_key)
         if not ctx:
             return {"status": "skip", "reason": "empty-context", "role": role_key}
+        self._microcompact_agent_messages(ctx)
         with self.lock:
             self.current_phase = f"agent:{role_key}:model-call"
             self.current_tool_name = ""
@@ -18348,7 +19225,7 @@ class SessionState:
             ctx,
             tools=self._tools_for_agent(role_key),
             system=self._agent_role_system_prompt(role_key),
-            max_tokens=AGENT_MAX_OUTPUT_TOKENS,
+            max_tokens=self.max_output_tokens,
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -18694,10 +19571,23 @@ class SessionState:
                 media_inputs_pool=media_inputs_pool,
                 media_seen_ts_by_role=media_seen_ts_by_role,
             )
-            route = self._manager_delegate_turn(
-                pinned_selection=pinned_selection,
-                media_inputs_round=manager_media_inputs,
-            )
+            # AgentBus fast-route: skip manager if a valid worker handoff is pending
+            bus_route = self._drain_agentbus_fast_route()
+            if bus_route:
+                target = bus_route["to"]
+                instruction = trim(str(bus_route.get("payload", "") or ""), 1400)
+                route = {
+                    "target": target,
+                    "instruction": instruction,
+                    "source": "agentbus-direct",
+                    "is_mandatory": False,
+                    "executor_mode": False,
+                }
+            else:
+                route = self._manager_delegate_turn(
+                    pinned_selection=pinned_selection,
+                    media_inputs_round=manager_media_inputs,
+                )
             target = str(route.get("target", "") or "").strip().lower()
             instruction = trim(str(route.get("instruction", "") or "").strip(), 1400)
             if compact_mode and target in AGENT_ROLES:
@@ -18738,6 +19628,23 @@ class SessionState:
                 media_inputs_round=role_media_inputs,
             )
             self._blackboard_update_from_worker_step(role, step)
+            # ── Agent turn 结束后的终止检测：结论性回复 + 无待办 + 无错误 → 自动 finish ──
+            agent_text = self._latest_agent_assistant_text(role)
+            if (
+                agent_text
+                and self._looks_like_conclusive_reply(agent_text)
+                and not self.todo.has_open_items()
+                and not self._manager_has_error_log(self._ensure_blackboard())
+            ):
+                self._blackboard_mark_approved(
+                    f"conclusive reply from {role}: auto-finish", role
+                )
+                self._mark_all_done_silently(f"conclusive reply from {role}")
+                self._emit(
+                    "status",
+                    {"summary": f"agent '{role}' gave conclusive reply; finishing run"},
+                )
+                break
             board_after = self._ensure_blackboard()
             board_after_fp = self._watchdog_state_fingerprint(board_after)
             wd_event = self._watchdog_process_worker_step(
@@ -18786,6 +19693,7 @@ class SessionState:
                                 },
                             )
                         continue
+                    self._auto_summary_on_finish()
                     self._mark_all_done_silently(note)
                     self._emit(
                         "status",
@@ -18847,7 +19755,9 @@ class SessionState:
                 )
                 break
         else:
-            self._emit("error", {"summary": f"max loop reached ({self.max_agent_rounds})"})
+            summary = self._auto_summary_on_finish()
+            self._mark_all_done_silently(f"budget exhausted: {summary}")
+            self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
 
     def _multi_agent_worker(self, *, pinned_selection: str):
         mode = self._effective_execution_mode()
@@ -18980,7 +19890,9 @@ class SessionState:
                     sync_index += 1
                 continue
         else:
-            self._emit("error", {"summary": f"max loop reached ({self.max_agent_rounds})"})
+            summary = self._auto_summary_on_finish()
+            self._mark_all_done_silently(f"budget exhausted: {summary}")
+            self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
 
     def _agent_worker(self):
         single_role = "developer"
@@ -19205,7 +20117,7 @@ class SessionState:
                     self.messages,
                     tools=TOOLS,
                     system=self._system_prompt(),
-                    max_tokens=AGENT_MAX_OUTPUT_TOKENS,
+                    max_tokens=self.max_output_tokens,
                     think=False,
                     stream_thinking=False,
                     on_thinking_chunk=self._append_live_thinking,
@@ -19579,6 +20491,9 @@ class SessionState:
                                 },
                             )
                             continue
+                    # 对简单查询（非工程任务）限制自动继续预算
+                    if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
+                        auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
                         todo_blocking or self._looks_like_incomplete_reply(text)
                     )
@@ -20080,7 +20995,9 @@ class SessionState:
                 if stop_due_to_repeated_tool_loop or stop_due_to_hard_break or stop_due_to_finish_task:
                     break
             else:
-                self._emit("error", {"summary": f"max loop reached ({self.max_agent_rounds})"})
+                summary = self._auto_summary_on_finish()
+                self._mark_all_done_silently(f"budget exhausted: {summary}")
+                self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
         except CircuitBreakerTriggered as exc:
             note = trim(str(exc), 320) or "Circuit breaker triggered."
             self._emit("status", {"summary": f"hard-stop: {note}"})
@@ -20446,6 +21363,107 @@ class SessionState:
         bio.seek(0)
         return bio.read()
 
+    def export_conversation_md(self) -> str:
+        snap = self.snapshot()
+        title = snap.get("title") or snap.get("id") or "Session"
+        lines = [
+            f"# {title}",
+            "",
+            f"- Session: `{snap.get('id', '')}`",
+            f"- Model: `{snap.get('model', '')}`",
+            f"- Created: {_fmt_export_ts(snap.get('created_at', 0))}",
+            "",
+            "---",
+            "",
+        ]
+        for row in snap.get("conversation_feed", []):
+            role = str(row.get("role", "system"))
+            ts = row.get("ts", 0)
+            time_str = _fmt_export_ts(ts)
+            text = str(row.get("text", ""))
+            thinking = str(row.get("thinking", "") or "")
+            row_type = str(row.get("type", "message"))
+            agent = str(row.get("agent_role", "") or "")
+            header = f"**[{role}]**"
+            if agent:
+                header += f" _{agent}_"
+            if row_type not in ("message", ""):
+                header += f" `{row_type}`"
+            if time_str:
+                header += f"  <sub>{time_str}</sub>"
+            lines.append(header)
+            lines.append("")
+            if thinking:
+                lines.append("<details><summary>thinking</summary>")
+                lines.append("")
+                lines.append(thinking)
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            if text:
+                lines.append(text)
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        return "\n".join(lines)
+
+    def export_conversation_pdf(self) -> bytes:
+        md_text = self.export_conversation_md()
+        return _text_to_minimal_pdf(md_text)
+
+    def _conversation_to_html(self) -> str:
+        snap = self.snapshot()
+        title = _html_esc(snap.get("title") or snap.get("id") or "Session")
+        model = _html_esc(snap.get("model", ""))
+        rows_html = []
+        for row in snap.get("conversation_feed", []):
+            role = str(row.get("role", "system"))
+            ts = row.get("ts", 0)
+            time_str = _fmt_export_ts(ts)
+            text = str(row.get("text", ""))
+            thinking = str(row.get("thinking", "") or "")
+            bg = "#e8f4fd" if role == "user" else ("#f0f0f0" if role == "assistant" else "#fff9e6")
+            block = f'<div style="background:{bg};border-radius:8px;padding:10px 14px;margin:6px 0">'
+            block += f'<div style="font-weight:bold;font-size:13px;color:#555;margin-bottom:4px">[{_html_esc(role)}] {_html_esc(time_str)}</div>'
+            if thinking:
+                block += f'<details style="margin-bottom:6px"><summary style="color:#888;font-size:12px">thinking</summary><pre style="white-space:pre-wrap;font-size:12px;color:#666">{_html_esc(thinking)}</pre></details>'
+            if text:
+                block += f'<pre style="white-space:pre-wrap;font-size:13px;margin:0">{_html_esc(text)}</pre>'
+            block += '</div>'
+            rows_html.append(block)
+        body = "\n".join(rows_html)
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:860px;margin:0 auto;padding:20px;background:#fff}}
+h1{{font-size:20px;margin-bottom:4px}}
+.meta{{color:#888;font-size:13px;margin-bottom:16px}}</style></head>
+<body><h1>{title}</h1><div class="meta">Model: {model}</div>
+{body}
+</body></html>"""
+
+    def export_conversation_image(self) -> bytes:
+        html_content = self._conversation_to_html()
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page(viewport={"width": 860, "height": 800})
+                page.set_content(html_content)
+                page.wait_for_load_state("networkidle")
+                img = page.screenshot(full_page=True, type="png")
+                browser.close()
+                return img
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        try:
+            import imgkit
+            return imgkit.from_string(html_content, False, options={"width": "860", "encoding": "UTF-8"})
+        except ImportError:
+            pass
+        raise RuntimeError("Image export requires playwright or imgkit. Install: pip install playwright && playwright install chromium")
+
 class SessionManager:
     def __init__(
         self,
@@ -20471,6 +21489,7 @@ class SessionManager:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         run_finished_callback=None,
     ):
         self.root = root
@@ -20493,6 +21512,7 @@ class SessionManager:
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
         )
+        self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
         self.max_run_seconds = normalize_timeout_seconds(
             max_run_seconds if max_run_seconds is not None else MAX_RUN_SECONDS,
             minimum=MIN_RUN_TIMEOUT_SECONDS,
@@ -20839,6 +21859,7 @@ class SessionManager:
                 arbiter_max_tokens=self.arbiter_max_tokens,
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
+                max_output_tokens=self.max_output_tokens,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -20879,6 +21900,7 @@ class SessionManager:
                 arbiter_max_tokens=self.arbiter_max_tokens,
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
+                max_output_tokens=self.max_output_tokens,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -21291,7 +22313,7 @@ window.MathJax={
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="importConfigBtn" class="subtle">Upload LLM.config.json</button>
     <input id="configInput" type="file" accept=".json,application/json" style="display:none">
-    <a id="downloadBtn" href="#" target="_blank" rel="noreferrer">Open Skills Studio</a>
+    <a id="downloadBtn" href="#">Open Skills Studio</a>
   </div>
 </header>
 <div class="status-cards" id="topStats"></div>
@@ -21320,7 +22342,15 @@ window.MathJax={
           <button id="interruptBtn" class="subtle">Interrupt</button>
           <button id="compactBtn" class="subtle">Compact</button>
           <button id="refreshBtn" class="subtle">Refresh</button>
-          <a id="downloadSessionBtn" class="subtle disabled" href="#">Export Session</a>
+          <div class="export-dropdown" style="position:relative;display:inline-block">
+            <button id="exportMenuBtn" class="subtle">Export ▾</button>
+            <div id="exportMenu" style="display:none;position:absolute;bottom:100%;left:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:999;min-width:160px;padding:4px 0;margin-bottom:4px">
+              <a id="downloadSessionBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export ZIP</a>
+              <a id="exportMdBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export Markdown</a>
+              <a id="exportPdfBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export PDF</a>
+              <a id="exportPngBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export Image</a>
+            </div>
+          </div>
           <div id="ctxLive" class="ctx-live" title="Remaining context budget">
             <span class="ctx-live-dot"></span>
             <span id="ctxLiveText" class="mono">ctx_left=-</span>
@@ -21394,6 +22424,7 @@ button,a{border:1px solid var(--line);padding:10px 14px;border-radius:12px;backg
 button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27,45,.08)}
 #sendBtn,#newSessionBtn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0}
 .subtle{background:#f6f8fa}
+.export-item:hover{background:#f0f4f8}
 .actions select{padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff;min-width:160px}
 .think-switch{display:flex;align-items:center;gap:6px;border:1px solid var(--line);padding:8px 10px;border-radius:12px;background:#fff;font-weight:600}
 .danger{color:var(--warn);border-color:#f3c0c0}
@@ -21508,7 +22539,7 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-md blockquote{margin:.5rem 0;padding:.4rem .6rem;border-left:3px solid #9db8e8;background:#eef4ff;border-radius:6px;color:#27446f}
 .msg-md .md-inline-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;padding:1px 5px;border-radius:5px;background:#e8eef8;border:1px solid #d3dded;color:#1e3a5f;white-space:pre}
 .msg-md .md-code-lang{display:inline-block;margin:.3rem 0 0;padding:2px 8px;border:1px solid #cfd9ea;border-bottom:0;border-radius:8px 8px 0 0;background:#f3f7fd;color:#3b4f6d;font-size:.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.msg-md .md-code{margin:0 0 .55rem;max-width:100%;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:0 8px 8px 8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.4;white-space:pre}
+.msg-md .md-code{margin:0 0 .55rem;max-width:100%;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:0 8px 8px 8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.4;white-space:pre;overscroll-behavior:contain;scrollbar-gutter:stable}
 .msg-md .md-table{margin:.5rem 0;border-collapse:collapse;max-width:100%;width:100%;display:block;overflow:auto;background:#fff}
 .msg-md .md-table th,.msg-md .md-table td{border:1px solid #d7e0ec;padding:6px 8px;text-align:left;vertical-align:top;white-space:nowrap}
 .msg-md .md-table th{background:#f5f8fc;font-weight:700}
@@ -21618,7 +22649,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 
 APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
-const MD_CACHE_MAX=420;
+const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
 const SNAPSHOT_DELAY_VISIBLE_MS=300;
 const SNAPSHOT_DELAY_HIDDEN_MS=2400;
@@ -21633,30 +22664,30 @@ const CHAT_SCROLL_RENDER_THROTTLE_MS=70;
 const CHAT_SCROLL_SYNC_DEBOUNCE_MS=260;
 const CHAT_SCROLL_SETTLE_MS=620;
 const CHAT_SCROLL_SETTLE_EPS_PX=1;
-const DELTA_MAX_FEED=420;
-const DELTA_MAX_MESSAGES=420;
-const DELTA_MAX_ACTIVITY=100;
-const DELTA_MAX_OPERATIONS=220;
+const DELTA_MAX_FEED=300;
+const DELTA_MAX_MESSAGES=300;
+const DELTA_MAX_ACTIVITY=80;
+const DELTA_MAX_OPERATIONS=160;
 const DELTA_MAX_UPLOADS=40;
 const DELTA_WATCHDOG_INTERVAL_MS=1800;
 const DELTA_WATCHDOG_STALL_MS=9000;
 const MARKDOWN_WORKER_MIN_CHARS=800;
 const MARKDOWN_WORKER_MAX_PENDING=96;
 const MARKDOWN_WORKER_REQ_TTL_MS=45000;
-const CHAT_VIRT={heights:Object.create(null),heightVersion:0,avgHeight:140,overscanPx:400,maxCacheKeys:1200,poolByKind:Object.create(null),poolSize:0,poolMax:180};
+const CHAT_VIRT={heights:Object.create(null),heightVersion:0,avgHeight:140,overscanPx:400,maxCacheKeys:600,poolByKind:Object.create(null),poolSize:0,poolMax:180};
 const RENDER_EVT_TYPES=new Set(['render_frame','render_bridge']);
-const RENDER_QUEUE_MAX=140;
+const RENDER_QUEUE_MAX=80;
 const RENDER_META_MIN_INTERVAL_MS=180;
 const RENDER={queue:[],raf:0,canvas:null,ctx:null,lastSeq:0,lastPaintAt:0,lastMetaAt:0,lastSummary:'',hideTimer:0,imgTicket:0};
 const CODE_PREVIEW_VIRT_THRESHOLD=1800;
 const CODE_PREVIEW_VIRT_EST_ROW_PX=24;
 const CODE_PREVIEW_VIRT_OVERSCAN=160;
-const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties']);
+const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties','.f','.f90','.f95','.f03','.f08','.for','.fpp','.hs','.lhs','.erl','.hrl','.ex','.exs','.ml','.mli','.vhd','.vhdl','.v','.sv','.asm','.s','.proto','.tf','.tfvars','.prisma','.graphql','.gql','.zig','.nim','.jl','.cr','.d','.clj','.cljs','.cljc','.lisp','.cl','.el','.rkt','.pas','.pp','.wgsl','.glsl','.hlsl','.groovy','.cmake','.dockerfile']);
 const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt']);
-const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini'};
+const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini','.f':'fortran','.f90':'fortran','.f95':'fortran','.f03':'fortran','.f08':'fortran','.for':'fortran','.fpp':'fortran','.hs':'haskell','.lhs':'haskell','.erl':'erlang','.hrl':'erlang','.ex':'elixir','.exs':'elixir','.ml':'ocaml','.mli':'ocaml','.vhd':'vhdl','.vhdl':'vhdl','.v':'verilog','.sv':'verilog','.asm':'asm','.s':'asm','.proto':'protobuf','.tf':'hcl','.tfvars':'hcl','.zig':'zig','.nim':'nim','.jl':'julia','.cr':'crystal','.d':'dlang','.clj':'clojure','.cljs':'clojure','.cljc':'clojure','.lisp':'lisp','.cl':'lisp','.el':'lisp','.rkt':'racket','.pas':'pascal','.pp':'pascal','.wgsl':'wgsl','.glsl':'glsl','.hlsl':'hlsl','.groovy':'groovy','.cmake':'cmake','.dockerfile':'shell','.prisma':'prisma','.graphql':'graphql','.gql':'graphql'};
 const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini'};
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
-const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library'])};
+const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library']),fortran:new Set(['program','module','subroutine','function','end','use','implicit','none','integer','real','character','logical','complex','dimension','allocatable','intent','in','out','inout','do','if','then','else','elseif','endif','call','return','write','read','format','type','class','interface','contains','allocate','deallocate']),haskell:new Set(['module','where','import','qualified','as','hiding','data','type','newtype','class','instance','deriving','if','then','else','case','of','let','in','do','return','where','infixl','infixr','infix','forall','default']),erlang:new Set(['module','export','import','if','case','of','end','receive','after','when','fun','try','catch','throw','begin','andalso','orelse','not','band','bor','bxor','bnot','bsl','bsr']),elixir:new Set(['def','defp','defmodule','defmacro','defstruct','defprotocol','defimpl','if','else','unless','case','cond','do','end','fn','when','with','for','raise','rescue','import','use','alias','require']),ocaml:new Set(['let','in','if','then','else','match','with','fun','function','type','module','struct','sig','end','open','val','rec','and','or','not','begin','do','done','for','while','to','downto','mutable','ref']),vhdl:new Set(['library','use','entity','architecture','is','of','begin','end','signal','variable','constant','port','in','out','inout','process','if','then','else','elsif','case','when','for','generate','component','generic','map']),verilog:new Set(['module','endmodule','input','output','inout','wire','reg','assign','always','begin','end','if','else','case','endcase','for','while','parameter','localparam','initial','posedge','negedge','task','function']),asm:new Set([]),protobuf:new Set(['syntax','package','import','option','message','enum','service','rpc','returns','repeated','optional','required','map','oneof','reserved','extend']),hcl:new Set(['resource','data','variable','output','locals','module','provider','terraform','backend','required_providers','for_each','count','depends_on','lifecycle','dynamic','content','block']),zig:new Set(['const','var','fn','pub','return','if','else','for','while','break','continue','switch','struct','enum','union','error','defer','errdefer','try','catch','import','comptime','inline','test','unreachable']),nim:new Set(['proc','func','method','type','var','let','const','if','elif','else','case','of','for','while','break','continue','return','import','include','from','object','ref','ptr','template','macro','iterator','yield','discard']),julia:new Set(['function','end','if','elseif','else','for','while','break','continue','return','module','using','import','export','struct','mutable','abstract','type','const','let','do','begin','try','catch','finally','throw','macro','quote']),crystal:new Set(['def','class','module','struct','enum','if','elsif','else','unless','case','when','while','until','for','do','end','return','yield','begin','rescue','ensure','require','include','extend','abstract','private','protected']),dlang:new Set(['module','import','class','struct','enum','interface','if','else','for','foreach','while','do','switch','case','default','break','continue','return','void','auto','const','immutable','static','public','private','protected','override','template','mixin','alias']),clojure:new Set(['def','defn','defmacro','fn','let','if','cond','case','do','loop','recur','for','doseq','when','when-not','ns','require','use','import','try','catch','throw','finally']),lisp:new Set(['defun','defmacro','defvar','defparameter','defconstant','let','let*','if','cond','case','when','unless','lambda','progn','loop','do','dolist','dotimes','setq','setf','funcall','apply','require','provide']),racket:new Set(['define','lambda','let','let*','letrec','if','cond','case','when','unless','begin','do','for','for/list','for/hash','match','struct','class','require','provide','module','import','export']),pascal:new Set(['program','unit','uses','interface','implementation','begin','end','var','const','type','procedure','function','if','then','else','for','to','downto','while','repeat','until','case','of','with','record','class','array','set','nil']),wgsl:new Set(['fn','var','let','const','struct','if','else','for','while','loop','break','continue','return','switch','case','default','override','enable','type','alias','discard','continuing','fallthrough']),glsl:new Set(['void','float','int','bool','vec2','vec3','vec4','mat2','mat3','mat4','sampler2D','uniform','varying','attribute','in','out','inout','if','else','for','while','do','break','continue','return','struct','const','precision','highp','mediump','lowp']),hlsl:new Set(['float','float2','float3','float4','int','bool','void','struct','cbuffer','Texture2D','SamplerState','if','else','for','while','do','break','continue','return','in','out','inout','uniform','static','const','register','semantic']),prisma:new Set(['model','enum','datasource','generator','type','relation','default','unique','id','map','index','ignore','updatedAt']),graphql:new Set(['type','query','mutation','subscription','input','enum','interface','union','scalar','schema','fragment','on','directive','extend','implements'])};
 S.staticMode=STATIC_UI;
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
@@ -21820,18 +22851,18 @@ function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText'
 function showCompactToast(text){let el=document.querySelector('.compact-toast');if(!el){el=document.createElement('div');el.className='compact-toast';document.body.appendChild(el)}el.textContent=text;el.classList.add('show');if(el._t)clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),2800)}
 function parseCompactReason(data){const direct=String(data?.reason||'').trim();if(direct)return direct;const s=String(data?.summary||'');const m=s.match(/context compacted \\(([^)]*)\\)/);return m?String(m[1]||'').trim():''}
 function isRenderRuntimeEventType(evtType){return RENDER_EVT_TYPES.has(String(evtType||''))}
-function pullRenderState(id,force=false){const sid=String(id||S.activeId||'').trim();if(!sid||S.renderStateInFlight)return;const now=Date.now();if(!force&&now-Number(S.lastRenderStatePullAt||0)<1200)return;S.lastRenderStatePullAt=now;S.renderStateInFlight=true;api('/api/sessions/'+sid+'/render-state').then(st=>{if(!st||typeof st!=='object')return;const frame=st?.frame;if(frame&&typeof frame==='object'){_renderBridgeEnqueue(frame);return}const seq=Number(st?.seq||0);if(seq<=0)return;const kind=String(st?.last_kind||st?.latest?.kind||'generic');const latest=st?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeShow();_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(90000)}).catch(()=>{}).finally(()=>{S.renderStateInFlight=false})}
+function pullRenderState(id,force=false){const sid=String(id||S.activeId||'').trim();if(!sid||S.renderStateInFlight)return;const now=Date.now();if(!force&&now-Number(S.lastRenderStatePullAt||0)<1200)return;S.lastRenderStatePullAt=now;S.renderStateInFlight=true;api('/api/sessions/'+sid+'/render-state').then(st=>{if(!st||typeof st!=='object')return;const frame=st?.frame;if(frame&&typeof frame==='object'){_renderBridgeEnqueue(frame);return}const seq=Number(st?.seq||0);if(seq<=0)return;const kind=String(st?.last_kind||st?.latest?.kind||'generic');const latest=st?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeShow();_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(30000)}).catch(()=>{}).finally(()=>{S.renderStateInFlight=false})}
 function _renderBridgeShow(){const wrap=E('renderBridge');if(!wrap)return null;wrap.classList.remove('hidden');if(RENDER.hideTimer){clearTimeout(RENDER.hideTimer);RENDER.hideTimer=0}return wrap}
-function _renderBridgeHideLater(ms=90000){if(RENDER.hideTimer){clearTimeout(RENDER.hideTimer);RENDER.hideTimer=0}RENDER.hideTimer=setTimeout(()=>{const wrap=E('renderBridge');if(wrap)wrap.classList.add('hidden')},Math.max(4000,Number(ms)||90000))}
+function _renderBridgeHideLater(ms=30000){if(RENDER.hideTimer){clearTimeout(RENDER.hideTimer);RENDER.hideTimer=0}RENDER.hideTimer=setTimeout(()=>{const wrap=E('renderBridge');if(wrap)wrap.classList.add('hidden')},Math.max(4000,Number(ms)||30000))}
 function _renderBridgeEnsureCanvas(){const canvas=E('renderCanvas');if(!canvas)return null;const wrap=_renderBridgeShow();if(!wrap)return null;const ctx=(canvas.getContext&&canvas.getContext('2d'))?canvas.getContext('2d'):null;if(!ctx)return null;const dpr=Math.max(1,Math.min(3,window.devicePixelRatio||1));const rect=canvas.getBoundingClientRect();const w=Math.max(260,Math.floor(rect.width||canvas.clientWidth||canvas.width||960));const h=Math.max(120,Math.floor(rect.height||canvas.clientHeight||canvas.height||220));const bw=Math.max(260,Math.floor(w*dpr));const bh=Math.max(120,Math.floor(h*dpr));if(canvas.width!==bw||canvas.height!==bh){canvas.width=bw;canvas.height=bh;ctx.setTransform(1,0,0,1,0,0);ctx.scale(dpr,dpr)}RENDER.canvas=canvas;RENDER.ctx=ctx;return{canvas,ctx,w,h}}
 function _renderBridgeSafeNum(v,def=0,min=-1e6,max=1e6){const n=Number(v);if(!Number.isFinite(n))return def;return Math.max(min,Math.min(max,n))}
 function _renderBridgeColor(raw,fallback='#1f6feb'){const s=String(raw||'').trim();if(/^#[0-9a-fA-F]{3,8}$/.test(s))return s;if(/^rgba?\\(([^)]+)\\)$/.test(s))return s;if(/^hsla?\\(([^)]+)\\)$/.test(s))return s;return fallback}
 function _renderBridgeUpdateMeta(text,force=false){const meta=E('renderMeta');if(!meta)return;const now=Date.now();if(!force&&now-Number(RENDER.lastMetaAt||0)<RENDER_META_MIN_INTERVAL_MS)return;const txt=String(text||'').trim();if(!txt)return;RENDER.lastMetaAt=now;RENDER.lastSummary=txt;meta.textContent=txt}
 function _renderBridgeDrawImage(frame,ctx,w,h){const b64=String(frame?.image_b64||'').trim();if(!b64)return;const mime=String(frame?.mime||'image/png').trim()||'image/png';const src=`data:${mime};base64,${b64}`;const ticket=Number(RENDER.imgTicket||0)+1;RENDER.imgTicket=ticket;const img=new Image();img.onload=()=>{if(ticket!==Number(RENDER.imgTicket||0))return;ctx.drawImage(img,0,0,w,h)};img.onerror=()=>{};img.src=src}
-function _renderBridgeDrawFrame(frame){const ready=_renderBridgeEnsureCanvas();if(!ready)return;const {ctx,w,h}=ready;const srcW=Math.max(1,_renderBridgeSafeNum(frame?.width,0,0,8192));const srcH=Math.max(1,_renderBridgeSafeNum(frame?.height,0,0,8192));const sx=(srcW>0)?(w/srcW):1;const sy=(srcH>0)?(h/srcH):1;const clear=!!frame?.clear||!RENDER.lastPaintAt;if(clear){ctx.clearRect(0,0,w,h)}const bg=String(frame?.bg||'').trim();if(bg){ctx.fillStyle=_renderBridgeColor(bg,'#ffffff');ctx.fillRect(0,0,w,h)}if(String(frame?.image_b64||'').trim()){_renderBridgeDrawImage(frame,ctx,w,h)}const lines=Array.isArray(frame?.lines)?frame.lines:[];if(lines.length){for(const line of lines){const pts=Array.isArray(line?.points)?line.points:[];if(pts.length<2)continue;ctx.beginPath();const p0=pts[0];const x0=_renderBridgeSafeNum(Array.isArray(p0)?p0[0]:0,0)*sx;const y0=_renderBridgeSafeNum(Array.isArray(p0)?p0[1]:0,0)*sy;ctx.moveTo(x0,y0);for(let i=1;i<pts.length;i++){const p=pts[i];ctx.lineTo(_renderBridgeSafeNum(Array.isArray(p)?p[0]:0,0)*sx,_renderBridgeSafeNum(Array.isArray(p)?p[1]:0,0)*sy)}ctx.strokeStyle=_renderBridgeColor(line?.color,'#1f6feb');ctx.globalAlpha=_renderBridgeSafeNum(line?.alpha,1,0,1);ctx.lineWidth=_renderBridgeSafeNum(line?.width,1.6,0.1,60);ctx.stroke();ctx.globalAlpha=1}}const points=Array.isArray(frame?.points)?frame.points:[];if(points.length){for(const p of points){ctx.beginPath();ctx.arc(_renderBridgeSafeNum(p?.x,0)*sx,_renderBridgeSafeNum(p?.y,0)*sy,_renderBridgeSafeNum(p?.size,1.6,0.1,40),0,Math.PI*2);ctx.fillStyle=_renderBridgeColor(p?.color,'#1a7f64');ctx.globalAlpha=_renderBridgeSafeNum(p?.alpha,1,0,1);ctx.fill();ctx.globalAlpha=1}}const txt=String(frame?.text||'').trim();if(txt){ctx.fillStyle='#26364d';ctx.font='12px ui-monospace, SFMono-Regular, Menlo, monospace';ctx.fillText(txt.slice(0,240),8,18)}RENDER.lastPaintAt=Date.now();RENDER.lastSeq=Math.max(Number(RENDER.lastSeq||0),Number(frame?.seq||0));const lineCount=Array.isArray(frame?.lines)?frame.lines.length:0;const pointCount=Array.isArray(frame?.points)?frame.points.length:0;const kind=String(frame?.kind||'generic');_renderBridgeUpdateMeta(`render seq=${RENDER.lastSeq} · kind=${kind} · lines=${lineCount} · points=${pointCount}`,true);_renderBridgeHideLater(90000)}
+function _renderBridgeDrawFrame(frame){const ready=_renderBridgeEnsureCanvas();if(!ready)return;const {ctx,w,h}=ready;const srcW=Math.max(1,_renderBridgeSafeNum(frame?.width,0,0,8192));const srcH=Math.max(1,_renderBridgeSafeNum(frame?.height,0,0,8192));const sx=(srcW>0)?(w/srcW):1;const sy=(srcH>0)?(h/srcH):1;const clear=!!frame?.clear||!RENDER.lastPaintAt;if(clear){ctx.clearRect(0,0,w,h)}const bg=String(frame?.bg||'').trim();if(bg){ctx.fillStyle=_renderBridgeColor(bg,'#ffffff');ctx.fillRect(0,0,w,h)}if(String(frame?.image_b64||'').trim()){_renderBridgeDrawImage(frame,ctx,w,h)}const lines=Array.isArray(frame?.lines)?frame.lines:[];if(lines.length){for(const line of lines){const pts=Array.isArray(line?.points)?line.points:[];if(pts.length<2)continue;ctx.beginPath();const p0=pts[0];const x0=_renderBridgeSafeNum(Array.isArray(p0)?p0[0]:0,0)*sx;const y0=_renderBridgeSafeNum(Array.isArray(p0)?p0[1]:0,0)*sy;ctx.moveTo(x0,y0);for(let i=1;i<pts.length;i++){const p=pts[i];ctx.lineTo(_renderBridgeSafeNum(Array.isArray(p)?p[0]:0,0)*sx,_renderBridgeSafeNum(Array.isArray(p)?p[1]:0,0)*sy)}ctx.strokeStyle=_renderBridgeColor(line?.color,'#1f6feb');ctx.globalAlpha=_renderBridgeSafeNum(line?.alpha,1,0,1);ctx.lineWidth=_renderBridgeSafeNum(line?.width,1.6,0.1,60);ctx.stroke();ctx.globalAlpha=1}}const points=Array.isArray(frame?.points)?frame.points:[];if(points.length){for(const p of points){ctx.beginPath();ctx.arc(_renderBridgeSafeNum(p?.x,0)*sx,_renderBridgeSafeNum(p?.y,0)*sy,_renderBridgeSafeNum(p?.size,1.6,0.1,40),0,Math.PI*2);ctx.fillStyle=_renderBridgeColor(p?.color,'#1a7f64');ctx.globalAlpha=_renderBridgeSafeNum(p?.alpha,1,0,1);ctx.fill();ctx.globalAlpha=1}}const txt=String(frame?.text||'').trim();if(txt){ctx.fillStyle='#26364d';ctx.font='12px ui-monospace, SFMono-Regular, Menlo, monospace';ctx.fillText(txt.slice(0,240),8,18)}RENDER.lastPaintAt=Date.now();RENDER.lastSeq=Math.max(Number(RENDER.lastSeq||0),Number(frame?.seq||0));const lineCount=Array.isArray(frame?.lines)?frame.lines.length:0;const pointCount=Array.isArray(frame?.points)?frame.points.length:0;const kind=String(frame?.kind||'generic');_renderBridgeUpdateMeta(`render seq=${RENDER.lastSeq} · kind=${kind} · lines=${lineCount} · points=${pointCount}`,true);_renderBridgeHideLater(30000)}
 function _renderBridgeDrain(){RENDER.raf=0;if(!Array.isArray(RENDER.queue)||!RENDER.queue.length)return;const latest=RENDER.queue[RENDER.queue.length-1]||{};RENDER.queue.length=0;_renderBridgeDrawFrame(latest);if(RENDER.queue.length){RENDER.raf=requestAnimationFrame(_renderBridgeDrain)}}
 function _renderBridgeEnqueue(frame){if(!frame||typeof frame!=='object')return;_renderBridgeShow();if(!Array.isArray(RENDER.queue))RENDER.queue=[];RENDER.queue.push(frame);if(RENDER.queue.length>RENDER_QUEUE_MAX){RENDER.queue=RENDER.queue.slice(-Math.floor(RENDER_QUEUE_MAX*0.6))}const summary=String(frame?.summary||'').trim();if(summary){_renderBridgeUpdateMeta(summary,false)}if(!RENDER.raf){RENDER.raf=requestAnimationFrame(_renderBridgeDrain)}}
-function _renderBridgeSyncFromSnapshot(snap){const rb=snap?.render_bridge||null;if(!rb||typeof rb!=='object')return;const seq=Number(rb?.seq||0);if(seq<=0)return;_renderBridgeShow();const kind=String(rb?.last_kind||rb?.latest?.kind||'generic');const latest=rb?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(90000)}
+function _renderBridgeSyncFromSnapshot(snap){const rb=snap?.render_bridge||null;if(!rb||typeof rb!=='object')return;const seq=Number(rb?.seq||0);if(seq<=0)return;_renderBridgeShow();const kind=String(rb?.last_kind||rb?.latest?.kind||'generic');const latest=rb?.latest||{};const lines=Number(latest?.lines||0);const points=Number(latest?.points||0);_renderBridgeUpdateMeta(`render seq=${seq} · kind=${kind} · lines=${lines} · points=${points}`,true);_renderBridgeHideLater(30000)}
 function _deltaEnsureSnapshot(){if(!S.snap||typeof S.snap!=='object')return false;if(!Array.isArray(S.snap.messages))S.snap.messages=[];if(!Array.isArray(S.snap.conversation_feed))S.snap.conversation_feed=[];if(!Array.isArray(S.snap.activity))S.snap.activity=[];if(!Array.isArray(S.snap.operations))S.snap.operations=[];if(!Array.isArray(S.snap.uploads))S.snap.uploads=[];if(!Array.isArray(S.snap.todos))S.snap.todos=[];if(!Array.isArray(S.snap.tasks))S.snap.tasks=[];return true}
 function _deltaPushLimited(arr,row,maxCount){if(!Array.isArray(arr))return;if(!row||typeof row!=='object')return;arr.push(row);const maxN=Math.max(20,Number(maxCount)||120);if(arr.length>maxN){arr.splice(0,arr.length-maxN)}}
 function _deltaAdoptAgentRole(data){if(!_deltaEnsureSnapshot())return'';const role=_chatVirtAgentRoleKey(data?.agent_role);if(!role)return'';S.snap.agent_active_role=role;return role}
@@ -22016,7 +23047,7 @@ function onRuntimeEvent(evt){
   if(seqState.gap)return{handled:true,needsSnapshot:true};
   const typ=String(evt.type||'');
   if(typ==='render_frame'){_renderBridgeEnqueue(evt.data||{});return{handled:true,needsSnapshot:false}}
-  if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(90000)}return{handled:true,needsSnapshot:false}}
+  if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(30000)}return{handled:true,needsSnapshot:false}}
   if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(reason==='auto'||reason.startsWith('truncation-rescue')){const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · delta-sync`)}_deltaAppendActivity(typ,evt.data||{},Number(evt?.ts||Date.now()/1000));_deltaScheduleRender({boards:true,sessions:true});return{handled:true,needsSnapshot:false}}
   return _deltaApplyRuntimeEvent(evt);
 }
@@ -22047,7 +23078,7 @@ function _deltaStartWatchdog(){
   };
   S.deltaWatchdogTimer=setTimeout(tick,DELTA_WATCHDOG_INTERVAL_MS);
 }
-function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills');if(offline){link.removeAttribute('target');link.removeAttribute('rel')}else{link.setAttribute('target','_blank');link.setAttribute('rel','noreferrer')}}
+function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
@@ -22066,11 +23097,12 @@ function _scrollContainerToNodeCenter(container,target){
 }
 function _bindNestedScrollGuards(root){
   if(!root)return;
+  const SEL='.msg-diff-shell,.msg-code-shell,.preview-code-scroll,.md-code';
   const nodes=[];
-  if(root.matches&&root.matches('.msg-diff-shell,.msg-code-shell,.preview-code-scroll')){
+  if(root.matches&&root.matches(SEL)){
     nodes.push(root);
   }
-  for(const n of root.querySelectorAll('.msg-diff-shell,.msg-code-shell,.preview-code-scroll')){
+  for(const n of root.querySelectorAll(SEL)){
     nodes.push(n);
   }
   const markManualCenterOff=(node)=>{
@@ -22087,6 +23119,17 @@ function _bindNestedScrollGuards(root){
       if(key)S.diffCenterDisabled[key]=1;
     }
   };
+  const markChatUserScrolling=()=>{
+    const chatEl=E('chat');
+    if(!chatEl)return;
+    const now=Date.now();
+    chatEl._virtManualUnlockTs=Math.max(
+      Number(chatEl._virtManualUnlockTs||0),
+      now+CHAT_SCROLL_LOCK_MS
+    );
+    S.follow.chat=false;
+    chatEl._virtAutoFollowPaused=true;
+  };
   for(const node of nodes){
     if(!node||node._nestedScrollGuardBound)continue;
     node._nestedScrollGuardBound=true;
@@ -22097,16 +23140,38 @@ function _bindNestedScrollGuards(root){
       const maxLeft=Math.max(0,Number(node.scrollWidth||0)-Number(node.clientWidth||0));
       const top=Number(node.scrollTop||0);
       const left=Number(node.scrollLeft||0);
-      const canY=(dy<0&&top>0)||(dy>0&&top<maxTop);
-      const canX=(dx<0&&left>0)||(dx>0&&left<maxLeft);
+      const canY=(dy<0&&top>0.5)||(dy>0&&top<maxTop-0.5);
+      const canX=(dx<0&&left>0.5)||(dx>0&&left<maxLeft-0.5);
       markManualCenterOff(node);
       if(canY||canX){
         ev.stopPropagation();
+        markChatUserScrolling();
       }
+    },{passive:false});
+    node.addEventListener('mousedown',()=>{markManualCenterOff(node);markChatUserScrolling();},{passive:true});
+    node.addEventListener('touchstart',ev=>{
+      markManualCenterOff(node);
+      markChatUserScrolling();
+      node._touchStartY=Number(ev.touches?.[0]?.clientY||0);
+      node._touchStartX=Number(ev.touches?.[0]?.clientX||0);
     },{passive:true});
-    node.addEventListener('mousedown',()=>{markManualCenterOff(node);},{passive:true});
-    node.addEventListener('touchstart',()=>{markManualCenterOff(node);},{passive:true});
-    node.addEventListener('touchmove',ev=>{markManualCenterOff(node);ev.stopPropagation();},{passive:true});
+    node.addEventListener('touchmove',ev=>{
+      markManualCenterOff(node);
+      const curY=Number(ev.touches?.[0]?.clientY||0);
+      const curX=Number(ev.touches?.[0]?.clientX||0);
+      const dy=curY-(node._touchStartY||0);
+      const dx=curX-(node._touchStartX||0);
+      const maxTop=Math.max(0,Number(node.scrollHeight||0)-Number(node.clientHeight||0));
+      const maxLeft=Math.max(0,Number(node.scrollWidth||0)-Number(node.clientWidth||0));
+      const top=Number(node.scrollTop||0);
+      const left=Number(node.scrollLeft||0);
+      const canY=(dy>0&&top>0.5)||(dy<0&&top<maxTop-0.5);
+      const canX=(dx>0&&left>0.5)||(dx<0&&left<maxLeft-0.5);
+      if(canY||canX){
+        ev.stopPropagation();
+      }
+      markChatUserScrolling();
+    },{passive:false});
   }
 }
 function _centerDiffShellToHotspot(root){
@@ -22136,8 +23201,7 @@ function _centerDiffShellToHotspot(root){
   const target=lines[bestCenter];
   if(!target)return;
   if(msgKey)shell.setAttribute('data-centered-key',msgKey);
-  const run=()=>{try{_scrollContainerToNodeCenter(shell,target);if(msgKey)S.diffCenteredDone[msgKey]=1;}catch(_){}};
-  if(typeof requestAnimationFrame==='function'){requestAnimationFrame(run)}else{run()}
+  try{_scrollContainerToNodeCenter(shell,target);if(msgKey)S.diffCenteredDone[msgKey]=1;}catch(_){}
 }
 function splitTableRow(line){const src=String(line||'').trim().replace(/^\\|/,'').replace(/\\|$/,'');if(!src)return[];return src.split('|').map(x=>String(x||'').trim())}
 function isTableSeparator(line){const cells=splitTableRow(line);if(!cells.length)return false;return cells.every(cell=>/^:?-{3,}:?$/.test(cell))}
@@ -22509,7 +23573,7 @@ function _previewRenderStageSelector(tab,stages,selectedReq,payload=null){
   stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
 }
 function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
-function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:true,backtick:false};if(v==='json')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
+function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake'||v==='nim'||v==='julia'||v==='elixir'||v==='crystal')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql'||v==='haskell')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml'||v==='vhdl')return{hashComment:false,slashComment:false,dashComment:true,blockComment:false,xmlComment:true,backtick:false};if(v==='json'||v==='fortran'||v==='asm'||v==='protobuf'||v==='prisma'||v==='graphql'||v==='wgsl')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='lisp'||v==='clojure'||v==='racket')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
 function _codeWordSet(lang){return CODE_KEYWORDS[String(lang||'default')]||CODE_KEYWORDS.default}
 function _isWordStart(ch){return /[A-Za-z_$]/.test(ch)}
 function _isWordChar(ch){return /[A-Za-z0-9_$]/.test(ch)}
@@ -22913,8 +23977,7 @@ function _scrollCodePreviewToAnchor(body,anchorLine){
     target=body.querySelector('.code-row.code-add,.code-row.code-delete')||rows[0];
   }
   if(!target)return;
-  const run=()=>{try{_scrollContainerToNodeCenter(scrollWrap,target);if(previewKey)S.previewCenteredDone[previewKey]=1;}catch(_){}};
-  if(typeof requestAnimationFrame==='function'){requestAnimationFrame(run)}else{run()}
+  try{_scrollContainerToNodeCenter(scrollWrap,target);if(previewKey)S.previewCenteredDone[previewKey]=1;}catch(_){}
 }
 async function _renderCodePreviewTab(tab,body,forceReload=false){
   const ticket=String(++S.previewNonce);
@@ -23032,7 +24095,7 @@ function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');c
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}const nodes=chatEl.querySelectorAll('.msg[data-run-live=\"1\"]');if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const pre=node.querySelector('pre');if(!pre)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));pre.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const pre=node.querySelector('pre');if(!pre)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));pre.textContent=_chatVirtLiveRunText(label,elapsed)}}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
@@ -23101,7 +24164,7 @@ function _chatVirtAcquireNode(kind){const key=String(kind||'text');const pool=_c
 function _chatVirtReleaseNode(node){
   if(!node)return;
   const key=String(node.getAttribute('data-pool-kind')||'text');
-  if(Number(CHAT_VIRT.poolSize||0)>=Number(CHAT_VIRT.poolMax||420))return;
+  if(Number(CHAT_VIRT.poolSize||0)>=Number(CHAT_VIRT.poolMax||180))return;
   if(S.mathObserver){
     try{S.mathObserver.unobserve(node)}catch(_){}
   }
@@ -23316,6 +24379,70 @@ function _chatVirtBuildMessageNode(m){
   return d;
 }
 function _chatVirtFindWindow(rows,top,bottom){const startTarget=Math.max(0,top-CHAT_VIRT.overscanPx);const endTarget=Math.max(0,bottom+CHAT_VIRT.overscanPx);let start=0;let acc=0;while(start<rows.length){const h=_chatVirtEstimatedHeight(rows[start]);if((acc+h)>=startTarget)break;acc+=h;start+=1}let end=start;let accEnd=acc;while(end<rows.length&&accEnd<=endTarget){accEnd+=_chatVirtEstimatedHeight(rows[end]);end+=1}end=Math.min(rows.length,end+2);return {start,end,topOffset:acc,endOffset:accEnd}}
+function _chatVirtReuseWindow(chatEl,rows,top,bottom){
+  if(!chatEl||!Array.isArray(rows)||!rows.length)return null;
+  const prevRows=Array.isArray(chatEl._virtLastRows)?chatEl._virtLastRows:[];
+  const prevStart=Number(chatEl._virtLastWinStart||-1);
+  const prevEnd=Number(chatEl._virtLastWinEnd||-1);
+  const prevTopOffset=Number(chatEl._virtLastTopOffset);
+  const prevEndOffset=Number(chatEl._virtLastEndOffset);
+  if(prevStart<0||prevEnd<=prevStart)return null;
+  if(!Number.isFinite(prevTopOffset)||!Number.isFinite(prevEndOffset)||prevEndOffset<=prevTopOffset)return null;
+  if(prevRows.length!==rows.length)return null;
+  const prevFirstKey=String(prevRows[prevStart]?._vk||'');
+  const nextFirstKey=String(rows[prevStart]?._vk||'');
+  const prevLastKey=String(prevRows[Math.max(0,prevEnd-1)]?._vk||'');
+  const nextLastKey=String(rows[Math.max(0,prevEnd-1)]?._vk||'');
+  if(prevFirstKey!==nextFirstKey||prevLastKey!==nextLastKey)return null;
+  const viewport=Math.max(0,bottom-top);
+  const innerPad=Math.max(120,Math.min(Math.round(CHAT_VIRT.overscanPx*0.45),Math.round(viewport*0.35)));
+  if((prevEndOffset-prevTopOffset)<(viewport+(innerPad*2)))return null;
+  const safeTop=prevTopOffset+innerPad;
+  const safeBottom=prevEndOffset-innerPad;
+  if(top>=safeTop&&bottom<=safeBottom){
+    return {start:prevStart,end:prevEnd,topOffset:prevTopOffset,endOffset:prevEndOffset};
+  }
+  return null;
+}
+function _chatVirtReleaseRendered(root){if(!root)return;for(const node of root.querySelectorAll('.msg[data-vk]')){_chatVirtReleaseNode(node)}}
+function _chatVirtFindRenderedNode(chatEl,key){
+  if(!chatEl||!key)return null;
+  for(const node of chatEl.querySelectorAll('.msg[data-vk]')){
+    if(String(node.getAttribute('data-vk')||'')===String(key||''))return node;
+  }
+  return null;
+}
+function _chatVirtCaptureAnchor(chatEl){
+  if(!chatEl)return null;
+  const viewportTop=Number(chatEl.getBoundingClientRect().top||0);
+  let fallback=null;
+  for(const node of chatEl.querySelectorAll('.msg[data-vk]')){
+    const key=String(node.getAttribute('data-vk')||'').trim();
+    if(!key)continue;
+    const rect=node.getBoundingClientRect();
+    const top=Number(rect.top||0)-viewportTop;
+    const bottom=Number(rect.bottom||0)-viewportTop;
+    const anchor={key:key,offset:top};
+    if(!fallback)fallback=anchor;
+    if(bottom>1)return anchor;
+  }
+  return fallback;
+}
+function _chatVirtRestoreAnchor(chatEl,anchor){
+  if(!chatEl||!anchor||!anchor.key)return false;
+  const node=_chatVirtFindRenderedNode(chatEl,anchor.key);
+  if(!node)return false;
+  const viewportTop=Number(chatEl.getBoundingClientRect().top||0);
+  const rect=node.getBoundingClientRect();
+  const currentOffset=Number(rect.top||0)-viewportTop;
+  const delta=currentOffset-Number(anchor.offset||0);
+  if(Math.abs(delta)<0.75)return true;
+  const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
+  const target=Math.max(0,Math.min(Number(chatEl.scrollTop||0)+delta,maxTop));
+  if(Math.abs(target-Number(chatEl.scrollTop||0))<0.75)return true;
+  chatEl.scrollTop=target;
+  return true;
+}
 function _chatVirtBindScroll(chatEl){
   if(chatEl._virtBound)return;
   chatEl._virtBound=true;
@@ -23385,28 +24512,11 @@ function _chatVirtBindScroll(chatEl){
     const now=Date.now();
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
-    chatEl._virtInputUnlockTs=Math.max(
-      Number(chatEl._virtInputUnlockTs||0),
-      now+CHAT_SCROLL_INPUT_LOCK_MS
-    );
-    const atBottomBefore=nearBottom(chatEl,6);
     if(dy<0){
-      markManual(CHAT_SCROLL_LOCK_MS);
       S.follow.chat=false;
       return;
     }
-    if(!atBottomBefore){
-      markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.45));
-      S.follow.chat=false;
-      return;
-    }
-    S.follow.chat=true;
-    chatEl._virtManualUnlockTs=0;
-    chatEl._virtInputUnlockTs=0;
-    chatEl._virtTouchUnlockTs=0;
-    if(atBottomBefore){
-      chatEl._virtAutoFollowPaused=false;
-    }
+    if(nearBottom(chatEl,6))S.follow.chat=true;
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -23420,9 +24530,7 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtScrollDirection=(curTop>prevTop)?1:((curTop<prevTop)?-1:0);
     chatEl._virtLastScrollTop=curTop;
     const atBottom=nearBottom(chatEl,6);
-    const manualLock=Number(chatEl._virtManualUnlockTs||0)>now;
-    const recentUpIntent=(now-Number(chatEl._virtLastWheelTs||0))<220&&Number(chatEl._virtLastWheelDy||0)<0;
-    if(atBottom&&!manualLock&&!recentUpIntent){
+    if(atBottom){
       S.follow.chat=true;
       chatEl._virtManualUnlockTs=0;
       chatEl._virtInputUnlockTs=0;
@@ -23432,9 +24540,6 @@ function _chatVirtBindScroll(chatEl){
       S.follow.chat=false;
       if(S.snap?.running){
         chatEl._virtAutoFollowPaused=true;
-      }
-      if(!atBottom||recentUpIntent){
-        chatEl._virtManualUnlockTs=Math.max(Number(chatEl._virtManualUnlockTs||0),now+CHAT_SCROLL_LOCK_MS);
       }
     }
     scheduleScrollRender();
@@ -23453,12 +24558,9 @@ function renderChat(reason='snapshot'){
   if((!S.snap?.running)&&atBottomNow){
     c._virtAutoFollowPaused=false;
   }
-  const now=Date.now();
-  const manualLock=Number(c._virtManualUnlockTs||0)>now;
-  const autoPaused=Boolean(c._virtAutoFollowPaused);
-  const scrolling=_chatVirtIsUserScrolling(c);
-  const keep=first||(!manualLock&&!autoPaused&&!scrolling&&(atBottomNow||Boolean(S.follow.chat)));
+  const keep=first||Boolean(S.follow.chat)||atBottomNow;
   const oldScrollTop=Number(c.scrollTop||0);
+  const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
   const feedSig=String(S.lastFeedSig||feedSignature(S.snap||{}));
   let rows=[];
   if(reason==='scroll'&&Array.isArray(c._virtRowsCacheRows)&&String(c._virtRowsCacheSig||'')===feedSig){
@@ -23474,7 +24576,7 @@ function renderChat(reason='snapshot'){
   const prevWinEnd=Number(c._virtLastWinEnd||-1);
   const top=Math.max(0,c.scrollTop);
   const bottom=top+Math.max(0,c.clientHeight||0);
-  const win=_chatVirtFindWindow(rows,top,bottom);
+  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom);
   const totalKey=`${feedSig}|hv=${Number(CHAT_VIRT.heightVersion||0)}|rows=${rows.length}`;
   let totalEstimated=0;
   if(reason==='scroll'&&String(c._virtTotalKey||'')===totalKey){
@@ -23592,19 +24694,19 @@ function renderChat(reason='snapshot'){
       CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
     }
   }
-  if(reason!=='scroll'){
-    const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
-    if(keep){
-      c.scrollTop=maxTop;
-    }else{
-      c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
-    }
+  const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
+  if(keep){
+    c.scrollTop=maxTop;
+  }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
+    c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
   }
   c._chatHasRendered=true;
   c._virtRendering=false;
   c._virtLastRows=rows;
   c._virtLastWinStart=win.start;
   c._virtLastWinEnd=win.end;
+  c._virtLastTopOffset=Number(win.topOffset||0);
+  c._virtLastEndOffset=Number(win.endOffset||0);
   if(hasHeightChange&&reason!=='scroll'){
     if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
     c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
@@ -23654,8 +24756,14 @@ refreshFileExplorer(false).catch(()=>{});
 const uploads=(S.snap?.uploads||[]).slice(-8).reverse();
 E('uploadList').innerHTML=uploads.map(u=>`<div>${esc(u.filename)} → ${esc(u.workspace_path||'')} (${esc(u.kind||'')}, ${esc(u.size||0)}B)</div>`).join('')||`<div>${esc(t('no_uploads'))}</div>`;
 const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';
+const sessionMd=S.activeId?('/api/sessions/'+S.activeId+'/export.md'):'#';
+const sessionPdf=S.activeId?('/api/sessions/'+S.activeId+'/export.pdf'):'#';
+const sessionPng=S.activeId?('/api/sessions/'+S.activeId+'/export.png'):'#';
 const dl1=E('downloadSessionBtn');
-if(S.activeId){dl1.classList.remove('disabled');dl1.href=sessionZip}else{dl1.classList.add('disabled');dl1.href='#'}
+const dlMd=E('exportMdBtn');
+const dlPdf=E('exportPdfBtn');
+const dlPng=E('exportPngBtn');
+if(S.activeId){dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}else{dl1.href='#';if(dlMd)dlMd.href='#';if(dlPdf)dlPdf.href='#';if(dlPng)dlPng.href='#'}
 renderSkillsEntryLink()}
 function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection)}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;return{options,models,selected,thinking}}
 function _modelNameFromSelection(selection){const raw=String(selection||'').trim();if(!raw)return'';if(raw.includes('::')){const parts=raw.split('::',2);return String(parts[1]||parts[0]||'').trim()}return raw}
@@ -23753,7 +24861,7 @@ function _chatVirtDebounceWhileScrolling(chatEl,timerField,fn,delayMs=CHAT_SCROL
       if(!_chatVirtIsUserScrolling(chatEl))done();
     };
     chatEl[scrollEndField]=onScrollEnd;
-    try{chatEl.addEventListener('scrollend',onScrollEnd,{passive:true})}catch(_){}
+    chatEl.addEventListener('scrollend',onScrollEnd,{once:true,passive:true});
   }
 }
 async function refreshSnapshot(opt={}){
@@ -23903,7 +25011,7 @@ async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resu
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});document.addEventListener('click',()=>{exportMenu.style.display='none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -23957,7 +25065,7 @@ SKILLS_INDEX_HTML = """<!doctype html>
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="refreshBtn" class="subtle">Refresh</button>
-    <a id="agentLink" href="#" target="_blank" rel="noreferrer">Open Agent UI</a>
+    <a id="agentLink" href="#">Open Agent UI</a>
   </div>
 </header>
 <div class="status-cards" id="topStats"></div>
@@ -24251,9 +25359,9 @@ function pointToSegmentDistance(px,py,x1,y1,x2,y2){const dx=x2-x1,dy=y2-y1;const
 function findNearestEdgeIndexAt(px,py,threshold=14){const byId={};for(const n of (S.flow.nodes||[])){byId[n.id]=n}const z=getFlowZoom();let bestIdx=-1;let best=Number.POSITIVE_INFINITY;for(let i=0;i<(S.flow.edges||[]).length;i++){const e=S.flow.edges[i];const rp=resolveEdgeSidesAndPoints(e,byId);if(!rp)continue;const x1=(Number(rp.p1.x)||0)*z,y1=(Number(rp.p1.y)||0)*z,x2=(Number(rp.p2.x)||0)*z,y2=(Number(rp.p2.y)||0)*z;const dLine=pointToSegmentDistance(px,py,x1,y1,x2,y2);const dArrow=Math.hypot(px-x2,py-y2);const d=Math.min(dLine,dArrow);if(d<best){best=d;bestIdx=i}}if(best<=Math.max(6,Number(threshold)||14))return bestIdx;return -1}
 function beginLinkDrag(nodeId,side,ev){if(ev){ev.preventDefault();ev.stopPropagation()}const canvas=E('flowCanvas');if(!canvas)return;const rect=canvas.getBoundingClientRect();S.drag=null;S.pan=null;S.selectedNodeId=String(nodeId||'');S.linkDrag={fromId:String(nodeId||''),fromSide:normalizeSide(side)||'right',toX:(ev?ev.clientX:rect.left)-rect.left,toY:(ev?ev.clientY:rect.top)-rect.top};renderNodeEditor();renderFlow()}
 function renderFlow(){const canvas=E('flowCanvas');const svg=E('flowSvg');if(!canvas||!svg)return;const z=getFlowZoom();canvas.innerHTML='';svg.innerHTML='';const defs=document.createElementNS('http://www.w3.org/2000/svg','defs');const marker=document.createElementNS('http://www.w3.org/2000/svg','marker');marker.setAttribute('id','arrow');marker.setAttribute('viewBox','0 0 10 10');marker.setAttribute('refX','10');marker.setAttribute('refY','5');marker.setAttribute('markerWidth','7');marker.setAttribute('markerHeight','7');marker.setAttribute('orient','auto-start-reverse');const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d','M 0 0 L 10 5 L 0 10 z');path.setAttribute('fill','#7f95b8');marker.appendChild(path);defs.appendChild(marker);svg.appendChild(defs);const byId={};let baseW=1300,baseH=900;for(const n of S.flow.nodes){byId[n.id]=n;baseW=Math.max(baseW,(Number(n.x)||0)+230);baseH=Math.max(baseH,(Number(n.y)||0)+190)}const viewW=Math.max(320,Math.floor(baseW*z));const viewH=Math.max(220,Math.floor(baseH*z));canvas.style.minWidth=`${viewW}px`;canvas.style.minHeight=`${viewH}px`;svg.style.minWidth=`${viewW}px`;svg.style.minHeight=`${viewH}px`;svg.setAttribute('width',String(viewW));svg.setAttribute('height',String(viewH));const returnMap={};for(const e of (S.flow.edges||[])){const a=byId[e.from],b=byId[e.to];if(!a||!b)continue;let fs=edgeFromSide(e);let ts=edgeToSide(e);if(!fs||!ts){const autoSides=inferEdgeSides(a,b);if(!fs)fs=autoSides.from;if(!ts)ts=autoSides.to}const pa=nodePortPoint(a,fs);const pb=nodePortPoint(b,ts);const ca={x:pa.x*z,y:pa.y*z};const cb={x:pb.x*z,y:pb.y*z};const bi=edgeBidirectional(e);const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',String(ca.x));line.setAttribute('y1',String(ca.y));line.setAttribute('x2',String(cb.x));line.setAttribute('y2',String(cb.y));line.setAttribute('stroke','#7f95b8');line.setAttribute('stroke-width','1.8');if(bi)line.setAttribute('marker-start','url(#arrow)');line.setAttribute('marker-end','url(#arrow)');svg.appendChild(line);const lbl=document.createElementNS('http://www.w3.org/2000/svg','text');lbl.setAttribute('x',String((ca.x+cb.x)/2));lbl.setAttribute('y',String((ca.y+cb.y)/2-7));lbl.setAttribute('text-anchor','middle');lbl.setAttribute('class','flow-edge-label');lbl.textContent=edgePathLabel(e);svg.appendChild(lbl);if(bi){const n=edgeReturnN(e);const f=String(e.from||'').trim();const t=String(e.to||'').trim();if(f)returnMap[f]=Math.max(Number(returnMap[f]||0),n);if(t)returnMap[t]=Math.max(Number(returnMap[t]||0),n)}}if(S.linkDrag&&byId[S.linkDrag.fromId]){const src=nodePortPoint(byId[S.linkDrag.fromId],S.linkDrag.fromSide);const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',String(src.x*z));line.setAttribute('y1',String(src.y*z));line.setAttribute('x2',String(Number(S.linkDrag.toX)||src.x*z));line.setAttribute('y2',String(Number(S.linkDrag.toY)||src.y*z));line.setAttribute('class','flow-link-preview');svg.appendChild(line)}for(const n of S.flow.nodes){const d=document.createElement('div');d.className='flow-node'+(n.id===S.selectedNodeId?' active':'');d.style.left=((Number(n.x)||0)*z)+'px';d.style.top=((Number(n.y)||0)*z)+'px';d.style.transform=`scale(${z})`;d.style.transformOrigin='top left';d.innerHTML=`<div class=\"k\">${esc(n.type||'node')}</div><div class=\"t\">${esc(n.title||n.id)}</div><div class=\"c\">${esc(n.content||'')}</div>`;d.onmousedown=(ev)=>{ev.preventDefault();S.linkDrag=null;S.selectedNodeId=n.id;const zz=getFlowZoom();S.drag={id:n.id,dx:ev.clientX-((Number(n.x)||0)*zz),dy:ev.clientY-((Number(n.y)||0)*zz)};renderFlow();renderNodeEditor()};d.onclick=()=>{S.selectedNodeId=n.id;renderFlow();renderNodeEditor()};for(const side of FLOW_SIDES){const p=document.createElement('div');p.className='flow-port side-'+side+((S.linkDrag&&S.linkDrag.fromId===n.id&&S.linkDrag.fromSide===side)?' active':'');p.setAttribute('data-node-id',String(n.id));p.setAttribute('data-side',side);p.onmousedown=(ev)=>beginLinkDrag(n.id,side,ev);d.appendChild(p)}const backN=Number(returnMap[String(n.id)]||0);if(backN>0){const badge=document.createElement('div');badge.className='flow-return-badge';badge.textContent='n='+String(backN);d.appendChild(badge)}canvas.appendChild(d)}renderEdgeSelects();scheduleFlowWrapAdjust();updateFlowZoomUI()}
-let flowWrapRaf=0;
+let flowWrapRaf=0;let flowWrapDebounce=0;
 function adjustFlowWrapHeight(){const wrap=E('flowWrap');const panel=document.querySelector('.skills-panel-center');const stage=wrap&&wrap.closest?wrap.closest('.flow-stage'):null;if(!wrap||!panel||!stage)return;const mobile=(window.matchMedia&&window.matchMedia('(max-width:1180px)').matches);if(mobile){stage.style.height='320px';stage.style.minHeight='320px';wrap.style.height='100%';return}const kids=Array.from(panel.children||[]);let used=0;for(const el of kids){if(el===stage||el===wrap)continue;const st=getComputedStyle(el);used+=el.offsetHeight+(parseFloat(st.marginTop)||0)+(parseFloat(st.marginBottom)||0)}const ps=getComputedStyle(panel);const gap=(parseFloat(ps.rowGap||ps.gap)||0);if(kids.length>1)used+=gap*(kids.length-1);const vh=Math.max(760,window.innerHeight||900);const maxPx=Math.floor(vh*0.58);let available=Math.floor(panel.clientHeight-used);if(!Number.isFinite(available))available=360;available=Math.max(280,Math.min(maxPx,available));stage.style.height=`${available}px`;stage.style.minHeight='260px';wrap.style.height='100%'}
-function scheduleFlowWrapAdjust(){if(flowWrapRaf)cancelAnimationFrame(flowWrapRaf);flowWrapRaf=requestAnimationFrame(()=>{flowWrapRaf=0;adjustFlowWrapHeight()})}
+function scheduleFlowWrapAdjust(){if(flowWrapRaf)cancelAnimationFrame(flowWrapRaf);if(flowWrapDebounce)clearTimeout(flowWrapDebounce);flowWrapDebounce=setTimeout(()=>{flowWrapDebounce=0;flowWrapRaf=requestAnimationFrame(()=>{flowWrapRaf=0;adjustFlowWrapHeight()})},60)}
 function switchFlowPanel(mode){const m=(String(mode||'').toLowerCase()==='link')?'link':'node';const nodeBtn=E('flowTabNodeBtn');const linkBtn=E('flowTabLinkBtn');const nodePanel=E('flowPanelNode');const linkPanel=E('flowPanelLink');if(nodeBtn)nodeBtn.classList.toggle('active',m==='node');if(linkBtn)linkBtn.classList.toggle('active',m==='link');if(nodePanel)nodePanel.classList.toggle('active',m==='node');if(linkPanel)linkPanel.classList.toggle('active',m==='link');scheduleFlowWrapAdjust()}
 function renderEdgeSelects(){const ids=S.flow.nodes.map(n=>n.id);const render=id=>{const el=E(id);if(!el)return;const cur=el.value;el.innerHTML=ids.map(x=>`<option value=\"${esc(x)}\">${esc(x)}</option>`).join('');if(cur&&ids.includes(cur))el.value=cur};render('edgeFrom');render('edgeTo')}
 function renderNodeEditor(){const n=S.flow.nodes.find(x=>x.id===S.selectedNodeId)||null;if(!n)return;E('nodeTitle').value=n.title||'';E('nodeType').value=n.type||'process';E('nodeContent').value=n.content||''}
@@ -24320,6 +25428,7 @@ class AppContext:
         arbiter_max_tokens: int = ARBITER_DEFAULT_MAX_TOKENS,
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
+        max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         max_user: int = 0,
         max_user_sessions: int = 0,
     ):
@@ -24364,6 +25473,7 @@ class AppContext:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
         self.skills_root = skills_root
         ensure_runtime_skills(self.skills_root)
         self.skills_store = SkillStore(self.skills_root)
@@ -24832,6 +25942,7 @@ class AppContext:
                 self.arbiter_max_tokens,
                 self.arbiter_temperature,
                 self.execution_mode,
+                self.max_output_tokens,
                 run_finished_callback=self._on_session_run_finished,
             )
             self._session_mgrs[user_id] = mgr
@@ -24913,6 +26024,9 @@ class AppContext:
         active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
         self._sync_global_ollama_defaults(active)
         self.thinking = False
+        cfg_max_output_tokens = cfg.get("max_output_tokens")
+        if cfg_max_output_tokens is not None:
+            self.max_output_tokens = max(256, int(cfg_max_output_tokens))
 
         def normalized_profiles() -> tuple[dict[str, dict], str]:
             rows: dict[str, dict] = {}
@@ -26007,6 +27121,33 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             return self._send_bytes(sess.export_bundle(), "application/zip", f"{sess.id}_session_export.zip")
+        m = re.match(r"^/api/sessions/([^/]+)/export\.md$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            md = sess.export_conversation_md()
+            return self._send_bytes(md.encode("utf-8"), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
+        m = re.match(r"^/api/sessions/([^/]+)/export\.pdf$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                pdf = sess.export_conversation_pdf()
+                return self._send_bytes(pdf, "application/pdf", f"{sess.id}_conversation.pdf")
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+        m = re.match(r"^/api/sessions/([^/]+)/export\.png$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                img = sess.export_conversation_image()
+                return self._send_bytes(img, "image/png", f"{sess.id}_conversation.png")
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -26641,6 +27782,12 @@ def main():
         help="Agent execution mode (single|sequential|sync). Empty means read from startup config, then fallback to sync.",
     )
     parser.add_argument(
+        "--max-output-tokens",
+        default=AGENT_MAX_OUTPUT_TOKENS,
+        type=int,
+        help=f"Max output tokens per agent turn (default: {AGENT_MAX_OUTPUT_TOKENS}). Also configurable via config file key 'max_output_tokens'.",
+    )
+    parser.add_argument(
         "--max_user",
         default=None,
         type=int,
@@ -26858,6 +28005,7 @@ def main():
             or ""
         ).strip()
     resolved_execution_mode = normalize_execution_mode(raw_execution_mode, default=EXECUTION_MODE_SYNC)
+    resolved_max_output_tokens = max(256, int(getattr(args, "max_output_tokens", AGENT_MAX_OUTPUT_TOKENS) or AGENT_MAX_OUTPUT_TOKENS))
     if raw_execution_mode:
         normalized_raw = str(raw_execution_mode).strip().lower()
         if normalized_raw != resolved_execution_mode:
@@ -26904,6 +28052,7 @@ def main():
         resolved_arbiter_max_tokens,
         resolved_arbiter_temperature,
         resolved_execution_mode,
+        resolved_max_output_tokens,
         resolved_max_user,
         resolved_max_user_sessions,
     )
