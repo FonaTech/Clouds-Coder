@@ -1402,7 +1402,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
         return idx
 
     catalog_id = add_obj("<< /Type /Catalog /Pages 2 0 R >>")
-    pages_id = add_obj("PAGES_PLACEHOLDER")
+    add_obj("PAGES_PLACEHOLDER")  # obj 2: placeholder, replaced after page generation
     font_id = add_obj("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")
 
     page_ids: list[int] = []
