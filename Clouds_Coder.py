@@ -36,12 +36,78 @@ from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+MAIX_DEVICE_APPS_ROOT = Path("/maixapp/apps")
+
+
+def _path_is_within_root(target: Path, root: Path) -> bool:
+    try:
+        left = Path(target).expanduser().resolve()
+        right = Path(root).expanduser().resolve()
+    except Exception:
+        return False
+    try:
+        return left == right or left.is_relative_to(right)
+    except Exception:
+        return False
+
+
+def _default_codes_root(workdir: Path) -> Path:
+    base = Path(workdir).expanduser().resolve()
+    if _path_is_within_root(base, MAIX_DEVICE_APPS_ROOT):
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(base.name or "workspace")).strip("._") or "workspace"
+        return (MAIX_DEVICE_APPS_ROOT / ".clouds_coder_sessions" / safe_name).resolve()
+    return (base / "Codes").resolve()
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw not in {"0", "false", "no", "off", "disable", "disabled"}
+
+
+def _runtime_direct_workspace_enabled(workdir: Path | None = None) -> bool:
+    if "AGENT_SESSION_DIRECT_WORKSPACE" in os.environ:
+        return _env_truthy("AGENT_SESSION_DIRECT_WORKSPACE", False)
+    if workdir is None:
+        workdir = WORKDIR
+    return _path_is_within_root(Path(workdir).expanduser().resolve(), MAIX_DEVICE_APPS_ROOT)
+
+
+def _runtime_allowed_absolute_roots(base_roots: list[Path] | None = None) -> list[Path]:
+    roots = list(base_roots or [])
+    roots.append(MAIX_DEVICE_APPS_ROOT)
+    raw = str(os.getenv("AGENT_ALLOWED_ABSOLUTE_ROOTS", "") or "").strip()
+    if raw:
+        for token in re.split(r"[,\n" + re.escape(os.pathsep) + r"]+", raw):
+            item = str(token or "").strip()
+            if not item:
+                continue
+            try:
+                roots.append(Path(item).expanduser().resolve())
+            except Exception:
+                continue
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = Path(root).expanduser().resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
 WORKDIR = Path(os.getenv("AGENT_WORKDIR", os.getcwd())).resolve()
 SCRIPT_DIR = Path(__file__).resolve().parent
-CODES_ROOT = WORKDIR / "Codes"
+CODES_ROOT = _default_codes_root(WORKDIR)
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 MAX_TOOL_OUTPUT = 50_000
 TOKEN_THRESHOLD = 100_000
@@ -373,6 +439,143 @@ UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 DEFAULT_UI_LANGUAGE = "zh-CN"
 DEFAULT_WEB_UI_DIR = "./web_UI"
 DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
+MAIX_MANAGED_APP_ID = "clouds_coder"
+MAIX_MANAGED_APP_NAME = "Clouds Coder"
+MAIX_MANAGED_APP_AUTHOR = "Branch Coder"
+MAIX_MANAGED_APP_DESC = "Touch control panel and local coding service for MaixCAM Pro / MaixCAM 2."
+MAIX_MANAGED_MAIN_MARKER = "# Managed by Clouds Coder MaixPy launcher"
+MAIX_MANAGED_APP_YAML_MARKER = "# Managed by Clouds Coder app packaging"
+MAIX_MANAGED_PERMISSION_SCRIPT = "maixcam_permission_passthrough.py"
+MAIX_APP_CONFIG_ITEM = "clouds_coder"
+MAIX_MANAGED_LINKED_DIRS = {
+    "js_lib": "./js_lib",
+    "skills": "./skills",
+}
+MAIX_DEVICE_PANEL_CONFIG_DEFAULTS = {
+    "language": "en",
+    "service_port": 8080,
+    "service_timeout_min": 30,
+    "font_scale": 18,
+    "auto_start": False,
+    "enable_skills_ui": False,
+    "target_mode": "self",
+    "target_app_id": "",
+}
+MAIX_DEVICE_PACKAGE_EXCLUDES = (
+    ".git",
+    ".gitignore",
+    ".DS_Store",
+    "__pycache__",
+    "dist",
+    "Codes",
+    "*.pyc",
+)
+MAIX_DEVICE_SERVICE_STATE_FILE = "clouds_coder_service.json"
+MAIX_DEVICE_SERVICE_LOG_FILE = "clouds_coder_service.log"
+MAIX_DEVICE_BOOT_LOG_FILE = "clouds_coder_device_boot.log"
+MAIX_DEVICE_FONT_CANDIDATES = [
+    ("sourcehansans_cn", "/maixapp/share/font/SourceHanSansCN-Regular.otf", 18),
+    ("sourcehansans", "/maixapp/share/font/SourceHanSansCN-Regular.otf", 18),
+]
+MAIX_DEVICE_TOUCH_TAP_SLOP = 10
+MAIX_DEVICE_TOUCH_GESTURE_THRESHOLD = 18
+MAIX_DEVICE_TOUCH_GESTURE_AXIS_MARGIN = 10
+MAIX_DEVICE_UI_LANGUAGE_FALLBACKS = {
+    "zh-TW": "zh-CN",
+    "ja": "en",
+}
+MAIX_DEVICE_UI_TEXT = {
+    "zh-CN": {
+        "title": "Clouds Coder",
+        "subtitle": "MaixCAM Pro / MaixCAM 2 本地服务",
+        "tab_service": "服务",
+        "tab_settings": "设置",
+        "tab_apps": "APP",
+        "running": "运行中",
+        "starting": "启动中",
+        "stopped": "已停止",
+        "start": "启动服务",
+        "stop": "停止服务",
+        "restart": "重启服务",
+        "package": "打包目标APP",
+        "backup": "备份目标APP",
+        "use_self": "使用当前APP",
+        "use_selected": "使用选中APP",
+        "launch_selected": "启动选中APP",
+        "prev": "上一个",
+        "next": "下一个",
+        "refresh": "刷新",
+        "language": "语言",
+        "auto_start": "自动启动",
+        "skills_ui": "Skills UI",
+        "port": "端口",
+        "timeout": "超时(分钟)",
+        "font_scale": "字体缩放",
+        "workspace": "工作区",
+        "device_ip": "设备IP",
+        "active_port": "激活端口",
+        "browser_url": "访问地址",
+        "parallel_tasks": "并行任务",
+        "selected_app": "当前目标",
+        "self_target": "当前APP",
+        "no_apps": "没有可选APP",
+        "package_ok": "打包完成",
+        "backup_ok": "备份完成",
+        "restart_hint": "设置已保存，重启服务后生效",
+        "service_started": "服务已启动",
+        "service_stopped": "服务已停止",
+        "service_restarted": "服务已重启",
+        "service_failed": "服务启动失败",
+        "package_failed": "打包失败",
+        "backup_failed": "备份失败",
+        "touch_exit": "点击左上角 Clouds Coder 退出",
+    },
+    "en": {
+        "title": "Clouds Coder",
+        "subtitle": "MaixCAM Pro / MaixCAM 2 local service",
+        "tab_service": "Service",
+        "tab_settings": "Settings",
+        "tab_apps": "Apps",
+        "running": "Running",
+        "starting": "Starting",
+        "stopped": "Stopped",
+        "start": "Start Service",
+        "stop": "Stop Service",
+        "restart": "Restart",
+        "package": "Package Target",
+        "backup": "Backup Target",
+        "use_self": "Use Self",
+        "use_selected": "Use Selected",
+        "launch_selected": "Launch App",
+        "prev": "Prev",
+        "next": "Next",
+        "refresh": "Refresh",
+        "language": "Language",
+        "auto_start": "Auto Start",
+        "skills_ui": "Skills UI",
+        "port": "Port",
+        "timeout": "Timeout (min)",
+        "font_scale": "Font Scale",
+        "workspace": "Workspace",
+        "device_ip": "Device IP",
+        "active_port": "Active Port",
+        "browser_url": "Browser URL",
+        "parallel_tasks": "Parallel Tasks",
+        "selected_app": "Target",
+        "self_target": "Current App",
+        "no_apps": "No apps found",
+        "package_ok": "Package created",
+        "backup_ok": "Backup created",
+        "restart_hint": "Saved. Restart service to apply.",
+        "service_started": "Service started",
+        "service_stopped": "Service stopped",
+        "service_restarted": "Service restarted",
+        "service_failed": "Service start failed",
+        "package_failed": "Package failed",
+        "backup_failed": "Backup failed",
+        "touch_exit": "Tap Clouds Coder to exit",
+    },
+}
 WEB_UI_REQUIRED_FILES = (
     "index.html",
     "style.css",
@@ -7182,6 +7385,8 @@ class SessionState:
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
+        workspace_root: Path | None = None,
+        direct_workspace: bool = False,
         owner_user_id: str = "",
         run_finished_callback=None,
     ):
@@ -7189,7 +7394,9 @@ class SessionState:
         self.title = title
         self.root = root / session_id
         self.root.mkdir(parents=True, exist_ok=True)
-        self.files_root = self.root / "files"
+        requested_workspace = Path(workspace_root).expanduser().resolve() if workspace_root else None
+        self.direct_workspace = bool(direct_workspace and requested_workspace is not None)
+        self.files_root = requested_workspace if self.direct_workspace and requested_workspace else (self.root / "files")
         self.files_root.mkdir(parents=True, exist_ok=True)
         self.uploads_dir = self.root / "uploads"
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -8895,6 +9102,18 @@ class SessionState:
         uploads_ctx = self._uploads_prompt_block()
         html_hint = self._html_frontend_boost_instruction()
         research_hint = self._deep_research_boost_instruction()
+        workspace_hint = (
+            f"Workspace maps directly to live app root {self.files_root}. Relative paths modify the installed app. "
+            if bool(getattr(self, "direct_workspace", False))
+            else ""
+        )
+        maix_path_hint = "Absolute paths under /maixapp/apps are allowed when editing installed Maix apps. "
+        maix_hint = (
+            "If the task involves MaixCAM or MaixPy device development, "
+            "load_skill('maixcam-hardware-dev') for hardware/API usage, "
+            "load_skill('maixcam-local-app-dev') for app structure and packaging, "
+            "and load_skill('maixcam-permission-bridge') when target apps need offline skills/js_lib provisioning. "
+        )
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -8911,6 +9130,9 @@ class SessionState:
             "Use load_skill for guidance on specific topics "
             "(workspace-paths, task-management, tool-best-practices, context-management). "
             "If execution stalls, load_skill('execution-degradation-recovery'). "
+            f"{workspace_hint}"
+            f"{maix_path_hint}"
+            f"{maix_hint}"
             f"{html_block}"
             f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
@@ -9985,9 +10207,16 @@ class SessionState:
             return rel or "."
         candidate = Path(raw)
         if candidate.is_absolute():
-            raise ValueError(
-                "illegal absolute path. use relative path or '/workspace/<relative>' only"
-            )
+            try:
+                resolved = candidate.expanduser().resolve()
+            except Exception:
+                resolved = candidate.expanduser()
+            if not self._is_allowed_absolute_tool_path(str(resolved)):
+                raise ValueError(
+                    "illegal absolute path. use relative path, '/workspace/<relative>', "
+                    "or an allowed absolute path under /maixapp/apps"
+                )
+            return str(resolved)
         norm = candidate.as_posix().strip()
         if not norm:
             raise ValueError("path is required")
@@ -10002,13 +10231,18 @@ class SessionState:
         low = txt.lower()
         if low in {"/workspace", "/workspace/"} or low.startswith("/workspace/"):
             return ""
+        if self._is_allowed_absolute_tool_path(txt):
+            return ""
         return (
             "Error: illegal absolute path for agent tool call. "
-            "Use relative path or '/workspace/<relative>' only."
+            "Use relative path, '/workspace/<relative>', or an allowed absolute path under /maixapp/apps."
         )
 
     def _session_path(self, path_text: str) -> Path:
         normalized = self._normalize_tool_path_text(path_text)
+        candidate = Path(normalized)
+        if candidate.is_absolute():
+            return candidate.resolve()
         return safe_path(normalized, self.files_root)
 
     def _session_rel(self, path: Path) -> str:
@@ -12072,7 +12306,15 @@ class SessionState:
                 time.sleep(min(1.4, 0.35 * attempt))
         raise last_exc if last_exc is not None else OllamaError("chat failed")
 
-    def _is_allowed_absolute_write_path(self, raw_path: str) -> bool:
+    def _allowed_absolute_roots(self) -> list[Path]:
+        roots: list[Path] = [self.root.resolve(), self.files_root.resolve()]
+        try:
+            roots.append(self.skills.skills_root.resolve())
+        except Exception:
+            pass
+        return _runtime_allowed_absolute_roots(roots)
+
+    def _is_allowed_absolute_tool_path(self, raw_path: str) -> bool:
         txt = str(raw_path or "").strip().strip("'\"")
         if not txt.startswith("/"):
             return True
@@ -12083,18 +12325,13 @@ class SessionState:
             target = Path(txt).expanduser().resolve()
         except Exception:
             return False
-        roots: list[Path] = [self.root.resolve(), self.files_root.resolve()]
-        try:
-            roots.append(self.skills.skills_root.resolve())
-        except Exception:
-            pass
-        for root in roots:
-            try:
-                if target == root or target.is_relative_to(root):
-                    return True
-            except Exception:
-                continue
+        for root in self._allowed_absolute_roots():
+            if _path_is_within_root(target, root):
+                return True
         return False
+
+    def _is_allowed_absolute_write_path(self, raw_path: str) -> bool:
+        return self._is_allowed_absolute_tool_path(raw_path)
 
     def _shell_write_targets_outside_scope(self, command: str) -> list[str]:
         cmd = str(command or "")
@@ -12188,7 +12425,8 @@ class SessionState:
         return (
             "Error: write blocked for absolute path(s) outside session/skills scope: "
             f"{preview}{suffix}. "
-            "Use relative paths in session workspace, or use write_skill for skills."
+            "Use relative paths in workspace, write_skill for skills, "
+            "or an allowed absolute path under /maixapp/apps."
         )
 
     def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
@@ -17843,9 +18081,16 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
+        workspace_hint = (
+            f"Workspace maps directly to live app root {self.files_root}. Relative paths modify the installed app. "
+            if bool(getattr(self, "direct_workspace", False))
+            else ""
+        )
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: {self.files_root}. Use relative paths. "
+            f"{workspace_hint}"
+            "Absolute paths under /maixapp/apps are allowed when editing installed Maix apps. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             "Use load_skill for detailed guidance (multi-agent-guide, code-review-checklist, finish-protocol). "
@@ -21490,6 +21735,8 @@ class SessionManager:
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
+        workspace_root: Path | None = None,
+        direct_workspace: bool = False,
         run_finished_callback=None,
     ):
         self.root = root
@@ -21526,6 +21773,8 @@ class SessionManager:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.workspace_root = Path(workspace_root).expanduser().resolve() if workspace_root else None
+        self.direct_workspace = bool(direct_workspace and self.workspace_root is not None)
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -21862,6 +22111,8 @@ class SessionManager:
                 max_output_tokens=self.max_output_tokens,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
+                workspace_root=self.workspace_root,
+                direct_workspace=self.direct_workspace,
                 owner_user_id=self.user_id,
                 run_finished_callback=self.run_finished_callback,
             )
@@ -21903,6 +22154,8 @@ class SessionManager:
                 max_output_tokens=self.max_output_tokens,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
+                workspace_root=self.workspace_root,
+                direct_workspace=self.direct_workspace,
                 owner_user_id=self.user_id,
                 run_finished_callback=self.run_finished_callback,
             )
@@ -25436,6 +25689,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
+        self.direct_session_workspace = _runtime_direct_workspace_enabled(self.workspace)
         self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
@@ -25943,6 +26197,8 @@ class AppContext:
                 self.arbiter_temperature,
                 self.execution_mode,
                 self.max_output_tokens,
+                workspace_root=self.workspace if self.direct_session_workspace else None,
+                direct_workspace=self.direct_session_workspace,
                 run_finished_callback=self._on_session_run_finished,
             )
             self._session_mgrs[user_id] = mgr
@@ -26936,6 +27192,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_text(self.app.web_ui_agent_app_ts(), "text/plain; charset=utf-8")
         if path == "/api/health":
             return self._send_json({"ok": True, "version": APP_VERSION, "workspace": str(WORKDIR)})
+        if path == "/api/device/status":
+            scheduler_state = self.app.scheduler_status(self._user_id())
+            port = int(getattr(self.app, "agent_port", 0) or 0)
+            lan_ip = detect_local_lan_ip()
+            return self._send_json(
+                {
+                    "ok": True,
+                    "version": APP_VERSION,
+                    "workspace": str(self.app.workspace),
+                    "agent_port": port,
+                    "device_ip": lan_ip,
+                    "browser_url": f"http://{lan_ip}:{port}" if port > 0 else "",
+                    "scheduler": scheduler_state,
+                    "parallel_tasks": int(scheduler_state.get("running_total", 0) or 0),
+                    "queue_size": int(scheduler_state.get("queue_size", 0) or 0),
+                }
+            )
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
@@ -27512,78 +27785,1769 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-    def do_POST(self):
-        path = unquote(urlparse(self.path).path)
-        mgr = self._session_mgr()
-        if path == "/api/webui/export":
-            payload = self._read_json()
-            ui_dir_raw = str(payload.get("dir", "") or "").strip()
-            overwrite = bool(payload.get("overwrite", False))
-            ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
-            out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
-            return self._send_json(out, status=201 if out.get("ok") else 400)
-        if path == "/api/skillslab/model":
-            payload = self._read_json()
-            selection = str(payload.get("selection", payload.get("model", ""))).strip()
-            if not selection:
-                return self._send_json({"error": "selection required"}, status=400)
+
+def _maix_device_ui_language(raw: str | None) -> str:
+    return "en"
+
+
+def _maix_device_t(lang: str | None, key: str) -> str:
+    code = _maix_device_ui_language(lang)
+    table = MAIX_DEVICE_UI_TEXT.get(code, MAIX_DEVICE_UI_TEXT["en"])
+    return str(table.get(key, MAIX_DEVICE_UI_TEXT["en"].get(key, key)))
+
+
+def _maix_device_clamp_int(raw: object, default: int, lower: int, upper: int) -> int:
+    try:
+        value = int(float(raw))
+    except Exception:
+        value = int(default)
+    return max(lower, min(upper, value))
+
+
+def _maix_device_get_app_config_kv(maix_app_module, key: str, default: object):
+    if not maix_app_module or not hasattr(maix_app_module, "get_app_config_kv"):
+        return default
+    getter = getattr(maix_app_module, "get_app_config_kv")
+    for args in (
+        (MAIX_APP_CONFIG_ITEM, key, default),
+        (key, default),
+        (MAIX_APP_CONFIG_ITEM, key),
+    ):
+        try:
+            return getter(*args)
+        except TypeError:
+            continue
+        except Exception:
+            break
+    return default
+
+
+def _maix_device_set_app_config_kv(maix_app_module, key: str, value: object) -> bool:
+    if not maix_app_module or not hasattr(maix_app_module, "set_app_config_kv"):
+        return False
+    setter = getattr(maix_app_module, "set_app_config_kv")
+    for args in (
+        (MAIX_APP_CONFIG_ITEM, key, value),
+        (key, value),
+    ):
+        try:
+            setter(*args)
+            return True
+        except TypeError:
+            continue
+        except Exception:
+            return False
+    return False
+
+
+def _maix_device_get_sys_config_kv(maix_app_module, item: str, key: str, default: object):
+    if not maix_app_module or not hasattr(maix_app_module, "get_sys_config_kv"):
+        return default
+    getter = getattr(maix_app_module, "get_sys_config_kv")
+    for args in (
+        (item, key, default),
+        (item, key),
+        (key, default),
+    ):
+        try:
+            return getter(*args)
+        except TypeError:
+            continue
+        except Exception:
+            break
+    return default
+
+
+def _maix_device_runtime_root(maix_app_module=None) -> Path:
+    base = None
+    if maix_app_module and hasattr(maix_app_module, "get_tmp_path"):
+        try:
+            base = Path(str(maix_app_module.get_tmp_path() or "")).expanduser().resolve()
+        except Exception:
+            base = None
+    if base is None:
+        base = (SCRIPT_DIR / ".maix_runtime").resolve()
+    root = base / MAIX_MANAGED_APP_ID
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _maix_device_service_state_path(maix_app_module=None) -> Path:
+    return _maix_device_runtime_root(maix_app_module) / MAIX_DEVICE_SERVICE_STATE_FILE
+
+
+def _maix_device_service_log_path(maix_app_module=None) -> Path:
+    return _maix_device_runtime_root(maix_app_module) / MAIX_DEVICE_SERVICE_LOG_FILE
+
+
+def _maix_device_boot_log_path(maix_app_module=None) -> Path:
+    return _maix_device_runtime_root(maix_app_module) / MAIX_DEVICE_BOOT_LOG_FILE
+
+
+def _maix_device_log_exception(stage: str, exc: Exception, maix_app_module=None) -> str:
+    detail = trim(str(exc), 240)
+    trace = traceback.format_exc()
+    payload = (
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] stage={stage}\n"
+        f"error={detail}\n"
+        f"{trace}\n"
+    )
+    try:
+        fp = _maix_device_boot_log_path(maix_app_module)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with open(fp, "a", encoding="utf-8") as f:
+            f.write(payload)
+    except Exception:
+        pass
+    print(f"[maix-device] {stage} failed: {detail}")
+    return detail
+
+
+def _maix_device_fallback_config_path() -> Path:
+    return (SCRIPT_DIR / ".clouds_coder.device.json").resolve()
+
+
+def _maix_device_normalize_config(payload: dict | None) -> dict:
+    data = dict(MAIX_DEVICE_PANEL_CONFIG_DEFAULTS)
+    if isinstance(payload, dict):
+        data.update(payload)
+    data["language"] = "en"
+    data["service_port"] = _maix_device_clamp_int(data.get("service_port"), 8080, 8000, 9000)
+    data["service_timeout_min"] = _maix_device_clamp_int(data.get("service_timeout_min"), 30, 10, 240)
+    data["font_scale"] = _maix_device_clamp_int(data.get("font_scale"), 18, 12, 28)
+    data["auto_start"] = bool(_to_bool_like(data.get("auto_start"), False))
+    data["enable_skills_ui"] = bool(_to_bool_like(data.get("enable_skills_ui"), False))
+    target_mode = str(data.get("target_mode", "self") or "self").strip().lower()
+    data["target_mode"] = "app" if target_mode == "app" else "self"
+    data["target_app_id"] = str(data.get("target_app_id", "") or "").strip()
+    return data
+
+
+def _maix_device_load_config(maix_app_module=None) -> dict:
+    payload: dict = {}
+    if maix_app_module and hasattr(maix_app_module, "get_app_config_kv"):
+        for key, default in MAIX_DEVICE_PANEL_CONFIG_DEFAULTS.items():
+            payload[key] = _maix_device_get_app_config_kv(maix_app_module, key, default)
+        payload["language"] = "en"
+    else:
+        fp = _maix_device_fallback_config_path()
+        if fp.exists():
             try:
-                return self._send_json(mgr.set_runtime_model(selection, None))
-            except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        if path == "/api/skillslab/language":
-            payload = self._read_json()
-            language = str(payload.get("language", payload.get("lang", ""))).strip()
-            if not language:
-                return self._send_json({"error": "language required"}, status=400)
-            try:
-                out = mgr.set_user_language(language)
-                out["supported_languages"] = supported_ui_languages_payload()
-                return self._send_json(out)
-            except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        if path == "/api/skillslab/generate":
-            payload = self._read_json()
-            try:
-                out = self.app.generate_skill_from_flow(self._user_id(), payload if isinstance(payload, dict) else {})
-                return self._send_json(out)
-            except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        if path == "/api/skillslab/save":
-            payload = self._read_json()
-            p = str(payload.get("path", "")).strip()
-            c = str(payload.get("content", ""))
-            overwrite = bool(payload.get("overwrite", False))
-            try:
-                out = self.app.write_skill_file(p, c, overwrite=overwrite)
-                return self._send_json(out)
-            except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        if path == "/api/skillslab/scan":
-            try:
-                return self._send_json(self.app.scan_skills())
-            except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        if path == "/api/skillslab/upload":
-            payload = self._read_json()
-            filename = str(payload.get("filename", "")).strip()
-            content_b64 = str(payload.get("content_b64", "")).strip()
-            mime = str(payload.get("mime", "")).strip()
-            overwrite = bool(payload.get("overwrite", False))
-            if not filename or not content_b64:
-                return self._send_json({"error": "filename and content_b64 required"}, status=400)
-            try:
-                raw = base64.b64decode(content_b64, validate=True)
+                payload = parse_json_object(fp.read_text(encoding="utf-8"), {})
             except Exception:
-                return self._send_json({"error": "invalid base64 payload"}, status=400)
-            if len(raw) > 30 * 1024 * 1024:
-                return self._send_json({"error": "max upload size is 30MB"}, status=413)
+                payload = {}
+    return _maix_device_normalize_config(payload)
+
+
+def _maix_device_save_config(config: dict, maix_app_module=None) -> dict:
+    normalized = _maix_device_normalize_config(config)
+    if maix_app_module and hasattr(maix_app_module, "set_app_config_kv"):
+        for key, value in normalized.items():
+            _maix_device_set_app_config_kv(maix_app_module, key, value)
+    else:
+        fp = _maix_device_fallback_config_path()
+        fp.write_text(json_dumps(normalized, indent=2), encoding="utf-8")
+    return normalized
+
+
+def _maix_device_launcher_content() -> str:
+    return (
+        "#!/usr/bin/env python3\n"
+        f"{MAIX_MANAGED_MAIN_MARKER}\n"
+        "from Clouds_Coder import run_maixcam_device_app\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    raise SystemExit(run_maixcam_device_app())\n"
+    )
+
+
+def _maix_device_manifest_payload() -> dict:
+    return {
+        "id": MAIX_MANAGED_APP_ID,
+        "name": MAIX_MANAGED_APP_NAME,
+        "version": APP_VERSION,
+        "author": MAIX_MANAGED_APP_AUTHOR,
+        "desc": MAIX_MANAGED_APP_DESC,
+        "icon": "",
+        "files": [
+            "main.py",
+            Path(__file__).name,
+            MAIX_MANAGED_PERMISSION_SCRIPT,
+            "js_lib",
+            "skills",
+        ],
+        "linked_paths": dict(MAIX_MANAGED_LINKED_DIRS),
+        "permission_passthrough": {
+            "mode": "copy",
+            "script": MAIX_MANAGED_PERMISSION_SCRIPT,
+        },
+        "exclude": list(MAIX_DEVICE_PACKAGE_EXCLUDES),
+    }
+
+
+def _render_simple_yaml_scalar(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "\"\""
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _render_simple_yaml(payload: dict) -> str:
+    lines = [MAIX_MANAGED_APP_YAML_MARKER]
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for sub_key, sub_value in value.items():
+                lines.append(f"  {sub_key}: {_render_simple_yaml_scalar(sub_value)}")
+            continue
+        if isinstance(value, (list, tuple)):
+            lines.append(f"{key}:")
+            for item in value:
+                lines.append(f"  - {_render_simple_yaml_scalar(item)}")
+            continue
+        lines.append(f"{key}: {_render_simple_yaml_scalar(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_simple_yaml_scalar(raw: str) -> object:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text in {"true", "True"}:
+        return True
+    if text in {"false", "False"}:
+        return False
+    if text in {"null", "Null", "none", "None"}:
+        return None
+    if text[:1] in {"\"", "'"}:
+        try:
+            return json.loads(text if text[:1] == "\"" else json.dumps(text[1:-1], ensure_ascii=False))
+        except Exception:
+            return text.strip("\"'")
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            return int(text)
+        except Exception:
+            return text
+    if re.fullmatch(r"-?\d+\.\d+", text):
+        try:
+            return float(text)
+        except Exception:
+            return text
+    return text
+
+
+def _parse_simple_yaml(text: str) -> dict:
+    payload: dict = {}
+    current_key = ""
+    for raw_line in str(text or "").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        stripped = raw_line.strip()
+        if indent == 0:
+            if ":" not in stripped:
+                continue
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            current_key = key
+            if value:
+                payload[key] = _parse_simple_yaml_scalar(value)
+            else:
+                payload[key] = []
+            continue
+        if not current_key:
+            continue
+        if stripped.startswith("- "):
+            if not isinstance(payload.get(current_key), list):
+                payload[current_key] = []
+            payload[current_key].append(_parse_simple_yaml_scalar(stripped[2:]))
+            continue
+        if ":" in stripped:
+            sub_key, sub_value = stripped.split(":", 1)
+            if not isinstance(payload.get(current_key), dict):
+                payload[current_key] = {}
+            payload[current_key][sub_key.strip()] = _parse_simple_yaml_scalar(sub_value.strip())
+    return payload
+
+
+def _ensure_clouds_coder_maix_app_files(project_dir: Path) -> dict:
+    root = Path(project_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    main_path = root / "main.py"
+    app_yaml_path = root / "app.yaml"
+    launcher = _maix_device_launcher_content()
+    manifest_text = _render_simple_yaml(_maix_device_manifest_payload())
+    current_main = try_read_text(main_path, max_bytes=200_000) or ""
+    current_yaml = try_read_text(app_yaml_path, max_bytes=200_000) or ""
+    if (not current_main) or (MAIX_MANAGED_MAIN_MARKER in current_main):
+        main_path.write_text(launcher, encoding="utf-8")
+    if (not current_yaml) or (MAIX_MANAGED_APP_YAML_MARKER in current_yaml):
+        app_yaml_path.write_text(manifest_text, encoding="utf-8")
+    return {
+        "main.py": str(main_path),
+        "app.yaml": str(app_yaml_path),
+    }
+
+
+def _load_maix_app_manifest(project_dir: Path) -> dict:
+    root = Path(project_dir).resolve()
+    if root == SCRIPT_DIR:
+        _ensure_clouds_coder_maix_app_files(root)
+    manifest_path = root / "app.yaml"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"{manifest_path} not found")
+    raw = manifest_path.read_text(encoding="utf-8")
+    payload = _parse_simple_yaml(raw)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"invalid manifest: {manifest_path}")
+    payload["_path"] = str(manifest_path)
+    return payload
+
+
+def _maix_device_manifest_linked_paths(project_dir: Path, manifest: dict | None = None) -> dict[str, Path]:
+    root = Path(project_dir).resolve()
+    data = dict(manifest or {})
+    linked: dict[str, Path] = {}
+    raw = data.get("linked_paths", {})
+    if isinstance(raw, dict):
+        for dest_name, src_raw in raw.items():
+            dest = str(dest_name or "").strip().replace("\\", "/").strip("/")
+            src_text = str(src_raw or "").strip()
+            if not dest or not src_text:
+                continue
+            src_path = Path(src_text).expanduser()
+            if not src_path.is_absolute():
+                src_path = (root / src_path).resolve()
+            else:
+                src_path = src_path.resolve()
+            linked[dest] = src_path
+    for dest, src_text in MAIX_MANAGED_LINKED_DIRS.items():
+        local_src_raw = Path(str(src_text or "")).expanduser()
+        local_src = (root / local_src_raw).resolve() if not local_src_raw.is_absolute() else local_src_raw.resolve()
+        if local_src.exists() and dest not in linked:
+            linked[dest] = local_src
+    return linked
+
+
+def _maix_device_collect_external_entries(
+    source_path: Path,
+    archive_root: PurePosixPath,
+    exclude_patterns: list[str],
+) -> list[tuple[Path, PurePosixPath]]:
+    src = Path(source_path).resolve()
+    out: list[tuple[Path, PurePosixPath]] = []
+    if not src.exists():
+        return out
+    if src.is_file():
+        rel = PurePosixPath(src.name)
+        if not _maix_device_match_exclude(rel, exclude_patterns):
+            out.append((src, archive_root))
+        return out
+    if not src.is_dir():
+        return out
+    for fp in sorted(src.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = PurePosixPath(fp.relative_to(src).as_posix())
+        if _maix_device_match_exclude(rel, exclude_patterns):
+            continue
+        out.append((fp, archive_root / rel))
+    return out
+
+
+def provision_maix_offline_assets(
+    target_dir: Path | str,
+    *,
+    manifest: dict | None = None,
+    source_project_dir: Path | str | None = None,
+    overwrite: bool = False,
+    mode: str = "copy",
+) -> dict:
+    target = Path(target_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    src_project = Path(source_project_dir).resolve() if source_project_dir else SCRIPT_DIR
+    link_map = _maix_device_manifest_linked_paths(src_project, manifest)
+    out = {
+        "ok": True,
+        "target_dir": str(target),
+        "mode": str(mode or "copy"),
+        "linked_paths": {k: str(v) for k, v in link_map.items()},
+        "provisioned": [],
+        "skipped": [],
+        "missing": [],
+        "errors": [],
+    }
+    use_symlink = str(mode or "").strip().lower() in {"symlink", "symlink_or_copy", "link"}
+    for rel_name, src in link_map.items():
+        src_path = Path(src).resolve()
+        if not src_path.exists():
+            out["missing"].append({"name": rel_name, "source": str(src_path)})
+            continue
+        dest = target / rel_name
+        try:
             try:
-                out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
-                return self._send_json(out)
+                if dest.exists() and dest.resolve() == src_path:
+                    out["skipped"].append({"name": rel_name, "target": str(dest), "reason": "same_path"})
+                    continue
+            except Exception:
+                pass
+            if not dest.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if use_symlink:
+                    try:
+                        dest.symlink_to(src_path, target_is_directory=src_path.is_dir())
+                        out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "symlink"})
+                        continue
+                    except Exception:
+                        pass
+                if src_path.is_dir():
+                    shutil.copytree(src_path, dest, dirs_exist_ok=bool(overwrite))
+                    out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "copytree"})
+                else:
+                    shutil.copy2(src_path, dest)
+                    out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "copy"})
+                continue
+            if dest.is_symlink():
+                try:
+                    if dest.resolve() == src_path:
+                        out["skipped"].append({"name": rel_name, "target": str(dest), "reason": "already_linked"})
+                        continue
+                except Exception:
+                    pass
+                if overwrite:
+                    dest.unlink()
+                    if use_symlink:
+                        dest.symlink_to(src_path, target_is_directory=src_path.is_dir())
+                        out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "symlink_replaced"})
+                        continue
+                out["skipped"].append({"name": rel_name, "target": str(dest), "reason": "existing_symlink"})
+                continue
+            if src_path.is_dir() and dest.is_dir():
+                copied = 0
+                for fp in sorted(src_path.rglob("*")):
+                    if not fp.is_file():
+                        continue
+                    rel = fp.relative_to(src_path)
+                    dst = dest / rel
+                    if dst.exists() and not overwrite:
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(fp, dst)
+                    copied += 1
+                out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "merge_copy", "files": copied})
+                continue
+            if src_path.is_file() and dest.is_file():
+                if overwrite:
+                    shutil.copy2(src_path, dest)
+                    out["provisioned"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "method": "overwrite_copy"})
+                else:
+                    out["skipped"].append({"name": rel_name, "target": str(dest), "reason": "existing_file"})
+                continue
+            out["skipped"].append({"name": rel_name, "target": str(dest), "reason": "existing_path"})
+        except Exception as exc:
+            out["ok"] = False
+            out["errors"].append({"name": rel_name, "source": str(src_path), "target": str(dest), "error": trim(str(exc), 220)})
+    return out
+
+
+def _maix_device_match_exclude(rel_path: PurePosixPath, patterns: list[str]) -> bool:
+    value = rel_path.as_posix()
+    for raw in patterns:
+        pat = str(raw or "").strip().replace("\\", "/")
+        if not pat:
+            continue
+        if value == pat:
+            return True
+        if rel_path.match(pat):
+            return True
+        if pat.endswith("/") and value.startswith(pat.rstrip("/") + "/"):
+            return True
+        if any(part == pat for part in rel_path.parts):
+            return True
+    return False
+
+
+def _maix_device_collect_path_entries(
+    project_dir: Path,
+    source_path: Path,
+    archive_root: PurePosixPath,
+    exclude_patterns: list[str],
+) -> list[tuple[Path, PurePosixPath]]:
+    root = Path(project_dir).resolve()
+    src = Path(source_path).resolve()
+    out: list[tuple[Path, PurePosixPath]] = []
+    try:
+        src.relative_to(root)
+    except Exception:
+        return out
+    if src.is_file():
+        rel = PurePosixPath(src.relative_to(root).as_posix())
+        if not _maix_device_match_exclude(rel, exclude_patterns):
+            out.append((src, archive_root))
+        return out
+    if not src.is_dir():
+        return out
+    for fp in sorted(src.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = PurePosixPath(fp.relative_to(root).as_posix())
+        if _maix_device_match_exclude(rel, exclude_patterns):
+            continue
+        nested = PurePosixPath(fp.relative_to(src).as_posix())
+        out.append((fp, archive_root / nested))
+    return out
+
+
+def _maix_device_collect_package_entries(project_dir: Path, manifest: dict) -> list[tuple[Path, PurePosixPath]]:
+    root = Path(project_dir).resolve()
+    exclude_patterns = list(MAIX_DEVICE_PACKAGE_EXCLUDES)
+    manifest_excludes = manifest.get("exclude", [])
+    if isinstance(manifest_excludes, list):
+        exclude_patterns.extend(str(x or "").strip() for x in manifest_excludes)
+    entries: list[tuple[Path, PurePosixPath]] = []
+    files_spec = manifest.get("files", [])
+    if isinstance(files_spec, dict):
+        iterable = files_spec.items()
+    elif isinstance(files_spec, list):
+        iterable = [(item, item) for item in files_spec]
+    else:
+        iterable = []
+    if iterable:
+        for src_raw, dst_raw in iterable:
+            src_rel = str(src_raw or "").strip()
+            dst_rel = str(dst_raw or src_raw or "").strip()
+            if not src_rel or not dst_rel:
+                continue
+            src = (root / src_rel).resolve()
+            archive_root = PurePosixPath(dst_rel.replace("\\", "/"))
+            entries.extend(_maix_device_collect_path_entries(root, src, archive_root, exclude_patterns))
+    else:
+        for fp in sorted(root.rglob("*")):
+            if not fp.is_file():
+                continue
+            rel = PurePosixPath(fp.relative_to(root).as_posix())
+            if _maix_device_match_exclude(rel, exclude_patterns):
+                continue
+            entries.append((fp, rel))
+    linked_paths = _maix_device_manifest_linked_paths(root, manifest)
+    for rel_name, src in linked_paths.items():
+        archive_root = PurePosixPath(str(rel_name).replace("\\", "/").strip("/") or Path(str(src)).name)
+        entries.extend(_maix_device_collect_external_entries(Path(src), archive_root, exclude_patterns))
+    manifest_path = root / "app.yaml"
+    if manifest_path.exists():
+        manifest_entry = (manifest_path, PurePosixPath("app.yaml"))
+        if not any(dst == manifest_entry[1] for _, dst in entries):
+            entries.append(manifest_entry)
+    unique: dict[str, Path] = {}
+    for src, dst in entries:
+        unique[dst.as_posix()] = src
+    return [(src, PurePosixPath(dst)) for dst, src in sorted(unique.items())]
+
+
+def package_maix_app_project(project_dir: Path | str, output_dir: Path | str | None = None) -> dict:
+    root = Path(project_dir).resolve()
+    if root == SCRIPT_DIR:
+        _ensure_clouds_coder_maix_app_files(root)
+    manifest = _load_maix_app_manifest(root)
+    linked_paths = _maix_device_manifest_linked_paths(root, manifest)
+    entries = _maix_device_collect_package_entries(root, manifest)
+    if not entries:
+        raise ValueError(f"no files collected for {root}")
+    app_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(manifest.get("id", root.name) or root.name)).strip("._") or root.name
+    version = str(manifest.get("version", APP_VERSION) or APP_VERSION).strip() or APP_VERSION
+    dist_dir = Path(output_dir).resolve() if output_dir else (root / "dist").resolve()
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    out_path = dist_dir / f"{app_id}_v{version}.zip"
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for src, dst in entries:
+            zf.write(src, dst.as_posix())
+    return {
+        "ok": True,
+        "project_dir": str(root),
+        "package_path": str(out_path),
+        "app_id": app_id,
+        "version": version,
+        "file_count": len(entries),
+        "linked_paths": {k: str(v) for k, v in linked_paths.items()},
+    }
+
+
+def backup_maix_app_project(project_dir: Path | str, output_dir: Path | str | None = None) -> dict:
+    root = Path(project_dir).resolve()
+    manifest = {}
+    try:
+        manifest = _load_maix_app_manifest(root)
+    except Exception:
+        manifest = {"id": root.name, "version": APP_VERSION}
+    entries = _maix_device_collect_package_entries(root, manifest)
+    if not entries:
+        raise ValueError(f"no files collected for backup: {root}")
+    app_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(manifest.get("id", root.name) or root.name)).strip("._") or root.name
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = Path(output_dir).resolve() if output_dir else (_maix_device_runtime_root(None) / "backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    out_path = backup_dir / f"{app_id}_backup_{stamp}.zip"
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for src, dst in entries:
+            zf.write(src, dst.as_posix())
+    return {
+        "ok": True,
+        "project_dir": str(root),
+        "backup_path": str(out_path),
+        "file_count": len(entries),
+    }
+
+
+def _maix_device_load_service_state(maix_app_module=None) -> dict:
+    fp = _maix_device_service_state_path(maix_app_module)
+    if not fp.exists():
+        return {}
+    try:
+        return parse_json_object(fp.read_text(encoding="utf-8"), {})
+    except Exception:
+        return {}
+
+
+def _maix_device_save_service_state(payload: dict, maix_app_module=None) -> dict:
+    fp = _maix_device_service_state_path(maix_app_module)
+    fp.write_text(json_dumps(payload or {}, indent=2), encoding="utf-8")
+    return payload
+
+
+def _maix_device_clear_service_state(maix_app_module=None):
+    fp = _maix_device_service_state_path(maix_app_module)
+    if fp.exists():
+        fp.unlink()
+
+
+def _maix_device_pid_alive(pid: object) -> bool:
+    try:
+        pid_int = int(pid or 0)
+    except Exception:
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        os.kill(pid_int, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _maix_device_health_check(port: int, timeout: float = 0.8) -> bool:
+    url = f"http://127.0.0.1:{int(port)}/api/health"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=max(0.2, float(timeout))) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = parse_json_object(raw, {})
+        return bool(data.get("ok"))
+    except Exception:
+        return False
+
+
+def _maix_device_fetch_agent_status(port: int, timeout: float = 0.8) -> dict:
+    url = f"http://127.0.0.1:{int(port)}/api/device/status"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=max(0.2, float(timeout))) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = parse_json_object(raw, {})
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def _maix_device_service_status(maix_app_module=None) -> dict:
+    meta = _maix_device_load_service_state(maix_app_module)
+    if not meta:
+        lan_ip = detect_local_lan_ip()
+        return {
+            "running": False,
+            "healthy": False,
+            "status": "stopped",
+            "device_ip": lan_ip,
+            "active_port": 0,
+            "browser_url": "",
+            "parallel_tasks": 0,
+            "queue_size": 0,
+        }
+    pid = int(meta.get("pid", 0) or 0)
+    port = _maix_device_clamp_int(meta.get("port"), 8080, 1, 65535)
+    alive = _maix_device_pid_alive(pid)
+    healthy = alive and _maix_device_health_check(port, timeout=0.45)
+    snapshot = _maix_device_fetch_agent_status(port, timeout=0.65) if healthy else {}
+    scheduler_state = snapshot.get("scheduler", {}) if isinstance(snapshot.get("scheduler"), dict) else {}
+    lan_ip = str(snapshot.get("device_ip", "") or "").strip() or detect_local_lan_ip()
+    browser_url = str(snapshot.get("browser_url", "") or "").strip() or (f"http://{lan_ip}:{port}" if healthy else "")
+    status = "running" if healthy else ("starting" if alive else "stopped")
+    out = dict(meta)
+    out.update(
+        {
+            "running": bool(alive),
+            "healthy": bool(healthy),
+            "status": status,
+            "url": browser_url,
+            "browser_url": browser_url,
+            "device_ip": lan_ip,
+            "active_port": int(snapshot.get("agent_port", port) or port),
+            "parallel_tasks": int(snapshot.get("parallel_tasks", scheduler_state.get("running_total", 0)) or 0),
+            "queue_size": int(snapshot.get("queue_size", scheduler_state.get("queue_size", 0)) or 0),
+        }
+    )
+    return out
+
+
+def _maix_device_stop_service(maix_app_module=None) -> dict:
+    meta = _maix_device_load_service_state(maix_app_module)
+    pid = int(meta.get("pid", 0) or 0)
+    if pid > 0 and _maix_device_pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        deadline = time.time() + 4.0
+        while time.time() < deadline and _maix_device_pid_alive(pid):
+            time.sleep(0.12)
+        if _maix_device_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    _maix_device_clear_service_state(maix_app_module)
+    return {"ok": True, "status": "stopped"}
+
+
+def _maix_device_start_service(workspace_dir: Path | str, config: dict, maix_app_module=None) -> dict:
+    root = Path(workspace_dir).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"workspace not found: {root}")
+    try:
+        current_manifest = _load_maix_app_manifest(SCRIPT_DIR)
+    except Exception:
+        current_manifest = _maix_device_manifest_payload()
+    provision_maix_offline_assets(
+        root,
+        manifest=current_manifest,
+        source_project_dir=SCRIPT_DIR,
+        overwrite=False,
+        mode=str((current_manifest.get("permission_passthrough", {}) or {}).get("mode", "copy")),
+    )
+    service_log = _maix_device_service_log_path(maix_app_module)
+    timeout_seconds = _maix_device_clamp_int(config.get("service_timeout_min"), 30, 10, 240) * 60
+    port = _maix_device_clamp_int(config.get("service_port"), 8080, 8000, 9000)
+    cmd = [
+        sys.executable or "python3",
+        str(Path(__file__).resolve()),
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--lang",
+        str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE),
+        "--timeout",
+        str(timeout_seconds),
+    ]
+    if not bool(config.get("enable_skills_ui", False)):
+        cmd.append("--no_Skills_UI")
+    env = dict(os.environ)
+    env["AGENT_WORKDIR"] = str(root)
+    log_fp = open(service_log, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            env=env,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_fp.close()
+    meta = {
+        "pid": int(proc.pid),
+        "port": int(port),
+        "workspace": str(root),
+        "language": str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE),
+        "enable_skills_ui": bool(config.get("enable_skills_ui", False)),
+        "started_at": now_ts(),
+        "log_path": str(service_log),
+    }
+    _maix_device_save_service_state(meta, maix_app_module)
+    return _maix_device_service_status(maix_app_module)
+
+
+def _maix_device_extract_attr(obj: object, name: str, default: object = "") -> object:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _maix_device_list_apps(maix_app_module=None) -> list[dict]:
+    if not maix_app_module or not hasattr(maix_app_module, "get_apps_info"):
+        return []
+    rows = []
+    try:
+        try:
+            app_infos = maix_app_module.get_apps_info(False)
+        except TypeError:
+            app_infos = maix_app_module.get_apps_info()
+    except Exception:
+        app_infos = []
+    for item in app_infos or []:
+        app_id = str(_maix_device_extract_attr(item, "id", "") or "").strip()
+        if not app_id or app_id == MAIX_MANAGED_APP_ID:
+            continue
+        name = str(_maix_device_extract_attr(item, "name", app_id) or app_id).strip() or app_id
+        version = str(_maix_device_extract_attr(item, "version", "") or "").strip()
+        brief = str(_maix_device_extract_attr(item, "brief", "") or "").strip()
+        path = ""
+        if hasattr(maix_app_module, "get_app_path"):
+            try:
+                path = str(maix_app_module.get_app_path(app_id) or "").strip()
+            except Exception:
+                path = ""
+        rows.append(
+            {
+                "id": app_id,
+                "name": name,
+                "version": version,
+                "brief": brief,
+                "path": path,
+            }
+        )
+    rows.sort(key=lambda row: (str(row.get("name", "")).lower(), str(row.get("id", "")).lower()))
+    return rows
+
+
+def _maix_device_resolve_target(config: dict, apps: list[dict], lang: str | None = None) -> dict:
+    if str(config.get("target_mode", "self") or "self").strip().lower() == "app":
+        wanted = str(config.get("target_app_id", "") or "").strip()
+        for row in apps:
+            if str(row.get("id", "")) == wanted and str(row.get("path", "")).strip():
+                return {
+                    "mode": "app",
+                    "id": str(row.get("id", "")),
+                    "name": str(row.get("name", row.get("id", "")) or row.get("id", "")),
+                    "path": str(Path(str(row.get("path", "") or "")).resolve()),
+                    "version": str(row.get("version", "") or ""),
+                }
+    return {
+        "mode": "self",
+        "id": MAIX_MANAGED_APP_ID,
+        "name": _maix_device_t(lang, "self_target"),
+        "path": str(SCRIPT_DIR),
+        "version": APP_VERSION,
+    }
+
+def _skills_handler_do_POST(self):
+    path = unquote(urlparse(self.path).path)
+    mgr = self._session_mgr()
+    if path == "/api/webui/export":
+        payload = self._read_json()
+        ui_dir_raw = str(payload.get("dir", "") or "").strip()
+        overwrite = bool(payload.get("overwrite", False))
+        ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
+        out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
+        return self._send_json(out, status=201 if out.get("ok") else 400)
+    if path == "/api/skillslab/model":
+        payload = self._read_json()
+        selection = str(payload.get("selection", payload.get("model", ""))).strip()
+        if not selection:
+            return self._send_json({"error": "selection required"}, status=400)
+        try:
+            return self._send_json(mgr.set_runtime_model(selection, None))
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    if path == "/api/skillslab/language":
+        payload = self._read_json()
+        language = str(payload.get("language", payload.get("lang", ""))).strip()
+        if not language:
+            return self._send_json({"error": "language required"}, status=400)
+        try:
+            out = mgr.set_user_language(language)
+            out["supported_languages"] = supported_ui_languages_payload()
+            return self._send_json(out)
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    if path == "/api/skillslab/generate":
+        payload = self._read_json()
+        try:
+            out = self.app.generate_skill_from_flow(self._user_id(), payload if isinstance(payload, dict) else {})
+            return self._send_json(out)
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    if path == "/api/skillslab/save":
+        payload = self._read_json()
+        p = str(payload.get("path", "")).strip()
+        c = str(payload.get("content", ""))
+        overwrite = bool(payload.get("overwrite", False))
+        try:
+            out = self.app.write_skill_file(p, c, overwrite=overwrite)
+            return self._send_json(out)
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    if path == "/api/skillslab/scan":
+        try:
+            return self._send_json(self.app.scan_skills())
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    if path == "/api/skillslab/upload":
+        payload = self._read_json()
+        filename = str(payload.get("filename", "")).strip()
+        content_b64 = str(payload.get("content_b64", "")).strip()
+        mime = str(payload.get("mime", "")).strip()
+        overwrite = bool(payload.get("overwrite", False))
+        if not filename or not content_b64:
+            return self._send_json({"error": "filename and content_b64 required"}, status=400)
+        try:
+            raw = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            return self._send_json({"error": "invalid base64 payload"}, status=400)
+        if len(raw) > 30 * 1024 * 1024:
+            return self._send_json({"error": "max upload size is 30MB"}, status=413)
+        try:
+            out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+            return self._send_json(out)
+        except Exception as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+    return self._send_json({"error": "not found"}, status=404)
+
+
+SkillsHandler.do_POST = _skills_handler_do_POST
+
+
+def _maix_device_import_runtime() -> dict:
+    try:
+        from maix import app as maix_app
+        from maix import display as maix_display
+        from maix import image as maix_image
+        from maix import touchscreen as maix_touchscreen
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "app": maix_app,
+        "display": maix_display,
+        "image": maix_image,
+        "touchscreen": maix_touchscreen,
+    }
+
+
+def _maix_device_detect_name() -> str:
+    try:
+        raw = " ".join(str(part) for part in os.uname())
+    except Exception:
+        raw = ""
+    low = raw.lower().replace("_", "")
+    if "maixcam2" in low:
+        return "MaixCAM 2"
+    if "maixcampro" in low:
+        return "MaixCAM Pro"
+    if "maixcam" in low:
+        return "MaixCAM"
+    return "Maix Device"
+
+
+def _maix_device_scale_int(scale: float = 1.0) -> int:
+    try:
+        value = float(scale)
+    except Exception:
+        value = 1.0
+    return 2 if value >= 1.5 else 1
+
+
+def _maix_device_color(image_module, value, fallback=(255, 255, 255)):
+    base = value if value is not None else fallback
+    if not isinstance(base, (tuple, list)) or len(base) < 3:
+        base = fallback
+    rgb = (
+        max(0, min(255, int(base[0]))),
+        max(0, min(255, int(base[1]))),
+        max(0, min(255, int(base[2]))),
+    )
+    try:
+        color_cls = getattr(image_module, "Color", None)
+        if color_cls and hasattr(color_cls, "from_rgb"):
+            return color_cls.from_rgb(*rgb)
+    except Exception:
+        pass
+    return rgb
+
+
+def _maix_device_string_size(image_module, text: object, scale: float = 1.0) -> tuple[int, int]:
+    txt = str(text or "")
+    scale_int = _maix_device_scale_int(scale)
+    try:
+        size = image_module.string_size(txt, scale=scale_int)
+    except TypeError:
+        try:
+            size = image_module.string_size(txt)
+        except Exception:
+            size = None
+    except Exception:
+        size = None
+    if isinstance(size, (tuple, list)) and len(size) >= 2:
+        w = int(size[0])
+        h = int(size[1])
+        return max(1, w), max(1, h)
+    return max(1, int(max(1, len(txt)) * 8 * scale_int)), max(1, int(16 * scale_int))
+
+
+def _maix_device_clip_text(image_module, text: object, max_width: int, scale: float = 1.0) -> str:
+    txt = str(text or "")
+    if max_width <= 0 or not txt:
+        return ""
+    if _maix_device_string_size(image_module, txt, scale=scale)[0] <= max_width:
+        return txt
+    suffix = "..."
+    trimmed = txt
+    while trimmed:
+        candidate = trimmed + suffix
+        if _maix_device_string_size(image_module, candidate, scale=scale)[0] <= max_width:
+            return candidate
+        trimmed = trimmed[:-1]
+    return suffix
+
+
+def _maix_device_draw_text(
+    img,
+    image_module,
+    x: int,
+    y: int,
+    text: object,
+    color=(255, 255, 255),
+    scale: float = 1.0,
+    thickness: int = 1,
+):
+    txt = str(text or "")
+    color_obj = _maix_device_color(image_module, color)
+    scale_int = _maix_device_scale_int(scale)
+    thick = max(1, int(thickness or 1))
+    try:
+        img.draw_string(int(x), int(y), txt, color_obj, scale=scale_int, thickness=thick, wrap=False)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    try:
+        img.draw_string(int(x), int(y), txt, color_obj, scale=scale_int, thickness=thick)
+        return
+    except Exception:
+        pass
+    try:
+        img.draw_string(int(x), int(y), txt, color_obj, scale=scale_int)
+        return
+    except Exception:
+        pass
+    try:
+        img.draw_string(int(x), int(y), txt, color_obj)
+    except Exception:
+        pass
+
+
+def _maix_device_draw_box(img, x: int, y: int, w: int, h: int, fill, border=None, border_thickness: int = 2):
+    if w <= 0 or h <= 0:
+        return
+    try:
+        image_module = sys.modules.get("maix.image")
+    except Exception:
+        image_module = None
+    fill_color = _maix_device_color(image_module, fill, fallback=(0, 0, 0))
+    try:
+        img.draw_rect(int(x), int(y), int(w), int(h), fill_color, -1)
+    except TypeError:
+        try:
+            img.draw_rect(int(x), int(y), int(w), int(h), color=fill_color, thickness=-1)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if border is None:
+        return
+    border_color = _maix_device_color(image_module, border, fallback=(255, 255, 255))
+    try:
+        img.draw_rect(int(x), int(y), int(w), int(h), border_color, max(1, int(border_thickness)))
+    except TypeError:
+        try:
+            img.draw_rect(int(x), int(y), int(w), int(h), color=border_color, thickness=max(1, int(border_thickness)))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _maix_device_hotspot_contains(hotspot: dict, x: int, y: int) -> bool:
+    return (
+        int(hotspot.get("x", 0)) <= int(x) <= int(hotspot.get("x", 0)) + int(hotspot.get("w", 0))
+        and int(hotspot.get("y", 0)) <= int(y) <= int(hotspot.get("y", 0)) + int(hotspot.get("h", 0))
+    )
+
+
+def _maix_device_find_hotspot(hotspots: list[dict], x: int, y: int) -> dict | None:
+    for row in reversed(hotspots):
+        if _maix_device_hotspot_contains(row, x, y):
+            return row
+    return None
+
+
+def _maix_device_selected_index(state: dict, config: dict) -> int:
+    apps = state.get("apps", [])
+    if not apps:
+        return 0
+    wanted = str(config.get("target_app_id", "") or "").strip()
+    if wanted:
+        for idx, row in enumerate(apps):
+            if str(row.get("id", "")) == wanted:
+                return idx
+    return max(0, min(int(state.get("selected_index", 0) or 0), len(apps) - 1))
+
+
+def _maix_device_selected_app(state: dict, config: dict) -> dict | None:
+    apps = state.get("apps", [])
+    if not apps:
+        return None
+    idx = _maix_device_selected_index(state, config)
+    if idx < 0 or idx >= len(apps):
+        return None
+    return apps[idx]
+
+
+def _maix_device_cycle_language(current: str) -> str:
+    return "en"
+
+
+def _maix_device_set_notice(state: dict, text: str, error: bool = False):
+    state["notice"] = trim(str(text or ""), 180)
+    state["notice_error"] = bool(error)
+
+
+def _maix_device_apply_slider(config: dict, slider_id: str, ratio: float):
+    ratio = max(0.0, min(1.0, float(ratio)))
+    if slider_id == "service_port":
+        config["service_port"] = 8000 + int(round(99 * ratio))
+    elif slider_id == "service_timeout_min":
+        config["service_timeout_min"] = 10 + int(round(110 * ratio))
+    elif slider_id == "font_scale":
+        config["font_scale"] = 12 + int(round(16 * ratio))
+
+
+def _maix_device_settings_metrics(height: int, scale: float, scroll: int = 0) -> dict:
+    body_y = 132
+    footer_top = max(body_y + 140, int(height) - 52)
+    viewport_h = max(180, footer_top - body_y - 8)
+    content_h = max(viewport_h + 120, int(640 + max(0.0, float(scale) - 1.0) * 90))
+    scroll_limit = max(0, content_h - viewport_h)
+    scroll_value = max(0, min(int(scroll or 0), scroll_limit))
+    return {
+        "body_y": body_y,
+        "footer_top": footer_top,
+        "viewport_h": viewport_h,
+        "content_h": content_h,
+        "scroll_limit": scroll_limit,
+        "scroll": scroll_value,
+    }
+
+
+def _maix_device_clamp_settings_scroll(state: dict, height: int, scale: float) -> int:
+    metrics = _maix_device_settings_metrics(height, scale, int(state.get("settings_scroll", 0) or 0))
+    state["settings_scroll"] = int(metrics["scroll"])
+    return int(metrics["scroll"])
+
+
+def _maix_device_y_visible(y: int, h: int, top: int, bottom: int) -> bool:
+    return (y + h) >= int(top) and y <= int(bottom)
+
+
+def _maix_device_reset_touch_state(state: dict):
+    state["touch_down"] = False
+    state["active_button"] = ""
+    state["active_slider"] = ""
+    state["gesture_mode"] = ""
+    state["touch_start_x"] = 0
+    state["touch_start_y"] = 0
+    state["touch_last_x"] = 0
+    state["touch_last_y"] = 0
+    state["touch_start_scroll"] = int(state.get("settings_scroll", 0) or 0)
+    state["gesture_hot_id"] = ""
+    state["gesture_hot_kind"] = ""
+
+
+def _maix_device_draw_button(
+    hotspots: list[dict],
+    img,
+    image_module,
+    hot_id: str,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    label: str,
+    *,
+    fill,
+    border,
+    fg=(255, 255, 255),
+    scale: float = 1.0,
+):
+    _maix_device_draw_box(img, x, y, w, h, fill, border)
+    txt = _maix_device_clip_text(image_module, label, max(20, w - 16), scale=scale)
+    tw, th = _maix_device_string_size(image_module, txt, scale=scale)
+    _maix_device_draw_text(img, image_module, x + max(6, (w - tw) // 2), y + max(4, (h - th) // 2), txt, color=fg, scale=scale)
+    hotspots.append({"kind": "button", "id": hot_id, "x": x, "y": y, "w": w, "h": h})
+
+
+def _maix_device_draw_slider(
+    hotspots: list[dict],
+    img,
+    image_module,
+    hot_id: str,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    label: str,
+    value: int,
+    min_value: int,
+    max_value: int,
+    *,
+    accent,
+    fg=(235, 241, 255),
+    muted=(124, 142, 176),
+    scale: float = 1.0,
+):
+    _maix_device_draw_box(img, x, y, w, h, (29, 41, 61), (63, 84, 120))
+    value_text = str(int(value))
+    _maix_device_draw_text(img, image_module, x + 12, y + 10, label, color=fg, scale=scale)
+    value_w, _ = _maix_device_string_size(image_module, value_text, scale=scale)
+    _maix_device_draw_text(img, image_module, x + w - value_w - 12, y + 10, value_text, color=muted, scale=scale)
+    track_x = x + 16
+    track_y = y + h - 22
+    track_w = max(24, w - 32)
+    track_color = _maix_device_color(image_module, (63, 84, 120))
+    accent_color = _maix_device_color(image_module, accent)
+    try:
+        img.draw_rect(track_x, track_y, track_w, 8, track_color, -1)
+    except Exception:
+        pass
+    ratio = 0.0 if max_value <= min_value else (float(value) - float(min_value)) / float(max_value - min_value)
+    ratio = max(0.0, min(1.0, ratio))
+    knob_x = track_x + int(round(track_w * ratio))
+    try:
+        img.draw_rect(track_x, track_y, max(6, knob_x - track_x), 8, accent_color, -1)
+    except Exception:
+        pass
+    try:
+        img.draw_rect(max(track_x, knob_x - 4), track_y - 4, 8, 16, accent_color, -1)
+    except Exception:
+        pass
+    hotspots.append(
+        {
+            "kind": "slider",
+            "id": hot_id,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "track_x": track_x,
+            "track_w": track_w,
+        }
+    )
+
+
+def _maix_device_draw_header_tabs(
+    hotspots: list[dict],
+    img,
+    image_module,
+    state: dict,
+    config: dict,
+    colors: dict,
+    current_tab: str,
+    scale: float,
+):
+    width = int(state.get("screen_w", 640) or 640)
+    lang = str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE)
+    service = state.get("service_status", {}) if isinstance(state.get("service_status"), dict) else {}
+    title_text = _maix_device_t(lang, "title")
+    title_scale = 2.0
+    title_x = 18
+    title_y = 20
+    subtitle_y = 56
+    _maix_device_draw_box(img, 0, 0, width, 126, colors["bg"])
+    _maix_device_draw_text(img, image_module, title_x + 2, title_y + 2, title_text, color=(10, 14, 22), scale=title_scale, thickness=2)
+    _maix_device_draw_text(img, image_module, title_x, title_y, title_text, color=colors["text"], scale=title_scale, thickness=2)
+    title_w, title_h = _maix_device_string_size(image_module, title_text, scale=title_scale)
+    hotspots.append({"kind": "button", "id": "exit_app", "x": 8, "y": 4, "w": max(176, title_w + 28), "h": max(42, title_h + 16)})
+    _maix_device_draw_text(img, image_module, 18, subtitle_y, _maix_device_t(lang, "subtitle"), color=colors["muted"], scale=0.82 * scale)
+    header_ip = str(service.get("device_ip", "") or state.get("lan_ip", "127.0.0.1"))
+    header_right = f"{_maix_device_detect_name()} | {header_ip}"
+    header_right = _maix_device_clip_text(image_module, header_right, max(80, width - 260), scale=0.8 * scale)
+    right_w, _ = _maix_device_string_size(image_module, header_right, scale=0.8 * scale)
+    _maix_device_draw_text(img, image_module, width - right_w - 16, 18, header_right, color=colors["muted"], scale=0.8 * scale)
+    status_key = str(service.get("status", "stopped") or "stopped")
+    status_label = _maix_device_t(lang, status_key)
+    status_fill = colors["green"] if status_key == "running" else (colors["gold"] if status_key == "starting" else colors["red"])
+    _maix_device_draw_box(img, width - 150, 42, 132, 34, status_fill, status_fill)
+    _maix_device_draw_text(img, image_module, width - 142, 49, status_label, color=(255, 255, 255), scale=0.9 * scale)
+    tab_y = 84
+    tab_w = max(86, (width - 48) // 3)
+    tabs = [
+        ("tab_service", _maix_device_t(lang, "tab_service")),
+        ("tab_settings", _maix_device_t(lang, "tab_settings")),
+        ("tab_apps", _maix_device_t(lang, "tab_apps")),
+    ]
+    for idx, (hot_id, label) in enumerate(tabs):
+        is_active = current_tab == hot_id.split("_", 1)[1]
+        fill = colors["blue"] if is_active else colors["panel"]
+        _maix_device_draw_button(
+            hotspots,
+            img,
+            image_module,
+            hot_id,
+            16 + idx * tab_w,
+            tab_y,
+            tab_w - 8,
+            36,
+            label,
+            fill=fill,
+            border=colors["line"],
+            scale=0.82 * scale,
+        )
+
+
+def _maix_device_render_panel(img, image_module, state: dict, config: dict) -> list[dict]:
+    width = int(state.get("screen_w", 640) or 640)
+    height = int(state.get("screen_h", 480) or 480)
+    lang = str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE)
+    scale = max(0.75, min(1.45, float(config.get("font_scale", 18) or 18) / 18.0))
+    service = state.get("service_status", {}) if isinstance(state.get("service_status"), dict) else {}
+    target = _maix_device_resolve_target(config, state.get("apps", []), lang)
+    selected = _maix_device_selected_app(state, config)
+    hotspots: list[dict] = []
+    colors = {
+        "bg": (14, 21, 34),
+        "panel": (24, 34, 52),
+        "panel_alt": (29, 41, 61),
+        "line": (63, 84, 120),
+        "text": (236, 242, 255),
+        "muted": (140, 158, 188),
+        "green": (44, 160, 96),
+        "red": (189, 70, 74),
+        "blue": (60, 125, 208),
+        "gold": (212, 152, 54),
+    }
+    _maix_device_draw_box(img, 0, 0, width, height, colors["bg"])
+    current_tab = str(state.get("tab", "service") or "service")
+    body_y = 132
+    card_w = width - 32
+    if current_tab == "service":
+        device_ip = str(service.get("device_ip", "") or state.get("lan_ip", "127.0.0.1"))
+        active_port = int(service.get("active_port", config.get("service_port", 8080)) or int(config.get("service_port", 8080) or 8080))
+        browser_url = str(service.get("browser_url", "") or "").strip() or f"http://{device_ip}:{active_port}"
+        parallel_tasks = int(service.get("parallel_tasks", 0) or 0)
+        _maix_device_draw_box(img, 16, body_y, card_w, 128, colors["panel_alt"], colors["line"])
+        _maix_device_draw_text(img, image_module, 28, body_y + 10, f"{_maix_device_t(lang, 'selected_app')}: {target.get('name', '')}", color=colors["text"], scale=0.82 * scale)
+        ip_line = f"{_maix_device_t(lang, 'device_ip')}: {device_ip}"
+        port_line = f"{_maix_device_t(lang, 'active_port')}: {active_port}"
+        url_line = f"{_maix_device_t(lang, 'browser_url')}: {browser_url}"
+        task_line = f"{_maix_device_t(lang, 'parallel_tasks')}: {parallel_tasks}"
+        workspace_line = f"{_maix_device_t(lang, 'workspace')}: {target.get('path', '')}"
+        _maix_device_draw_text(img, image_module, 28, body_y + 32, _maix_device_clip_text(image_module, ip_line, card_w - 24, scale=0.72 * scale), color=colors["muted"], scale=0.72 * scale)
+        _maix_device_draw_text(img, image_module, 28, body_y + 52, _maix_device_clip_text(image_module, port_line, card_w - 24, scale=0.72 * scale), color=colors["muted"], scale=0.72 * scale)
+        _maix_device_draw_text(img, image_module, 28, body_y + 72, _maix_device_clip_text(image_module, url_line, card_w - 24, scale=0.72 * scale), color=colors["muted"], scale=0.72 * scale)
+        _maix_device_draw_text(img, image_module, 28, body_y + 92, _maix_device_clip_text(image_module, task_line, card_w - 24, scale=0.72 * scale), color=colors["muted"], scale=0.72 * scale)
+        _maix_device_draw_text(img, image_module, 28, body_y + 112, _maix_device_clip_text(image_module, workspace_line, card_w - 24, scale=0.68 * scale), color=colors["muted"], scale=0.68 * scale)
+        btn_w = (card_w - 12) // 2
+        btn_y1 = body_y + 144
+        btn_y2 = body_y + 212
+        running = bool(service.get("running"))
+        _maix_device_draw_button(
+            hotspots,
+            img,
+            image_module,
+            "service_toggle",
+            16,
+            btn_y1,
+            btn_w,
+            54,
+            _maix_device_t(lang, "stop") if running else _maix_device_t(lang, "start"),
+            fill=colors["red"] if running else colors["green"],
+            border=colors["line"],
+            scale=0.86 * scale,
+        )
+        _maix_device_draw_button(hotspots, img, image_module, "service_restart", 16 + btn_w + 12, btn_y1, btn_w, 54, _maix_device_t(lang, "restart"), fill=colors["blue"], border=colors["line"], scale=0.86 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "package_target", 16, btn_y2, btn_w, 54, _maix_device_t(lang, "package"), fill=colors["gold"], border=colors["line"], scale=0.82 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "backup_target", 16 + btn_w + 12, btn_y2, btn_w, 54, _maix_device_t(lang, "backup"), fill=colors["panel"], border=colors["line"], scale=0.82 * scale)
+    elif current_tab == "settings":
+        settings_metrics = _maix_device_settings_metrics(height, scale, int(state.get("settings_scroll", 0) or 0))
+        state["settings_scroll"] = int(settings_metrics["scroll"])
+        view_top = int(settings_metrics["body_y"])
+        view_bottom = int(settings_metrics["footer_top"])
+        content_y = body_y - int(settings_metrics["scroll"])
+
+        y_port = content_y
+        y_timeout = content_y + 94
+        y_font = content_y + 188
+        y_auto = content_y + 286
+        y_skills = content_y + 346
+        y_lang = content_y + 406
+        y_hint = content_y + 470
+
+        if _maix_device_y_visible(y_port, 82, view_top, view_bottom):
+            _maix_device_draw_slider(hotspots, img, image_module, "service_port", 16, y_port, card_w, 82, _maix_device_t(lang, "port"), int(config.get("service_port", 8080) or 8080), 8000, 8099, accent=colors["blue"], scale=0.82 * scale)
+        if _maix_device_y_visible(y_timeout, 82, view_top, view_bottom):
+            _maix_device_draw_slider(hotspots, img, image_module, "service_timeout_min", 16, y_timeout, card_w, 82, _maix_device_t(lang, "timeout"), int(config.get("service_timeout_min", 30) or 30), 10, 120, accent=colors["gold"], scale=0.82 * scale)
+        if _maix_device_y_visible(y_font, 82, view_top, view_bottom):
+            _maix_device_draw_slider(hotspots, img, image_module, "font_scale", 16, y_font, card_w, 82, _maix_device_t(lang, "font_scale"), int(config.get("font_scale", 18) or 18), 12, 28, accent=colors["green"], scale=0.82 * scale)
+
+        auto_label = f"{_maix_device_t(lang, 'auto_start')}: {'ON' if bool(config.get('auto_start')) else 'OFF'}"
+        skills_label = f"{_maix_device_t(lang, 'skills_ui')}: {'ON' if bool(config.get('enable_skills_ui')) else 'OFF'}"
+        if _maix_device_y_visible(y_auto, 48, view_top, view_bottom):
+            _maix_device_draw_button(hotspots, img, image_module, "toggle_auto_start", 16, y_auto, card_w, 48, auto_label, fill=colors["green"] if bool(config.get("auto_start")) else colors["panel"], border=colors["line"], scale=0.78 * scale)
+        if _maix_device_y_visible(y_skills, 48, view_top, view_bottom):
+            _maix_device_draw_button(hotspots, img, image_module, "toggle_skills_ui", 16, y_skills, card_w, 48, skills_label, fill=colors["blue"] if bool(config.get("enable_skills_ui")) else colors["panel"], border=colors["line"], scale=0.78 * scale)
+        if _maix_device_y_visible(y_lang, 50, view_top, view_bottom):
+            _maix_device_draw_box(img, 16, y_lang, card_w, 50, colors["panel"], colors["line"])
+            _maix_device_draw_text(img, image_module, 28, y_lang + 12, "GUI language: English", color=colors["text"], scale=0.78 * scale)
+        if _maix_device_y_visible(y_hint, 118, view_top, view_bottom):
+            _maix_device_draw_box(img, 16, y_hint, card_w, 118, colors["panel_alt"], colors["line"])
+            _maix_device_draw_text(img, image_module, 28, y_hint + 12, "Settings gestures", color=colors["text"], scale=0.82 * scale)
+            _maix_device_draw_text(img, image_module, 28, y_hint + 40, "Swipe up/down to scroll the column", color=colors["muted"], scale=0.72 * scale)
+            _maix_device_draw_text(img, image_module, 28, y_hint + 62, "Swipe left/right on a slider to adjust", color=colors["muted"], scale=0.72 * scale)
+            _maix_device_draw_text(img, image_module, 28, y_hint + 84, "Small diagonal motion is ignored", color=colors["muted"], scale=0.72 * scale)
+    else:
+        _maix_device_draw_box(img, 16, body_y, card_w, 94, colors["panel_alt"], colors["line"])
+        if selected:
+            _maix_device_draw_text(img, image_module, 28, body_y + 12, _maix_device_clip_text(image_module, str(selected.get("name", selected.get("id", ""))), card_w - 24, scale=0.9 * scale), color=colors["text"], scale=0.9 * scale)
+            meta_line = f"{selected.get('id', '')} | {selected.get('version', '')}"
+            path_line = str(selected.get("path", "") or "")
+            _maix_device_draw_text(img, image_module, 28, body_y + 40, _maix_device_clip_text(image_module, meta_line, card_w - 24, scale=0.76 * scale), color=colors["muted"], scale=0.76 * scale)
+            _maix_device_draw_text(img, image_module, 28, body_y + 64, _maix_device_clip_text(image_module, path_line, card_w - 24, scale=0.72 * scale), color=colors["muted"], scale=0.72 * scale)
+        else:
+            _maix_device_draw_text(img, image_module, 28, body_y + 34, _maix_device_t(lang, "no_apps"), color=colors["muted"], scale=0.84 * scale)
+        btn_w = (card_w - 12) // 2
+        btn_y1 = body_y + 106
+        btn_y2 = body_y + 166
+        btn_y3 = body_y + 226
+        _maix_device_draw_button(hotspots, img, image_module, "apps_prev", 16, btn_y1, btn_w, 48, _maix_device_t(lang, "prev"), fill=colors["panel"], border=colors["line"], scale=0.8 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "apps_next", 16 + btn_w + 12, btn_y1, btn_w, 48, _maix_device_t(lang, "next"), fill=colors["panel"], border=colors["line"], scale=0.8 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "use_self", 16, btn_y2, btn_w, 48, _maix_device_t(lang, "use_self"), fill=colors["panel"], border=colors["line"], scale=0.72 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "use_selected", 16 + btn_w + 12, btn_y2, btn_w, 48, _maix_device_t(lang, "use_selected"), fill=colors["blue"], border=colors["line"], scale=0.72 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "refresh_apps", 16, btn_y3, btn_w, 48, _maix_device_t(lang, "refresh"), fill=colors["panel"], border=colors["line"], scale=0.8 * scale)
+        _maix_device_draw_button(hotspots, img, image_module, "launch_selected", 16 + btn_w + 12, btn_y3, btn_w, 48, _maix_device_t(lang, "launch_selected"), fill=colors["green"], border=colors["line"], scale=0.72 * scale)
+    _maix_device_draw_header_tabs(hotspots, img, image_module, state, config, colors, current_tab, scale)
+    footer_text = str(state.get("notice", "") or "").strip() or _maix_device_t(lang, "touch_exit")
+    footer_color = (255, 210, 210) if bool(state.get("notice_error")) else colors["muted"]
+    _maix_device_draw_box(img, 12, height - 40, width - 24, 28, colors["panel"], colors["line"])
+    _maix_device_draw_text(img, image_module, 20, height - 34, _maix_device_clip_text(image_module, footer_text, width - 48, scale=0.68 * scale), color=footer_color, scale=0.68 * scale)
+    return hotspots
+
+
+def _maix_device_handle_action(state: dict, config: dict, action: str, runtime: dict):
+    maix_app_module = runtime.get("app")
+    lang = str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE)
+    apps = state.get("apps", [])
+    action = str(action or "").strip()
+    if action == "exit_app":
+        if maix_app_module and hasattr(maix_app_module, "set_exit_flag"):
+            try:
+                maix_app_module.set_exit_flag(True)
+            except Exception:
+                pass
+        return
+    if action in {"tab_service", "tab_settings", "tab_apps"}:
+        state["tab"] = action.split("_", 1)[1]
+        return
+    try:
+        if action == "service_toggle":
+            status = _maix_device_service_status(maix_app_module)
+            if status.get("running"):
+                _maix_device_stop_service(maix_app_module)
+                _maix_device_set_notice(state, _maix_device_t(lang, "service_stopped"))
+            else:
+                target = _maix_device_resolve_target(config, apps, lang)
+                _maix_device_clear_service_state(maix_app_module)
+                _maix_device_start_service(target.get("path", SCRIPT_DIR), config, maix_app_module)
+                deadline = time.time() + 8.0
+                latest = {}
+                while time.time() < deadline:
+                    latest = _maix_device_service_status(maix_app_module)
+                    if latest.get("healthy"):
+                        break
+                    time.sleep(0.25)
+                _maix_device_set_notice(state, _maix_device_t(lang, "service_started") if latest.get("running") else _maix_device_t(lang, "service_failed"), error=not bool(latest.get("running")))
+        elif action == "service_restart":
+            target = _maix_device_resolve_target(config, apps, lang)
+            _maix_device_stop_service(maix_app_module)
+            time.sleep(0.2)
+            _maix_device_start_service(target.get("path", SCRIPT_DIR), config, maix_app_module)
+            _maix_device_set_notice(state, _maix_device_t(lang, "service_restarted"))
+        elif action == "package_target":
+            target = _maix_device_resolve_target(config, apps, lang)
+            out = package_maix_app_project(target.get("path", SCRIPT_DIR))
+            _maix_device_set_notice(state, f"{_maix_device_t(lang, 'package_ok')}: {Path(str(out.get('package_path', ''))).name}")
+        elif action == "backup_target":
+            target = _maix_device_resolve_target(config, apps, lang)
+            out = backup_maix_app_project(target.get("path", SCRIPT_DIR), output_dir=_maix_device_runtime_root(maix_app_module) / "backups")
+            _maix_device_set_notice(state, f"{_maix_device_t(lang, 'backup_ok')}: {Path(str(out.get('backup_path', ''))).name}")
+        elif action == "cycle_language":
+            config["language"] = _maix_device_cycle_language(str(config.get("language", DEFAULT_UI_LANGUAGE) or DEFAULT_UI_LANGUAGE))
+            config.update(_maix_device_save_config(config, maix_app_module))
+        elif action == "toggle_auto_start":
+            config["auto_start"] = not bool(config.get("auto_start"))
+            config.update(_maix_device_save_config(config, maix_app_module))
+        elif action == "toggle_skills_ui":
+            config["enable_skills_ui"] = not bool(config.get("enable_skills_ui"))
+            config.update(_maix_device_save_config(config, maix_app_module))
+            if state.get("service_status", {}).get("running"):
+                _maix_device_set_notice(state, _maix_device_t(lang, "restart_hint"))
+        elif action == "apps_prev":
+            if apps:
+                state["selected_index"] = (_maix_device_selected_index(state, config) - 1) % len(apps)
+        elif action == "apps_next":
+            if apps:
+                state["selected_index"] = (_maix_device_selected_index(state, config) + 1) % len(apps)
+        elif action == "use_self":
+            config["target_mode"] = "self"
+            config["target_app_id"] = ""
+            config.update(_maix_device_save_config(config, maix_app_module))
+            if state.get("service_status", {}).get("running"):
+                _maix_device_set_notice(state, _maix_device_t(lang, "restart_hint"))
+        elif action == "use_selected":
+            row = _maix_device_selected_app(state, config)
+            if not row:
+                raise ValueError(_maix_device_t(lang, "no_apps"))
+            config["target_mode"] = "app"
+            config["target_app_id"] = str(row.get("id", "") or "")
+            config.update(_maix_device_save_config(config, maix_app_module))
+            if state.get("service_status", {}).get("running"):
+                _maix_device_set_notice(state, _maix_device_t(lang, "restart_hint"))
+        elif action == "refresh_apps":
+            state["apps"] = _maix_device_list_apps(maix_app_module)
+            state["selected_index"] = _maix_device_selected_index(state, config)
+        elif action == "launch_selected":
+            row = _maix_device_selected_app(state, config)
+            if not row:
+                raise ValueError(_maix_device_t(lang, "no_apps"))
+            if hasattr(maix_app_module, "switch_app"):
+                try:
+                    maix_app_module.switch_app(str(row.get("id", "")))
+                except TypeError:
+                    maix_app_module.switch_app(str(row.get("id", "")), "")
+        state["service_status"] = _maix_device_service_status(maix_app_module)
+    except Exception as exc:
+        message = f"{_maix_device_t(lang, 'service_failed')}: {trim(str(exc), 96)}"
+        if action == "package_target":
+            message = f"{_maix_device_t(lang, 'package_failed')}: {trim(str(exc), 96)}"
+        elif action == "backup_target":
+            message = f"{_maix_device_t(lang, 'backup_failed')}: {trim(str(exc), 96)}"
+        _maix_device_set_notice(state, message, error=True)
+
+
+def run_maixcam_permission_passthrough_cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Provision MaixCAM local offline assets into a target app workspace.")
+    parser.add_argument("--target", required=True, help="Target app workspace directory.")
+    parser.add_argument("--manifest", default="", help="Optional source manifest path. Default: current app.yaml")
+    parser.add_argument("--mode", default="copy", help="Provision mode: copy|symlink_or_copy|symlink")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite conflicting files when merging.")
+    args = parser.parse_args(argv)
+    manifest_path = Path(str(args.manifest or (SCRIPT_DIR / "app.yaml"))).expanduser().resolve()
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = _parse_simple_yaml(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(json_dumps({"ok": False, "error": f"manifest parse failed: {exc}", "manifest": str(manifest_path)}))
+            return 2
+    else:
+        manifest = _maix_device_manifest_payload()
+    out = provision_maix_offline_assets(
+        args.target,
+        manifest=manifest,
+        source_project_dir=manifest_path.parent if manifest_path.exists() else SCRIPT_DIR,
+        overwrite=bool(args.overwrite),
+        mode=str(args.mode or "copy"),
+    )
+    print(json_dumps(out))
+    return 0 if bool(out.get("ok")) else 2
+
+
+def run_maixcam_device_app() -> int:
+    runtime = _maix_device_import_runtime()
+    if not bool(runtime.get("ok")):
+        print(f"MaixPy runtime unavailable: {runtime.get('error', 'unknown error')}")
+        return 2
+    maix_app_module = runtime["app"]
+    display_module = runtime["display"]
+    image_module = runtime["image"]
+    touchscreen_module = runtime["touchscreen"]
+    disp = None
+    img = None
+    screen_w = 480
+    screen_h = 640
+    try:
+        disp = display_module.Display()
+        ts = touchscreen_module.TouchScreen()
+        screen_w = int(disp.width())
+        screen_h = int(disp.height())
+        img = image_module.Image(screen_w, screen_h)
+    except Exception as exc:
+        detail = _maix_device_log_exception("display_init", exc, maix_app_module)
+        print(f"MaixPy display init failed: {detail}")
+        return 2
+    try:
+        boot_log = _maix_device_boot_log_path(maix_app_module)
+        if boot_log.exists():
+            boot_log.unlink()
+    except Exception:
+        pass
+    try:
+        config = _maix_device_load_config(maix_app_module)
+        state = {
+            "tab": "service",
+            "apps": _maix_device_list_apps(maix_app_module),
+            "selected_index": 0,
+            "service_status": _maix_device_service_status(maix_app_module),
+            "notice": "",
+            "notice_error": False,
+            "screen_w": screen_w,
+            "screen_h": screen_h,
+            "lan_ip": detect_local_lan_ip(),
+            "hotspots": [],
+            "settings_scroll": 0,
+        }
+        _maix_device_reset_touch_state(state)
+        state["selected_index"] = _maix_device_selected_index(state, config)
+        if bool(config.get("auto_start")) and not bool(state["service_status"].get("running")):
+            try:
+                target = _maix_device_resolve_target(config, state.get("apps", []), config.get("language"))
+                _maix_device_start_service(target.get("path", SCRIPT_DIR), config, maix_app_module)
+                state["service_status"] = _maix_device_service_status(maix_app_module)
             except Exception as exc:
-                return self._send_json({"error": str(exc)}, status=400)
-        return self._send_json({"error": "not found"}, status=404)
+                detail = _maix_device_log_exception("auto_start_service", exc, maix_app_module)
+                _maix_device_set_notice(state, f"{_maix_device_t(config.get('language'), 'service_failed')}: {detail}", error=True)
+        last_status_poll = 0.0
+        last_x = 0
+        last_y = 0
+        while not bool(getattr(maix_app_module, "need_exit", lambda: False)()):
+            now = time.time()
+            if now - last_status_poll >= 1.0:
+                state["service_status"] = _maix_device_service_status(maix_app_module)
+                state["lan_ip"] = detect_local_lan_ip()
+                last_status_poll = now
+            try:
+                x, y, pressed = ts.read()
+                x = int(x)
+                y = int(y)
+                pressed = bool(pressed)
+            except Exception:
+                x, y, pressed = 0, 0, False
+            if pressed:
+                last_x, last_y = x, y
+                if not bool(state.get("touch_down")):
+                    hit = _maix_device_find_hotspot(state.get("hotspots", []), x, y)
+                    state["touch_down"] = True
+                    state["touch_start_x"] = x
+                    state["touch_start_y"] = y
+                    state["touch_last_x"] = x
+                    state["touch_last_y"] = y
+                    state["touch_start_scroll"] = int(state.get("settings_scroll", 0) or 0)
+                    state["gesture_mode"] = ""
+                    state["gesture_hot_id"] = str(hit.get("id", "") or "") if hit else ""
+                    state["gesture_hot_kind"] = str(hit.get("kind", "") or "") if hit else ""
+                    state["active_button"] = ""
+                    state["active_slider"] = ""
+                    if hit and str(hit.get("kind")) == "button":
+                        state["active_button"] = str(hit.get("id", "") or "")
+                else:
+                    state["touch_last_x"] = x
+                    state["touch_last_y"] = y
+                    dx_total = int(x - int(state.get("touch_start_x", x) or x))
+                    dy_total = int(y - int(state.get("touch_start_y", y) or y))
+                    if str(state.get("tab", "")) == "settings":
+                        if not state.get("gesture_mode"):
+                            slider_candidate = str(state.get("gesture_hot_kind", "")) == "slider"
+                            if (
+                                slider_candidate
+                                and abs(dx_total) >= MAIX_DEVICE_TOUCH_GESTURE_THRESHOLD
+                                and abs(dx_total) >= abs(dy_total) + MAIX_DEVICE_TOUCH_GESTURE_AXIS_MARGIN
+                            ):
+                                state["gesture_mode"] = "settings_slider"
+                                state["active_slider"] = str(state.get("gesture_hot_id", "") or "")
+                                state["active_button"] = ""
+                            elif (
+                                abs(dy_total) >= MAIX_DEVICE_TOUCH_GESTURE_THRESHOLD
+                                and abs(dy_total) >= abs(dx_total) + MAIX_DEVICE_TOUCH_GESTURE_AXIS_MARGIN
+                            ):
+                                state["gesture_mode"] = "settings_scroll"
+                                state["active_button"] = ""
+                                state["active_slider"] = ""
+                        if state.get("gesture_mode") == "settings_scroll":
+                            metrics = _maix_device_settings_metrics(screen_h, max(0.75, min(1.45, float(config.get("font_scale", 18) or 18) / 18.0)), int(state.get("touch_start_scroll", 0) or 0))
+                            next_scroll = int(state.get("touch_start_scroll", 0) or 0) - dy_total
+                            state["settings_scroll"] = max(0, min(int(metrics.get("scroll_limit", 0) or 0), next_scroll))
+                        elif state.get("gesture_mode") == "settings_slider":
+                            hit = next((row for row in state.get("hotspots", []) if str(row.get("id", "")) == str(state.get("active_slider", ""))), None)
+                            if hit:
+                                ratio = 0.0 if int(hit.get("track_w", 0) or 0) <= 0 else (x - int(hit.get("track_x", 0) or 0)) / float(int(hit.get("track_w", 1) or 1))
+                                _maix_device_apply_slider(config, str(hit.get("id", "")), ratio)
+            elif state.get("touch_down"):
+                dx_total = int(last_x - int(state.get("touch_start_x", last_x) or last_x))
+                dy_total = int(last_y - int(state.get("touch_start_y", last_y) or last_y))
+                moved = max(abs(dx_total), abs(dy_total))
+                if state.get("gesture_mode") == "settings_slider" and state.get("active_slider"):
+                    config.update(_maix_device_save_config(config, maix_app_module))
+                    if state.get("service_status", {}).get("running") and str(state.get("active_slider")) in {"service_port", "service_timeout_min"}:
+                        _maix_device_set_notice(state, _maix_device_t(config.get("language"), "restart_hint"))
+                elif state.get("gesture_mode") == "settings_scroll":
+                    _maix_device_clamp_settings_scroll(state, screen_h, max(0.75, min(1.45, float(config.get("font_scale", 18) or 18) / 18.0)))
+                elif state.get("active_button") and moved <= MAIX_DEVICE_TOUCH_TAP_SLOP:
+                    hit = _maix_device_find_hotspot(state.get("hotspots", []), last_x, last_y)
+                    if hit and str(hit.get("id", "")) == str(state.get("active_button", "")):
+                        _maix_device_handle_action(state, config, str(hit.get("id", "")), runtime)
+                _maix_device_reset_touch_state(state)
+            state["hotspots"] = _maix_device_render_panel(img, image_module, state, config)
+            try:
+                disp.show(img)
+            except Exception as exc:
+                _maix_device_log_exception("display_show", exc, maix_app_module)
+            time.sleep(0.03)
+        return 0
+    except Exception as exc:
+        detail = _maix_device_log_exception("device_ui_loop", exc, maix_app_module)
+        try:
+            if img is not None and disp is not None:
+                _maix_device_draw_box(img, 0, 0, screen_w, screen_h, (14, 21, 34))
+                _maix_device_draw_text(img, image_module, 16, 18, "Clouds Coder", color=(236, 242, 255), scale=1.0)
+                _maix_device_draw_text(
+                    img,
+                    image_module,
+                    16,
+                    48,
+                    _maix_device_clip_text(image_module, f"Boot failed: {detail}", max(80, screen_w - 32), scale=0.78),
+                    color=(255, 210, 210),
+                    scale=0.78,
+                )
+                _maix_device_draw_text(
+                    img,
+                    image_module,
+                    16,
+                    74,
+                    _maix_device_clip_text(image_module, f"log: {_maix_device_boot_log_path(maix_app_module)}", max(80, screen_w - 32), scale=0.68),
+                    color=(140, 158, 188),
+                    scale=0.68,
+                )
+                disp.show(img)
+                time.sleep(1.2)
+        except Exception:
+            pass
+        return 2
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
@@ -27799,8 +29763,77 @@ def main():
         type=int,
         help="Max concurrent running tasks per user (0 means unlimited). When --max_user>0 and this flag is omitted, defaults to 1.",
     )
+    parser.add_argument(
+        "--device-ui",
+        action="store_true",
+        help="Run the MaixPy touch control panel for MaixCAM Pro / MaixCAM 2.",
+    )
+    parser.add_argument(
+        "--package-app",
+        action="store_true",
+        help="Generate a MaixPy APP zip for the current project or --package-target path.",
+    )
+    parser.add_argument(
+        "--package-target",
+        default="",
+        help="Project directory used by --package-app. Default: current Clouds Coder app project.",
+    )
+    parser.add_argument(
+        "--provision-links",
+        action="store_true",
+        help="Provision local offline assets (skills/js_lib) into a target app workspace.",
+    )
+    parser.add_argument(
+        "--provision-target",
+        default="",
+        help="Target workspace directory used by --provision-links.",
+    )
+    parser.add_argument(
+        "--provision-manifest",
+        default="",
+        help="Optional manifest path used by --provision-links.",
+    )
+    parser.add_argument(
+        "--provision-mode",
+        default="copy",
+        help="Provision mode for --provision-links: copy|symlink_or_copy|symlink.",
+    )
+    parser.add_argument(
+        "--provision-overwrite",
+        action="store_true",
+        help="Overwrite conflicts when provisioning offline assets.",
+    )
     parser.set_defaults(auto_model_switch=False, use_external_web_ui=None, arbiter_enabled=True)
     args = parser.parse_args()
+    if bool(getattr(args, "device_ui", False)):
+        return int(run_maixcam_device_app())
+    if bool(getattr(args, "package_app", False)):
+        target_dir = Path(str(getattr(args, "package_target", "") or SCRIPT_DIR)).expanduser().resolve()
+        try:
+            out = package_maix_app_project(target_dir)
+            print(
+                "[maix-app] packaged "
+                f"{out.get('package_path')} files={int(out.get('file_count', 0) or 0)}"
+            )
+            return 0
+        except Exception as exc:
+            print(f"[maix-app] package failed: {exc}")
+            return 2
+    if bool(getattr(args, "provision_links", False)):
+        target_dir = str(getattr(args, "provision_target", "") or "").strip()
+        if not target_dir:
+            print("[maix-app] --provision-target required when using --provision-links")
+            return 2
+        cli_args = ["--target", target_dir]
+        manifest_path = str(getattr(args, "provision_manifest", "") or "").strip()
+        if manifest_path:
+            cli_args.extend(["--manifest", manifest_path])
+        mode = str(getattr(args, "provision_mode", "") or "copy").strip()
+        if mode:
+            cli_args.extend(["--mode", mode])
+        if bool(getattr(args, "provision_overwrite", False)):
+            cli_args.append("--overwrite")
+        return int(run_maixcam_permission_passthrough_cli(cli_args))
     ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
     web_ui_config = load_web_ui_config_file(web_ui_config_path)
