@@ -1,4 +1,4 @@
-# CHANGELOG 2026-03-16
+# CHANGELOG 2026-03-17
 
 Trilingual merged release notes: English / 中文 / 日本語.
 
