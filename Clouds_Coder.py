@@ -75,6 +75,8 @@ AGENT_MAX_OUTPUT_TOKENS = 16384
 OLLAMA_THINKING_TOOL_BUFFER = 4096
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD = 2
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD = 2
+WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE = 4
+WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE = 4
 WATCHDOG_STATE_STALL_THRESHOLD = 6
 WATCHDOG_CONTEXT_STALL_THRESHOLD = 2
 WATCHDOG_REPEAT_SIMILARITY_THRESHOLD = 0.85
@@ -2354,7 +2356,7 @@ def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
     except Exception:
         return None
 
-def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> str:
+def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
     diff = list(
@@ -2366,9 +2368,12 @@ def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 
             lineterm="",
         )
     )
-    if len(diff) > max_lines:
+    added = sum(1 for ln in diff if ln.startswith("+") and not ln.startswith("+++"))
+    deleted = sum(1 for ln in diff if ln.startswith("-") and not ln.startswith("---"))
+    if max_lines and len(diff) > max_lines:
         diff = diff[:max_lines] + [f"... diff truncated, total lines={len(diff)}"]
-    return "\n".join(diff) if diff else f"@@ no textual diff for {path}"
+    text = "\n".join(diff) if diff else f"@@ no textual diff for {path}"
+    return text, added, deleted
 
 def _skip_row(text: str) -> dict:
     msg = str(text or "").strip() or "⋮"
@@ -7226,6 +7231,7 @@ class SessionState:
         self.multimodal_capability_cache: dict[str, dict] = {}
         self.failed_selections: list[str] = []
         self.todo = TodoManager()
+        self.single_advance_prompt_enhance = False
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
         self.skills_last_refresh_ts = 0.0
@@ -8900,6 +8906,19 @@ class SessionState:
         budget = int(self.runtime_round_budget or 0)
         html_block = f"{html_hint}\n\n" if html_hint else ""
         research_block = f"{research_hint}\n\n" if research_hint else ""
+        _is_single_no_enhance = (
+            runtime_mode == EXECUTION_MODE_SINGLE
+            and not self.single_advance_prompt_enhance
+        )
+        skill_hint = (
+            "Use load_skill for workspace-paths and tool-best-practices if needed. "
+            if _is_single_no_enhance
+            else (
+                "Use load_skill for guidance on specific topics "
+                "(workspace-paths, task-management, tool-best-practices, context-management). "
+                "If execution stalls, load_skill('execution-degradation-recovery'). "
+            )
+        )
         return (
             f"You are a coding agent. Workspace: {self.files_root}. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
@@ -8908,9 +8927,7 @@ class SessionState:
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task when done. "
-            "Use load_skill for guidance on specific topics "
-            "(workspace-paths, task-management, tool-best-practices, context-management). "
-            "If execution stalls, load_skill('execution-degradation-recovery'). "
+            f"{skill_hint}"
             f"{html_block}"
             f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
@@ -14005,10 +14022,13 @@ class SessionState:
         bb = self._ensure_blackboard()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         trigger_reason = ""
+        _is_single = self._effective_execution_mode() == EXECUTION_MODE_SINGLE
+        _intent_th = WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_INTENT_NO_TOOL_THRESHOLD
+        _repeat_th = WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_REPEAT_NO_TOOL_THRESHOLD
         if not bool(dq.get("active", False)):
-            if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(WATCHDOG_INTENT_NO_TOOL_THRESHOLD):
+            if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(_intent_th):
                 trigger_reason = "intent-without-tool-call"
-            elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(WATCHDOG_REPEAT_NO_TOOL_THRESHOLD):
+            elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(_repeat_th):
                 trigger_reason = "repeated-no-tool-reply"
             elif (
                 self._watchdog_context_near_limit()
@@ -18582,11 +18602,9 @@ class SessionState:
                     self._emit("status", {"summary": summary})
                     out = f"{out}\n{summary}"
                 after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
-                diff = make_unified_diff(rel, before_text, after_text)
+                diff, added, deleted = make_unified_diff(rel, before_text, after_text)
                 numbered = make_numbered_diff(before_text, after_text)
                 numbered_text = render_numbered_diff_text(numbered)
-                added = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
-                deleted = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
                 code_stage = self._record_code_preview_stage(
                     rel_path=rel,
                     before_text=before_text,
@@ -18635,11 +18653,9 @@ class SessionState:
                     self._emit("status", {"summary": summary})
                     out = f"{out}\n{summary}"
                 after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
-                diff = make_unified_diff(rel, before_text, after_text)
+                diff, added, deleted = make_unified_diff(rel, before_text, after_text)
                 numbered = make_numbered_diff(before_text, after_text)
                 numbered_text = render_numbered_diff_text(numbered)
-                added = sum(1 for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
-                deleted = sum(1 for ln in diff.splitlines() if ln.startswith("-") and not ln.startswith("---"))
                 code_stage = self._record_code_preview_stage(
                     rel_path=rel,
                     before_text=before_text,
@@ -19265,7 +19281,7 @@ class SessionState:
                 for tc in tool_calls
             ]
         self._append_agent_context_message(role_key, assistant, mirror_to_global=True)
-        if text.strip() or thinking_text:
+        if (text.strip() or thinking_text) and not tool_calls:
             emit_text = text if text.strip() else "[thinking-only output]"
             self._emit_agent_message(role_key, emit_text, summary=f"{self._agent_display_name(role_key)} response")
         if not tool_calls:
@@ -20251,7 +20267,7 @@ class SessionState:
                         for tc in tool_calls
                     ]
                 self.messages.append(assistant)
-                if text.strip() or thinking_text:
+                if (text.strip() or thinking_text) and not tool_calls:
                     emit_text = text if text.strip() else "[thinking-only output]"
                     emit_summary = "assistant message" if text.strip() else "assistant thinking-only message"
                     self._emit(
@@ -20409,6 +20425,8 @@ class SessionState:
                         fault_counter = 0
                         last_fault_reason = ""
                         self._prune_runtime_retry_hints()
+                        if self.todo.has_open_items():
+                            self._mark_all_done_silently("single-mode endpoint exit")
                         self._emit(
                             "status",
                             {
@@ -20426,6 +20444,8 @@ class SessionState:
                         fault_counter = 0
                         last_fault_reason = ""
                         self._prune_runtime_retry_hints()
+                        if self.todo.has_open_items():
+                            self._mark_all_done_silently("single-mode conclusive/substantial exit")
                         self._emit(
                             "status",
                             {
@@ -21014,6 +21034,10 @@ class SessionState:
         except Exception as exc:
             self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
         finally:
+            if self.todo.has_open_items() and not self.cancel_requested:
+                _last = self._latest_agent_assistant_text(single_role) or ""
+                if self._looks_like_conclusive_reply(_last):
+                    self._mark_all_done_silently(f"single-mode conclusive exit by {single_role}")
             dropped_pending_inputs = 0
             removed_runtime_hints = 0
             with self.lock:
@@ -21526,6 +21550,7 @@ class SessionManager:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.single_advance_prompt_enhance = False
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -21792,6 +21817,7 @@ class SessionManager:
             min(1.0, float(self.arbiter_temperature if self.arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)),
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
+        sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
         sess._apply_active_profile()
         sess.updated_at = now_ts()
         sess._persist()
@@ -22889,6 +22915,7 @@ function _deltaScheduleRender(flags={}){
   if(S.deltaRenderRaf)return;
   S.deltaRenderRaf=requestAnimationFrame(()=>{
     S.deltaRenderRaf=0;
+    if(S.refreshInFlight)return;
     const needChat=!!S.deltaRenderChat;
     const needBoards=!!S.deltaRenderBoards;
     const needSessions=!!S.deltaRenderSessions;
@@ -23048,7 +23075,7 @@ function onRuntimeEvent(evt){
   const typ=String(evt.type||'');
   if(typ==='render_frame'){_renderBridgeEnqueue(evt.data||{});return{handled:true,needsSnapshot:false}}
   if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(30000)}return{handled:true,needsSnapshot:false}}
-  if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(reason==='auto'||reason.startsWith('truncation-rescue')){const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · delta-sync`)}_deltaAppendActivity(typ,evt.data||{},Number(evt?.ts||Date.now()/1000));_deltaScheduleRender({boards:true,sessions:true});return{handled:true,needsSnapshot:false}}
+  if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(reason==='auto'||reason.startsWith('truncation-rescue')){const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · delta-sync`)}_deltaAppendActivity(typ,evt.data||{},Number(evt?.ts||Date.now()/1000));return{handled:true,needsSnapshot:false}}
   return _deltaApplyRuntimeEvent(evt);
 }
 function _deltaStartWatchdog(){
@@ -24909,23 +24936,21 @@ async function refreshSnapshot(opt={}){
     const chatEl=E('chat');
     const scrolling=_chatVirtIsUserScrolling(chatEl);
     const feedSig=feedSignature(S.snap);
-    if(forceFull||feedSig!==S.lastFeedSig){
-      S.lastFeedSig=feedSig;
-      if(scrolling&&chatEl){
-        _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('snapshot'));
-      }else{
-        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');
-        renderChat();
-      }
-    }
     const boardSig=boardsSignature(S.snap);
-    if(forceFull||boardSig!==S.lastBoardsSig){
-      S.lastBoardsSig=boardSig;
+    const needChat=forceFull||feedSig!==S.lastFeedSig;
+    const needBoards=forceFull||boardSig!==S.lastBoardsSig;
+    if(needChat)S.lastFeedSig=feedSig;
+    if(needBoards)S.lastBoardsSig=boardSig;
+    if(needChat||needBoards){
+      const doRender=()=>{
+        if(needChat)renderChat('snapshot');
+        if(needBoards)renderBoards();
+      };
       if(scrolling&&chatEl){
-        _chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);
+        _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',doRender);
       }else{
-        if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');
-        renderBoards();
+        if(chatEl){_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');}
+        doRender();
       }
     }
     renderActivePreview(false);
@@ -26027,6 +26052,8 @@ class AppContext:
         cfg_max_output_tokens = cfg.get("max_output_tokens")
         if cfg_max_output_tokens is not None:
             self.max_output_tokens = max(256, int(cfg_max_output_tokens))
+        if "single_advance_prompt_enhance" in cfg:
+            self.single_advance_prompt_enhance = bool(cfg["single_advance_prompt_enhance"])
 
         def normalized_profiles() -> tuple[dict[str, dict], str]:
             rows: dict[str, dict] = {}
