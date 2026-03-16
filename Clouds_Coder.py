@@ -40,6 +40,11 @@ APP_VERSION = "0.2.0"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 MAIX_DEVICE_APPS_ROOT = Path("/maixapp/apps")
+MAIX_DEVICE_APPS_ALIASES = (
+    "/maixapp/apps",
+    "/maixcam/apps",
+    "/maixcam/app",
+)
 
 
 def _path_is_within_root(target: Path, root: Path) -> bool:
@@ -72,14 +77,11 @@ def _env_truthy(name: str, default: bool = False) -> bool:
 def _runtime_direct_workspace_enabled(workdir: Path | None = None) -> bool:
     if "AGENT_SESSION_DIRECT_WORKSPACE" in os.environ:
         return _env_truthy("AGENT_SESSION_DIRECT_WORKSPACE", False)
-    if workdir is None:
-        workdir = WORKDIR
-    return _path_is_within_root(Path(workdir).expanduser().resolve(), MAIX_DEVICE_APPS_ROOT)
+    return False
 
 
 def _runtime_allowed_absolute_roots(base_roots: list[Path] | None = None) -> list[Path]:
     roots = list(base_roots or [])
-    roots.append(MAIX_DEVICE_APPS_ROOT)
     raw = str(os.getenv("AGENT_ALLOWED_ABSOLUTE_ROOTS", "") or "").strip()
     if raw:
         for token in re.split(r"[,\n" + re.escape(os.pathsep) + r"]+", raw):
@@ -102,6 +104,89 @@ def _runtime_allowed_absolute_roots(base_roots: list[Path] | None = None) -> lis
             continue
         seen.add(key)
         out.append(resolved)
+    return out
+
+
+def _maix_device_authorized_app_root(raw_path: object) -> Path | None:
+    txt = str(raw_path or "").strip().strip("'\"").replace("\\", "/")
+    if not txt:
+        return None
+    for prefix in MAIX_DEVICE_APPS_ALIASES:
+        if txt == prefix or txt.startswith(prefix + "/"):
+            suffix = txt[len(prefix) :].lstrip("/")
+            if not suffix:
+                return None
+            app_name = str(suffix.split("/", 1)[0] or "").strip()
+            if not app_name or app_name in {".", ".."}:
+                return None
+            try:
+                candidate = (MAIX_DEVICE_APPS_ROOT / app_name).resolve()
+            except Exception:
+                return None
+            if candidate != MAIX_DEVICE_APPS_ROOT and _path_is_within_root(candidate, MAIX_DEVICE_APPS_ROOT):
+                return candidate
+            return None
+    if not txt.startswith("/"):
+        return None
+    try:
+        resolved = Path(txt).expanduser().resolve()
+    except Exception:
+        return None
+    if not _path_is_within_root(resolved, MAIX_DEVICE_APPS_ROOT) or resolved == MAIX_DEVICE_APPS_ROOT:
+        return None
+    try:
+        rel = resolved.relative_to(MAIX_DEVICE_APPS_ROOT)
+    except Exception:
+        return None
+    if not rel.parts:
+        return None
+    try:
+        candidate = (MAIX_DEVICE_APPS_ROOT / rel.parts[0]).resolve()
+    except Exception:
+        return None
+    if candidate != MAIX_DEVICE_APPS_ROOT and _path_is_within_root(candidate, MAIX_DEVICE_APPS_ROOT):
+        return candidate
+    return None
+
+
+def _extract_maix_app_roots_from_text(text: object) -> list[Path]:
+    raw = str(text or "").replace("\\", "/")
+    if not raw:
+        return []
+    out: list[Path] = []
+    seen: set[str] = set()
+    pattern = r"/maix(?:app|cam)/(?:apps|app)/[A-Za-z0-9._/-]+"
+    for match in re.finditer(pattern, raw):
+        root = _maix_device_authorized_app_root(match.group(0))
+        if root is None:
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(root)
+    return out
+
+
+def _runtime_allowed_maix_app_roots() -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    raw_values = [
+        str(os.getenv("AGENT_ALLOWED_MAIX_APP_ROOTS", "") or "").strip(),
+        str(os.getenv("AGENT_ALLOWED_ABSOLUTE_ROOTS", "") or "").strip(),
+    ]
+    for raw in raw_values:
+        if not raw:
+            continue
+        for token in re.split(r"[,\n" + re.escape(os.pathsep) + r"]+", raw):
+            root = _maix_device_authorized_app_root(token)
+            if root is None:
+                continue
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(root)
     return out
 
 
@@ -7414,6 +7499,10 @@ class SessionState:
         self.lock = threading.RLock()
         self.owner_user_id = str(owner_user_id or "")
         self.run_finished_callback = run_finished_callback
+        self.allowed_maix_app_roots = [str(p) for p in _runtime_allowed_maix_app_roots()]
+        self.auto_transfer_maix_apps = _env_truthy("AGENT_AUTO_TRANSFER_MAIX_APPS", True)
+        self.last_maix_auto_transfer_generation = 0
+        self.last_maix_auto_transfer_results: list[dict] = []
         self.events = EventHub()
         self.ollama = OllamaClient(ollama_base, model)
         self.auto_model_switch = bool(auto_model_switch)
@@ -8538,6 +8627,20 @@ class SessionState:
                 latest_render = raw.get("render_frame_latest", {})
                 if isinstance(latest_render, dict):
                     self.render_frame_latest = latest_render
+                allowed_maix_roots = raw.get("allowed_maix_app_roots", [])
+                if isinstance(allowed_maix_roots, list):
+                    self.allowed_maix_app_roots = [str(p) for p in self._normalized_maix_app_roots(allowed_maix_roots)]
+                self.auto_transfer_maix_apps = bool(raw.get("auto_transfer_maix_apps", self.auto_transfer_maix_apps))
+                self.last_maix_auto_transfer_generation = int(
+                    raw.get("last_maix_auto_transfer_generation", self.last_maix_auto_transfer_generation) or 0
+                )
+                raw_transfer_results = raw.get("last_maix_auto_transfer_results", [])
+                if isinstance(raw_transfer_results, list):
+                    clean_transfer_results: list[dict] = []
+                    for row in raw_transfer_results[-12:]:
+                        if isinstance(row, dict):
+                            clean_transfer_results.append(dict(row))
+                    self.last_maix_auto_transfer_results = clean_transfer_results
                 self.event_seq = int(raw.get("event_seq", self.event_seq) or 0)
                 self.created_at = raw.get("created_at", self.created_at)
                 self.updated_at = raw.get("updated_at", self.updated_at)
@@ -8646,6 +8749,10 @@ class SessionState:
             "render_frame_last_ts": float(self.render_frame_last_ts or 0.0),
             "render_frame_last_kind": str(self.render_frame_last_kind or ""),
             "render_frame_latest": self.render_frame_latest if isinstance(self.render_frame_latest, dict) else {},
+            "allowed_maix_app_roots": [str(p) for p in self._authorized_maix_app_roots()],
+            "auto_transfer_maix_apps": bool(self.auto_transfer_maix_apps),
+            "last_maix_auto_transfer_generation": int(self.last_maix_auto_transfer_generation or 0),
+            "last_maix_auto_transfer_results": list(self.last_maix_auto_transfer_results)[-12:],
             "event_seq": int(self.event_seq or 0),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -9105,14 +9212,23 @@ class SessionState:
         workspace_hint = (
             f"Workspace maps directly to live app root {self.files_root}. Relative paths modify the installed app. "
             if bool(getattr(self, "direct_workspace", False))
-            else ""
+            else (
+                f"Workspace is session-local at {self.files_root}. "
+                "Keep routine edits inside this session workspace. "
+                "Only deploy finished MaixCAM apps into /maixapp/apps/<app_name> when the user explicitly asks. "
+            )
         )
-        maix_path_hint = "Absolute paths under /maixapp/apps are allowed when editing installed Maix apps. "
+        maix_auth_hint = self._authorized_maix_app_paths_text() + " "
+        maix_path_hint = (
+            "Absolute paths under /maixapp/apps are allowed only for explicitly authorized installed apps and final deployment. "
+        )
         maix_hint = (
             "If the task involves MaixCAM or MaixPy device development, "
             "load_skill('maixcam-hardware-dev') for hardware/API usage, "
             "load_skill('maixcam-local-app-dev') for app structure and packaging, "
             "and load_skill('maixcam-permission-bridge') when target apps need offline skills/js_lib provisioning. "
+            "MaixCAM app projects must use main.py and app.yaml; app.json alone is not a valid MaixPy app manifest. "
+            "Use the deploy-app CLI when you need to copy a finished session project into /maixapp/apps/<app_name>. "
         )
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
@@ -9131,6 +9247,7 @@ class SessionState:
             "(workspace-paths, task-management, tool-best-practices, context-management). "
             "If execution stalls, load_skill('execution-degradation-recovery'). "
             f"{workspace_hint}"
+            f"{maix_auth_hint}"
             f"{maix_path_hint}"
             f"{maix_hint}"
             f"{html_block}"
@@ -10214,7 +10331,7 @@ class SessionState:
             if not self._is_allowed_absolute_tool_path(str(resolved)):
                 raise ValueError(
                     "illegal absolute path. use relative path, '/workspace/<relative>', "
-                    "or an allowed absolute path under /maixapp/apps"
+                    "or an authorized absolute path under /maixapp/apps/<app_name>"
                 )
             return str(resolved)
         norm = candidate.as_posix().strip()
@@ -10235,7 +10352,7 @@ class SessionState:
             return ""
         return (
             "Error: illegal absolute path for agent tool call. "
-            "Use relative path, '/workspace/<relative>', or an allowed absolute path under /maixapp/apps."
+            "Use relative path, '/workspace/<relative>', or an authorized absolute path under /maixapp/apps/<app_name>."
         )
 
     def _session_path(self, path_text: str) -> Path:
@@ -12306,12 +12423,150 @@ class SessionState:
                 time.sleep(min(1.4, 0.35 * attempt))
         raise last_exc if last_exc is not None else OllamaError("chat failed")
 
+    def _normalized_maix_app_roots(self, items: list[object] | tuple[object, ...] | None = None) -> list[Path]:
+        out: list[Path] = []
+        seen: set[str] = set()
+        for item in list(items or []):
+            root = _maix_device_authorized_app_root(item)
+            if root is None:
+                continue
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(root)
+        return out
+
+    def _authorized_maix_app_roots(self) -> list[Path]:
+        return self._normalized_maix_app_roots(getattr(self, "allowed_maix_app_roots", []))
+
+    def _authorized_maix_app_paths_text(self) -> str:
+        roots = self._authorized_maix_app_roots()
+        if not roots:
+            return (
+                "Installed Maix app paths are blocked by default. "
+                "Grant access only when the user explicitly names /maixapp/apps/<app_name>."
+            )
+        joined = ", ".join(str(p) for p in roots[:6])
+        suffix = " ..." if len(roots) > 6 else ""
+        return (
+            "Authorized installed Maix app roots: "
+            f"{joined}{suffix}. Absolute /maixapp/apps access is limited to these roots."
+        )
+
+    def _grant_maix_app_access_locked(self, roots: list[Path], *, source: str = "user") -> list[str]:
+        merged = self._authorized_maix_app_roots()
+        seen = {str(p) for p in merged}
+        added: list[str] = []
+        for root in roots:
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(root)
+            added.append(key)
+        if added:
+            self.allowed_maix_app_roots = [str(p) for p in merged]
+            self.updated_at = now_ts()
+        return added
+
+    def _ingest_user_maix_permissions_locked(self, content: str) -> list[str]:
+        roots = _extract_maix_app_roots_from_text(content)
+        if not roots:
+            return []
+        return self._grant_maix_app_access_locked(roots, source="user_message")
+
+    def _maix_auto_transfer_ready(self) -> tuple[bool, str]:
+        if not bool(self.auto_transfer_maix_apps):
+            return False, "auto-transfer-disabled"
+        if int(self.last_maix_auto_transfer_generation or 0) >= int(self.run_generation or 0):
+            return False, "already-transferred-for-run"
+        if not MAIX_DEVICE_APPS_ROOT.exists() or not MAIX_DEVICE_APPS_ROOT.is_dir():
+            return False, "apps-root-missing"
+        if bool(self.runtime_goal_reset_pending):
+            return False, "goal-reset-pending"
+        if self.todo.has_open_items():
+            return False, "open-todos"
+        board = self._ensure_blackboard()
+        approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
+        if not bool(approval.get("approved", False)):
+            return False, "not-approved"
+        if self._approval_is_stale_for_latest_user(board):
+            return False, "stale-approval"
+        can_finish, reason = self._can_auto_finish_from_approval(
+            board,
+            latest_user_ts=self._latest_user_message_ts(),
+        )
+        if not can_finish:
+            return False, reason
+        return True, "ok"
+
+    def auto_transfer_detected_maix_apps(self) -> dict:
+        ready, reason = self._maix_auto_transfer_ready()
+        if not ready:
+            return {"ok": False, "reason": reason, "transferred": []}
+        projects = detect_maix_app_projects_in_workspace(self.files_root, max_depth=2)
+        if not projects:
+            return {"ok": False, "reason": "no-app-project-detected", "transferred": []}
+        authorized = self._authorized_maix_app_roots()
+        results: list[dict] = []
+        granted_after_transfer: list[Path] = []
+        for project_dir in projects[:8]:
+            target_name = infer_maix_app_deploy_name(project_dir)
+            for auth_root in authorized:
+                if str(auth_root.name or "").strip() == str(target_name or "").strip():
+                    target_name = str(auth_root.name)
+                    break
+            try:
+                out = deploy_maix_app_project(
+                    project_dir,
+                    app_name=target_name,
+                    overwrite=True,
+                    package_after=False,
+                )
+                results.append(out)
+                target_root = _maix_device_authorized_app_root(out.get("target_dir", ""))
+                if target_root is not None:
+                    granted_after_transfer.append(target_root)
+            except Exception as exc:
+                results.append(
+                    {
+                        "ok": False,
+                        "project_dir": str(project_dir),
+                        "app_name": str(target_name or ""),
+                        "error": trim(str(exc), 240),
+                    }
+                )
+        with self.lock:
+            added = self._grant_maix_app_access_locked(granted_after_transfer, source="auto_transfer")
+            self.last_maix_auto_transfer_generation = int(self.run_generation or 0)
+            self.last_maix_auto_transfer_results = list(results)[-12:]
+            self.updated_at = now_ts()
+            self._persist()
+        ok_count = sum(1 for row in results if isinstance(row, dict) and bool(row.get("ok", False)))
+        if ok_count > 0:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"auto-transferred {ok_count} Maix app project(s) into /maixapp/apps"
+                        + (f"; authorized {len(added)} deployed root(s)" if added else "")
+                    )
+                },
+            )
+        return {
+            "ok": bool(ok_count > 0),
+            "reason": "ok" if ok_count > 0 else "deploy-failed",
+            "transferred": results,
+        }
+
     def _allowed_absolute_roots(self) -> list[Path]:
         roots: list[Path] = [self.root.resolve(), self.files_root.resolve()]
         try:
             roots.append(self.skills.skills_root.resolve())
         except Exception:
             pass
+        roots.extend(self._authorized_maix_app_roots())
         return _runtime_allowed_absolute_roots(roots)
 
     def _is_allowed_absolute_tool_path(self, raw_path: str) -> bool:
@@ -12426,7 +12681,7 @@ class SessionState:
             "Error: write blocked for absolute path(s) outside session/skills scope: "
             f"{preview}{suffix}. "
             "Use relative paths in workspace, write_skill for skills, "
-            "or an allowed absolute path under /maixapp/apps."
+            "or an authorized absolute path under /maixapp/apps/<app_name>."
         )
 
     def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
@@ -18084,13 +18339,18 @@ class SessionState:
         workspace_hint = (
             f"Workspace maps directly to live app root {self.files_root}. Relative paths modify the installed app. "
             if bool(getattr(self, "direct_workspace", False))
-            else ""
+            else (
+                f"Workspace is session-local at {self.files_root}. "
+                "Keep edits here unless the user explicitly asks for deployment into /maixapp/apps/<app_name>. "
+            )
         )
+        maix_auth_hint = self._authorized_maix_app_paths_text() + " "
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: {self.files_root}. Use relative paths. "
             f"{workspace_hint}"
-            "Absolute paths under /maixapp/apps are allowed when editing installed Maix apps. "
+            f"{maix_auth_hint}"
+            "Absolute paths under /maixapp/apps are allowed only for explicitly authorized installed-app edits and final deployment. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             "Use load_skill for detailed guidance (multi-agent-guide, code-review-checklist, finish-protocol). "
@@ -19205,7 +19465,9 @@ class SessionState:
         text = trim(str(content or "").strip(), 6000)
         if not text:
             raise ValueError("content required")
+        granted_paths: list[str] = []
         with self.lock:
+            granted_paths = self._ingest_user_maix_permissions_locked(text)
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
             round_idx = int(self.agent_round_index)
@@ -19234,6 +19496,17 @@ class SessionState:
                 )
             },
         )
+        if granted_paths:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "authorized installed Maix app access from live input: "
+                        + ", ".join(granted_paths[:4])
+                        + (" ..." if len(granted_paths) > 4 else "")
+                    )
+                },
+            )
         return row
 
     def _inject_pending_user_inputs(self) -> int:
@@ -19315,6 +19588,7 @@ class SessionState:
         start_worker = False
         dropped_stale_inputs = 0
         removed_runtime_hints = 0
+        granted_paths: list[str] = []
         with self.lock:
             if self.running:
                 pass
@@ -19324,6 +19598,7 @@ class SessionState:
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
+                granted_paths = self._ingest_user_maix_permissions_locked(clean_goal)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
                 self.runtime_reclassify_goal = clean_goal
                 self.runtime_reclassify_required = True
@@ -19365,6 +19640,17 @@ class SessionState:
                 "delay_rounds": int(row.get("delay_rounds", 0) or 0),
                 "delay_reason": str(row.get("delay_reason", "")),
             }
+        if granted_paths:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "authorized installed Maix app access: "
+                        + ", ".join(granted_paths[:4])
+                        + (" ..." if len(granted_paths) > 4 else "")
+                    )
+                },
+            )
         threading.Thread(target=self._agent_worker, daemon=True).start()
         return {"ok": True, "queued": False, "running": True}
 
@@ -21584,6 +21870,10 @@ class SessionState:
                 },
                 "event_seq": int(self.event_seq or 0),
                 "session_files_root": str(self.files_root),
+                "session_workspace_mode": "direct" if bool(self.direct_workspace) else "session",
+                "authorized_maix_app_roots": [str(p) for p in self._authorized_maix_app_roots()],
+                "auto_transfer_maix_apps": bool(self.auto_transfer_maix_apps),
+                "last_maix_auto_transfer_results": list(self.last_maix_auto_transfer_results)[-12:],
                 "llm_model_catalog": model_catalog,
                 "messages": visible_messages,
                 "conversation_feed": conversation_feed[-conversation_window:],
@@ -26055,6 +26345,31 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        mgr = None
+        sess = None
+        with self._lock:
+            mgr = self._session_mgrs.get(str(user_id or ""))
+        if mgr is not None:
+            try:
+                sess = mgr.get(str(session_id or ""))
+            except Exception:
+                sess = None
+        if isinstance(sess, SessionState):
+            try:
+                sess.auto_transfer_detected_maix_apps()
+            except Exception as exc:
+                try:
+                    sess._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "auto-transfer skipped: "
+                                f"{trim(str(exc), 180)}"
+                            )
+                        },
+                    )
+                except Exception:
+                    pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -27240,6 +27555,8 @@ class Handler(BaseHTTPRequestHandler):
                     "supported_languages": supported_ui_languages_payload(),
                     "repo_root": str(REPO_ROOT),
                     "skills_root": str(self.app.skills_root),
+                    "maix_apps_root": str(MAIX_DEVICE_APPS_ROOT),
+                    "authorized_maix_app_roots": [],
                     "llm_config_path": str(LLM_CONFIG_PATH),
                     "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
                     "skills_port": skills_port,
@@ -27255,6 +27572,7 @@ class Handler(BaseHTTPRequestHandler):
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
+                    "session_workspace_mode": "direct" if bool(getattr(self.app, "direct_session_workspace", False)) else "session",
                     "arbiter_enabled": bool(mgr.arbiter_enabled),
                     "arbiter_model": str(mgr.arbiter_model or ""),
                     "arbiter_timeout_seconds": float(mgr.arbiter_timeout_seconds),
@@ -27520,6 +27838,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": f"{exc}. Please upload LLM.config.json in WebUI first."}, status=404)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/sessions/([^/]+)/deploy-app$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            payload = self._read_json()
+            default_name = ""
+            try:
+                app_workspace = Path(str(self.app.workspace or "")).resolve()
+                if _path_is_within_root(app_workspace, MAIX_DEVICE_APPS_ROOT):
+                    default_name = app_workspace.name
+            except Exception:
+                default_name = ""
+            app_name = str(payload.get("app_name", payload.get("name", default_name or sess.title or sess.id))).strip()
+            overwrite = bool(payload.get("overwrite", False))
+            package_after = bool(payload.get("package", False))
+            try:
+                out = deploy_maix_app_project(
+                    sess.files_root,
+                    app_name=app_name,
+                    overwrite=overwrite,
+                    package_after=package_after,
+                )
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_json(out, status=201)
         if path == "/api/sessions":
             payload = self._read_json()
             sess = mgr.create(payload.get("title"))
@@ -28348,6 +28692,181 @@ def _maix_device_collect_package_entries(project_dir: Path, manifest: dict) -> l
     return [(src, PurePosixPath(dst)) for dst, src in sorted(unique.items())]
 
 
+def _maix_device_safe_app_dir_name(raw: object, fallback: str = "maix_app") -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "")).strip("._")
+    return safe or str(fallback or "maix_app")
+
+
+def _maix_device_copy_project_tree(
+    source_dir: Path | str,
+    target_dir: Path | str,
+    *,
+    overwrite: bool = False,
+    exclude_patterns: list[str] | None = None,
+) -> dict:
+    source = Path(source_dir).resolve()
+    target = Path(target_dir).resolve()
+    if not source.exists() or not source.is_dir():
+        raise FileNotFoundError(f"project source not found: {source}")
+    target.mkdir(parents=True, exist_ok=True)
+    patterns = list(exclude_patterns or MAIX_DEVICE_PACKAGE_EXCLUDES)
+    copied = 0
+    skipped = 0
+    for fp in sorted(source.rglob("*")):
+        if not fp.is_file():
+            continue
+        rel = PurePosixPath(fp.relative_to(source).as_posix())
+        if _maix_device_match_exclude(rel, patterns):
+            continue
+        dst = target / rel.as_posix()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and not overwrite:
+            skipped += 1
+            continue
+        if dst.exists() and (dst.is_dir() and not dst.is_symlink()):
+            if overwrite:
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                skipped += 1
+                continue
+        elif dst.exists() and dst.is_symlink() and overwrite:
+            dst.unlink(missing_ok=True)
+        shutil.copy2(fp, dst)
+        copied += 1
+    return {
+        "ok": True,
+        "source_dir": str(source),
+        "target_dir": str(target),
+        "copied_files": int(copied),
+        "skipped_files": int(skipped),
+        "exclude": list(patterns),
+    }
+
+
+def deploy_maix_app_project(
+    source_dir: Path | str,
+    *,
+    app_name: str = "",
+    overwrite: bool = False,
+    package_after: bool = False,
+) -> dict:
+    source = Path(source_dir).resolve()
+    if not source.exists() or not source.is_dir():
+        raise FileNotFoundError(f"project source not found: {source}")
+    default_name = source.name or "maix_app"
+    safe_name = _maix_device_safe_app_dir_name(app_name or default_name, fallback=default_name)
+    target = (MAIX_DEVICE_APPS_ROOT / safe_name).resolve()
+    if not _path_is_within_root(target, MAIX_DEVICE_APPS_ROOT):
+        raise ValueError(f"illegal app target path: {target}")
+    if source == target:
+        raise ValueError("deploy source and target are the same path; choose another app name or deploy from a session workspace")
+    has_main = bool((source / "main.py").exists())
+    has_manifest = bool((source / "app.yaml").exists())
+    if not (has_main and has_manifest):
+        raise ValueError("source project is not a MaixPy app; main.py and app.yaml are required before deployment")
+
+    existed = bool(target.exists())
+    if existed and overwrite:
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+
+    copy_result = _maix_device_copy_project_tree(
+        source,
+        target,
+        overwrite=bool(overwrite),
+        exclude_patterns=list(MAIX_DEVICE_PACKAGE_EXCLUDES),
+    )
+
+    try:
+        source_manifest = _load_maix_app_manifest(source)
+    except Exception:
+        source_manifest = {}
+    source_permission = source_manifest.get("permission_passthrough", {}) if isinstance(source_manifest, dict) else {}
+    provision_result = provision_maix_offline_assets(
+        target,
+        manifest=source_manifest if isinstance(source_manifest, dict) else {},
+        source_project_dir=source,
+        overwrite=bool(overwrite),
+        mode=str((source_permission or {}).get("mode", "copy") or "copy"),
+    )
+    fallback_manifest = {}
+    try:
+        fallback_manifest = _load_maix_app_manifest(SCRIPT_DIR)
+    except Exception:
+        fallback_manifest = _maix_device_manifest_payload()
+    fallback_permission = fallback_manifest.get("permission_passthrough", {}) if isinstance(fallback_manifest, dict) else {}
+    fallback_assets = provision_maix_offline_assets(
+        target,
+        manifest=fallback_manifest if isinstance(fallback_manifest, dict) else {},
+        source_project_dir=SCRIPT_DIR,
+        overwrite=bool(overwrite),
+        mode=str((fallback_permission or {}).get("mode", "copy") or "copy"),
+    )
+    package_result = {}
+    if package_after:
+        package_result = package_maix_app_project(target)
+    return {
+        "ok": True,
+        "source_dir": str(source),
+        "target_dir": str(target),
+        "app_name": safe_name,
+        "target_existed": existed,
+        "overwrite": bool(overwrite),
+        "copy": copy_result,
+        "offline_assets": provision_result,
+        "shared_assets": fallback_assets,
+        "package": package_result,
+    }
+
+
+def detect_maix_app_projects_in_workspace(workspace_dir: Path | str, max_depth: int = 2) -> list[Path]:
+    root = Path(workspace_dir).resolve()
+    if not root.exists() or not root.is_dir():
+        return []
+    out: list[Path] = []
+    seen: set[str] = set()
+    candidates = [root / "app.yaml"]
+    for manifest in sorted(root.rglob("app.yaml")):
+        candidates.append(manifest)
+    for manifest in candidates:
+        try:
+            manifest_path = Path(manifest).resolve()
+        except Exception:
+            continue
+        if not manifest_path.exists() or not manifest_path.is_file():
+            continue
+        project_dir = manifest_path.parent
+        try:
+            rel = project_dir.relative_to(root)
+            depth = len(rel.parts)
+        except Exception:
+            depth = 0
+        if depth > int(max_depth):
+            continue
+        if any(part in {".git", "__pycache__", "dist", "skills", "js_lib"} for part in project_dir.parts):
+            continue
+        if not (project_dir / "main.py").exists():
+            continue
+        key = str(project_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(project_dir)
+    return sorted(out)
+
+
+def infer_maix_app_deploy_name(project_dir: Path | str) -> str:
+    root = Path(project_dir).resolve()
+    try:
+        manifest = _load_maix_app_manifest(root)
+    except Exception:
+        manifest = {}
+    raw = str(manifest.get("id", "") or root.name or "maix_app").strip()
+    return _maix_device_safe_app_dir_name(raw, fallback=root.name or "maix_app")
+
+
 def package_maix_app_project(project_dir: Path | str, output_dir: Path | str | None = None) -> dict:
     root = Path(project_dir).resolve()
     if root == SCRIPT_DIR:
@@ -28558,6 +29077,15 @@ def _maix_device_start_service(workspace_dir: Path | str, config: dict, maix_app
         cmd.append("--no_Skills_UI")
     env = dict(os.environ)
     env["AGENT_WORKDIR"] = str(root)
+    if str(config.get("target_mode", "self") or "self").strip().lower() == "app":
+        authorized_root = _maix_device_authorized_app_root(str(root))
+        if authorized_root is not None:
+            joined = str(authorized_root)
+            prev_abs = str(env.get("AGENT_ALLOWED_ABSOLUTE_ROOTS", "") or "").strip()
+            env["AGENT_ALLOWED_ABSOLUTE_ROOTS"] = (
+                prev_abs + os.pathsep + joined if prev_abs else joined
+            )
+            env["AGENT_ALLOWED_MAIX_APP_ROOTS"] = joined
     log_fp = open(service_log, "ab")
     try:
         proc = subprocess.Popen(
@@ -29803,6 +30331,31 @@ def main():
         action="store_true",
         help="Overwrite conflicts when provisioning offline assets.",
     )
+    parser.add_argument(
+        "--deploy-app",
+        action="store_true",
+        help="Copy a finished MaixPy project into /maixapp/apps/<app_name>.",
+    )
+    parser.add_argument(
+        "--deploy-source",
+        default="",
+        help="Source project directory used by --deploy-app. Default: current Clouds Coder app project.",
+    )
+    parser.add_argument(
+        "--deploy-name",
+        default="",
+        help="Destination app folder name under /maixapp/apps used by --deploy-app.",
+    )
+    parser.add_argument(
+        "--deploy-overwrite",
+        action="store_true",
+        help="Replace an existing /maixapp/apps/<app_name> directory before deployment.",
+    )
+    parser.add_argument(
+        "--deploy-package",
+        action="store_true",
+        help="Package the deployed app after copying it into /maixapp/apps.",
+    )
     parser.set_defaults(auto_model_switch=False, use_external_web_ui=None, arbiter_enabled=True)
     args = parser.parse_args()
     if bool(getattr(args, "device_ui", False)):
@@ -29818,6 +30371,23 @@ def main():
             return 0
         except Exception as exc:
             print(f"[maix-app] package failed: {exc}")
+            return 2
+    if bool(getattr(args, "deploy_app", False)):
+        source_dir = Path(str(getattr(args, "deploy_source", "") or SCRIPT_DIR)).expanduser().resolve()
+        try:
+            out = deploy_maix_app_project(
+                source_dir,
+                app_name=str(getattr(args, "deploy_name", "") or "").strip(),
+                overwrite=bool(getattr(args, "deploy_overwrite", False)),
+                package_after=bool(getattr(args, "deploy_package", False)),
+            )
+            print(f"[maix-app] deployed {out.get('target_dir')}")
+            package_info = out.get("package", {}) if isinstance(out, dict) else {}
+            if isinstance(package_info, dict) and package_info.get("package_path"):
+                print(f"[maix-app] package {package_info.get('package_path')}")
+            return 0
+        except Exception as exc:
+            print(f"[maix-app] deploy failed: {exc}")
             return 2
     if bool(getattr(args, "provision_links", False)):
         target_dir = str(getattr(args, "provision_target", "") or "").strip()
