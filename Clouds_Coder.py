@@ -20849,7 +20849,11 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
-                    # Parse plan choice immediately — don't wait for classification
+                self.run_generation = int(self.run_generation) + 1
+                clean_goal = trim(str(content or "").strip(), 4000)
+                self.messages.append({"role": "user", "content": content, "ts": now_ts()})
+                # Parse plan choice immediately after clean_goal is available
+                if _awaiting_plan_choice:
                     choice = self._parse_plan_choice(clean_goal, self.runtime_plan_proposal)
                     if choice:
                         self.runtime_plan_choice = choice
@@ -20858,9 +20862,6 @@ class SessionState:
                         self._inject_plan_into_context(choice)
                         self.runtime_reclassify_required = False
                         self.runtime_goal_reset_pending = False
-                self.run_generation = int(self.run_generation) + 1
-                clean_goal = trim(str(content or "").strip(), 4000)
-                self.messages.append({"role": "user", "content": content, "ts": now_ts()})
                 # Restart intent fusion: merge user/plan/context intents
                 if self._is_restart_scenario():
                     self._fuse_restart_intent(clean_goal)
