@@ -44,7 +44,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODES_ROOT = WORKDIR / "Codes"
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 MAX_TOOL_OUTPUT = 50_000
-TOKEN_THRESHOLD = 100_000
+TOKEN_THRESHOLD = 1_000_000
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
@@ -93,7 +93,30 @@ TRUNCATION_CONTINUATION_ECHO_CHARS = 12000
 TRUNCATION_OVERLAP_SCAN_CHARS = 420
 TRUNCATION_PAIR_SCAN_CHARS = 120_000
 TRUNCATION_LIVE_BUFFER_MAX_CHARS = 32000
-MIN_CONTEXT_TOKEN_LIMIT = 18_000
+MIN_CONTEXT_TOKEN_LIMIT = 4_000
+# Tiered compression thresholds (fraction of ctx_left / limit)
+COMPACT_TIER1_PCT = 0.40   # >40% left: normal; 20-40%: tier 1 light
+COMPACT_TIER2_PCT = 0.20   # 10-20%: tier 2 medium
+COMPACT_TIER3_PCT = 0.10   # <10%: tier 3 heavy
+# Absolute minimums — prevent percentage instability at low ctx_left
+COMPACT_TIER1_ABS = 3000
+COMPACT_TIER2_ABS = 1500
+# File buffer
+FILE_BUFFER_CONTENT_THRESHOLD = 2000  # chars: content larger than this gets offloaded
+FILE_BUFFER_MAX_FILES = 500
+# Agent context limits per tier (messages count)
+AGENT_MSG_LIMIT_TIER0 = 800
+AGENT_MSG_LIMIT_TIER1 = 400
+AGENT_MSG_LIMIT_TIER2 = 200
+AGENT_MSG_LIMIT_TIER3 = 80
+AGENT_CTX_LIMIT_TIER0 = 400
+AGENT_CTX_LIMIT_TIER1 = 200
+AGENT_CTX_LIMIT_TIER2 = 100
+AGENT_CTX_LIMIT_TIER3 = 40
+MANAGER_CTX_LIMIT_TIER0 = 400
+MANAGER_CTX_LIMIT_TIER1 = 200
+MANAGER_CTX_LIMIT_TIER2 = 100
+MANAGER_CTX_LIMIT_TIER3 = 40
 MAX_CONTEXT_ARCHIVE_SEGMENTS = 1200
 MODEL_OUTPUT_RETRY_TIMES = 3
 ARBITER_TRIGGER_MIN_CONTENT_CHARS = 50
@@ -166,21 +189,24 @@ EXECUTION_MODE_CHOICES = (
     EXECUTION_MODE_SYNC,
 )
 AGENT_ROLES = ("explorer", "developer", "reviewer")
-AGENT_BUBBLE_ROLES = AGENT_ROLES + ("manager",)
+AGENT_BUBBLE_ROLES = AGENT_ROLES + ("manager", "planner")
 AGENT_ROLE_LABELS = {
     "explorer": "Explorer",
     "developer": "Developer",
     "reviewer": "Reviewer",
     "manager": "Manager",
+    "planner": "Planner",
 }
 AGENT_ROLE_BUBBLE_COLORS = {
     "explorer": "#ff5fa2",
     "developer": "#22b455",
     "reviewer": "#dca61b",
     "manager": "#7c3aed",
+    "planner": "#e8533f",
 }
 BLACKBOARD_STATUSES = (
     "INITIALIZING",
+    "PLANNING",
     "RESEARCHING",
     "CODING",
     "TESTING",
@@ -254,6 +280,91 @@ SKILL_PROMPT_MAX_ITEMS = 40
 SKILL_PROMPT_MAX_CHARS = 2600
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
+PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
+PLAN_MODE_FORCED_LEVELS = {4, 5}
+PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
+# Task phase definitions for stage-aware delegation
+TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
+TASK_PHASE_ROUTING = {
+    "research": "explorer",
+    "design": "explorer",
+    "implement": "developer",
+    "test": "developer",
+    "review": "reviewer",
+    "deploy": "developer",
+}
+# Complexity keywords for semantic detection
+COMPLEXITY_KEYWORDS = (
+    "简单", "复杂", "难", "容易", "快速", "详细", "深入",
+    "l1", "l2", "l3", "l4", "l5",
+    "simple", "complex", "easy", "hard", "difficult",
+    "thorough", "quick", "fast", "lightweight", "heavy",
+)
+PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
+# Reviewer debug mode
+REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
+REVIEWER_DEBUG_TOOL_ALLOWLIST = {
+    "bash", "read_file", "write_file", "edit_file",
+    "read_from_blackboard", "write_to_blackboard",
+    "finish_task", "finish_current_task",
+}
+EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
+PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 4096
+PLAN_MODE_MAX_OPTIONS = 3
+PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
+    "bash", "read_file", "context_recall", "task_get", "task_list",
+    "check_background", "read_from_blackboard", "write_to_blackboard",
+    "list_skills", "load_skill", "compress",
+}
+FAILURE_LEDGER_MAX_FIXES = 20
+FAILURE_LEDGER_MAX_COMPILE_ERRORS = 15
+FAILURE_LEDGER_MAX_DELEGATIONS = 10
+FAILURE_LEDGER_MAX_STALLS = 8
+FAILURE_LEDGER_MAX_TOOL_FPS = 30
+FAILURE_LEDGER_MAX_ERRORS = 25
+# Error category definitions: (name, {cmd_keywords, output_patterns, success_negatives, label})
+# Priority order matters — first match wins. test before runtime because pytest cmd contains 'python'.
+ERROR_CATEGORY_DEFS: list[tuple[str, dict]] = [
+    ("test", {
+        "cmd_keywords": ["pytest", "unittest", "nose", "jest", "mocha", "vitest", "cargo test", "go test", "phpunit", "rspec", "mix test"],
+        "output_patterns": ["FAILED", "ERRORS", "AssertionError", "assert ", "expected ", "failures=", "test failed", "FAIL:"],
+        "success_negatives": ["failed", "error", "FAILED"],
+        "label": "测试错误",
+    }),
+    ("lint", {
+        "cmd_keywords": ["mypy", "pylint", "flake8", "ruff", "eslint", "tsc ", "typescript", "clippy", "golint", "rubocop", "shellcheck"],
+        "output_patterns": ["error:", "warning:", "violation", "rule ", "type error", "incompatible type", "unused variable"],
+        "success_negatives": ["error:", "violation", "type error"],
+        "label": "Lint/类型错误",
+    }),
+    ("compilation", {
+        "cmd_keywords": ["make", "gcc", "gfortran", "g++", "clang", "cmake", "cargo build", "javac", "rustc", "msbuild", "dotnet build", "go build"],
+        "output_patterns": ["error:", "fatal error", "syntax error", "compile error", "undefined reference", "linker error"],
+        "success_negatives": ["error:", "fatal error", "syntax error"],
+        "label": "编译错误",
+    }),
+    ("build_package", {
+        "cmd_keywords": ["npm run build", "yarn build", "webpack", "vite build", "pip install", "poetry install", "bundle install", "gradle", "mvn ", "maven"],
+        "output_patterns": ["error:", "ERR!", "build failed", "ModuleNotFoundError", "cannot find module", "dependency", "resolution failed"],
+        "success_negatives": ["error:", "ERR!", "build failed"],
+        "label": "构建/包错误",
+    }),
+    ("deploy_infra", {
+        "cmd_keywords": ["docker", "kubectl", "terraform", "ansible", "cdk ", "pulumi", "serverless", "sam deploy", "helm"],
+        "output_patterns": ["error:", "failed", "denied", "timeout", "unreachable", "ImagePullBackOff", "CrashLoopBackOff"],
+        "success_negatives": ["error:", "failed", "denied"],
+        "label": "部署/基础设施错误",
+    }),
+    ("runtime", {
+        "cmd_keywords": ["python", "node ", "ruby ", "java ", "go run", "cargo run", "php ", "perl ", "bash ", "sh ", "./"],
+        "output_patterns": ["Traceback", "Exception", "Error:", "panic:", "segfault", "SIGSEGV", "core dumped", "stack trace", "at Object.", "RuntimeError"],
+        "success_negatives": ["Traceback", "Exception", "Error:", "panic:", "segfault"],
+        "label": "运行时错误",
+    }),
+]
+CHECKPOINT_MAX_COUNT = 3
+CHECKPOINT_INTERVAL_ROUNDS = 6
+PERSISTED_ROUTES_MAX = 8
 HTML_FRONTEND_REQUEST_KEYWORDS = (
     "html",
     "web page",
@@ -7276,6 +7387,11 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_plan_mode_needed = False
+        self.runtime_plan_approved = False
+        self.runtime_plan_proposal = {}
+        self.runtime_plan_choice = ""
+        self.plan_mode_user_preference = "auto"  # "auto"|"on"|"off"
         self.rounds_without_todo = 0
         self.last_todo_reminder_ts = 0.0
         self.todo_reminder_count = 0
@@ -7283,6 +7399,12 @@ class SessionState:
         self.todo_last_issue = ""
         self.last_toolcall_overflow_hint_ts = 0.0
         self.last_reviewer_gate_warn_ts = 0.0
+        self.reviewer_debug_mode = False
+        self.reviewer_debug_rounds = 0
+        self.reviewer_debug_context = ""
+        self.explorer_consecutive_delegations = 0
+        self.last_explorer_instruction_hash = ""
+        self._pending_media_inputs: list[dict] = []
         self.tool_retry_counts: dict[str, int] = {}
         self.last_auto_title_ts = 0.0
         self.live_thinking_text = ""
@@ -7337,6 +7459,9 @@ class SessionState:
         self.context_archives: list[dict] = []
         self.last_compact_reason = ""
         self.last_compact_ts = 0.0
+        self.file_buffer_dir = self.root / "file_buffer"
+        self.file_buffer_dir.mkdir(parents=True, exist_ok=True)
+        self.file_buffer_index: dict[str, dict] = {}  # ref_id -> {path, chars, summary}
         self.created_at = now_ts()
         self.updated_at = now_ts()
         self.shutdown_requests: dict[str, dict] = {}
@@ -7477,6 +7602,21 @@ class SessionState:
                 used_rel=used_rel,
             )
             items.extend(extra)
+        # Merge pending media inputs from read_file (multimodal file reads)
+        with self.lock:
+            pending = list(getattr(self, "_pending_media_inputs", []))
+            self._pending_media_inputs = []
+        for media in pending:
+            kind = str(media.get("type", "") or "").strip().lower()
+            if kind not in kind_allow:
+                continue
+            rel = str(media.get("workspace_path", "") or "")
+            if rel in used_rel:
+                continue
+            if len(items) >= max_items:
+                break
+            items.append(media)
+            used_rel.add(rel)
         return items
 
     def _latest_user_message_ts(self) -> float:
@@ -8190,8 +8330,25 @@ class SessionState:
                             }
                         )
                     self.context_archives = clean_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
+                # Restore file_buffer_index
+                raw_fbi = raw.get("file_buffer_index", {})
+                if isinstance(raw_fbi, dict):
+                    clean_fbi: dict[str, dict] = {}
+                    for ref_id, entry in raw_fbi.items():
+                        if isinstance(entry, dict) and entry.get("path"):
+                            clean_fbi[str(ref_id)] = {
+                                "path": str(entry.get("path", "")),
+                                "chars": int(entry.get("chars", 0) or 0),
+                                "summary": trim(str(entry.get("summary", "") or ""), 200),
+                            }
+                    self.file_buffer_index = clean_fbi
                 self.last_compact_reason = str(raw.get("last_compact_reason", self.last_compact_reason) or "")
                 self.last_compact_ts = float(raw.get("last_compact_ts", self.last_compact_ts) or 0.0)
+                pref = str(raw.get("plan_mode_user_preference", "auto") or "auto").lower()
+                self.plan_mode_user_preference = pref if pref in PLAN_MODE_USER_CHOICES else "auto"
+                self.reviewer_debug_mode = bool(raw.get("reviewer_debug_mode", False))
+                self.reviewer_debug_rounds = int(raw.get("reviewer_debug_rounds", 0) or 0)
+                self.reviewer_debug_context = trim(str(raw.get("reviewer_debug_context", "") or ""), 1000)
                 pending_inputs = raw.get("pending_user_inputs", [])
                 if isinstance(pending_inputs, list):
                     clean_pending: list[dict] = []
@@ -8400,8 +8557,13 @@ class SessionState:
             "last_truncation_ts": self.last_truncation_ts,
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
             "context_archives": self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:],
+            "file_buffer_index": dict(self.file_buffer_index) if self.file_buffer_index else {},
             "last_compact_reason": self.last_compact_reason,
             "last_compact_ts": self.last_compact_ts,
+            "plan_mode_user_preference": str(self.plan_mode_user_preference or "auto"),
+            "reviewer_debug_mode": bool(self.reviewer_debug_mode),
+            "reviewer_debug_rounds": int(self.reviewer_debug_rounds or 0),
+            "reviewer_debug_context": trim(str(self.reviewer_debug_context or ""), 1000),
             "pending_user_inputs": self.pending_user_inputs[-40:],
             "run_generation": int(self.run_generation),
             "agent_round_index": int(self.agent_round_index),
@@ -8580,6 +8742,7 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_plan_mode_needed = False
         return removed_hints
 
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
@@ -8919,6 +9082,10 @@ class SessionState:
                 "If execution stalls, load_skill('execution-degradation-recovery'). "
             )
         )
+        plan_steps_block = ""
+        plan_ctx = self._plan_steps_context_for_manager()
+        if plan_ctx:
+            plan_steps_block = f"{plan_ctx}\n"
         return (
             f"You are a coding agent. Workspace: {self.files_root}. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
@@ -8928,6 +9095,7 @@ class SessionState:
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task when done. "
             f"{skill_hint}"
+            f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
@@ -8936,7 +9104,28 @@ class SessionState:
         )
 
     def _estimate_tokens(self) -> int:
-        return len(json_dumps(self.messages)) // 4
+        # Core: messages (global or agent context depending on mode)
+        if self._is_multi_agent_mode():
+            # In multi-agent mode, the actual context sent to the model is per-role
+            # agent_messages filtered by active role. Use the largest agent context
+            # as the representative cost, since that's the bottleneck.
+            agent_max = 0
+            for role in (self.runtime_participants or AGENT_ROLES):
+                ctx = self._agent_context(role)
+                if ctx:
+                    cost = len(json_dumps(ctx)) // 4
+                    if cost > agent_max:
+                        agent_max = cost
+            msg_tokens = max(agent_max, len(json_dumps(self.messages)) // 4)
+        else:
+            msg_tokens = len(json_dumps(self.messages)) // 4
+        # Overhead: system prompt + tools (always present in API calls)
+        try:
+            sys_tokens = len(self._system_prompt()) // 4
+        except Exception:
+            sys_tokens = 300
+        tools_tokens = len(json_dumps(TOOLS)) // 4 if TOOLS else 0
+        return msg_tokens + sys_tokens + tools_tokens
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
         limit = max(1, int(self.context_token_upper_bound or 0))
@@ -8952,8 +9141,86 @@ class SessionState:
             "used_percent": used_pct,
         }
 
+    def _context_compression_tier(self, metrics: dict | None = None) -> int:
+        """Return compression tier 0-3 based on context budget.
+        Tier 0: >40% left (normal)
+        Tier 1: 20-40% left (light — aggressive microcompact, trim outputs)
+        Tier 2: 10-20% left (medium — compact agent contexts, file buffer)
+        Tier 3: <10% left (heavy — deep compact everything)
+        """
+        m = metrics or self._context_budget_metrics()
+        left = int(m.get("left", 0))
+        left_pct = float(m.get("left_percent", 100.0)) / 100.0
+        if left < COMPACT_TIER2_ABS:
+            return 3
+        if left < COMPACT_TIER1_ABS:
+            return max(2, 3 if left_pct < COMPACT_TIER3_PCT else 2)
+        if left_pct < COMPACT_TIER3_PCT:
+            return 3
+        if left_pct < COMPACT_TIER2_PCT:
+            return 2
+        if left_pct < COMPACT_TIER1_PCT:
+            return 1
+        return 0
+
+    def _tier_agent_context_limits(self, tier: int) -> dict:
+        """Return message count limits for agent_messages, contexts, manager_context by tier."""
+        t = min(max(tier, 0), 3)
+        return {
+            "agent_messages": [AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3][t],
+            "context_per_role": [AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3][t],
+            "manager_context": [MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3][t],
+        }
+
+    def _compact_agent_contexts(self, tier: int):
+        """Compress agent_messages, manager_context, and per-role contexts based on tier."""
+        limits = self._tier_agent_context_limits(tier)
+        am_limit = limits["agent_messages"]
+        ctx_limit = limits["context_per_role"]
+        mgr_limit = limits["manager_context"]
+        # 1. Microcompact agent messages (tier >= 1)
+        if tier >= 1:
+            keep = max(1, 3 - tier)  # tier1=2, tier2=1, tier3=0(but min 1)
+            self._microcompact_agent_messages(self.agent_messages, keep_recent=keep)
+        # 2. Trim agent_messages to limit
+        if len(self.agent_messages) > am_limit:
+            self.agent_messages = self.agent_messages[-am_limit:]
+        # 3. Trim manager_context
+        if len(self.manager_context) > mgr_limit:
+            self.manager_context = self.manager_context[-mgr_limit:]
+        # 4. Trim per-role contexts
+        for role in AGENT_ROLES:
+            ctx = self.contexts.get(role, [])
+            if len(ctx) > ctx_limit:
+                self.contexts[role] = ctx[-ctx_limit:]
+        # 5. Tier 2+: offload large content in agent messages to file buffer
+        if tier >= 2:
+            self._offload_agent_message_content(self.agent_messages)
+            self._offload_agent_message_content(self.manager_context)
+        # 6. Tier 3: aggressive content trimming
+        if tier >= 3:
+            for msg in self.agent_messages:
+                c = msg.get("content", "")
+                if isinstance(c, str) and len(c) > 600:
+                    msg["content"] = trim(c, 600)
+            for msg in self.manager_context:
+                c = msg.get("content", "")
+                if isinstance(c, str) and len(c) > 600:
+                    msg["content"] = trim(c, 600)
+
     def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
-        self._microcompact()
+        metrics = self._context_budget_metrics()
+        tier = self._context_compression_tier(metrics)
+        # Tier 1+: apply progressively aggressive microcompact
+        if tier >= 1:
+            keep = max(1, 3 - tier)
+            self._microcompact(keep_recent=keep)
+        else:
+            self._microcompact()
+        # Tier 2+: compact agent contexts proactively
+        if tier >= 2:
+            self._compact_agent_contexts(tier)
+        # Re-check after tier-based compression
         metrics = self._context_budget_metrics()
         used = int(metrics.get("used", 0) or 0)
         limit = max(1, int(metrics.get("limit", 0) or 0))
@@ -9757,10 +10024,10 @@ class SessionState:
                 total += len(str(row.get("content", ""))) // 4
             return total
 
-    def _select_compact_tail(self, token_budget: int, min_count: int = 8, max_count: int = 48) -> list[dict]:
+    def _select_compact_tail(self, token_budget: int, min_count: int = 4, max_count: int = 48) -> list[dict]:
         if not self.messages:
             return []
-        budget = max(2000, int(token_budget))
+        budget = max(1000, int(token_budget))
         selected: list[dict] = []
         total = 0
         for row in reversed(self.messages):
@@ -9809,6 +10076,60 @@ class SessionState:
         self.context_archives.append(seg)
         self.context_archives = self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
         return seg
+
+    # --- File buffer methods (修改 7) ---
+
+    def _offload_to_file_buffer(self, content: str, label: str = "") -> str:
+        """Write large content to disk, return compact reference placeholder."""
+        if len(content) < FILE_BUFFER_CONTENT_THRESHOLD:
+            return content
+        ref_id = f"fb_{int(now_ts())}_{uuid.uuid4().hex[:6]}"
+        fp = self.file_buffer_dir / f"{ref_id}.txt"
+        fp.write_text(content, encoding="utf-8")
+        summary = trim(content, 120).replace("\n", " ")
+        self.file_buffer_index[ref_id] = {
+            "path": fp.relative_to(self.root).as_posix(),
+            "chars": len(content),
+            "summary": summary,
+        }
+        # Prune old entries if over limit
+        if len(self.file_buffer_index) > FILE_BUFFER_MAX_FILES:
+            oldest_keys = sorted(self.file_buffer_index.keys())[:len(self.file_buffer_index) - FILE_BUFFER_MAX_FILES]
+            for k in oldest_keys:
+                old_path = self.root / self.file_buffer_index[k].get("path", "")
+                if old_path.exists():
+                    try:
+                        old_path.unlink()
+                    except Exception:
+                        pass
+                del self.file_buffer_index[k]
+        return f"[file_buffer:{ref_id} chars={len(content)} summary={summary}]"
+
+    def _load_from_file_buffer(self, ref_id: str) -> str:
+        """Load content from file buffer by reference ID."""
+        entry = self.file_buffer_index.get(ref_id)
+        if not entry:
+            return f"[file_buffer:{ref_id} not found]"
+        fp = self.root / entry.get("path", "")
+        if not fp.exists():
+            return f"[file_buffer:{ref_id} file missing]"
+        try:
+            return fp.read_text(encoding="utf-8")
+        except Exception as exc:
+            return f"[file_buffer:{ref_id} read error: {exc}]"
+
+    def _offload_agent_message_content(self, messages: list[dict]):
+        """Scan messages and offload large string content to file buffer."""
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) >= FILE_BUFFER_CONTENT_THRESHOLD:
+                msg["content"] = self._offload_to_file_buffer(content, label=msg.get("role", ""))
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        bc = block.get("content", "")
+                        if isinstance(bc, str) and len(bc) >= FILE_BUFFER_CONTENT_THRESHOLD:
+                            block["content"] = self._offload_to_file_buffer(bc, label=block.get("type", ""))
 
     def _summarize_compact_rows(self, rows: list[dict]) -> str:
         if not rows:
@@ -9882,17 +10203,145 @@ class SessionState:
             lines.append(f"Current focus: {focus}")
         lines.append(f"Open tasks ({len(task_open)}):")
         lines.extend(task_open[:6] if task_open else ["- none"])
+        # Checkpoint drift detection
+        bb = self._ensure_blackboard()
+        cps = bb.get("checkpoints", [])
+        if isinstance(cps, list) and len(cps) >= 2:
+            latest_cp = cps[-1] if isinstance(cps[-1], dict) else {}
+            prev_cp = cps[-2] if isinstance(cps[-2], dict) else {}
+            if self._checkpoint_detect_drift(latest_cp, prev_cp):
+                cp_round = int(latest_cp.get("round", 0) or 0)
+                lines.append(f"⚠️ 自 round {cp_round} 以来无实质进展，需要换策略。")
         return "\n".join(lines)
+
+    def _failure_aware_brief(self) -> str:
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return ""
+        lines: list[str] = []
+        # Unresolved errors (unified) — grouped by category
+        all_errors = fl.get("errors", [])
+        unresolved = [e for e in all_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+        # Fallback: if errors is empty but compilation_errors has data, use that
+        if not unresolved:
+            comp_errors = fl.get("compilation_errors", [])
+            unresolved = [e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            for e in unresolved:
+                if "category" not in e:
+                    e["category"] = "compilation"
+        if unresolved:
+            lines.append("## ⚠️ 已知问题（勿重复尝试）")
+            by_cat: dict[str, list] = {}
+            for e in unresolved:
+                cat = str(e.get("category", "unknown") or "unknown")
+                by_cat.setdefault(cat, []).append(e)
+            cat_labels = dict(ERROR_CATEGORY_DEFS)
+            for cat, errs in by_cat.items():
+                label = cat_labels.get(cat, {}).get("label", cat) if cat in cat_labels else cat
+                lines.append(f"{label} (未解决):")
+                for e in errs[:8]:
+                    f = str(e.get("file", "") or "")
+                    msg = str(e.get("error_msg", "") or "")
+                    cnt = int(e.get("count", 1) or 1)
+                    lines.append(f"- {f}: {trim(msg, 120)} (出现 {cnt} 次)")
+        # Failed fix attempts
+        fixes = fl.get("attempted_fixes", [])
+        if fixes:
+            lines.append("已尝试修复 (失败):")
+            for fx in fixes[-6:]:
+                if not isinstance(fx, dict):
+                    continue
+                fix_desc = str(fx.get("fix", "") or "")
+                result = str(fx.get("result", "") or "")
+                lines.append(f"- {trim(fix_desc, 100)} → {trim(result, 60)}")
+        # Repeated delegations
+        delegations = fl.get("repeated_delegations", [])
+        repeated = [d for d in delegations if isinstance(d, dict) and int(d.get("count", 0) or 0) >= 2]
+        if repeated:
+            lines.append("重复委派 (需换策略):")
+            for d in repeated[:5]:
+                tgt = str(d.get("target", "") or "")
+                cnt = int(d.get("count", 1) or 1)
+                preview = str(d.get("instruction_preview", "") or "")
+                lines.append(f"- {tgt} 收到相同指令 {cnt} 次: {trim(preview, 80)}")
+        # Stall events
+        stalls = fl.get("stall_events", [])
+        if stalls:
+            lines.append(f"停滞事件: {len(stalls)} 次 (最近: {str(stalls[-1].get('reason', '') if isinstance(stalls[-1], dict) else '')})")
+        if not lines:
+            return ""
+        return trim("\n".join(lines), 800)
+
+    def _create_checkpoint_snapshot(self) -> dict:
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger", {})
+        if not isinstance(fl, dict):
+            fl = {}
+        comp_errors = fl.get("errors", []) or fl.get("compilation_errors", [])
+        active_errors = len([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
+        artifacts = bb.get("code_artifacts", {})
+        artifacts_keys = sorted(artifacts.keys()) if isinstance(artifacts, dict) else []
+        files_hash = hashlib.sha1(str(artifacts_keys).encode("utf-8")).hexdigest()[:12]
+        try:
+            todo_snap = json_dumps(self.todo.snapshot()) if hasattr(self, "todo") else ""
+        except Exception:
+            todo_snap = ""
+        todos_hash = hashlib.sha1(todo_snap.encode("utf-8")).hexdigest()[:12]
+        stall_events = fl.get("stall_events", [])
+        delegations = fl.get("repeated_delegations", [])
+        return {
+            "round": int(getattr(self, "agent_round_index", 0) or 0),
+            "ts": float(now_ts()),
+            "active_errors_count": active_errors,
+            "files_modified_hash": files_hash,
+            "todos_hash": todos_hash,
+            "stall_count": len(stall_events) if isinstance(stall_events, list) else 0,
+            "delegation_count": sum(
+                int(d.get("count", 0) or 0) for d in delegations if isinstance(d, dict)
+            ) if isinstance(delegations, list) else 0,
+        }
+
+    def _checkpoint_detect_drift(self, current: dict, previous: dict) -> bool:
+        if not isinstance(current, dict) or not isinstance(previous, dict):
+            return False
+        errors_not_reduced = int(current.get("active_errors_count", 0) or 0) >= int(previous.get("active_errors_count", 0) or 0)
+        files_unchanged = str(current.get("files_modified_hash", "")) == str(previous.get("files_modified_hash", ""))
+        stalls_increased = int(current.get("stall_count", 0) or 0) > int(previous.get("stall_count", 0) or 0)
+        return errors_not_reduced and files_unchanged and stalls_increased
+
+    def _maybe_create_checkpoint(self):
+        bb = self._ensure_blackboard()
+        cps = bb.get("checkpoints", [])
+        if not isinstance(cps, list):
+            cps = []
+        current_round = int(getattr(self, "agent_round_index", 0) or 0)
+        if cps:
+            last_cp = cps[-1] if isinstance(cps[-1], dict) else {}
+            last_round = int(last_cp.get("round", 0) or 0)
+            if current_round - last_round < CHECKPOINT_INTERVAL_ROUNDS:
+                return
+        snapshot = self._create_checkpoint_snapshot()
+        cps.append(snapshot)
+        bb["checkpoints"] = cps[-CHECKPOINT_MAX_COUNT:]
+        self.blackboard = bb
 
     def _auto_compact(self, reason: str):
         context_before = self._context_budget_metrics()
+        tier = self._context_compression_tier(context_before)
         transcript_dir = self.root / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = transcript_dir / f"transcript_{int(now_ts())}.jsonl"
         with transcript_path.open("w", encoding="utf-8") as handle:
             for msg in self.messages:
                 handle.write(json_dumps(msg) + "\n")
-        tail_budget = max(4500, min(16_000, int(self.context_token_upper_bound * 0.35)))
+        # Adjust tail budget based on tier — lower tier = smaller tail
+        if tier >= 3:
+            tail_budget = max(2000, min(6000, int(self.context_token_upper_bound * 0.20)))
+        elif tier >= 2:
+            tail_budget = max(3000, min(10_000, int(self.context_token_upper_bound * 0.28)))
+        else:
+            tail_budget = max(4500, min(16_000, int(self.context_token_upper_bound * 0.35)))
         tail = self._select_compact_tail(tail_budget)
         if len(tail) >= len(self.messages):
             tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
@@ -9907,35 +10356,59 @@ class SessionState:
             if seg_id
             else "If details are missing, call context_recall with recent_segments=2."
         )
+        # Create checkpoint before compaction
+        self._maybe_create_checkpoint()
+        # Build state handoff for lossless continuity
+        state_handoff = self._build_state_handoff()
+        failure_brief = self._failure_aware_brief()
+        failure_section = f"{failure_brief}\n" if failure_brief else ""
         compact_note = (
             "<compact-resume>\n"
             f"reason: {reason}\n"
+            f"tier: {tier}\n"
             f"transcript: {transcript_path}\n"
             f"archive_segment: {seg_id or 'none'} messages={seg_msg_count} path={seg_path or '-'}\n"
+            f"{state_handoff}\n"
             f"{self._open_work_brief()}\n"
+            f"{failure_section}"
             f"summary:\n{summary}\n"
             f"{continuation}\n"
             "Continue exploring from current pending work; do not restart from scratch.\n"
             "</compact-resume>"
         )
         tail.append({"role": "user", "content": compact_note, "ts": now_ts()})
-        target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
+        # Adjust target tokens based on tier
+        if tier >= 3:
+            target_tokens = max(2000, min(8000, int(self.context_token_upper_bound * 0.35)))
+        elif tier >= 2:
+            target_tokens = max(3000, min(12_000, int(self.context_token_upper_bound * 0.45)))
+        else:
+            target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
         while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
             tail.pop(0)
         if self._estimate_messages_tokens(tail) > target_tokens:
             for msg in tail:
                 if msg.get("role") == "tool":
-                    msg["content"] = trim(msg.get("content", ""), 1800)
+                    msg["content"] = trim(msg.get("content", ""), 1800 if tier < 2 else 600)
             while len(tail) > 2 and self._estimate_messages_tokens(tail) > target_tokens:
                 tail.pop(0)
         self.messages = tail
+        # Compact agent contexts in sync (critical fix for re-wall prevention)
+        self._compact_agent_contexts(max(tier, 1))
+        # Tier 2+: offload remaining large content in messages to file buffer
+        if tier >= 2:
+            for msg in self.messages:
+                c = msg.get("content", "")
+                if isinstance(c, str) and len(c) >= FILE_BUFFER_CONTENT_THRESHOLD * 2:
+                    msg["content"] = self._offload_to_file_buffer(c, label="compact-msg")
         self.last_compact_reason = str(reason or "")
         self.last_compact_ts = now_ts()
         self._emit(
             "compact",
             {
-                "summary": f"context compacted ({reason}) archives={len(self.context_archives)}",
+                "summary": f"context compacted ({reason}) tier={tier} archives={len(self.context_archives)}",
                 "reason": str(reason or ""),
+                "tier": tier,
                 "archive_segment": seg_id,
                 "archived_messages": seg_msg_count,
                 "context_limit_before": int(context_before.get("limit", 0)),
@@ -9944,6 +10417,50 @@ class SessionState:
                 "context_left_percent_before": round(float(context_before.get("left_percent", 0.0)), 2),
             },
         )
+
+    def _build_state_handoff(self) -> str:
+        """Build a lossless state handoff string for compact-resume note.
+        Captures: goal, progress, current node state, active agent, round info."""
+        bb = self._ensure_blackboard()
+        parts: list[str] = ["<STATE_HANDOFF>"]
+        # 1. Original goal
+        goal = trim(str(bb.get("original_goal", "") or ""), 500)
+        if goal:
+            parts.append(f"GOAL: {goal}")
+        # 2. Current progress / manager judgement
+        judgement = bb.get("manager_judgement", {})
+        if isinstance(judgement, dict):
+            progress = str(judgement.get("progress", "") or "")
+            remaining = judgement.get("remaining_rounds", "")
+            if progress:
+                parts.append(f"PROGRESS: {progress}")
+            if remaining != "":
+                parts.append(f"REMAINING_ROUNDS: {remaining}")
+        # 3. Active agent and phase
+        active_role = str(getattr(self, "runtime_active_role", "") or "")
+        phase = str(getattr(self, "current_phase", "") or "")
+        round_idx = int(getattr(self, "agent_round_index", 0) or 0)
+        parts.append(f"ROUND: {round_idx}, ACTIVE_AGENT: {active_role or 'none'}, PHASE: {phase or 'idle'}")
+        # 4. Task profile
+        tp = bb.get("task_profile", {})
+        if isinstance(tp, dict):
+            task_type = str(tp.get("task_type", "") or "")
+            complexity = str(tp.get("complexity", "") or "")
+            if task_type:
+                parts.append(f"TASK_TYPE: {task_type}, COMPLEXITY: {complexity}")
+        # 5. Last delegate instruction (if multi-agent)
+        last_del = bb.get("last_delegate", {})
+        if isinstance(last_del, dict) and last_del.get("instruction"):
+            parts.append(f"LAST_DELEGATE: {trim(str(last_del.get('instruction', '')), 200)}")
+        # 6. Key blackboard entries (code_artifacts keys, review_feedback)
+        artifacts = bb.get("code_artifacts", {})
+        if isinstance(artifacts, dict) and artifacts:
+            parts.append(f"CODE_ARTIFACTS: {', '.join(sorted(artifacts.keys())[:10])}")
+        review = bb.get("review_feedback", "")
+        if review:
+            parts.append(f"REVIEW_FEEDBACK: {trim(str(review), 200)}")
+        parts.append("</STATE_HANDOFF>")
+        return "\n".join(parts)
 
     def _git_status_map(self, cwd: Path) -> dict[str, str]:
         try:
@@ -11303,7 +11820,7 @@ class SessionState:
                 active_rows.append(trim(content, 140))
             if len(active_rows) >= 3:
                 break
-        return {
+        snapshot = {
             "goal": self._latest_user_goal_text(),
             "todo_open_count": int(open_count),
             "todo_in_progress_count": int(in_progress_count),
@@ -11312,6 +11829,20 @@ class SessionState:
             "assistant_thinking": trim(str(thinking_text or "").strip(), 700),
             "agent_round_index": int(self.agent_round_index),
         }
+        # Inject plan step progress so arbiter knows overall completion state
+        bb = self._ensure_blackboard()
+        plan_todos = bb.get("project_todos", [])
+        plan_steps = [t for t in plan_todos if t.get("category") == "plan_step"]
+        if plan_steps:
+            completed = len([t for t in plan_steps if t.get("status") == "completed"])
+            total = len(plan_steps)
+            snapshot["plan_progress"] = f"{completed}/{total} steps completed"
+            if completed < total:
+                snapshot["plan_warning"] = (
+                    f"IMPORTANT: Only {completed}/{total} plan steps are completed. "
+                    "Do NOT classify as TASK_COMPLETED unless ALL steps are done."
+                )
+        return snapshot
 
     def _build_arbiter_client(self) -> OllamaClient:
         client = OllamaClient(self.ollama.base_url, self.ollama.model)
@@ -11412,16 +11943,41 @@ class SessionState:
 
     def _mark_all_done_silently(self, reason: str = "") -> dict:
         summary = trim(str(reason or "").strip(), 160) or "arbiter: task completed"
+        # Protect plan_step todos — they must only be completed by _advance_plan_step
+        bb = self._ensure_blackboard()
+        plan_todos = bb.get("project_todos", [])
+        saved_plan_steps: dict[str, dict] = {}
+        for t in plan_todos:
+            if t.get("category") == "plan_step" and t.get("status") != "completed":
+                saved_plan_steps[str(t.get("id", ""))] = {
+                    "status": t.get("status", "pending"),
+                    "completed_at": t.get("completed_at"),
+                    "completed_by": t.get("completed_by", ""),
+                    "evidence": t.get("evidence", ""),
+                }
         result = self.todo.complete_all_open(summary)
+        # Restore plan_step todos to their original state
+        if saved_plan_steps:
+            bb = self._ensure_blackboard()
+            for t in bb.get("project_todos", []):
+                tid = str(t.get("id", ""))
+                if tid in saved_plan_steps:
+                    t["status"] = saved_plan_steps[tid]["status"]
+                    t["completed_at"] = saved_plan_steps[tid]["completed_at"]
+                    t["completed_by"] = saved_plan_steps[tid]["completed_by"]
+                    t["evidence"] = saved_plan_steps[tid]["evidence"]
+            self.blackboard = bb
+            self._sync_todos_from_blackboard(reason="plan-step-restore")
         updated = int(result.get("updated", 0) or 0)
         total = int(result.get("total", 0) or 0)
+        pending_steps = len(saved_plan_steps)
         self._prune_runtime_retry_hints()
         self._emit(
             "status",
             {
                 "summary": (
-                    "arbiter marked task completed; "
-                    f"todos completed={updated}/{total}"
+                    f"arbiter marked task completed; todos completed={updated}/{total}"
+                    + (f"; {pending_steps} plan steps protected (still pending)" if pending_steps else "")
                 )
             },
         )
@@ -12501,12 +13057,60 @@ class SessionState:
     def _run_read(self, path: str, limit: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            lines = self._session_path(rel).read_text(encoding="utf-8").splitlines()
+            fp = self._session_path(rel)
+            # Multimodal: detect image/audio/video files and handle natively
+            ext = fp.suffix.lower() if fp.suffix else ""
+            if ext in IMAGE_EXTS:
+                return self._run_read_media(fp, rel, "image")
+            if ext in AUDIO_EXTS:
+                return self._run_read_media(fp, rel, "audio")
+            if ext in VIDEO_EXTS:
+                return self._run_read_media(fp, rel, "video")
+            lines = fp.read_text(encoding="utf-8").splitlines()
             if limit and limit < len(lines):
                 lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
             return trim("\n".join(lines))
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
+
+    def _run_read_media(self, fp: Path, rel: str, media_type: str) -> str:
+        """Read a media file and return description or inject into multimodal context."""
+        if not fp.exists():
+            return f"Error: file not found: {rel}"
+        caps = self._capabilities_from_profile()
+        cap_key = f"input_{media_type}"
+        file_size = fp.stat().st_size
+        size_kb = file_size / 1024
+        if bool(caps.get(cap_key, False)) and file_size < 20 * 1024 * 1024:
+            # Model supports this media type — encode and inject as multimodal input
+            try:
+                b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+                mime = guess_mime_from_name(fp.name)
+                media_item = {
+                    "type": media_type,
+                    "data_b64": b64,
+                    "mime": mime,
+                    "name": fp.name,
+                    "workspace_path": str(rel),
+                }
+                # Store for injection into next API call
+                with self.lock:
+                    self._pending_media_inputs.append(media_item)
+                return (
+                    f"[{media_type} file loaded: {rel} ({size_kb:.1f} KB, {mime})] "
+                    f"The {media_type} has been attached to the conversation for native {media_type} analysis. "
+                    f"Describe or analyze it directly."
+                )
+            except Exception as exc:
+                return f"Error reading {media_type} file: {exc}"
+        else:
+            # Model doesn't support this media type — return metadata only
+            reason = "model does not support" if not caps.get(cap_key) else "file too large"
+            return (
+                f"[{media_type} file: {rel} ({size_kb:.1f} KB)] "
+                f"Note: {reason} native {media_type} input. "
+                f"File exists at {fp}. Use bash tools to process it if needed."
+            )
 
     def _is_html_file_rel(self, path: str) -> bool:
         low = str(path or "").strip().lower()
@@ -13313,6 +13917,15 @@ class SessionState:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if bool(self.runtime_goal_reset_pending):
             return False, "goal-reset-pending"
+        # Plan step gate: if plan_step todos exist, ALL must be completed
+        plan_step_todos = [
+            t for t in bb.get("project_todos", [])
+            if t.get("category") == "plan_step"
+        ]
+        if plan_step_todos:
+            pending = [t for t in plan_step_todos if t.get("status") != "completed"]
+            if pending:
+                return False, f"plan-steps-incomplete:{len(pending)}/{len(plan_step_todos)}"
         # Project todo gate: coding tasks must pass compile + test
         profile = self._ensure_blackboard_task_profile(bb)
         task_type = str(profile.get("task_type", "general") or "general")
@@ -13371,8 +13984,16 @@ class SessionState:
 
     def _manager_progress_state(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        # Hard guard: pending plan steps → never "done"
+        plan_step_todos = [
+            t for t in bb.get("project_todos", [])
+            if t.get("category") == "plan_step"
+        ]
+        has_pending_plan_steps = plan_step_todos and any(
+            t.get("status") != "completed" for t in plan_step_todos
+        )
         can_finish, _ = self._can_auto_finish_from_approval(bb)
-        if can_finish:
+        if can_finish and not has_pending_plan_steps:
             return "done"
         profile = self._ensure_blackboard_task_profile(bb)
         task_type = str(profile.get("task_type", "") or "")
@@ -14053,6 +14674,8 @@ class SessionState:
                 bb["watchdog"] = wd
                 self.blackboard = bb
                 self._blackboard_touch()
+                # Failure ledger: record stall event
+                self._ledger_record_stall(trigger_reason, "unresolved")
                 if int(wd["trigger_count"]) >= 2:
                     self._watchdog_escalate_to_single_developer(bb, reason=trigger_reason)
                 else:
@@ -14200,6 +14823,16 @@ class SessionState:
             "project_todos": [],
             "watchdog": self._new_watchdog_state(),
             "decomposition_queue": self._new_decomposition_queue_state(),
+            "failure_ledger": {
+                "attempted_fixes": [],
+                "compilation_errors": [],
+                "errors": [],
+                "repeated_delegations": [],
+                "stall_events": [],
+                "tool_call_fingerprints": [],
+            },
+            "checkpoints": [],
+            "persisted_manager_routes": [],
         }
 
     def _normalize_blackboard(self, raw: object) -> dict:
@@ -14371,7 +15004,323 @@ class SessionState:
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
         )
+        # Preserve plan-mode data through normalization
+        raw_plan = src.get("plan")
+        if isinstance(raw_plan, dict):
+            board["plan"] = raw_plan
+        # Preserve failure_ledger, checkpoints, persisted_manager_routes
+        raw_fl = src.get("failure_ledger")
+        board["failure_ledger"] = self._normalize_failure_ledger(raw_fl) if isinstance(raw_fl, dict) else {
+            "attempted_fixes": [],
+            "compilation_errors": [],
+            "errors": [],
+            "repeated_delegations": [],
+            "stall_events": [],
+            "tool_call_fingerprints": [],
+        }
+        raw_cp = src.get("checkpoints")
+        board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
+        raw_pmr = src.get("persisted_manager_routes")
+        board["persisted_manager_routes"] = list(raw_pmr)[-PERSISTED_ROUTES_MAX:] if isinstance(raw_pmr, list) else []
         return board
+
+    def _normalize_failure_ledger(self, raw: dict) -> dict:
+        fl: dict = {
+            "attempted_fixes": [],
+            "compilation_errors": [],
+            "errors": [],
+            "repeated_delegations": [],
+            "stall_events": [],
+            "tool_call_fingerprints": [],
+        }
+        if not isinstance(raw, dict):
+            return fl
+        def _safe_list(key: str, max_len: int) -> list[dict]:
+            items = raw.get(key)
+            if not isinstance(items, list):
+                return []
+            out: list[dict] = []
+            for item in items[-max_len:]:
+                if isinstance(item, dict):
+                    out.append(item)
+            return out
+        fl["attempted_fixes"] = _safe_list("attempted_fixes", FAILURE_LEDGER_MAX_FIXES)
+        fl["compilation_errors"] = _safe_list("compilation_errors", FAILURE_LEDGER_MAX_COMPILE_ERRORS)
+        fl["errors"] = _safe_list("errors", FAILURE_LEDGER_MAX_ERRORS)
+        fl["repeated_delegations"] = _safe_list("repeated_delegations", FAILURE_LEDGER_MAX_DELEGATIONS)
+        fl["stall_events"] = _safe_list("stall_events", FAILURE_LEDGER_MAX_STALLS)
+        fl["tool_call_fingerprints"] = _safe_list("tool_call_fingerprints", FAILURE_LEDGER_MAX_TOOL_FPS)
+        return fl
+
+    def _ledger_record_fix_attempt(self, file: str, error: str, fix: str, result: str, actor: str):
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fixes = fl.get("attempted_fixes", [])
+        fixes.append({
+            "file": trim(str(file or ""), 260),
+            "error": trim(str(error or ""), 400),
+            "fix": trim(str(fix or ""), 400),
+            "result": trim(str(result or ""), 200),
+            "actor": trim(str(actor or ""), 40),
+            "round": int(getattr(self, "agent_round_index", 0) or 0),
+            "ts": float(now_ts()),
+        })
+        fl["attempted_fixes"] = fixes[-FAILURE_LEDGER_MAX_FIXES:]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    # --- Unified error detection helpers (修改 3) ---
+
+    def _detect_error_category(self, cmd_str: str) -> str | None:
+        """Match a command string against ERROR_CATEGORY_DEFS, return first matching category name."""
+        cmd_lower = str(cmd_str or "").lower()
+        for cat_name, cat_def in ERROR_CATEGORY_DEFS:
+            if any(kw in cmd_lower for kw in cat_def.get("cmd_keywords", [])):
+                return cat_name
+        return None
+
+    def _check_output_has_errors(self, output: str, category: str) -> bool:
+        """Check if output contains error patterns for the given category."""
+        out_lower = str(output or "").lower()
+        cat_def = dict(ERROR_CATEGORY_DEFS).get(category, {})
+        return any(pat.lower() in out_lower for pat in cat_def.get("output_patterns", []))
+
+    def _extract_error_lines(self, output: str, category: str, max_lines: int = 3) -> list[tuple[str, str]]:
+        """Scan output lines for error patterns, return [(file_hint, error_line), ...]."""
+        cat_def = dict(ERROR_CATEGORY_DEFS).get(category, {})
+        patterns = [p.lower() for p in cat_def.get("output_patterns", [])]
+        results: list[tuple[str, str]] = []
+        for ln in str(output or "").split("\n"):
+            if any(pat in ln.lower() for pat in patterns):
+                file_hint = ""
+                parts = ln.split(":")
+                if len(parts) >= 2 and ("." in parts[0] or "/" in parts[0]):
+                    file_hint = parts[0].strip()
+                results.append((file_hint, ln.strip()))
+                if len(results) >= max_lines:
+                    break
+        return results
+
+    # --- Unified error record / clear / sync (修改 4) ---
+
+    def _ledger_record_error(self, category: str, file: str, error_msg: str):
+        """Record an error into fl['errors'] with category field. Dedup by fingerprint."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        errors = fl.get("errors", [])
+        fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
+        for entry in errors:
+            if entry.get("fingerprint") == fp:
+                entry["count"] = int(entry.get("count", 1) or 1) + 1
+                entry["last_round"] = int(getattr(self, "agent_round_index", 0) or 0)
+                fl["errors"] = errors
+                bb["failure_ledger"] = fl
+                self.blackboard = bb
+                self._sync_compilation_errors_compat()
+                return
+        errors.append({
+            "fingerprint": fp,
+            "category": str(category or ""),
+            "file": trim(str(file or ""), 260),
+            "error_msg": trim(str(error_msg or ""), 400),
+            "count": 1,
+            "first_round": int(getattr(self, "agent_round_index", 0) or 0),
+            "last_round": int(getattr(self, "agent_round_index", 0) or 0),
+        })
+        fl["errors"] = errors[-FAILURE_LEDGER_MAX_ERRORS:]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+        self._sync_compilation_errors_compat()
+
+    def _ledger_clear_errors(self, category: str | None = None):
+        """Clear errors from fl['errors']. If category given, only that category; else all."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        if category is None:
+            fl["errors"] = []
+            fl["attempted_fixes"] = []
+        else:
+            fl["errors"] = [e for e in fl.get("errors", []) if e.get("category") != category]
+            # Clear attempted_fixes that match files in the cleared category
+            fl["attempted_fixes"] = [
+                fx for fx in fl.get("attempted_fixes", [])
+                if not (isinstance(fx, dict) and fx.get("category") == category)
+            ]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+        self._sync_compilation_errors_compat()
+
+    def _sync_compilation_errors_compat(self):
+        """Sync fl['compilation_errors'] from fl['errors'] where category=='compilation' for backward compat."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fl["compilation_errors"] = [
+            e for e in fl.get("errors", [])
+            if isinstance(e, dict) and e.get("category") == "compilation"
+        ]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    # --- Thin wrappers for backward compatibility (修改 4d, 4e) ---
+
+    def _ledger_record_compile_error(self, file: str, error_msg: str):
+        self._ledger_record_error("compilation", file, error_msg)
+
+    def _ledger_clear_compile_errors(self):
+        self._ledger_clear_errors("compilation")
+
+    # --- Unified tool result error processing (修改 5) ---
+
+    def _process_tool_result_errors(self, name: str, args: dict, output: str, ok: bool, role_key: str):
+        """Detect and record errors from bash tool results, or clear on success."""
+        if name != "bash" or not isinstance(args, dict):
+            return
+        cmd_str = str(args.get("command", "") or "").lower()
+        category = self._detect_error_category(cmd_str)
+        if not category:
+            return
+        if not ok:
+            error_lines = self._extract_error_lines(str(output or ""), category)
+            for file_hint, err_line in error_lines:
+                self._ledger_record_error(category, file_hint or cmd_str[:80], trim(err_line, 300))
+        else:
+            out_lower = str(output or "").lower()
+            cat_def = dict(ERROR_CATEGORY_DEFS).get(category, {})
+            negatives = cat_def.get("success_negatives", [])
+            if not any(neg.lower() in out_lower for neg in negatives):
+                self._ledger_clear_errors(category)
+                # Auto-deactivate reviewer debug mode when errors are resolved
+                if bool(self.reviewer_debug_mode) and not self._manager_has_error_log():
+                    self._deactivate_reviewer_debug_mode("errors resolved")
+
+    # --- Generalized error context (修改 6) ---
+
+    def _recent_error_context(self, max_chars: int = 800) -> str:
+        """Build context string from all error categories in fl['errors']."""
+        bb = self._ensure_blackboard()
+        lines: list[str] = []
+        fl = bb.get("failure_ledger", {})
+        if isinstance(fl, dict):
+            all_errors = fl.get("errors", [])
+            unresolved = [e for e in all_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            if unresolved:
+                # Group by category
+                by_cat: dict[str, list] = {}
+                for e in unresolved:
+                    cat = str(e.get("category", "unknown") or "unknown")
+                    by_cat.setdefault(cat, []).append(e)
+                cat_labels = dict(ERROR_CATEGORY_DEFS)
+                for cat, errs in by_cat.items():
+                    label = cat_labels.get(cat, {}).get("label", cat.upper()) if cat in cat_labels else cat.upper()
+                    lines.append(f"UNRESOLVED {label.upper()}:")
+                    for e in errs[:5]:
+                        f = str(e.get("file", "") or "")
+                        msg = str(e.get("error_msg", "") or "")
+                        cnt = int(e.get("count", 1) or 1)
+                        lines.append(f"  [{f}] {trim(msg, 200)} (seen {cnt}x)")
+            fixes = fl.get("attempted_fixes", [])
+            if fixes:
+                lines.append("PREVIOUSLY ATTEMPTED FIXES (all failed):")
+                for fx in fixes[-3:]:
+                    if isinstance(fx, dict):
+                        lines.append(f"  - {trim(str(fx.get('fix', '') or ''), 120)} -> {trim(str(fx.get('result', '') or ''), 60)}")
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        _all_kw = ("error:", "fatal error", "syntax error", "compile error", "build failed",
+                    "traceback", "exception", "failed", "panic:", "FAIL:", "AssertionError")
+        for entry in reversed(logs[-6:]):
+            if not isinstance(entry, dict):
+                continue
+            txt = str(entry.get("content", "") or "")
+            if any(kw in txt.lower() for kw in _all_kw):
+                lines.append(f"LAST ERROR OUTPUT:\n{trim(txt, 400)}")
+                break
+        if not lines:
+            return ""
+        return trim("\n".join(lines), max_chars)
+
+    def _recent_compile_error_context(self, max_chars: int = 800) -> str:
+        return self._recent_error_context(max_chars=max_chars)
+
+    def _ledger_record_delegation(self, target: str, instruction: str):
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        delegations = fl.get("repeated_delegations", [])
+        fp = hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12]
+        for entry in delegations:
+            if entry.get("instruction_hash") == fp and entry.get("target") == target:
+                entry["count"] = int(entry.get("count", 1) or 1) + 1
+                entry["last_round"] = int(getattr(self, "agent_round_index", 0) or 0)
+                fl["repeated_delegations"] = delegations
+                bb["failure_ledger"] = fl
+                self.blackboard = bb
+                return
+        delegations.append({
+            "target": trim(str(target or ""), 40),
+            "instruction_hash": fp,
+            "instruction_preview": trim(str(instruction or ""), 200),
+            "count": 1,
+            "first_round": int(getattr(self, "agent_round_index", 0) or 0),
+            "last_round": int(getattr(self, "agent_round_index", 0) or 0),
+        })
+        fl["repeated_delegations"] = delegations[-FAILURE_LEDGER_MAX_DELEGATIONS:]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    def _ledger_record_stall(self, reason: str, resolution: str):
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        stalls = fl.get("stall_events", [])
+        stalls.append({
+            "reason": trim(str(reason or ""), 200),
+            "resolution": trim(str(resolution or ""), 200),
+            "round": int(getattr(self, "agent_round_index", 0) or 0),
+            "ts": float(now_ts()),
+        })
+        fl["stall_events"] = stalls[-FAILURE_LEDGER_MAX_STALLS:]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    def _ledger_record_tool_call(self, tool_name: str, args: dict):
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fps = fl.get("tool_call_fingerprints", [])
+        try:
+            args_str = json_dumps(args) if isinstance(args, dict) else str(args or "")
+        except Exception:
+            args_str = str(args or "")
+        fp = hashlib.sha1((str(tool_name or "") + args_str).encode("utf-8")).hexdigest()[:16]
+        for entry in fps:
+            if entry.get("fingerprint") == fp:
+                entry["count"] = int(entry.get("count", 1) or 1) + 1
+                entry["last_round"] = int(getattr(self, "agent_round_index", 0) or 0)
+                fl["tool_call_fingerprints"] = fps
+                bb["failure_ledger"] = fl
+                self.blackboard = bb
+                return
+        fps.append({
+            "fingerprint": fp,
+            "tool_name": trim(str(tool_name or ""), 60),
+            "count": 1,
+            "first_round": int(getattr(self, "agent_round_index", 0) or 0),
+            "last_round": int(getattr(self, "agent_round_index", 0) or 0),
+        })
+        fl["tool_call_fingerprints"] = fps[-FAILURE_LEDGER_MAX_TOOL_FPS:]
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
 
     def _ensure_blackboard(self) -> dict:
         if not isinstance(self.blackboard, dict) or not self.blackboard:
@@ -14729,6 +15678,31 @@ class SessionState:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if bb.get("project_todos"):
             return
+        # 如果有已审批的 plan steps，优先用 plan steps 生成 todos
+        plan = bb.get("plan", {})
+        if isinstance(plan, dict) and plan.get("phase") == "executing" and plan.get("steps"):
+            steps = plan["steps"]
+            plan_todos = [
+                {
+                    "id": f"pt:{i:03d}",
+                    "content": trim(str(s or "").strip(), 400),
+                    "status": "in_progress" if i == 0 else "pending",
+                    "category": "plan_step",
+                    "plan_step_index": i,
+                    "created_at": float(now_ts()),
+                    "completed_at": None,
+                    "completed_by": "",
+                    "evidence": "",
+                }
+                for i, s in enumerate(steps) if str(s or "").strip()
+            ][:10]
+            if plan_todos:
+                bb["project_todos"] = plan_todos
+                bb["plan_step_cursor"] = 0
+                bb["plan_step_total"] = len(plan_todos)
+                self.blackboard = bb
+                self._blackboard_touch()
+                return
         raw = self._generate_project_todos_from_profile(bb)
         bb["project_todos"] = [
             {
@@ -14806,6 +15780,23 @@ class SessionState:
                 todo.update(status="completed", completed_at=float(now_ts()), evidence="测试通过")
             elif cat == "review" and feedback_pass:
                 todo.update(status="completed", completed_at=float(now_ts()), evidence="审查通过")
+            elif cat == "plan_step":
+                # Plan steps 不自动完成，由 _advance_plan_step 显式推进
+                # 但如果当前步骤之前的所有步骤都完成了，标记当前步骤为 in_progress
+                if todo.get("status") == "pending":
+                    step_idx = int(todo.get("plan_step_index", 0) or 0)
+                    all_prior_done = all(
+                        t.get("status") == "completed"
+                        for t in todos
+                        if t.get("category") == "plan_step"
+                        and int(t.get("plan_step_index", 0) or 0) < step_idx
+                    )
+                    if all_prior_done and not any(
+                        t.get("status") == "in_progress"
+                        for t in todos
+                        if t.get("category") == "plan_step"
+                    ):
+                        todo["status"] = "in_progress"
 
         if not any(t.get("status") == "in_progress" for t in todos):
             for t in todos:
@@ -14815,6 +15806,104 @@ class SessionState:
 
         bb["project_todos"] = todos
         self.blackboard = bb
+
+    def _advance_plan_step(self, evidence: str = "", actor: str = "developer"):
+        bb = self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not todos:
+            return False
+        current = None
+        for t in todos:
+            if t.get("category") == "plan_step" and t.get("status") == "in_progress":
+                current = t
+                break
+        if not current:
+            return False
+        current["status"] = "completed"
+        current["completed_at"] = float(now_ts())
+        current["completed_by"] = actor
+        current["evidence"] = trim(str(evidence or "").strip(), 200) or "step completed"
+        # 推进 cursor，激活下一步
+        cursor = int(bb.get("plan_step_cursor", 0) or 0)
+        bb["plan_step_cursor"] = cursor + 1
+        next_step = None
+        for t in todos:
+            if t.get("category") == "plan_step" and t.get("status") == "pending":
+                next_step = t
+                break
+        if next_step:
+            next_step["status"] = "in_progress"
+            step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
+            total = int(bb.get("plan_step_total", len(todos)) or len(todos))
+            self._emit("status", {
+                "summary": f"📋 Plan step {step_idx}/{total}: {trim(str(next_step.get('content', '') or ''), 120)}"
+            })
+        self.blackboard = bb
+        self._blackboard_touch()
+        # Immediately sync todos so UI reflects plan step advancement
+        self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
+        return True
+
+    def _single_agent_plan_step_check(self, tool_results: list[dict]):
+        """In single-agent mode, check if current plan step should be advanced based on tool results."""
+        bb = self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        plan_steps = [t for t in todos if t.get("category") == "plan_step"]
+        if not plan_steps:
+            # No plan steps — just sync todos
+            self._sync_todos_from_blackboard(reason="single-agent-round")
+            return
+        current = None
+        for t in plan_steps:
+            if t.get("status") == "in_progress":
+                current = t
+                break
+        if not current:
+            self._sync_todos_from_blackboard(reason="single-agent-round")
+            return
+        # Heuristic: check if tool results indicate step completion
+        # - write_file/edit_file calls suggest implementation progress
+        # - successful bash calls suggest testing/verification
+        step_content = str(current.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        wrote_files = any(
+            str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
+            for r in tool_results
+        )
+        ran_bash_ok = any(
+            str(r.get("name", "")) == "bash" and r.get("ok", False)
+            for r in tool_results
+        )
+        # Auto-advance conditions based on phase:
+        should_advance = False
+        if phase in ("research", "design") and wrote_files:
+            # Research/design phase completed when files are produced
+            should_advance = True
+        elif phase == "implement" and wrote_files and ran_bash_ok:
+            # Implementation completed when files written and bash succeeds
+            should_advance = True
+        elif phase in ("test", "review") and ran_bash_ok and not any(
+            not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
+        ):
+            # Test/review completed when all bash calls succeed
+            should_advance = True
+        # Also check if the agent explicitly mentioned step completion
+        if not should_advance:
+            # Check last assistant message for step completion signals
+            last_text = ""
+            for msg in reversed(self.messages[-3:]):
+                if msg.get("role") == "assistant":
+                    last_text = str(msg.get("content", "") or "").lower()
+                    break
+            step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
+                                 "next step", "下一步", "proceed to step", "进入下一")
+            if any(sig in last_text for sig in step_done_signals):
+                should_advance = True
+        if should_advance:
+            evidence = f"single-agent auto-advance: phase={phase}, wrote={wrote_files}, bash_ok={ran_bash_ok}"
+            self._advance_plan_step(evidence=evidence, actor="single")
+        else:
+            self._sync_todos_from_blackboard(reason="single-agent-round")
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -14880,6 +15969,42 @@ class SessionState:
         board["status"] = "COMPLETED"
         self._blackboard_touch()
         self._sync_todos_from_blackboard(reason="approved", board=board)
+
+    # --- Reviewer Debug Mode ---
+
+    def _activate_reviewer_debug_mode(self, error_context: str = ""):
+        """Activate reviewer debug mode — reviewer gets write access to fix bugs."""
+        if bool(self.reviewer_debug_mode):
+            return  # already active
+        self.reviewer_debug_mode = True
+        self.reviewer_debug_rounds = 0
+        self.reviewer_debug_context = trim(str(error_context or ""), 1000)
+        self._emit("status", {
+            "summary": f"reviewer debug mode ACTIVATED — reviewer can now edit files to fix bugs"
+        })
+
+    def _deactivate_reviewer_debug_mode(self, reason: str = ""):
+        """Deactivate reviewer debug mode — reviewer returns to read-only."""
+        if not bool(self.reviewer_debug_mode):
+            return
+        self.reviewer_debug_mode = False
+        rounds_used = int(self.reviewer_debug_rounds)
+        self.reviewer_debug_rounds = 0
+        self.reviewer_debug_context = ""
+        self._emit("status", {
+            "summary": f"reviewer debug mode DEACTIVATED ({reason or 'resolved'}; {rounds_used} rounds used)"
+        })
+
+    def _check_reviewer_debug_mode_timeout(self) -> bool:
+        """Check if debug mode should be deactivated due to round limit.
+        Returns True if debug mode was deactivated (should switch to developer)."""
+        if not bool(self.reviewer_debug_mode):
+            return False
+        self.reviewer_debug_rounds = int(self.reviewer_debug_rounds or 0) + 1
+        if self.reviewer_debug_rounds > REVIEWER_DEBUG_MODE_MAX_ROUNDS:
+            self._deactivate_reviewer_debug_mode("round limit exceeded")
+            return True
+        return False
 
     def _auto_summary_on_finish(self) -> str:
         """Generate concise summary from blackboard state when run ends."""
@@ -15035,7 +16160,9 @@ class SessionState:
 
         proj_todos = board.get("project_todos", [])
         if proj_todos:
-            lines.append("\n### Project Tasks")
+            has_plan_steps = any(pt.get("category") == "plan_step" for pt in proj_todos)
+            title = "Plan Steps" if has_plan_steps else "Project Tasks"
+            lines.append(f"\n### {title}")
             for pt in proj_todos:
                 s = pt.get("status", "pending")
                 c = trim(str(pt.get("content", "") or ""), 200)
@@ -15046,8 +16173,9 @@ class SessionState:
                     mark = "[>]"
                 else:
                     mark = "[ ]"
+                prefix = f"Step {int(pt.get('plan_step_index', 0) or 0) + 1}: " if has_plan_steps else ""
                 suffix = f" — {ev}" if ev else ""
-                lines.append(f"- {mark} {c}{suffix}")
+                lines.append(f"- {mark} {prefix}{c}{suffix}")
 
         return "\n".join(lines)
 
@@ -15072,6 +16200,10 @@ class SessionState:
                     "requires_user_confirmation": {"type": "boolean"},
                     "is_mandatory": {"type": "boolean"},
                     "executor_mode": {"type": "boolean"},
+                    "advance_plan_step": {
+                        "type": "boolean",
+                        "description": "Set true if the current plan step is completed and should advance to next step.",
+                    },
                 },
                 ["target", "instruction"],
             )
@@ -15100,6 +16232,15 @@ class SessionState:
                     "participants": {"type": "array", "items": {"type": "string", "enum": list(AGENT_ROLES)}},
                     "assigned_expert": {"type": "string", "enum": list(AGENT_ROLES)},
                     "requires_user_confirmation": {"type": "boolean"},
+                    "requires_plan": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether this task needs a plan-mode research phase before execution. "
+                            "True for tasks involving: multi-file refactoring, architecture changes, "
+                            "migration, new feature with unclear scope, system-level changes. "
+                            "False for simple Q&A, single-file edits, direct bug fixes."
+                        ),
+                    },
                 },
                 ["level", "judgement", "inherit_previous_state"],
             )
@@ -15373,6 +16514,11 @@ class SessionState:
             level = 3
         if level not in TASK_LEVEL_CHOICES:
             level = 3
+        # Complexity inheritance: if user didn't mention complexity, inherit previous level
+        previous_level = int(getattr(self, "runtime_task_level", 0) or 0)
+        if previous_level > 0 and not self._user_mentions_complexity(str(goal_text or "")):
+            if bool(inherit_previous_state) or self._is_plan_choice_response(str(goal_text or "")):
+                level = previous_level
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
         config_mode = normalize_execution_mode(self.execution_mode, default="")
@@ -15505,7 +16651,9 @@ class SessionState:
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if not objective:
             objective = fallback_objective
+        _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
         self.runtime_task_level = int(level)
+        self._prev_applied_task_level = int(level)
         self.runtime_execution_mode = mode
         self.runtime_assigned_expert = assigned
         self.runtime_participants = list(participants)
@@ -15519,6 +16667,32 @@ class SessionState:
         self.runtime_direct_objective = objective
         self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
         self.runtime_reclassify_required = False
+        # Plan mode 判定（用户偏好 > 规则兜底 > LLM 语义）
+        raw_requires_plan = bool(decision.get("requires_plan", False))
+        user_pref = str(self.plan_mode_user_preference or "auto").lower()
+        if user_pref == "off":
+            requires_plan = False
+        elif user_pref == "on":
+            requires_plan = True
+        else:  # auto — 保持原逻辑
+            if level in PLAN_MODE_FORCED_LEVELS:
+                requires_plan = True
+            elif level in PLAN_MODE_ENABLED_LEVELS:
+                requires_plan = raw_requires_plan
+            else:
+                requires_plan = False
+        if self.runtime_plan_approved:
+            requires_plan = False
+        self.runtime_plan_mode_needed = requires_plan
+        # Check if user is replying with a plan choice
+        if self.runtime_plan_proposal and not self.runtime_plan_approved:
+            choice_text = str(goal_text or "").strip()
+            choice = self._parse_plan_choice(choice_text, self.runtime_plan_proposal)
+            if choice:
+                self.runtime_plan_choice = choice
+                self.runtime_plan_approved = True
+                self.runtime_plan_mode_needed = False
+                self._inject_plan_into_context(choice)
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
         profile["task_level"] = int(level)
@@ -15568,6 +16742,13 @@ class SessionState:
                 )
             },
         )
+        if _prev_level_val > 0 and _prev_level_val != int(level):
+            self._emit("status", {
+                "summary": (
+                    f"⚠️ 复杂度等级变更: L{_prev_level_val} → L{level} "
+                    f"(理由: {trim(judgement, 200)})"
+                )
+            })
 
     def _manager_classify_task_level(
         self,
@@ -15598,6 +16779,15 @@ class SessionState:
             prompt += (
                 "IMPORTANT: User has configured Single-agent mode. "
                 "Prefer level 1-2 for simple tasks. Only escalate to level 3+ if truly complex.\n"
+            )
+        prev_level = int(self.runtime_task_level or 0)
+        if prev_level > 0 and self._is_minor_followup_input(goal_text):
+            prompt += (
+                f"\nIMPORTANT: The previous task was classified as level {prev_level}. "
+                f"This appears to be a follow-up input, NOT a new task. "
+                f"Unless the user is clearly starting a completely different task, "
+                f"you MUST inherit the previous level={prev_level} and set inherit_previous_state=true. "
+                f"Do NOT downgrade the level for follow-up inputs.\n"
             )
         with self.lock:
             self.current_phase = "manager:classify:model-call"
@@ -15644,6 +16834,61 @@ class SessionState:
         row["low_confidence_reason"] = "manager classifier returned no valid tool call"
         return row
 
+    # ------------------------------------------------------------------
+    # Continuation / follow-up detection (complexity inheritance)
+    # ------------------------------------------------------------------
+
+    _CONTINUATION_PHRASES = frozenset({
+        "继续", "continue", "go", "proceed", "go ahead", "ok", "好", "好的",
+        "是", "是的", "确认", "执行", "开始", "start", "yes", "do it", "run it",
+        "let's go", "carry on", "keep going", "接着做", "往下做", "下一步", "next",
+    })
+
+    def _is_continuation_input(self, text: str) -> bool:
+        """Return True if *text* is a short continuation phrase that should inherit complexity."""
+        t = str(text or "").strip().lower().rstrip("!.。！")
+        if not t or len(t) > 30:
+            return False
+        if "?" in t or "？" in t or "\n" in t:
+            return False
+        return t in self._CONTINUATION_PHRASES
+
+    _NEW_TASK_PREFIXES = (
+        "实现", "创建", "写一个", "新建", "添加", "开发", "设计", "重构", "修改",
+        "build", "implement", "create", "add", "write", "develop", "design",
+        "refactor", "make", "generate", "set up", "setup",
+    )
+
+    def _is_minor_followup_input(self, text: str) -> bool:
+        """Return True if *text* looks like a lightweight follow-up, not a brand-new task."""
+        t = str(text or "").strip()
+        if not t or len(t) > 80:
+            return False
+        t_lower = t.lower()
+        for prefix in self._NEW_TASK_PREFIXES:
+            if t_lower.startswith(prefix):
+                return False
+        board = self._ensure_blackboard()
+        progress = str(board.get("progress", "") or "").strip().lower()
+        if progress in ("done", "completed"):
+            return False
+        return True
+
+    def _is_plan_choice_response(self, text: str) -> bool:
+        """Check if user text is a response to a plan proposal."""
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {})
+        if not isinstance(plan, dict):
+            return False
+        if plan.get("phase") != "awaiting_choice":
+            return False
+        return True
+
+    def _user_mentions_complexity(self, text: str) -> bool:
+        """Check if user text explicitly mentions complexity-related keywords."""
+        t = str(text or "").strip().lower()
+        return any(kw in t for kw in COMPLEXITY_KEYWORDS)
+
     def _refresh_runtime_task_policy(
         self,
         *,
@@ -15655,6 +16900,26 @@ class SessionState:
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
         if not goal:
             return {}
+        # --- Continuation input short-circuit: inherit previous complexity ---
+        prev_level = int(self.runtime_task_level or 0)
+        if prev_level > 0 and self._is_continuation_input(goal):
+            decision = {
+                "level": prev_level,
+                "execution_mode": self._effective_execution_mode(),
+                "participants": list(self.runtime_participants or []),
+                "assigned_expert": str(self.runtime_assigned_expert or ""),
+                "task_type": str(self.runtime_task_type or "general"),
+                "complexity": str(self.runtime_task_complexity or "simple"),
+                "scale_preference": str(self.runtime_scale_preference or "balanced"),
+                "round_budget": int(self.runtime_round_budget or 0),
+                "requires_user_confirmation": False,
+                "inherit_previous_state": True,
+                "judgement": "continuation input detected — inheriting previous complexity",
+                "source": "continuation-inherit",
+                "semantic_confidence": "high",
+            }
+            self._apply_runtime_task_decision(goal, decision)
+            return dict(decision)
         need = bool(
             force
             or self.runtime_reclassify_required
@@ -15681,11 +16946,94 @@ class SessionState:
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
 
+    def _plan_steps_context_for_manager(self) -> str:
+        bb = self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not todos or not any(t.get("category") == "plan_step" for t in todos):
+            return ""
+        lines = ["APPROVED PLAN STEPS:"]
+        for t in todos:
+            if t.get("category") != "plan_step":
+                continue
+            idx = int(t.get("plan_step_index", 0) or 0) + 1
+            status = t.get("status", "pending")
+            mark = "✅" if status == "completed" else "👉" if status == "in_progress" else "⬜"
+            phase_hint = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+            phase_tag = f" [{phase_hint}]" if phase_hint else ""
+            lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
+        lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        # Add current phase routing hint
+        current_phase = self._infer_current_phase_from_blackboard()
+        if current_phase:
+            preferred = TASK_PHASE_ROUTING.get(current_phase, "developer")
+            lines.append(
+                f"CURRENT PHASE: {current_phase} → prefer routing to {preferred}. "
+                f"Each phase has its own expertise — let {preferred} lead this phase independently. "
+                "Do NOT carry over implementation patterns from previous phases. "
+            )
+        return "\n".join(lines) + "\n"
+
+    def _plan_step_phase_hint(self, step_content: str) -> str:
+        """Infer the task phase from a plan step's content."""
+        c = str(step_content or "").lower()
+        if any(kw in c for kw in ("研究", "分析", "调研", "探索", "research", "analyze", "investigate", "explore", "inspect")):
+            return "research"
+        if any(kw in c for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
+            return "design"
+        if any(kw in c for kw in ("实现", "编写", "创建", "开发", "implement", "write", "create", "build", "develop", "code")):
+            return "implement"
+        if any(kw in c for kw in ("测试", "验证", "检查", "test", "verify", "check", "validate", "compile")):
+            return "test"
+        if any(kw in c for kw in ("审查", "评审", "review", "audit", "inspect code")):
+            return "review"
+        if any(kw in c for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
+            return "deploy"
+        return ""
+
+    def _infer_current_phase_from_blackboard(self) -> str:
+        """Infer the current task phase from blackboard state and active plan step."""
+        bb = self._ensure_blackboard()
+        for t in bb.get("project_todos", []):
+            if t.get("category") == "plan_step" and t.get("status") == "in_progress":
+                phase = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+                if phase:
+                    return phase
+        # Fallback: infer from blackboard state
+        code_count = len(bb.get("code_artifacts", {}) or {})
+        research_count = len(bb.get("research_notes", []) or [])
+        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        if not research_count and not code_count:
+            return "research"
+        if research_count > 0 and not code_count:
+            return "design"
+        if code_count > 0 and not feedback:
+            return "implement"
+        if feedback:
+            return "review"
+        return ""
+
     def _project_todo_hint_for_manager(self) -> str:
         bb = self._ensure_blackboard()
         todos = bb.get("project_todos", [])
         if not todos:
             return ""
+        # plan step 模式
+        has_plan_steps = any(t.get("category") == "plan_step" for t in todos)
+        if has_plan_steps:
+            completed = [t for t in todos if t.get("category") == "plan_step" and t.get("status") == "completed"]
+            pending = [t for t in todos if t.get("category") == "plan_step" and t.get("status") != "completed"]
+            if not pending:
+                return f"All {len(completed)} plan steps completed. Route to finish. "
+            cur = pending[0]
+            step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
+            total = len(completed) + len(pending)
+            return (
+                f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
+                f"({len(completed)} completed, {len(pending)} remaining) "
+                f"DO NOT finish until all {total} steps are completed. "
+                f"Focus on THIS step. When done, set advance_plan_step=true. "
+            )
+        # 原有逻辑
         pending = [t for t in todos if t.get("status") != "completed"]
         if not pending:
             return "All project tasks completed. Route to finish. "
@@ -15713,6 +17061,35 @@ class SessionState:
                 "Explorer should only be used for specific file/API lookups, not broad analysis. "
             )
         project_todo_hint = self._project_todo_hint_for_manager()
+        plan_context = self._plan_steps_context_for_manager()
+        # If no plan steps, give manager autonomous planning ability
+        if not plan_context:
+            plan_context = (
+                "No pre-approved plan. Analyze the goal, break it into logical phases, "
+                "and delegate one phase at a time. Track progress via blackboard. "
+                "Each phase should use the most appropriate agent for that phase's work. "
+            )
+        # Phase-aware independence hint
+        current_phase = self._infer_current_phase_from_blackboard()
+        phase_hint = ""
+        if current_phase:
+            phase_hint = (
+                f"PHASE INDEPENDENCE: Current phase is '{current_phase}'. "
+                "Each task phase has its own expertise and approach. "
+                "Do NOT force implementation patterns from previous phases onto the current one. "
+                "For research/analysis phases: let the agent think freely and use its domain knowledge. "
+                "For implementation phases: focus on concrete code output. "
+                "For test/review phases: focus on verification, not re-implementation. "
+            )
+        failure_brief = self._failure_aware_brief()
+        failure_hint = ""
+        if failure_brief:
+            failure_hint = (
+                "FAILURE CONTEXT (from ledger):\n"
+                f"{trim(failure_brief, 600)}\n"
+                "IMPORTANT: Previous fix attempts FAILED. You MUST change your approach — "
+                "do NOT repeat the same instruction. Include the exact error output in your delegation. "
+            )
         return (
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
@@ -15721,10 +17098,13 @@ class SessionState:
             "Role capabilities: "
             "Explorer=read-only (bash/read_file/search/blackboard, NO write_file/edit_file); "
             "Developer=all tools (write_file/edit_file/bash/read_file/etc); "
-            "Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). "
-            "NEVER delegate file-writing tasks to Explorer or Reviewer. "
+            f"{'Reviewer=DEBUG MODE (bash/read_file/write_file/edit_file/finish_task — can fix bugs directly). ' if bool(self.reviewer_debug_mode) else 'Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). '}"
+            f"{'NEVER delegate file-writing tasks to Explorer. Reviewer is in debug mode and can fix bugs. ' if bool(self.reviewer_debug_mode) else 'NEVER delegate file-writing tasks to Explorer or Reviewer. '}"
             f"{coding_hint}"
             f"{project_todo_hint}"
+            f"{plan_context}"
+            f"{phase_hint}"
+            f"{failure_hint}"
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
             f"objective={trim(str(profile.get('direct_objective','') or ''), 220)}. "
@@ -15891,7 +17271,25 @@ class SessionState:
         cycles = int(board.get("manager_cycles", 0) or 0)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
+        # Hard guard: pending plan steps block finish — redirect to developer instead
+        pending_plan_steps = [
+            t for t in board.get("project_todos", [])
+            if t.get("category") == "plan_step" and t.get("status") != "completed"
+        ]
         if cycles >= max_budget:
+            if pending_plan_steps:
+                # Budget exhausted but plan steps remain — continue with current step instead of finishing
+                cur = pending_plan_steps[0]
+                self._emit("status", {
+                    "summary": f"Max cycles reached but {len(pending_plan_steps)} plan steps pending; continuing."
+                })
+                return {
+                    "target": "developer",
+                    "instruction": f"Continue with plan step: {trim(str(cur.get('content', '')), 300)}",
+                    "reason": f"budget-exhausted-but-plan-steps-pending:{len(pending_plan_steps)}",
+                    "source": "fallback",
+                    "advance_plan_step": False,
+                }
             self._emit("status", {"summary": "Max cycles reached; forcing finish."})
             return {
                 "target": "finish",
@@ -16167,12 +17565,43 @@ class SessionState:
             return row
         target = str(row.get("target", "") or "").strip().lower()
         task_type_low = str(row.get("task_type", "") or "").strip().lower()
+        # 5a: Merge in-memory routes with persisted routes for detection
+        bb_for_routes = self._ensure_blackboard()
+        persisted_routes = bb_for_routes.get("persisted_manager_routes", [])
+        if not isinstance(persisted_routes, list):
+            persisted_routes = []
+        merged_routes = list(persisted_routes) + list(self.manager_routes)
+        # 5b: Delegation repetition detection from failure_ledger
+        fl = bb_for_routes.get("failure_ledger", {})
+        if isinstance(fl, dict):
+            for deleg in (fl.get("repeated_delegations") or []):
+                if (
+                    isinstance(deleg, dict)
+                    and str(deleg.get("target", "") or "").strip().lower() == target
+                    and int(deleg.get("count", 0) or 0) >= 3
+                ):
+                    alt_targets = [r for r in ("reviewer", "developer", "explorer") if r != target]
+                    if len(bb_for_routes.get("code_artifacts", {}) or {}) > 0:
+                        row["target"] = "finish"
+                        row["instruction"] = (
+                            f"Anti-stall: delegation to '{target}' repeated {deleg.get('count')} times with same instruction. "
+                            "Forcing finish to break loop."
+                        )
+                    else:
+                        row["target"] = alt_targets[0] if alt_targets else "developer"
+                        row["instruction"] = (
+                            f"Anti-stall: delegation to '{target}' repeated {deleg.get('count')} times. "
+                            f"Switching to {row['target']} with fresh approach."
+                        )
+                    row["reason"] = f"{row.get('reason', '')}|anti-stall-repeated-delegation"
+                    row["source"] = "anti-stall"
+                    return row
         if task_type_low in ("simple_code", "engineering") and target == "explorer":
-            board = self._ensure_blackboard()
+            board = bb_for_routes
             progress = self._manager_progress_state(board)
             if progress in ("initializing", "in_progress"):
                 explorer_count = sum(
-                    1 for x in self.manager_routes[-8:]
+                    1 for x in merged_routes[-8:]
                     if str(x.get("target", "") or "").strip().lower() == "explorer"
                 )
                 if explorer_count >= 2:
@@ -16186,9 +17615,9 @@ class SessionState:
                     return row
         if target not in AGENT_ROLES:
             return row
-        recent = [str(x.get("target", "") or "").strip().lower() for x in self.manager_routes[-4:]]
+        recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
         if len(recent) >= 2 and recent[-1] == target and recent[-2] == target:
-            board = self._ensure_blackboard()
+            board = bb_for_routes
             low_reason = str(row.get("reason", "") or "").strip().lower()
             if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
                 row["target"] = "finish"
@@ -16211,7 +17640,7 @@ class SessionState:
             row["source"] = "anti-stall"
             return row
         if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
-            board = self._ensure_blackboard()
+            board = bb_for_routes
             if len(board.get("code_artifacts", {}) or {}) > 0:
                 row["target"] = "finish"
                 row["instruction"] = "Oscillation detected with existing outputs; finish now."
@@ -16402,7 +17831,17 @@ class SessionState:
                 target = assigned_expert
             else:
                 if self._manager_has_error_log(board):
-                    target = "explorer"
+                    # Error exists: activate reviewer debug mode and route to reviewer
+                    error_logs = board.get("execution_logs", []) if isinstance(board.get("execution_logs"), list) else []
+                    error_summary = ""
+                    for log in reversed(error_logs[-5:]):
+                        if isinstance(log, dict) and str(log.get("category", "")).lower() in ("compilation", "runtime", "test", "lint", "build"):
+                            error_summary = trim(str(log.get("error", log.get("output", "")) or ""), 500)
+                            break
+                    if not error_summary:
+                        error_summary = "Error detected in execution logs. Check blackboard for details."
+                    self._activate_reviewer_debug_mode(error_summary)
+                    target = "reviewer"
                 elif len(board.get("code_artifacts", {}) or {}) > 0:
                     target = "reviewer"
                 elif len(board.get("research_notes", []) or []) > 0:
@@ -16582,6 +18021,7 @@ class SessionState:
                 "requires_user_confirmation": bool(args.get("requires_user_confirmation", False)),
                 "is_mandatory": _to_bool_like(args.get("is_mandatory", False), default=False),
                 "executor_mode": _to_bool_like(args.get("executor_mode", False), default=False),
+                "advance_plan_step": _to_bool_like(args.get("advance_plan_step", False), default=False),
                 "round_budget": args.get("round_budget", 0),
                 "reason": trim(str(text or "").strip(), 600),
                 "source": "tool",
@@ -16878,6 +18318,29 @@ class SessionState:
         active_profile = self._ensure_blackboard_task_profile(board)
         target = str(route.get("target", "") or "").strip().lower()
         instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
+        # Anti-stall: detect explorer consecutive delegation loop
+        if target == "explorer":
+            inst_hash = str(hash(instruction[:200]))
+            if inst_hash == self.last_explorer_instruction_hash:
+                self.explorer_consecutive_delegations += 1
+            else:
+                self.explorer_consecutive_delegations = 1
+                self.last_explorer_instruction_hash = inst_hash
+            if self.explorer_consecutive_delegations >= EXPLORER_STALL_THRESHOLD:
+                self._emit("status", {
+                    "summary": f"explorer stall detected ({self.explorer_consecutive_delegations} consecutive); switching to developer"
+                })
+                target = "developer"
+                instruction = f"Explorer is stalled. Take over: {instruction}"
+                self.explorer_consecutive_delegations = 0
+        else:
+            self.explorer_consecutive_delegations = 0
+            self.last_explorer_instruction_hash = ""
+        # Reviewer debug mode timeout check
+        if target == "reviewer" and bool(self.reviewer_debug_mode):
+            if self._check_reviewer_debug_mode_timeout():
+                target = "developer"
+                instruction = f"Reviewer debug mode timed out. Developer take over: {instruction}"
         try:
             task_level = int(route.get("task_level", active_profile.get("task_level", self.runtime_task_level or 3)) or 3)
         except Exception:
@@ -16945,8 +18408,27 @@ class SessionState:
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
         }
+        # advance_plan_step: 当前 plan step 完成，推进到下一步
+        if _to_bool_like(route.get("advance_plan_step", False), default=False):
+            self._advance_plan_step(
+                evidence=trim(str(route.get("instruction", "") or ""), 200),
+                actor=str(route.get("target", "developer") or "developer"),
+            )
         self.manager_routes.append(route_row)
         self.manager_routes = self.manager_routes[-240:]
+        # Failure ledger: persist route and record delegation
+        _pmr = board.get("persisted_manager_routes", [])
+        if not isinstance(_pmr, list):
+            _pmr = []
+        _pmr.append({
+            "target": target,
+            "instruction_hash": hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12],
+            "round": int(getattr(self, "agent_round_index", 0) or 0),
+            "ts": float(now_ts()),
+        })
+        board["persisted_manager_routes"] = _pmr[-PERSISTED_ROUTES_MAX:]
+        self.blackboard = board
+        self._ledger_record_delegation(target, instruction)
         profile = self._ensure_blackboard_task_profile(board)
         profile["task_level"] = int(task_level)
         profile["execution_mode"] = execution_mode
@@ -17109,7 +18591,23 @@ class SessionState:
         role_capability_note = {
             "explorer": "YOUR TOOLS: read-only (bash/read_file/search/blackboard). You CANNOT write_file or edit_file.",
             "developer": "YOUR TOOLS: all tools available (write_file/edit_file/bash/read_file/etc).",
-            "reviewer": "YOUR TOOLS: read+verify (bash/read_file/finish_task). You CANNOT write_file or edit_file.",
+            "reviewer": (
+                "YOUR TOOLS: read+verify+DEBUG (bash/read_file/write_file/edit_file/finish_task). "
+                "You CAN directly edit code to fix bugs when in debug mode. "
+                "DEBUG METHODOLOGY: 1) read_file to see the exact problematic line, "
+                "2) analyze the error output character-by-character, "
+                "3) edit_file to fix the root cause directly, "
+                "4) bash to verify the fix compiles/runs, "
+                "5) finish_task when the error is resolved. "
+            ) if bool(self.reviewer_debug_mode) else (
+                "YOUR TOOLS: read+verify (bash/read_file/finish_task). You CANNOT write_file or edit_file. "
+                "When you find errors: 1) read_file to see the exact problematic line, "
+                "2) analyze the error output character-by-character, "
+                "3) send ask_colleague(to='developer', intent='fix_request') with STRUCTURED content: "
+                "ERROR: <exact error output>, FILE: <path>, LINE: <number>, "
+                "ROOT_CAUSE: <analysis>, CATEGORY: <compilation|runtime|test|lint|build|deploy>, "
+                "FIX: change '<old>' to '<new>' OR <action to take>. "
+            ),
         }.get(role_key, "")
         if role_key == "explorer":
             tool_examples = "bash/read_file/read_from_blackboard"
@@ -17140,6 +18638,16 @@ class SessionState:
             "use ask_colleague immediately with explicit intent and concise payload; "
             "do not wait for another manager cycle."
         )
+        compile_error_ctx = self._recent_compile_error_context(max_chars=800)
+        error_section = ""
+        if compile_error_ctx:
+            error_section = (
+                "<compile-error-context>\n"
+                f"{compile_error_ctx}\n"
+                "CRITICAL: Read the EXACT error message above. Fix the SPECIFIC syntax/character issue. "
+                "Do NOT repeat previous failed fixes.\n"
+                "</compile-error-context>\n"
+            )
         board_md = self._blackboard_read_state_markdown(max_items=5)
         payload = (
             "<manager-delegate>\n"
@@ -17152,6 +18660,7 @@ class SessionState:
             f"{executor_note}\n"
             f"{collaboration_note}\n"
             f"{role_capability_note}\n"
+            f"{error_section}"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
             f"{trim(board_md, 6000)}\n"
@@ -17680,10 +19189,13 @@ class SessionState:
         row["agent_role"] = role_key
         if "ts" not in row:
             row["ts"] = now_ts()
-        # Write to unified agent_messages
+        # Write to unified agent_messages with tier-aware trim
         self.agent_messages.append(row)
-        if len(self.agent_messages) > 1200:
-            self.agent_messages = self.agent_messages[-800:]
+        tier = self._context_compression_tier()
+        am_limit = self._tier_agent_context_limits(tier)["agent_messages"]
+        overflow = int(am_limit * 1.5)  # trigger trim at 1.5x limit
+        if len(self.agent_messages) > overflow:
+            self.agent_messages = self.agent_messages[-am_limit:]
         if mirror_to_global:
             mirror = dict(row)
             if "tool_calls" in mirror and isinstance(mirror.get("tool_calls"), list):
@@ -17711,10 +19223,14 @@ class SessionState:
         if "ts" not in row:
             row["ts"] = now_ts()
         self.manager_context.append(row)
-        self.manager_context = self.manager_context[-400:]
+        tier = self._context_compression_tier()
+        mgr_limit = self._tier_agent_context_limits(tier)["manager_context"]
+        if len(self.manager_context) > int(mgr_limit * 1.5):
+            self.manager_context = self.manager_context[-mgr_limit:]
         self.agent_messages.append(row)
-        if len(self.agent_messages) > 1200:
-            self.agent_messages = self.agent_messages[-800:]
+        am_limit = self._tier_agent_context_limits(tier)["agent_messages"]
+        if len(self.agent_messages) > int(am_limit * 1.5):
+            self.agent_messages = self.agent_messages[-am_limit:]
 
     def _agent_display_name(self, role: str) -> str:
         return AGENT_ROLE_LABELS.get(self._sanitize_agent_role(role), str(role or "").strip().title() or "Agent")
@@ -17869,12 +19385,41 @@ class SessionState:
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             "Use load_skill for detailed guidance (multi-agent-guide, code-review-checklist, finish-protocol). "
+            f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
         if role_key == "explorer":
             return base + "Role: analyze goals, inspect codebase, produce research notes. Prefer read/search. "
         if role_key == "reviewer":
-            return base + "Role: verify output, run checks, issue pass/fix decisions. Write review_feedback to blackboard. "
+            if bool(self.reviewer_debug_mode):
+                debug_ctx = trim(str(self.reviewer_debug_context or ""), 500)
+                return base + (
+                    "Role: DEBUG MODE ACTIVE — independent bug fix process. "
+                    "You have FULL write access: write_file, edit_file, bash, read_file, finish_task. "
+                    "You CAN and SHOULD directly edit code to fix bugs. "
+                    "Be methodical and calm: "
+                    "1) Read the error context carefully. "
+                    "2) Locate the root cause in the source file. "
+                    "3) Fix it with edit_file (precise, minimal changes). "
+                    "4) Verify the fix compiles/runs with bash. "
+                    "5) Call finish_task when the error is resolved. "
+                    f"DEBUG CONTEXT: {debug_ctx} "
+                )
+            return base + (
+                "Role: verify output, run checks, issue pass/fix decisions. Write review_feedback to blackboard. "
+                "DEBUG METHODOLOGY when any error occurs (compilation, runtime, test, lint, build, deploy): "
+                "1) Read the EXACT error message — identify the file, line number, and error type. "
+                "2) Read the source file at that exact line — examine what the error points to. "
+                "3) Identify the ROOT CAUSE — match the error to a specific rule violation. "
+                "For runtime errors: identify the traceback, exception type, and the triggering line. "
+                "For test failures: identify which test failed, the assertion, expected vs actual. "
+                "For lint/type errors: identify the rule violation and exact location. "
+                "4) When sending fix_request via ask_colleague, you MUST include: "
+                "the exact error output, the file and line number, the root cause analysis, "
+                "the error category (compilation/runtime/test/lint/build/deploy), "
+                "and the precise fix (what to change FROM and TO). "
+                "NEVER send vague fix requests without verifying the actual cause. "
+            )
         return base + "Role: implement code changes, execute tools, record progress to blackboard. "
 
     def _seed_multi_agent_contexts_if_needed(self, user_text: str = ""):
@@ -18686,6 +20231,20 @@ class SessionState:
                 )
             return out
         if name == "TodoWrite":
+            # Protect plan_step todos: worker TodoWrite creates sub-items, not replacements
+            bb = self._ensure_blackboard()
+            has_plan_steps = any(
+                t.get("category") == "plan_step"
+                for t in bb.get("project_todos", [])
+            )
+            if has_plan_steps:
+                # Tag worker items as sub-tasks so _sync_todos_from_blackboard won't conflict
+                items = args.get("items", [])
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
+                            item["owner"] = str(role_key or "developer")
+                return self.todo.update(items)
             return self.todo.update(args["items"])
         if name == "TodoWriteRescue":
             return self._todo_write_rescue(args)
@@ -18726,6 +20285,9 @@ class SessionState:
                 todo_mark = self.todo.complete_all_open(summary)
             else:
                 todo_mark = self.todo.complete_active(summary)
+            # Deactivate reviewer debug mode on finish
+            if bool(self.reviewer_debug_mode) and role_key == "reviewer":
+                self._deactivate_reviewer_debug_mode("reviewer finished")
             updated = int(todo_mark.get("updated", 0) or 0)
             if updated > 0:
                 self._emit(
@@ -18838,6 +20400,25 @@ class SessionState:
                 return "Error: ask_colleague.intent is required"
             if not content:
                 return "Error: ask_colleague.content is required"
+            if intent == "fix_request":
+                required_markers = ["ERROR:", "ROOT_CAUSE:", "FIX:"]
+                soft_markers = ["FILE:", "LINE:", "CATEGORY:"]
+                missing = [m for m in required_markers if m not in content.upper()]
+                missing_soft = [m for m in soft_markers if m not in content.upper()]
+                if missing or missing_soft:
+                    hint_parts = []
+                    if missing:
+                        hint_parts.append(f"Missing required: {', '.join(missing)}")
+                    if missing_soft:
+                        hint_parts.append(f"Recommended: {', '.join(missing_soft)}")
+                    content = (
+                        f"{content}\n\n"
+                        "[SYSTEM NOTE: fix_request should include structured fields: "
+                        "ERROR: <exact error>, FILE: <path>, LINE: <number>, "
+                        "ROOT_CAUSE: <analysis>, CATEGORY: <compilation|runtime|test|lint|build|deploy>, "
+                        "FIX: <specific change>. "
+                        f"{'; '.join(hint_parts)}]"
+                    )
             env = self._agent_send_bus(from_role, to_role, intent, content)
             return (
                 f"agent_bus sent ({env.get('from')} -> {env.get('to')}, "
@@ -19049,6 +20630,8 @@ class SessionState:
                     "</live-user-adjustment>"
                 )
                 self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                # Merge user feedback with plan direction
+                self._merge_user_feedback_with_plan(content)
                 self.runtime_reclassify_goal = trim(content, 4000)
                 self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
@@ -19082,6 +20665,104 @@ class SessionState:
             )
         return len(injected)
 
+    def _merge_user_feedback_with_plan(self, user_text: str):
+        """When user provides feedback during execution, inject plan-aware merge note into manager context."""
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {})
+        if not isinstance(plan, dict):
+            return
+        current_step = None
+        for t in bb.get("project_todos", []):
+            if t.get("category") == "plan_step" and t.get("status") == "in_progress":
+                current_step = t
+                break
+        step_desc = trim(str(current_step.get("content", "") if current_step else "none"), 200)
+        is_plan_executing = plan.get("phase") == "executing"
+        if is_plan_executing:
+            merge_note = (
+                f"<user-feedback-merge>\n"
+                f"User provided new input during plan execution: {trim(user_text, 500)}\n"
+                f"Current plan step: {step_desc}\n"
+                f"Re-evaluate: Does this feedback change the current step's approach? "
+                f"If yes, adjust delegation accordingly. If it's a new requirement, "
+                f"integrate it into the current or next step. Do NOT restart from scratch.\n"
+                f"</user-feedback-merge>"
+            )
+        else:
+            merge_note = (
+                f"<user-feedback-merge>\n"
+                f"User provided new input: {trim(user_text, 500)}\n"
+                f"Integrate this feedback with current work direction. "
+                f"Adjust approach if needed but maintain progress.\n"
+                f"</user-feedback-merge>"
+            )
+        if self._is_multi_agent_mode():
+            self._append_manager_context({
+                "role": "system",
+                "content": merge_note,
+                "ts": now_ts(),
+                "agent_role": "manager",
+            })
+
+    def _is_restart_scenario(self) -> bool:
+        """Check if current state is a restart after finished/aborted task."""
+        bb = self._ensure_blackboard()
+        status = str(bb.get("status", "") or "").upper()
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        return status in ("COMPLETED", "ABORTED") or bool(approval.get("approved", False))
+
+    def _fuse_restart_intent(self, user_text: str):
+        """Fuse user intent with plan/context intent on restart.
+        Priority: 1. user intent, 2. plan intent, 3. context intent."""
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        original_goal = trim(str(bb.get("original_goal", "") or ""), 500)
+        plan_steps = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+        # Detect pure continuation
+        _CONTINUE_PHRASES = {
+            "继续", "continue", "go on", "接着", "接续", "keep going", "proceed",
+            "继续执行", "接着做", "go ahead", "next", "下一步",
+        }
+        is_continuation = str(user_text or "").strip().lower().rstrip("!.。！") in _CONTINUE_PHRASES
+        if is_continuation and plan_steps:
+            # Pure continuation — inherit plan intent fully
+            pending = [s for i, s in enumerate(plan_steps) if i >= int(bb.get("plan_step_cursor", 0) or 0)]
+            if pending:
+                fused = (
+                    f"<intent-fusion type='continuation'>\n"
+                    f"User said: {trim(user_text, 100)}\n"
+                    f"Continuing approved plan. Original goal: {original_goal}\n"
+                    f"Remaining steps: {', '.join(trim(str(s), 80) for s in pending[:5])}\n"
+                    f"Resume from where we left off. Do NOT restart.\n"
+                    f"</intent-fusion>"
+                )
+                self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
+                # Don't reset blackboard — continue
+                self.runtime_goal_reset_pending = False
+                return
+        if is_continuation and original_goal:
+            # Continuation without plan — inherit context intent
+            fused = (
+                f"<intent-fusion type='context-continuation'>\n"
+                f"User said: {trim(user_text, 100)}\n"
+                f"Continue previous work. Original goal: {original_goal}\n"
+                f"Resume from current state. Do NOT restart.\n"
+                f"</intent-fusion>"
+            )
+            self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
+            self.runtime_goal_reset_pending = False
+            return
+        # New instruction — fuse with context but user intent takes priority
+        if original_goal:
+            fused = (
+                f"<intent-fusion type='new-with-context'>\n"
+                f"New user instruction: {trim(user_text, 500)}\n"
+                f"Previous context: {original_goal}\n"
+                f"User's new instruction takes priority. Use previous context for background only.\n"
+                f"</intent-fusion>"
+            )
+            self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
+
     def submit_user_message(self, content: str):
         start_worker = False
         dropped_stale_inputs = 0
@@ -19092,12 +20773,27 @@ class SessionState:
             else:
                 if self.pending_user_inputs:
                     dropped_stale_inputs = len(self.pending_user_inputs)
+                # Preserve plan state if awaiting user choice
+                _awaiting_plan_choice = bool(
+                    self.runtime_plan_proposal
+                    and not self.runtime_plan_approved
+                )
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
+                if _awaiting_plan_choice:
+                    # Restore plan proposal so choice can be parsed
+                    self.runtime_plan_mode_needed = True
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
+                # Restart intent fusion: merge user/plan/context intents
+                if self._is_restart_scenario():
+                    self._fuse_restart_intent(clean_goal)
                 self.runtime_reclassify_goal = clean_goal
-                self.runtime_reclassify_required = True
+                # Skip reclassification for plan choice responses — preserve complexity
+                if _awaiting_plan_choice or self._is_plan_choice_response(clean_goal):
+                    self.runtime_reclassify_required = False
+                else:
+                    self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
                 self.running = True
                 self.current_phase = "starting"
@@ -19380,6 +21076,25 @@ class SessionState:
             }
             # Atomic blackboard sync: update shared state immediately after each tool result.
             self._blackboard_update_from_tool_result(role_key, item)
+            # Failure ledger: record tool call and detect errors (unified)
+            self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
+            self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, item["ok"], role_key)
+            # Failure ledger: record edit_file as potential fix attempt if errors exist
+            if name in ("edit_file", "write_file") and isinstance(args, dict):
+                fl = self._ensure_blackboard().get("failure_ledger", {})
+                all_errors = fl.get("errors", []) if isinstance(fl, dict) else []
+                edit_path = str(args.get("path", "") or "").strip()
+                if all_errors and edit_path:
+                    matching = [e for e in all_errors if edit_path.endswith(str(e.get("file", "") or "")) or str(e.get("file", "") or "").endswith(edit_path)]
+                    if matching:
+                        fix_desc = trim(str(args.get("new_text", "") or args.get("content", "") or ""), 300)
+                        self._ledger_record_fix_attempt(
+                            edit_path,
+                            trim(str(matching[-1].get("error_msg", "") or ""), 300),
+                            fix_desc,
+                            "pending",
+                            role_key,
+                        )
             item["bb_applied"] = True
             tool_results.append(item)
             if name in {"finish_task", "finish_current_task", "mark_done"} and (not str(output).startswith("Error:")):
@@ -19568,6 +21283,9 @@ class SessionState:
                 self._emit("status", {"summary": "run interrupted"})
                 break
             self._apply_auto_compact_if_needed("auto:multi-sync")
+            # Periodic checkpoint in multi-agent sync loop
+            if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
+                self._maybe_create_checkpoint()
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
                 self.current_phase = "manager:dispatch"
@@ -19910,6 +21628,450 @@ class SessionState:
             self._mark_all_done_silently(f"budget exhausted: {summary}")
             self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
 
+    # ── Plan Mode Methods ──
+
+    def _plan_mode_worker(self, pinned_selection: str):
+        """Plan mode: explorer 调研 → manager 综合 → emit 方案 → 等待用户选择"""
+        # Phase 1: Explorer 调研
+        self._emit("status", {"summary": "plan-mode: research phase started"})
+        bb = self._ensure_blackboard()
+        bb["status"] = "PLANNING"
+        bb["plan"] = {"phase": "research", "findings": []}
+        self.blackboard = bb
+
+        research_prompt = self._plan_mode_research_prompt()
+        self._seed_plan_mode_explorer_context(research_prompt)
+
+        for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
+            if self.cancel_requested:
+                return
+            step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
+            if step.get("status") in ("no-tools", "skip", "interrupted"):
+                break
+            self._plan_mode_update_findings(step)
+
+        # Phase 2: Manager 综合分析
+        self._emit("status", {"summary": "plan-mode: synthesizing proposals"})
+        bb = self._ensure_blackboard()
+        if not isinstance(bb.get("plan"), dict):
+            bb["plan"] = {"phase": "synthesis", "findings": []}
+        bb["plan"]["phase"] = "synthesis"
+        self.blackboard = bb
+
+        proposal = self._plan_mode_synthesize_proposal(pinned_selection)
+        if not proposal or not proposal.get("options"):
+            self._emit("status", {"summary": "plan-mode: synthesis failed, falling back to direct execution"})
+            self.runtime_plan_mode_needed = False
+            self.runtime_plan_approved = True
+            return
+
+        # Phase 3: Emit 方案到前端
+        self.runtime_plan_proposal = proposal
+        bb = self._ensure_blackboard()
+        if not isinstance(bb.get("plan"), dict):
+            bb["plan"] = {"phase": "awaiting_choice", "findings": []}
+        bb["plan"]["phase"] = "awaiting_choice"
+        bb["plan"]["proposal"] = proposal
+        self.blackboard = bb
+
+        plan_text = self._format_plan_proposal_markdown(proposal)
+        self.messages.append({
+            "role": "assistant",
+            "content": plan_text,
+            "ts": now_ts(),
+            "agent_role": "planner",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": trim(plan_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
+            "summary": "plan-mode proposal",
+            "agent_role": "planner",
+        })
+        self._emit("status", {"summary": "plan-mode: awaiting user choice"})
+
+    def _plan_mode_research_prompt(self) -> str:
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
+        lang_note = model_language_instruction(self.ui_language)
+        os_note = _detect_os_shell_instruction()
+        return (
+            f"You are in plan-mode research phase. Your task is to analyze the following request "
+            f"WITHOUT making any modifications.\n\n"
+            f"## User Request\n{goal}\n\n"
+            f"## Instructions\n"
+            f"1. Analyze the impact scope — which files, modules, and systems are affected\n"
+            f"2. Identify key files that need to be read and understood\n"
+            f"3. Assess risks and potential side effects\n"
+            f"4. Note any ambiguities or decisions that need user input\n"
+            f"5. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"6. Write your findings to the blackboard under 'plan.findings'.\n\n"
+            f"Workspace: {self.files_root}\n"
+            f"{os_note}\n"
+            f"{lang_note}"
+        )
+
+    def _seed_plan_mode_explorer_context(self, research_prompt: str):
+        os_note = _detect_os_shell_instruction()
+        self._append_agent_context_message("explorer", {
+            "role": "system",
+            "content": (
+                "You are Explorer in plan-mode (read-only research). "
+                "Analyze the codebase to understand the task scope. "
+                "Do NOT modify any files. Use read_file, bash (read-only commands), "
+                "and blackboard tools only. "
+                f"{os_note} "
+                f"{model_language_instruction(self.ui_language)}"
+            ),
+            "ts": now_ts(),
+            "agent_role": "explorer",
+        }, mirror_to_global=False)
+        self._append_agent_context_message("explorer", {
+            "role": "user",
+            "content": research_prompt,
+            "ts": now_ts(),
+            "agent_role": "explorer",
+        }, mirror_to_global=False)
+
+    def _plan_mode_explorer_turn(self, pinned_selection: str, round_idx: int) -> dict:
+        ctx = self._agent_context("explorer")
+        if not ctx:
+            return {"status": "skip", "reason": "empty-context"}
+        # Build filtered tool list (read-only allowlist)
+        filtered_tools = []
+        for tool in TOOLS:
+            fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = str(fn.get("name", "")).strip()
+            if name in PLAN_MODE_RESEARCH_TOOL_ALLOWLIST:
+                filtered_tools.append(tool)
+        if not filtered_tools:
+            filtered_tools = self._tools_for_agent("explorer")
+        with self.lock:
+            self.current_phase = f"plan-mode:explorer:round-{round_idx}"
+            self.current_tool_name = ""
+            self.active_agent_role = "explorer"
+        response = self._chat_with_same_model_retry(
+            ctx,
+            tools=filtered_tools,
+            system=(
+                "You are Explorer in plan-mode research. Read-only analysis. "
+                "Do NOT create, write, or edit files. "
+                f"Workspace: {self.files_root}. "
+                f"{_detect_os_shell_instruction()} "
+                f"{model_language_instruction(self.ui_language)}"
+            ),
+            max_tokens=self.max_output_tokens,
+            think=False,
+            stream_thinking=False,
+            on_thinking_chunk=self._append_live_thinking,
+            pinned_selection=pinned_selection,
+            context_label=f"plan-mode explorer round {round_idx}",
+            retries=MODEL_OUTPUT_RETRY_TIMES,
+        )
+        text = str(response.get("content") or "")
+        tool_calls = response.get("tool_calls", [])
+        text, _ = self._sanitize_assistant_text_for_runtime(text, tool_calls)
+        assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": "explorer"}
+        if tool_calls:
+            assistant["tool_calls"] = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": json_dumps(tc["function"]["arguments"]),
+                    },
+                }
+                for tc in tool_calls
+            ]
+        self._append_agent_context_message("explorer", assistant, mirror_to_global=False)
+        # B4: Emit planner research bubble for user visibility
+        if text.strip():
+            self._emit("message", {
+                "role": "assistant",
+                "agent_role": "planner",
+                "text": trim(text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
+                "summary": f"plan-mode: research round {round_idx + 1}",
+            })
+        if not tool_calls:
+            return {"status": "no-tools", "text": text}
+        # Execute tool calls (read-only)
+        for tc in tool_calls:
+            if self.cancel_requested:
+                return {"status": "interrupted"}
+            fn_name = tc["function"]["name"]
+            fn_args = tc["function"]["arguments"]
+            # Block write operations in bash
+            if fn_name == "bash":
+                cmd = str(fn_args.get("command", "") if isinstance(fn_args, dict) else "")
+                cmd_lower = cmd.lower().strip()
+                write_indicators = ("rm ", "mv ", "cp ", ">", ">>", "tee ", "dd ", "write_file", "edit_file", "mkdir ", "touch ")
+                if any(cmd_lower.startswith(w) or f" {w}" in cmd_lower for w in write_indicators):
+                    result_content = "[plan-mode] Write operations are blocked during research phase."
+                    self._append_agent_context_message("explorer", {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result_content,
+                        "ts": now_ts(),
+                        "agent_role": "explorer",
+                    }, mirror_to_global=False)
+                    continue
+            try:
+                raw_output = self._dispatch_tool(fn_name, fn_args, agent_role="explorer")
+            except Exception as exc:
+                raw_output = f"Error: {exc}"
+            result_content = str(raw_output or "")
+            self._append_agent_context_message("explorer", {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": trim(result_content, 8000),
+                "ts": now_ts(),
+                "agent_role": "explorer",
+            }, mirror_to_global=False)
+            # B5: Emit tool result as planner bubble
+            self._emit("tool_result", {
+                "name": fn_name,
+                "agent_role": "planner",
+                "result": trim(result_content, 500),
+                "summary": f"plan-mode research: {fn_name}",
+            })
+        return {"status": "ok", "tool_count": len(tool_calls), "text": text}
+
+    def _plan_mode_update_findings(self, step: dict):
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {})
+        if not isinstance(plan, dict):
+            plan = {"phase": "research", "findings": []}
+        findings = plan.get("findings", [])
+        if not isinstance(findings, list):
+            findings = []
+        text = trim(str(step.get("text", "") or ""), 2000)
+        if text:
+            findings.append({"round": len(findings), "content": text, "ts": now_ts()})
+        findings = findings[-20:]
+        plan["findings"] = findings
+        bb["plan"] = plan
+        self.blackboard = bb
+        # B6: Emit findings status as planner
+        if text:
+            self._emit("status", {
+                "summary": f"plan-mode: finding #{len(findings)} collected",
+                "agent_role": "planner",
+            })
+
+    def _plan_mode_synthesize_proposal(self, pinned_selection: str) -> dict:
+        bb = self._ensure_blackboard()
+        plan_data = bb.get("plan", {})
+        findings = plan_data.get("findings", []) if isinstance(plan_data, dict) else []
+        findings_text = "\n\n".join(
+            f"### Finding {i+1}\n{f.get('content', '')}"
+            for i, f in enumerate(findings) if isinstance(f, dict)
+        )
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
+        synthesis_prompt = (
+            f"Based on the research findings below, generate a structured plan proposal "
+            f"with up to {PLAN_MODE_MAX_OPTIONS} options for the user to choose from.\n\n"
+            f"## User Request\n{goal}\n\n"
+            f"## Research Findings\n{trim(findings_text, 6000)}\n\n"
+            f"## Instructions\n"
+            f"Call the submit_plan_proposal tool with:\n"
+            f"- context: brief background analysis\n"
+            f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
+            f"- recommended: id of the recommended option\n\n"
+            f"Make options meaningfully different (e.g. different approaches, scope levels, or trade-offs).\n"
+            f"{model_language_instruction(self.ui_language)}"
+        )
+        synthesis_ctx = [
+            {"role": "system", "content": "You are a technical architect synthesizing research into actionable plans.", "ts": now_ts()},
+            {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
+        ]
+        response = self._chat_with_same_model_retry(
+            synthesis_ctx,
+            tools=self._plan_mode_synthesis_tools(),
+            system="Generate a structured plan proposal. Use the submit_plan_proposal tool.",
+            max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
+            think=False,
+            stream_thinking=False,
+            on_thinking_chunk=self._append_live_thinking,
+            pinned_selection=pinned_selection,
+            context_label="plan-mode synthesis",
+            retries=MODEL_OUTPUT_RETRY_TIMES,
+        )
+        tool_calls = response.get("tool_calls", [])
+        for tc in tool_calls:
+            if tc.get("function", {}).get("name") == "submit_plan_proposal":
+                args = tc["function"].get("arguments", {})
+                if isinstance(args, dict) and args.get("options"):
+                    return dict(args)
+        return {}
+
+    def _plan_mode_synthesis_tools(self) -> list:
+        return [tool_def(
+            "submit_plan_proposal",
+            "Submit a structured plan proposal with multiple options for user review.",
+            {
+                "context": {"type": "string", "description": "Background analysis of the task"},
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "title": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "steps": {"type": "array", "items": {"type": "string"}},
+                            "pros": {"type": "string"},
+                            "cons": {"type": "string"},
+                            "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                        },
+                        "required": ["id", "title", "summary", "steps"],
+                    },
+                },
+                "recommended": {"type": "string", "description": "ID of recommended option"},
+            },
+            ["context", "options", "recommended"],
+        )]
+
+    def _format_plan_proposal_markdown(self, proposal: dict) -> str:
+        lines = ["## 📋 执行方案\n"]
+        context = str(proposal.get("context", "") or "").strip()
+        if context:
+            lines.append(f"### 背景分析\n{context}\n")
+        recommended = str(proposal.get("recommended", "") or "").strip()
+        options = proposal.get("options", [])
+        if not isinstance(options, list):
+            options = []
+        for opt in options[:PLAN_MODE_MAX_OPTIONS]:
+            if not isinstance(opt, dict):
+                continue
+            opt_id = str(opt.get("id", "") or "").strip()
+            title = str(opt.get("title", "") or "").strip()
+            is_recommended = opt_id == recommended
+            header = f"### 方案 {opt_id}: {title}"
+            if is_recommended:
+                header += " ⭐推荐"
+            lines.append(header)
+            summary = str(opt.get("summary", "") or "").strip()
+            if summary:
+                lines.append(summary)
+            steps = opt.get("steps", [])
+            if isinstance(steps, list) and steps:
+                lines.append("\n**步骤：**")
+                for i, s in enumerate(steps):
+                    lines.append(f"{i+1}. {s}")
+            pros = str(opt.get("pros", "") or "").strip()
+            if pros:
+                lines.append(f"\n**优势：** {pros}")
+            cons = str(opt.get("cons", "") or "").strip()
+            if cons:
+                lines.append(f"**劣势：** {cons}")
+            risk = str(opt.get("risk", "") or "").strip()
+            if risk:
+                lines.append(f"**风险：** {risk}")
+            lines.append("")
+        lines.append("---")
+        lines.append('请回复选择（如"方案A"、"A"、"选1"），或输入修改意见。')
+        return "\n".join(lines)
+
+    def _parse_plan_choice(self, text: str, proposal: dict) -> str:
+        if not text or not proposal:
+            return ""
+        low = text.strip().lower()
+        options = proposal.get("options", [])
+        if not isinstance(options, list) or not options:
+            return ""
+        option_ids = [str(o.get("id", "")).strip() for o in options if isinstance(o, dict)]
+        # Direct ID match: "A", "B", "C"
+        if low.upper() in option_ids:
+            return low.upper()
+        # "方案A", "方案 A", "option A"
+        import re
+        m = re.search(r'(?:方案|option|选项)\s*([a-zA-Z0-9])', low, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).upper()
+            if candidate in option_ids:
+                return candidate
+        # "选1", "第1个", "第一个"
+        num_map = {"一": "1", "二": "2", "三": "3", "1": "1", "2": "2", "3": "3"}
+        m2 = re.search(r'(?:选|第)\s*([一二三1-3])', low)
+        if m2:
+            idx_str = num_map.get(m2.group(1), "")
+            if idx_str:
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(option_ids):
+                    return option_ids[idx]
+        # "继续"/"确认"/"推荐" → pick recommended
+        recommended = str(proposal.get("recommended", "") or "").strip()
+        confirm_tokens = ("继续", "确认", "推荐", "推荐方案", "go", "proceed", "continue", "yes", "ok")
+        if any(tok in low for tok in confirm_tokens) and recommended:
+            return recommended
+        return ""
+
+    def _inject_plan_into_context(self, choice_id: str):
+        chosen = next(
+            (o for o in self.runtime_plan_proposal.get("options", [])
+             if isinstance(o, dict) and o.get("id") == choice_id),
+            None,
+        )
+        if not chosen:
+            return
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(chosen.get("steps", [])))
+        plan_msg = (
+            f"[approved-plan] Execute the following plan:\n"
+            f"## {chosen.get('title', '')}\n"
+            f"{chosen.get('summary', '')}\n\n"
+            f"### Steps:\n{steps_text}\n\n"
+            f"Follow these steps. Use tools to implement each step concretely."
+        )
+        self.messages.append({
+            "role": "system",
+            "content": plan_msg,
+            "ts": now_ts(),
+        })
+        if self._is_multi_agent_mode():
+            for role in ("explorer", "developer"):
+                self._append_agent_context_message(role, {
+                    "role": "system",
+                    "content": plan_msg,
+                    "ts": now_ts(),
+                    "agent_role": role,
+                }, mirror_to_global=False)
+        bb = self._ensure_blackboard()
+        bb["plan"] = {"phase": "executing", "chosen": choice_id, "steps": chosen.get("steps", [])}
+        self.blackboard = bb
+        self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen.get('title', '')}")
+        # Auto-create todos from plan steps → write into bb["project_todos"]
+        steps = chosen.get("steps", [])
+        if steps and isinstance(steps, list):
+            plan_todos = []
+            for i, step in enumerate(steps):
+                step_text = trim(str(step or "").strip(), 400)
+                if not step_text:
+                    continue
+                plan_todos.append({
+                    "id": f"pt:{i:03d}",
+                    "content": step_text,
+                    "status": "in_progress" if i == 0 else "pending",
+                    "category": "plan_step",
+                    "plan_step_index": i,
+                    "created_at": float(now_ts()),
+                    "completed_at": None,
+                    "completed_by": "",
+                    "evidence": "",
+                })
+            if plan_todos:
+                bb["project_todos"] = plan_todos[:10]
+                bb["plan_step_cursor"] = 0
+                bb["plan_step_total"] = len(plan_todos)
+                self.blackboard = bb
+                self._blackboard_touch()
+                # 同步到 UI todo
+                try:
+                    self.todo.update([
+                        {"content": t["content"], "status": t["status"], "owner": "developer"}
+                        for t in plan_todos[:10]
+                    ])
+                except Exception:
+                    pass
+
     def _agent_worker(self):
         single_role = "developer"
         try:
@@ -19959,6 +22121,10 @@ class SessionState:
                     "status",
                     {"summary": "level-5 requires user confirmation before next actions"},
                 )
+                return
+            # ── Plan Mode 检查 ──
+            if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
+                self._plan_mode_worker(pinned_selection=pinned_selection)
                 return
             if self._is_multi_agent_mode():
                 self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
@@ -20044,6 +22210,10 @@ class SessionState:
                         )
                         break
                 self._apply_auto_compact_if_needed("auto")
+                # Periodic checkpoint in single-agent loop
+                _sa_round = int(getattr(self, "agent_round_index", 0) or 0)
+                if _sa_round > 0 and _sa_round % CHECKPOINT_INTERVAL_ROUNDS == 0:
+                    self._maybe_create_checkpoint()
                 notifs = self.bg.drain()
                 if notifs:
                     text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
@@ -20783,6 +22953,25 @@ class SessionState:
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    # Failure ledger: record tool call and detect errors (single-agent, unified)
+                    self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
+                    _sa_ok = not str(output or "").startswith("Error")
+                    self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
+                    if name in ("edit_file", "write_file") and isinstance(args, dict):
+                        _fl = self._ensure_blackboard().get("failure_ledger", {})
+                        _all_errors = _fl.get("errors", []) if isinstance(_fl, dict) else []
+                        _edit_path = str(args.get("path", "") or "").strip()
+                        if _all_errors and _edit_path:
+                            _matching = [e for e in _all_errors if _edit_path.endswith(str(e.get("file", "") or "")) or str(e.get("file", "") or "").endswith(_edit_path)]
+                            if _matching:
+                                _fix_desc = trim(str(args.get("new_text", "") or args.get("content", "") or ""), 300)
+                                self._ledger_record_fix_attempt(
+                                    _edit_path,
+                                    trim(str(_matching[-1].get("error_msg", "") or ""), 300),
+                                    _fix_desc,
+                                    "pending",
+                                    "single",
+                                )
                     self._emit("tool_result", {"name": name, "result": trim(output, 500), "summary": f"tool done: {name}"})
                     if int(tool_error_streaks.get(tool_key, 0) or 0) >= HARD_BREAK_TOOL_ERROR_THRESHOLD:
                         stop_due_to_hard_break = True
@@ -20823,6 +23012,8 @@ class SessionState:
                     state_changed=bool(single_watchdog_after_fp != single_watchdog_before_fp),
                     pinned_selection=pinned_selection,
                 )
+                # Single-agent plan step tracking: sync todos and auto-advance
+                self._single_agent_plan_step_check(single_round_tool_results)
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
@@ -21345,6 +23536,7 @@ class SessionState:
                 "context_token_upper_bound": int(self.context_token_upper_bound),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
                 "context_left_tokens": int(ctx.get("left", 0)),
                 "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
@@ -22367,6 +24559,7 @@ window.MathJax={
           <button id="sendBtn">Send</button>
           <button id="interruptBtn" class="subtle">Interrupt</button>
           <button id="compactBtn" class="subtle">Compact</button>
+          <button id="planModeBtn" class="subtle" title="Toggle Plan Mode">Plan: Auto</button>
           <button id="refreshBtn" class="subtle">Refresh</button>
           <div class="export-dropdown" style="position:relative;display:inline-block">
             <button id="exportMenuBtn" class="subtle">Export ▾</button>
@@ -22524,11 +24717,13 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg.assistant.agent-developer,.msg.system.agent-developer{background:#e9fbea;border:1px solid #bde6c4}
 .msg.assistant.agent-reviewer,.msg.system.agent-reviewer{background:#fff6de;border:1px solid #f1d89a}
 .msg.assistant.agent-manager,.msg.system.agent-manager{background:#f3e9ff;border:1px solid #d7bbff}
+.msg.assistant.agent-planner,.msg.system.agent-planner{background:#fde8e4;border:1px solid #f5b8ad}
 .msg-agent-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.02em;margin:0 0 6px 0;border:1px solid #d6deea;background:#f5f8fd;color:#31465f}
 .msg-agent-badge.explorer{background:#ffe6f0;border-color:#ffbdd5;color:#9b275e}
 .msg-agent-badge.developer{background:#e6f8e8;border-color:#b8e2c0;color:#1c6a33}
 .msg-agent-badge.reviewer{background:#fff3d4;border-color:#efd692;color:#8a6213}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
+.msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
 .manager-delegate-card{border:1px solid #d7bbff;background:#f8f3ff;border-radius:10px;padding:10px}
 .manager-delegate-head{font-weight:800;font-size:.86rem;color:#5a2fa6}
 .manager-delegate-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0 8px}
@@ -23490,6 +25685,8 @@ self.onmessage=(ev)=>{
         slot.classList.remove('md-async-slot');
         const msg=slot.closest('.msg');
         if(msg){
+          const vk=String(msg.getAttribute('data-vk')||'');
+          if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1}}}
           const req=String(msg.getAttribute('data-math-request')||'').trim();
           if(req)_mathTypeset(msg,`chat:${req}`);
         }else{
@@ -24183,7 +26380,7 @@ function _chatVirtCollectRows(){
   }
   return rows;
 }
-function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const base=Math.max(72,Math.min(560,80+Math.ceil((txtLen+thinkLen)/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
+function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const totalLen=txtLen+thinkLen;const base=totalLen>1200?Math.max(400,Math.min(3200,120+Math.ceil(totalLen/60)*18)):Math.max(72,Math.min(560,80+Math.ceil(totalLen/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
 function _chatVirtBindPreviewButtons(root){if(!root)return;for(const btn of root.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}}
 function _chatVirtPruneHeightCache(rows){const keys=Object.keys(CHAT_VIRT.heights||{});if(keys.length<=CHAT_VIRT.maxCacheKeys)return;const keep=new Set(rows.map(x=>String(x?._vk||'')));for(const k of keys){if(!keep.has(k)){delete CHAT_VIRT.heights[k]}}}
 function _chatVirtPoolForKind(kind){const key=String(kind||'text');let pool=CHAT_VIRT.poolByKind[key];if(!Array.isArray(pool)){pool=[];CHAT_VIRT.poolByKind[key]=pool}return pool}
@@ -24209,8 +26406,8 @@ function _chatVirtReleaseNode(node){
   CHAT_VIRT.poolSize=Number(CHAT_VIRT.poolSize||0)+1;
 }
 function _chatVirtReleaseRendered(root){if(!root)return;for(const node of root.querySelectorAll('.msg[data-vk]')){_chatVirtReleaseNode(node)}}
-function _chatVirtAgentRoleKey(raw){const role=String(raw||'').trim().toLowerCase();return(role==='explorer'||role==='developer'||role==='reviewer'||role==='manager')?role:''}
-function _chatVirtAgentRoleLabel(role){if(role==='explorer')return'Explorer';if(role==='developer')return'Developer';if(role==='reviewer')return'Reviewer';if(role==='manager')return'Manager';return''}
+function _chatVirtAgentRoleKey(raw){const role=String(raw||'').trim().toLowerCase();return(role==='explorer'||role==='developer'||role==='reviewer'||role==='manager'||role==='planner')?role:''}
+function _chatVirtAgentRoleLabel(role){if(role==='explorer')return'Explorer';if(role==='developer')return'Developer';if(role==='reviewer')return'Reviewer';if(role==='manager')return'Manager';if(role==='planner')return'Planner';return''}
 function _stripLeadingAgentTitle(raw,agentRole){
   let txt=String(raw||'').replace(/^\\uFEFF/,'').trimStart();
   const role=_chatVirtAgentRoleKey(agentRole);
@@ -24764,6 +26961,7 @@ function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
 function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | mode=${S.snap?.execution_mode||S.config?.execution_mode||'sync'} | active_agent=${S.snap?.agent_active_role||'-'} | bb=${S.snap?.blackboard?.status||'-'} | task=${S.snap?.blackboard?.task_profile?.task_type||'-'} | complexity=${S.snap?.blackboard?.task_profile?.complexity||'-'} | judgement=${S.snap?.blackboard?.manager_judgement?.progress||'-'} | budget=${S.snap?.blackboard?.task_profile?.round_budget??'-'} | remaining=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'} | bb_cycles=${S.snap?.blackboard?.manager_cycles??'-'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
 renderCtxLive(S.snap);
+const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 _renderBridgeSyncFromSnapshot(S.snap||{});
 setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]));
 setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
@@ -25034,9 +27232,10 @@ async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
+async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});document.addEventListener('click',()=>{exportMenu.style.display='none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});document.addEventListener('click',()=>{exportMenu.style.display='none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -27357,6 +29556,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "session not found"}, status=404)
             sess.interrupt()
             return self._send_json({"ok": True})
+        m = re.match(r"^/api/sessions/([^/]+)/config/plan-mode$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+            except Exception:
+                body = {}
+            pref = str(body.get("preference", "auto") or "auto").strip().lower()
+            if pref not in PLAN_MODE_USER_CHOICES:
+                pref = "auto"
+            sess.plan_mode_user_preference = pref
+            return self._send_json({"plan_mode": pref})
         return self._send_json({"error": "not found"}, status=404)
 
     def do_PATCH(self):

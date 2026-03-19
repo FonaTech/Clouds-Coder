@@ -8,7 +8,9 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog (EN/中文/日本語)</a> ·
+  <a href="./CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
+  <a href="./CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
+  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -20,7 +22,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
+Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md) | Previous: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -91,13 +93,22 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - Agent runtime with session isolation
 - General-purpose task routing (coding + analysis + synthesis + reporting) in one session graph
 - Built-in `LLM -> Coding -> LLM` execution pattern for complex multi-step work
+- **Plan Mode** with UI toggle (Auto/On/Off) — research → proposal → user choice → step-by-step execution, works in both Single and Sync modes
+- **Multi-agent collaboration** with 4 roles (manager/explorer/developer/reviewer) and blackboard-centered coordination
+- **Reviewer Debug Mode** — reviewer gains write access to independently diagnose and fix bugs when errors are detected
+- **6-category universal error detection** (test/lint/compilation/build/deploy/runtime) with unified failure ledger
+- **4-tier context compression** (normal → light → medium → heavy) with file buffer offload, supporting ctx_left from 4K to 1M tokens
+- **Task phase-aware delegation** — manager routes to the right agent based on current phase (research/design/implement/test/review/deploy)
+- **Native multimodal support** — read_file auto-detects image/audio/video and injects as native model input when supported
+- **Real-time user input merge** — mid-execution feedback adjusts plan direction without restart
+- **Restart intent fusion** — user > plan > context priority when resuming after finish/abort
 - Built-in Web UI + optional external Web UI loading
 - Skills Studio (separate UI/port) for skill scanning, editing, and generation
 - Ollama integration with model probing and catalog loading
 - OpenAI-compatible profile support via `LLM.config.json`
 - Unified timeout scheduler (global run timeout, model-active spans excluded)
 - Truncation recovery loop with continuation passes, token/pass counters, and live UI status
-- Context compaction + recall archive mechanism
+- Context compaction + recall archive mechanism with lossless state handoff
 - No-tool idle diagnosis/recovery hints for stalled complex tasks
 - Task/Todo/Background/Team/Worktree mechanisms in one runtime
 - SSE event stream with heartbeat and write-exception handling
@@ -119,24 +130,32 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 ├───────────────────────────────────────────────────────────────────────┤
 │ Presentation Layer                                                     │
 │  - Agent Web UI (chat, boards, preview, runtime status)              │
+│  - Plan Mode toggle (Auto/On/Off) + Planner bubble (orange-red)     │
 │  - Skills Studio UI (scan/generate/save/upload skills)               │
 ├───────────────────────────────────────────────────────────────────────┤
 │ API & Stream Layer                                                     │
-│  - REST APIs: sessions/config/models/tools/preview/render            │
+│  - REST APIs: sessions/config/models/tools/preview/render/plan-mode  │
 │  - SSE channel: /api/sessions/{id}/events (heartbeat + resilience)   │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Orchestration & Control Layer                                          │
 │  - AppContext / SessionManager / SessionState                         │
+│  - Plan Mode: research → proposal → user choice → step execution     │
+│  - Phase-aware delegation (research/implement/test/review/deploy)    │
 │  - EventHub / TodoManager / TaskManager / WorktreeManager             │
+│  - 6-layer plan step protection + complexity inheritance              │
 │  - Truncation rescue + timeout governance + recovery controller        │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Model & Tool Execution Layer                                           │
 │  - Ollama/OpenAI-compatible profile orchestration                      │
+│  - Native multimodal: auto-detect image/audio/video in read_file     │
+│  - 6-category error detection + unified failure ledger                │
+│  - 4-tier context compression + file buffer offload (4K–1M tokens)   │
+│  - Reviewer Debug Mode (write access on error detection)             │
 │  - tools: bash/read/write/edit/Todo/skills/context/task/render        │
 │  - live-input arbitration + constrained-model safeguards               │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Artifact & Persistence Layer                                           │
-│  - per-session files/uploads/context_archive/code_preview              │
+│  - per-session files/uploads/context_archive/file_buffer/code_preview │
 │  - conversation/activity/operations/todos/tasks/worktree              │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -146,12 +165,13 @@ Mermaid:
 ```mermaid
 flowchart TB
   UX["Experience & Traceability<br/>multi-preview / stage history / runtime progress / skills flow"]
-  UI["Presentation Layer<br/>Agent Web UI + Skills Studio"]
-  API["API & Stream Layer<br/>REST + SSE + render-state/frame"]
-  ORCH["Orchestration & Control<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
-  EXEC["Model & Tool Execution<br/>OllamaClient + tool dispatch<br/>bash/read/write/edit/skills/context/task"]
-  DATA["Artifact & Persistence<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations"]
-  UX --> UI --> API --> ORCH --> EXEC --> DATA
+  UI["Presentation Layer<br/>Agent Web UI + Plan Mode toggle + Skills Studio"]
+  API["API & Stream Layer<br/>REST + SSE + render-state/frame + plan-mode"]
+  ORCH["Plan & Orchestration<br/>Plan Mode (research→proposal→execute) / Phase-aware delegation<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
+  AGENT["Multi-Agent Collaboration<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + Reviewer Debug Mode + Anti-stall"]
+  EXEC["Model & Tool Execution<br/>OllamaClient + native multimodal + tool dispatch<br/>6-category error detection + 4-tier compression + file buffer"]
+  DATA["Artifact & Persistence<br/>files / uploads / context_archive / file_buffer / code_preview<br/>conversation / activity / operations"]
+  UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
   DATA --> UI
 ```
@@ -209,20 +229,28 @@ User Goal
    │
    ▼
 Intent + Context Intake
-   │ (uploads/history/context budget)
+   │ (uploads/history/context budget/multimodal detection)
    ▼
-Plan/Decompose (Todo/Task/Worktree)
+Plan Mode Gate (Auto/On/Off)
+   ├─ Plan ON ──► Explorer research → Manager synthesis → User choice
+   │                                                         │
+   │              ◄──────── approved plan steps ◄────────────┘
    │
    ▼
-Agent Loop
+Agent Loop (Single or Sync mode)
+  ├─ Phase-aware delegation (research→explorer, implement→developer, ...)
   ├─ Model Call
   │    ├─ normal output ───────────────┐
   │    ├─ tool call request ──► run tool├─► append result -> next round
   │    └─ truncation signal ─► continuation/rescue
   │
+  ├─ Error detected → Reviewer Debug Mode (write access)
+  ├─ 4-tier context compression (normal/light/medium/heavy)
+  ├─ Live user input → merge with plan direction
+  ├─ Plan step auto-advance (Single) / advance_plan_step (Sync)
   ├─ no-tool idle detected -> diagnosis + recovery hints
   ├─ timeout governance (model-active span excluded)
-  └─ context pressure -> compact + recall
+  └─ context pressure -> compact + file buffer + state handoff
    │
    ▼
 Converged Output + Artifacts
@@ -235,10 +263,16 @@ Mermaid:
 
 ```mermaid
 flowchart TD
-  A["User Goal"] --> B["Intent + Context Intake<br/>uploads/history/context budget"]
-  B --> C["Plan / Decompose<br/>Todo/Task/Worktree"]
-  C --> D["Agent Loop"]
-  D --> E["Model Call"]
+  A["User Goal"] --> B["Intent + Context Intake<br/>uploads/history/context budget/multimodal"]
+  B --> PM{"Plan Mode Gate<br/>Auto/On/Off"}
+  PM -->|Plan ON| PR["Explorer Research"]
+  PR --> PS["Manager Synthesis → Proposals"]
+  PS --> UC["User Choice"]
+  UC --> PL["Approved Plan Steps"]
+  PM -->|Plan OFF| D
+  PL --> D["Agent Loop<br/>Single or Sync mode"]
+  D --> PH["Phase-aware Delegation<br/>research→explorer / implement→developer"]
+  PH --> E["Model Call"]
   E --> F["normal output"]
   E --> G["tool call request"]
   G --> H["run tool"]
@@ -246,9 +280,10 @@ flowchart TD
   E --> I["truncation signal"]
   I --> J["continuation / rescue"]
   J --> D
-  D --> K["no-tool idle detection + recovery hints"]
-  D --> L["timeout governance<br/>model-active span excluded"]
-  D --> M["context pressure -> compact + recall"]
+  D --> DBG["Error → Reviewer Debug Mode<br/>write access to fix bugs"]
+  D --> TC["4-tier context compression<br/>+ file buffer + state handoff"]
+  D --> LI["Live user input<br/>merge with plan direction"]
+  D --> SA["Plan step advance<br/>auto (Single) / manager (Sync)"]
   D --> N["Converged Output + Artifacts"]
   N --> O["Preview / History / Export<br/>MD/Code/HTML + stage backups"]
 ```
@@ -257,10 +292,10 @@ flowchart TD
 
 Clouds Coder now supports role-specialized collaboration inside one monolithic runtime process:
 
-- `manager`: routing/arbitration only (does not implement code directly)
+- `manager`: routing/arbitration only (does not implement code directly); phase-aware delegation
 - `explorer`: research, dependency/path analysis, environment probing
 - `developer`: implementation, file edits, tool execution
-- `reviewer`: validation, test judgment, approval/block decisions
+- `reviewer`: validation, test judgment, approval/block decisions; **Debug Mode** grants write access to fix bugs independently
 
 This is not a microservice cluster. All agents run in one process and synchronize through one shared blackboard (single source of truth), which gives:
 
@@ -270,10 +305,11 @@ This is not a microservice cluster. All agents run in one process and synchroniz
 
 Blackboard-centered data slices:
 
-- `original_goal`, `status`, `manager_cycles`
+- `original_goal`, `status`, `manager_cycles`, `plan` (phase/steps/cursor)
 - `research_notes`, `code_artifacts`, `execution_logs`, `review_feedback`
+- `errors` (unified 6-category failure ledger) + `compilation_errors` (compat view)
 - `todos` with owner attribution (`manager`/`explorer`/`developer`/`reviewer`)
-- manager judgement state (`task level`, `budget`, `remaining rounds`, `approval gate`)
+- manager judgement state (`task level`, `budget`, `remaining rounds`, `approval gate`, `phase`)
 
 Execution topologies:
 
@@ -294,7 +330,9 @@ Mermaid (same-frequency collaboration under monolithic kernel):
 
 ```mermaid
 flowchart LR
-  U["User Input"] --> M["Manager"]
+  U["User Input"] --> P["Planner<br/>(Plan Mode)"]
+  P -->|approved plan| M["Manager"]
+  U -->|direct| M
   M --> B["Session Blackboard"]
   B --> E["Explorer"]
   B --> D["Developer"]
@@ -302,10 +340,11 @@ flowchart LR
   E -->|research notes / risk / references| B
   D -->|code artifacts / tool outputs| B
   R -->|review verdict / fix request| B
+  R -.->|Debug Mode: edit_file| D
   B --> M
-  M -->|delegate_task + mandatory flags + budget update| E
-  M -->|delegate_task + mandatory flags + budget update| D
-  M -->|delegate_task + mandatory flags + budget update| R
+  M -->|phase-aware delegate + mandatory flags + budget| E
+  M -->|phase-aware delegate + mandatory flags + budget| D
+  M -->|phase-aware delegate + debug mode trigger| R
 ```
 
 Mermaid (routing loop and dynamic interception):
@@ -313,6 +352,7 @@ Mermaid (routing loop and dynamic interception):
 ```mermaid
 sequenceDiagram
   participant U as User
+  participant P as Planner
   participant M as Manager
   participant B as Blackboard
   participant E as Explorer
@@ -320,18 +360,31 @@ sequenceDiagram
   participant R as Reviewer
 
   U->>M: New requirement / Continue
-  M->>B: classify(task_level, mode, budget)
+  alt Plan Mode ON
+    M->>P: activate plan mode
+    P->>E: research(read-only)
+    E->>B: write(findings)
+    P->>U: propose options (A/B/C)
+    U->>P: choose option
+    P->>B: write(plan steps)
+  end
+  M->>B: classify(task_level, mode, budget, phase)
   M->>E: delegate(research objective)
   E->>B: write(research_notes)
   M->>D: delegate(implementation objective)
   D->>B: write(code_artifacts, execution_logs)
   M->>R: delegate(review objective)
   R->>B: write(review_feedback, approval)
+  alt errors detected
+    M->>R: activate Debug Mode (write access)
+    R->>D: edit_file(fix bug directly)
+    R->>B: write(fix evidence)
+  end
   alt reviewer finds regression
     M->>E: re-check APIs/constraints
     M->>D: patch with reviewer feedback
   end
-  M->>B: mark_completed or continue
+  M->>B: advance_plan_step or mark_completed
 ```
 
 Mermaid (blackboard state machine):
@@ -401,6 +454,65 @@ Priority-ordered updates merged into this architecture:
 - Expanded `RUNTIME_CONTROL_HINT_PREFIXES` with `<arbiter-continue>` and `<fault-prefill>` for richer recovery loops.
 
 The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md).
+
+### 3.6 2026-03-16 Critical Fix: Single-Mode Agent Leak & Termination Signal
+
+Two interrelated critical bugs were fixed in the multi-agent orchestration layer:
+
+1. Single-mode agent leak (`_manager_apply_task_policy`)
+- When `executor_mode_flag=True`, the target-not-in-participants branch could append extra agents, overriding the Single-mode `participants = [assigned_expert]` constraint.
+- Fix: added a hard post-guard that forces `participants = [assigned_expert]` and redirects non-expert targets back, regardless of executor_mode_flag.
+
+2. Conclusive-reply termination signal ignored by Manager
+- When an agent (e.g. developer) replied "task complete", the Manager continued dispatching explorer → developer → reviewer in a loop, because: (a) conclusive-reply detection only ran on the fallback path, not the tool-parsed routing path; (b) `_manager_apply_task_policy()` had no conclusive-reply check; (c) text-based completion never set `approval.approved` on the blackboard.
+- Fix: four-layer defense added:
+  - Layer 1 — Fallback general endpoint detection: `_detect_endpoint_intent` extended from `simple_qa`-only to all task types.
+  - Layer 2 — Policy-layer interception: conclusive-reply detection added before `can_finish_from_approval` gate.
+  - Layer 3 — Sync-loop interception: post-turn conclusive-reply detection in `_multi_agent_sync_blackboard_worker()` with auto-approval and immediate break.
+- Safety guards: conclusive-reply finish is suppressed when error logs exist or open todo items remain.
+
+Full trilingual details: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md)
+
+### 3.7 2026-03-20 Major Update: Plan Mode Architecture & Core Overhaul
+
+The largest architecture update since project inception — 7 modules, 60+ modification points.
+
+**Plan Mode — Unified Architecture**
+- New UI toggle button: `Plan: Auto/On/Off` — users control whether planning runs regardless of task level.
+- Works identically in both Single and Sync execution modes. Single mode auto-advances plan steps via `_single_agent_plan_step_check()`.
+- 6-layer plan step protection prevents premature finish: arbiter can't batch-complete plan steps, manager can't route to finish with pending steps.
+- Planner chat bubble with orange-red theme and full agent badge structure.
+
+**Tiered Context Compression + File Buffer**
+- 4-tier progressive compression (Tier 0–3) based on ctx_left percentage and absolute thresholds.
+- Agent contexts (`agent_messages`, `manager_context`, per-role `contexts`) now compressed during compact — previously untouched, causing immediate re-wall.
+- File buffer offloads large content (>2KB) to disk with compact references. ctx_left range extended to [4K, 1M].
+- `_build_state_handoff()` ensures lossless goal/progress/state preservation across compaction.
+
+**Universal Error Architecture**
+- Unified `errors` list with `category` field replaces compilation-only detection. 6 categories: test, lint, compilation, build_package, deploy_infra, runtime.
+- `_process_tool_result_errors()` replaces inline detection in both multi-agent and single-agent paths.
+- Reviewer DEBUG METHODOLOGY generalized to cover all error types.
+
+**Reviewer Debug Mode**
+- When errors are detected, reviewer automatically gains `write_file`/`edit_file` access to independently fix bugs.
+- Auto-deactivates when errors resolve or after 6 rounds (falls back to developer).
+- Explorer stall detection: 3 consecutive identical delegations → forced switch to developer.
+
+**Complexity Inheritance & Real-time Input**
+- Plan choice responses skip reclassification — complexity level preserved.
+- Live user inputs trigger `_merge_user_feedback_with_plan()` for mid-flight plan adjustment.
+- Restart intent fusion with priority: user intent > plan intent > context intent.
+
+**Task Phase Independence**
+- Phase-aware delegation: research→explorer, implement→developer, test→developer, review→reviewer.
+- Manager receives `PHASE INDEPENDENCE` instruction to prevent carrying over patterns from previous phases.
+
+**Multimodal Native Support & TodoWrite Isolation**
+- `_run_read()` detects image/audio/video files and injects as native multimodal input when model supports it.
+- TodoWrite in plan mode creates sub-items tagged with owner, preventing plan_step overwrite.
+
+Full trilingual details: [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md)
 
 ## 4. Key Runtime Components
 
@@ -774,3 +886,5 @@ flowchart TD
 ## 13. License
 
 This project is released under the MIT License. See [LICENSE](./LICENSE).
+
+
