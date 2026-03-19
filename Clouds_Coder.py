@@ -8443,6 +8443,12 @@ class SessionState:
                 self.runtime_goal_reset_pending = bool(
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
+                # Restore plan mode state
+                self.runtime_plan_mode_needed = bool(raw.get("runtime_plan_mode_needed", False))
+                self.runtime_plan_approved = bool(raw.get("runtime_plan_approved", False))
+                raw_proposal = raw.get("runtime_plan_proposal", {})
+                self.runtime_plan_proposal = dict(raw_proposal) if isinstance(raw_proposal, dict) else {}
+                self.runtime_plan_choice = str(raw.get("runtime_plan_choice", "") or "")
                 self.active_agent_role = str(raw.get("active_agent_role", self.active_agent_role) or "").strip().lower()
                 raw_contexts = raw.get("contexts", {})
                 if isinstance(raw_contexts, dict):
@@ -8595,6 +8601,10 @@ class SessionState:
             "runtime_reclassify_goal": trim(str(self.runtime_reclassify_goal or ""), 4000),
             "runtime_reclassify_required": bool(self.runtime_reclassify_required),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
+            "runtime_plan_mode_needed": bool(self.runtime_plan_mode_needed),
+            "runtime_plan_approved": bool(self.runtime_plan_approved),
+            "runtime_plan_proposal": dict(self.runtime_plan_proposal) if self.runtime_plan_proposal else {},
+            "runtime_plan_choice": str(self.runtime_plan_choice or ""),
             "active_agent_role": str(self.active_agent_role or ""),
             "contexts": {role: list(self.contexts.get(role, []))[-400:] for role in AGENT_ROLES},
             "manager_context": list(self.manager_context)[-400:],
@@ -9207,6 +9217,63 @@ class SessionState:
                 c = msg.get("content", "")
                 if isinstance(c, str) and len(c) > 600:
                     msg["content"] = trim(c, 600)
+        # 7. Plan mode context compression — tiered by ctx_left
+        self._compact_plan_context(tier)
+
+    def _compact_plan_context(self, tier: int):
+        """Compress plan mode context based on tier.
+        Tier 0: keep everything
+        Tier 1: trim plan findings to last 3
+        Tier 2: drop plan findings, keep only plan steps + user choice
+        Tier 3: minimal — only plan steps and chosen option title
+        """
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan")
+        if not isinstance(plan, dict):
+            return
+        if tier <= 0:
+            return
+        if tier == 1:
+            # Keep last 3 findings
+            findings = plan.get("findings", [])
+            if isinstance(findings, list) and len(findings) > 3:
+                plan["findings"] = findings[-3:]
+        elif tier == 2:
+            # Drop findings entirely, keep steps + proposal summary
+            plan.pop("findings", None)
+            proposal = plan.get("proposal", {})
+            if isinstance(proposal, dict):
+                # Trim option details — keep only chosen option
+                chosen_id = str(plan.get("chosen", "") or "")
+                options = proposal.get("options", [])
+                if isinstance(options, list) and chosen_id:
+                    proposal["options"] = [
+                        o for o in options
+                        if isinstance(o, dict) and o.get("id") == chosen_id
+                    ]
+                    # Trim chosen option — drop pros/cons/risk
+                    for o in proposal.get("options", []):
+                        o.pop("pros", None)
+                        o.pop("cons", None)
+                        o.pop("risk", None)
+        elif tier >= 3:
+            # Minimal: only phase, chosen, steps
+            phase = plan.get("phase", "")
+            chosen = plan.get("chosen", "")
+            steps = plan.get("steps", [])
+            bb["plan"] = {"phase": phase, "chosen": chosen, "steps": steps}
+        self.blackboard = bb
+        # Also trim plan proposal in runtime state
+        if tier >= 2 and self.runtime_plan_proposal:
+            chosen_id = str(self.runtime_plan_choice or "")
+            if chosen_id:
+                options = self.runtime_plan_proposal.get("options", [])
+                if isinstance(options, list):
+                    self.runtime_plan_proposal["options"] = [
+                        o for o in options if isinstance(o, dict) and o.get("id") == chosen_id
+                    ]
+            if tier >= 3:
+                self.runtime_plan_proposal = {}
 
     def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
         metrics = self._context_budget_metrics()
@@ -15980,7 +16047,7 @@ class SessionState:
         self.reviewer_debug_rounds = 0
         self.reviewer_debug_context = trim(str(error_context or ""), 1000)
         self._emit("status", {
-            "summary": f"reviewer debug mode ACTIVATED — reviewer can now edit files to fix bugs"
+            "summary": "reviewer debug mode ACTIVATED — reviewer can now edit files to fix bugs"
         })
 
     def _deactivate_reviewer_debug_mode(self, reason: str = ""):
@@ -20782,6 +20849,15 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
+                    # Parse plan choice immediately — don't wait for classification
+                    choice = self._parse_plan_choice(clean_goal, self.runtime_plan_proposal)
+                    if choice:
+                        self.runtime_plan_choice = choice
+                        self.runtime_plan_approved = True
+                        self.runtime_plan_mode_needed = False
+                        self._inject_plan_into_context(choice)
+                        self.runtime_reclassify_required = False
+                        self.runtime_goal_reset_pending = False
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
@@ -26366,7 +26442,7 @@ function _chatVirtCollectRows(){
     const label=String(S.snap?.live_run_notice_label||'model call').trim()||'model call';
     const startedAt=Number(S.snap?.live_run_notice_started_at||0);
     const snapElapsed=Number(S.snap?.live_run_notice_elapsed||0);
-    const elapsed=startedAt>0?Math.max(snapElapsed,(Date.now()/1000)-startedAt):snapElapsed;
+    const elapsed=startedAt>0?(Date.now()/1000)-startedAt:snapElapsed;
     rows.push({
       role:'assistant',
       type:'live_run_notice',
@@ -26375,7 +26451,7 @@ function _chatVirtCollectRows(){
       elapsed:elapsed,
       startedAt:startedAt,
       agent_role:activeAgentRole||undefined,
-      _vk:`run:${activeAgentRole}:${label}:${Math.round(startedAt*10)}`
+      _vk:`run:${activeAgentRole}:${label}`
     });
   }
   return rows;
