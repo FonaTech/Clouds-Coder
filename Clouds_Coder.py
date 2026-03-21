@@ -15868,12 +15868,25 @@ class SessionState:
         self.blackboard = board
 
     def _blackboard_reset_for_goal(self, goal: str):
-        # Preserve loaded skills across goal reset
+        # Preserve loaded skills and plan data across goal reset
         old_bb = self._ensure_blackboard()
         preserved_skills = old_bb.get("loaded_skills", {})
+        preserved_plan = old_bb.get("plan", {})
+        preserved_todos = old_bb.get("project_todos", [])
+        preserved_cursor = old_bb.get("plan_step_cursor", None)
+        preserved_total = old_bb.get("plan_step_total", None)
         self.blackboard = self._new_blackboard(goal)
         if isinstance(preserved_skills, dict) and preserved_skills:
             self.blackboard["loaded_skills"] = preserved_skills
+        # Restore plan state if plan is in executing phase
+        if isinstance(preserved_plan, dict) and preserved_plan.get("phase") == "executing":
+            self.blackboard["plan"] = preserved_plan
+            if isinstance(preserved_todos, list) and preserved_todos:
+                self.blackboard["project_todos"] = preserved_todos
+            if preserved_cursor is not None:
+                self.blackboard["plan_step_cursor"] = preserved_cursor
+            if preserved_total is not None:
+                self.blackboard["plan_step_total"] = preserved_total
         self.manager_context = []
         self.agent_messages = [m for m in self.agent_messages if m.get("agent_role") != "manager"]
         self.manager_routes = []
@@ -16501,9 +16514,14 @@ class SessionState:
     def _sync_todos_from_blackboard(self, reason: str = "", board: dict | None = None):
         if bool(self.runtime_reclassify_required):
             return
-        if not self._is_multi_agent_mode():
-            return
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        # In single mode, still sync plan_step todos if they exist
+        has_plan_steps = any(
+            isinstance(t, dict) and t.get("category") == "plan_step"
+            for t in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+        )
+        if not self._is_multi_agent_mode() and not has_plan_steps:
+            return
         self._init_project_todos(bb)
         self._update_project_todo_status(bb)
         system_rows = self._todo_project_rows_from_blackboard(bb)
@@ -17591,6 +17609,17 @@ class SessionState:
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
         lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
+                     "Do NOT reinterpret or replace plan steps with your own objectives. ")
+        # Add loaded skills enforcement
+        bb_skills = bb.get("loaded_skills", {})
+        if isinstance(bb_skills, dict) and bb_skills:
+            skill_names = list(bb_skills.keys())[:3]
+            lines.append(
+                f"LOADED SKILLS: {', '.join(skill_names)}. "
+                "Delegate agents to follow the loaded skill's workflow scripts and procedures. "
+                "The skill defines the correct execution path — do NOT deviate from it. "
+            )
         # Add current phase routing hint
         current_phase = self._infer_current_phase_from_blackboard()
         if current_phase:
@@ -17719,6 +17748,16 @@ class SessionState:
                 "IMPORTANT: Previous fix attempts FAILED. You MUST change your approach — "
                 "do NOT repeat the same instruction. Include the exact error output in your delegation. "
             )
+        # Loaded skills constraint for manager
+        skills_constraint = self._loaded_skills_prompt_hint(for_role="manager")
+        bb_skills = board.get("loaded_skills", {})
+        if isinstance(bb_skills, dict) and bb_skills:
+            skill_names = list(bb_skills.keys())[:5]
+            skills_constraint += (
+                f"CRITICAL: Skills {skill_names} are loaded. Your delegations MUST instruct agents to "
+                "follow the loaded skill's workflow and scripts. Do NOT invent alternative approaches "
+                "when a loaded skill already defines the correct procedure. "
+            )
         return (
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
@@ -17734,6 +17773,7 @@ class SessionState:
             f"{plan_context}"
             f"{phase_hint}"
             f"{failure_hint}"
+            f"{skills_constraint}"
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
             f"objective={trim(str(profile.get('direct_objective','') or ''), 220)}. "
@@ -19309,6 +19349,20 @@ class SessionState:
         board_md = self._blackboard_read_state_markdown(max_items=5)
         # Include loaded skills hint in delegation
         loaded_skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        # Include current plan step in delegation so agents stay on track
+        current_plan_step_note = ""
+        bb_for_plan = self._ensure_blackboard()
+        plan_todos = bb_for_plan.get("project_todos", [])
+        if isinstance(plan_todos, list):
+            for pt in plan_todos:
+                if isinstance(pt, dict) and pt.get("category") == "plan_step" and pt.get("status") == "in_progress":
+                    step_text = trim(str(pt.get("content", "") or ""), 300)
+                    step_idx = int(pt.get("plan_step_index", 0) or 0) + 1
+                    current_plan_step_note = (
+                        f"CURRENT PLAN STEP (#{step_idx}): {step_text}\n"
+                        f"Your work must directly execute THIS step. Do not skip or replace it.\n"
+                    )
+                    break
         payload = (
             "<manager-delegate>\n"
             f"target={role_key}\n"
@@ -19321,6 +19375,7 @@ class SessionState:
             f"{collaboration_note}\n"
             f"{role_capability_note}\n"
             f"{loaded_skills_note}"
+            f"{current_plan_step_note}"
             f"{error_section}"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
