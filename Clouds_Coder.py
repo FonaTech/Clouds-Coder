@@ -22737,6 +22737,7 @@ class SessionState:
         if not isinstance(options, list) or not options:
             return ""
         option_ids = [str(o.get("id", "")).strip() for o in options if isinstance(o, dict)]
+        # --- Fast path: hardcoded pattern matching (fallback) ---
         # Direct ID match: "A", "B", "C"
         if low.upper() in option_ids:
             return low.upper()
@@ -22761,6 +22762,47 @@ class SessionState:
         confirm_tokens = ("继续", "确认", "推荐", "推荐方案", "go", "proceed", "continue", "yes", "ok")
         if any(tok in low for tok in confirm_tokens) and recommended:
             return recommended
+        # --- Slow path: LLM semantic matching ---
+        return self._parse_plan_choice_via_llm(text, proposal, option_ids)
+
+    def _parse_plan_choice_via_llm(self, user_text: str, proposal: dict, option_ids: list[str]) -> str:
+        options_desc = []
+        for opt in proposal.get("options", []):
+            if not isinstance(opt, dict):
+                continue
+            oid = str(opt.get("id", "")).strip()
+            title = str(opt.get("title", "")).strip()
+            summary = trim(str(opt.get("summary", "")).strip(), 120)
+            options_desc.append(f"{oid}: {title} — {summary}")
+        if not options_desc:
+            return ""
+        recommended = str(proposal.get("recommended", "") or "").strip()
+        rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
+        prompt = (
+            f"The user was presented with these options:\n"
+            + "\n".join(options_desc)
+            + rec_hint
+            + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"
+            f"Which option did the user choose? Reply with ONLY the option ID "
+            f"(one of: {', '.join(option_ids)}), or \"NONE\" if the user did not choose any option "
+            f"and instead asked a question or gave feedback."
+        )
+        try:
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="You are a precise intent classifier. Output only the option ID or NONE.",
+                max_tokens=8,
+                think=False,
+            )
+            answer = str(rsp.get("content", "") or "").strip().upper()
+            # Extract option ID from response (handle "A", "A.", "Option A", etc.)
+            for oid in option_ids:
+                if oid in answer:
+                    return oid
+            if answer == "NONE" or not answer:
+                return ""
+        except Exception:
+            pass
         return ""
 
     def _inject_plan_into_context(self, choice_id: str):
