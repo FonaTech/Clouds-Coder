@@ -54,9 +54,20 @@ MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
+BASH_READ_LOOP_THRESHOLD = 3
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 3
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 3
+STALL_SEVERITY_ESCALATION_THRESHOLD = 5
+STALL_SEVERITY_WEIGHT_BASH_READ_LOOP = 2
+STALL_SEVERITY_WEIGHT_REPEATED_TOOL = 3
+STALL_SEVERITY_WEIGHT_FAULT = 2
+STALL_SEVERITY_WEIGHT_RECOVERY_RETRY = 2
+STALL_SEVERITY_WEIGHT_WATCHDOG = 2
+STALL_SEVERITY_DECAY_ON_SUCCESS = 2
+STALL_ESCALATION_MIN_LEVEL = 2
+STALL_PLAN_SYNTHESIS_MAX_TOKENS = 3000
+STALL_ESCALATION_CONTEXT_MAX_CHARS = 3000
 MAX_RUN_SECONDS = 3000
 MIN_RUN_TIMEOUT_SECONDS = 600
 MAX_RUN_TIMEOUT_SECONDS = 86_400
@@ -179,6 +190,8 @@ RETRY_RUNTIME_HINT_PREFIXES = (
     "<truncate-rescue>",
     "<thinking-empty-recovery>",
     "<fault-prefill>",
+    "<edit-recovery>",
+    "<continuation-briefing>",
 )
 EXECUTION_MODE_SINGLE = "single"
 EXECUTION_MODE_SEQUENTIAL = "sequential"
@@ -309,6 +322,7 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
     "finish_task", "finish_current_task",
 }
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
+DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 4096
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
@@ -944,6 +958,23 @@ def load_web_ui_config_file(path: Path) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def extract_show_upload_list_setting(raw: object) -> bool | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = ("show_upload_list", "upload_list_visible", "enable_upload_list")
+    for key in keys:
+        if key in raw:
+            return _to_bool_like(raw.get(key), default=False)
+    for section_key in ("web_ui", "ui", "frontend"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _to_bool_like(section.get(key), default=False)
+    return None
+
+
 def default_multimodal_capabilities() -> dict[str, bool]:
     return {
         "input_image": False,
@@ -1465,15 +1496,32 @@ def _html_esc(text: str) -> str:
 
 
 def _text_to_minimal_pdf(text: str) -> bytes:
-    """纯 Python 最小 PDF 生成器，无外部依赖。"""
+    """纯 Python 最小 PDF 生成器，支持 CJK（中日韩）字符。"""
     raw = str(text or "")
     lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    font_size = 10
-    leading = font_size * 1.35
+    font_size = 9
+    leading = font_size * 1.5
     margin_top, margin_bottom, margin_left, margin_right = 50, 50, 50, 50
     page_w, page_h = 595, 842  # A4
+
+    def _has_cjk(s: str) -> bool:
+        for ch in s:
+            cp = ord(ch)
+            if (0x2E80 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF
+                    or 0xFE30 <= cp <= 0xFE4F or 0x20000 <= cp <= 0x2FA1F
+                    or 0x3000 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF
+                    or 0xFF00 <= cp <= 0xFFEF):
+                return True
+        return False
+
+    has_cjk = _has_cjk(raw)
+
+    # CJK chars are wider; adjust chars-per-line accordingly
     usable_w = page_w - margin_left - margin_right
-    max_chars_per_line = max(20, int(usable_w / (font_size * 0.52)))
+    if has_cjk:
+        max_chars_per_line = max(20, int(usable_w / (font_size * 0.55)))
+    else:
+        max_chars_per_line = max(20, int(usable_w / (font_size * 0.52)))
     usable_h = page_h - margin_top - margin_bottom
     lines_per_page = max(1, int(usable_h / leading))
 
@@ -1489,51 +1537,87 @@ def _text_to_minimal_pdf(text: str) -> bytes:
         wrapped.append(line)
 
     # 分页
-    pages: list[list[str]] = []
+    pages_list: list[list[str]] = []
     for i in range(0, len(wrapped), lines_per_page):
-        pages.append(wrapped[i:i + lines_per_page])
-    if not pages:
-        pages = [[""]]
+        pages_list.append(wrapped[i:i + lines_per_page])
+    if not pages_list:
+        pages_list = [[""]]
 
-    def _pdf_escape(s: str) -> str:
-        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    def _pdf_escape_bytes(s: str) -> bytes:
+        """Encode string to UTF-16BE hex for CJK-safe PDF text."""
+        encoded = s.encode("utf-16-be")
+        return b"<FEFF" + encoded.hex().upper().encode("ascii") + b">"
 
-    def _safe_latin1(s: str) -> str:
-        return s.encode("latin-1", errors="replace").decode("latin-1")
+    def _pdf_escape_latin(s: str) -> str:
+        safe = s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        return safe.encode("latin-1", errors="replace").decode("latin-1")
 
     objects: list[bytes] = []
     offsets: list[int] = []
-    buf = b"%PDF-1.4\n"
+    buf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
 
-    def add_obj(content: str) -> int:
+    def add_obj_bytes(content: bytes) -> int:
         nonlocal buf
         idx = len(objects) + 1
         offsets.append(len(buf))
-        obj_bytes = f"{idx} 0 obj\n{content}\nendobj\n".encode("latin-1")
+        obj_bytes = f"{idx} 0 obj\n".encode("ascii") + content + b"\nendobj\n"
         buf += obj_bytes
         objects.append(obj_bytes)
         return idx
 
+    def add_obj(content: str) -> int:
+        return add_obj_bytes(content.encode("latin-1", errors="replace"))
+
     catalog_id = add_obj("<< /Type /Catalog /Pages 2 0 R >>")
-    add_obj("PAGES_PLACEHOLDER")  # obj 2: placeholder, replaced after page generation
-    font_id = add_obj("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")
+    add_obj("PAGES_PLACEHOLDER")  # obj 2: replaced after page generation
+
+    if has_cjk:
+        # CIDFont for CJK support using Adobe-GB1 (Simplified Chinese) as primary
+        # with fallback ordering — most PDF viewers can render CJK with this
+        cid_font_id = add_obj(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light "
+            "/Encoding /UniGB-UTF16-H "
+            "/DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 "
+            "/BaseFont /STSong-Light "
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 5 >> "
+            "/DW 1000 >>] >>"
+        )
+        # Also add a latin fallback font for ASCII-heavy sections
+        latin_font_id = add_obj("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>")
+    else:
+        latin_font_id = add_obj("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>")
+        cid_font_id = 0
 
     page_ids: list[int] = []
-    for page_lines in pages:
-        stream_lines = [f"BT /F1 {font_size} Tf"]
+    for page_lines in pages_list:
+        stream_parts: list[bytes] = []
+        stream_parts.append(b"BT\n")
         y = page_h - margin_top
-        stream_lines.append(f"{margin_left} {y} Td")
+        stream_parts.append(f"{margin_left} {y} Td\n".encode("ascii"))
         for pl in page_lines:
-            safe = _safe_latin1(_pdf_escape(pl))
-            stream_lines.append(f"({safe}) Tj")
-            stream_lines.append(f"0 -{leading:.1f} Td")
-        stream_lines.append("ET")
-        stream = "\n".join(stream_lines)
-        stream_bytes = stream.encode("latin-1")
-        content_id = add_obj(f"<< /Length {len(stream_bytes)} >>\nstream\n{stream}\nendstream")
+            if has_cjk and _has_cjk(pl):
+                stream_parts.append(f"/F1 {font_size} Tf\n".encode("ascii"))
+                stream_parts.append(_pdf_escape_bytes(pl) + b" Tj\n")
+            else:
+                font_tag = "/F2" if has_cjk else "/F1"
+                stream_parts.append(f"{font_tag} {font_size} Tf\n".encode("ascii"))
+                safe = _pdf_escape_latin(pl)
+                stream_parts.append(f"({safe}) Tj\n".encode("latin-1", errors="replace"))
+            stream_parts.append(f"0 -{leading:.1f} Td\n".encode("ascii"))
+        stream_parts.append(b"ET")
+        stream_bytes = b"".join(stream_parts)
+        content_id = add_obj_bytes(
+            f"<< /Length {len(stream_bytes)} >>\nstream\n".encode("ascii")
+            + stream_bytes
+            + b"\nendstream"
+        )
+        if has_cjk:
+            font_dict = f"/F1 {cid_font_id} 0 R /F2 {latin_font_id} 0 R"
+        else:
+            font_dict = f"/F1 {latin_font_id} 0 R"
         page_id = add_obj(
             f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w} {page_h}] "
-            f"/Contents {content_id} 0 R /Resources << /Font << /F1 {font_id} 0 R >> >> >>"
+            f"/Contents {content_id} 0 R /Resources << /Font << {font_dict} >> >> >>"
         )
         page_ids.append(page_id)
 
@@ -1548,14 +1632,14 @@ def _text_to_minimal_pdf(text: str) -> bytes:
 
     xref_offset = len(buf)
     buf += b"xref\n"
-    buf += f"0 {len(objects) + 1}\n".encode("latin-1")
+    buf += f"0 {len(objects) + 1}\n".encode("ascii")
     buf += b"0000000000 65535 f \n"
     for off in offsets:
-        buf += f"{off:010d} 00000 n \n".encode("latin-1")
+        buf += f"{off:010d} 00000 n \n".encode("ascii")
     buf += b"trailer\n"
-    buf += f"<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n".encode("latin-1")
+    buf += f"<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n".encode("ascii")
     buf += b"startxref\n"
-    buf += f"{xref_offset}\n".encode("latin-1")
+    buf += f"{xref_offset}\n".encode("ascii")
     buf += b"%%EOF\n"
     return buf
 
@@ -6952,6 +7036,20 @@ class OllamaClient:
             stream_thinking = False
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
+        # Some providers require all system messages at the beginning (or merged into one)
+        if provider in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+            sys_msgs = [m for m in req_messages if m.get("role") == "system"]
+            non_sys_msgs = [m for m in req_messages if m.get("role") != "system"]
+            if len(sys_msgs) > 1:
+                # Merge all system messages into one to avoid API rejection
+                merged_system = "\n\n".join(
+                    str(m.get("content", "") or "").strip()
+                    for m in sys_msgs
+                    if str(m.get("content", "") or "").strip()
+                )
+                req_messages = [{"role": "system", "content": merged_system}] + non_sys_msgs
+            elif sys_msgs:
+                req_messages = sys_msgs + non_sys_msgs
         if provider in {"openai_compat", "openai", "siliconflow"}:
             return self._chat_openai_compat(
                 req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
@@ -7373,6 +7471,7 @@ class SessionState:
         self.current_phase = "idle"
         self.current_tool_name = ""
         self.runtime_task_level = 0
+        self.user_task_level_override = 0
         self.runtime_execution_mode = ""
         self.runtime_assigned_expert = ""
         self.runtime_participants: list[str] = []
@@ -7402,8 +7501,17 @@ class SessionState:
         self.reviewer_debug_mode = False
         self.reviewer_debug_rounds = 0
         self.reviewer_debug_context = ""
+        self.developer_edit_fail_streaks: dict = {}   # {path: consecutive_fail_count}
+        self.developer_edit_last_diag: dict = {}      # {path: last_diagnostic_msg}
         self.explorer_consecutive_delegations = 0
         self.last_explorer_instruction_hash = ""
+        self.bash_read_loop_fp = ""
+        self.bash_read_loop_count = 0
+        self.stall_severity_score = 0
+        self.stall_severity_sources: list[dict] = []
+        self.stall_escalation_triggered = False
+        self.stall_escalation_round = 0
+        self._cached_llm_complexity = ""
         self._pending_media_inputs: list[dict] = []
         self.tool_retry_counts: dict[str, int] = {}
         self.last_auto_title_ts = 0.0
@@ -8349,6 +8457,8 @@ class SessionState:
                 self.reviewer_debug_mode = bool(raw.get("reviewer_debug_mode", False))
                 self.reviewer_debug_rounds = int(raw.get("reviewer_debug_rounds", 0) or 0)
                 self.reviewer_debug_context = trim(str(raw.get("reviewer_debug_context", "") or ""), 1000)
+                self.developer_edit_fail_streaks = dict(raw.get("developer_edit_fail_streaks", {})) if isinstance(raw.get("developer_edit_fail_streaks"), dict) else {}
+                self.developer_edit_last_diag = {}
                 pending_inputs = raw.get("pending_user_inputs", [])
                 if isinstance(pending_inputs, list):
                     clean_pending: list[dict] = []
@@ -8393,6 +8503,11 @@ class SessionState:
                 except Exception:
                     lvl = 0
                 self.runtime_task_level = lvl if lvl in TASK_LEVEL_CHOICES else 0
+                try:
+                    _utlo = int(raw.get("user_task_level_override", 0) or 0)
+                except Exception:
+                    _utlo = 0
+                self.user_task_level_override = _utlo if _utlo in (0, *TASK_LEVEL_CHOICES) else 0
                 self.runtime_execution_mode = normalize_execution_mode(
                     raw.get("runtime_execution_mode", self.runtime_execution_mode),
                     default="",
@@ -8570,6 +8685,7 @@ class SessionState:
             "reviewer_debug_mode": bool(self.reviewer_debug_mode),
             "reviewer_debug_rounds": int(self.reviewer_debug_rounds or 0),
             "reviewer_debug_context": trim(str(self.reviewer_debug_context or ""), 1000),
+            "developer_edit_fail_streaks": dict(self.developer_edit_fail_streaks) if self.developer_edit_fail_streaks else {},
             "pending_user_inputs": self.pending_user_inputs[-40:],
             "run_generation": int(self.run_generation),
             "agent_round_index": int(self.agent_round_index),
@@ -8577,6 +8693,7 @@ class SessionState:
             "current_tool_name": str(self.current_tool_name or ""),
             "execution_mode": normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC),
             "runtime_task_level": int(self.runtime_task_level or 0),
+            "user_task_level_override": int(self.user_task_level_override or 0),
             "runtime_execution_mode": (
                 normalize_execution_mode(self.runtime_execution_mode, default="")
                 if str(self.runtime_execution_mode or "").strip()
@@ -8722,6 +8839,12 @@ class SessionState:
         self.todo_write_issue_count = 0
         self.todo_last_issue = ""
         self.tool_retry_counts = {}
+        self.bash_read_loop_fp = ""
+        self.bash_read_loop_count = 0
+        self.stall_severity_score = 0
+        self.stall_severity_sources = []
+        self.stall_escalation_triggered = False
+        self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
         self.live_truncation_text = ""
@@ -8737,7 +8860,8 @@ class SessionState:
         self.live_run_notice_elapsed = 0.0
         self.run_model_active_seconds = 0.0
         self.agent_round_index = 0
-        self.runtime_task_level = 0
+        _utlo = int(getattr(self, 'user_task_level_override', 0) or 0)
+        self.runtime_task_level = _utlo if _utlo in TASK_LEVEL_CHOICES else 0
         self.runtime_execution_mode = ""
         self.runtime_assigned_expert = ""
         self.runtime_participants = []
@@ -9053,6 +9177,7 @@ class SessionState:
             if body_z and cached_fp and cached_fp == fp:
                 restored = decompress_text_blob(body_z)
                 if restored:
+                    self._broadcast_loaded_skill(key, restored)
                     return restored
         text = self.skills.load(name)
         if text and not str(text).startswith("Error:"):
@@ -9064,7 +9189,195 @@ class SessionState:
             self._prune_skill_load_cache()
             self.updated_at = now_ts()
             self._persist()
+            self._broadcast_loaded_skill(key, text)
         return text
+
+    def _broadcast_loaded_skill(self, skill_key: str, skill_text: str):
+        """Broadcast a loaded skill to blackboard and all agent contexts."""
+        # 1. Write skill reference to blackboard so all agents are aware
+        bb = self._ensure_blackboard()
+        loaded_skills = bb.get("loaded_skills", {})
+        if not isinstance(loaded_skills, dict):
+            loaded_skills = {}
+        loaded_skills[skill_key] = {
+            "loaded_at": now_ts(),
+            "size": len(skill_text),
+            "preview": trim(skill_text, 300),
+        }
+        bb["loaded_skills"] = loaded_skills
+        self.blackboard = bb
+        self._blackboard_touch()
+        # 2. Inject skill content into all agent contexts (not just the caller)
+        caller_role = str(self.active_agent_role or "").strip().lower()
+        inject_msg = (
+            f"<loaded-skill name=\"{skill_key}\">\n"
+            f"A skill has been loaded. Follow its instructions precisely.\n"
+            f"{trim(skill_text, 12000)}\n"
+            f"</loaded-skill>"
+        )
+        for role in ("explorer", "developer", "reviewer"):
+            if role == caller_role:
+                continue  # caller already gets it as tool result
+            self._append_agent_context_message(role, {
+                "role": "user",
+                "content": inject_msg,
+                "ts": now_ts(),
+                "agent_role": role,
+            }, mirror_to_global=False)
+        self._emit("status", {
+            "summary": f"skill '{skill_key}' loaded and broadcast to all agents"
+        })
+
+    def _auto_discover_and_load_skills(self, goal_text: str, trigger: str = ""):
+        """Skill discovery: LLM semantic match (with timeout) → keyword fallback → lazy load."""
+        try:
+            self._ensure_skills_ready(force=False)
+        except Exception:
+            return
+        skill_meta = self.skills.list_metadata()
+        if not skill_meta:
+            return
+        # Skip if already loaded skills for this goal
+        bb = self._ensure_blackboard()
+        already_loaded = bb.get("loaded_skills", {})
+        if isinstance(already_loaded, dict) and len(already_loaded) >= 3:
+            return
+        goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 600)
+        if not goal:
+            return
+        goal_low = goal.lower()
+        # Build skill catalog
+        skill_catalog: list[dict] = []
+        for s in skill_meta:
+            name = str(s.get("name", "")).strip()
+            qname = str(s.get("qualified_name", name)).strip()
+            desc = trim(str(s.get("description", "")).strip(), 200)
+            if name and desc and desc != "-":
+                skill_catalog.append({"name": name, "qname": qname, "desc": desc})
+        if not skill_catalog:
+            return
+
+        matched_names: list[str] = []
+
+        # --- Path 1: LLM semantic match (5s timeout) ---
+        import threading
+        llm_result: list[str] = []
+        def _llm_match():
+            try:
+                catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:30])
+                rsp = self.ollama.chat(
+                    [{"role": "user", "content": (
+                        f"/no_think\nAvailable skills:\n{catalog_text}\n\n"
+                        f"User's task: {goal}\n\n"
+                        f"Which skills are relevant? Reply JSON array of names only. Max 2. "
+                        f"Example: [\"ppt-master\"] or []"
+                    )}],
+                    system="/no_think\nOutput only a JSON array of skill names.",
+                    max_tokens=200,
+                    think=False,
+                )
+                answer = str(rsp.get("content", "") or "").strip()
+                m = re.search(r'\[([^\]]*)\]', answer)
+                if m:
+                    import json as _json
+                    try:
+                        names = _json.loads(f"[{m.group(1)}]")
+                        if isinstance(names, list):
+                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:2])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        t = threading.Thread(target=_llm_match, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        if llm_result:
+            matched_names = llm_result
+            self._emit("status", {"summary": f"skill discovery (LLM): matched {matched_names} ({trigger})"})
+
+        # --- Path 2: Keyword fallback if LLM returned nothing ---
+        if not matched_names:
+            matched_names = self._keyword_match_skills(goal_low, skill_catalog)
+            if matched_names:
+                self._emit("status", {"summary": f"skill discovery (keyword): matched {matched_names} ({trigger})"})
+
+        # --- Load matched skills ---
+        loaded_count = 0
+        for name_str in matched_names[:2]:
+            if isinstance(already_loaded, dict) and any(name_str in k for k in already_loaded):
+                continue
+            result = self._load_skill_with_cache(name_str)
+            if result and not str(result).startswith("Error:"):
+                loaded_count += 1
+        if loaded_count > 0:
+            self._emit("status", {
+                "summary": f"skill auto-discovery: {loaded_count} skill(s) loaded ({trigger})"
+            })
+
+    def _keyword_match_skills(self, goal_low: str, skill_catalog: list[dict]) -> list[str]:
+        """Keyword-based skill matching as fallback when LLM fails."""
+        # Mapping: goal keywords → skill name patterns
+        keyword_skill_map = [
+            # PPT/Presentation
+            (["ppt", "pptx", "演示", "幻灯片", "presentation", "slide", "keynote"], ["ppt"]),
+            # Word/Document
+            (["docx", "word", "文档", "document", "合同", "简历", "resume"], ["docx", "kimi-docx", "doc"]),
+            # Excel/Spreadsheet
+            (["excel", "xlsx", "表格", "spreadsheet", "数据表"], ["xlsx", "kimi-xlsx"]),
+            # PDF
+            (["pdf", "论文", "paper", "报告"], ["pdf", "kimi-pdf"]),
+            # Frontend/Design
+            (["前端", "frontend", "页面", "网页", "landing", "ui设计", "界面"], ["frontend", "canvas", "web-artifacts"]),
+            # Visualization/Chart
+            (["可视化", "图表", "chart", "dashboard", "plotly", "echarts", "matplotlib"], ["visualization", "html-report"]),
+            # API/MCP
+            (["mcp", "model context protocol"], ["mcp-builder"]),
+            (["api", "rest", "graphql", "endpoint"], ["api-dev", "claude-api"]),
+            # Agent
+            (["agent", "智能体", "助手", "bot"], ["agent-builder"]),
+            # Code review
+            (["review", "审查", "代码审查", "code review"], ["code-review"]),
+            # Testing
+            (["playwright", "selenium", "e2e", "端到端测试", "webapp test"], ["webapp-testing"]),
+            # Skill creation
+            (["skill", "技能"], ["skill-creator", "skills_gen"]),
+            # Art/Design
+            (["art", "艺术", "p5", "算法艺术"], ["algorithmic-art"]),
+            (["gif", "动图", "slack"], ["slack-gif"]),
+            (["brand", "品牌", "logo"], ["brand"]),
+            (["theme", "主题", "样式"], ["theme-factory"]),
+            # Research
+            (["深度研究", "deep research", "综述"], ["deep-research"]),
+        ]
+        matched: list[str] = []
+        for keywords, skill_patterns in keyword_skill_map:
+            if any(kw in goal_low for kw in keywords):
+                # Find matching skill in catalog
+                for pattern in skill_patterns:
+                    for s in skill_catalog:
+                        if pattern in s["name"].lower() or pattern in s["qname"].lower():
+                            if s["qname"] not in matched:
+                                matched.append(s["qname"])
+                            break
+                if len(matched) >= 2:
+                    break
+        return matched[:2]
+
+    def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
+        """Unified skill awareness hint for any system prompt. Reads blackboard loaded_skills."""
+        bb = self._ensure_blackboard()
+        loaded = bb.get("loaded_skills", {})
+        if isinstance(loaded, dict) and loaded:
+            skill_names = list(loaded.keys())[:5]
+            return (
+                f"ACTIVE SKILLS: {', '.join(skill_names)} have been loaded into your context. "
+                "Follow loaded skill instructions precisely. "
+                "Use load_skill to load additional skills if needed. "
+            )
+        return (
+            "Use list_skills to discover available skills for your task, then load_skill to load them. "
+            "Skills provide domain-specific workflows for professional outputs. "
+        )
 
     def _system_prompt(self) -> str:
         try:
@@ -9083,15 +9396,13 @@ class SessionState:
             runtime_mode == EXECUTION_MODE_SINGLE
             and not self.single_advance_prompt_enhance
         )
-        skill_hint = (
-            "Use load_skill for workspace-paths and tool-best-practices if needed. "
-            if _is_single_no_enhance
-            else (
-                "Use load_skill for guidance on specific topics "
-                "(workspace-paths, task-management, tool-best-practices, context-management). "
-                "If execution stalls, load_skill('execution-degradation-recovery'). "
+        # Dynamic skill awareness — unified hint
+        skill_hint = self._loaded_skills_prompt_hint(for_role="developer")
+        if _is_single_no_enhance and not self._ensure_blackboard().get("loaded_skills"):
+            skill_hint = (
+                "Use load_skill for workspace-paths and tool-best-practices if needed. "
+                "Use list_skills to discover available skills for specific tasks. "
             )
-        )
         plan_steps_block = ""
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
@@ -10526,6 +10837,25 @@ class SessionState:
         review = bb.get("review_feedback", "")
         if review:
             parts.append(f"REVIEW_FEEDBACK: {trim(str(review), 200)}")
+        # 7. Failure context
+        fl = bb.get("failure_ledger", {})
+        if isinstance(fl, dict):
+            fixes = fl.get("attempted_fixes", [])
+            recent_fixes = [fx for fx in fixes[-3:] if isinstance(fx, dict)]
+            if recent_fixes:
+                fix_lines = []
+                for fx in recent_fixes:
+                    f = trim(str(fx.get("file", "") or ""), 80)
+                    result = str(fx.get("result", "") or "")
+                    fix_lines.append(f"  {f} -> {result}")
+                parts.append("ATTEMPTED_FIXES:\n" + "\n".join(fix_lines))
+            unresolved = [e for e in fl.get("errors", []) if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            if unresolved:
+                err_lines = [f"  [{e.get('category','')}] {e.get('file','')}: {trim(str(e.get('error_msg','')), 120)}" for e in unresolved[:3]]
+                parts.append("UNRESOLVED_ERRORS:\n" + "\n".join(err_lines))
+        if self.developer_edit_fail_streaks:
+            stuck = ", ".join(f"{k}({v}x)" for k, v in self.developer_edit_fail_streaks.items())
+            parts.append(f"EDIT_STALLS: {stuck}")
         parts.append("</STATE_HANDOFF>")
         return "\n".join(parts)
 
@@ -12183,83 +12513,100 @@ class SessionState:
         if len(t) >= 120:
             return True
         markers = [
-            "实现",
-            "修复",
-            "重构",
-            "设计",
-            "构建",
-            "架构",
-            "内核",
-            "框架",
-            "死循环",
-            "状态机",
-            "调度",
-            "后端",
-            "前端",
-            "自动化",
-            "agentbus",
-            "watchdog",
-            "decomposition",
-            "workflow",
-            "architecture",
-            "build",
-            "implement",
-            "refactor",
-            "fix",
-            "debug",
+            # 工程/开发
+            "实现", "修复", "重构", "设计", "构建", "架构", "内核", "框架",
+            "死循环", "状态机", "调度", "后端", "前端", "自动化",
+            "agentbus", "watchdog", "decomposition", "workflow",
+            "architecture", "build", "implement", "refactor", "fix", "debug",
             "multi-step",
+            # 文档/演示/设计制作
+            "ppt", "pptx", "演示文稿", "幻灯片", "presentation",
+            "生成报告", "制作", "做一个",
+            "excel", "xlsx", "电子表格", "docx", "word",
+            "pdf", "可视化", "visualization", "dashboard",
+            "svg", "canvas", "动画", "animation",
+            # 全栈/部署
+            "api", "server", "数据库", "database", "部署", "deploy",
+            "docker", "mcp", "agent", "bot", "爬虫", "crawler",
+            "测试", "test", "playwright",
+            # 品牌/内容
+            "品牌", "brand", "theme", "gif",
+            # 通用复杂任务动词
+            "分析并", "总结并", "对比", "深度",
         ]
         return any(x in t for x in markers)
+
+    def _llm_classify_task_complexity(self, goal_text: str) -> str:
+        """LLM semantic pre-screening: classify task as simple/complex. 3s timeout."""
+        goal = trim(str(goal_text or ""), 300)
+        if not goal or len(goal) < 6:
+            return "simple"
+        import threading
+        result_box = ["simple"]
+        def _classify():
+            try:
+                rsp = self.ollama.chat(
+                    [{"role": "user", "content": (
+                        f"/no_think\nClassify this task as SIMPLE or COMPLEX.\n"
+                        f"COMPLEX = needs multiple steps, file creation, code generation, document production, "
+                        f"multi-agent collaboration, design work, data processing, API development, testing.\n"
+                        f"SIMPLE = direct Q&A, lookup, single-line fix, short explanation.\n\n"
+                        f"Task: {goal}\n\n"
+                        f"Reply with ONLY one word: SIMPLE or COMPLEX"
+                    )}],
+                    system="/no_think\nClassify tasks. Output one word only.",
+                    max_tokens=30,
+                    think=False,
+                )
+                answer = str(rsp.get("content", "") or "").strip().upper()
+                if "COMPLEX" in answer:
+                    result_box[0] = "complex"
+            except Exception:
+                pass
+        t = threading.Thread(target=_classify, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        return result_box[0]
 
     def _infer_task_profile(self, goal: str) -> dict:
         clean = strip_thinking_content(str(goal or "")).strip()
         low = clean.lower()
-        nontrivial = self._looks_nontrivial_request(clean)
-        direct_question = self._looks_like_direct_question_request(clean)
+        # Use cached LLM complexity result (set by _agent_worker entry point)
+        llm_complexity = str(getattr(self, '_cached_llm_complexity', '') or '')
+        nontrivial = self._looks_nontrivial_request(clean) or llm_complexity == "complex"
+        direct_question = self._looks_like_direct_question_request(clean) and llm_complexity != "complex"
         code_markers = [
-            "代码",
-            "寫代碼",
-            "写代码",
-            "文件",
-            "脚本",
-            "模块",
-            "函数",
-            "class",
-            "bug",
-            "修复",
-            "实现",
-            "重构",
-            "app.py",
-            "crawler.py",
-            ".py",
-            ".js",
-            ".ts",
-            ".html",
-            "python",
-            "javascript",
-            "bash",
-            "terminal",
-            "tool",
-            "patch",
-            "edit",
-            "write_file",
-            "read_file",
-            "build",
-            "implement",
-            "fix",
-            "refactor",
-            "debug",
+            # 代码/编程
+            "代码", "寫代碼", "写代码", "脚本", "模块", "函数", "class", "bug",
+            "修复", "实现", "重构", "app.py", "crawler.py",
+            ".py", ".js", ".ts", ".html", ".css", ".vue", ".jsx", ".tsx",
+            "python", "javascript", "bash", "terminal", "tool", "patch", "edit",
+            "write_file", "read_file", "build", "implement", "fix", "refactor", "debug",
+            # 文档/演示生成（需要 skill 支撑）
+            "ppt", "pptx", "演示文稿", "幻灯片", "presentation", "slide",
+            "生成ppt", "制作ppt", "做ppt", "做一个ppt",
+            "excel", "xlsx", "电子表格", "spreadsheet", "表格",
+            "docx", "word", "文档", "document", "报告", "report",
+            "pdf", "生成pdf", "制作pdf",
+            # 设计/前端/可视化
+            "html报告", "可视化", "visualization", "图表", "chart", "dashboard",
+            "前端", "frontend", "ui", "界面", "landing page", "网页", "页面",
+            "svg", "canvas", "动画", "animation", "设计",
+            # 工程/架构
+            "api", "server", "服务", "数据库", "database", "部署", "deploy",
+            "docker", "容器", "微服务", "microservice", "架构",
+            "mcp", "agent", "bot", "爬虫", "crawler", "scraper",
+            # 测试
+            "测试", "test", "单元测试", "集成测试", "playwright", "selenium",
+            # 品牌/内容
+            "品牌", "brand", "logo", "主题", "theme",
+            "gif", "图片", "image", "插画",
         ]
         research_markers = [
-            "分析",
-            "调研",
-            "研究",
-            "白皮书",
-            "论文",
-            "report",
-            "analysis",
-            "research",
-            "investigate",
+            "分析", "调研", "研究", "白皮书", "论文", "report",
+            "analysis", "research", "investigate", "总结", "综述",
+            "对比", "compare", "benchmark", "评测", "survey",
+            "阅读", "解读", "review",
         ]
         has_code_intent = any(x in low for x in code_markers)
         has_research_intent = any(x in low for x in research_markers)
@@ -12440,12 +12787,13 @@ class SessionState:
         candidate = ""
         try:
             rsp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
+                [{"role": "user", "content": f"/no_think\n{prompt}"}],
                 system=(
+                    "/no_think\n"
                     "You generate short practical session titles for developer workflow tracking. "
                     f"{model_language_instruction(self.ui_language)}"
                 ),
-                max_tokens=24,
+                max_tokens=80,
                 think=False,
             )
             candidate = self._normalize_auto_title(str(rsp.get("content", "") or ""))
@@ -13794,19 +14142,22 @@ class SessionState:
         if not recommended:
             recommended = list(base.get("recommended_agents", []))
         max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
-        try:
-            raw_level = int(src.get("task_level", 0) or 0)
-        except Exception:
-            raw_level = 0
-        if raw_level not in TASK_LEVEL_CHOICES:
-            if task_type == "simple_qa":
-                raw_level = 1 if len(str(goal or "")) <= 180 else 2
-            elif task_type in {"simple_code", "research"} and complexity == "simple":
-                raw_level = 3
-            elif complexity == "complex":
-                raw_level = 4
-            else:
-                raw_level = 2
+        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+            raw_level = int(self.user_task_level_override)
+        else:
+            try:
+                raw_level = int(src.get("task_level", 0) or 0)
+            except Exception:
+                raw_level = 0
+            if raw_level not in TASK_LEVEL_CHOICES:
+                if task_type == "simple_qa":
+                    raw_level = 1 if len(str(goal or "")) <= 180 else 2
+                elif task_type in {"simple_code", "research"} and complexity == "simple":
+                    raw_level = 3
+                elif complexity == "complex":
+                    raw_level = 4
+                else:
+                    raw_level = 2
         task_level = int(raw_level)
         level_policy = TASK_LEVEL_POLICIES.get(task_level, TASK_LEVEL_POLICIES[3])
         execution_mode = normalize_execution_mode(
@@ -14744,7 +15095,14 @@ class SessionState:
                 # Failure ledger: record stall event
                 self._ledger_record_stall(trigger_reason, "unresolved")
                 if int(wd["trigger_count"]) >= 2:
-                    self._watchdog_escalate_to_single_developer(bb, reason=trigger_reason)
+                    _wd_sev = self._bump_stall_severity("watchdog", STALL_SEVERITY_WEIGHT_WATCHDOG)
+                    if _wd_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                        if not self._escalate_stall_to_plan_mode(
+                            "watchdog", last_fault_reason=trigger_reason, pinned_selection=pinned_selection,
+                        ):
+                            self._watchdog_escalate_to_single_developer(bb, reason=trigger_reason)
+                    else:
+                        self._watchdog_escalate_to_single_developer(bb, reason=trigger_reason)
                 else:
                     triggered = self._watchdog_activate_decomposition(
                         bb,
@@ -15089,6 +15447,19 @@ class SessionState:
         board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
         raw_pmr = src.get("persisted_manager_routes")
         board["persisted_manager_routes"] = list(raw_pmr)[-PERSISTED_ROUTES_MAX:] if isinstance(raw_pmr, list) else []
+        # Preserve loaded_skills across normalization
+        raw_loaded_skills = src.get("loaded_skills")
+        if isinstance(raw_loaded_skills, dict) and raw_loaded_skills:
+            clean_skills: dict[str, dict] = {}
+            for skey, sinfo in list(raw_loaded_skills.items())[:10]:
+                if isinstance(sinfo, dict):
+                    clean_skills[str(skey)] = {
+                        "loaded_at": float(sinfo.get("loaded_at", 0.0) or 0.0),
+                        "size": int(sinfo.get("size", 0) or 0),
+                        "preview": trim(str(sinfo.get("preview", "") or ""), 300),
+                    }
+            if clean_skills:
+                board["loaded_skills"] = clean_skills
         return board
 
     def _normalize_failure_ledger(self, raw: dict) -> dict:
@@ -15137,6 +15508,81 @@ class SessionState:
         fl["attempted_fixes"] = fixes[-FAILURE_LEDGER_MAX_FIXES:]
         bb["failure_ledger"] = fl
         self.blackboard = bb
+
+    def _ledger_update_fix_attempt_status(self, file: str, new_status: str):
+        """Update status of most recent fix_attempt for a file."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fixes = fl.get("attempted_fixes", [])
+        for fx in reversed(fixes):
+            if not isinstance(fx, dict):
+                continue
+            fx_file = str(fx.get("file", "") or "")
+            if fx_file and (fx_file.endswith(file) or file.endswith(fx_file)):
+                if fx.get("result") in ("pending", "applied"):
+                    fx["result"] = new_status
+                    break
+        fl["attempted_fixes"] = fixes
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    def _ledger_verify_fix_attempts_on_success(self, category: str):
+        """After successful bash, mark 'applied' fix_attempts as verified."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fixes = fl.get("attempted_fixes", [])
+        for fx in fixes:
+            if isinstance(fx, dict) and fx.get("result") == "applied":
+                fx["result"] = f"verified({category})"
+        fl["attempted_fixes"] = fixes
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    def _ledger_mark_fix_attempts_failed(self, category: str, error_msg: str):
+        """After failed bash, mark 'applied' fix_attempts as failed."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger")
+        if not isinstance(fl, dict):
+            return
+        fixes = fl.get("attempted_fixes", [])
+        for fx in fixes:
+            if isinstance(fx, dict) and fx.get("result") == "applied":
+                fx["result"] = f"failed({category}): {trim(error_msg, 120)}"
+        fl["attempted_fixes"] = fixes
+        bb["failure_ledger"] = fl
+        self.blackboard = bb
+
+    def _continuation_failure_briefing(self) -> str:
+        """Generate failure context summary for continuation scenarios."""
+        bb = self._ensure_blackboard()
+        fl = bb.get("failure_ledger", {})
+        if not isinstance(fl, dict):
+            return ""
+        lines = []
+        # Edit stalls
+        if self.developer_edit_fail_streaks:
+            stuck = [f"{k} ({v} failures)" for k, v in self.developer_edit_fail_streaks.items()]
+            lines.append(f"Edit stalls: {'; '.join(stuck)}")
+        # Failed fixes
+        fixes = fl.get("attempted_fixes", [])
+        failed = [fx for fx in fixes if isinstance(fx, dict) and "failed" in str(fx.get("result", "") or "").lower()]
+        if failed:
+            lines.append("Failed fixes:")
+            for fx in failed[-3:]:
+                lines.append(f"  - {trim(str(fx.get('file','')),80)}: {trim(str(fx.get('result','')),120)}")
+        # Unresolved errors
+        unresolved = [e for e in fl.get("errors", []) if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+        if unresolved:
+            lines.append("Unresolved errors:")
+            for e in unresolved[:3]:
+                lines.append(f"  - [{e.get('category','')}] {e.get('file','')}: {trim(str(e.get('error_msg','')),150)}")
+        if not lines:
+            return ""
+        return "FAILURE CONTEXT (from previous attempt):\n" + "\n".join(lines) + "\n"
 
     # --- Unified error detection helpers (修改 3) ---
 
@@ -15247,7 +15693,26 @@ class SessionState:
     # --- Unified tool result error processing (修改 5) ---
 
     def _process_tool_result_errors(self, name: str, args: dict, output: str, ok: bool, role_key: str):
-        """Detect and record errors from bash tool results, or clear on success."""
+        """Detect and record errors from tool results, or clear on success."""
+        # --- edit_file 错误处理 ---
+        if name == "edit_file" and isinstance(args, dict):
+            edit_path = str(args.get("path", "") or "").strip()
+            if not ok and "text not found" in str(output or "").lower():
+                self._ledger_record_error("edit_mismatch", edit_path or "unknown", trim(str(output or ""), 300))
+                count = int(self.developer_edit_fail_streaks.get(edit_path, 0) or 0) + 1
+                self.developer_edit_fail_streaks[edit_path] = count
+                self.developer_edit_last_diag[edit_path] = trim(str(output or ""), 500)
+                if count >= 2:
+                    self._inject_edit_recovery_hint(edit_path, count, str(output or ""), role_key)
+            elif ok and edit_path:
+                self.developer_edit_fail_streaks.pop(edit_path, None)
+                self.developer_edit_last_diag.pop(edit_path, None)
+                if not self.developer_edit_fail_streaks:
+                    self._ledger_clear_errors("edit_mismatch")
+                self._ledger_update_fix_attempt_status(edit_path, "applied")
+            return
+
+        # --- 原有 bash 处理逻辑 ---
         if name != "bash" or not isinstance(args, dict):
             return
         cmd_str = str(args.get("command", "") or "").lower()
@@ -15258,6 +15723,7 @@ class SessionState:
             error_lines = self._extract_error_lines(str(output or ""), category)
             for file_hint, err_line in error_lines:
                 self._ledger_record_error(category, file_hint or cmd_str[:80], trim(err_line, 300))
+            self._ledger_mark_fix_attempts_failed(category, trim(str(output or ""), 200))
         else:
             out_lower = str(output or "").lower()
             cat_def = dict(ERROR_CATEGORY_DEFS).get(category, {})
@@ -15267,6 +15733,7 @@ class SessionState:
                 # Auto-deactivate reviewer debug mode when errors are resolved
                 if bool(self.reviewer_debug_mode) and not self._manager_has_error_log():
                     self._deactivate_reviewer_debug_mode("errors resolved")
+                self._ledger_verify_fix_attempts_on_success(category)
 
     # --- Generalized error context (修改 6) ---
 
@@ -15401,7 +15868,12 @@ class SessionState:
         self.blackboard = board
 
     def _blackboard_reset_for_goal(self, goal: str):
+        # Preserve loaded skills across goal reset
+        old_bb = self._ensure_blackboard()
+        preserved_skills = old_bb.get("loaded_skills", {})
         self.blackboard = self._new_blackboard(goal)
+        if isinstance(preserved_skills, dict) and preserved_skills:
+            self.blackboard["loaded_skills"] = preserved_skills
         self.manager_context = []
         self.agent_messages = [m for m in self.agent_messages if m.get("agent_role") != "manager"]
         self.manager_routes = []
@@ -15873,6 +16345,43 @@ class SessionState:
 
         bb["project_todos"] = todos
         self.blackboard = bb
+
+    def _instruction_implies_step_advance(self, instruction: str, reason: str = "") -> bool:
+        """Detect if manager instruction semantically implies current plan step is done."""
+        bb = self._ensure_blackboard()
+        plan_steps = [t for t in bb.get("project_todos", []) if t.get("category") == "plan_step"]
+        if not plan_steps:
+            return False
+        # Must have an in_progress step to advance
+        current = None
+        for t in plan_steps:
+            if t.get("status") == "in_progress":
+                current = t
+                break
+        if not current:
+            return False
+        text = (str(instruction or "") + " " + str(reason or "")).lower()
+        # Patterns that indicate step completion
+        step_done_patterns = (
+            "审查通过", "通过审查", "已通过", "已完成", "完成了",
+            "进入 step", "进入step", "enter step", "move to step",
+            "step completed", "step done", "step passed",
+            "现在进入", "开始 step", "开始step",
+            "阶段完成", "阶段通过", "phase complete",
+        )
+        # Also detect "Step N 通过" or "进入 Step N+1" patterns
+        import re
+        current_idx = int(current.get("plan_step_index", 0) or 0)
+        # "Step 2 已通过" / "Step 2 完成" / "进入 Step 3"
+        next_step_pattern = re.search(
+            r'(?:进入|enter|move\s+to|start)\s*step\s*(\d+)',
+            text, re.IGNORECASE
+        )
+        if next_step_pattern:
+            mentioned_step = int(next_step_pattern.group(1))
+            if mentioned_step > current_idx + 1:
+                return True
+        return any(pat in text for pat in step_done_patterns)
 
     def _advance_plan_step(self, evidence: str = "", actor: str = "developer"):
         bb = self._ensure_blackboard()
@@ -16400,7 +16909,19 @@ class SessionState:
                 or len(board.get("execution_logs", []) or [])
                 or len(board.get("review_feedback", []) or [])
             )
-            if has_progress and progress in {"in_progress", "almost_done", "blocked"} and len(str(goal_text or "").strip()) <= 120:
+            if has_progress and progress in {"in_progress", "almost_done", "blocked", "initializing"}:
+                inherit_previous_state = True
+        # Also inherit if there's an active high-level task regardless of goal_reset_pending
+        if not inherit_previous_state and int(self.runtime_task_level or 0) >= 3:
+            board = self._ensure_blackboard()
+            progress = self._manager_progress_state(board)
+            has_progress = bool(
+                len(board.get("research_notes", []) or [])
+                or len(board.get("code_artifacts", {}) or {})
+                or len(board.get("execution_logs", []) or [])
+                or len(board.get("review_feedback", []) or [])
+            )
+            if has_progress and progress in {"in_progress", "almost_done", "blocked", "initializing"}:
                 inherit_previous_state = True
         if bool(inherit_previous_state):
             board = self._ensure_blackboard()
@@ -16584,7 +17105,20 @@ class SessionState:
         # Complexity inheritance: if user didn't mention complexity, inherit previous level
         previous_level = int(getattr(self, "runtime_task_level", 0) or 0)
         if previous_level > 0 and not self._user_mentions_complexity(str(goal_text or "")):
-            if bool(inherit_previous_state) or self._is_plan_choice_response(str(goal_text or "")):
+            # Inherit when: plan choice, explicit inherit flag, OR active high-level task has progress
+            _should_inherit = bool(inherit_previous_state) or self._is_plan_choice_response(str(goal_text or ""))
+            if not _should_inherit and previous_level >= 3:
+                board = self._ensure_blackboard()
+                has_progress = bool(
+                    len(board.get("research_notes", []) or [])
+                    or len(board.get("code_artifacts", {}) or {})
+                    or len(board.get("execution_logs", []) or [])
+                    or len(board.get("review_feedback", []) or [])
+                )
+                progress_state = self._manager_progress_state(board)
+                if has_progress and progress_state in {"in_progress", "almost_done", "blocked", "initializing"}:
+                    _should_inherit = True
+            if _should_inherit:
                 level = previous_level
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
@@ -16719,6 +17253,8 @@ class SessionState:
         if not objective:
             objective = fallback_objective
         _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
+        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+            level = int(self.user_task_level_override)
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
         self.runtime_execution_mode = mode
@@ -16759,6 +17295,9 @@ class SessionState:
                 self.runtime_plan_choice = choice
                 self.runtime_plan_approved = True
                 self.runtime_plan_mode_needed = False
+                self.stall_severity_score = 0
+                self.stall_severity_sources = []
+                self.stall_escalation_triggered = False
                 self._inject_plan_into_context(choice)
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
@@ -16967,6 +17506,29 @@ class SessionState:
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
         if not goal:
             return {}
+        # --- User override short-circuit: user manually set level, skip manager ---
+        _utlo = int(getattr(self, 'user_task_level_override', 0) or 0)
+        if _utlo > 0 and _utlo in TASK_LEVEL_CHOICES:
+            policy = TASK_LEVEL_POLICIES.get(_utlo, {})
+            decision = {
+                "level": _utlo,
+                "execution_mode": self._effective_execution_mode(),
+                "participants": list(self.runtime_participants or []),
+                "assigned_expert": str(self.runtime_assigned_expert or ""),
+                "task_type": str(self.runtime_task_type or "general"),
+                "complexity": str(policy.get("complexity", self.runtime_task_complexity or "simple")),
+                "scale_preference": "thorough" if _utlo >= 4 else str(self.runtime_scale_preference or "balanced"),
+                "round_budget": int(policy.get("round_budget", self.runtime_round_budget or 0) or 0),
+                "requires_user_confirmation": False,
+                "inherit_previous_state": True,
+                "judgement": f"user_task_level_override={_utlo} — skipping manager evaluation",
+                "source": "user-override",
+                "semantic_confidence": "high",
+            }
+            self.runtime_reclassify_required = False
+            self.runtime_goal_reset_pending = False
+            self._apply_runtime_task_decision(goal, decision)
+            return dict(decision)
         # --- Continuation input short-circuit: inherit previous complexity ---
         prev_level = int(self.runtime_task_level or 0)
         if prev_level > 0 and self._is_continuation_input(goal):
@@ -17701,9 +18263,30 @@ class SessionState:
                 row["instruction"] = "Execute one concrete implementation step using tools now."
                 row["reason"] = f"{row.get('reason', '')}|anti-stall->developer"
             else:
-                row["target"] = "explorer"
-                row["instruction"] = "Run a focused search/read step to unblock the next coding move."
-                row["reason"] = f"{row.get('reason', '')}|anti-stall->explorer"
+                # Developer stuck — check if errors/edit failures exist
+                has_edit_fails = bool(self.developer_edit_fail_streaks)
+                has_errors = self._manager_has_error_log(bb_for_routes)
+                if has_errors or has_edit_fails:
+                    error_ctx = self._recent_error_context(400)
+                    if has_edit_fails:
+                        stuck_files = ", ".join(list(self.developer_edit_fail_streaks.keys())[:3])
+                        error_ctx = f"Edit failures on: {stuck_files}. {error_ctx}"
+                    self._activate_reviewer_debug_mode(error_ctx)
+                    row["target"] = "reviewer"
+                    row["instruction"] = (
+                        "Developer stuck with errors. DEBUG MODE: diagnose and fix directly. "
+                        f"Context: {trim(error_ctx, 400)}"
+                    )
+                    row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer-debug"
+                else:
+                    row["target"] = "developer"
+                    row["instruction"] = (
+                        "Anti-stall: CHANGE YOUR APPROACH. "
+                        "If edit_file keeps failing, use write_file. "
+                        "If reading without editing, make a concrete change now. "
+                        "If done, call finish_task."
+                    )
+                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-change"
             row["source"] = "anti-stall"
             return row
         if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
@@ -17714,6 +18297,8 @@ class SessionState:
                 row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-finish"
                 row["source"] = "anti-stall"
                 return row
+        if int(self.stall_severity_score or 0) >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+            row["stall_plan_escalation"] = True
         return row
 
     def _manager_apply_task_policy(self, route: dict) -> dict:
@@ -18476,7 +19061,14 @@ class SessionState:
             "remaining_rounds": int(remaining_rounds),
         }
         # advance_plan_step: 当前 plan step 完成，推进到下一步
-        if _to_bool_like(route.get("advance_plan_step", False), default=False):
+        should_advance = _to_bool_like(route.get("advance_plan_step", False), default=False)
+        # Auto-detect step advancement from instruction semantics
+        if not should_advance:
+            should_advance = self._instruction_implies_step_advance(
+                str(route.get("instruction", "") or ""),
+                str(route.get("reason", "") or ""),
+            )
+        if should_advance:
             self._advance_plan_step(
                 evidence=trim(str(route.get("instruction", "") or ""), 200),
                 actor=str(route.get("target", "developer") or "developer"),
@@ -18541,10 +19133,9 @@ class SessionState:
             "remaining_rounds": int(remaining_rounds),
             "updated_at": float(now_ts()),
         }
+        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+            task_level = int(self.user_task_level_override)
         self.runtime_task_level = int(task_level)
-        self.runtime_execution_mode = execution_mode
-        self.runtime_participants = list(participants)
-        self.runtime_assigned_expert = assigned_expert
         self.runtime_round_budget = int(round_budget)
         self.runtime_task_judgement = judgement or self.runtime_task_judgement
         self.runtime_task_type = str(profile.get("task_type", self.runtime_task_type) or "")
@@ -18716,6 +19307,8 @@ class SessionState:
                 "</compile-error-context>\n"
             )
         board_md = self._blackboard_read_state_markdown(max_items=5)
+        # Include loaded skills hint in delegation
+        loaded_skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
         payload = (
             "<manager-delegate>\n"
             f"target={role_key}\n"
@@ -18727,6 +19320,7 @@ class SessionState:
             f"{executor_note}\n"
             f"{collaboration_note}\n"
             f"{role_capability_note}\n"
+            f"{loaded_skills_note}"
             f"{error_section}"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
@@ -19446,12 +20040,13 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
+        skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: {self.files_root}. Use relative paths. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            "Use load_skill for detailed guidance (multi-agent-guide, code-review-checklist, finish-protocol). "
+            f"{skills_note}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -19487,7 +20082,25 @@ class SessionState:
                 "and the precise fix (what to change FROM and TO). "
                 "NEVER send vague fix requests without verifying the actual cause. "
             )
-        return base + "Role: implement code changes, execute tools, record progress to blackboard. "
+        return base + (
+            "Role: implement code changes, execute tools, record progress to blackboard. "
+            "EDIT METHODOLOGY (follow strictly): "
+            "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
+            "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
+            "3) Keep old_text as SHORT as possible while still unique (1-3 lines ideal). "
+            "4) If edit_file fails 'text not found': IMMEDIATELY re-read the file, compare whitespace, retry with exact content. "
+            "5) If edit_file fails 2+ times on same file: switch to write_file to rewrite entire file. "
+            "6) After every successful edit, run build/test to verify. "
+            "NEVER loop on read_file without attempting a concrete edit_file or write_file call. "
+            "PROBLEM-SOLVING (critical): "
+            "When you discover missing files, broken imports, or incomplete source code: "
+            "A) Think deeply about what the missing content should contain based on ALL available context "
+            "(documentation, Makefile, imports, existing code patterns, architecture docs). "
+            "B) CREATE the missing files yourself using write_file — do not wait or re-read. "
+            "C) If compilation fails due to missing dependencies, write stub implementations. "
+            "D) NEVER re-read the same directory/file more than twice — after 2 reads, you MUST act. "
+            "E) If truly blocked, explain WHY to the user and propose alternatives. "
+        )
 
     def _seed_multi_agent_contexts_if_needed(self, user_text: str = ""):
         if not self._is_multi_agent_mode():
@@ -19750,6 +20363,46 @@ class SessionState:
             "status",
             {"summary": f"forced segmented convergence enabled for {focus}"},
         )
+
+    def _inject_edit_recovery_hint(self, file_path: str, fail_count: int, diagnostic: str, role_key: str):
+        """Inject recovery hint after consecutive edit_file failures."""
+        import re as _re
+        line_hint = ""
+        m = _re.search(r"line\(?s?\)?\s*([\d,\s]+)", diagnostic.lower())
+        if m:
+            line_hint = f"Diagnostic line hints: {m.group(1).strip()}. "
+
+        stall_reached = fail_count >= DEVELOPER_EDIT_STALL_THRESHOLD
+        if stall_reached:
+            strategy = (
+                f"FORCED STRATEGY CHANGE: edit_file has failed {fail_count} times on this file. "
+                "You MUST use one of these alternatives NOW: "
+                "A) Use write_file to rewrite the entire file. "
+                "B) Break edit into single-line old_text (one unique line only). "
+                "C) Use bash with sed for simple replacements. "
+                "Do NOT attempt edit_file again without first reading the file fresh. "
+            )
+        else:
+            strategy = (
+                "RECOVERY: "
+                f"1) Call read_file on '{file_path}' to get FRESH content. "
+                "2) Check exact whitespace/indentation at target location. "
+                "3) Use shorter, unique old_text (1-3 lines max). "
+                "4) If still failing next time, use write_file instead. "
+            )
+
+        hint = (
+            f"<edit-recovery>"
+            f"edit_file failed {fail_count} time(s) on '{file_path}'. "
+            f"{line_hint}"
+            f"Last diagnostic: {trim(diagnostic, 300)}. "
+            f"{strategy}"
+            f"</edit-recovery>"
+        )
+
+        self._prune_runtime_retry_hints()
+        self.messages.append({"role": "user", "content": hint, "ts": now_ts()})
+        self._emit("status", {"summary": f"edit-recovery hint for {file_path} (fail #{fail_count})"})
 
     def _diagnose_no_tool_idle(self, latest_text: str, streak: int) -> dict:
         raw = str(latest_text or "")
@@ -20700,7 +21353,11 @@ class SessionState:
                 # Merge user feedback with plan direction
                 self._merge_user_feedback_with_plan(content)
                 self.runtime_reclassify_goal = trim(content, 4000)
-                self.runtime_reclassify_required = True
+                # Only trigger reclassification in auto mode (no user override)
+                if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+                    self.runtime_reclassify_required = False
+                else:
+                    self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
                 injected.append(
                     {
@@ -20800,6 +21457,7 @@ class SessionState:
                     f"User said: {trim(user_text, 100)}\n"
                     f"Continuing approved plan. Original goal: {original_goal}\n"
                     f"Remaining steps: {', '.join(trim(str(s), 80) for s in pending[:5])}\n"
+                    f"{self._continuation_failure_briefing()}"
                     f"Resume from where we left off. Do NOT restart.\n"
                     f"</intent-fusion>"
                 )
@@ -20813,6 +21471,7 @@ class SessionState:
                 f"<intent-fusion type='context-continuation'>\n"
                 f"User said: {trim(user_text, 100)}\n"
                 f"Continue previous work. Original goal: {original_goal}\n"
+                f"{self._continuation_failure_briefing()}"
                 f"Resume from current state. Do NOT restart.\n"
                 f"</intent-fusion>"
             )
@@ -20859,6 +21518,9 @@ class SessionState:
                         self.runtime_plan_choice = choice
                         self.runtime_plan_approved = True
                         self.runtime_plan_mode_needed = False
+                        self.stall_severity_score = 0
+                        self.stall_severity_sources = []
+                        self.stall_escalation_triggered = False
                         self._inject_plan_into_context(choice)
                         self.runtime_reclassify_required = False
                         self.runtime_goal_reset_pending = False
@@ -20867,7 +21529,9 @@ class SessionState:
                     self._fuse_restart_intent(clean_goal)
                 self.runtime_reclassify_goal = clean_goal
                 # Skip reclassification for plan choice responses — preserve complexity
-                if _awaiting_plan_choice or self._is_plan_choice_response(clean_goal):
+                # Also skip when user has manually set task level override
+                _has_user_override = int(getattr(self, 'user_task_level_override', 0) or 0) > 0
+                if _awaiting_plan_choice or self._is_plan_choice_response(clean_goal) or _has_user_override:
                     self.runtime_reclassify_required = False
                 else:
                     self.runtime_reclassify_required = True
@@ -21169,7 +21833,7 @@ class SessionState:
                             edit_path,
                             trim(str(matching[-1].get("error_msg", "") or ""), 300),
                             fix_desc,
-                            "pending",
+                            "applied" if item["ok"] else "failed(edit_error)",
                             role_key,
                         )
             item["bb_applied"] = True
@@ -21359,10 +22023,19 @@ class SessionState:
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
+            if self.stall_escalation_triggered:
+                self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
+                break
             self._apply_auto_compact_if_needed("auto:multi-sync")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
                 self._maybe_create_checkpoint()
+            # Auto-rename session title in sync mode
+            if rounds_used in (1, 3, 6):
+                try:
+                    self._maybe_auto_rename_session_title("sync-progress")
+                except Exception:
+                    pass
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
                 self.current_phase = "manager:dispatch"
@@ -21716,6 +22389,15 @@ class SessionState:
         bb["plan"] = {"phase": "research", "findings": []}
         self.blackboard = bb
 
+        # Auto-discover and load relevant skills before research
+        try:
+            self._auto_discover_and_load_skills(
+                self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                trigger="plan-mode-start",
+            )
+        except Exception:
+            pass
+
         research_prompt = self._plan_mode_research_prompt()
         self._seed_plan_mode_explorer_context(research_prompt)
 
@@ -21770,10 +22452,27 @@ class SessionState:
         goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
         lang_note = model_language_instruction(self.ui_language)
         os_note = _detect_os_shell_instruction()
+        # Include loaded skill summaries in research prompt
+        bb_skills = self._ensure_blackboard().get("loaded_skills", {})
+        skills_section = ""
+        if isinstance(bb_skills, dict) and bb_skills:
+            skill_previews = []
+            for skey, sinfo in list(bb_skills.items())[:3]:
+                preview = trim(str(sinfo.get("preview", "") if isinstance(sinfo, dict) else ""), 200)
+                if preview:
+                    skill_previews.append(f"- **{skey}**: {preview}")
+            if skill_previews:
+                skills_section = (
+                    f"\n## Loaded Skills (use these to guide your research and plan design)\n"
+                    + "\n".join(skill_previews)
+                    + "\n\nThese skills have been injected into your context. "
+                    "Leverage their instructions to produce a more professional and complete plan.\n"
+                )
         return (
             f"You are in plan-mode research phase. Your task is to analyze the following request "
             f"WITHOUT making any modifications.\n\n"
             f"## User Request\n{goal}\n\n"
+            f"{skills_section}"
             f"## Instructions\n"
             f"1. Analyze the impact scope — which files, modules, and systems are affected\n"
             f"2. Identify key files that need to be read and understood\n"
@@ -21788,6 +22487,7 @@ class SessionState:
 
     def _seed_plan_mode_explorer_context(self, research_prompt: str):
         os_note = _detect_os_shell_instruction()
+        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
@@ -21795,6 +22495,7 @@ class SessionState:
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
                 "and blackboard tools only. "
+                f"{skills_hint}"
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -21825,6 +22526,8 @@ class SessionState:
             self.current_phase = f"plan-mode:explorer:round-{round_idx}"
             self.current_tool_name = ""
             self.active_agent_role = "explorer"
+        # Build loaded-skills hint for system prompt
+        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
         response = self._chat_with_same_model_retry(
             ctx,
             tools=filtered_tools,
@@ -21832,6 +22535,7 @@ class SessionState:
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
                 f"Workspace: {self.files_root}. "
+                f"{skills_hint}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -21844,9 +22548,12 @@ class SessionState:
             retries=MODEL_OUTPUT_RETRY_TIMES,
         )
         text = str(response.get("content") or "")
+        thinking_text = str(response.get("thinking", "") or "").strip()
         tool_calls = response.get("tool_calls", [])
         text, _ = self._sanitize_assistant_text_for_runtime(text, tool_calls)
         assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": "explorer"}
+        if thinking_text:
+            assistant["thinking"] = thinking_text
         if tool_calls:
             assistant["tool_calls"] = [
                 {
@@ -21860,14 +22567,26 @@ class SessionState:
                 for tc in tool_calls
             ]
         self._append_agent_context_message("explorer", assistant, mirror_to_global=False)
-        # B4: Emit planner research bubble for user visibility
-        if text.strip():
-            self._emit("message", {
+        # B4: Emit planner research bubble for user visibility (persist in messages)
+        if text.strip() or thinking_text:
+            planner_msg = {
+                "role": "assistant",
+                "content": text.strip(),
+                "ts": now_ts(),
+                "agent_role": "planner",
+            }
+            if thinking_text:
+                planner_msg["thinking"] = thinking_text
+            self.messages.append(planner_msg)
+            emit_data = {
                 "role": "assistant",
                 "agent_role": "planner",
                 "text": trim(text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
                 "summary": f"plan-mode: research round {round_idx + 1}",
-            })
+            }
+            if thinking_text:
+                emit_data["thinking"] = trim(thinking_text, 2000)
+            self._emit("message", emit_data)
         if not tool_calls:
             return {"status": "no-tools", "text": text}
         # Execute tool calls (read-only)
@@ -21934,6 +22653,242 @@ class SessionState:
                 "agent_role": "planner",
             })
 
+    # ------------------------------------------------------------------
+    # Stall severity tracking & plan-mode escalation
+    # ------------------------------------------------------------------
+
+    def _bump_stall_severity(self, source: str, points: int) -> int:
+        self.stall_severity_score = max(0, int(self.stall_severity_score or 0)) + int(points)
+        self.stall_severity_sources.append({
+            "source": trim(str(source), 80),
+            "points": int(points),
+            "ts": now_ts(),
+            "cumulative": int(self.stall_severity_score),
+        })
+        self.stall_severity_sources = self.stall_severity_sources[-12:]
+        self._emit("status", {
+            "summary": f"stall-severity +{points} ({source}); total={self.stall_severity_score}"
+        })
+        return int(self.stall_severity_score)
+
+    def _decay_stall_severity(self, points: int = 2):
+        if int(self.stall_severity_score or 0) > 0:
+            self.stall_severity_score = max(0, int(self.stall_severity_score) - int(points))
+
+    def _collect_stall_context(self, fault_counter: int = 0, last_fault_reason: str = "") -> dict:
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 2000)
+        stall_events = list(self.stall_severity_sources[-8:])
+        error_ctx = trim(self._recent_error_context(600), STALL_ESCALATION_CONTEXT_MAX_CHARS)
+        recent_tools: list[str] = []
+        for msg in reversed(self.messages[-30:]):
+            tc_list = msg.get("tool_calls", [])
+            if isinstance(tc_list, list):
+                for tc in tc_list:
+                    fn = tc.get("function", {})
+                    if isinstance(fn, dict):
+                        recent_tools.append(str(fn.get("name", "")))
+            if len(recent_tools) >= 20:
+                break
+        repeated = []
+        seen: dict[str, int] = {}
+        for t in recent_tools:
+            seen[t] = seen.get(t, 0) + 1
+        for t, c in seen.items():
+            if c >= 3:
+                repeated.append(f"{t}(x{c})")
+        open_todos: list[str] = []
+        try:
+            snap = self.todo.snapshot()
+            for item in (snap or [])[:6]:
+                if isinstance(item, dict) and str(item.get("status", "")).strip().lower() != "done":
+                    open_todos.append(trim(str(item.get("text", "")), 120))
+        except Exception:
+            pass
+        bb = self._ensure_blackboard()
+        task_level = 0
+        try:
+            task_level = int(bb.get("task_profile", {}).get("task_level", 0) or 0)
+        except Exception:
+            pass
+        return {
+            "goal": goal,
+            "task_level": task_level,
+            "stall_events": stall_events,
+            "error_context": error_ctx,
+            "repeated_tools": repeated,
+            "recent_tools": recent_tools[:12],
+            "open_todos": open_todos,
+            "fault_counter": int(fault_counter),
+            "last_fault_reason": trim(str(last_fault_reason or ""), 300),
+            "severity_score": int(self.stall_severity_score),
+        }
+
+    def _escalate_stall_to_plan_mode(
+        self,
+        trigger_source: str,
+        fault_counter: int = 0,
+        last_fault_reason: str = "",
+        pinned_selection: str = "",
+    ) -> bool:
+        if self.stall_escalation_triggered:
+            return False
+        if self.runtime_plan_mode_needed or self.runtime_plan_proposal:
+            return False
+        stall_ctx = self._collect_stall_context(fault_counter, last_fault_reason)
+        task_level = int(stall_ctx.get("task_level", 0) or 0)
+        user_pref = str(self.plan_mode_user_preference or "auto").lower()
+        if task_level < STALL_ESCALATION_MIN_LEVEL or user_pref == "off":
+            self._emit_stall_conclusion(trigger_source, last_fault_reason, stall_ctx)
+            self.stall_escalation_triggered = True
+            return True
+        self.stall_escalation_triggered = True
+        self.stall_escalation_round = int(self.agent_round_index or 0)
+        self._blackboard_set_status("STALL_PLANNING", f"stall escalation from {trigger_source}")
+        self._ledger_record_stall(f"stall-escalation:{trigger_source}", "plan-mode-escalation")
+        exec_mode = self._effective_execution_mode()
+        if exec_mode == EXECUTION_MODE_SINGLE:
+            self._escalate_stall_single_mode(stall_ctx, pinned_selection)
+        else:
+            self._escalate_stall_sync_mode(stall_ctx, pinned_selection)
+        return True
+
+    def _escalate_stall_single_mode(self, stall_context: dict, pinned_selection: str):
+        proposal = self._plan_mode_synthesize_stall_proposal(stall_context, pinned_selection)
+        if not proposal or not proposal.get("options"):
+            self._emit_stall_conclusion(
+                "synthesis-failed",
+                stall_context.get("last_fault_reason", ""),
+                stall_context,
+            )
+            return
+        self.runtime_plan_proposal = proposal
+        self.runtime_plan_mode_needed = True
+        self.runtime_plan_approved = False
+        md = self._format_plan_proposal_markdown(proposal)
+        stall_header = self._format_stall_findings(stall_context)
+        full_md = f"{stall_header}\n\n{md}"
+        self.messages.append({
+            "role": "assistant",
+            "content": full_md,
+            "ts": now_ts(),
+            "agent_role": "planner",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": full_md,
+            "summary": "stall escalation: plan proposal generated",
+            "agent_role": "planner",
+        })
+
+    def _escalate_stall_sync_mode(self, stall_context: dict, pinned_selection: str):
+        self._escalate_stall_single_mode(stall_context, pinned_selection)
+
+    def _plan_mode_synthesize_stall_proposal(self, stall_context: dict, pinned_selection: str) -> dict:
+        goal = trim(str(stall_context.get("goal", "")), 2000)
+        findings_text = self._format_stall_findings(stall_context)
+        synthesis_prompt = (
+            f"The agent has stalled while working on the user's task. "
+            f"Based on the failure analysis below, generate a structured recovery plan "
+            f"with up to {PLAN_MODE_MAX_OPTIONS} differentiated options.\n\n"
+            f"## User's Original Goal\n{goal}\n\n"
+            f"## Failure Analysis\n{findings_text}\n\n"
+            f"## Instructions\n"
+            f"Generate 3 recovery options with MEANINGFULLY DIFFERENT approaches:\n"
+            f"- Option A: Direct workaround — bypass the blocker with an alternative method\n"
+            f"- Option B: Different path — re-approach the goal from a completely different angle\n"
+            f"- Option C: Minimal viable + user action items — do what's possible now, list what the user needs to do manually\n\n"
+            f"Call the submit_plan_proposal tool with:\n"
+            f"- context: brief failure analysis (what was tried, what failed, why)\n"
+            f"- options: array of 3 options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
+            f"- recommended: id of the recommended option\n\n"
+            f"{model_language_instruction(self.ui_language)}"
+        )
+        synthesis_ctx = [
+            {"role": "system", "content": "You are a recovery planner analyzing execution failures and proposing alternative approaches.", "ts": now_ts()},
+            {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
+        ]
+        try:
+            response = self._chat_with_same_model_retry(
+                synthesis_ctx,
+                tools=self._plan_mode_synthesis_tools(),
+                system="Generate a structured stall recovery plan. Use the submit_plan_proposal tool.",
+                max_tokens=STALL_PLAN_SYNTHESIS_MAX_TOKENS,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="stall-plan synthesis",
+                retries=MODEL_OUTPUT_RETRY_TIMES,
+            )
+            tool_calls = response.get("tool_calls", [])
+            for tc in tool_calls:
+                if tc.get("function", {}).get("name") == "submit_plan_proposal":
+                    args = tc["function"].get("arguments", {})
+                    if isinstance(args, dict) and args.get("options"):
+                        return dict(args)
+        except Exception as exc:
+            self._emit("status", {"summary": f"stall plan synthesis error: {exc}"})
+        return {}
+
+    def _emit_stall_conclusion(self, trigger_source: str, last_fault_reason: str = "", stall_context: dict | None = None):
+        ctx = stall_context or self._collect_stall_context(last_fault_reason=last_fault_reason)
+        lines = ["## 执行遇阻\n"]
+        lines.append(f"**停止原因：** {trim(str(trigger_source), 200)}")
+        if last_fault_reason:
+            lines.append(f"**错误详情：** {trim(str(last_fault_reason), 400)}")
+        error_ctx = str(ctx.get("error_context", "") or "").strip()
+        if error_ctx:
+            lines.append(f"\n**最近错误：**\n```\n{trim(error_ctx, 600)}\n```")
+        repeated = ctx.get("repeated_tools", [])
+        if repeated:
+            lines.append(f"\n**重复工具调用：** {', '.join(repeated)}")
+        lines.append("\n**建议操作：**")
+        lines.append("1. 检查环境是否满足任务要求（文件是否存在、依赖是否安装）")
+        lines.append("2. 手动执行失败的命令，确认错误信息")
+        lines.append("3. 提供更具体的指导或修改任务描述后重试")
+        lines.append("\n请提供进一步指示，我将根据新信息继续执行。")
+        conclusion_md = "\n".join(lines)
+        self.messages.append({
+            "role": "assistant",
+            "content": conclusion_md,
+            "ts": now_ts(),
+            "agent_role": "planner",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": conclusion_md,
+            "summary": f"stall conclusion: {trigger_source}",
+            "agent_role": "planner",
+        })
+
+    def _format_stall_findings(self, stall_context: dict) -> str:
+        lines = ["### 卡死分析\n"]
+        goal = str(stall_context.get("goal", "") or "").strip()
+        if goal:
+            lines.append(f"**目标：** {trim(goal, 400)}")
+        lines.append(f"**严重度分数：** {stall_context.get('severity_score', 0)}")
+        events = stall_context.get("stall_events", [])
+        if events:
+            lines.append("\n**卡死事件序列：**")
+            for ev in events[-6:]:
+                if isinstance(ev, dict):
+                    lines.append(f"- [{ev.get('source', '?')}] +{ev.get('points', 0)} → 累计 {ev.get('cumulative', '?')}")
+        error_ctx = str(stall_context.get("error_context", "") or "").strip()
+        if error_ctx:
+            lines.append(f"\n**错误上下文：**\n```\n{trim(error_ctx, 500)}\n```")
+        repeated = stall_context.get("repeated_tools", [])
+        if repeated:
+            lines.append(f"\n**重复工具：** {', '.join(repeated)}")
+        fault_reason = str(stall_context.get("last_fault_reason", "") or "").strip()
+        if fault_reason:
+            lines.append(f"**最后故障原因：** {trim(fault_reason, 200)}")
+        open_todos = stall_context.get("open_todos", [])
+        if open_todos:
+            lines.append("\n**未完成任务：**")
+            for t in open_todos[:4]:
+                lines.append(f"- {trim(str(t), 100)}")
+        return "\n".join(lines)
+
     def _plan_mode_synthesize_proposal(self, pinned_selection: str) -> dict:
         bb = self._ensure_blackboard()
         plan_data = bb.get("plan", {})
@@ -21943,11 +22898,28 @@ class SessionState:
             for i, f in enumerate(findings) if isinstance(f, dict)
         )
         goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
+        # Include loaded skill guidance in synthesis
+        bb_skills = bb.get("loaded_skills", {})
+        skills_section = ""
+        if isinstance(bb_skills, dict) and bb_skills:
+            skill_previews = []
+            for skey, sinfo in list(bb_skills.items())[:3]:
+                preview = trim(str(sinfo.get("preview", "") if isinstance(sinfo, dict) else ""), 300)
+                if preview:
+                    skill_previews.append(f"- {skey}: {preview}")
+            if skill_previews:
+                skills_section = (
+                    f"\n## Available Skills\n"
+                    + "\n".join(skill_previews)
+                    + "\n\nIncorporate these skills' capabilities into your plan options. "
+                    "Each option's steps should reference using the relevant skills.\n\n"
+                )
         synthesis_prompt = (
             f"Based on the research findings below, generate a structured plan proposal "
             f"with up to {PLAN_MODE_MAX_OPTIONS} options for the user to choose from.\n\n"
             f"## User Request\n{goal}\n\n"
             f"## Research Findings\n{trim(findings_text, 6000)}\n\n"
+            f"{skills_section}"
             f"## Instructions\n"
             f"Call the submit_plan_proposal tool with:\n"
             f"- context: brief background analysis\n"
@@ -21957,7 +22929,10 @@ class SessionState:
             f"{model_language_instruction(self.ui_language)}"
         )
         synthesis_ctx = [
-            {"role": "system", "content": "You are a technical architect synthesizing research into actionable plans.", "ts": now_ts()},
+            {"role": "system", "content": (
+                "You are a technical architect synthesizing research into actionable plans. "
+                "When loaded skills are available, incorporate their capabilities and best practices into plan options."
+            ), "ts": now_ts()},
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
         response = self._chat_with_same_model_retry(
@@ -22056,6 +23031,7 @@ class SessionState:
         if not isinstance(options, list) or not options:
             return ""
         option_ids = [str(o.get("id", "")).strip() for o in options if isinstance(o, dict)]
+        # --- Fast path: hardcoded pattern matching (fallback) ---
         # Direct ID match: "A", "B", "C"
         if low.upper() in option_ids:
             return low.upper()
@@ -22080,6 +23056,47 @@ class SessionState:
         confirm_tokens = ("继续", "确认", "推荐", "推荐方案", "go", "proceed", "continue", "yes", "ok")
         if any(tok in low for tok in confirm_tokens) and recommended:
             return recommended
+        # --- Slow path: LLM semantic matching ---
+        return self._parse_plan_choice_via_llm(text, proposal, option_ids)
+
+    def _parse_plan_choice_via_llm(self, user_text: str, proposal: dict, option_ids: list[str]) -> str:
+        options_desc = []
+        for opt in proposal.get("options", []):
+            if not isinstance(opt, dict):
+                continue
+            oid = str(opt.get("id", "")).strip()
+            title = str(opt.get("title", "")).strip()
+            summary = trim(str(opt.get("summary", "")).strip(), 120)
+            options_desc.append(f"{oid}: {title} — {summary}")
+        if not options_desc:
+            return ""
+        recommended = str(proposal.get("recommended", "") or "").strip()
+        rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
+        prompt = (
+            f"The user was presented with these options:\n"
+            + "\n".join(options_desc)
+            + rec_hint
+            + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"
+            f"Which option did the user choose? Reply with ONLY the option ID "
+            f"(one of: {', '.join(option_ids)}), or \"NONE\" if the user did not choose any option "
+            f"and instead asked a question or gave feedback."
+        )
+        try:
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": f"/no_think\n{prompt}"}],
+                system="/no_think\nYou are a precise intent classifier. Output only the option ID or NONE.",
+                max_tokens=60,
+                think=False,
+            )
+            answer = str(rsp.get("content", "") or "").strip().upper()
+            # Extract option ID from response (handle "A", "A.", "Option A", etc.)
+            for oid in option_ids:
+                if oid in answer:
+                    return oid
+            if answer == "NONE" or not answer:
+                return ""
+        except Exception:
+            pass
         return ""
 
     def _inject_plan_into_context(self, choice_id: str):
@@ -22154,6 +23171,12 @@ class SessionState:
         try:
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
+            # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
+            goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
+            try:
+                self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
+            except Exception:
+                self._cached_llm_complexity = "simple"
             self._emit(
                 "status",
                 {
@@ -22163,6 +23186,14 @@ class SessionState:
                     )
                 },
             )
+            # ── Auto-discover and load relevant skills BEFORE classification ──
+            try:
+                self._auto_discover_and_load_skills(
+                    self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                    trigger="pre-classify",
+                )
+            except Exception:
+                pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()
             self._emit_multimodal_attach_status(
                 scope="manager classify",
@@ -22199,6 +23230,11 @@ class SessionState:
                     {"summary": "level-5 requires user confirmation before next actions"},
                 )
                 return
+            # ── Auto-rename session title early ──
+            try:
+                self._maybe_auto_rename_session_title("run-start")
+            except Exception:
+                pass
             # ── Plan Mode 检查 ──
             if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
                 self._plan_mode_worker(pinned_selection=pinned_selection)
@@ -22302,26 +23338,31 @@ class SessionState:
                     self._emit("inbox", {"summary": f"{len(inbox)} inbox messages"})
                 self._inject_pending_user_inputs()
                 if self.runtime_reclassify_required:
-                    policy_media_inputs = self._recent_multimodal_inputs()
-                    self._emit_multimodal_attach_status(
-                        scope="manager reclassify",
-                        media_inputs=policy_media_inputs,
-                        roles=["manager"],
-                    )
-                    self._refresh_runtime_task_policy(
-                        pinned_selection=pinned_selection,
-                        force=True,
-                        goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                        media_inputs_round=policy_media_inputs,
-                    )
-                    if self._is_multi_agent_mode():
-                        self._emit(
-                            "status",
-                            {"summary": "runtime policy switched to multi-agent mode; handoff now"},
+                    # Skip reclassification if user has manually set task level
+                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+                        self.runtime_reclassify_required = False
+                        self.runtime_goal_reset_pending = False
+                    else:
+                        policy_media_inputs = self._recent_multimodal_inputs()
+                        self._emit_multimodal_attach_status(
+                            scope="manager reclassify",
+                            media_inputs=policy_media_inputs,
+                            roles=["manager"],
                         )
-                        self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
-                        self._multi_agent_worker(pinned_selection=pinned_selection)
-                        return
+                        self._refresh_runtime_task_policy(
+                            pinned_selection=pinned_selection,
+                            force=True,
+                            goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                            media_inputs_round=policy_media_inputs,
+                        )
+                        if self._is_multi_agent_mode():
+                            self._emit(
+                                "status",
+                                {"summary": "runtime policy switched to multi-agent mode; handoff now"},
+                            )
+                            self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
+                            self._multi_agent_worker(pinned_selection=pinned_selection)
+                            return
                 dq = self._normalize_decomposition_queue_state(
                     self._ensure_blackboard().get("decomposition_queue", {})
                 )
@@ -23046,7 +24087,7 @@ class SessionState:
                                     _edit_path,
                                     trim(str(_matching[-1].get("error_msg", "") or ""), 300),
                                     _fix_desc,
-                                    "pending",
+                                    "applied" if _sa_ok else "failed(edit_error)",
                                     "single",
                                 )
                     self._emit("tool_result", {"name": name, "result": trim(output, 500), "summary": f"tool done: {name}"})
@@ -23141,16 +24182,77 @@ class SessionState:
                         retry_requested_this_round = True
                         repeated_tool_rounds = 0
                     else:
-                        self._emit(
-                            "status",
-                            {
-                                "summary": (
-                                    "stop: repeated tool loop detected; "
-                                    "halted early to avoid max loop exhaustion"
-                                )
-                            },
-                        )
-                        stop_due_to_repeated_tool_loop = True
+                        _stall_sev = self._bump_stall_severity("repeated-tool-loop", STALL_SEVERITY_WEIGHT_REPEATED_TOOL)
+                        if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                            if self._escalate_stall_to_plan_mode(
+                                "repeated-tool-loop", fault_counter=fault_counter,
+                                last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
+                            ):
+                                stop_due_to_hard_break = True
+                                hard_break_reason = "stall escalated to plan mode (repeated-tool-loop)"
+                        else:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "stop: repeated tool loop detected; "
+                                        "halted early to avoid max loop exhaustion"
+                                    )
+                                },
+                            )
+                            stop_due_to_repeated_tool_loop = True
+                # --- Bash read-loop detection (succeeding but repeating same reads) ---
+                _bash_only = all(n == "bash" for n in round_tool_names) if round_tool_names else False
+                if (
+                    _bash_only
+                    and round_tool_fp
+                    and round_ok_count > 0
+                    and round_tool_fp == self.bash_read_loop_fp
+                ):
+                    self.bash_read_loop_count += 1
+                elif _bash_only and round_tool_fp:
+                    self.bash_read_loop_fp = round_tool_fp
+                    self.bash_read_loop_count = 1
+                else:
+                    self.bash_read_loop_count = 0
+                    self.bash_read_loop_fp = ""
+                if self.bash_read_loop_count >= BASH_READ_LOOP_THRESHOLD:
+                    _read_loop_reason = (
+                        f"bash read-loop detected: identical successful read commands repeated "
+                        f"{self.bash_read_loop_count} times without progress. "
+                        "You are re-reading the same files/directories without taking action."
+                    )
+                    self._prune_runtime_retry_hints()
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "<read-loop-intervention>"
+                            f"{_read_loop_reason} "
+                            "MANDATORY: Stop reading and take ONE concrete action: "
+                            "1) If files are MISSING: create them based on context (docs, Makefile, imports). "
+                            "2) If compilation FAILS: fix the error, do not re-read the same file. "
+                            "3) If you are STUCK: report the blocker to the user and stop. "
+                            "4) Think deeply about the user's goal and the project structure to find the solution. "
+                            "Do NOT run ls, cat, find, or head on the same paths again."
+                            "</read-loop-intervention>"
+                        ),
+                        "ts": now_ts(),
+                    })
+                    self._ledger_record_stall(
+                        f"bash-read-loop({self.bash_read_loop_count})",
+                        "injected read-loop intervention"
+                    )
+                    self.bash_read_loop_count = 0
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                    retry_requested_this_round = True
+                    _stall_sev = self._bump_stall_severity("bash-read-loop", STALL_SEVERITY_WEIGHT_BASH_READ_LOOP)
+                    if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                        if self._escalate_stall_to_plan_mode(
+                            "bash-read-loop", fault_counter=fault_counter,
+                            last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
+                        ):
+                            stop_due_to_hard_break = True
+                            hard_break_reason = "stall escalated to plan mode (bash-read-loop)"
                 if round_error_count > 0 and round_ok_count == 0:
                     fault_counter += 1
                     last_fault_reason = f"tool-errors({', '.join(round_tool_names[:3])})"
@@ -23198,38 +24300,59 @@ class SessionState:
                     recovery_retry_rounds = 0
                     fault_counter = 0
                     last_fault_reason = ""
+                    self._decay_stall_severity(STALL_SEVERITY_DECAY_ON_SUCCESS)
                 if fault_counter >= int(FUSED_FAULT_BREAK_THRESHOLD):
-                    stop_due_to_hard_break = True
-                    hard_break_reason = (
-                        "fused fault counter reached hard threshold "
-                        f"({fault_counter}); last={trim(last_fault_reason or 'unknown', 140)}"
-                    )
-                    retry_requested_this_round = False
-                    self._emit(
-                        "status",
-                        {
-                            "summary": (
-                                "hard-break triggered: "
-                                f"{hard_break_reason}; execution paused for manual intervention"
-                            )
-                        },
-                    )
+                    _stall_sev = self._bump_stall_severity("fault-threshold", STALL_SEVERITY_WEIGHT_FAULT)
+                    if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                        if self._escalate_stall_to_plan_mode(
+                            "fault-threshold", fault_counter=fault_counter,
+                            last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
+                        ):
+                            stop_due_to_hard_break = True
+                            hard_break_reason = "stall escalated to plan mode (fault-threshold)"
+                            retry_requested_this_round = False
+                    if not self.stall_escalation_triggered:
+                        stop_due_to_hard_break = True
+                        hard_break_reason = (
+                            "fused fault counter reached hard threshold "
+                            f"({fault_counter}); last={trim(last_fault_reason or 'unknown', 140)}"
+                        )
+                        retry_requested_this_round = False
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "hard-break triggered: "
+                                    f"{hard_break_reason}; execution paused for manual intervention"
+                                )
+                            },
+                        )
                 if recovery_retry_rounds >= HARD_BREAK_RECOVERY_ROUND_THRESHOLD:
-                    stop_due_to_hard_break = True
-                    hard_break_reason = (
-                        "recovery instructions repeated without progress "
-                        f"({recovery_retry_rounds} rounds)"
-                    )
-                    retry_requested_this_round = False
-                    self._emit(
-                        "status",
-                        {
-                            "summary": (
-                                "hard-break triggered: "
-                                f"{hard_break_reason}; execution paused for manual intervention"
-                            )
-                        },
-                    )
+                    _stall_sev = self._bump_stall_severity("recovery-retry-exhausted", STALL_SEVERITY_WEIGHT_RECOVERY_RETRY)
+                    if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                        if self._escalate_stall_to_plan_mode(
+                            "recovery-retry-exhausted", fault_counter=fault_counter,
+                            last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
+                        ):
+                            stop_due_to_hard_break = True
+                            hard_break_reason = "stall escalated to plan mode (recovery-retry-exhausted)"
+                            retry_requested_this_round = False
+                    if not self.stall_escalation_triggered:
+                        stop_due_to_hard_break = True
+                        hard_break_reason = (
+                            "recovery instructions repeated without progress "
+                            f"({recovery_retry_rounds} rounds)"
+                        )
+                        retry_requested_this_round = False
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "hard-break triggered: "
+                                    f"{hard_break_reason}; execution paused for manual intervention"
+                                )
+                            },
+                        )
                 if used_todo:
                     self.rounds_without_todo = 0
                     self.todo_reminder_count = 0
@@ -23614,6 +24737,7 @@ class SessionState:
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
                 "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
+                "user_task_level": int(self.user_task_level_override or 0),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
                 "context_left_tokens": int(ctx.get("left", 0)),
                 "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
@@ -24606,9 +25730,34 @@ window.MathJax={
     <select id="langSelect"></select>
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
-    <button id="importConfigBtn" class="subtle">Upload LLM.config.json</button>
+    <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
     <input id="configInput" type="file" accept=".json,application/json" style="display:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
+  </div>
+  <!-- LLM Config Modal -->
+  <div id="llmConfigModal" class="llm-modal-overlay" style="display:none">
+    <div class="llm-modal">
+      <div class="llm-modal-header">
+        <span class="llm-modal-title" id="llmModalTitle">Fill LLM Config</span>
+        <button class="llm-modal-close" id="llmModalClose">&times;</button>
+      </div>
+      <div class="llm-modal-body">
+        <div class="llm-field">
+          <label id="llmProviderLabel">Provider</label>
+          <select id="llmProvider">
+            <option value="ollama">Ollama</option>
+            <option value="openai_compat">OpenAI Compatible</option>
+            <option value="siliconflow">SiliconFlow</option>
+            <option value="custom_http">Custom HTTP</option>
+          </select>
+        </div>
+        <div id="llmFieldsContainer"></div>
+      </div>
+      <div class="llm-modal-footer">
+        <button id="llmConfigConfirm" class="llm-modal-btn-primary">Confirm</button>
+        <button id="llmConfigImport" class="llm-modal-btn-secondary">Import config</button>
+      </div>
+    </div>
   </div>
 </header>
 <div class="status-cards" id="topStats"></div>
@@ -24628,16 +25777,42 @@ window.MathJax={
     <div id="convView" class="conv-view">
       <div id="chat"></div>
       <div class="composer">
-        <textarea id="prompt" placeholder="描述你的任务，或让 Agent 使用工具执行操作..."></textarea>
-        <div id="uploadDrop" class="upload-drop">拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件</div>
+        <div id="promptComposerShell" class="composer-shell">
+          <div class="prompt-wrapper">
+            <textarea id="prompt" placeholder="描述你的任务，或将文件拖入此处..."></textarea>
+          </div>
+          <div class="composer-footer">
+            <button id="promptFilePick" type="button" class="composer-file-btn">选择文件</button>
+            <div id="promptFileHint" class="composer-file-hint">
+              <span id="promptFileHintText">支持拖入文件：代码 / Markdown / PDF / Excel / Word / PPT / CSV</span>
+            </div>
+          </div>
+          <div id="promptDropOverlay" class="prompt-drop-overlay">释放以上传文件</div>
+        </div>
         <input id="uploadInput" type="file" multiple>
-        <div id="uploadList" class="mono upload-list"></div>
+        <div id="uploadList" class="upload-list hidden"></div>
         <div class="row">
           <button id="sendBtn">Send</button>
           <button id="interruptBtn" class="subtle">Interrupt</button>
-          <button id="compactBtn" class="subtle">Compact</button>
+          <div class="popup-dropdown" style="position:relative;display:inline-block">
+            <button id="toolsMenuBtn" class="subtle">Tools ▾</button>
+            <div id="toolsMenu" class="popup-menu" style="display:none">
+              <a id="compactAction" class="popup-item" href="#">Compact</a>
+              <a id="refreshAction" class="popup-item" href="#">Refresh</a>
+            </div>
+          </div>
+          <div class="popup-dropdown" style="position:relative;display:inline-block">
+            <button id="levelBtn" class="subtle level-btn">Level: Auto</button>
+            <div id="levelMenu" class="popup-menu popup-menu-wide" style="display:none">
+              <a class="popup-item level-option" data-level="0" href="#">Auto</a>
+              <a class="popup-item level-option" data-level="1" href="#">L1 Simple (budget: 2)</a>
+              <a class="popup-item level-option" data-level="2" href="#">L2 Multi (budget: 6)</a>
+              <a class="popup-item level-option" data-level="3" href="#">L3 Collab (budget: 10)</a>
+              <a class="popup-item level-option" data-level="4" href="#">L4 Complex (budget: 24)</a>
+              <a class="popup-item level-option" data-level="5" href="#">L5 System (budget: ∞)</a>
+            </div>
+          </div>
           <button id="planModeBtn" class="subtle" title="Toggle Plan Mode">Plan: Auto</button>
-          <button id="refreshBtn" class="subtle">Refresh</button>
           <div class="export-dropdown" style="position:relative;display:inline-block">
             <button id="exportMenuBtn" class="subtle">Export ▾</button>
             <div id="exportMenu" style="display:none;position:absolute;bottom:100%;left:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:999;min-width:160px;padding:4px 0;margin-bottom:4px">
@@ -24851,16 +26026,40 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
-.composer textarea{width:100%;min-height:100px;border:1px solid var(--line);border-radius:12px;padding:10px;resize:vertical}
-.upload-drop{margin-top:8px;border:1px dashed #8aa8d1;border-radius:10px;background:#f7fbff;padding:8px 10px;font-size:.84rem;color:#375076;cursor:pointer}
+.composer-shell{position:relative;border:1px solid var(--control-line);border-radius:16px;background:linear-gradient(180deg,var(--control-panel),var(--control-panel-soft));box-shadow:inset 0 1px 0 rgba(255,255,255,.7),0 10px 22px rgba(15,23,42,.05);overflow:hidden;transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease}
+.composer-shell:focus-within{border-color:var(--focus-border);box-shadow:0 0 0 4px var(--focus-ring),inset 0 1px 0 rgba(255,255,255,.78),0 16px 34px rgba(15,23,42,.08)}
+.composer textarea{width:100%;min-height:90px;border:0;border-radius:0;padding:13px 14px 9px;background:transparent;color:var(--control-fg);resize:vertical;transition:none}
+.composer textarea:focus{outline:none}
+.prompt-wrapper{position:relative}
+.composer-footer{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:8px 12px;border-top:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.38),rgba(255,255,255,.16))}
+.composer-file-btn{display:inline-flex;align-items:center;gap:8px;flex:none;padding:7px 12px;border:1px solid var(--control-line);border-radius:999px;background:linear-gradient(180deg,var(--control-surface),var(--control-surface-soft));color:var(--control-fg);font-size:.78rem;font-weight:700;cursor:pointer;box-shadow:0 4px 10px rgba(15,23,42,.05);transition:border-color .16s ease,transform .16s ease,box-shadow .16s ease}
+.composer-file-btn::before{content:"+";display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:color-mix(in srgb,var(--brand) 14%, #ffffff 86%);color:var(--brand);font-weight:800;line-height:1}
+.composer-file-btn:hover{border-color:var(--selected-line);transform:translateY(-1px);box-shadow:0 8px 18px rgba(15,23,42,.08)}
+.composer-file-hint{min-width:0;flex:1;font-size:.75rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.composer-shell.dragover{border-color:var(--focus-border);box-shadow:0 0 0 4px var(--focus-ring),0 18px 36px rgba(15,23,42,.08)}
+.composer-shell.dragover textarea,.composer-shell.dragover .composer-footer{filter:saturate(.92);opacity:.72}
+.prompt-drop-overlay{display:none;position:absolute;inset:10px;border-radius:14px;background:linear-gradient(180deg,var(--focus-ring),rgba(255,255,255,.3));border:2px dashed var(--focus-border);z-index:3;pointer-events:none;font-size:.94rem;color:var(--brand);font-weight:700;letter-spacing:.01em;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.composer-shell.dragover .prompt-drop-overlay{display:flex}
+.upload-drop{margin-top:8px;border:1px dashed #8aa8d1;border-radius:10px;background:#f7fbff;padding:8px 10px;font-size:.84rem;color:#375076;cursor:pointer;display:none}
 .upload-drop.dragover{border-color:#1f6feb;background:#eaf2ff}
 #uploadInput{display:none}
-.upload-list{margin-top:6px;border:1px solid var(--line);border-radius:10px;background:#fff;max-height:88px;overflow:auto;padding:6px}
+.upload-list{margin-top:8px;border:1px solid var(--control-line);border-radius:12px;background:linear-gradient(180deg,var(--control-panel),rgba(255,255,255,.88));max-height:88px;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:6px;box-shadow:inset 0 1px 0 rgba(255,255,255,.72)}
+.upload-entry{display:flex;flex-direction:column;gap:2px;padding:6px 8px;border:1px solid var(--control-line);border-radius:10px;background:linear-gradient(180deg,var(--control-surface),var(--control-surface-soft))}
+.upload-entry-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.upload-entry-name{font-weight:700;font-size:.78rem;color:var(--control-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.upload-entry-meta{flex:none;font-size:.68rem;color:var(--muted);white-space:nowrap}
+.upload-entry-path{font-size:.7rem;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.upload-empty{padding:3px 5px;font-size:.74rem;color:var(--muted)}
 .row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 .ctx-live{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d6deea;border-radius:999px;background:#f8fbff;min-width:250px}
 .ctx-live-dot{width:8px;height:8px;border-radius:50%;background:#13b8a6;box-shadow:0 0 0 rgba(19,184,166,.45)}
 .ctx-live-bar{position:relative;display:inline-block;width:84px;height:6px;border-radius:999px;background:#e5edf8;overflow:hidden}
 .ctx-live-fill{display:block;height:100%;width:0%;background:linear-gradient(90deg,#13b8a6,#1f6feb);transition:width .24s ease,background .24s ease}
+@media (max-width:760px){
+  .composer-footer{flex-direction:column;align-items:stretch}
+  .composer-file-btn{justify-content:center}
+  .composer-file-hint{white-space:normal}
+}
 .ctx-live.warn .ctx-live-dot{background:#e1a400}
 .ctx-live.warn .ctx-live-fill{background:linear-gradient(90deg,#ffcc66,#e1a400)}
 .ctx-live.danger .ctx-live-dot{background:#cf3b3b}
@@ -24943,6 +26142,29 @@ h3{font-size:.96rem;margin:10px 0 6px}
   .ctx-live{margin-left:0;width:100%;min-width:0}
   #runtimeScroll{max-height:42vh}
 }
+.popup-dropdown{position:relative;display:inline-block}
+.popup-menu{display:none;position:absolute;bottom:100%;left:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:999;min-width:160px;padding:4px 0;margin-bottom:4px;max-height:360px;overflow-y:auto}
+.popup-menu-wide{min-width:200px}
+.popup-item{display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px;cursor:pointer;white-space:nowrap}
+.popup-item:hover{background:#f0f4f8}
+.popup-item.active{background:#eaf2ff;font-weight:700;color:var(--brand)}
+.level-btn{font-variant-numeric:tabular-nums}
+.llm-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:9999;display:flex;align-items:center;justify-content:center}
+.llm-modal{background:var(--bg,#f5f7fa);border:1px solid var(--line,#d9e1ec);border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.18);width:480px;max-width:92vw;max-height:85vh;overflow:hidden;display:flex;flex-direction:column}
+.llm-modal-header{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--line,#d9e1ec)}
+.llm-modal-title{font-size:1rem;font-weight:700;color:var(--fg,#0f1b2d)}
+.llm-modal-close{background:none;border:none;font-size:1.3rem;cursor:pointer;color:var(--muted,#6c7a8d);padding:0 4px;line-height:1}
+.llm-modal-body{padding:16px 18px;overflow-y:auto;flex:1}
+.llm-field{margin-bottom:12px}
+.llm-field label{display:block;font-size:.78rem;font-weight:600;color:var(--muted,#6c7a8d);margin-bottom:4px}
+.llm-field select,.llm-field input[type="text"],.llm-field input[type="url"],.llm-field input[type="password"],.llm-field input[type="number"]{width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.88rem;background:#fff;color:var(--fg,#0f1b2d);box-sizing:border-box}
+.llm-field input:focus,.llm-field select:focus,.llm-field textarea:focus{outline:none;border-color:var(--brand,#1f6feb);box-shadow:0 0 0 2px rgba(31,111,235,.15)}
+.llm-field .llm-hint{font-size:.72rem;color:var(--muted,#6c7a8d);margin-top:3px}
+.llm-modal-footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line,#d9e1ec)}
+.llm-modal-btn-primary{flex:1;padding:9px 16px;border-radius:8px;border:none;background:var(--brand,#1f6feb);color:#fff;font-weight:600;font-size:.88rem;cursor:pointer}
+.llm-modal-btn-primary:hover{opacity:.9}
+.llm-modal-btn-secondary{flex:1;padding:9px 16px;border-radius:8px;border:1px solid var(--line,#d9e1ec);background:var(--bg,#f5f7fa);color:var(--fg,#0f1b2d);font-weight:600;font-size:.88rem;cursor:pointer}
+.llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
 APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
@@ -24987,19 +26209,30 @@ const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
 const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library']),fortran:new Set(['program','module','subroutine','function','end','use','implicit','none','integer','real','character','logical','complex','dimension','allocatable','intent','in','out','inout','do','if','then','else','elseif','endif','call','return','write','read','format','type','class','interface','contains','allocate','deallocate']),haskell:new Set(['module','where','import','qualified','as','hiding','data','type','newtype','class','instance','deriving','if','then','else','case','of','let','in','do','return','where','infixl','infixr','infix','forall','default']),erlang:new Set(['module','export','import','if','case','of','end','receive','after','when','fun','try','catch','throw','begin','andalso','orelse','not','band','bor','bxor','bnot','bsl','bsr']),elixir:new Set(['def','defp','defmodule','defmacro','defstruct','defprotocol','defimpl','if','else','unless','case','cond','do','end','fn','when','with','for','raise','rescue','import','use','alias','require']),ocaml:new Set(['let','in','if','then','else','match','with','fun','function','type','module','struct','sig','end','open','val','rec','and','or','not','begin','do','done','for','while','to','downto','mutable','ref']),vhdl:new Set(['library','use','entity','architecture','is','of','begin','end','signal','variable','constant','port','in','out','inout','process','if','then','else','elsif','case','when','for','generate','component','generic','map']),verilog:new Set(['module','endmodule','input','output','inout','wire','reg','assign','always','begin','end','if','else','case','endcase','for','while','parameter','localparam','initial','posedge','negedge','task','function']),asm:new Set([]),protobuf:new Set(['syntax','package','import','option','message','enum','service','rpc','returns','repeated','optional','required','map','oneof','reserved','extend']),hcl:new Set(['resource','data','variable','output','locals','module','provider','terraform','backend','required_providers','for_each','count','depends_on','lifecycle','dynamic','content','block']),zig:new Set(['const','var','fn','pub','return','if','else','for','while','break','continue','switch','struct','enum','union','error','defer','errdefer','try','catch','import','comptime','inline','test','unreachable']),nim:new Set(['proc','func','method','type','var','let','const','if','elif','else','case','of','for','while','break','continue','return','import','include','from','object','ref','ptr','template','macro','iterator','yield','discard']),julia:new Set(['function','end','if','elseif','else','for','while','break','continue','return','module','using','import','export','struct','mutable','abstract','type','const','let','do','begin','try','catch','finally','throw','macro','quote']),crystal:new Set(['def','class','module','struct','enum','if','elsif','else','unless','case','when','while','until','for','do','end','return','yield','begin','rescue','ensure','require','include','extend','abstract','private','protected']),dlang:new Set(['module','import','class','struct','enum','interface','if','else','for','foreach','while','do','switch','case','default','break','continue','return','void','auto','const','immutable','static','public','private','protected','override','template','mixin','alias']),clojure:new Set(['def','defn','defmacro','fn','let','if','cond','case','do','loop','recur','for','doseq','when','when-not','ns','require','use','import','try','catch','throw','finally']),lisp:new Set(['defun','defmacro','defvar','defparameter','defconstant','let','let*','if','cond','case','when','unless','lambda','progn','loop','do','dolist','dotimes','setq','setf','funcall','apply','require','provide']),racket:new Set(['define','lambda','let','let*','letrec','if','cond','case','when','unless','begin','do','for','for/list','for/hash','match','struct','class','require','provide','module','import','export']),pascal:new Set(['program','unit','uses','interface','implementation','begin','end','var','const','type','procedure','function','if','then','else','for','to','downto','while','repeat','until','case','of','with','record','class','array','set','nil']),wgsl:new Set(['fn','var','let','const','struct','if','else','for','while','loop','break','continue','return','switch','case','default','override','enable','type','alias','discard','continuing','fallthrough']),glsl:new Set(['void','float','int','bool','vec2','vec3','vec4','mat2','mat3','mat4','sampler2D','uniform','varying','attribute','in','out','inout','if','else','for','while','do','break','continue','return','struct','const','precision','highp','mediump','lowp']),hlsl:new Set(['float','float2','float3','float4','int','bool','void','struct','cbuffer','Texture2D','SamplerState','if','else','for','while','do','break','continue','return','in','out','inout','uniform','static','const','register','semantic']),prisma:new Set(['model','enum','datasource','generator','type','relation','default','unique','id','map','index','ignore','updatedAt']),graphql:new Set(['type','query','mutation','subscription','input','enum','interface','union','scalar','schema','fragment','on','directive','extend','implements'])};
 S.staticMode=STATIC_UI;
+async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl)}catch(err){showError(err.message||String(err))}}
+function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}}
+async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el)config[f.key]=el.value.trim()}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
+async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
+function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
 const I18N={
   'en':{
     app_title:'Clouds Coder',app_subtitle:'WebUI-driven conversational coding agent platform',powered_by:'Powered By Fona',
-    apply_model:'Apply Model',upload_llm_config:'Upload LLM.config.json',open_skills:'Open Skills Studio',skills_offline:'Skills Studio (Offline)',
+    apply_model:'Apply Model',upload_llm_config:'Fill LLM Config',open_skills:'Open Skills Studio',skills_offline:'Skills Studio (Offline)',
     panel_sessions:'Sessions',panel_conversation:'Conversation',panel_runtime:'Runtime',
     btn_new_session:'New Session',btn_rename:'Rename',btn_delete:'Delete',
     btn_send:'Send',btn_interrupt:'Interrupt',btn_compact:'Compact',btn_refresh:'Refresh',btn_export_session:'Export Session',
     btn_clear_stale_todos:'Clear Stale Todos',
-    prompt_placeholder:'Describe your task, or ask the agent to use tools to perform actions...',
+    prompt_placeholder:'Describe your task, or drag files here...',
     upload_drop:'Drag and drop code / Markdown / PDF / Excel / Word / PPT / CSV here, or click to choose files',
+    upload_file_hint:'Supports: code / Markdown / PDF / Excel / Word / PPT / CSV',
+    upload_pick_file:'Choose files',
+    upload_drop_release:'Drop to upload',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
     stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_model:'Model',
     no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
@@ -25012,17 +26245,29 @@ const I18N={
     file_too_large:'File too large',
     compact_auto:'Auto compact triggered',
     rel_path:'Relative path',thinking:'thinking',thinking_stream:'thinking (stream)',
-    copy_code:'Copy Code',copy_done:'Copied'
+    copy_code:'Copy Code',copy_done:'Copied',
+    btn_tools:'Tools ▾',btn_compact_action:'Compact',btn_refresh_action:'Refresh',
+    btn_level:'Level',level_auto:'Auto',level_1_simple:'L1 Simple',level_2_multi:'L2 Multi',
+    level_3_collab:'L3 Collab',level_4_complex:'L4 Complex',level_5_system:'L5 System',
+
+
+    llm_fill_config:'Fill LLM Config',llm_provider:'Provider',llm_confirm:'Confirm',llm_import_config:'Import config',
+    llm_thinking_stream:'Thinking Stream',llm_enabled:'Enabled',llm_disabled:'Disabled',
+    llm_model:'Model',llm_scan:'Scan',llm_scan_hint:'Click Scan to detect models from Ollama',llm_scan_first:'Scan models first',
+    llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed'
   },
   'zh-CN':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驱动的会话式集成编程 Agent 平台',powered_by:'Powered By Fona',
-    apply_model:'应用模型',upload_llm_config:'上传 LLM.config.json',open_skills:'打开 Skills Studio',skills_offline:'Skills Studio（离线）',
+    apply_model:'应用模型',upload_llm_config:'填写 LLM 配置',open_skills:'打开 Skills Studio',skills_offline:'Skills Studio（离线）',
     panel_sessions:'会话',panel_conversation:'对话',panel_runtime:'运行态',
     btn_new_session:'新建会话',btn_rename:'重命名',btn_delete:'删除',
     btn_send:'发送',btn_interrupt:'中断',btn_compact:'压缩',btn_refresh:'刷新',btn_export_session:'导出会话',
     btn_clear_stale_todos:'清除陈旧待办',
-    prompt_placeholder:'描述你的任务，或让 Agent 使用工具执行操作...',
+    prompt_placeholder:'描述你的任务，或将文件拖入此处...',
     upload_drop:'拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件',
+    upload_file_hint:'支持拖入文件：代码 / Markdown / PDF / Excel / Word / PPT / CSV',
+    upload_pick_file:'选择文件',
+    upload_drop_release:'释放以上传文件',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
     stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_model:'模型',
     no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
@@ -25035,17 +26280,29 @@ const I18N={
     file_too_large:'文件过大',
     compact_auto:'自动 compact 触发',
     rel_path:'相对路径',thinking:'思考',thinking_stream:'思考（流式）',
-    copy_code:'复制代码',copy_done:'已复制'
+    copy_code:'复制代码',copy_done:'已复制',
+    btn_tools:'工具 ▾',btn_compact_action:'压缩',btn_refresh_action:'刷新',
+    btn_level:'等级',level_auto:'自动',level_1_simple:'L1 简单',level_2_multi:'L2 多轮',
+    level_3_collab:'L3 协作',level_4_complex:'L4 复杂',level_5_system:'L5 系统',
+
+
+    llm_fill_config:'填写 LLM 配置',llm_provider:'供应商',llm_confirm:'确认',llm_import_config:'导入配置',
+    llm_thinking_stream:'思维流',llm_enabled:'启用',llm_disabled:'禁用',
+    llm_model:'模型',llm_scan:'扫描',llm_scan_hint:'点击扫描检测 Ollama 可用模型',llm_scan_first:'请先扫描模型',
+    llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败'
   },
   'zh-TW':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驅動的會話式整合程式 Agent 平台',powered_by:'Powered By Fona',
-    apply_model:'套用模型',upload_llm_config:'上傳 LLM.config.json',open_skills:'開啟 Skills Studio',skills_offline:'Skills Studio（離線）',
+    apply_model:'套用模型',upload_llm_config:'填寫 LLM 設定',open_skills:'開啟 Skills Studio',skills_offline:'Skills Studio（離線）',
     panel_sessions:'會話',panel_conversation:'對話',panel_runtime:'執行狀態',
     btn_new_session:'新增會話',btn_rename:'重新命名',btn_delete:'刪除',
     btn_send:'送出',btn_interrupt:'中斷',btn_compact:'壓縮',btn_refresh:'重新整理',btn_export_session:'匯出會話',
     btn_clear_stale_todos:'清除陳舊待辦',
-    prompt_placeholder:'描述你的任務，或要求 Agent 使用工具執行操作...',
-    upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案',
+    prompt_placeholder:'描述你的任務，或將檔案拖入此處...',
+    upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV��或點擊此處選擇檔案',
+    upload_file_hint:'支援拖入檔案：程式碼 / Markdown / PDF / Excel / Word / PPT / CSV',
+    upload_pick_file:'選擇檔案',
+    upload_drop_release:'釋放以上傳檔案',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
     stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_model:'模型',
     no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
@@ -25058,17 +26315,29 @@ const I18N={
     file_too_large:'檔案過大',
     compact_auto:'已觸發自動 compact',
     rel_path:'相對路徑',thinking:'思考',thinking_stream:'思考（串流）',
-    copy_code:'複製程式碼',copy_done:'已複製'
+    copy_code:'複製程式碼',copy_done:'已複製',
+    btn_tools:'工具 ▾',btn_compact_action:'壓縮',btn_refresh_action:'重新整理',
+    btn_level:'等級',level_auto:'自動',level_1_simple:'L1 簡單',level_2_multi:'L2 多輪',
+    level_3_collab:'L3 協���',level_4_complex:'L4 複雜',level_5_system:'L5 系統',
+
+
+    llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
+    llm_thinking_stream:'思維流',llm_enabled:'啟用',llm_disabled:'停用',
+    llm_model:'模型',llm_scan:'掃描',llm_scan_hint:'點擊掃描偵測 Ollama 可用模型',llm_scan_first:'請先掃描模型',
+    llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗'
   },
   'ja':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 駆動の対話型コーディング Agent プラットフォーム',powered_by:'Powered By Fona',
-    apply_model:'モデル適用',upload_llm_config:'LLM.config.json をアップロード',open_skills:'Skills Studio を開く',skills_offline:'Skills Studio（オフライン）',
+    apply_model:'モデル適用',upload_llm_config:'LLM設定入力',open_skills:'Skills Studio を開く',skills_offline:'Skills Studio（オフライン）',
     panel_sessions:'セッション',panel_conversation:'会話',panel_runtime:'ランタイム',
     btn_new_session:'新規セッション',btn_rename:'リネーム',btn_delete:'削除',
     btn_send:'送信',btn_interrupt:'中断',btn_compact:'コンパクト',btn_refresh:'更新',btn_export_session:'セッションをエクスポート',
     btn_clear_stale_todos:'古いTodoを消去',
-    prompt_placeholder:'タスクを説明するか、Agent にツール実行を依頼してください...',
+    prompt_placeholder:'タスクを説明、またはファイルをここにドラッグ...',
     upload_drop:'コード / Markdown / PDF / Excel / Word / PPT / CSV をドラッグ＆ドロップ、またはクリックして選択',
+    upload_file_hint:'対応形式：コード / Markdown / PDF / Excel / Word / PPT / CSV',
+    upload_pick_file:'ファイルを選択',
+    upload_drop_release:'ドロップしてアップロード',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
     stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_model:'モデル',
     no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
@@ -25081,14 +26350,23 @@ const I18N={
     file_too_large:'ファイルが大きすぎます',
     compact_auto:'自動 compact を実行',
     rel_path:'相対パス',thinking:'thinking',thinking_stream:'thinking (stream)',
-    copy_code:'Copy Code',copy_done:'Copied'
+    copy_code:'Copy Code',copy_done:'Copied',
+    btn_tools:'ツール ▾',btn_compact_action:'コンパクト',btn_refresh_action:'更新',
+    btn_level:'レベル',level_auto:'自動',level_1_simple:'L1 シンプル',level_2_multi:'L2 マルチ',
+    level_3_collab:'L3 コラボ',level_4_complex:'L4 複雑',level_5_system:'L5 システム',
+
+
+    llm_fill_config:'LLM設定入力',llm_provider:'プロバイダー',llm_confirm:'確認',llm_import_config:'設定をインポート',
+    llm_thinking_stream:'シンキングストリーム',llm_enabled:'有効',llm_disabled:'無効',
+    llm_model:'モデル',llm_scan:'スキャン',llm_scan_hint:'スキャンをクリックしてOllamaモデルを検出',llm_scan_first:'先にモデルをスキャン',
+    llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗'
   }
 };
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
-function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('importConfigBtn','upload_llm_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('compactBtn','btn_compact');setText('refreshBtn','btn_refresh');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}renderPreviewTabs()}
+function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
 async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderSkillsEntryLink()}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const timeoutMs=Math.max(1000,Math.min(180000,Number(o.timeoutMs||45000)||45000));delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
@@ -27035,10 +28313,12 @@ function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==
 function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='code')return'⌘';return'📄'}
 function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(kids.length)} item(s)</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
 function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=`nodes=${Number(st.nodeCount||0)}${st.inflight?' · loading...':''}`;const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">tree truncated at ${esc(Number(st.maxNodes||0))} nodes</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
+function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>`<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div></div>`).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
 function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | mode=${S.snap?.execution_mode||S.config?.execution_mode||'sync'} | active_agent=${S.snap?.agent_active_role||'-'} | bb=${S.snap?.blackboard?.status||'-'} | task=${S.snap?.blackboard?.task_profile?.task_type||'-'} | complexity=${S.snap?.blackboard?.task_profile?.complexity||'-'} | judgement=${S.snap?.blackboard?.manager_judgement?.progress||'-'} | budget=${S.snap?.blackboard?.task_profile?.round_budget??'-'} | remaining=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'} | bb_cycles=${S.snap?.blackboard?.manager_cycles??'-'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
+const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
 _renderBridgeSyncFromSnapshot(S.snap||{});
 setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]));
 setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
@@ -27055,8 +28335,7 @@ const tools=(S.tools||[]).slice(0,16).map(x=>`<div><span class=\"tag\">tool</spa
 setPanelHtml('catalog',protocols+providers+skills+tools||`<div class=\"mono\">${esc(t('no_catalog'))}</div>`);
 renderFileExplorer();
 refreshFileExplorer(false).catch(()=>{});
-const uploads=(S.snap?.uploads||[]).slice(-8).reverse();
-E('uploadList').innerHTML=uploads.map(u=>`<div>${esc(u.filename)} → ${esc(u.workspace_path||'')} (${esc(u.kind||'')}, ${esc(u.size||0)}B)</div>`).join('')||`<div>${esc(t('no_uploads'))}</div>`;
+renderUploadList();
 const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';
 const sessionMd=S.activeId?('/api/sessions/'+S.activeId+'/export.md'):'#';
 const sessionPdf=S.activeId?('/api/sessions/'+S.activeId+'/export.pdf'):'#';
@@ -27303,16 +28582,16 @@ async function createSession(){showError('');const title=prompt(t('session_title
 async function renameSession(){if(!S.activeId){showError(t('select_session_first'));return}const old=S.sessions.find(x=>x.id===S.activeId)?.title||t('session_default');const s=prompt(t('rename_session_prompt'),old);if(!s)return;await api('/api/sessions/'+S.activeId,{method:'PATCH',body:JSON.stringify({title:s})});await refreshSessions();await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
-async function importDefaultConfig(){try{if(!S.activeId){showError(t('select_session_first'));return}const ci=E('configInput');if(ci)ci.click()}catch(err){showError(err.message||String(err))}}
-async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
+async function importDefaultConfig(){try{if(!S.activeId){showError(t('select_session_first'));return}const res=await api('/api/sessions/'+S.activeId+'/config/import-default',{method:'POST'});if(res?.ok&&res?.catalog){showError('');const cat=res.catalog;if(applyModelCatalog(cat)){const modal=E('llmConfigModal');if(modal)modal.style.display='none';await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return}applyModelCatalog(cat)||renderModelControls();await refreshSnapshot({forceFull:true,allowWhenFrozen:true});const modal=E('llmConfigModal');if(modal)modal.style.display='none';return}const ci=E('configInput');if(ci)ci.click()}catch(err){const ci=E('configInput');if(ci)ci.click()}}
+async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
-async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('uploadDrop');const fileInput=E('uploadInput');if(drop&&fileInput){drop.onclick=()=>fileInput.click();fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');uploadFiles(e.dataTransfer?.files||[]).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('importConfigBtn',importDefaultConfig);bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('compactBtn',compactNow);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('refreshBtn',()=>refreshAll(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});document.addEventListener('click',()=>{exportMenu.style.display='none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);bindClick('llmConfigImport',importDefaultConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -27809,6 +29088,7 @@ class AppContext:
         self.web_ui_external_enabled = False
         self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
         self.web_ui_assets_override: dict[str, str] = {}
+        self.show_upload_list = False
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -27915,6 +29195,7 @@ class AppContext:
             "external_enabled": bool(self.web_ui_external_enabled),
             "config_path": str(self.web_ui_config_path or ""),
             "dir": str(self.web_ui_dir),
+            "show_upload_list": bool(getattr(self, "show_upload_list", False)),
             "validation": dict(self.web_ui_validation or {}),
         }
 
@@ -27926,9 +29207,12 @@ class AppContext:
         enable_external: bool = False,
         export_builtin: bool = False,
         export_overwrite: bool = False,
+        show_upload_list: bool | None = None,
     ) -> dict:
         self.web_ui_config_path = str(config_path or self.web_ui_config_path or "")
         self.web_ui_dir = resolve_web_ui_dir_path(str(ui_dir or DEFAULT_WEB_UI_DIR), self.workspace)
+        if show_upload_list is not None:
+            self.show_upload_list = bool(show_upload_list)
         export_result: dict = {}
         if export_builtin:
             export_result = self.export_builtin_web_ui(self.web_ui_dir, overwrite=bool(export_overwrite))
@@ -29275,6 +30559,7 @@ class Handler(BaseHTTPRequestHandler):
                     "skills_port": skills_port,
                     "skills_ui_enabled": skills_enabled,
                     "skills_ui_url": skills_url,
+                    "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
                     "web_ui_mode": str(web_ui_state.get("mode", "builtin")),
                     "web_ui_external_enabled": bool(web_ui_state.get("external_enabled", False)),
@@ -29301,6 +30586,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(mgr.model_catalog(force_probe=refresh_probe))
         if path == "/api/tools":
             return self._send_json(self.app.tools_catalog())
+        if path == "/api/ollama/models":
+            ollama_url = str((query.get("base_url", [""]) or [""])[0]).strip() or "http://127.0.0.1:11434"
+            try:
+                models = list_ollama_models(ollama_url, timeout=5)
+                return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
+            except Exception as exc:
+                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
         if path == "/api/skills":
             return self._send_json(self.app.skills_catalog())
         if path == "/api/skills/providers":
@@ -29647,6 +30939,27 @@ class Handler(BaseHTTPRequestHandler):
                 pref = "auto"
             sess.plan_mode_user_preference = pref
             return self._send_json({"plan_mode": pref})
+        m = re.match(r"^/api/sessions/([^/]+)/config/task-level$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+            except Exception:
+                body = {}
+            level = int(body.get("level", 0) or 0)
+            if level not in (0, *TASK_LEVEL_CHOICES):
+                level = 0
+            with sess.lock:
+                sess.user_task_level_override = level
+                if level > 0:
+                    sess.runtime_task_level = level
+                    policy = TASK_LEVEL_POLICIES.get(level, {})
+                    sess.runtime_round_budget = int(policy.get("round_budget", 0) or 0)
+                    sess.runtime_task_complexity = str(policy.get("complexity", "simple"))
+                    sess.runtime_scale_preference = "thorough" if level >= 4 else "balanced"
+            return self._send_json({"task_level": level})
         return self._send_json({"error": "not found"}, status=404)
 
     def do_PATCH(self):
@@ -29813,6 +31126,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
                     "supported_languages": supported_ui_languages_payload(),
+                    "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
                 }
             )
@@ -30143,6 +31457,7 @@ def main():
             default=False,
         )
     )
+    resolved_show_upload_list = False
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -30163,10 +31478,16 @@ def main():
                 if external_default_provider == "ollama":
                     bootstrap_base_url = str(ext_active.get("base_url", bootstrap_base_url) or bootstrap_base_url)
                     bootstrap_model = str(ext_active.get("model", bootstrap_model) or bootstrap_model)
+            external_show_upload_list = extract_show_upload_list_setting(external_config)
+            if external_show_upload_list is not None:
+                resolved_show_upload_list = bool(external_show_upload_list)
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
             sys.exit(2)
+    web_ui_show_upload_list = extract_show_upload_list_setting(web_ui_config)
+    if web_ui_show_upload_list is not None:
+        resolved_show_upload_list = bool(web_ui_show_upload_list)
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
@@ -30387,6 +31708,7 @@ def main():
         enable_external=resolved_use_external_web_ui,
         export_builtin=resolved_export_web_ui,
         export_overwrite=resolved_export_web_ui_force,
+        show_upload_list=resolved_show_upload_list,
     )
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
     setattr(app, "agent_port", int(args.port))
@@ -30421,6 +31743,7 @@ def main():
     print(f"[web-agent] skills_root={skills_root}")
     print(f"[web-agent] web_ui_config={web_ui_config_path}")
     print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
+    print(f"[web-agent] show_upload_list={'on' if resolved_show_upload_list else 'off'}")
     print(
         "[web-agent] web_ui_mode="
         f"{web_ui_state.get('mode', 'builtin')} "
