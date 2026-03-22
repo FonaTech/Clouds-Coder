@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import ast
 import base64
-from collections import deque
+from collections import Counter, defaultdict, deque
 import csv
 import difflib
 import errno
@@ -12,6 +13,8 @@ import hmac
 import io
 import importlib.util
 import json
+import math
+import multiprocessing
 import mimetypes
 import os
 import queue
@@ -43,11 +46,99 @@ except Exception:
 APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
-WORKDIR = Path(os.getenv("AGENT_WORKDIR", os.getcwd())).resolve()
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _resolve_default_agent_workdir() -> Path:
+    raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return SCRIPT_DIR
+
+def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
+    root = Path(workspace).resolve()
+    legacy_root = (root / "skills").resolve()
+    moved: list[str] = []
+    errors: list[str] = []
+    if legacy_root == root or (not legacy_root.exists()) or (not legacy_root.is_dir()):
+        return {
+            "root": str(root),
+            "legacy_root": str(legacy_root),
+            "moved": moved,
+            "errors": errors,
+        }
+    # Earlier builds could incorrectly place runtime data under workspace/skills when started from that cwd.
+    for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
+        src = legacy_root / name
+        dst = root / name
+        try:
+            if (not src.exists()) or dst.exists():
+                continue
+            shutil.move(str(src), str(dst))
+            moved.append(name)
+        except Exception as exc:
+            errors.append(f"{name}:{trim(str(exc), 220)}")
+    return {
+        "root": str(root),
+        "legacy_root": str(legacy_root),
+        "moved": moved,
+        "errors": errors,
+    }
+
+WORKDIR = _resolve_default_agent_workdir()
 CODES_ROOT = WORKDIR / "Codes"
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 MAX_TOOL_OUTPUT = 50_000
+LONG_OUTPUT_MODEL_PAGE_CHARS = 12_000
+LONG_OUTPUT_UI_PAGE_CHARS = 2_400
+LONG_OUTPUT_UI_PREVIEW_MAX_PAGES = 4
+LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
+LONG_OUTPUT_READ_PAGE_LINES = 240
+LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
+LONG_OUTPUT_TEMP_MAX_FILES = 160
+JSON_FSYNC_ENABLED = str(os.getenv("AGENT_JSON_FSYNC", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+RAG_LIBRARY_DIRNAME = "RAG_Library"
+RAG_ADMIN_PORT_OFFSET = 2
+CODE_LIBRARY_DIRNAME = "Code_Library"
+CODE_ADMIN_PORT_OFFSET = 3
+RAG_CHUNK_CHARS = 1200
+RAG_CHUNK_OVERLAP = 180
+RAG_MAX_CHUNKS_PER_DOC = 200
+CODE_CHUNK_CHARS = 1800
+CODE_CHUNK_OVERLAP = 120
+CODE_MAX_CHUNKS_PER_DOC = 260
+RAG_MAX_QUERY_RESULTS = 12
+RAG_GRAPH_MAX_NODES = 0
+RAG_TASK_HISTORY_LIMIT = 400
+RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
+RAG_MAX_IMPORT_FILES = 20_000
+RAG_MAX_IMPORT_BATCH_ITEMS = 500
+RAG_MAX_IMPORT_BATCH_BYTES = 48 * 1024 * 1024
+RAG_PDF_IMAGE_LIMIT = 8
+RAG_QUERY_CONTEXT_CHARS = 1600
+RAG_MAX_GLOBAL_COMMUNITIES = 5
+RAG_MAX_COMMUNITY_MAP_SUPPORT = 4
+RAG_DYNAMIC_NOISE_MIN_DOC_FREQ = 6
+RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ = 2
+RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO = 0.18
+RAG_DYNAMIC_NOISE_HARD_DOC_RATIO = 0.42
+RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
+RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
+RAG_IMPORT_WORKER_COUNT = max(
+    1,
+    min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
+)
+CODE_IMPORT_WORKER_COUNT = max(
+    1,
+    min(4, int(str(os.getenv("AGENT_CODE_IMPORT_WORKERS", str(RAG_IMPORT_WORKER_COUNT)) or str(RAG_IMPORT_WORKER_COUNT)))),
+)
+RAG_PARSE_TIMEOUT_SECONDS = max(
+    15,
+    min(240, int(str(os.getenv("AGENT_RAG_PARSE_TIMEOUT", "75") or "75"))),
+)
+CODE_PARSE_TIMEOUT_SECONDS = max(
+    10,
+    min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
+)
 TOKEN_THRESHOLD = 1_000_000
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
@@ -2528,6 +2619,12 @@ class CryptoBox:
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.key_file = self.codes_root / ".encryption_key"
         self.key = self._load_or_create_key()
+        self.json_fsync_enabled = str(os.getenv("AGENT_JSON_FSYNC", "") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _load_or_create_key(self) -> bytes:
         if self.key_file.exists():
@@ -2576,6 +2673,14 @@ class CryptoBox:
         pt = self._stream_xor(ct, nonce)
         return pt.decode("utf-8")
 
+    def _fsync_json_file(self, fileobj) -> None:
+        if not self.json_fsync_enabled:
+            return
+        try:
+            os.fsync(fileobj.fileno())
+        except Exception:
+            pass
+
     def write_json(self, path: Path, obj: object):
         path.parent.mkdir(parents=True, exist_ok=True)
         enc = self.encrypt_text(json_dumps(obj, indent=2))
@@ -2585,7 +2690,7 @@ class CryptoBox:
             with tmp.open("w", encoding="utf-8") as f:
                 f.write(enc)
                 f.flush()
-                os.fsync(f.fileno())
+                self._fsync_json_file(f)
             if path.exists():
                 try:
                     os.replace(path, bak)
@@ -2809,6 +2914,64 @@ def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
         return path.read_text(encoding="utf-8")
     except Exception:
         return None
+
+def _json_default_copy(default: object) -> object:
+    if isinstance(default, dict):
+        return dict(default)
+    if isinstance(default, list):
+        return list(default)
+    return default
+
+def _read_json_file(path: Path, default: object) -> object:
+    bak = path.with_name(f"{path.name}.bak")
+    expected_dict = isinstance(default, dict)
+    expected_list = isinstance(default, list)
+    for fp in (path, bak):
+        if not fp.exists() or (not fp.is_file()):
+            continue
+        try:
+            raw = fp.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if expected_dict and not isinstance(obj, dict):
+            continue
+        if expected_list and not isinstance(obj, list):
+            continue
+        return obj
+    return _json_default_copy(default)
+
+def _write_json_file(path: Path, obj: object):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bak = path.with_name(f"{path.name}.bak")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(json_dumps(obj, indent=2))
+            f.flush()
+            if JSON_FSYNC_ENABLED:
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+        if path.exists():
+            try:
+                os.replace(path, bak)
+            except Exception:
+                try:
+                    shutil.copy2(path, bak)
+                except Exception:
+                    pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -4921,6 +5084,481 @@ if __name__ == "__main__":
         ),
     )
 
+def ensure_generated_research_scientific_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+    research_root = generated_root / "research-orchestrator-pro"
+    scientific_root = generated_root / "scientific-reasoning-lab"
+
+    research_skill = """---
+name: research-orchestrator-pro
+aliases:
+  - research
+  - research-pro
+  - literature-lab
+triggers:
+  - research
+  - literature review
+  - survey
+  - experiment design
+  - uploaded pdf
+  - uploaded data
+  - scientific report
+  - 科研
+  - 综述
+  - 实验设计
+  - 数据分析
+entrypoints:
+  - references/workflow.md
+  - references/report-interfaces.md
+  - references/experiment-design.md
+  - scripts/render_research_bundle.py
+attachments:
+  - references/*.md
+  - scripts/*.py
+clouds_coder:
+  preferred_tools:
+    - read_file
+    - bash
+    - load_skill
+    - TodoWrite
+    - write_file
+  runtime_contract: |
+    - Treat this as the authoritative research workflow for Clouds_Coder.
+    - Enter this skill chain concretely by reading `references/workflow.md` first.
+    - Route uploaded files early: PDFs -> `pdf-vision-literature-integrator` or `upload-office-parser`; spreadsheets -> `upload-tabular-parser` or `xlsx`.
+    - Maintain workspace-local research artifacts: question, evidence table, experiment ledger, and report bundle.
+    - If the final deliverable includes `.docx`, `.xlsx`, `.pdf`, `.pptx`, or `.ppt`, immediately load the matching output skill and hand off through `references/report-interfaces.md`.
+    - Keep generated files in the current workspace, never inside `/skills`.
+description: Professional research orchestration for uploaded PDFs and data, evidence synthesis, experiment planning, and handoff into docx/xlsx/pdf/pptx/ppt report pipelines.
+---
+
+# Research Orchestrator Pro
+
+Use this skill for serious research workflows inside Clouds_Coder, especially when the task mixes uploaded literature, uploaded tables, experiment design, and multi-format report delivery.
+
+## Mandatory Flow
+1. Read `references/workflow.md`.
+2. Build a concrete todo chain.
+3. Parse uploaded sources and classify them into literature / tabular / notes / output requirements.
+4. Build an evidence table before drafting conclusions.
+5. If experiments are requested, read `references/experiment-design.md` and create an explicit experiment ledger.
+6. If report files are requested, read `references/report-interfaces.md` and hand off to the correct document skill.
+
+## Minimum Artifact Set
+Keep these workspace artifacts unless the user already defined an equivalent structure:
+- `research/question.md`
+- `research/evidence_table.csv`
+- `research/analysis.md`
+- `research/report_bundle.json`
+
+## Quality Bar
+- Every important claim needs traceable evidence.
+- Distinguish verified facts, inferred conclusions, and open questions.
+- Never jump straight from raw uploads to polished reports without an intermediate evidence structure.
+"""
+
+    research_workflow = """# Workflow
+
+## 1. Intake and routing
+- Identify the research question, constraints, deliverables, and deadline pressure.
+- Detect which source lanes exist:
+  - uploaded PDF / paper / literature
+  - uploaded CSV / XLS / XLSX
+  - uploaded DOCX / PPTX
+  - raw notes or conversation-only requirements
+  - requested report outputs (`docx`, `xlsx`, `pdf`, `pptx`, `ppt`)
+
+## 2. Mandatory skill coupling
+- If PDFs matter, load `pdf-vision-literature-integrator` for text-plus-figure evidence when available.
+- If Office uploads matter, load `upload-office-parser`.
+- If spreadsheets matter, load `upload-tabular-parser` and usually `xlsx`.
+- If output files are required, load the matching delivery skill before final artifact generation.
+
+## 3. Workspace artifact discipline
+Create or maintain:
+- `research/question.md` for scope and assumptions
+- `research/evidence_table.csv` with `claim,evidence,source,confidence,caveat`
+- `research/analysis.md` for synthesis
+- `research/report_bundle.json` for downstream handoff into report skills
+
+## 4. Evidence synthesis
+- Merge textual evidence, extracted tables, and visual figure notes when available.
+- Keep a separation between direct evidence and your own inference.
+- Record unresolved contradictions explicitly.
+
+## 5. Report handoff
+- Use `references/report-interfaces.md` to prepare the bundle.
+- Pass report generation to `docx`, `xlsx`, `pdf`, `pptx`, or `ppt` instead of ad hoc file writing.
+"""
+
+    research_interfaces = """# Report Interfaces
+
+Downstream report skills should receive a workspace-local `research/report_bundle.json` with a structure like:
+
+```json
+{
+  "title": "Project title",
+  "language": "zh-CN",
+  "question": "Core research question",
+  "deliverables": ["docx", "pdf", "pptx"],
+  "audience": "technical leadership",
+  "summary_points": ["..."],
+  "evidence_rows": [
+    {
+      "claim": "...",
+      "evidence": "...",
+      "source": "...",
+      "confidence": "high",
+      "caveat": "..."
+    }
+  ],
+  "experiment_plan": {
+    "hypothesis": "...",
+    "variables": ["..."],
+    "controls": ["..."],
+    "measurements": ["..."],
+    "success_criteria": ["..."]
+  }
+}
+```
+
+## Handoff rules
+- `docx`: narrative report, proposal, memo, technical brief
+- `xlsx`: evidence tables, experiment tables, source registries, metrics sheets
+- `pdf`: publication-style report, paper-like summary, printable deliverable
+- `pptx` / `ppt`: presentation-ready summary for leadership, defense, or lecture
+
+Prepare the bundle first, then load the matching output skill and let that skill own file production.
+"""
+
+    research_experiment = """# Experiment Design
+
+When the task asks for experiment design or validation planning, produce an explicit ledger with:
+- hypothesis
+- primary objective
+- independent variables
+- dependent variables
+- controls / baseline
+- confounders
+- required datasets or instruments
+- evaluation metrics
+- success criteria
+- failure conditions
+- next-step decisions
+
+Do not hide unknowns. If a variable or dataset is missing, write it down as a blocker or assumption.
+"""
+
+    research_script = r"""#!/usr/bin/env python3
+import argparse
+import csv
+import json
+from pathlib import Path
+
+
+def _normalize_rows(rows):
+    out = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            out.append(
+                {
+                    "claim": str(row.get("claim", "")).strip(),
+                    "evidence": str(row.get("evidence", "")).strip(),
+                    "source": str(row.get("source", "")).strip(),
+                    "confidence": str(row.get("confidence", "")).strip(),
+                    "caveat": str(row.get("caveat", "")).strip(),
+                }
+            )
+    return out
+
+
+def _write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _render_summary(payload: dict) -> str:
+    lines = [f"# {str(payload.get('title') or 'Research Summary').strip()}", ""]
+    question = str(payload.get("question") or "").strip()
+    if question:
+        lines.extend(["## Research Question", question, ""])
+    summary_points = payload.get("summary_points") if isinstance(payload.get("summary_points"), list) else []
+    lines.append("## Summary")
+    if summary_points:
+        lines.extend(f"- {str(item).strip()}" for item in summary_points if str(item).strip())
+    else:
+        lines.append("- (pending)")
+    lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_experiment(payload: dict) -> str:
+    plan = payload.get("experiment_plan")
+    if not isinstance(plan, dict):
+        return "# Experiment Plan\n\n- (pending)\n"
+    lines = ["# Experiment Plan", ""]
+    for key in (
+        "hypothesis",
+        "objective",
+        "variables",
+        "controls",
+        "measurements",
+        "success_criteria",
+        "failure_conditions",
+    ):
+        value = plan.get(key)
+        lines.append(f"## {key}")
+        if isinstance(value, list):
+            lines.extend(f"- {str(item).strip()}" for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+            lines.append(text or "- (pending)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render a workspace-local research bundle from JSON input.")
+    parser.add_argument("--input", required=True, help="Input JSON file")
+    parser.add_argument("--outdir", required=True, help="Output directory")
+    args = parser.parse_args()
+
+    src = Path(args.input).expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"input not found: {src}")
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("input JSON must be an object")
+
+    rows = _normalize_rows(payload.get("evidence_rows"))
+    _write_text(outdir / "summary.md", _render_summary(payload))
+    _write_text(outdir / "experiment_plan.md", _render_experiment(payload))
+
+    csv_path = outdir / "evidence_table.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["claim", "evidence", "source", "confidence", "caveat"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    bundle = {
+        "title": str(payload.get("title") or "Research Bundle").strip(),
+        "language": str(payload.get("language") or "").strip(),
+        "question": str(payload.get("question") or "").strip(),
+        "deliverables": payload.get("deliverables") if isinstance(payload.get("deliverables"), list) else [],
+        "summary_md": str((outdir / "summary.md").name),
+        "evidence_csv": str(csv_path.name),
+        "experiment_md": str((outdir / "experiment_plan.md").name),
+    }
+    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
+    print(str(outdir))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    scientific_skill = """---
+name: scientific-reasoning-lab
+aliases:
+  - scientific
+  - theorem-lab
+  - deep-science
+triggers:
+  - scientific reasoning
+  - theorem
+  - proof
+  - derivation
+  - formula
+  - mechanism
+  - 数学推导
+  - 理论基础
+  - 科学推理
+  - 深度思考
+entrypoints:
+  - references/proof-ledger.md
+  - references/review-loop.md
+  - references/autoresearch-patterns.md
+  - scripts/build_reasoning_packet.py
+attachments:
+  - references/*.md
+  - scripts/*.py
+clouds_coder:
+  preferred_tools:
+    - read_file
+    - bash
+    - ask_colleague
+    - TodoWrite
+    - load_skill
+  runtime_contract: |
+    - Use this skill for mathematical derivation, theoretical analysis, mechanistic modeling, and deep scientific reasoning.
+    - Enter this skill chain concretely by reading `references/proof-ledger.md` first.
+    - Keep reasoning explicit: assumptions, symbols, derivations, counterexamples, falsification tests, and open questions.
+    - For non-trivial conclusions, request at least one colleague audit via `ask_colleague` or the manager/reviewer path.
+    - Do not present speculative theory as established fact.
+    - If the final answer must become a document or slide deck, hand off the stabilized reasoning packet into `research-orchestrator-pro`, `docx`, `pdf`, or `pptx`.
+description: Deep scientific reasoning workflow for derivations, theory exploration, mechanistic models, conjecture testing, and multi-agent audit inspired by autonomous research loops.
+---
+
+# Scientific Reasoning Lab
+
+Use this skill when the task is not just "write a report" but actually requires theory building, proof structure, derivation, mechanism exploration, or rigorous scientific argumentation.
+
+## Mandatory Flow
+1. Read `references/proof-ledger.md`.
+2. Formalize the problem: notation, assumptions, objective, known constraints.
+3. Produce a derivation or theory path with explicit intermediate steps.
+4. Run a counterexample / falsification pass.
+5. Read `references/review-loop.md` and trigger an audit if the result matters.
+6. Package the stable reasoning into a reusable reasoning packet.
+
+## Output Contract
+- Separate:
+  - proven / derived results
+  - plausible but unverified conjectures
+  - external facts that still need retrieval validation
+- Keep an `open questions` section instead of hiding uncertainty.
+"""
+
+    scientific_ledger = """# Proof Ledger
+
+Always build a ledger with these sections:
+- problem statement
+- notation and symbols
+- assumptions
+- known facts / imported results
+- derivation steps
+- edge cases
+- possible counterexamples
+- falsification tests
+- final claim status: proven / plausible / rejected / unresolved
+
+If a step is hand-wavy, mark it as a gap instead of pretending it is proven.
+"""
+
+    scientific_review = """# Review Loop
+
+For important results, request an explicit audit from another agent or role after the first derivation pass.
+
+## Audit focus
+- hidden assumptions
+- algebra / calculus mistakes
+- missing edge cases
+- confusing notation
+- unsupported causal leap
+- external fact that still needs retrieval
+
+Do not ask for a generic review. Ask for a targeted audit with the exact conjecture or derivation under scrutiny.
+"""
+
+    scientific_autoresearch = """# Autoresearch Patterns
+
+Use these high-level patterns inspired by autonomous research systems such as `karpathy/autoresearch`:
+- maintain an agenda of open questions instead of one monolithic thought dump
+- alternate between proposing an explanation and criticizing it
+- convert uncertainty into explicit experiments or falsification tests
+- archive intermediate artifacts so later report-generation skills receive a clean packet
+- treat "unknown" as a first-class outcome, not as failure
+
+This reference is for workflow inspiration, not for copying any external implementation.
+"""
+
+    scientific_script = r"""#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+
+def _render_list(items):
+    rows = [str(item).strip() for item in (items or []) if str(item).strip()]
+    return rows or ["(pending)"]
+
+
+def render_packet(payload: dict) -> str:
+    title = str(payload.get("title") or "Scientific Reasoning Packet").strip()
+    lines = [f"# {title}", ""]
+    mapping = [
+        ("Problem", payload.get("problem")),
+        ("Assumptions", _render_list(payload.get("assumptions"))),
+        ("Definitions", _render_list(payload.get("definitions"))),
+        ("Derivations", _render_list(payload.get("derivations"))),
+        ("Counterexamples", _render_list(payload.get("counterexamples"))),
+        ("Falsification Tests", _render_list(payload.get("falsification_tests"))),
+        ("Open Questions", _render_list(payload.get("open_questions"))),
+        ("Audit Requests", _render_list(payload.get("audit_requests"))),
+    ]
+    for heading, value in mapping:
+        lines.append(f"## {heading}")
+        if isinstance(value, list):
+            lines.extend(f"- {item}" for item in value)
+        else:
+            text = str(value or "").strip()
+            lines.append(text or "(pending)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a scientific reasoning packet from JSON input.")
+    parser.add_argument("--input", required=True, help="Input JSON file")
+    parser.add_argument("--output", required=True, help="Output markdown file")
+    args = parser.parse_args()
+
+    src = Path(args.input).expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"input not found: {src}")
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("input JSON must be an object")
+
+    out = Path(args.output).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_packet(payload), encoding="utf-8")
+    print(str(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    _write_text_if_changed(research_root / "SKILL.md", research_skill)
+    _write_text_if_changed(research_root / "references" / "workflow.md", research_workflow)
+    _write_text_if_changed(research_root / "references" / "report-interfaces.md", research_interfaces)
+    _write_text_if_changed(research_root / "references" / "experiment-design.md", research_experiment)
+    _write_text_if_changed(research_root / "scripts" / "render_research_bundle.py", research_script)
+
+    _write_text_if_changed(scientific_root / "SKILL.md", scientific_skill)
+    _write_text_if_changed(scientific_root / "references" / "proof-ledger.md", scientific_ledger)
+    _write_text_if_changed(scientific_root / "references" / "review-loop.md", scientific_review)
+    _write_text_if_changed(scientific_root / "references" / "autoresearch-patterns.md", scientific_autoresearch)
+    _write_text_if_changed(scientific_root / "scripts" / "build_reasoning_packet.py", scientific_script)
+
+    _write_text_if_changed(
+        generated_root / "research-science-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": [
+                    "research-orchestrator-pro",
+                    "scientific-reasoning-lab",
+                ],
+                "focus": [
+                    "uploaded_pdf_and_data_research",
+                    "experiment_design",
+                    "report_bundle_handoff",
+                    "scientific_derivation",
+                    "multi_agent_audit",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
 def ensure_generated_runtime_skills_manifest(skills_root: Path):
     generated_root = skills_root / "generated"
     tracked = [
@@ -4934,6 +5572,10 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/retrieval-synthesis-fallback/SKILL.md",
         "generated/pdf-vision-literature-integrator/SKILL.md",
         "generated/deep-research-orchestrator/scripts/render_deep_research_report.py",
+        "generated/research-orchestrator-pro/SKILL.md",
+        "generated/research-orchestrator-pro/scripts/render_research_bundle.py",
+        "generated/scientific-reasoning-lab/SKILL.md",
+        "generated/scientific-reasoning-lab/scripts/build_reasoning_packet.py",
         "generated/html-report-engineering/SKILL.md",
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
@@ -5245,6 +5887,7 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_execution_recovery_skill(skills_root)
     ensure_generated_html_frontend_report_skills(skills_root)
     ensure_generated_deep_research_skills(skills_root)
+    ensure_generated_research_scientific_skills(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -7712,7 +8355,12 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
 
 TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
-    tool_def("read_file", "Read file content.", {"path": {"type": "string"}, "limit": {"type": "integer"}}, ["path"]),
+    tool_def(
+        "read_file",
+        "Read file content with optional line pagination.",
+        {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+        ["path"],
+    ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     tool_def("edit_file", "Edit a file by replacing first match.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
     tool_def("TodoWrite", "Update todo list.", {"items": {"type": "array", "items": {"type": "object"}}}, ["items"]),
@@ -7763,6 +8411,28 @@ TOOLS = [
             "max_messages": {"type": "integer"},
             "offset": {"type": "integer"},
             "include_tools": {"type": "boolean"},
+        },
+    ),
+    tool_def(
+        "query_code_library",
+        "Query the independent code library for repo/file/symbol references before implementing or reviewing code.",
+        {
+            "query": {"type": "string"},
+            "top_k": {"type": "integer"},
+            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "language": {"type": "string"},
+        },
+        ["query"],
+    ),
+    tool_def(
+        "query_knowledge_library",
+        "Read current global knowledge-library status or query the TF-Graph_IDF RAG library for grounded document references.",
+        {
+            "query": {"type": "string"},
+            "top_k": {"type": "integer"},
+            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "category": {"type": "string"},
+            "kind": {"type": "string"},
         },
     ),
     tool_def(
@@ -7915,6 +8585,8 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "read_from_blackboard",
         "write_to_blackboard",
         "compress",
+        "query_code_library",
+        "query_knowledge_library",
     },
     "developer": {str(name) for name in TOOL_SPEC_BY_NAME.keys()},
     "reviewer": {
@@ -7933,6 +8605,8 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "read_from_blackboard",
         "write_to_blackboard",
         "compress",
+        "query_code_library",
+        "query_knowledge_library",
     },
 }
 
@@ -7964,7 +8638,15 @@ class SessionState:
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
+        upload_callback=None,
         run_finished_callback=None,
+        reference_prepare_callback=None,
+        query_code_library_callback=None,
+        query_knowledge_library_callback=None,
+        code_library_root: Path | str | None = None,
+        code_library_status_callback=None,
+        knowledge_library_root: Path | str | None = None,
+        knowledge_library_status_callback=None,
     ):
         self.id = session_id
         self.title = title
@@ -7980,6 +8662,8 @@ class SessionState:
         self.context_archive_dir.mkdir(parents=True, exist_ok=True)
         self.code_preview_dir = self.root / "code_preview"
         self.code_preview_dir.mkdir(parents=True, exist_ok=True)
+        self.long_output_dir = self.files_root / ".clouds_coder" / "long_output"
+        self.long_output_dir.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.root / "meta.json"
         self.state_path = self.root / "state.json"
         self.crypto = crypto
@@ -7987,7 +8671,25 @@ class SessionState:
         # Use re-entrant lock to avoid self-deadlock.
         self.lock = threading.RLock()
         self.owner_user_id = str(owner_user_id or "")
+        self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
+        self.reference_prepare_callback = reference_prepare_callback
+        self.query_code_library_callback = query_code_library_callback
+        self.query_knowledge_library_callback = query_knowledge_library_callback
+        try:
+            self.code_library_root = (
+                str(Path(code_library_root).resolve()) if code_library_root else ""
+            )
+        except Exception:
+            self.code_library_root = str(code_library_root or "").strip()
+        self.code_library_status_callback = code_library_status_callback
+        try:
+            self.knowledge_library_root = (
+                str(Path(knowledge_library_root).resolve()) if knowledge_library_root else ""
+            )
+        except Exception:
+            self.knowledge_library_root = str(knowledge_library_root or "").strip()
+        self.knowledge_library_status_callback = knowledge_library_status_callback
         self.events = EventHub()
         self.ollama = OllamaClient(ollama_base, model)
         self.auto_model_switch = bool(auto_model_switch)
@@ -8028,6 +8730,8 @@ class SessionState:
         self.operations: list[dict] = []
         self.code_preview_index: dict[str, list[dict]] = {}
         self.uploads: list[dict] = []
+        self.runtime_code_reference_text = ""
+        self.runtime_code_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
         self.cancel_requested = False
@@ -9449,6 +10153,8 @@ class SessionState:
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
         self.runtime_plan_mode_needed = False
+        self.runtime_code_reference_text = ""
+        self.runtime_code_reference_meta = {}
         return removed_hints
 
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
@@ -9736,7 +10442,7 @@ class SessionState:
         if prev_fp and self.skills.fingerprint and prev_fp != self.skills.fingerprint:
             self.skill_load_cache = {}
 
-    def _load_skill_with_cache(self, name: str) -> str:
+    def _load_skill_with_cache(self, name: str, load_source: str = "manual") -> str:
         self._ensure_skills_ready(force=False)
         key, err = self.skills._resolve_name(name)
         if err or not key:
@@ -9749,7 +10455,7 @@ class SessionState:
             if body_z and cached_fp and cached_fp == fp:
                 restored = decompress_text_blob(body_z)
                 if restored:
-                    self._broadcast_loaded_skill(key, restored)
+                    self._broadcast_loaded_skill(key, restored, load_source=load_source)
                     return restored
         text = self.skills.load(name)
         if text and not str(text).startswith("Error:"):
@@ -9761,41 +10467,165 @@ class SessionState:
             self._prune_skill_load_cache()
             self.updated_at = now_ts()
             self._persist()
-            self._broadcast_loaded_skill(key, text)
+            self._broadcast_loaded_skill(key, text, load_source=load_source)
         return text
 
-    def _broadcast_loaded_skill(self, skill_key: str, skill_text: str):
-        """Broadcast a loaded skill to blackboard and all agent contexts."""
+    def _build_skill_focus_tokens(
+        self,
+        skill_key: str,
+        *,
+        skill_name: str = "",
+        aliases: list[str] | None = None,
+        triggers: list[str] | None = None,
+        skill_dir_rel: str = "",
+    ) -> list[str]:
+        generic_low_signal = {
+            "skill",
+            "skills",
+            "document",
+            "documents",
+            "word",
+            "report",
+            "paper",
+            "presentation",
+            "presentations",
+            "slide",
+            "slides",
+            "deck",
+            "analysis",
+            "data",
+        }
+        raw_items: list[str] = []
+        raw_items.extend(
+            [
+                str(skill_name or "").strip(),
+                str(skill_key or "").strip(),
+                str(PurePosixPath(str(skill_dir_rel or "")).name).strip(),
+            ]
+        )
+        if isinstance(aliases, list):
+            raw_items.extend(str(x).strip() for x in aliases)
+        if isinstance(triggers, list):
+            raw_items.extend(str(x).strip() for x in triggers)
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in raw_items:
+            token = re.sub(r"\s+", " ", str(item or "").strip().lower()).strip()
+            if not token:
+                continue
+            if ":" in token:
+                token = token.split(":", 1)[-1].strip()
+            token = token.replace("_", " ").replace("-", " ")
+            token = re.sub(r"\s+", " ", token).strip()
+            if not token or token in seen or token in generic_low_signal:
+                continue
+            if token.isascii() and len(token) < 3:
+                continue
+            seen.add(token)
+            out.append(token)
+        return out
+
+    def _broadcast_loaded_skill(self, skill_key: str, skill_text: str, *, load_source: str = "manual"):
+        """Broadcast a loaded skill to blackboard, global single-agent context, and agent contexts."""
         # 1. Write skill reference to blackboard so all agents are aware
         bb = self._ensure_blackboard()
         loaded_skills = bb.get("loaded_skills", {})
         if not isinstance(loaded_skills, dict):
             loaded_skills = {}
+        skill_row = self.skills.skills.get(skill_key, {}) if isinstance(getattr(self.skills, "skills", {}), dict) else {}
+        meta = skill_row.get("meta", {}) if isinstance(skill_row.get("meta"), dict) else {}
+        skill_name = str(skill_row.get("name", skill_key) or skill_key).strip() or skill_key
+        skill_path = str(skill_row.get("skill_path", "") or "").strip()
+        skill_abs_path = str(skill_row.get("skill_abs_path", "") or "").strip()
+        aliases = self.skills._skill_aliases(meta)
+        triggers = self.skills._skill_triggers(meta)
+        runtime_contract = self.skills._skill_runtime_contract(meta)
+        attachments = skill_row.get("attachments", [])
+        if not isinstance(attachments, list):
+            attachments = []
+        entrypoints = self.skills._skill_entrypoints(meta)
+        entrypoint_rows: list[dict] = []
+        skill_dir_rel = ""
+        skill_dir_virtual = ""
+        try:
+            if skill_abs_path:
+                skill_dir_rel = (
+                    Path(skill_abs_path).resolve().parent.relative_to(self.skills.skills_root.resolve()).as_posix()
+                )
+                skill_dir_virtual = f"{SKILLS_VIRTUAL_PREFIX}/{skill_dir_rel}".replace("//", "/")
+        except Exception:
+            skill_dir_rel = ""
+            skill_dir_virtual = ""
+        for rel in entrypoints:
+            virtual_path = ""
+            if skill_abs_path:
+                try:
+                    base = Path(skill_abs_path).resolve().parent
+                    vp_rel = (base / rel).resolve().relative_to(self.skills.skills_root.resolve()).as_posix()
+                    virtual_path = f"{SKILLS_VIRTUAL_PREFIX}/{vp_rel}".replace("//", "/")
+                except Exception:
+                    virtual_path = ""
+            entrypoint_rows.append({"path": rel, "virtual_path": virtual_path})
+        existing_row = loaded_skills.get(skill_key, {}) if isinstance(loaded_skills.get(skill_key, {}), dict) else {}
         loaded_skills[skill_key] = {
             "loaded_at": now_ts(),
             "size": len(skill_text),
             "preview": trim(skill_text, 300),
+            "skill_name": skill_name,
+            "skill_path": skill_path,
+            "skill_dir_rel": skill_dir_rel,
+            "skill_dir_virtual": skill_dir_virtual,
+            "aliases": aliases,
+            "triggers": triggers,
+            "focus_tokens": self._build_skill_focus_tokens(
+                skill_key,
+                skill_name=skill_name,
+                aliases=aliases,
+                triggers=triggers,
+                skill_dir_rel=skill_dir_rel,
+            ),
+            "entrypoints": entrypoint_rows,
+            "runtime_contract": trim(runtime_contract, 2400),
+            "chain_required": bool(entrypoint_rows or attachments),
+            "chain_started": bool(existing_row.get("chain_started", False)),
+            "chain_started_at": float(existing_row.get("chain_started_at", 0.0) or 0.0),
+            "chain_evidence": list(existing_row.get("chain_evidence", []) or [])[-8:],
+            "last_chain_tool": str(existing_row.get("last_chain_tool", "") or "").strip(),
+            "last_chain_event": trim(str(existing_row.get("last_chain_event", "") or "").strip(), 240),
+            "load_source": trim(str(load_source or "").strip(), 80),
+            "focus_goal_sig": str(bb.get("loaded_skills_goal_sig", "") or ""),
+            "focus_goal_preview": trim(str(bb.get("loaded_skills_goal_preview", "") or ""), 240),
         }
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
         self._blackboard_touch()
-        # 2. Inject skill content into all agent contexts (not just the caller)
-        caller_role = str(self.active_agent_role or "").strip().lower()
+        # 2. Inject skill content into global context and all agent contexts
         inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
             f"A skill has been loaded. Follow its instructions precisely.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
-        for role in ("explorer", "developer", "reviewer"):
-            if role == caller_role:
-                continue  # caller already gets it as tool result
-            self._append_agent_context_message(role, {
+        self.messages.append(
+            {
                 "role": "user",
                 "content": inject_msg,
                 "ts": now_ts(),
-                "agent_role": role,
-            }, mirror_to_global=False)
+                "agent_role": "shared",
+            }
+        )
+        self.messages = self.messages[-400:]
+        self.agent_messages.append(
+            {
+                "role": "user",
+                "content": inject_msg,
+                "ts": now_ts(),
+                "agent_role": "shared",
+            }
+        )
+        am_limit = self._tier_agent_context_limits(self._context_compression_tier())["agent_messages"]
+        if len(self.agent_messages) > int(am_limit * 1.5):
+            self.agent_messages = self.agent_messages[-am_limit:]
         self._emit("status", {
             "summary": f"skill '{skill_key}' loaded and broadcast to all agents"
         })
@@ -9805,6 +10635,258 @@ class SessionState:
         if not goal:
             return ""
         return hashlib.sha1(goal.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _current_plan_step_row(self, board: dict | None = None) -> dict | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not isinstance(todos, list):
+            return None
+        for row in todos:
+            if isinstance(row, dict) and row.get("category") == "plan_step" and row.get("status") == "in_progress":
+                return row
+        return None
+
+    def _current_plan_step_text(self, board: dict | None = None) -> str:
+        row = self._current_plan_step_row(board)
+        return trim(str((row or {}).get("content", "") or "").strip(), 400)
+
+    def _current_execution_focus_text(self) -> str:
+        bb = self._ensure_blackboard()
+        parts: list[str] = []
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 1200)
+        if goal:
+            parts.append(goal)
+        step_text = self._current_plan_step_text(bb)
+        if step_text:
+            parts.append(f"Current plan step: {step_text}")
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        objective = trim(str(profile.get("direct_objective", "") or "").strip(), 600)
+        if objective:
+            parts.append(f"Direct objective: {objective}")
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = trim(str(plan.get("phase", "") or "").strip(), 60)
+        if plan_phase:
+            parts.append(f"Plan phase: {plan_phase}")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in parts:
+            norm = re.sub(r"\s+", " ", str(item or "").strip()).strip()
+            if not norm:
+                continue
+            low = norm.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            deduped.append(norm)
+        return "\n".join(deduped)
+
+    def _refresh_loaded_skills_for_execution_focus(self, trigger: str = ""):
+        focus = self._current_execution_focus_text()
+        if focus:
+            self._auto_discover_and_load_skills(focus, trigger=trigger)
+
+    def _loaded_skill_rows(self, board: dict | None = None) -> dict[str, dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        loaded = bb.get("loaded_skills", {})
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _skill_chain_focus_match(self, skill_key: str, row: dict, focus_text: str) -> bool:
+        if str(row.get("load_source", "") or "").strip().lower() == "manual":
+            return True
+        low = re.sub(r"\s+", " ", str(focus_text or "").lower()).strip()
+        if not low:
+            return False
+        tokens = row.get("focus_tokens", [])
+        if not isinstance(tokens, list):
+            tokens = []
+        for token in tokens:
+            probe = re.sub(r"\s+", " ", str(token or "").strip().lower()).strip()
+            if probe and probe in low:
+                return True
+        skill_name = str(row.get("skill_name", skill_key) or skill_key).strip().lower()
+        return bool(skill_name and skill_name in low)
+
+    def _skill_chain_entry_examples(self, rows: list[tuple[str, dict]]) -> list[str]:
+        examples: list[str] = []
+        for _, row in rows[:2]:
+            entrypoints = row.get("entrypoints", [])
+            if not isinstance(entrypoints, list):
+                entrypoints = []
+            for item in entrypoints:
+                if not isinstance(item, dict):
+                    continue
+                ref = trim(
+                    str(item.get("virtual_path", "") or item.get("path", "") or "").strip(),
+                    160,
+                )
+                if ref:
+                    examples.append(ref)
+                    break
+        return examples[:2]
+
+    def _skill_chain_completion_blocker(self, *, focus_text: str = "", context: str = "finish") -> str:
+        board = self._ensure_blackboard()
+        loaded = self._loaded_skill_rows(board)
+        if not loaded:
+            return ""
+        current_focus = focus_text or self._current_execution_focus_text()
+        pending: list[tuple[str, dict]] = []
+        for skill_key, row in loaded.items():
+            if not isinstance(row, dict):
+                continue
+            if not bool(row.get("chain_required", False)):
+                continue
+            if bool(row.get("chain_started", False)):
+                continue
+            if not self._skill_chain_focus_match(skill_key, row, current_focus):
+                continue
+            pending.append((skill_key, row))
+        if not pending:
+            return ""
+        names = ", ".join(
+            str(row.get("skill_name", skill_key) or skill_key)
+            for skill_key, row in pending[:3]
+        )
+        examples = self._skill_chain_entry_examples(pending)
+        example_note = f" Suggested entrypoints: {', '.join(examples)}." if examples else ""
+        action = (
+            "before marking the current plan step complete"
+            if context == "plan-step"
+            else "before finishing the task"
+        )
+        return (
+            f"Loaded skill chain not yet entered for current focus ({names}). "
+            "Read a skill entrypoint or use a skill resource/script under /skills/... "
+            f"{action}.{example_note}"
+        )
+
+    def _loaded_skill_matches_path(self, path: Path) -> list[str]:
+        loaded = self._loaded_skill_rows()
+        if not loaded:
+            return []
+        try:
+            target = path.resolve()
+            root = self.skills.skills_root.resolve()
+            if not target.is_relative_to(root):
+                return []
+            rel = target.relative_to(root).as_posix()
+        except Exception:
+            return []
+        matches: list[str] = []
+        for skill_key, row in loaded.items():
+            skill_dir_rel = str(row.get("skill_dir_rel", "") or "").strip().strip("/")
+            if not skill_dir_rel:
+                continue
+            if rel == skill_dir_rel or rel.startswith(f"{skill_dir_rel}/"):
+                matches.append(skill_key)
+        return matches
+
+    def _loaded_skill_matches_command(self, raw_command: str, effective_command: str = "") -> list[str]:
+        loaded = self._loaded_skill_rows()
+        if not loaded:
+            return []
+        try:
+            skills_root = str(self.skills.skills_root.resolve())
+        except Exception:
+            skills_root = str(self.skills.skills_root)
+        combined: list[str] = []
+        for item in (raw_command, effective_command):
+            txt = str(item or "").strip()
+            if txt:
+                combined.append(txt)
+        raw = str(raw_command or "")
+        if raw:
+            expanded = (
+                raw.replace("${SKILLS_ROOT}", skills_root)
+                .replace("$SKILLS_ROOT", skills_root)
+            )
+            if expanded and expanded not in combined:
+                combined.append(expanded)
+        if not combined:
+            return []
+        matches: list[str] = []
+        for skill_key, row in loaded.items():
+            skill_dir_rel = str(row.get("skill_dir_rel", "") or "").strip().strip("/")
+            if not skill_dir_rel:
+                continue
+            markers = [
+                str(row.get("skill_dir_virtual", "") or f"{SKILLS_VIRTUAL_PREFIX}/{skill_dir_rel}"),
+                str((self.skills.skills_root / skill_dir_rel).resolve()),
+                f"$SKILLS_ROOT/{skill_dir_rel}",
+                f"${{SKILLS_ROOT}}/{skill_dir_rel}",
+            ]
+            entrypoints = row.get("entrypoints", [])
+            if isinstance(entrypoints, list):
+                for item in entrypoints:
+                    if not isinstance(item, dict):
+                        continue
+                    ref = str(item.get("virtual_path", "") or "").strip()
+                    if ref:
+                        markers.append(ref)
+            low_combined = [txt.lower() for txt in combined]
+            hit = False
+            for marker in markers:
+                probe = str(marker or "").strip().lower()
+                if not probe:
+                    continue
+                if any(probe in txt for txt in low_combined):
+                    hit = True
+                    break
+            if hit and skill_key not in matches:
+                matches.append(skill_key)
+        return matches
+
+    def _record_skill_chain_entry(self, skill_keys: list[str], *, tool_name: str, evidence: str):
+        if not isinstance(skill_keys, list) or not skill_keys:
+            return
+        bb = self._ensure_blackboard()
+        loaded = self._loaded_skill_rows(bb)
+        if not loaded:
+            return
+        changed = False
+        started_now: list[str] = []
+        stamp = float(now_ts())
+        detail = trim(str(evidence or "").strip(), 240)
+        for skill_key in skill_keys:
+            row = loaded.get(skill_key, {})
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            evidence_rows = row.get("chain_evidence", [])
+            if not isinstance(evidence_rows, list):
+                evidence_rows = []
+            evidence_rows.append(
+                {
+                    "ts": stamp,
+                    "tool": str(tool_name or "").strip(),
+                    "detail": detail,
+                }
+            )
+            was_started = bool(row.get("chain_started", False))
+            row["chain_started"] = True
+            if not row.get("chain_started_at"):
+                row["chain_started_at"] = stamp
+            row["chain_evidence"] = evidence_rows[-8:]
+            row["last_chain_tool"] = str(tool_name or "").strip()
+            row["last_chain_event"] = detail
+            loaded[skill_key] = row
+            changed = True
+            if not was_started:
+                started_now.append(str(row.get("skill_name", skill_key) or skill_key))
+        if not changed:
+            return
+        bb["loaded_skills"] = loaded
+        self.blackboard = bb
+        self._blackboard_touch()
+        if started_now:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"skill chain entered: {', '.join(started_now[:3])} via {trim(tool_name, 40)}"
+                    )
+                },
+            )
 
     def _clear_loaded_skill_contexts(self):
         def _filter_rows(rows: list[dict]) -> list[dict]:
@@ -9817,6 +10899,9 @@ class SessionState:
                     continue
                 kept.append(row)
             return kept
+        self.messages = _filter_rows(list(self.messages))[-400:]
+        am_limit = self._tier_agent_context_limits(self._context_compression_tier())["agent_messages"]
+        self.agent_messages = _filter_rows(list(self.agent_messages))[-am_limit:]
         for role in AGENT_ROLES:
             self.contexts[role] = _filter_rows(list(self.contexts.get(role, [])))[-400:]
         self.manager_context = _filter_rows(list(self.manager_context))[-400:]
@@ -9910,7 +10995,7 @@ class SessionState:
                     [{"role": "user", "content": (
                         f"/no_think\nAvailable skills:\n{catalog_text}\n\n"
                         f"User's task: {goal}\n\n"
-                        f"Which skills are relevant? Reply JSON array of names only. Max 2. "
+                        f"Which skills are relevant? Reply JSON array of names only. Max 3. "
                         f"Example: [\"ppt-master\"] or []"
                     )}],
                     system="/no_think\nOutput only a JSON array of skill names.",
@@ -9924,7 +11009,7 @@ class SessionState:
                     try:
                         names = _json.loads(f"[{m.group(1)}]")
                         if isinstance(names, list):
-                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:2])
+                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:3])
                     except Exception:
                         pass
             except Exception:
@@ -9944,10 +11029,10 @@ class SessionState:
 
         # --- Load matched skills ---
         loaded_count = 0
-        for name_str in matched_names[:2]:
+        for name_str in matched_names[:3]:
             if isinstance(already_loaded, dict) and any(name_str in k for k in already_loaded):
                 continue
-            result = self._load_skill_with_cache(name_str)
+            result = self._load_skill_with_cache(name_str, load_source=f"auto:{trigger or 'discovery'}")
             if result and not str(result).startswith("Error:"):
                 loaded_count += 1
         if loaded_count > 0:
@@ -9979,10 +11064,10 @@ class SessionState:
             for _, _, qname in scored:
                 if qname not in matched:
                     matched.append(qname)
-                if len(matched) >= 2:
+                if len(matched) >= 3:
                     break
             if matched:
-                return matched[:2]
+                return matched[:3]
 
         # Mapping: goal keywords → skill name patterns
         keyword_skill_map = [
@@ -10014,8 +11099,10 @@ class SessionState:
             (["gif", "动图", "slack"], ["slack-gif"]),
             (["brand", "品牌", "logo"], ["brand"]),
             (["theme", "主题", "样式"], ["theme-factory"]),
-            # Research
-            (["深度研究", "deep research", "综述"], ["deep-research"]),
+            # Research / literature / experimental workflows
+            (["深度研究", "deep research", "综述", "research", "literature review", "experiment design", "科研", "实验设计"], ["research-orchestrator-pro", "deep-research", "pdf-vision", "upload-office", "upload-tabular"]),
+            # Scientific reasoning / theory / derivation
+            (["scientific reasoning", "theorem", "proof", "derivation", "formula", "scientific", "数学推导", "理论基础", "科学推理", "深度思考"], ["scientific-reasoning-lab", "research-orchestrator-pro"]),
         ]
         matched: list[str] = []
         for keywords, skill_patterns in keyword_skill_map:
@@ -10027,24 +11114,142 @@ class SessionState:
                             if s["qname"] not in matched:
                                 matched.append(s["qname"])
                             break
-                if len(matched) >= 2:
+                if len(matched) >= 3:
                     break
-        return matched[:2]
+        return matched[:3]
 
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
         """Unified skill awareness hint for any system prompt. Reads blackboard loaded_skills."""
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
         if isinstance(loaded, dict) and loaded:
-            skill_names = list(loaded.keys())[:5]
+            skill_names = []
+            for skill_key, row in list(loaded.items())[:5]:
+                status = "entered" if bool((row or {}).get("chain_started", False)) else (
+                    "pending-entry" if bool((row or {}).get("chain_required", False)) else "loaded"
+                )
+                label = str((row or {}).get("skill_name", skill_key) or skill_key).strip() or skill_key
+                skill_names.append(f"{label}({status})")
             return (
                 f"ACTIVE SKILLS: {', '.join(skill_names)} have been loaded into your context. "
                 "Follow loaded skill instructions precisely. "
+                "If a skill is pending-entry, you must concretely enter that skill chain by reading an entrypoint "
+                "or using a skill resource/script before claiming completion. "
                 "Use load_skill to load additional skills if needed. "
             )
         return (
             "Use list_skills to discover available skills for your task, then load_skill to load them. "
             "Skills provide domain-specific workflows for professional outputs. "
+        )
+
+    def _refresh_runtime_code_reference(self, text: str):
+        cb = getattr(self, "reference_prepare_callback", None)
+        payload: dict = {}
+        if callable(cb):
+            try:
+                raw = cb(self, str(text or ""))
+                payload = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                payload = {}
+        self.runtime_code_reference_text = trim(str(payload.get("code_text", payload.get("text", "")) or ""), 8000)
+        meta = payload.get("code_meta", payload.get("meta", {}))
+        self.runtime_code_reference_meta = dict(meta) if isinstance(meta, dict) else {}
+
+    def _runtime_code_reference_prompt_block(self, max_chars: int = 4200) -> str:
+        text = trim(str(getattr(self, "runtime_code_reference_text", "") or ""), max_chars)
+        if not text:
+            return ""
+        meta = dict(getattr(self, "runtime_code_reference_meta", {}) or {})
+        tags: list[str] = []
+        route = str(meta.get("route", meta.get("requested_route", "")) or "").strip()
+        if route:
+            tags.append(f"route={route}")
+        result_count = int(meta.get("result_count", meta.get("top_results", 0)) or 0)
+        if result_count > 0:
+            tags.append(f"results={result_count}")
+        header = "Code Library Context"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "Prioritize these code-library references for code implementation/review tasks before generic reasoning. "
+            "If a reference conflicts with the current workspace file, trust the current workspace after verification.\n"
+            f"{text}"
+        )
+
+    def _knowledge_library_prompt_block(self) -> str:
+        info: dict = {}
+        cb = getattr(self, "knowledge_library_status_callback", None)
+        if callable(cb):
+            try:
+                raw = cb(self)
+                info = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                info = {}
+        root = str(info.get("root", "") or getattr(self, "knowledge_library_root", "") or "").strip()
+        stats = info.get("stats", {}) if isinstance(info.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", info.get("documents", 0)) or 0)
+        chunks = int(stats.get("chunks", info.get("chunks", 0)) or 0)
+        tasks = int(stats.get("tasks", info.get("tasks", 0)) or 0)
+        ready = bool(info.get("ready", False) or docs > 0 or chunks > 0)
+        tags = [f"ready={'yes' if ready else 'no'}", f"documents={docs}", f"chunks={chunks}"]
+        if root:
+            tags.insert(0, f"root={root}")
+        if tasks > 0:
+            tags.append(f"tasks={tasks}")
+        header = "Knowledge Library"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "This is the global TF-Graph_IDF RAG knowledge library for imported documents and research material. "
+            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`. "
+            "Do not infer knowledge-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
+            "Use `query_knowledge_library` to check readiness or retrieve grounded references from the global library."
+        )
+
+    def _code_library_prompt_block(self) -> str:
+        info: dict = {}
+        cb = getattr(self, "code_library_status_callback", None)
+        if callable(cb):
+            try:
+                raw = cb(self)
+                info = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                info = {}
+        root = str(info.get("root", "") or getattr(self, "code_library_root", "") or "").strip()
+        stats = info.get("stats", {}) if isinstance(info.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", info.get("documents", 0)) or 0)
+        chunks = int(stats.get("chunks", info.get("chunks", 0)) or 0)
+        tasks = int(stats.get("tasks", info.get("tasks", 0)) or 0)
+        source_roots = [str(x).strip() for x in (info.get("source_roots", []) or []) if str(x).strip()]
+        ready = bool(info.get("ready", False) or docs > 0 or chunks > 0)
+        tags = [f"ready={'yes' if ready else 'no'}", f"documents={docs}", f"chunks={chunks}"]
+        if root:
+            tags.insert(0, f"root={root}")
+        if tasks > 0:
+            tags.append(f"tasks={tasks}")
+        if source_roots:
+            tags.append(f"source_roots={len(source_roots)}")
+        header = "Code Library"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        source_hint = ""
+        if source_roots:
+            preview = ", ".join(source_roots[:3])
+            if len(source_roots) > 3:
+                preview += ", ..."
+            source_hint = (
+                f" Discovered external raw code-corpus roots: {preview}. "
+                "Those raw corpora are source trees, not the query index itself, unless they have been imported into the Code Library."
+            )
+        return (
+            f"{header}:\n"
+            "This is the global Code Graph Library for imported source-code references used in implementation and review tasks. "
+            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`."
+            f"{source_hint} "
+            "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
+            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
         )
 
     def _system_prompt(self) -> str:
@@ -10055,11 +11260,17 @@ class SessionState:
         uploads_ctx = self._uploads_prompt_block()
         html_hint = self._html_frontend_boost_instruction()
         research_hint = self._deep_research_boost_instruction()
+        knowledge_hint = self._knowledge_library_prompt_block()
+        code_hint = self._code_library_prompt_block()
+        code_ref_block = self._runtime_code_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
         html_block = f"{html_hint}\n\n" if html_hint else ""
         research_block = f"{research_hint}\n\n" if research_hint else ""
+        knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
+        code_hint_block = f"{code_hint}\n\n" if code_hint else ""
+        code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
             and not self.single_advance_prompt_enhance
@@ -10087,6 +11298,9 @@ class SessionState:
             f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
+            f"{knowledge_block}"
+            f"{code_hint_block}"
+            f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
             f"Skills:\n{self.skills.descriptions()}"
@@ -11125,19 +12339,19 @@ class SessionState:
 
     # --- File buffer methods (修改 7) ---
 
-    def _offload_to_file_buffer(self, content: str, label: str = "") -> str:
-        """Write large content to disk, return compact reference placeholder."""
-        if len(content) < FILE_BUFFER_CONTENT_THRESHOLD:
-            return content
+    def _write_file_buffer_entry(self, content: str, label: str = "") -> dict:
+        """Write large content to disk and return entry metadata."""
         ref_id = f"fb_{int(now_ts())}_{uuid.uuid4().hex[:6]}"
         fp = self.file_buffer_dir / f"{ref_id}.txt"
         fp.write_text(content, encoding="utf-8")
         summary = trim(content, 120).replace("\n", " ")
-        self.file_buffer_index[ref_id] = {
+        entry = {
             "path": fp.relative_to(self.root).as_posix(),
             "chars": len(content),
             "summary": summary,
+            "label": str(label or ""),
         }
+        self.file_buffer_index[ref_id] = entry
         # Prune old entries if over limit
         if len(self.file_buffer_index) > FILE_BUFFER_MAX_FILES:
             oldest_keys = sorted(self.file_buffer_index.keys())[:len(self.file_buffer_index) - FILE_BUFFER_MAX_FILES]
@@ -11149,7 +12363,19 @@ class SessionState:
                     except Exception:
                         pass
                 del self.file_buffer_index[k]
-        return f"[file_buffer:{ref_id} chars={len(content)} summary={summary}]"
+        return {
+            "ref_id": ref_id,
+            "path": entry["path"],
+            "chars": int(entry["chars"]),
+            "summary": summary,
+            "placeholder": f"[file_buffer:{ref_id} chars={len(content)} summary={summary}]",
+        }
+
+    def _offload_to_file_buffer(self, content: str, label: str = "") -> str:
+        """Write large content to disk, return compact reference placeholder."""
+        if len(content) < FILE_BUFFER_CONTENT_THRESHOLD:
+            return content
+        return str(self._write_file_buffer_entry(content, label=label).get("placeholder", content))
 
     def _load_from_file_buffer(self, ref_id: str) -> str:
         """Load content from file buffer by reference ID."""
@@ -11163,6 +12389,164 @@ class SessionState:
             return fp.read_text(encoding="utf-8")
         except Exception as exc:
             return f"[file_buffer:{ref_id} read error: {exc}]"
+
+    def _is_long_listing_command(self, command: str) -> bool:
+        text = str(command or "").strip().lower()
+        if not text:
+            return False
+        segments = re.split(r"(?:&&|\|\||;|\||\n)+", text)
+        wrappers = {"env", "command", "builtin", "time", "nohup"}
+        for seg in segments:
+            part = seg.strip()
+            if not part:
+                continue
+            try:
+                tokens = shlex.split(part, posix=(os.name != "nt"))
+            except Exception:
+                tokens = part.split()
+            if not tokens:
+                continue
+            cmd_name = ""
+            for tok in tokens:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tok):
+                    continue
+                base = Path(tok).name.lower()
+                if base in wrappers:
+                    continue
+                cmd_name = base
+                break
+            if cmd_name in {"ls", "find", "rg", "fd", "tree"}:
+                return True
+        return False
+
+    def _paginate_text(self, text: str, page_chars: int, max_pages: int | None = None) -> list[str]:
+        src = str(text or "")
+        if not src:
+            return [""]
+        page_chars = max(256, int(page_chars or 0))
+        pages: list[str] = []
+        cursor = 0
+        total = len(src)
+        while cursor < total:
+            end = min(total, cursor + page_chars)
+            if end < total:
+                newline = src.rfind("\n", cursor, end)
+                if newline > cursor + int(page_chars * 0.55):
+                    end = newline + 1
+            chunk = src[cursor:end].rstrip("\n")
+            pages.append(chunk)
+            cursor = end
+            while cursor < total and src[cursor] == "\n":
+                cursor += 1
+            if max_pages is not None and len(pages) >= max_pages:
+                break
+        return pages or [""]
+
+    def _prune_long_output_files(self):
+        try:
+            files = sorted(
+                self.long_output_dir.glob("*.txt"),
+                key=lambda fp: fp.stat().st_mtime,
+            )
+        except Exception:
+            return
+        overflow = len(files) - LONG_OUTPUT_TEMP_MAX_FILES
+        if overflow <= 0:
+            return
+        for fp in files[:overflow]:
+            try:
+                fp.unlink()
+            except Exception:
+                pass
+
+    def _write_long_output_artifact(self, content: str, command: str) -> str:
+        base = ""
+        try:
+            tokens = shlex.split(str(command or ""), posix=(os.name != "nt"))
+        except Exception:
+            tokens = str(command or "").split()
+        for tok in tokens:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tok):
+                continue
+            base = Path(tok).name.lower()
+            if base in {"env", "command", "builtin", "time", "nohup"}:
+                continue
+            break
+        stem = re.sub(r"[^a-z0-9._-]+", "-", base or "output").strip("-") or "output"
+        fp = self.long_output_dir / f"{int(now_ts() * 1000)}_{stem}_{uuid.uuid4().hex[:6]}.txt"
+        fp.write_text(str(content or ""), encoding="utf-8")
+        self._prune_long_output_files()
+        return self._session_rel(fp)
+
+    def _prepare_shell_output_payload(self, command: str, output_text: str, cwd: Path | None = None) -> dict:
+        clean = str(output_text or "").strip()
+        if not clean:
+            clean = "(no output)"
+        is_listing = self._is_long_listing_command(command)
+        model_pages = self._paginate_text(clean, LONG_OUTPUT_MODEL_PAGE_CHARS)
+        ui_pages_all = self._paginate_text(clean, LONG_OUTPUT_UI_PAGE_CHARS)
+        ui_pages = ui_pages_all[:LONG_OUTPUT_UI_PREVIEW_MAX_PAGES]
+        temp_output_path = ""
+        buffer_ref = ""
+        buffer_chars = 0
+        strategy = "inline"
+        model_truncated = False
+        ui_truncated = len(ui_pages_all) > len(ui_pages)
+        should_temp = is_listing and (
+            len(clean) > LONG_OUTPUT_LISTING_OFFLOAD_CHARS or len(model_pages) > 1 or ui_truncated
+        )
+        should_buffer = should_temp or len(model_pages) > 1 or ui_truncated or len(clean) >= FILE_BUFFER_CONTENT_THRESHOLD * 4
+        if should_temp:
+            temp_output_path = self._write_long_output_artifact(clean, command)
+            strategy = "temp-read_file"
+        elif len(model_pages) > 1:
+            strategy = "paged-inline"
+        if should_buffer:
+            entry = self._write_file_buffer_entry(clean, label="shell-output")
+            buffer_ref = str(entry.get("ref_id", ""))
+            buffer_chars = int(entry.get("chars", 0) or 0)
+        model_output = clean
+        if len(model_pages) > 1 or should_temp:
+            model_truncated = True
+            preview = (
+                self._run_read(temp_output_path, LONG_OUTPUT_READ_PAGE_LINES, 0)
+                if temp_output_path
+                else model_pages[0]
+            )
+            parts = [
+                (
+                    f"[long_output chars={len(clean)} pages={len(model_pages)} "
+                    f"strategy={strategy}{f' cwd={cwd}' if cwd else ''}]"
+                )
+            ]
+            if temp_output_path:
+                parts.append(
+                    f"use read_file path=\"{temp_output_path}\" offset=0 limit={LONG_OUTPUT_READ_PAGE_LINES}"
+                )
+            if buffer_ref:
+                parts.append(f"buffer_ref={buffer_ref}")
+            parts.append(f"preview_page=1/{len(model_pages)}")
+            parts.append(preview)
+            if len(model_pages) > 1:
+                parts.append(f"... ({len(model_pages) - 1} more page(s) omitted from model context)")
+            model_output = "\n".join(parts)
+        return {
+            "output": model_output,
+            "output_full_chars": len(clean),
+            "output_full_lines": clean.count("\n") + (1 if clean else 0),
+            "ui_output_preview": ui_pages[0] if ui_pages else "",
+            "ui_output_pages": ui_pages,
+            "ui_output_page_count": len(ui_pages),
+            "ui_output_page_total": len(ui_pages_all),
+            "ui_truncated": bool(ui_truncated),
+            "model_truncated": bool(model_truncated),
+            "buffer_ref": buffer_ref,
+            "buffer_chars": buffer_chars,
+            "temp_output_path": temp_output_path,
+            "long_output_strategy": strategy,
+            "output_page_index": 1,
+            "output_page_count": len(model_pages),
+        }
 
     def _offload_agent_message_content(self, messages: list[dict]):
         """Scan messages and offload large string content to file buffer."""
@@ -12531,6 +13915,27 @@ class SessionState:
         )
         if cfg_obj and (named_config or looks_like_llm_config(cfg_obj)):
             loaded_config = self.load_llm_config(cfg_obj, source=workspace_rel)
+        rag_info: dict = {}
+        if callable(self.upload_callback):
+            try:
+                maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                if isinstance(maybe, dict):
+                    rag_info = dict(maybe)
+            except Exception as exc:
+                rag_info = {"ok": False, "error": trim(str(exc), 260)}
+        if rag_info:
+            meta["rag"] = dict(rag_info)
+            with self.lock:
+                for idx in range(len(self.uploads) - 1, -1, -1):
+                    row = self.uploads[idx]
+                    if str(row.get("id", "")) != upload_id:
+                        continue
+                    patched = dict(row)
+                    patched["rag"] = dict(rag_info)
+                    self.uploads[idx] = patched
+                    self.updated_at = now_ts()
+                    self._persist()
+                    break
         return {
             "id": upload_id,
             "filename": safe_name,
@@ -12539,6 +13944,7 @@ class SessionState:
             "size": len(raw),
             "uploaded_at": meta["uploaded_at"],
             "preview": trim(parsed_excerpt, 1200),
+            "rag": rag_info,
             "model_catalog": loaded_config,
         }
 
@@ -14063,6 +15469,14 @@ class SessionState:
             err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
 
+        def _store_shell_output(output_value: str, exit_code: int | None = None):
+            text = str(output_value or "").strip()
+            if not text:
+                text = str(meta.get("error") or "(no output)")
+            if exit_code is not None:
+                meta["exit_code"] = int(exit_code)
+            meta.update(self._prepare_shell_output_payload(command, text, cwd=cwd))
+
         def _collect_with_reader_threads(proc: subprocess.Popen):
             nonlocal next_progress_emit
             reader_threads: list[threading.Thread] = []
@@ -14172,10 +15586,12 @@ class SessionState:
             merged_raw = _merge_output_text()
             merged, _ = filter_runtime_noise_lines(merged_raw)
             if meta.get("error"):
-                meta["output"] = trim(merged or str(meta["error"]))
+                _store_shell_output(merged or str(meta["error"]))
             else:
-                meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                meta["output"] = trim(merged or "(no output)")
+                _store_shell_output(
+                    merged or "(no output)",
+                    int(proc.returncode if proc.returncode is not None else 0),
+                )
 
         try:
             proc_env = os.environ.copy()
@@ -14263,10 +15679,12 @@ class SessionState:
                         merged_raw = _merge_output_text()
                         merged, _ = filter_runtime_noise_lines(merged_raw)
                         if meta.get("error"):
-                            meta["output"] = trim(merged or str(meta["error"]))
+                            _store_shell_output(merged or str(meta["error"]))
                         else:
-                            meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                            meta["output"] = trim(merged or "(no output)")
+                            _store_shell_output(
+                                merged or "(no output)",
+                                int(proc.returncode if proc.returncode is not None else 0),
+                            )
                 except Exception as exc:
                     # Some platforms may reject selector registration for PIPEs.
                     # On Windows, also catch any OSError (e.g. WinError 10093 WSANOTINITIALISED).
@@ -14286,12 +15704,20 @@ class SessionState:
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
+        if not meta.get("ui_output_pages"):
+            meta.update(
+                self._prepare_shell_output_payload(
+                    command,
+                    str(meta.get("output") or meta.get("error") or "(no output)"),
+                    cwd=cwd,
+                )
+            )
         return meta
 
     def _run_bash(self, command: str) -> str:
         return self._run_shell_meta(command, self.files_root, 120)["output"]
 
-    def _run_read(self, path: str, limit: int | None = None) -> str:
+    def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._session_path(rel)
@@ -14304,9 +15730,51 @@ class SessionState:
             if ext in VIDEO_EXTS:
                 return self._run_read_media(fp, rel, "video")
             lines = fp.read_text(encoding="utf-8").splitlines()
-            if limit and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-            return trim("\n".join(lines))
+            total_lines = len(lines)
+            if total_lines == 0:
+                return ""
+            offset_val = max(0, int(offset or 0))
+            requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
+            if offset_val >= total_lines:
+                return (
+                    f"[read_file page path={rel} lines=0 of {total_lines} offset={offset_val}]\n"
+                    "[end_of_file]"
+                )
+            full_text = "\n".join(lines)
+            auto_paginate = limit is None and offset_val == 0 and len(full_text) > LONG_OUTPUT_READ_PAGE_MAX_CHARS
+            if not auto_paginate and limit is None and offset_val == 0 and len(full_text) <= MAX_TOOL_OUTPUT:
+                return full_text
+            page_parts: list[str] = []
+            chars = 0
+            idx = offset_val
+            while idx < total_lines and len(page_parts) < requested_limit:
+                line = lines[idx]
+                piece = line if not page_parts else "\n" + line
+                if page_parts and (chars + len(piece)) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
+                    break
+                if (not page_parts) and len(line) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
+                    page_parts.append(line[:LONG_OUTPUT_READ_PAGE_MAX_CHARS])
+                    idx += 1
+                    break
+                page_parts.append(piece if page_parts else line)
+                chars += len(piece)
+                idx += 1
+            body = "".join(page_parts)
+            page_no = (offset_val // requested_limit) + 1
+            total_pages = max(1, (total_lines + requested_limit - 1) // requested_limit)
+            out = [
+                (
+                    f"[read_file page path={rel} lines={offset_val + 1}-{idx} of {total_lines} "
+                    f"page={page_no}/{total_pages} offset={offset_val} limit={requested_limit}]"
+                ),
+                body,
+            ]
+            if idx < total_lines:
+                out.append(f"[next_page read_file path=\"{rel}\" offset={idx} limit={requested_limit}]")
+            if offset_val > 0:
+                prev_offset = max(0, offset_val - requested_limit)
+                out.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
+            return "\n".join(part for part in out if part != "")
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
@@ -14628,7 +16096,12 @@ class SessionState:
     def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
         subtools = [
             tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
-            tool_def("read_file", "Read file.", {"path": {"type": "string"}}, ["path"]),
+            tool_def(
+                "read_file",
+                "Read file with optional line pagination.",
+                {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+                ["path"],
+            ),
         ]
         if agent_type != "Explore":
             subtools.extend(
@@ -14702,7 +16175,7 @@ class SessionState:
                 if name == "bash":
                     out = self._run_bash(args.get("command", ""))
                 elif name == "read_file":
-                    out = self._run_read(args.get("path", ""))
+                    out = self._run_read(args.get("path", ""), args.get("limit"), args.get("offset"))
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
                 elif name == "edit_file":
@@ -17271,6 +18744,14 @@ class SessionState:
                 break
         if not current:
             return False
+        skill_blocker = self._skill_chain_completion_blocker(
+            focus_text=self._current_execution_focus_text(),
+            context="plan-step",
+        )
+        if skill_blocker:
+            self._emit("status", {"summary": trim(f"plan step advance blocked: {skill_blocker}", 220)})
+            self._sync_todos_from_blackboard(reason="plan-step-skill-chain-blocked", board=bb)
+            return False
         current["status"] = "completed"
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
@@ -17294,6 +18775,11 @@ class SessionState:
         self._blackboard_touch()
         # Immediately sync todos so UI reflects plan step advancement
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
+        if next_step:
+            try:
+                self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-advanced")
+            except Exception:
+                pass
         return True
 
     def _single_agent_plan_step_check(self, tool_results: list[dict]):
@@ -18482,6 +19968,8 @@ class SessionState:
                 f"LOADED SKILLS: {', '.join(skill_names)}. "
                 "Delegate agents to follow the loaded skill's workflow scripts and procedures. "
                 "The skill defines the correct execution path — do NOT deviate from it. "
+                "A skill-linked step is not complete until the agent has concretely entered the skill chain "
+                "by reading an entrypoint or using a skill resource/script. "
             )
         # Add current phase routing hint
         current_phase = self._infer_current_phase_from_blackboard()
@@ -19499,6 +20987,17 @@ class SessionState:
         if target not in {"finish", "reviewer"} and finish_gate_reason != "reviewer-summary-missing":
             board["manager_summary_attempts"] = 0
             self.blackboard = board
+        if target == "finish":
+            skill_blocker = self._skill_chain_completion_blocker(context="finish")
+            if skill_blocker:
+                target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
+                instruction = trim(
+                    f"{skill_blocker} Enter the referenced skill chain concretely now, then continue execution.",
+                    1200,
+                )
+                row["reason"] = "finish-blocked-skill-chain"
+                row["source"] = "policy"
+                self._emit("status", {"summary": trim(f"manager finish blocked: {skill_blocker}", 220)})
         if target != "finish" and objective:
             low_instruction = instruction.lower()
             low_objective = objective.lower()
@@ -20959,12 +22458,13 @@ class SessionState:
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
         skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: {self.files_root}. Use relative paths. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            f"{skills_note}"
+            f"{skills_note}{code_note + ' ' if code_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -21738,6 +23238,14 @@ class SessionState:
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, 120)
+            self._record_skill_chain_entry(
+                self._loaded_skill_matches_command(
+                    str(args.get("command", "") or ""),
+                    str(meta.get("effective_command", "") or ""),
+                ),
+                tool_name="bash",
+                evidence=f"bash: {trim(str(args.get('command', '') or '').strip(), 180)}",
+            )
             self._emit(
                 "command",
                 {
@@ -21748,8 +23256,25 @@ class SessionState:
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
-                    "output": trim(meta["output"], 1200),
-                    "summary": f"bash ({meta['exit_code']}) {meta['command'][:80]}",
+                    "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
+                    "ui_output_pages": meta.get("ui_output_pages", []),
+                    "ui_output_page_count": meta.get("ui_output_page_count", 0),
+                    "ui_output_page_total": meta.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(meta.get("ui_truncated", False)),
+                    "model_truncated": bool(meta.get("model_truncated", False)),
+                    "buffer_ref": meta.get("buffer_ref", ""),
+                    "buffer_chars": int(meta.get("buffer_chars", 0) or 0),
+                    "temp_output_path": meta.get("temp_output_path", ""),
+                    "long_output_strategy": meta.get("long_output_strategy", "inline"),
+                    "output_page_index": int(meta.get("output_page_index", 1) or 1),
+                    "output_page_count": int(meta.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"bash ({meta['exit_code']}) {meta['command'][:80]}"
+                        + (" · long-output buffered" if meta.get("temp_output_path") else "")
+                        + (" · model-paged" if meta.get("model_truncated") else "")
+                    ),
                 },
             )
             return meta["output"]
@@ -21763,8 +23288,25 @@ class SessionState:
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
-            out = self._run_read(rel, args.get("limit"))
-            self._emit("file_read", {"path": rel, "summary": f"read file: {rel}"})
+            out = self._run_read(rel, args.get("limit"), args.get("offset"))
+            if not str(out).startswith("Error:"):
+                self._record_skill_chain_entry(
+                    self._loaded_skill_matches_path(fp),
+                    tool_name="read_file",
+                    evidence=f"read_file: {rel}",
+                )
+            limit_val = int(args.get("limit", 0) or 0) if args.get("limit") is not None else 0
+            offset_val = int(args.get("offset", 0) or 0) if args.get("offset") is not None else 0
+            summary = f"read file: {rel}"
+            if offset_val > 0 or limit_val > 0:
+                summary += (
+                    f" offset={offset_val}"
+                    + (f" limit={limit_val}" if limit_val > 0 else "")
+                )
+            self._emit(
+                "file_read",
+                {"path": rel, "offset": offset_val, "limit": limit_val, "summary": summary},
+            )
             return out
         if name == "write_file":
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
@@ -21779,6 +23321,12 @@ class SessionState:
             existed = fp.exists()
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
+            if not str(out).startswith("Error:"):
+                self._record_skill_chain_entry(
+                    self._loaded_skill_matches_path(fp),
+                    tool_name="write_file",
+                    evidence=f"write_file: {rel}",
+                )
             if not out.startswith("Error"):
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
@@ -21830,6 +23378,12 @@ class SessionState:
                 return f"Error: {type(exc).__name__}: {exc}"
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_edit(rel, args["old_text"], args["new_text"])
+            if not str(out).startswith("Error:"):
+                self._record_skill_chain_entry(
+                    self._loaded_skill_matches_path(fp),
+                    tool_name="edit_file",
+                    evidence=f"edit_file: {rel}",
+                )
             if not out.startswith("Error"):
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
@@ -21888,6 +23442,9 @@ class SessionState:
         if name == "TodoWriteRescue":
             return self._todo_write_rescue(args)
         if name in {"finish_task", "finish_current_task", "mark_done"}:
+            skill_blocker = self._skill_chain_completion_blocker(context="finish")
+            if skill_blocker:
+                return f"Error: {skill_blocker}"
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
             if role_key == "explorer":
                 bb = self._ensure_blackboard()
@@ -21948,7 +23505,8 @@ class SessionState:
             self._ensure_skills_ready(force=False)
             return ", ".join(self.skills.list_names())
         if name == "load_skill":
-            return self._load_skill_with_cache(args["name"])
+            source = f"manual:{role_key or 'single'}"
+            return self._load_skill_with_cache(args["name"], load_source=source)
         if name == "list_skill_providers":
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_providers(), indent=2)
@@ -21963,6 +23521,24 @@ class SessionState:
             return "Compress requested."
         if name == "context_recall":
             return self._context_recall(args)
+        if name == "query_code_library":
+            cb = getattr(self, "query_code_library_callback", None)
+            if not callable(cb):
+                return "Error: code library query is not available in this session"
+            try:
+                out = cb(self, dict(args or {}))
+                return str(out if out is not None else "")
+            except Exception as exc:
+                return f"Error: code library query failed: {exc}"
+        if name == "query_knowledge_library":
+            cb = getattr(self, "query_knowledge_library_callback", None)
+            if not callable(cb):
+                return "Error: knowledge library query is not available in this session"
+            try:
+                out = cb(self, dict(args or {}))
+                return str(out if out is not None else "")
+            except Exception as exc:
+                return f"Error: knowledge library query failed: {exc}"
         if name == "generate_media":
             media_type = str(args.get("media_type", "") or "").strip().lower()
             if media_type not in {"image", "audio", "video"}:
@@ -22004,6 +23580,12 @@ class SessionState:
             effective_command = self._rewrite_shell_virtual_paths(raw_command, self.files_root)
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
+            payload = self._prepare_shell_output_payload(raw_command, out_filtered or "(no output)", cwd=self.files_root)
+            self._record_skill_chain_entry(
+                self._loaded_skill_matches_command(raw_command, effective_command),
+                tool_name="background_run",
+                evidence=f"background_run: {trim(raw_command, 180)}",
+            )
             self._emit(
                 "command",
                 {
@@ -22011,10 +23593,28 @@ class SessionState:
                     "command": raw_command,
                     "effective_command": effective_command,
                     "cwd": str(self.files_root),
-                    "summary": f"background_run: {raw_command[:80]}",
+                    "output": payload.get("ui_output_preview", ""),
+                    "ui_output_pages": payload.get("ui_output_pages", []),
+                    "ui_output_page_count": payload.get("ui_output_page_count", 0),
+                    "ui_output_page_total": payload.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(payload.get("ui_truncated", False)),
+                    "model_truncated": bool(payload.get("model_truncated", False)),
+                    "buffer_ref": payload.get("buffer_ref", ""),
+                    "buffer_chars": int(payload.get("buffer_chars", 0) or 0),
+                    "temp_output_path": payload.get("temp_output_path", ""),
+                    "long_output_strategy": payload.get("long_output_strategy", "inline"),
+                    "output_page_index": int(payload.get("output_page_index", 1) or 1),
+                    "output_page_count": int(payload.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(payload.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(payload.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"background_run: {raw_command[:80]}"
+                        + (" · long-output buffered" if payload.get("temp_output_path") else "")
+                        + (" · model-paged" if payload.get("model_truncated") else "")
+                    ),
                 },
             )
-            return trim(out_filtered or "(no output)")
+            return str(payload.get("output", out_filtered or "(no output)"))
         if name == "check_background":
             return self.bg.check(args.get("task_id"))
         if name == "task_create":
@@ -22163,6 +23763,14 @@ class SessionState:
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, 300)
+            self._record_skill_chain_entry(
+                self._loaded_skill_matches_command(
+                    str(args.get("command", "") or ""),
+                    str(meta.get("effective_command", "") or ""),
+                ),
+                tool_name="worktree_run",
+                evidence=f"worktree_run[{trim(str(args.get('name', '') or '').strip(), 40)}]: {trim(str(args.get('command', '') or '').strip(), 180)}",
+            )
             self._emit(
                 "command",
                 {
@@ -22174,8 +23782,25 @@ class SessionState:
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
-                    "output": trim(meta["output"], 1200),
-                    "summary": f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}",
+                    "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
+                    "ui_output_pages": meta.get("ui_output_pages", []),
+                    "ui_output_page_count": meta.get("ui_output_page_count", 0),
+                    "ui_output_page_total": meta.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(meta.get("ui_truncated", False)),
+                    "model_truncated": bool(meta.get("model_truncated", False)),
+                    "buffer_ref": meta.get("buffer_ref", ""),
+                    "buffer_chars": int(meta.get("buffer_chars", 0) or 0),
+                    "temp_output_path": meta.get("temp_output_path", ""),
+                    "long_output_strategy": meta.get("long_output_strategy", "inline"),
+                    "output_page_index": int(meta.get("output_page_index", 1) or 1),
+                    "output_page_count": int(meta.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}"
+                        + (" · long-output buffered" if meta.get("temp_output_path") else "")
+                        + (" · model-paged" if meta.get("model_truncated") else "")
+                    ),
                 },
             )
             return meta["output"]
@@ -22250,6 +23875,7 @@ class SessionState:
                 content = trim(str(row.get("content", "") or "").strip(), 6000)
                 if not content:
                     continue
+                self._refresh_runtime_code_reference(content)
                 applied = int(row.get("applied_count", 0) or 0) + 1
                 delay_rounds = int(row.get("delay_rounds", 0) or 0)
                 base_weight = (
@@ -22433,6 +24059,7 @@ class SessionState:
                     self.runtime_plan_mode_needed = True
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
+                self._refresh_runtime_code_reference(clean_goal or content)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
                 # Parse plan choice immediately after clean_goal is available
                 if _awaiting_plan_choice:
@@ -23314,10 +24941,7 @@ class SessionState:
 
         # Auto-discover and load relevant skills before research
         try:
-            self._auto_discover_and_load_skills(
-                self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                trigger="plan-mode-start",
-            )
+            self._refresh_loaded_skills_for_execution_focus(trigger="plan-mode-start")
         except Exception:
             pass
 
@@ -24088,6 +25712,10 @@ class SessionState:
                     ])
                 except Exception:
                     pass
+        try:
+            self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
+        except Exception:
+            pass
 
     def _agent_worker(self):
         single_role = "developer"
@@ -24115,10 +25743,7 @@ class SessionState:
                     "status",
                     {"summary": "initial skill discovery started"},
                 )
-                self._auto_discover_and_load_skills(
-                    self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                    trigger="pre-classify",
-                )
+                self._refresh_loaded_skills_for_execution_focus(trigger="pre-classify")
             except Exception:
                 pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()
@@ -25834,7 +27459,15 @@ class SessionManager:
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
+        upload_callback=None,
         run_finished_callback=None,
+        reference_prepare_callback=None,
+        query_code_library_callback=None,
+        query_knowledge_library_callback=None,
+        code_library_root: Path | str | None = None,
+        code_library_status_callback=None,
+        knowledge_library_root: Path | str | None = None,
+        knowledge_library_status_callback=None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -25871,6 +27504,14 @@ class SessionManager:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.single_advance_prompt_enhance = False
+        self.upload_callback = upload_callback
+        self.reference_prepare_callback = reference_prepare_callback
+        self.query_code_library_callback = query_code_library_callback
+        self.query_knowledge_library_callback = query_knowledge_library_callback
+        self.code_library_root = code_library_root
+        self.code_library_status_callback = code_library_status_callback
+        self.knowledge_library_root = knowledge_library_root
+        self.knowledge_library_status_callback = knowledge_library_status_callback
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -26209,7 +27850,15 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                upload_callback=self.upload_callback,
                 run_finished_callback=self.run_finished_callback,
+                reference_prepare_callback=self.reference_prepare_callback,
+                query_code_library_callback=self.query_code_library_callback,
+                query_knowledge_library_callback=self.query_knowledge_library_callback,
+                code_library_root=self.code_library_root,
+                code_library_status_callback=self.code_library_status_callback,
+                knowledge_library_root=self.knowledge_library_root,
+                knowledge_library_status_callback=self.knowledge_library_status_callback,
             )
             desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
             if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
@@ -26250,7 +27899,15 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                upload_callback=self.upload_callback,
                 run_finished_callback=self.run_finished_callback,
+                reference_prepare_callback=self.reference_prepare_callback,
+                query_code_library_callback=self.query_code_library_callback,
+                query_knowledge_library_callback=self.query_knowledge_library_callback,
+                code_library_root=self.code_library_root,
+                code_library_status_callback=self.code_library_status_callback,
+                knowledge_library_root=self.knowledge_library_root,
+                knowledge_library_status_callback=self.knowledge_library_status_callback,
             )
             self._apply_user_defaults_to_session(sess)
             self.sessions[sid] = sess
@@ -26658,7 +28315,7 @@ window.MathJax={
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
-    <input id="configInput" type="file" accept=".json,application/json" style="display:none">
+    <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
   </div>
   <!-- LLM Config Modal -->
@@ -26681,7 +28338,7 @@ window.MathJax={
         <div id="llmFieldsContainer"></div>
       </div>
       <div class="llm-modal-footer">
-        <button id="llmConfigConfirm" class="llm-modal-btn-primary">Confirm</button>
+        <button id="llmConfigConfirm" type="button" class="llm-modal-btn-primary">Confirm</button>
         <label for="configInput" id="llmConfigImport" class="llm-modal-btn-secondary" style="cursor:pointer;margin:0">Import config</label>
       </div>
     </div>
@@ -27047,6 +28704,14 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .cmd-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#f9fbff}
 .cmd-main{font-weight:600}
 .cmd-sub{color:var(--muted);font-size:.82rem}
+.cmd-flags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.cmd-flag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #d4deec;background:#eef4fb;color:#37506c;font-size:.72rem;font-weight:600}
+.cmd-flag.warn{background:#fff3e4;border-color:#ffd3a1;color:#8a4b08}
+.cmd-flag.info{background:#e8f2ff;border-color:#bfd4ff;color:#0f4ca8}
+.cmd-output{margin-top:6px;max-height:220px;overflow:auto;background:#fff;border:1px solid #e7edf5;border-radius:6px;padding:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-word}
+.cmd-pager{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cmd-pager button{border:1px solid #d7e2f0;background:#fff;border-radius:6px;padding:2px 8px;font-size:.75rem;cursor:pointer}
+.cmd-pager button:disabled{opacity:.45;cursor:default}
 .diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff}
 .diff-head{font-weight:600;margin-bottom:4px}
 .diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
@@ -27087,14 +28752,15 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-field select,.llm-field input[type="text"],.llm-field input[type="url"],.llm-field input[type="password"],.llm-field input[type="number"]{width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.88rem;background:#fff;color:var(--fg,#0f1b2d);box-sizing:border-box}
 .llm-field input:focus,.llm-field select:focus,.llm-field textarea:focus{outline:none;border-color:var(--brand,#1f6feb);box-shadow:0 0 0 2px rgba(31,111,235,.15)}
 .llm-field .llm-hint{font-size:.72rem;color:var(--muted,#6c7a8d);margin-top:3px}
-.llm-modal-footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line,#d9e1ec)}
+.llm-modal-footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line,#d9e1ec);align-items:stretch}
+.llm-modal-footer .llm-modal-btn-primary,.llm-modal-footer .llm-modal-btn-secondary{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;line-height:1.2;text-align:center;min-height:40px;margin:0}
 .llm-modal-btn-primary{flex:1;padding:9px 16px;border-radius:8px;border:none;background:var(--brand,#1f6feb);color:#fff;font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-primary:hover{opacity:.9}
 .llm-modal-btn-secondary{flex:1;padding:9px 16px;border-radius:8px;border:1px solid var(--line,#d9e1ec);background:var(--bg,#f5f7fa);color:var(--fg,#0f1b2d);font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -27375,7 +29041,14 @@ function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;c
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
   if(type==='command'){
-    return `[command] ${String(d.name||'')}\n$ ${String(d.command||'')}\ncwd: ${String(d.cwd||'')}\nexit: ${String(d.exit_code??'-')}  duration: ${String(d.duration_ms??'-')}ms\nchanged: ${Array.isArray(d.changed_files)?d.changed_files.join(', '):''}\n${String(d.output||'')}`;
+    const extra=[
+      d.temp_output_path?`temp_output: ${String(d.temp_output_path)}`:'',
+      d.buffer_ref?`buffer_ref: ${String(d.buffer_ref)}`:'',
+      d.ui_truncated?'ui_preview_truncated: yes':'',
+      d.model_truncated?'model_context_truncated: yes':'',
+      d.output_page_count&&Number(d.output_page_count)>1?`model_pages: ${String(d.output_page_index||1)}/${String(d.output_page_count||1)}`:''
+    ].filter(Boolean).join('\\n');
+    return `[command] ${String(d.name||'')}\n$ ${String(d.command||'')}\ncwd: ${String(d.cwd||'')}\nexit: ${String(d.exit_code??'-')}  duration: ${String(d.duration_ms??'-')}ms\nchanged: ${Array.isArray(d.changed_files)?d.changed_files.join(', '):''}${extra?`\n${extra}`:''}\n${String(d.output||'')}`;
   }
   if(type==='file_patch'){
     return `[file_patch] ${String(d.path||'')}\nlocation: ${String(d.session_rel_path||d.path||'')}\nsession_root: ${String(d.session_root||'')}\n+${String(d.added??0)} / -${String(d.deleted??0)}\n${String(d.diff_numbered||d.diff||'')}`;
@@ -29242,6 +30915,10 @@ function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[]
 function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=`nodes=${Number(st.nodeCount||0)}${st.inflight?' · loading...':''}`;const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">tree truncated at ${esc(Number(st.maxNodes||0))} nodes</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
 function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>`<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div></div>`).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
+function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
+function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
+function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
+function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | mode=${S.snap?.execution_mode||S.config?.execution_mode||'sync'} | active_agent=${S.snap?.agent_active_role||'-'} | bb=${S.snap?.blackboard?.status||'-'} | task=${S.snap?.blackboard?.task_profile?.task_type||'-'} | complexity=${S.snap?.blackboard?.task_profile?.complexity||'-'} | judgement=${S.snap?.blackboard?.manager_judgement?.progress||'-'} | budget=${S.snap?.blackboard?.task_profile?.round_budget??'-'} | remaining=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'} | bb_cycles=${S.snap?.blackboard?.manager_cycles??'-'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
@@ -29252,7 +30929,8 @@ setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
 setPanelHtml('activity',(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)).map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`);
 const ops=S.snap?.operations||[];
 const cmds=ops.filter(x=>x.type==='command').slice(-30).reverse();
-setPanelHtml('commands',cmds.map(e=>`<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(e.data.name||'command')} · exit=${esc(e.data.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(e.data.command||'')}<br>${esc(e.data.cwd||'')}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">UI preview truncated</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">Model context truncated</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">Temp read_file ready</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">Buffered copy</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>Prev</button><span class=\"cmd-sub\">preview ${esc(page)}/${esc(total)}${totalAll>total?` of ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>Next</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">read_file path: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">buffer_ref: ${esc(d.buffer_ref)} · chars=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">full_output: ${esc(d.output_full_chars)} chars · ${esc(d.output_full_lines||0)} lines · strategy=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||'command')} · exit=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+const cmdHost=E('commands');if(cmdHost){for(const btn of cmdHost.querySelectorAll('[data-cmd-page]')){btn.onclick=(ev)=>{ev.preventDefault();const key=String(btn.getAttribute('data-cmd-key')||'').trim();const step=Number(btn.getAttribute('data-cmd-page')||0);const total=Math.max(1,Number(btn.getAttribute('data-cmd-total')||1));if(!key||!step)return;if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const cur=Number(S.commandPageState[key]||1);S.commandPageState[key]=Math.max(1,Math.min(total,cur+step));renderBoards()}}}
 const diffs=ops.filter(x=>x.type==='file_patch').slice(-20).reverse();
 setPanelHtml('diffs',diffs.map(e=>`<div class=\"diff-item\"><div class=\"diff-head\">${esc(e.data.path)} (+${esc(e.data.added)} / -${esc(e.data.deleted)})</div><div class=\"cmd-sub\">${esc(e.data.session_rel_path||e.data.path||'')}<br>${esc(e.data.session_root||'')}</div><div class=\"diff-body\">${diffHtml(e.data.diff_numbered||e.data.diff)}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_diffs'))}</div>`);
 const protocols=(S.protocols||[]).map(x=>`<div><span class=\"tag\">protocol</span>${esc(x.protocol)} · providers=${esc(x.active_providers)} · skills=${esc(x.active_skills)}</div>`).join('');
@@ -29897,7 +31575,6747 @@ window.addEventListener('resize',()=>scheduleFlowWrapAdjust())
 window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=addNode;E('removeNodeBtn').onclick=removeNode;E('addEdgeBtn').onclick=addEdge;E('resetFlowBtn').onclick=resetFlow;E('exportFlowBtn').onclick=exportFlow;E('importFlowBtn').onclick=importFlow;E('analyzeBtn').onclick=analyzeRules;E('scanBtn').onclick=scanSkills;E('generateBtn').onclick=generateSkill;E('saveBtn').onclick=saveSkill;E('applyModelBtn').onclick=applyModel;E('refreshBtn').onclick=()=>refreshAll(true);const langSel=E('skillsLangSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const tabNode=E('flowTabNodeBtn');const tabLink=E('flowTabLinkBtn');if(tabNode)tabNode.onclick=()=>switchFlowPanel('node');if(tabLink)tabLink.onclick=()=>switchFlowPanel('link');const loadBtn=E('previewToFlowBtn');if(loadBtn)loadBtn.onclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)));E('nodeTitle').oninput=syncNodeEditor;E('nodeType').onchange=syncNodeEditor;E('nodeContent').oninput=syncNodeEditor;bindSkillUpload();bindFlowZoom();bindFlowPan();switchFlowPanel('node');resetFlow();scheduleFlowWrapAdjust();applySkillsI18n();try{await refreshAll(false)}catch(err){showError(err.message||String(err))}})
 """
 
+RAG_TERM_GROUPS = (
+    ("rag", "retrieval", "retriever", "检索", "检索增强"),
+    ("graph", "graphrag", "graph_idf", "知识图谱", "图谱"),
+    ("research", "paper", "论文", "科研", "literature"),
+    ("experiment", "benchmark", "evaluation", "实验", "评测"),
+    ("equation", "formula", "theorem", "公式", "定理"),
+    ("dataset", "csv", "excel", "表格", "数据集"),
+    ("presentation", "ppt", "slides", "演示", "幻灯片"),
+    ("citation", "reference", "引用", "参考文献"),
+    ("pdf", "document", "文档"),
+)
+RAG_RESEARCH_HINTS = (
+    "abstract",
+    "introduction",
+    "related work",
+    "method",
+    "methods",
+    "experiment",
+    "experiments",
+    "result",
+    "results",
+    "conclusion",
+    "references",
+    "摘要",
+    "引言",
+    "方法",
+    "实验",
+    "结果",
+    "结论",
+    "参考文献",
+    "研究",
+    "论文",
+)
+RAG_CODE_HINTS = (
+    "def ",
+    "class ",
+    "import ",
+    "from ",
+    "#include",
+    "function ",
+    "const ",
+    "let ",
+    "public class",
+)
+RAG_SHORT_TOKEN_ALLOWLIST = {
+    "2d",
+    "3d",
+    "ai",
+    "ar",
+    "cv",
+    "kg",
+    "llm",
+    "ml",
+    "nlp",
+    "rl",
+    "tf",
+    "ui",
+    "ux",
+    "vr",
+}
+RAG_EN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "ours",
+    "she",
+    "so",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "under",
+    "until",
+    "up",
+    "us",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "with",
+    "you",
+    "your",
+    "yours",
+}
+RAG_ZH_STOPWORDS = {
+    "一个",
+    "一种",
+    "一些",
+    "以及",
+    "但是",
+    "你们",
+    "他们",
+    "任何",
+    "使得",
+    "关于",
+    "其中",
+    "其余",
+    "因此",
+    "因为",
+    "如果",
+    "并且",
+    "我们",
+    "或者",
+    "是否",
+    "然后",
+    "现在",
+    "相关",
+    "研究",
+    "结果",
+    "通过",
+    "进行",
+    "这里",
+    "这些",
+    "这是",
+    "那个",
+    "那些",
+    "这种",
+    "部分",
+    "问题",
+    "可以",
+}
+RAG_GENERIC_ENTITY_TERMS_EN = {
+    "acknowledgment",
+    "acknowledgments",
+    "acknowledgement",
+    "acknowledgements",
+    "abstract",
+    "algorithm",
+    "algorithms",
+    "analysis",
+    "appendix",
+    "appendices",
+    "background",
+    "benchmark",
+    "chapter",
+    "citation",
+    "conclusion",
+    "content",
+    "dataset",
+    "definition",
+    "definitions",
+    "discussion",
+    "discussions",
+    "document",
+    "equation",
+    "equations",
+    "evaluation",
+    "fig",
+    "experiment",
+    "experiments",
+    "figure",
+    "figures",
+    "figs",
+    "finding",
+    "findings",
+    "graph",
+    "introduction",
+    "keyword",
+    "keywords",
+    "lemma",
+    "lemmas",
+    "literature",
+    "material",
+    "materials",
+    "method",
+    "methods",
+    "methodology",
+    "model",
+    "paper",
+    "pdf",
+    "preliminary",
+    "preliminaries",
+    "presentation",
+    "proof",
+    "proofs",
+    "proposition",
+    "propositions",
+    "reference",
+    "references",
+    "report",
+    "research",
+    "result",
+    "results",
+    "sec",
+    "section",
+    "sections",
+    "slide",
+    "slides",
+    "study",
+    "summary",
+    "supplement",
+    "supplemental",
+    "supplementary",
+    "supplements",
+    "survey",
+    "table",
+    "tables",
+    "theorem",
+    "theorems",
+}
+RAG_GENERIC_ENTITY_TERMS_ZH = {
+    "图",
+    "图谱",
+    "图示",
+    "图表",
+    "报告",
+    "定义",
+    "定理",
+    "小节",
+    "小结",
+    "式",
+    "公式",
+    "引理",
+    "实验",
+    "引言",
+    "方法",
+    "方法学",
+    "文档",
+    "文献",
+    "数据",
+    "数据集",
+    "推论",
+    "摘要",
+    "材料",
+    "算法",
+    "章节",
+    "致谢",
+    "讨论",
+    "补充实验",
+    "补充材料",
+    "补充说明",
+    "表",
+    "证明",
+    "附录",
+    "结果",
+    "结论",
+    "命题",
+    "参考文献",
+    "研究",
+    "论文",
+    "图像",
+    "表格",
+}
+RAG_STRUCTURAL_ENTITY_PATTERNS = (
+    re.compile(
+        r"^(?:fig(?:ure)?s?|table|tables|sec(?:tion)?s?|chapter|chapters|appendix|appendices|"
+        r"eq(?:uation)?s?|alg(?:orithm)?s?|lemma|lemmas|theorem|theorems|proof|proofs|"
+        r"corollary|corollaries|proposition|propositions|definition|definitions)\b"
+        r"(?:\s*[-#:,.]?\s*[\(\[]?[0-9ivxlcdmA-Za-z._-]+[\)\]]?)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:related(?:\s+|-)?work|future(?:\s+|-)?work|materials?(?:\s+|-)?and(?:\s+|-)?methods|"
+        r"results?(?:\s+|-)?and(?:\s+|-)?discussion|supplement(?:ary|al)?(?:\s+|-)?materials?|"
+        r"supplement(?:ary|al)?(?:\s+|-)?appendix|acknowledg(?:e)?ments?)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:图|图表|表|章节|小节|附录|式|公式|算法|引理|定理|命题|推论|定义|证明)"
+        r"(?:\s*[-#:：.]?\s*[A-Za-z0-9一二三四五六七八九十百千万IVXivx()（）._-]+)?$"
+    ),
+)
+
+
+def _rag_safe_name(name: str, fallback: str = "document") -> str:
+    raw = Path(str(name or fallback)).name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    return safe or fallback
+
+
+def _rag_detect_language(text: str) -> str:
+    sample = str(text or "")
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    cjk = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", sample))
+    if cjk > latin * 1.2 and cjk >= 8:
+        return "zh"
+    if latin > cjk * 1.5 and latin >= 12:
+        return "en"
+    if latin and cjk:
+        return "mixed"
+    if cjk:
+        return "zh"
+    if latin:
+        return "en"
+    return "unknown"
+
+
+def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 120) -> list[str]:
+    text = re.sub(r"\s+", "", str(seq or ""))
+    out: list[str] = []
+    if len(text) < min_n:
+        return out
+    for n in range(min_n, max_n + 1):
+        if len(out) >= limit:
+            break
+        for idx in range(0, max(0, len(text) - n + 1)):
+            out.append(text[idx : idx + n])
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _rag_is_noise_token(token: object) -> bool:
+    raw = re.sub(r"\s+", " ", str(token or "").strip())
+    if not raw:
+        return True
+    low = raw.lower()
+    if re.fullmatch(r"\d+(?:\.\d+)?", low):
+        return True
+    if re.fullmatch(r"[_./+\-=]+", low):
+        return True
+    for pattern in RAG_STRUCTURAL_ENTITY_PATTERNS:
+        if pattern.fullmatch(raw):
+            return True
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", raw))
+    if has_cjk:
+        return raw in RAG_ZH_STOPWORDS or raw in RAG_GENERIC_ENTITY_TERMS_ZH or len(raw) < 2
+    if low in RAG_EN_STOPWORDS or low in RAG_GENERIC_ENTITY_TERMS_EN:
+        return True
+    if len(low) <= 2 and low not in RAG_SHORT_TOKEN_ALLOWLIST:
+        return True
+    return False
+
+
+def _rag_entity_allowed(token: object) -> bool:
+    raw = re.sub(r"\s+", " ", str(token or "").strip())
+    if not raw or _rag_is_noise_token(raw):
+        return False
+    low = raw.lower()
+    for pattern in RAG_STRUCTURAL_ENTITY_PATTERNS:
+        if pattern.fullmatch(raw):
+            return False
+    if low in RAG_GENERIC_ENTITY_TERMS_EN or raw in RAG_GENERIC_ENTITY_TERMS_ZH:
+        return False
+    if re.fullmatch(r"[a-z][a-z0-9_./+-]{2,40}", low) and low in RAG_EN_STOPWORDS:
+        return False
+    return True
+
+
+def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        token = re.sub(r"\s+", " ", str(value or "").strip())
+        if not token or not _rag_entity_allowed(token):
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _rag_choose_community(category: object, language: object, entities: list[object], raw_community: object = "") -> str:
+    cat = str(category or "document").strip() or "document"
+    lang = str(language or "unknown").strip() or "unknown"
+    raw = str(raw_community or "").strip()
+    if ":" in raw:
+        prefix, suffix = raw.split(":", 1)
+        if prefix.strip():
+            cat = prefix.strip()
+        suffix = suffix.strip()
+        if _rag_entity_allowed(suffix):
+            return f"{cat}:{suffix}"
+    elif raw and not _rag_is_noise_token(raw):
+        return f"{cat}:{raw}"
+    if cat == "research":
+        filtered = _rag_filter_entities(list(entities or []), limit=1)
+        if filtered:
+            return f"{cat}:{filtered[0]}"
+    return f"{cat}:{lang}"
+
+
+def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
+    raw = html.unescape(str(text or ""))
+    lowered = raw.lower()
+    out: list[str] = []
+    for token in re.findall(r"[a-z][a-z0-9_./+-]{1,40}", lowered):
+        if _rag_is_noise_token(token):
+            continue
+        out.append(token)
+        if len(out) >= max_terms:
+            return out
+    for token in re.findall(r"\b\d+(?:\.\d+)?\b", lowered):
+        if _rag_is_noise_token(token):
+            continue
+        out.append(token)
+        if len(out) >= max_terms:
+            return out
+    for seq in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]{2,}", raw):
+        for gram in _rag_cjk_ngrams(seq, limit=80):
+            if _rag_is_noise_token(gram):
+                continue
+            out.append(gram)
+            if len(out) >= max_terms:
+                return out
+    for token in re.findall(r"\b[A-Z]{2,}(?:-[A-Z0-9]{1,8})?\b", raw):
+        lowered_token = token.lower()
+        if _rag_is_noise_token(lowered_token):
+            continue
+        out.append(lowered_token)
+        if len(out) >= max_terms:
+            return out
+    return out
+
+
+def _rag_expand_tokens(tokens: list[str]) -> list[str]:
+    seen = {
+        str(x).strip().lower()
+        for x in tokens
+        if str(x).strip() and not _rag_is_noise_token(str(x).strip().lower())
+    }
+    out = list(seen)
+    for group in RAG_TERM_GROUPS:
+        gset = {str(x).strip().lower() for x in group if str(x).strip()}
+        if seen.intersection(gset):
+            for token in gset:
+                if token not in seen and not _rag_is_noise_token(token):
+                    seen.add(token)
+                    out.append(token)
+    return out
+
+
+def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
+    raw = str(text or "")
+    counter: Counter[str] = Counter()
+    for m in re.finditer(r"\b(?:[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3}|[A-Z]{2,}(?:-[A-Z0-9]{1,8})?)\b", raw):
+        token = trim(m.group(0).strip(), 80)
+        if _rag_entity_allowed(token):
+            counter[token] += 1
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,8}", raw):
+        token = trim(m.group(0).strip(), 32)
+        if _rag_entity_allowed(token):
+            counter[token] += 1
+    for token, freq in Counter(_rag_tokenize(raw, max_terms=600)).most_common(80):
+        if freq < 2:
+            continue
+        if re.fullmatch(r"[a-z][a-z0-9_./+-]{2,20}", token) and _rag_entity_allowed(token):
+            counter[token] += freq
+    return _rag_filter_entities([name for name, _ in counter.most_common(limit * 3)], limit=limit)
+
+
+def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
+    name = str(filename or "").lower()
+    body = str(text or "").lower()
+    labels: list[str] = []
+    category = "document"
+    if kind in {"image", "audio", "video"}:
+        category = "multimodal"
+        labels.append(kind)
+    elif kind in {"csv", "excel"}:
+        category = "dataset"
+        labels.extend(["table", "structured"])
+    elif kind == "presentation":
+        category = "presentation"
+        labels.append("slides")
+    elif any(x in name for x in (".py", ".js", ".ts", ".java", ".go", ".rs", ".cpp", ".c", ".hpp")):
+        category = "code"
+        labels.append("source")
+    elif any(h in body for h in RAG_RESEARCH_HINTS):
+        category = "research"
+        labels.extend(["paper", "literature"])
+    elif any(h in body for h in ("table", "column", "row", "字段", "列名", "样本", "dataset")):
+        category = "dataset"
+        labels.append("structured")
+    elif any(h in body for h in RAG_CODE_HINTS):
+        category = "code"
+        labels.append("source")
+    if "report" in name or "报告" in body:
+        labels.append("report")
+    if "citation" in body or "引用" in body or "参考文献" in body:
+        labels.append("citation")
+    if kind == "pdf":
+        labels.append("pdf")
+    if kind == "document":
+        labels.append("office")
+    return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
+
+
+def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
+    content = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    if not content:
+        return []
+    blocks = [x.strip() for x in re.split(r"\n\s*\n+", content) if x.strip()]
+    chunks: list[dict] = []
+    current = ""
+    for block in blocks:
+        if len(block) > max_chars:
+            pieces = [block[i : i + max_chars] for i in range(0, len(block), max(200, max_chars - overlap))]
+        else:
+            pieces = [block]
+        for piece in pieces:
+            if not current:
+                current = piece
+                continue
+            if len(current) + 2 + len(piece) <= max_chars:
+                current = current + "\n\n" + piece
+                continue
+            preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
+            chunks.append({"text": current.strip(), "anchor": preview})
+            tail = current[-overlap:].strip()
+            current = (tail + "\n\n" + piece).strip() if tail else piece
+            if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                break
+        if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+            break
+    if current and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
+        preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
+        chunks.append({"text": current.strip(), "anchor": preview})
+    return chunks[:RAG_MAX_CHUNKS_PER_DOC]
+
+
+CODE_LIBRARY_IGNORED_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode", ".next", ".nuxt", ".cache",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".turbo", ".yarn", ".pnpm-store",
+    "node_modules", "dist", "build", "vendor", "target", "coverage", "out", "bin", "obj",
+    "__pycache__", ".venv", "venv", "env", ".tox",
+}
+CODE_LIBRARY_LANGUAGE_BY_EXT = {
+    ".py": "python",
+    ".pyi": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".h": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".cs": "csharp",
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".fish": "shell",
+    ".ps1": "powershell",
+    ".sql": "sql",
+    ".lua": "lua",
+    ".r": "r",
+    ".dart": "dart",
+    ".vue": "vue",
+    ".svelte": "svelte",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "css",
+    ".sass": "css",
+    ".less": "css",
+    ".xml": "xml",
+    ".json": "json",
+    ".jsonc": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".conf": "ini",
+    ".env": "env",
+    ".md": "markdown",
+}
+CODE_LIBRARY_SPECIAL_FILENAMES = {
+    "dockerfile": "docker",
+    "makefile": "make",
+    "cmakelists.txt": "cmake",
+    "requirements.txt": "requirements",
+    "package.json": "json",
+}
+
+
+def _code_language_from_name(name: str, text: str = "") -> str:
+    raw = str(name or "").strip()
+    low = raw.lower()
+    ext = Path(low).suffix.lower()
+    if ext in CODE_LIBRARY_LANGUAGE_BY_EXT:
+        return str(CODE_LIBRARY_LANGUAGE_BY_EXT.get(ext, "text"))
+    if low in CODE_LIBRARY_SPECIAL_FILENAMES:
+        return str(CODE_LIBRARY_SPECIAL_FILENAMES.get(low, "text"))
+    head = "\n".join(str(text or "").splitlines()[:2]).lower()
+    if head.startswith("#!/"):
+        if "python" in head:
+            return "python"
+        if "node" in head or "deno" in head:
+            return "javascript"
+        if "bash" in head or "sh" in head or "zsh" in head:
+            return "shell"
+    return "text"
+
+
+def _code_is_test_path(rel_path: str) -> bool:
+    low = str(rel_path or "").strip().lower()
+    return any(token in low for token in ("/tests/", "/test/", "_test.", ".spec.", ".test.", "/__tests__/"))
+
+
+def _code_module_name(rel_path: str, language: str = "") -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if not raw:
+        return ""
+    path = PurePosixPath(raw)
+    parts = [str(x) for x in path.parts if str(x).strip() and str(x) not in {".", ".."}]
+    if not parts:
+        return ""
+    stem = path.stem
+    if language == "python" and stem == "__init__":
+        stem = path.parent.name if path.parent.name else "__init__"
+        parts = [str(x) for x in path.parent.parts if str(x).strip() and str(x) not in {".", ".."}]
+    else:
+        parts = parts[:-1] + [stem]
+    return ".".join(part for part in parts if part)
+
+
+def _code_choose_community(rel_path: str, language: str, labels: list[str] | None = None) -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    parts = [part for part in raw.split("/") if part]
+    top = parts[0] if parts else "root"
+    label_set = {str(x).strip().lower() for x in (labels or []) if str(x).strip()}
+    if "test" in label_set or _code_is_test_path(raw):
+        return f"test:{top}"
+    return f"{str(language or 'code').strip() or 'code'}:{top}"
+
+
+def _code_query_terms(text: str, limit: int = 48) -> set[str]:
+    raw = str(text or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./:-]{1,80}", raw):
+        low = token.strip().lower().strip(":/.")
+        if not low or low in seen or low in RAG_EN_STOPWORDS:
+            continue
+        seen.add(low)
+        out.append(low)
+        if len(out) >= limit:
+            break
+    return set(out)
+
+
+class CodeContentParser:
+    def _decode_text_bytes(self, data: bytes) -> str:
+        if not data:
+            return ""
+        if b"\x00" in data[:4096]:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
+
+    def detect_language(self, fp: Path, text: str = "") -> str:
+        return _code_language_from_name(fp.name, text=text)
+
+    def supported_file(self, fp: Path, mime: str = "") -> bool:
+        if not fp or not fp.name:
+            return False
+        low_name = fp.name.lower()
+        if low_name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock", "poetry.lock", "composer.lock"}:
+            return False
+        if low_name.endswith((".min.js", ".min.css", ".map")):
+            return False
+        if fp.name.startswith(".") and low_name not in CODE_LIBRARY_SPECIAL_FILENAMES:
+            return False
+        if fp.suffix.lower() in CODE_LIBRARY_LANGUAGE_BY_EXT:
+            return True
+        return low_name in CODE_LIBRARY_SPECIAL_FILENAMES
+
+    def _normalize_symbol(self, value: object) -> str:
+        token = str(value or "").strip()
+        token = re.sub(r"\s+", " ", token)
+        if not token:
+            return ""
+        token = token.strip(".:")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:.#-]{0,119}", token):
+            return ""
+        return token
+
+    def _extract_imports(self, text: str, language: str) -> list[str]:
+        raw = str(text or "")
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def push(token: object):
+            val = str(token or "").strip().strip("\"'`")
+            val = re.sub(r"\s+", "", val)
+            val = val.strip(".")
+            if not val:
+                return
+            key = val.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            found.append(val)
+
+        if language == "python":
+            for m in re.finditer(r"(?m)^\s*import\s+([A-Za-z0-9_.,\s]+)", raw):
+                for part in str(m.group(1) or "").split(","):
+                    push(str(part).split(" as ", 1)[0])
+            for m in re.finditer(r"(?m)^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+", raw):
+                push(m.group(1))
+        elif language in {"javascript", "typescript", "vue", "svelte"}:
+            for m in re.finditer(r"""(?m)^\s*import\s+.*?\s+from\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+            for m in re.finditer(r"""(?m)^\s*export\s+.*?\s+from\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+            for m in re.finditer(r"""require\(\s*['"]([^'"]+)['"]\s*\)""", raw):
+                push(m.group(1))
+        elif language in {"java", "kotlin", "scala"}:
+            for m in re.finditer(r"(?m)^\s*import\s+([A-Za-z0-9_.*]+)", raw):
+                push(m.group(1))
+        elif language == "go":
+            for m in re.finditer(r'(?m)^\s*import\s+(?:\w+\s+)?["`]([^"`]+)["`]', raw):
+                push(m.group(1))
+            block = re.search(r'(?ms)^\s*import\s*\((.*?)\)', raw)
+            if block:
+                for token in re.findall(r'["`]([^"`]+)["`]', str(block.group(1) or "")):
+                    push(token)
+        elif language == "rust":
+            for m in re.finditer(r"(?m)^\s*use\s+([^;]+);", raw):
+                push(str(m.group(1) or "").split(" as ", 1)[0])
+        elif language in {"c", "cpp"}:
+            for m in re.finditer(r'(?m)^\s*#include\s+[<"]([^">]+)[">]', raw):
+                push(m.group(1))
+        elif language in {"ruby", "php"}:
+            for m in re.finditer(r"""(?m)^\s*(?:require|require_relative|include)\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+        return found[:48]
+
+    def _split_large_chunk(
+        self,
+        lines: list[str],
+        *,
+        line_start: int,
+        symbol: str,
+        kind: str,
+        max_chars: int = CODE_CHUNK_CHARS,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        buf: list[str] = []
+        buf_start = int(line_start or 1)
+        for idx, line in enumerate(lines):
+            candidate = "\n".join(buf + [line]).strip()
+            if buf and len(candidate) > max_chars:
+                text = "\n".join(buf).strip()
+                if text:
+                    end_line = buf_start + len(buf) - 1
+                    rows.append(
+                        {
+                            "text": text,
+                            "anchor": f"{kind} {symbol} L{buf_start}-{end_line}".strip(),
+                            "line_start": buf_start,
+                            "line_end": end_line,
+                            "symbol": symbol,
+                            "symbol_kind": kind,
+                        }
+                    )
+                back = max(0, len(buf) - 4)
+                buf = buf[back:]
+                buf_start = int(line_start or 1) + idx - len(buf)
+            buf.append(line)
+        text = "\n".join(buf).strip()
+        if text:
+            end_line = buf_start + len(buf) - 1
+            rows.append(
+                {
+                    "text": text,
+                    "anchor": f"{kind} {symbol} L{buf_start}-{end_line}".strip(),
+                    "line_start": buf_start,
+                    "line_end": end_line,
+                    "symbol": symbol,
+                    "symbol_kind": kind,
+                }
+            )
+        return rows[:24]
+
+    def _python_chunks(self, text: str) -> tuple[list[dict], list[dict]]:
+        src = str(text or "")
+        lines = src.splitlines()
+        out: list[dict] = []
+        symbols: list[dict] = []
+        try:
+            tree = ast.parse(src)
+        except Exception:
+            return out, symbols
+        prelude_end = 0
+        for node in list(tree.body):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                prelude_end = max(prelude_end, int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1))
+        if prelude_end > 0:
+            prelude_text = "\n".join(lines[:prelude_end]).strip()
+            if prelude_text:
+                out.append(
+                    {
+                        "text": prelude_text,
+                        "anchor": f"module imports L1-{prelude_end}",
+                        "line_start": 1,
+                        "line_end": prelude_end,
+                        "symbol": "__imports__",
+                        "symbol_kind": "imports",
+                    }
+                )
+
+        def add_symbol(node: ast.AST, symbol: str, kind: str):
+            start = int(getattr(node, "lineno", 1) or 1)
+            end = int(getattr(node, "end_lineno", start) or start)
+            if start < 1 or end < start:
+                return
+            chunk_lines = lines[start - 1 : end]
+            if not chunk_lines:
+                return
+            symbols.append(
+                {
+                    "name": symbol,
+                    "kind": kind,
+                    "line_start": start,
+                    "line_end": end,
+                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180),
+                }
+            )
+            text_chunk = "\n".join(chunk_lines).strip()
+            if len(text_chunk) <= CODE_CHUNK_CHARS:
+                out.append(
+                    {
+                        "text": text_chunk,
+                        "anchor": f"{kind} {symbol} L{start}-{end}".strip(),
+                        "line_start": start,
+                        "line_end": end,
+                        "symbol": symbol,
+                        "symbol_kind": kind,
+                    }
+                )
+            else:
+                out.extend(self._split_large_chunk(chunk_lines, line_start=start, symbol=symbol, kind=kind))
+
+        for node in list(tree.body):
+            if isinstance(node, ast.ClassDef):
+                add_symbol(node, str(node.name), "class")
+                for child in list(node.body):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        prefix = f"{node.name}.{getattr(child, 'name', '')}"
+                        add_symbol(child, prefix.strip("."), "method")
+            elif isinstance(node, ast.FunctionDef):
+                add_symbol(node, str(node.name), "function")
+            elif isinstance(node, ast.AsyncFunctionDef):
+                add_symbol(node, str(node.name), "async_function")
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:160]
+
+    def _decl_matchers(self, language: str) -> list[tuple[re.Pattern[str], str]]:
+        common = [
+            (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_][$\w]*)"), "class"),
+            (re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_][$\w]*)"), "interface"),
+            (re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_][$\w]*)"), "type"),
+            (re.compile(r"^\s*(?:export\s+)?enum\s+([A-Za-z_][$\w]*)"), "enum"),
+            (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][$\w]*)"), "function"),
+            (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][$\w]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][$\w]*)\s*=>"), "function"),
+            (re.compile(r"^\s*(?:public|private|protected|static|final|abstract|override|virtual|async|get|set|\s)*\s*([A-Za-z_][$\w]*)\s*\([^;{}]*\)\s*\{"), "method"),
+        ]
+        if language == "go":
+            return [
+                (re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+struct\b"), "struct"),
+                (re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+interface\b"), "interface"),
+                (re.compile(r"^\s*func\s*(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\("), "function"),
+            ]
+        if language == "rust":
+            return [
+                (re.compile(r"^\s*(?:pub\s+)?struct\s+([A-Za-z_]\w*)"), "struct"),
+                (re.compile(r"^\s*(?:pub\s+)?enum\s+([A-Za-z_]\w*)"), "enum"),
+                (re.compile(r"^\s*(?:pub\s+)?trait\s+([A-Za-z_]\w*)"), "trait"),
+                (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\("), "function"),
+                (re.compile(r"^\s*impl\b.*?([A-Za-z_]\w*)?\s*\{?$"), "impl"),
+            ]
+        if language in {"java", "kotlin", "scala", "swift", "csharp"}:
+            return [
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*class\s+([A-Za-z_]\w*)"), "class"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*interface\s+([A-Za-z_]\w*)"), "interface"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*enum\s+([A-Za-z_]\w*)"), "enum"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|override|suspend|async|\s)+[A-Za-z0-9_<>,\[\]?]+\s+([A-Za-z_]\w*)\s*\("), "method"),
+            ]
+        if language in {"c", "cpp"}:
+            return [
+                (re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)"), "type"),
+                (re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_:<>\s*&]+\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?\{"), "function"),
+            ]
+        if language == "ruby":
+            return [
+                (re.compile(r"^\s*class\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)"), "class"),
+                (re.compile(r"^\s*module\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)"), "module"),
+                (re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_]\w*[!?=]?)"), "method"),
+            ]
+        if language == "php":
+            return [
+                (re.compile(r"^\s*(?:final\s+|abstract\s+)?class\s+([A-Za-z_]\w*)"), "class"),
+                (re.compile(r"^\s*(?:public|private|protected|static|\s)*function\s+([A-Za-z_]\w*)\s*\("), "function"),
+            ]
+        return common
+
+    def _generic_code_chunks(self, text: str, language: str) -> tuple[list[dict], list[dict]]:
+        src = str(text or "")
+        lines = src.splitlines()
+        if not lines:
+            return [], []
+        matchers = self._decl_matchers(language)
+        brace_depth = 0
+        depths: list[int] = []
+        for line in lines:
+            depths.append(brace_depth)
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
+        candidates: list[dict] = []
+        for idx, line in enumerate(lines):
+            for pattern, kind in matchers:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                name = self._normalize_symbol(m.group(1) if m.groups() else "")
+                if not name:
+                    continue
+                candidates.append({"index": idx, "depth": int(depths[idx] or 0), "name": name, "kind": kind})
+                break
+        out: list[dict] = []
+        symbols: list[dict] = []
+        if candidates and candidates[0]["index"] > 0:
+            prelude = "\n".join(lines[: int(candidates[0]["index"])]).strip()
+            if prelude:
+                end = int(candidates[0]["index"])
+                out.append(
+                    {
+                        "text": prelude,
+                        "anchor": f"module prelude L1-{end}",
+                        "line_start": 1,
+                        "line_end": end,
+                        "symbol": "__prelude__",
+                        "symbol_kind": "prelude",
+                    }
+                )
+        for pos, cand in enumerate(candidates):
+            start_idx = int(cand["index"] or 0)
+            end_idx = len(lines) - 1
+            for nxt in candidates[pos + 1 :]:
+                if int(nxt["depth"] or 0) <= int(cand["depth"] or 0):
+                    end_idx = max(start_idx, int(nxt["index"] or 0) - 1)
+                    break
+            chunk_lines = lines[start_idx : end_idx + 1]
+            chunk_text = "\n".join(chunk_lines).strip()
+            if not chunk_text:
+                continue
+            line_start = start_idx + 1
+            line_end = end_idx + 1
+            symbols.append(
+                {
+                    "name": str(cand.get("name", "") or ""),
+                    "kind": str(cand.get("kind", "") or ""),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), str(cand.get("name", ""))), 180),
+                }
+            )
+            if len(chunk_text) <= CODE_CHUNK_CHARS:
+                out.append(
+                    {
+                        "text": chunk_text,
+                        "anchor": f"{cand.get('kind','symbol')} {cand.get('name','')} L{line_start}-{line_end}".strip(),
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "symbol": str(cand.get("name", "") or ""),
+                        "symbol_kind": str(cand.get("kind", "") or ""),
+                    }
+                )
+            else:
+                out.extend(
+                    self._split_large_chunk(
+                        chunk_lines,
+                        line_start=line_start,
+                        symbol=str(cand.get("name", "") or ""),
+                        kind=str(cand.get("kind", "") or "symbol"),
+                    )
+                )
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                break
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:200]
+
+    def _fallback_chunks(self, text: str) -> list[dict]:
+        rows = _rag_chunk_text(text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
+        out: list[dict] = []
+        line_no = 1
+        for row in rows[:CODE_MAX_CHUNKS_PER_DOC]:
+            chunk_text = str(row.get("text", "") or "")
+            line_count = max(1, chunk_text.count("\n") + 1)
+            out.append(
+                {
+                    "text": chunk_text,
+                    "anchor": str(row.get("anchor", "") or ""),
+                    "line_start": line_no,
+                    "line_end": line_no + line_count - 1,
+                    "symbol": "",
+                    "symbol_kind": "chunk",
+                }
+            )
+            line_no += max(1, line_count - 1)
+        return out
+
+    def _comment_summary(self, text: str, language: str) -> str:
+        lines = str(text or "").splitlines()[:24]
+        picked: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if picked:
+                    break
+                continue
+            if stripped.startswith(("#", "//", "/*", "*", "--")):
+                picked.append(re.sub(r"^(#|//|/\*+|\*+|--)\s*", "", stripped).strip("*/ "))
+                if len(" ".join(picked)) >= 280:
+                    break
+            elif picked:
+                break
+        return trim(" ".join(x for x in picked if x), 320)
+
+    def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
+        raw_text = trim(str(text_override or ""), 300_000)
+        raw_bytes: bytes | None = None
+        if not raw_text:
+            try:
+                raw_bytes = fp.read_bytes()
+            except Exception:
+                raw_bytes = None
+            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), 300_000)
+        language = self.detect_language(fp, text=raw_text)
+        imports = self._extract_imports(raw_text, language)
+        if language == "python":
+            chunks, symbols = self._python_chunks(raw_text)
+        else:
+            chunks, symbols = self._generic_code_chunks(raw_text, language)
+        if not chunks:
+            chunks = self._fallback_chunks(raw_text)
+        exports = [
+            str(row.get("name", "") or "").strip()
+            for row in symbols
+            if str(row.get("kind", "") or "").strip() in {"class", "function", "async_function", "struct", "trait", "interface", "enum", "type"}
+        ]
+        entities: list[str] = []
+        seen_entities: set[str] = set()
+        for token in exports + [str(row.get("name", "") or "") for row in symbols] + imports:
+            clean = self._normalize_symbol(token)
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen_entities:
+                continue
+            seen_entities.add(key)
+            entities.append(clean)
+            if len(entities) >= 48:
+                break
+        labels: list[str] = []
+        low_name = fp.name.lower()
+        if language and language != "text":
+            labels.append(language)
+        if _code_is_test_path(fp.name):
+            labels.append("test")
+        if low_name.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env")):
+            labels.append("config")
+        if low_name.endswith((".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".html")):
+            labels.append("frontend")
+        summary_bits = [f"{language} file" if language else "code file"]
+        if exports:
+            summary_bits.append("exports: " + ", ".join(exports[:8]))
+        elif symbols:
+            summary_bits.append("symbols: " + ", ".join(str(row.get("name", "")) for row in symbols[:8]))
+        if imports:
+            summary_bits.append("imports: " + ", ".join(imports[:6]))
+        comment_summary = self._comment_summary(raw_text, language)
+        if comment_summary:
+            summary_bits.append(comment_summary)
+        return {
+            "filename": fp.name,
+            "path": str(fp),
+            "kind": "source_code",
+            "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
+            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
+            "language": language or "text",
+            "text": raw_text,
+            "text_chars": len(raw_text),
+            "summary": trim(" | ".join(bit for bit in summary_bits if bit), 1600),
+            "entities": entities,
+            "category": "code",
+            "labels": sorted({str(x).strip() for x in labels if str(x).strip()}),
+            "metadata": {
+                "line_count": max(0, raw_text.count("\n") + (1 if raw_text else 0)),
+                "symbol_count": len(symbols),
+                "import_count": len(imports),
+            },
+            "symbols": symbols[:200],
+            "imports": imports[:64],
+            "exports": exports[:64],
+            "chunks": chunks[:CODE_MAX_CHUNKS_PER_DOC],
+        }
+
+
+class RAGContentParser:
+    TEXT_EXTS = {
+        ".txt", ".md", ".rst", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".html", ".htm",
+        ".csv", ".tsv", ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".go", ".rs", ".rb", ".php",
+        ".swift", ".kt", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".toml", ".ini",
+        ".cfg", ".conf", ".env", ".properties", ".tex", ".bib", ".log",
+    }
+
+    def _decode_text_bytes(self, data: bytes) -> str:
+        if not data:
+            return ""
+        if b"\x00" in data[:4096]:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
+
+    def _module_available(self, name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except Exception:
+            return False
+
+    def _run_text_extractor_cmd(self, cmd: list[str], timeout: int = 45) -> str:
+        if not cmd:
+            return ""
+        exe = shutil.which(str(cmd[0]))
+        if not exe:
+            return ""
+        try:
+            r = subprocess.run(
+                [exe] + [str(x) for x in cmd[1:]],
+                capture_output=True,
+                text=True,
+                errors="ignore",
+                timeout=timeout,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _extract_strings_fallback(self, fp: Path, min_len: int = 4) -> str:
+        text = self._run_text_extractor_cmd(["strings", "-n", str(min_len), str(fp)], timeout=30)
+        if text:
+            return trim(text, 80_000)
+        try:
+            raw = fp.read_bytes().decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+        chunks = re.findall(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff\s\-\_\.\,\:\;\(\)\[\]\/]{3,}", raw)
+        return trim("\n".join(chunks), 80_000)
+
+    def _extract_xml_text_tokens(self, xml_text: str, local_names: tuple[str, ...] = ("t",)) -> list[str]:
+        names = {x.lower() for x in local_names}
+        out: list[str] = []
+        if not xml_text.strip():
+            return out
+        try:
+            root = ET.fromstring(xml_text)
+            for node in root.iter():
+                tag = str(node.tag)
+                local = tag.rsplit("}", 1)[-1].split(":", 1)[-1].lower()
+                if local not in names:
+                    continue
+                text = (node.text or "").strip()
+                if text:
+                    out.append(html.unescape(text))
+        except Exception:
+            for name in names:
+                pattern = rf"(?is)<(?:\w+:)?{re.escape(name)}\b[^>]*>(.*?)</(?:\w+:)?{re.escape(name)}>"
+                for m in re.finditer(pattern, xml_text):
+                    raw = re.sub(r"(?is)<[^>]+>", "", m.group(1))
+                    val = html.unescape(raw).strip()
+                    if val:
+                        out.append(val)
+        return out
+
+    def _extract_pdf_text(self, pdf_path: Path) -> str:
+        try:
+            from pdfminer.high_level import extract_text
+
+            text = extract_text(str(pdf_path))
+            if text and text.strip():
+                return trim(text.strip(), 150_000)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        tool = shutil.which("pdftotext")
+        if tool:
+            try:
+                r = subprocess.run(
+                    [tool, "-layout", str(pdf_path), "-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return trim(r.stdout.strip(), 150_000)
+            except Exception:
+                pass
+        try:
+            raw = pdf_path.read_bytes()
+            text = raw.decode("latin-1", errors="ignore")
+            chunks = re.findall(r"\(([^()]{4,2000})\)", text)
+            return trim("\n".join(chunks), 80_000)
+        except Exception:
+            return ""
+
+    def _extract_csv_text(self, raw: bytes) -> str:
+        text = self._decode_text_bytes(raw)
+        if not text:
+            return ""
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        sample = "\n".join(lines[:40])
+        dialect = csv.excel
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            pass
+        table_lines: list[str] = []
+        try:
+            reader = csv.reader(io.StringIO(text), dialect)
+            for i, row in enumerate(reader):
+                if i >= 300:
+                    break
+                vals = [str(v).strip() for v in row]
+                if any(vals):
+                    table_lines.append("\t".join(vals))
+        except Exception:
+            table_lines = lines[:300]
+        return trim("\n".join(table_lines), 120_000)
+
+    def _extract_xlsx_text(self, fp: Path) -> str:
+        if self._module_available("openpyxl"):
+            try:
+                import openpyxl  # type: ignore
+
+                wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+                lines: list[str] = []
+                for ws in list(wb.worksheets)[:8]:
+                    lines.append(f"[Sheet] {ws.title}")
+                    rows = 0
+                    for row in ws.iter_rows(min_row=1, max_row=300, values_only=True):
+                        vals = [str(v).strip() for v in row if v not in (None, "")]
+                        if not vals:
+                            continue
+                        lines.append("\t".join(vals))
+                        rows += 1
+                        if rows >= 160:
+                            break
+                wb.close()
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                shared: list[str] = []
+                if "xl/sharedStrings.xml" in zf.namelist():
+                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                    shared = self._extract_xml_text_tokens(shared_xml, ("t",))
+                lines: list[str] = []
+                for name in sorted(zf.namelist()):
+                    if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
+                        continue
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    lines.append(f"[Sheet] {Path(name).stem}")
+                    taken = 0
+                    for row_raw in rows_raw:
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        vals: list[str] = []
+                        for attrs, body in cells:
+                            ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
+                            ctype = (ctype_m.group(1) if ctype_m else "").strip()
+                            token = ""
+                            if ctype == "inlineStr":
+                                token = " ".join(self._extract_xml_text_tokens(body, ("t",))).strip()
+                            else:
+                                vm = re.search(r"(?is)<v\b[^>]*>(.*?)</v>", body)
+                                if vm:
+                                    raw = re.sub(r"(?is)<[^>]+>", "", vm.group(1)).strip()
+                                    if ctype == "s" and raw.isdigit():
+                                        idx = int(raw)
+                                        token = shared[idx] if 0 <= idx < len(shared) else raw
+                                    else:
+                                        token = html.unescape(raw)
+                            token = token.strip()
+                            if token:
+                                vals.append(token)
+                        if vals:
+                            lines.append("\t".join(vals))
+                            taken += 1
+                        if taken >= 160:
+                            break
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_xls_text(self, fp: Path) -> str:
+        if self._module_available("xlrd"):
+            try:
+                import xlrd  # type: ignore
+
+                wb = xlrd.open_workbook(str(fp), on_demand=True)
+                lines: list[str] = []
+                for si in range(min(wb.nsheets, 8)):
+                    sh = wb.sheet_by_index(si)
+                    lines.append(f"[Sheet] {sh.name}")
+                    for r in range(min(sh.nrows, 160)):
+                        vals = [str(sh.cell_value(r, c)).strip() for c in range(sh.ncols) if sh.cell_value(r, c) not in ("", None)]
+                        if vals:
+                            lines.append("\t".join(vals))
+                wb.release_resources()
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+        if xls2csv_text:
+            return trim(xls2csv_text, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_docx_text(self, fp: Path) -> str:
+        if self._module_available("docx"):
+            try:
+                import docx  # type: ignore
+
+                doc = docx.Document(str(fp))
+                lines: list[str] = []
+                for p in doc.paragraphs:
+                    text = (p.text or "").strip()
+                    if text:
+                        lines.append(text)
+                for tb in doc.tables:
+                    for row in tb.rows:
+                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                        vals = [v for v in vals if v]
+                        if vals:
+                            lines.append("\t".join(vals))
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
+                lines: list[str] = []
+                for name in sorted(parts):
+                    tokens = self._extract_xml_text_tokens(zf.read(name).decode("utf-8", errors="ignore"), ("t",))
+                    if tokens:
+                        lines.append(f"[Part] {Path(name).name}")
+                        lines.extend(tokens[:3000])
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_doc_text(self, fp: Path) -> str:
+        for cmd in (
+            ["antiword", str(fp)],
+            ["catdoc", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_pptx_text(self, fp: Path) -> str:
+        if self._module_available("pptx"):
+            try:
+                import pptx  # type: ignore
+
+                pres = pptx.Presentation(str(fp))
+                lines: list[str] = []
+                for idx, slide in enumerate(pres.slides, 1):
+                    lines.append(f"[Slide {idx}]")
+                    for shape in slide.shapes:
+                        text = ""
+                        if hasattr(shape, "text"):
+                            text = str(getattr(shape, "text") or "").strip()
+                        if text:
+                            lines.append(text)
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
+                lines: list[str] = []
+                for name in sorted(slides):
+                    tokens = self._extract_xml_text_tokens(zf.read(name).decode("utf-8", errors="ignore"), ("t",))
+                    if tokens:
+                        lines.append(f"[Slide] {Path(name).stem}")
+                        lines.extend(tokens[:1200])
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_ppt_text(self, fp: Path) -> str:
+        for cmd in (
+            ["catppt", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def detect_kind(self, fp: Path, mime: str = "") -> str:
+        ext = fp.suffix.lower()
+        mime_low = str(mime or "").strip().lower()
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            return "image"
+        if ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            return "video"
+        if ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            return "audio"
+        if ext == ".pdf" or "pdf" in mime_low:
+            return "pdf"
+        if ext == ".csv":
+            return "csv"
+        if ext in {".xlsx", ".xls"}:
+            return "excel"
+        if ext in {".pptx", ".ppt"}:
+            return "presentation"
+        if ext in {".docx", ".doc"}:
+            return "document"
+        if ext in self.TEXT_EXTS or mime_low.startswith("text/") or "json" in mime_low:
+            return "text"
+        return "binary"
+
+    def supported_file(self, fp: Path, mime: str = "") -> bool:
+        return self.detect_kind(fp, mime) != "binary"
+
+    def media_metadata(self, fp: Path, mime: str = "") -> dict:
+        kind = self.detect_kind(fp, mime)
+        guessed = str(mime or guess_mime_from_name(fp.name, "application/octet-stream") or "application/octet-stream")
+        out = {
+            "kind": kind,
+            "mime": guessed,
+            "size": int(fp.stat().st_size) if fp.exists() else 0,
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else "",
+        }
+        if kind == "image" and self._module_available("PIL"):
+            try:
+                from PIL import Image  # type: ignore
+
+                with Image.open(fp) as im:
+                    out["width"] = int(im.width)
+                    out["height"] = int(im.height)
+            except Exception:
+                pass
+        if kind in {"audio", "video"}:
+            ffprobe = shutil.which("ffprobe")
+            if ffprobe:
+                try:
+                    r = subprocess.run(
+                        [
+                            ffprobe,
+                            "-v",
+                            "error",
+                            "-show_format",
+                            "-show_streams",
+                            "-print_format",
+                            "json",
+                            str(fp),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    payload = parse_json_object(r.stdout, {})
+                    fmt = payload.get("format", {}) if isinstance(payload, dict) else {}
+                    if isinstance(fmt, dict):
+                        if fmt.get("duration") is not None:
+                            out["duration"] = float(fmt.get("duration") or 0.0)
+                        if fmt.get("bit_rate") is not None:
+                            out["bit_rate"] = int(float(fmt.get("bit_rate") or 0))
+                    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+                    if isinstance(streams, list) and streams:
+                        stream0 = streams[0] if isinstance(streams[0], dict) else {}
+                        if isinstance(stream0, dict):
+                            if stream0.get("width") is not None:
+                                out["width"] = int(stream0.get("width") or 0)
+                            if stream0.get("height") is not None:
+                                out["height"] = int(stream0.get("height") or 0)
+                            if stream0.get("codec_name"):
+                                out["codec"] = str(stream0.get("codec_name"))
+                except Exception:
+                    pass
+        return out
+
+    def extract_pdf_images(self, pdf_path: Path, target_dir: Path, limit: int = RAG_PDF_IMAGE_LIMIT) -> list[dict]:
+        rows: list[dict] = []
+        if limit <= 0 or not self._module_available("fitz"):
+            return rows
+        try:
+            import fitz  # type: ignore
+
+            doc = fitz.open(str(pdf_path))
+            target_dir.mkdir(parents=True, exist_ok=True)
+            seen_xrefs: set[int] = set()
+            for page_idx in range(len(doc)):
+                if len(rows) >= limit:
+                    break
+                page = doc.load_page(page_idx)
+                for img_idx, info in enumerate(page.get_images(full=True), 1):
+                    if len(rows) >= limit:
+                        break
+                    xref = int(info[0] or 0)
+                    if xref <= 0 or xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+                    base = doc.extract_image(xref)
+                    blob = base.get("image", b"")
+                    ext = str(base.get("ext", "png") or "png")
+                    if not blob:
+                        continue
+                    fp = target_dir / f"page_{page_idx+1}_{img_idx}.{ext}"
+                    fp.write_bytes(blob)
+                    rows.append(
+                        {
+                            "type": "image",
+                            "page": page_idx + 1,
+                            "path": str(fp),
+                            "name": fp.name,
+                            "mime": guess_mime_from_name(fp.name, "image/png"),
+                            "size": len(blob),
+                        }
+                    )
+            doc.close()
+        except Exception:
+            return rows
+        return rows
+
+    def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
+        kind = self.detect_kind(fp, mime)
+        text = trim(str(text_override or ""), 150_000)
+        raw: bytes | None = None
+        if not text and fp.exists() and fp.is_file():
+            try:
+                raw = fp.read_bytes()
+            except Exception:
+                raw = None
+        if not text:
+            if kind == "pdf":
+                text = self._extract_pdf_text(fp)
+            elif kind == "csv" and raw is not None:
+                text = self._extract_csv_text(raw)
+            elif kind == "excel" and fp.suffix.lower() == ".xlsx":
+                text = self._extract_xlsx_text(fp)
+            elif kind == "excel":
+                text = self._extract_xls_text(fp)
+            elif kind == "presentation" and fp.suffix.lower() == ".pptx":
+                text = self._extract_pptx_text(fp)
+            elif kind == "presentation":
+                text = self._extract_ppt_text(fp)
+            elif kind == "document" and fp.suffix.lower() == ".docx":
+                text = self._extract_docx_text(fp)
+            elif kind == "document":
+                text = self._extract_doc_text(fp)
+            elif kind == "text" and raw is not None:
+                text = trim(self._decode_text_bytes(raw), 150_000)
+        lang = _rag_detect_language(text)
+        cls = _rag_classify_document(fp.name, kind, text)
+        meta = self.media_metadata(fp, mime=mime)
+        return {
+            "filename": fp.name,
+            "path": str(fp),
+            "kind": kind,
+            "mime": str(meta.get("mime", mime or "")),
+            "size": int(meta.get("size", 0) or 0),
+            "sha256": str(meta.get("sha256", "")),
+            "language": lang,
+            "text": text,
+            "text_chars": len(text),
+            "summary": trim(text, 1200),
+            "entities": _rag_extract_entities(text),
+            "category": str(cls.get("category", "document")),
+            "labels": list(cls.get("labels", [])),
+            "metadata": meta,
+        }
+
+
+class TFGraphIDFIndex:
+    def __init__(self):
+        self.built_at = 0.0
+        self.idf: dict[str, float] = {}
+        self.inverted: dict[str, list[tuple[str, float]]] = {}
+        self.chunk_norms: dict[str, float] = {}
+        self.chunk_meta: dict[str, dict] = {}
+        self.doc_meta: dict[str, dict] = {}
+        self.doc_to_chunks: dict[str, list[str]] = {}
+        self.related_docs: dict[str, dict[str, int]] = {}
+        self.entity_to_docs: dict[str, list[str]] = {}
+        self.community_counts: dict[str, int] = {}
+        self.community_doc_ids: dict[str, list[str]] = {}
+        self.community_reports: dict[str, dict] = {}
+        self.community_links: dict[str, dict[str, int]] = {}
+        self.community_idf: dict[str, float] = {}
+        self.community_inverted: dict[str, list[tuple[str, float]]] = {}
+        self.community_norms: dict[str, float] = {}
+        self.token_doc_df: dict[str, int] = {}
+        self.token_community_df: dict[str, int] = {}
+        self.dynamic_noise_hard_tokens: set[str] = set()
+        self.dynamic_noise_penalties: dict[str, float] = {}
+        self.dynamic_noise_meta: dict[str, dict] = {}
+
+    def snapshot(self) -> dict:
+        return {
+            "built_at": float(self.built_at or 0.0),
+            "idf": {str(k): float(v or 0.0) for k, v in self.idf.items()},
+            "inverted": {
+                str(token): [[str(chunk_id), float(weight or 0.0)] for chunk_id, weight in rows]
+                for token, rows in self.inverted.items()
+            },
+            "chunk_norms": {str(k): float(v or 0.0) for k, v in self.chunk_norms.items()},
+            "chunk_meta": {str(k): dict(v) for k, v in self.chunk_meta.items()},
+            "doc_meta": {str(k): dict(v) for k, v in self.doc_meta.items()},
+            "doc_to_chunks": {str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.doc_to_chunks.items()},
+            "related_docs": {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in self.related_docs.items()
+            },
+            "entity_to_docs": {str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.entity_to_docs.items()},
+            "community_counts": {str(k): int(v or 0) for k, v in self.community_counts.items()},
+            "community_doc_ids": {
+                str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.community_doc_ids.items()
+            },
+            "community_reports": {str(k): dict(v) for k, v in self.community_reports.items()},
+            "community_links": {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in self.community_links.items()
+            },
+            "community_idf": {str(k): float(v or 0.0) for k, v in self.community_idf.items()},
+            "community_inverted": {
+                str(token): [[str(community), float(weight or 0.0)] for community, weight in rows]
+                for token, rows in self.community_inverted.items()
+            },
+            "community_norms": {str(k): float(v or 0.0) for k, v in self.community_norms.items()},
+            "token_doc_df": {str(k): int(v or 0) for k, v in self.token_doc_df.items()},
+            "token_community_df": {str(k): int(v or 0) for k, v in self.token_community_df.items()},
+            "dynamic_noise_hard_tokens": sorted(str(x) for x in self.dynamic_noise_hard_tokens if str(x).strip()),
+            "dynamic_noise_penalties": {str(k): float(v or 0.0) for k, v in self.dynamic_noise_penalties.items()},
+            "dynamic_noise_meta": {str(k): dict(v) for k, v in self.dynamic_noise_meta.items()},
+        }
+
+    def restore(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        def _restore_weight_rows(raw: object) -> dict[str, list[tuple[str, float]]]:
+            out: dict[str, list[tuple[str, float]]] = {}
+            if not isinstance(raw, dict):
+                return out
+            for key, rows in raw.items():
+                norm_key = str(key or "").strip()
+                if not norm_key or not isinstance(rows, list):
+                    continue
+                pairs: list[tuple[str, float]] = []
+                for row in rows:
+                    if isinstance(row, (list, tuple)) and len(row) >= 2:
+                        left = str(row[0] or "").strip()
+                        if not left:
+                            continue
+                        try:
+                            weight = float(row[1] or 0.0)
+                        except Exception:
+                            weight = 0.0
+                        pairs.append((left, weight))
+                if pairs:
+                    out[norm_key] = pairs
+            return out
+
+        try:
+            self.built_at = float(payload.get("built_at", 0.0) or 0.0)
+            self.idf = {str(k): float(v or 0.0) for k, v in (payload.get("idf", {}) or {}).items()}
+            self.inverted = _restore_weight_rows(payload.get("inverted", {}))
+            self.chunk_norms = {str(k): float(v or 0.0) for k, v in (payload.get("chunk_norms", {}) or {}).items()}
+            self.chunk_meta = {
+                str(k): dict(v) for k, v in (payload.get("chunk_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.doc_meta = {
+                str(k): dict(v) for k, v in (payload.get("doc_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.doc_to_chunks = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("doc_to_chunks", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.related_docs = {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in (payload.get("related_docs", {}) or {}).items()
+                if isinstance(v, dict)
+            }
+            self.entity_to_docs = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("entity_to_docs", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.community_counts = {
+                str(k): int(v or 0) for k, v in (payload.get("community_counts", {}) or {}).items()
+            }
+            self.community_doc_ids = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("community_doc_ids", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.community_reports = {
+                str(k): dict(v) for k, v in (payload.get("community_reports", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.community_links = {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in (payload.get("community_links", {}) or {}).items()
+                if isinstance(v, dict)
+            }
+            self.community_idf = {
+                str(k): float(v or 0.0) for k, v in (payload.get("community_idf", {}) or {}).items()
+            }
+            self.community_inverted = _restore_weight_rows(payload.get("community_inverted", {}))
+            self.community_norms = {
+                str(k): float(v or 0.0) for k, v in (payload.get("community_norms", {}) or {}).items()
+            }
+            self.token_doc_df = {
+                str(k): int(v or 0) for k, v in (payload.get("token_doc_df", {}) or {}).items()
+            }
+            self.token_community_df = {
+                str(k): int(v or 0) for k, v in (payload.get("token_community_df", {}) or {}).items()
+            }
+            self.dynamic_noise_hard_tokens = {
+                str(x).strip().lower()
+                for x in (payload.get("dynamic_noise_hard_tokens", []) or [])
+                if str(x).strip()
+            }
+            self.dynamic_noise_penalties = {
+                str(k): float(v or 0.0) for k, v in (payload.get("dynamic_noise_penalties", {}) or {}).items()
+            }
+            self.dynamic_noise_meta = {
+                str(k): dict(v) for k, v in (payload.get("dynamic_noise_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            return bool(self.doc_meta or self.chunk_meta or self.community_reports)
+        except Exception:
+            return False
+
+    def _dynamic_noise_penalty_factor(self, doc_ratio: float, community_ratio: float) -> float:
+        pressure = 0.0
+        if doc_ratio >= RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO:
+            pressure = max(
+                pressure,
+                min(
+                    1.0,
+                    (doc_ratio - RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO)
+                    / max(0.001, RAG_DYNAMIC_NOISE_HARD_DOC_RATIO - RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO),
+                ),
+            )
+        if community_ratio >= RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO:
+            pressure = max(
+                pressure,
+                min(
+                    1.0,
+                    (community_ratio - RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO)
+                    / max(
+                        0.001,
+                        RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO - RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO,
+                    ),
+                ),
+            )
+        return max(0.10, 0.58 - 0.42 * pressure)
+
+    def _derive_dynamic_noise_controls(
+        self,
+        doc_df: Counter[str],
+        doc_total: int,
+        community_df: Counter[str],
+        community_total: int,
+    ) -> tuple[set[str], dict[str, float], dict[str, dict]]:
+        hard_tokens: set[str] = set()
+        penalties: dict[str, float] = {}
+        meta: dict[str, dict] = {}
+        if doc_total < 8 and community_total < 3:
+            return hard_tokens, penalties, meta
+        token_pool = set(doc_df.keys()) | set(community_df.keys())
+        for token in token_pool:
+            doc_freq = int(doc_df.get(token, 0) or 0)
+            community_freq = int(community_df.get(token, 0) or 0)
+            doc_ratio = (float(doc_freq) / float(max(1, doc_total))) if doc_total > 0 else 0.0
+            community_ratio = (
+                float(community_freq) / float(max(1, community_total)) if community_total > 0 else 0.0
+            )
+            hard = (
+                doc_total >= 12
+                and community_total >= 3
+                and doc_freq >= max(RAG_DYNAMIC_NOISE_MIN_DOC_FREQ * 2, int(math.ceil(doc_total * RAG_DYNAMIC_NOISE_HARD_DOC_RATIO)))
+                and community_freq >= max(
+                    RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ + 1,
+                    int(math.ceil(community_total * RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO)),
+                )
+            )
+            soft = (
+                (doc_freq >= RAG_DYNAMIC_NOISE_MIN_DOC_FREQ and doc_ratio >= RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO)
+                or (
+                    community_total >= 2
+                    and community_freq >= RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ
+                    and community_ratio >= RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO
+                )
+            )
+            if hard:
+                hard_tokens.add(token)
+                meta[token] = {
+                    "policy": "hard",
+                    "doc_freq": doc_freq,
+                    "doc_ratio": round(doc_ratio, 6),
+                    "community_freq": community_freq,
+                    "community_ratio": round(community_ratio, 6),
+                }
+                continue
+            if soft:
+                factor = self._dynamic_noise_penalty_factor(doc_ratio, community_ratio)
+                penalties[token] = factor
+                meta[token] = {
+                    "policy": "soft",
+                    "factor": round(factor, 6),
+                    "doc_freq": doc_freq,
+                    "doc_ratio": round(doc_ratio, 6),
+                    "community_freq": community_freq,
+                    "community_ratio": round(community_ratio, 6),
+                }
+        return hard_tokens, penalties, meta
+
+    def _token_noise_factor(self, token: str) -> float:
+        key = str(token or "").strip().lower()
+        if not key:
+            return 0.0
+        if key in self.dynamic_noise_hard_tokens:
+            return 0.0
+        return float(self.dynamic_noise_penalties.get(key, 1.0) or 1.0)
+
+    def build(self, documents: list[dict], chunks: list[dict]):
+        self.built_at = now_ts()
+        self.idf = {}
+        self.inverted = {}
+        self.chunk_norms = {}
+        self.chunk_meta = {}
+        self.doc_meta = {}
+        self.doc_to_chunks = {}
+        self.related_docs = {}
+        self.entity_to_docs = {}
+        self.community_counts = {}
+        self.community_doc_ids = {}
+        self.community_reports = {}
+        self.community_links = {}
+        self.community_idf = {}
+        self.community_inverted = {}
+        self.community_norms = {}
+        self.token_doc_df = {}
+        self.token_community_df = {}
+        self.dynamic_noise_hard_tokens = set()
+        self.dynamic_noise_penalties = {}
+        self.dynamic_noise_meta = {}
+        if not documents:
+            return
+        entity_to_docs: dict[str, set[str]] = defaultdict(set)
+        community_counts: Counter[str] = Counter()
+        for doc in documents:
+            doc_id = str(doc.get("id", "") or "").strip()
+            if not doc_id:
+                continue
+            category = str(doc.get("category", "document") or "document")
+            language = str(doc.get("language", "unknown") or "unknown")
+            entities = _rag_filter_entities(list(doc.get("entities", []) or []), limit=32)
+            community = _rag_choose_community(category, language, entities, doc.get("community", ""))
+            row = {
+                "id": doc_id,
+                "title": str(doc.get("title", doc.get("filename", doc_id)) or doc_id),
+                "filename": str(doc.get("filename", "") or ""),
+                "kind": str(doc.get("kind", "document") or "document"),
+                "category": category,
+                "language": language,
+                "summary": str(doc.get("summary", "") or ""),
+                "entities": entities[:32],
+                "community": community,
+                "updated_at": float(doc.get("updated_at", doc.get("created_at", 0.0)) or 0.0),
+                "chunk_count": int(doc.get("chunk_count", 0) or 0),
+                "assets_count": len(doc.get("assets", []) or []),
+            }
+            self.doc_meta[doc_id] = row
+            self.doc_to_chunks[doc_id] = []
+            community_counts[community] += 1
+            for ent in row["entities"][:16]:
+                entity_to_docs[ent].add(doc_id)
+        token_rows: dict[str, Counter[str]] = {}
+        chunk_df: Counter[str] = Counter()
+        doc_token_sets: dict[str, set[str]] = defaultdict(set)
+        for chunk in chunks:
+            chunk_id = str(chunk.get("id", "") or "").strip()
+            doc_id = str(chunk.get("doc_id", "") or "").strip()
+            if not chunk_id or doc_id not in self.doc_meta:
+                continue
+            text = str(chunk.get("text", "") or "")
+            tokens = _rag_expand_tokens(_rag_tokenize(text))
+            counts = Counter(tokens)
+            if counts:
+                chunk_df.update(counts.keys())
+                doc_token_sets[doc_id].update(counts.keys())
+            token_rows[chunk_id] = counts
+            entities = _rag_filter_entities(list(chunk.get("entities", []) or []), limit=24)
+            self.chunk_meta[chunk_id] = {
+                "id": chunk_id,
+                "doc_id": doc_id,
+                "seq": int(chunk.get("seq", 0) or 0),
+                "text": text,
+                "anchor": str(chunk.get("anchor", "") or ""),
+                "entities": entities[:24],
+            }
+            self.doc_to_chunks.setdefault(doc_id, []).append(chunk_id)
+        doc_df: Counter[str] = Counter()
+        for tokens in doc_token_sets.values():
+            if tokens:
+                doc_df.update(tokens)
+        related: dict[str, dict[str, int]] = defaultdict(dict)
+        for entity, doc_ids in entity_to_docs.items():
+            ordered = sorted(doc_ids)
+            if len(ordered) <= 1:
+                continue
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    a = ordered[i]
+                    b = ordered[j]
+                    related[a][b] = int(related[a].get(b, 0) or 0) + 1
+                    related[b][a] = int(related[b].get(a, 0) or 0) + 1
+        self.related_docs = {k: dict(v) for k, v in related.items()}
+        self.entity_to_docs = {k: sorted(v) for k, v in entity_to_docs.items()}
+        self.community_counts = dict(community_counts)
+        for doc_id, row in self.doc_meta.items():
+            row["graph_degree"] = (
+                len(self.doc_to_chunks.get(doc_id, []) or [])
+                + len(row.get("entities", []) or [])
+                + len(self.related_docs.get(doc_id, {}) or {})
+            )
+        community_doc_ids: dict[str, list[str]] = defaultdict(list)
+        community_entities: dict[str, Counter[str]] = defaultdict(Counter)
+        community_categories: dict[str, Counter[str]] = defaultdict(Counter)
+        community_languages: dict[str, Counter[str]] = defaultdict(Counter)
+        community_kinds: dict[str, Counter[str]] = defaultdict(Counter)
+        for doc_id, row in self.doc_meta.items():
+            community = str(row.get("community", "") or "").strip() or "document:unknown"
+            community_doc_ids[community].append(doc_id)
+            community_categories[community][str(row.get("category", "document") or "document")] += 1
+            community_languages[community][str(row.get("language", "unknown") or "unknown")] += 1
+            community_kinds[community][str(row.get("kind", "document") or "document")] += 1
+            community_entities[community].update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()][:12])
+        for community, doc_ids in community_doc_ids.items():
+            doc_ids.sort(
+                key=lambda doc_id: (
+                    int(self.doc_meta.get(doc_id, {}).get("graph_degree", 0) or 0),
+                    int(self.doc_meta.get(doc_id, {}).get("chunk_count", 0) or 0),
+                    float(self.doc_meta.get(doc_id, {}).get("updated_at", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+        community_links: dict[str, dict[str, int]] = defaultdict(dict)
+        for doc_id, related_map in self.related_docs.items():
+            left = str(self.doc_meta.get(doc_id, {}).get("community", "") or "").strip()
+            if not left:
+                continue
+            for other_id, weight in related_map.items():
+                right = str(self.doc_meta.get(other_id, {}).get("community", "") or "").strip()
+                if (not right) or right == left:
+                    continue
+                community_links[left][right] = int(community_links[left].get(right, 0) or 0) + int(weight or 0)
+        community_token_rows: dict[str, Counter[str]] = {}
+        community_df: Counter[str] = Counter()
+        community_reports: dict[str, dict] = {}
+        for community, doc_ids in community_doc_ids.items():
+            top_docs = [self.doc_meta.get(doc_id, {}) for doc_id in doc_ids[:6]]
+            top_entities = [name for name, _ in community_entities[community].most_common(10)]
+            top_categories = [name for name, _ in community_categories[community].most_common(3)]
+            top_languages = [name for name, _ in community_languages[community].most_common(3)]
+            top_kinds = [name for name, _ in community_kinds[community].most_common(3)]
+            links = sorted((community_links.get(community, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+            representative_docs = [
+                {
+                    "id": str(row.get("id", "") or ""),
+                    "title": str(row.get("title", "") or ""),
+                    "summary": trim(str(row.get("summary", "") or ""), 260),
+                    "entities": list(row.get("entities", []) or [])[:8],
+                    "graph_degree": int(row.get("graph_degree", 0) or 0),
+                }
+                for row in top_docs
+                if isinstance(row, dict)
+            ]
+            report_lines = [
+                f"Community: {community}",
+                f"Documents: {len(doc_ids)}",
+                f"Categories: {', '.join(top_categories) if top_categories else 'document'}",
+                f"Languages: {', '.join(top_languages) if top_languages else 'unknown'}",
+                f"Kinds: {', '.join(top_kinds) if top_kinds else 'document'}",
+            ]
+            if top_entities:
+                report_lines.append("Top entities: " + ", ".join(top_entities))
+            if links:
+                report_lines.append(
+                    "Cross-community links: "
+                    + ", ".join(f"{name} ({int(weight or 0)})" for name, weight in links[:4])
+                )
+            for idx, row in enumerate(representative_docs[:4], 1):
+                report_lines.append(
+                    f"Representative document {idx}: {row.get('title','')} "
+                    f"[{row.get('id','')}] degree={row.get('graph_degree',0)}"
+                )
+                if str(row.get("summary", "")).strip():
+                    report_lines.append(trim(str(row.get("summary", "") or ""), 320))
+                doc_entities = [str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()]
+                if doc_entities:
+                    report_lines.append("Document entities: " + ", ".join(doc_entities[:8]))
+            report_text = trim("\n".join(report_lines), 6000)
+            counts = Counter(_rag_expand_tokens(_rag_tokenize(report_text)))
+            if counts:
+                community_df.update(counts.keys())
+            community_token_rows[community] = counts
+            community_reports[community] = {
+                "community": community,
+                "doc_ids": list(doc_ids),
+                "doc_count": len(doc_ids),
+                "top_entities": top_entities,
+                "top_categories": top_categories,
+                "top_languages": top_languages,
+                "top_kinds": top_kinds,
+                "representative_docs": representative_docs,
+                "links": [{"community": name, "weight": int(weight or 0)} for name, weight in links[:6]],
+                "report": report_text,
+            }
+        doc_total = max(1, len(self.doc_meta))
+        community_total = max(1, len(community_reports))
+        hard_tokens, penalties, meta = self._derive_dynamic_noise_controls(
+            doc_df,
+            doc_total,
+            community_df,
+            community_total,
+        )
+        self.token_doc_df = {token: int(freq or 0) for token, freq in doc_df.items()}
+        self.token_community_df = {token: int(freq or 0) for token, freq in community_df.items()}
+        self.dynamic_noise_hard_tokens = set(hard_tokens)
+        self.dynamic_noise_penalties = dict(penalties)
+        self.dynamic_noise_meta = {str(token): dict(info) for token, info in meta.items()}
+        total_chunks = max(1, len(self.chunk_meta))
+        self.idf = {
+            token: math.log((1.0 + total_chunks) / (1.0 + freq)) + 1.0
+            for token, freq in chunk_df.items()
+            if token not in hard_tokens
+        }
+        inverted: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for chunk_id, counts in token_rows.items():
+            weights: dict[str, float] = {}
+            sq = 0.0
+            for token, freq in counts.items():
+                if token in hard_tokens:
+                    continue
+                weight = (1.0 + math.log(max(1, int(freq)))) * self.idf.get(token, 1.0) * penalties.get(token, 1.0)
+                if weight <= 0.0:
+                    continue
+                weights[token] = weight
+                sq += weight * weight
+            norm = math.sqrt(sq) or 1.0
+            self.chunk_norms[chunk_id] = norm
+            for token, weight in weights.items():
+                inverted[token].append((chunk_id, weight))
+        self.inverted = dict(inverted)
+        self.community_idf = {
+            token: math.log((1.0 + community_total) / (1.0 + freq)) + 1.0
+            for token, freq in community_df.items()
+            if token not in hard_tokens
+        }
+        community_inverted: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for community, counts in community_token_rows.items():
+            sq = 0.0
+            weights: dict[str, float] = {}
+            for token, freq in counts.items():
+                if token in hard_tokens:
+                    continue
+                weight = (
+                    (1.0 + math.log(max(1, int(freq))))
+                    * self.community_idf.get(token, 1.0)
+                    * penalties.get(token, 1.0)
+                )
+                if weight <= 0.0:
+                    continue
+                weights[token] = weight
+                sq += weight * weight
+            norm = math.sqrt(sq) or 1.0
+            self.community_norms[community] = norm
+            for token, weight in weights.items():
+                community_inverted[token].append((community, weight))
+        self.community_doc_ids = {k: list(v) for k, v in community_doc_ids.items()}
+        self.community_links = {k: dict(v) for k, v in community_links.items()}
+        self.community_reports = community_reports
+        self.community_inverted = dict(community_inverted)
+
+    def _query_weights(self, query: str) -> tuple[dict[str, float], float, set[str], str]:
+        tokens = _rag_expand_tokens(_rag_tokenize(query))
+        counts = Counter(tokens)
+        weights: dict[str, float] = {}
+        sq = 0.0
+        for token, freq in counts.items():
+            factor = self._token_noise_factor(token)
+            if factor <= 0.0:
+                continue
+            weight = (1.0 + math.log(max(1, int(freq)))) * self.idf.get(token, 1.0) * factor
+            if weight <= 0.0:
+                continue
+            weights[token] = weight
+            sq += weight * weight
+        norm = math.sqrt(sq) or 1.0
+        entities = set(_rag_filter_entities(_rag_extract_entities(query), limit=16))
+        qcat = str(_rag_classify_document("query.txt", "text", query).get("category", "document"))
+        return weights, norm, entities, qcat
+
+    def _finalize_query_rows(
+        self,
+        query: str,
+        rows: list[dict],
+        qentities: set[str],
+        *,
+        top_k: int,
+        route: str,
+        route_meta: dict | None = None,
+    ) -> dict:
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = "|".join(
+                [
+                    str(row.get("citation", "") or ""),
+                    str(row.get("doc_id", "") or ""),
+                    str(row.get("chunk_id", "") or ""),
+                    str(row.get("community", "") or ""),
+                    str(row.get("route_evidence", "") or ""),
+                ]
+            ).strip("|")
+            if not key:
+                key = trim(json_dumps(row, sort_keys=True), 240)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(dict(row))
+        deduped.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+                float(x.get("graph_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        top_rows = deduped[: max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))]
+        community_counter: Counter[str] = Counter(str(x.get("community", "")) for x in top_rows if str(x.get("community", "")).strip())
+        community_cards = []
+        for community, freq in community_counter.most_common(5):
+            related = [x for x in top_rows if str(x.get("community", "")) == community]
+            entities: Counter[str] = Counter()
+            for row in related:
+                entities.update([str(x) for x in (row.get("entities", []) or []) if str(x).strip()])
+            community_cards.append(
+                {
+                    "community": community,
+                    "hits": int(freq),
+                    "top_entities": [name for name, _ in entities.most_common(6)],
+                    "sample_titles": [str(x.get("title", "")) for x in related[:3]],
+                }
+            )
+        summary_parts = []
+        for row in top_rows[:4]:
+            summary_parts.append(f"{row.get('citation')} {row.get('title','')}: {trim(row.get('text',''), 180)}")
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(summary_parts),
+            "community_cards": community_cards,
+            "query_entities": sorted(qentities),
+            "route": str(route or "fast"),
+            "route_meta": dict(route_meta or {}),
+        }
+
+    def _fast_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        allowed_communities: set[str] | None = None,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for chunk_id, cweight in self.inverted.get(token, []):
+                scores[chunk_id] += qweight * cweight
+        rows: list[dict] = []
+        for chunk_id, dot in scores.items():
+            chunk = self.chunk_meta.get(chunk_id, {})
+            doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
+            if not doc:
+                continue
+            if category and str(doc.get("category", "")) != str(category):
+                continue
+            if kind and str(doc.get("kind", "")) != str(kind):
+                continue
+            if allowed and str(doc.get("community", "") or "") not in allowed:
+                continue
+            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            chunk_entities = set(str(x) for x in (chunk.get("entities", []) or []))
+            doc_entities = set(str(x) for x in (doc.get("entities", []) or []))
+            ent_overlap = len(qentities.intersection(chunk_entities))
+            doc_ent_overlap = len(qentities.intersection(doc_entities))
+            degree = int(doc.get("graph_degree", 0) or 0)
+            graph_bonus = (0.18 * ent_overlap) + (0.10 * doc_ent_overlap) + min(0.16, math.log1p(degree) / 12.0)
+            if qcat and str(doc.get("category", "")) == qcat:
+                graph_bonus += 0.08
+            if str(doc.get("community", "")) in self.community_counts:
+                graph_bonus += min(0.08, math.log1p(self.community_counts.get(str(doc.get("community", "")), 0)) / 16.0)
+            final_score = lexical * 0.82 + graph_bonus
+            rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": str(doc.get("id", "")),
+                    "chunk_id": chunk_id,
+                    "title": str(doc.get("title", "")),
+                    "filename": str(doc.get("filename", "")),
+                    "kind": str(doc.get("kind", "")),
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "language": str(doc.get("language", "")),
+                    "anchor": str(chunk.get("anchor", "")),
+                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "entities": list(chunk.get("entities", []) or [])[:12],
+                    "citation": f"[{doc.get('id', '')}:{chunk_id}]",
+                    "route_evidence": "chunk",
+                }
+            )
+        if not rows:
+            for doc in sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True):
+                if category and str(doc.get("category", "")) != str(category):
+                    continue
+                if kind and str(doc.get("kind", "")) != str(kind):
+                    continue
+                if allowed and str(doc.get("community", "") or "") not in allowed:
+                    continue
+                hay = f"{doc.get('title', '')}\n{doc.get('summary', '')}".strip().lower()
+                ratio = difflib.SequenceMatcher(None, query.lower()[:240], hay[:480]).ratio()
+                if ratio < 0.16:
+                    continue
+                rows.append(
+                    {
+                        "score": round(ratio, 6),
+                        "lexical_score": round(ratio, 6),
+                        "graph_score": 0.0,
+                        "doc_id": str(doc.get("id", "")),
+                        "chunk_id": "",
+                        "title": str(doc.get("title", "")),
+                        "filename": str(doc.get("filename", "")),
+                        "kind": str(doc.get("kind", "")),
+                        "category": str(doc.get("category", "")),
+                        "community": str(doc.get("community", "")),
+                        "language": str(doc.get("language", "")),
+                        "anchor": "",
+                        "text": trim(str(doc.get("summary", "")), 1200),
+                        "entities": list(doc.get("entities", []) or [])[:12],
+                        "citation": f"[{doc.get('id', '')}]",
+                        "route_evidence": "document",
+                    }
+                )
+        return self._finalize_query_rows(
+            query,
+            rows,
+            qentities,
+            top_k=top_k,
+            route="fast",
+            route_meta={"mode": "fast", "allowed_communities": sorted(allowed)[:8]},
+        )
+
+    def _decide_query_route(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> tuple[str, dict]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        tokens = _rag_expand_tokens(_rag_tokenize(query))
+        low = query.lower()
+        global_terms = [
+            "overall", "overview", "landscape", "big picture", "global", "across", "system-wide",
+            "summarize all", "compare", "comparison", "tradeoff", "relationship", "relationships",
+            "multi-hop", "cross-community", "trend", "timeline", "survey", "synthesize",
+            "整体", "全局", "综述", "概览", "总览", "全貌", "脉络", "关系", "联系", "对比", "比较",
+            "趋势", "演化", "系统性", "跨领域", "跨社区", "多跳", "汇总", "归纳", "科研路线",
+        ]
+        local_terms = [
+            "what is", "who is", "when did", "where is", "which file", "which document", "exact",
+            "citation", "cite", "locate", "path", "filename", "line", "chunk",
+            "是什么", "哪篇", "哪个", "哪一个", "哪份", "具体", "精确", "引用", "路径", "文件", "文档",
+        ]
+        reasons: list[str] = []
+        global_score = 0
+        local_score = 0
+        if len(tokens) >= 18:
+            global_score += 1
+            reasons.append("long-query")
+        if len(tokens) >= 32:
+            global_score += 1
+        if len(qentities) >= 2:
+            global_score += 1
+            reasons.append("multi-entity")
+        if any(term in low for term in global_terms):
+            global_score += 2
+            reasons.append("global-intent")
+        if qcat == "research" and len(tokens) >= 14:
+            global_score += 1
+            reasons.append("research-query")
+        if int(top_k or 0) >= 10:
+            global_score += 1
+        if any(term in low for term in local_terms):
+            local_score += 2
+            reasons.append("local-intent")
+        if re.search(r"\.(pdf|docx?|pptx?|csv|xlsx?|txt|md|json|py)\b", low):
+            local_score += 2
+            reasons.append("file-target")
+        if len(tokens) <= 10:
+            local_score += 1
+        if len(qentities) <= 1:
+            local_score += 1
+        route = "fast"
+        if len(self.community_reports) <= 1:
+            route = "fast"
+            reasons.append("community-index-small")
+        elif global_score >= 5 and global_score >= local_score + 1:
+            route = "global"
+        elif global_score >= 3 and global_score > local_score:
+            route = "hybrid"
+        return route, {
+            "mode": "auto",
+            "global_score": int(global_score),
+            "local_score": int(local_score),
+            "query_category": qcat,
+            "query_entities": sorted(qentities),
+            "community_count": len(self.community_reports),
+            "reasons": reasons[:12],
+            "token_count": len(tokens),
+            "nonzero_terms": len(qweights),
+            "query_norm": round(float(qnorm or 0.0), 6),
+        }
+
+    def _rank_global_communities(
+        self,
+        query: str,
+        *,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> list[dict]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for community, cweight in self.community_inverted.get(token, []):
+                scores[community] += qweight * cweight
+        community_rows: list[dict] = []
+        for community, report in self.community_reports.items():
+            if category and str(category) not in [str(x) for x in (report.get("top_categories", []) or [])]:
+                continue
+            if kind and str(kind) not in [str(x) for x in (report.get("top_kinds", []) or [])]:
+                continue
+            dot = float(scores.get(community, 0.0) or 0.0)
+            lexical = dot / ((self.community_norms.get(community, 1.0) or 1.0) * qnorm)
+            report_entities = {str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()}
+            ent_overlap = len(qentities.intersection(report_entities))
+            cross_links = sum(int(x.get("weight", 0) or 0) for x in (report.get("links", []) or [])[:3])
+            graph_bonus = (0.22 * ent_overlap) + min(0.18, math.log1p(cross_links) / 9.5) + min(
+                0.12, math.log1p(int(report.get("doc_count", 0) or 0)) / 8.0
+            )
+            if qcat and str(qcat) in [str(x) for x in (report.get("top_categories", []) or [])]:
+                graph_bonus += 0.08
+            final_score = lexical * 0.72 + graph_bonus
+            if final_score <= 0.0:
+                ratio = difflib.SequenceMatcher(None, query.lower()[:280], str(report.get("report", "")).lower()[:1200]).ratio()
+                if ratio < 0.18:
+                    continue
+                lexical = ratio
+                final_score = ratio * 0.62 + graph_bonus
+            community_rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": "",
+                    "chunk_id": "",
+                    "title": f"Community Report · {community}",
+                    "filename": "",
+                    "kind": "community_report",
+                    "category": str((report.get("top_categories", []) or ["document"])[0]),
+                    "community": community,
+                    "language": str((report.get("top_languages", []) or ["unknown"])[0]),
+                    "anchor": "",
+                    "text": trim(str(report.get("report", "") or ""), 1800),
+                    "entities": list(report.get("top_entities", []) or [])[:12],
+                    "citation": f"[community:{community}]",
+                    "route_evidence": "community_report",
+                    "sort_bias": 0.18,
+                }
+            )
+        community_rows.sort(
+            key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("graph_score", 0.0) or 0.0)),
+            reverse=True,
+        )
+        return community_rows
+
+    def _build_global_bridge_rows(self, selected_communities: list[str]) -> list[dict]:
+        bridge_rows: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for left in selected_communities[:RAG_MAX_GLOBAL_COMMUNITIES]:
+            for right, weight in sorted((self.community_links.get(left, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True):
+                if right not in selected_communities or left == right:
+                    continue
+                pair = tuple(sorted((left, right)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                left_report = self.community_reports.get(left, {})
+                right_report = self.community_reports.get(right, {})
+                shared_entities = sorted(
+                    set(str(x) for x in (left_report.get("top_entities", []) or []) if str(x).strip()).intersection(
+                        str(x) for x in (right_report.get("top_entities", []) or []) if str(x).strip()
+                    )
+                )
+                bridge_rows.append(
+                    {
+                        "score": round(min(0.92, 0.26 + math.log1p(int(weight or 0)) / 5.2), 6),
+                        "lexical_score": 0.0,
+                        "graph_score": round(min(0.92, 0.26 + math.log1p(int(weight or 0)) / 5.2), 6),
+                        "doc_id": "",
+                        "chunk_id": "",
+                        "title": f"Community Bridge · {left} ↔ {right}",
+                        "filename": "",
+                        "kind": "community_bridge",
+                        "category": str((left_report.get('top_categories', []) or ['document'])[0]),
+                        "community": left,
+                        "language": str((left_report.get('top_languages', []) or ['unknown'])[0]),
+                        "anchor": "",
+                        "text": trim(
+                            f"Cross-community bridge between {left} and {right}. "
+                            f"Link strength={int(weight or 0)}. "
+                            + (f"Shared entities: {', '.join(shared_entities[:8])}." if shared_entities else ""),
+                            1500,
+                        ),
+                        "entities": shared_entities[:12],
+                        "citation": f"[community-link:{left}<->{right}]",
+                        "route_evidence": "community_bridge",
+                        "sort_bias": 0.14,
+                    }
+                )
+                if len(bridge_rows) >= 4:
+                    break
+            if len(bridge_rows) >= 4:
+                break
+        return bridge_rows
+
+    def _build_query_community_map(
+        self,
+        query: str,
+        community_row: dict,
+        *,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> tuple[dict, list[dict]]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        community = str(community_row.get("community", "") or "").strip()
+        report = self.community_reports.get(community, {})
+        support = self._fast_query(
+            query,
+            top_k=max(2, min(RAG_MAX_COMMUNITY_MAP_SUPPORT, RAG_MAX_QUERY_RESULTS)),
+            category=category,
+            kind=kind,
+            allowed_communities={community},
+            qbundle=(qweights, qnorm, qentities, qcat),
+        )
+        support_rows = list(support.get("results", []) or [])
+        support_entities: Counter[str] = Counter()
+        support_titles: list[str] = []
+        evidence_lines: list[str] = []
+        support_citations: list[str] = []
+        for row in support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT]:
+            title = str(row.get("title", "") or "").strip()
+            citation = str(row.get("citation", "") or "").strip()
+            if title:
+                support_titles.append(title)
+            if citation:
+                support_citations.append(citation)
+            support_entities.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+            snippet = trim(str(row.get("text", "") or ""), 220)
+            if citation or title or snippet:
+                evidence_lines.append(f"{citation} {title}: {snippet}".strip())
+        report_entities = [str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()]
+        overlap_entities = [ent for ent in report_entities if ent in qentities]
+        if not overlap_entities:
+            overlap_entities = [name for name, _ in support_entities.most_common(8) if name in qentities]
+        if not overlap_entities:
+            overlap_entities = [name for name, _ in support_entities.most_common(8)]
+        if not overlap_entities:
+            overlap_entities = report_entities[:8]
+        representative_docs = [
+            str(row.get("title", "") or "").strip()
+            for row in (report.get("representative_docs", []) or [])[:4]
+            if isinstance(row, dict) and str(row.get("title", "") or "").strip()
+        ]
+        links = [
+            f"{str(row.get('community', '') or '').strip()} ({int(row.get('weight', 0) or 0)})"
+            for row in (report.get("links", []) or [])[:4]
+            if isinstance(row, dict) and str(row.get("community", "") or "").strip()
+        ]
+        map_lines = [
+            f"Query-specific community map for {community}.",
+            f"Community coverage: {int(report.get('doc_count', 0) or 0)} documents.",
+        ]
+        if report.get("top_categories"):
+            map_lines.append("Top categories: " + ", ".join(str(x) for x in (report.get("top_categories", []) or [])[:3]))
+        if report.get("top_kinds"):
+            map_lines.append("Modalities: " + ", ".join(str(x) for x in (report.get("top_kinds", []) or [])[:3]))
+        if overlap_entities:
+            map_lines.append("Query-aligned entities: " + ", ".join(overlap_entities[:8]))
+        if support_titles:
+            map_lines.append("Most relevant local evidence: " + ", ".join(support_titles[:4]))
+        elif representative_docs:
+            map_lines.append("Representative documents: " + ", ".join(representative_docs[:4]))
+        if links:
+            map_lines.append("Cross-community adjacency: " + ", ".join(links[:4]))
+        if evidence_lines:
+            map_lines.append("Evidence focus:\n" + "\n".join(evidence_lines[:3]))
+        elif str(report.get("report", "")).strip():
+            map_lines.append("Fallback report context: " + trim(str(report.get("report", "") or ""), 480))
+        map_text = trim("\n".join(map_lines), 2600)
+        map_score = max(
+            float(community_row.get("score", 0.0) or 0.0),
+            0.34
+            + min(0.20, 0.05 * len(support_rows))
+            + min(0.14, 0.04 * len(overlap_entities))
+            + (0.05 if links else 0.0),
+        )
+        return (
+            {
+                "score": round(map_score, 6),
+                "lexical_score": round(float(community_row.get("lexical_score", 0.0) or 0.0), 6),
+                "graph_score": round(float(community_row.get("graph_score", 0.0) or 0.0) + min(0.16, 0.03 * len(support_rows)), 6),
+                "doc_id": "",
+                "chunk_id": "",
+                "title": f"Community Map · {community}",
+                "filename": "",
+                "kind": "community_map",
+                "category": str((report.get("top_categories", []) or [community_row.get("category", "document")])[0]),
+                "community": community,
+                "language": str((report.get("top_languages", []) or [community_row.get("language", "unknown")])[0]),
+                "anchor": "",
+                "text": map_text,
+                "entities": overlap_entities[:12],
+                "citation": f"[community-map:{community}]",
+                "route_evidence": "community_map",
+                "sort_bias": 0.28,
+                "evidence_citations": support_citations[:6],
+            },
+            support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT],
+        )
+
+    def _build_global_reduce_row(
+        self,
+        query: str,
+        map_rows: list[dict],
+        bridge_rows: list[dict],
+        support_rows: list[dict],
+        qentities: set[str],
+    ) -> dict | None:
+        if not map_rows:
+            return None
+
+        def _compact_text(value: str, limit: int = 220) -> str:
+            flat = " ".join(part.strip() for part in str(value or "").splitlines() if part.strip())
+            return trim(flat, limit)
+
+        selected_communities = [str(row.get("community", "") or "").strip() for row in map_rows if str(row.get("community", "") or "").strip()]
+        selected_communities = [x for x in selected_communities if x]
+        entity_counter: Counter[str] = Counter()
+        for row in map_rows:
+            entity_counter.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+        for row in support_rows[:8]:
+            entity_counter.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+        for ent in sorted(qentities):
+            if ent:
+                entity_counter[ent] += 2
+        bridge_summaries = []
+        for row in bridge_rows[:3]:
+            bridge_summaries.append(_compact_text(str(row.get("text", "") or ""), 180))
+        evidence_anchors = []
+        seen_anchors: set[str] = set()
+        for row in support_rows[:8]:
+            citation = str(row.get("citation", "") or "").strip()
+            title = str(row.get("title", "") or "").strip()
+            anchor = f"{citation} {title}".strip()
+            if not anchor or anchor in seen_anchors:
+                continue
+            seen_anchors.add(anchor)
+            evidence_anchors.append(anchor)
+        reduce_lines = [
+            f"Global map-reduce synthesis for query: {query}",
+            "Communities selected: " + ", ".join(selected_communities[:RAG_MAX_GLOBAL_COMMUNITIES]),
+            "Community reductions:",
+        ]
+        for row in map_rows[:RAG_MAX_GLOBAL_COMMUNITIES]:
+            reduce_lines.append(
+                f"- {str(row.get('community', '') or '').strip()}: {_compact_text(str(row.get('text', '') or ''), 240)}"
+            )
+        if bridge_summaries:
+            reduce_lines.append("Cross-community bridges: " + " | ".join(bridge_summaries))
+        if entity_counter:
+            reduce_lines.append(
+                "Shared concepts/entities: "
+                + ", ".join(name for name, _ in entity_counter.most_common(10) if name)
+            )
+        if evidence_anchors:
+            reduce_lines.append("Evidence anchors: " + "; ".join(evidence_anchors[:6]))
+        text = trim("\n".join(reduce_lines), 3200)
+        score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
+        return {
+            "score": round(score, 6),
+            "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
+            "graph_score": round(float(map_rows[0].get("graph_score", 0.0) or 0.0) + 0.12, 6),
+            "doc_id": "",
+            "chunk_id": "",
+            "title": "Global Synthesis",
+            "filename": "",
+            "kind": "global_synthesis",
+            "category": str(map_rows[0].get("category", "document") or "document"),
+            "community": selected_communities[0] if selected_communities else "",
+            "language": str(map_rows[0].get("language", "unknown") or "unknown"),
+            "anchor": "",
+            "text": text,
+            "entities": [name for name, _ in entity_counter.most_common(12) if name],
+            "citation": "[global-synthesis]",
+            "route_evidence": "community_reduce",
+            "sort_bias": 0.38,
+        }
+
+    def _global_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        route_meta: dict | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "global",
+                "route_meta": {"mode": "global"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        community_rows = self._rank_global_communities(
+            query,
+            category=category,
+            kind=kind,
+            qbundle=(qweights, qnorm, qentities, qcat),
+        )
+        select_limit = 1 if len(community_rows) <= 1 else max(2, min(RAG_MAX_GLOBAL_COMMUNITIES, int(top_k or 4)))
+        selected_rows = community_rows[:select_limit]
+        selected_communities = [str(row.get("community", "") or "").strip() for row in selected_rows if str(row.get("community", "") or "").strip()]
+        if not selected_communities:
+            fallback = self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+            meta = dict(route_meta or {})
+            meta.update(
+                {
+                    "mode": "global",
+                    "fallback_route": "fast",
+                    "selected_communities": [],
+                    "community_result_count": 0,
+                    "bridge_count": 0,
+                    "support_count": len(list(fallback.get("results", []) or [])),
+                    "map_count": 0,
+                }
+            )
+            out = self._finalize_query_rows(
+                query,
+                list(fallback.get("results", []) or []),
+                qentities,
+                top_k=top_k,
+                route="global",
+                route_meta=meta,
+            )
+            out["summary"] = str(fallback.get("summary", "") or out.get("summary", "") or "")
+            return out
+        map_rows: list[dict] = []
+        support_rows: list[dict] = []
+        for row in selected_rows:
+            map_row, map_support = self._build_query_community_map(
+                query,
+                row,
+                category=category,
+                kind=kind,
+                qbundle=(qweights, qnorm, qentities, qcat),
+            )
+            if map_row:
+                map_rows.append(map_row)
+            support_rows.extend(map_support[:2])
+        bridge_rows = self._build_global_bridge_rows(selected_communities)
+        reduce_row = self._build_global_reduce_row(query, map_rows, bridge_rows, support_rows, qentities)
+        rows: list[dict] = []
+        if reduce_row:
+            rows.append(reduce_row)
+        rows.extend(map_rows)
+        rows.extend(bridge_rows[:3])
+        rows.extend(support_rows)
+        if len(rows) < max(3, min(int(top_k or 4), 6)):
+            rows.extend(selected_rows[:2])
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": "global",
+                "selected_communities": selected_communities[:6],
+                "community_result_count": len(community_rows),
+                "bridge_count": len(bridge_rows),
+                "support_count": len(support_rows),
+                "map_count": len(map_rows),
+                "reduce_mode": "community_map_reduce",
+            }
+        )
+        out = self._finalize_query_rows(query, rows, qentities, top_k=top_k, route="global", route_meta=meta)
+        if reduce_row and str(reduce_row.get("text", "")).strip():
+            out["summary"] = str(reduce_row.get("text", "") or "")
+            out["global_synthesis"] = dict(reduce_row)
+        out["community_maps"] = [dict(row) for row in map_rows[:RAG_MAX_GLOBAL_COMMUNITIES]]
+        return out
+
+    def _hybrid_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        route_meta: dict | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "hybrid",
+                "route_meta": {"mode": "hybrid"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        global_out = self._global_query(query, top_k=max(4, min(top_k, 6)), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        fast_rows = list(fast.get("results", []) or [])
+        global_rows = list(global_out.get("results", []) or [])
+        merged: list[dict] = []
+        fi = 0
+        gi = 0
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        while len(merged) < limit and (gi < len(global_rows) or fi < len(fast_rows)):
+            if gi < len(global_rows):
+                merged.append(global_rows[gi])
+                gi += 1
+            for _ in range(2):
+                if len(merged) >= limit:
+                    break
+                if fi < len(fast_rows):
+                    merged.append(fast_rows[fi])
+                    fi += 1
+            if gi >= len(global_rows) and fi >= len(fast_rows):
+                break
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": "hybrid",
+                "fast_count": len(fast_rows),
+                "global_count": len(global_rows),
+                "selected_communities": list(global_out.get("route_meta", {}).get("selected_communities", []) or [])[:6],
+                "map_count": int(global_out.get("route_meta", {}).get("map_count", 0) or 0),
+                "reduce_mode": str(global_out.get("route_meta", {}).get("reduce_mode", "") or ""),
+            }
+        )
+        out = self._finalize_query_rows(query, merged, qentities, top_k=top_k, route="hybrid", route_meta=meta)
+        if str(global_out.get("summary", "") or "").strip():
+            out["summary"] = str(global_out.get("summary", "") or "")
+        if isinstance(global_out.get("global_synthesis"), dict):
+            out["global_synthesis"] = dict(global_out.get("global_synthesis", {}) or {})
+        if isinstance(global_out.get("community_maps"), list):
+            out["community_maps"] = [dict(x) for x in (global_out.get("community_maps", []) or []) if isinstance(x, dict)]
+        return out
+
+    def query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        route: str = "auto",
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qbundle = self._query_weights(query)
+        wanted = str(route or "auto").strip().lower()
+        if wanted not in {"auto", "fast", "global", "hybrid"}:
+            wanted = "auto"
+        decided = wanted
+        meta: dict = {"requested_route": wanted}
+        if wanted == "auto":
+            decided, route_meta = self._decide_query_route(query, top_k=top_k, qbundle=qbundle)
+            meta.update(route_meta)
+        else:
+            meta.update({"mode": wanted, "community_count": len(self.community_reports)})
+            if wanted == "global" and len(self.community_reports) <= 1:
+                decided = "hybrid" if len(self.community_reports) == 1 else "fast"
+                meta["fallback_route"] = decided
+        if decided == "global":
+            return self._global_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
+        if decided == "hybrid":
+            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
+        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle)
+
+    def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        entity_nodes: dict[str, str] = {}
+        community_nodes: dict[str, str] = {}
+        try:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES if max_nodes is None else max_nodes)
+        except Exception:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES or 0)
+        node_budget = None if max_nodes_int <= 0 else max(20, max_nodes_int)
+        for doc in docs:
+            if node_budget is not None and len(nodes) >= node_budget:
+                break
+            doc_id = str(doc.get("id", ""))
+            doc_node = f"doc:{doc_id}"
+            nodes.append(
+                {
+                    "id": doc_node,
+                    "label": str(doc.get("title", doc_id)),
+                    "type": "document",
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "kind": str(doc.get("kind", "")),
+                }
+            )
+            community = str(doc.get("community", "") or "")
+            if community and community not in community_nodes and (node_budget is None or len(nodes) < node_budget):
+                community_id = f"community:{len(community_nodes)+1}"
+                community_nodes[community] = community_id
+                nodes.append({"id": community_id, "label": community, "type": "community"})
+            community_id = community_nodes.get(community, "")
+            if community_id:
+                edges.append({"source": doc_node, "target": community_id, "type": "belongs_to"})
+            for ent in list(doc.get("entities", []) or [])[:6]:
+                key = str(ent).strip()
+                if not key:
+                    continue
+                ent_id = entity_nodes.get(key)
+                if not ent_id and (node_budget is None or len(nodes) < node_budget):
+                    ent_id = f"entity:{hashlib.sha1(key.encode('utf-8', errors='ignore')).hexdigest()[:10]}"
+                    entity_nodes[key] = ent_id
+                    nodes.append({"id": ent_id, "label": key, "type": "entity"})
+                if ent_id:
+                    edges.append({"source": doc_node, "target": ent_id, "type": "mentions"})
+            for other, weight in list((self.related_docs.get(doc_id, {}) or {}).items())[:4]:
+                if other == doc_id:
+                    continue
+                edges.append({"source": doc_node, "target": f"doc:{other}", "type": "related", "weight": int(weight or 0)})
+        node_ids = {str(row.get("id", "")) for row in nodes if str(row.get("id", "")).strip()}
+        edges = [
+            dict(row)
+            for row in edges
+            if str(row.get("source", "")).strip() in node_ids and str(row.get("target", "")).strip() in node_ids
+        ]
+        return {
+            "built_at": self.built_at,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "communities": dict(self.community_counts),
+        }
+
+
+class RAGLibraryStore:
+    def _init_storage_layout(self, root: Path):
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "library_state.json"
+        self.documents_path = self.root / "documents.json"
+        self.chunks_path = self.root / "chunks.json"
+        self.tasks_path = self.root / "tasks.json"
+        self.index_snapshot_path = self.root / "index_snapshot.json"
+        self.backup_root = self.root / "backup"
+        self.parsed_root = self.root / "parsed"
+        self.assets_root = self.root / "assets"
+        self.inbox_root = self.root / "inbox"
+        self.queue_root = self.root / "queue"
+        for path in (self.backup_root, self.parsed_root, self.assets_root, self.inbox_root, self.queue_root):
+            path.mkdir(parents=True, exist_ok=True)
+
+    def __init__(self, root: Path):
+        self._init_storage_layout(root)
+        self.lock = threading.RLock()
+        self.created_at = now_ts()
+        self.updated_at = now_ts()
+        self.content_updated_at = now_ts()
+        self.documents: dict[str, dict] = {}
+        self.chunks: dict[str, dict] = {}
+        self.tasks: list[dict] = []
+        self.index = TFGraphIDFIndex()
+        self._load()
+        if not self._restore_index_snapshot():
+            self.rebuild_index(persist_snapshot=True)
+
+    def _rel(self, path: Path) -> str:
+        target = path.resolve()
+        if target.is_relative_to(self.root):
+            return target.relative_to(self.root).as_posix()
+        return str(target)
+
+    def _load(self):
+        raw = _read_json_file(self.state_path, {})
+        if not isinstance(raw, dict):
+            raw = {}
+        use_shards = any(path.exists() for path in (self.documents_path, self.chunks_path, self.tasks_path)) or int(
+            raw.get("format_version", 0) or 0
+        ) >= 2
+        if use_shards:
+            docs_raw = _read_json_file(self.documents_path, {})
+            chunks_raw = _read_json_file(self.chunks_path, {})
+            tasks_raw = _read_json_file(self.tasks_path, [])
+        else:
+            docs_raw = raw.get("documents", {})
+            chunks_raw = raw.get("chunks", {})
+            tasks_raw = raw.get("tasks", [])
+        if isinstance(docs_raw, dict):
+            self.documents = {str(k): dict(v) for k, v in docs_raw.items() if isinstance(v, dict)}
+        if isinstance(chunks_raw, dict):
+            self.chunks = {str(k): dict(v) for k, v in chunks_raw.items() if isinstance(v, dict)}
+        if isinstance(tasks_raw, list):
+            self.tasks = [dict(x) for x in tasks_raw[-RAG_TASK_HISTORY_LIMIT:] if isinstance(x, dict)]
+        self.created_at = float(raw.get("created_at", self.created_at) or self.created_at)
+        self.updated_at = float(raw.get("updated_at", self.updated_at) or self.updated_at)
+        self.content_updated_at = float(
+            raw.get("content_updated_at", raw.get("updated_at", self.content_updated_at)) or self.content_updated_at
+        )
+
+    def _save_locked(
+        self,
+        *,
+        write_documents: bool = True,
+        write_chunks: bool = True,
+        write_tasks: bool = True,
+        write_manifest: bool = True,
+    ):
+        tasks_payload = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+        payload = {
+            "format_version": 2,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "content_updated_at": self.content_updated_at,
+            "documents_count": len(self.documents),
+            "chunks_count": len(self.chunks),
+            "tasks_count": len(tasks_payload),
+            "documents_file": self.documents_path.name,
+            "chunks_file": self.chunks_path.name,
+            "tasks_file": self.tasks_path.name,
+            "index_file": self.index_snapshot_path.name,
+        }
+        if write_documents:
+            _write_json_file(self.documents_path, self.documents)
+        if write_chunks:
+            _write_json_file(self.chunks_path, self.chunks)
+        if write_tasks:
+            _write_json_file(self.tasks_path, tasks_payload)
+        if write_manifest:
+            _write_json_file(self.state_path, payload)
+
+    def _index_snapshot_payload_locked(self) -> dict:
+        return {
+            "content_updated_at": float(self.content_updated_at or 0.0),
+            "documents_count": len(self.documents),
+            "chunks_count": len(self.chunks),
+            "index": self.index.snapshot(),
+        }
+
+    def _persist_index_snapshot(self):
+        with self.lock:
+            payload = self._index_snapshot_payload_locked()
+        _write_json_file(self.index_snapshot_path, payload)
+
+    def _restore_index_snapshot(self) -> bool:
+        raw = _read_json_file(self.index_snapshot_path, {})
+        if not isinstance(raw, dict):
+            return False
+        try:
+            if int(raw.get("documents_count", -1) or -1) != len(self.documents):
+                return False
+            if int(raw.get("chunks_count", -1) or -1) != len(self.chunks):
+                return False
+            snapshot_updated = float(raw.get("content_updated_at", 0.0) or 0.0)
+            if snapshot_updated and abs(snapshot_updated - float(self.content_updated_at or 0.0)) > 1e-6:
+                return False
+            return self.index.restore(raw.get("index", {}) if isinstance(raw.get("index", {}), dict) else {})
+        except Exception:
+            return False
+
+    def _find_doc_by_sha_locked(self, sha256: str) -> str:
+        target = str(sha256 or "").strip()
+        if not target:
+            return ""
+        for doc_id, row in self.documents.items():
+            if str(row.get("sha256", "") or "").strip() == target:
+                return doc_id
+        return ""
+
+    def register_task(self, task: dict) -> dict:
+        row = dict(task or {})
+        row["id"] = str(row.get("id") or make_id("ragtask"))
+        row["status"] = str(row.get("status", "queued") or "queued")
+        row["submitted_at"] = float(row.get("submitted_at", now_ts()) or now_ts())
+        with self.lock:
+            self.tasks.append(row)
+            self.tasks = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+            self.updated_at = now_ts()
+            self._save_locked(write_documents=False, write_chunks=False)
+        return row
+
+    def update_task(self, task_id: str, **fields):
+        with self.lock:
+            for idx in range(len(self.tasks) - 1, -1, -1):
+                row = self.tasks[idx]
+                if str(row.get("id", "")) != str(task_id):
+                    continue
+                patched = dict(row)
+                patched.update(fields)
+                patched["updated_at"] = now_ts()
+                self.tasks[idx] = patched
+                self.updated_at = now_ts()
+                self._save_locked(write_documents=False, write_chunks=False)
+                return
+
+    def list_tasks(self, limit: int = 60) -> list[dict]:
+        with self.lock:
+            rows = [dict(x) for x in self.tasks[-max(1, int(limit or 60)) :]]
+        rows.sort(key=lambda x: float(x.get("submitted_at", 0.0) or 0.0), reverse=True)
+        return rows
+
+    def get_task(self, task_id: str) -> dict | None:
+        target = str(task_id or "").strip()
+        if not target:
+            return None
+        with self.lock:
+            for row in reversed(self.tasks):
+                if str(row.get("id", "") or "").strip() == target:
+                    return dict(row)
+        return None
+
+    def incomplete_tasks(self) -> list[dict]:
+        rows: list[dict] = []
+        with self.lock:
+            for row in self.tasks:
+                status = str(row.get("status", "") or "").strip().lower()
+                if status in {"queued", "running"}:
+                    rows.append(dict(row))
+        rows.sort(key=lambda x: float(x.get("submitted_at", 0.0) or 0.0))
+        return rows
+
+    def rebuild_index(self, persist_snapshot: bool = True):
+        with self.lock:
+            docs = [dict(v) for v in self.documents.values()]
+            chunks = [dict(v) for v in self.chunks.values()]
+        self.index.build(docs, chunks)
+        if persist_snapshot:
+            try:
+                self._persist_index_snapshot()
+            except Exception:
+                pass
+
+    def flush_content_state(self):
+        with self.lock:
+            self.updated_at = now_ts()
+            self._save_locked(write_tasks=False)
+
+    def library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        with self.lock:
+            docs = sorted(
+                (dict(v) for v in self.documents.values()),
+                key=lambda x: float(x.get("updated_at", x.get("created_at", 0.0)) or 0.0),
+                reverse=True,
+            )
+            chunks_total = len(self.chunks)
+            task_total = len(self.tasks)
+        categories = Counter(str(x.get("category", "document") or "document") for x in docs)
+        communities = Counter(
+            {
+                str(name): int(count or 0)
+                for name, count in (self.index.community_counts or {}).items()
+                if str(name).strip()
+            }
+        )
+        try:
+            doc_limit = int(limit)
+        except Exception:
+            doc_limit = 240
+        try:
+            doc_offset = max(0, int(offset))
+        except Exception:
+            doc_offset = 0
+        if doc_limit < 0:
+            selected_docs = docs[doc_offset:]
+        elif doc_limit == 0:
+            selected_docs = []
+        else:
+            selected_docs = docs[doc_offset : doc_offset + doc_limit]
+        total_docs = len(docs)
+        returned_docs = len(selected_docs)
+        return {
+            "root": str(self.root),
+            "updated_at": self.updated_at,
+            "content_updated_at": self.content_updated_at,
+            "total_documents": total_docs,
+            "returned_documents": returned_docs,
+            "offset": doc_offset,
+            "limit": doc_limit,
+            "has_more": (doc_offset + returned_docs) < total_docs,
+            "stats": {
+                "documents": total_docs,
+                "chunks": chunks_total,
+                "tasks": task_total,
+                "categories": dict(categories),
+                "communities": dict(communities.most_common(12)),
+                "dynamic_noise_hard_tokens": len(self.index.dynamic_noise_hard_tokens),
+                "dynamic_noise_soft_tokens": len(self.index.dynamic_noise_penalties),
+            },
+            "documents": [
+                {
+                    "id": str(x.get("id", "")),
+                    "title": str(x.get("title", "")),
+                    "filename": str(x.get("filename", "")),
+                    "kind": str(x.get("kind", "")),
+                    "category": str(x.get("category", "")),
+                    "language": str(x.get("language", "")),
+                    "community": str(
+                        self.index.doc_meta.get(str(x.get("id", "")), {}).get("community", x.get("community", ""))
+                    ),
+                    "chunk_count": int(x.get("chunk_count", 0) or 0),
+                    "assets_count": len(x.get("assets", []) or []),
+                    "summary": trim(str(x.get("summary", "") or ""), 420),
+                    "backup_path": str(x.get("backup_path", "")),
+                    "parsed_text_path": str(x.get("parsed_text_path", "")),
+                    "source_rel_path": str(x.get("source_rel_path", "")),
+                    "sha256": str(x.get("sha256", "")),
+                    "session_id": str(x.get("session_id", "")),
+                    "source_mode": str(x.get("source_mode", "")),
+                    "updated_at": float(x.get("updated_at", 0.0) or 0.0),
+                }
+                for x in selected_docs
+            ],
+        }
+
+    def filesystem_payload(self, max_nodes: int = 320) -> dict:
+        node_count = 0
+        truncated = False
+
+        def walk(path: Path, depth: int = 0) -> dict:
+            nonlocal node_count, truncated
+            node_count += 1
+            if node_count >= max_nodes:
+                truncated = True
+            row = {
+                "name": path.name or str(path),
+                "path": self._rel(path),
+                "type": "dir" if path.is_dir() else "file",
+            }
+            if path.is_file():
+                try:
+                    row["size"] = int(path.stat().st_size)
+                except Exception:
+                    row["size"] = 0
+                return row
+            children: list[dict] = []
+            if not truncated and depth < 6:
+                try:
+                    items = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                except Exception:
+                    items = []
+                for child in items:
+                    if node_count >= max_nodes:
+                        truncated = True
+                        break
+                    children.append(walk(child, depth + 1))
+            row["children"] = children
+            return row
+
+        tree = walk(self.root)
+        return {
+            "root": str(self.root),
+            "generated_at": now_ts(),
+            "node_count": node_count,
+            "truncated": truncated,
+            "tree": tree,
+        }
+
+    def ingest_document(
+        self,
+        *,
+        doc_id: str,
+        source_path: Path | None,
+        original_name: str,
+        parse_result: dict,
+        raw_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        session_id: str = "",
+        user_id: str = "",
+        source_rel_path: str = "",
+        tags: list[str] | None = None,
+        multimodal: dict | None = None,
+        asset_sources: list[dict] | None = None,
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        source_fp = Path(source_path).resolve() if isinstance(source_path, Path) else None
+        rel_raw = str(source_rel_path or "").strip().replace("\\", "/").lstrip("/")
+        rel_path_clean = "/".join(part for part in PurePosixPath(rel_raw).parts if part not in {"", ".", ".."})
+        if raw_bytes is None and source_fp and source_fp.exists():
+            raw_bytes = source_fp.read_bytes()
+        sha256 = str(parse_result.get("sha256", "") or "").strip()
+        if not sha256:
+            if raw_bytes is not None:
+                sha256 = _sha256_bytes(raw_bytes)
+            elif source_fp and source_fp.exists():
+                sha256 = _sha256_file(source_fp)
+        with self.lock:
+            existing_doc_id = self._find_doc_by_sha_locked(sha256)
+            if existing_doc_id:
+                row = dict(self.documents.get(existing_doc_id, {}))
+                stamp = now_ts()
+                source_links = row.get("source_links", [])
+                if not isinstance(source_links, list):
+                    source_links = []
+                source_links.append(
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                )
+                row["source_links"] = source_links[-24:]
+                if rel_path_clean:
+                    row["source_rel_path"] = rel_path_clean
+                row["updated_at"] = stamp
+                row["duplicate_hits"] = int(row.get("duplicate_hits", 0) or 0) + 1
+                self.documents[existing_doc_id] = row
+                self.updated_at = stamp
+                if persist_now:
+                    self._save_locked(write_chunks=False, write_tasks=False)
+                return {
+                    "ok": True,
+                    "doc_id": existing_doc_id,
+                    "duplicate": True,
+                    "title": str(row.get("title", "")),
+                    "backup_path": str(row.get("backup_path", "")),
+                }
+        safe_name = _rag_safe_name(original_name or (source_fp.name if source_fp else "document.bin"))
+        backup_dir = self.backup_root / doc_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / safe_name
+        if raw_bytes is not None:
+            backup_path.write_bytes(raw_bytes)
+        elif source_fp and source_fp.exists():
+            shutil.copy2(source_fp, backup_path)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 160_000)
+        multimodal_row = dict(multimodal or {})
+        mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
+        mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
+        mm_entities = [str(x).strip() for x in (multimodal_row.get("entities", []) or []) if str(x).strip()]
+        if mm_summary:
+            semantic_text = (semantic_text + "\n\n[Multimodal Summary]\n" + mm_summary).strip() if semantic_text else mm_summary
+        if not semantic_text:
+            semantic_text = (
+                f"title: {safe_name}\n"
+                f"kind: {parse_result.get('kind', 'document')}\n"
+                f"category: {parse_result.get('category', 'document')}\n"
+                f"mime: {parse_result.get('mime', '')}\n"
+            )
+        parsed_path = self.parsed_root / f"{doc_id}.md"
+        parsed_path.write_text(f"# {safe_name}\n\n{semantic_text}\n", encoding="utf-8")
+        asset_rows: list[dict] = []
+        asset_dir = self.assets_root / doc_id
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        if str(parse_result.get("kind", "")) in {"image", "audio", "video"}:
+            asset_rows.append(
+                {
+                    "type": str(parse_result.get("kind", "")),
+                    "path": self._rel(backup_path),
+                    "name": backup_path.name,
+                    "mime": str(parse_result.get("mime", "")),
+                    "size": int(parse_result.get("size", 0) or 0),
+                }
+            )
+        for idx, row in enumerate(asset_sources or [], 1):
+            src_raw = str(row.get("path", "") or "").strip()
+            if not src_raw:
+                continue
+            src = Path(src_raw)
+            if not src.exists() or not src.is_file():
+                continue
+            safe_asset = _rag_safe_name(str(row.get("name", "") or src.name), fallback=f"asset_{idx}")
+            dst = asset_dir / safe_asset
+            if src.resolve() != dst.resolve():
+                shutil.copy2(src, dst)
+            asset_rows.append(
+                {
+                    "type": str(row.get("type", "image") or "image"),
+                    "path": self._rel(dst),
+                    "name": dst.name,
+                    "mime": str(row.get("mime", guess_mime_from_name(dst.name, "application/octet-stream")) or ""),
+                    "size": int(dst.stat().st_size) if dst.exists() else 0,
+                    "page": int(row.get("page", 0) or 0),
+                }
+            )
+        tags_clean = [str(x).strip() for x in (tags or []) if str(x).strip()]
+        combined_entities = _rag_filter_entities(_rag_extract_entities(semantic_text), limit=32)
+        for ent in mm_entities:
+            if _rag_entity_allowed(ent) and ent not in combined_entities:
+                combined_entities.append(ent)
+        combined_entities = _rag_filter_entities(combined_entities, limit=32)
+        community = _rag_choose_community(
+            parse_result.get("category", "document"),
+            parse_result.get("language", "unknown"),
+            combined_entities,
+            "",
+        )
+        chunks = _rag_chunk_text(semantic_text)
+        chunk_ids: list[str] = []
+        with self.lock:
+            stamp = now_ts()
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                chunk_id = f"{doc_id}_c{chunk_idx:03d}"
+                chunk_text = str(chunk.get("text", "") or "")
+                row = {
+                    "id": chunk_id,
+                    "doc_id": doc_id,
+                    "seq": chunk_idx,
+                    "anchor": str(chunk.get("anchor", "") or ""),
+                    "text": chunk_text,
+                    "entities": _rag_filter_entities(_rag_extract_entities(chunk_text), limit=24),
+                }
+                self.chunks[chunk_id] = row
+                chunk_ids.append(chunk_id)
+            doc_row = {
+                "id": doc_id,
+                "title": safe_name,
+                "filename": safe_name,
+                "kind": str(parse_result.get("kind", "document") or "document"),
+                "category": str(parse_result.get("category", "document") or "document"),
+                "labels": sorted({str(x) for x in list(parse_result.get("labels", []) or []) + tags_clean + mm_tags if str(x).strip()}),
+                "language": str(parse_result.get("language", "unknown") or "unknown"),
+                "mime": str(parse_result.get("mime", "") or ""),
+                "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
+                "sha256": sha256,
+                "source_mode": str(source_mode or "manual"),
+                "source_path": str(source_fp or ""),
+                "source_rel_path": rel_path_clean,
+                "backup_path": self._rel(backup_path),
+                "parsed_text_path": self._rel(parsed_path),
+                "summary": trim(mm_summary or str(parse_result.get("summary", "") or semantic_text), 1600),
+                "entities": combined_entities,
+                "community": community,
+                "chunk_count": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+                "assets": asset_rows,
+                "multimodal": multimodal_row,
+                "session_id": str(session_id or ""),
+                "user_id": str(user_id or ""),
+                "source_links": [
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                ],
+                "created_at": stamp,
+                "updated_at": stamp,
+                "import_mark": True,
+            }
+            self.documents[doc_id] = doc_row
+            self.updated_at = stamp
+            self.content_updated_at = stamp
+            if persist_now:
+                self._save_locked(write_tasks=False)
+        if rebuild_index_now:
+            self.rebuild_index()
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "duplicate": False,
+            "title": safe_name,
+            "backup_path": self._rel(backup_path),
+            "parsed_text_path": self._rel(parsed_path),
+            "chunk_count": len(chunk_ids),
+        }
+
+
+def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str):
+    try:
+        parser = RAGContentParser()
+        result = parser.parse_file(Path(source_path), mime=mime, text_override=text_override)
+        send_conn.send({"ok": True, "result": result})
+    except Exception as exc:
+        try:
+            send_conn.send({"ok": False, "error": trim(str(exc), 320)})
+        except Exception:
+            pass
+    finally:
+        try:
+            send_conn.close()
+        except Exception:
+            pass
+
+
+class RAGIngestionService:
+    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None):
+        self.store = store
+        self.parser = parser
+        self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_count = int(RAG_IMPORT_WORKER_COUNT)
+        self.parse_timeout_seconds = int(RAG_PARSE_TIMEOUT_SECONDS)
+        self.resume_report = {"resumed": 0, "failed": 0, "cleaned": 0}
+        self.threads = [
+            threading.Thread(target=self._worker_loop, name=f"rag-ingestion-{idx+1}", daemon=True)
+            for idx in range(self.worker_count)
+        ]
+        for thread in self.threads:
+            thread.start()
+        self._cleanup_finished_job_artifacts()
+        self._resume_incomplete_tasks()
+
+    def _task_spool_path(self, task_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "").strip()) or "task"
+        return self.store.queue_root / f"{safe}.json"
+
+    def _serialize_job_value(self, value):
+        if isinstance(value, SessionState):
+            return None
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (bytes, bytearray)):
+            return {"__bytes_b64__": base64.b64encode(bytes(value)).decode("ascii")}
+        if isinstance(value, dict):
+            out: dict[str, object] = {}
+            for key, item in value.items():
+                if str(key) == "session":
+                    continue
+                out[str(key)] = self._serialize_job_value(item)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_job_value(item) for item in value]
+        return value
+
+    def _deserialize_job_value(self, value):
+        if isinstance(value, dict):
+            if set(value.keys()) == {"__bytes_b64__"}:
+                try:
+                    return base64.b64decode(str(value.get("__bytes_b64__", "") or ""))
+                except Exception:
+                    return b""
+            return {str(key): self._deserialize_job_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._deserialize_job_value(item) for item in value]
+        return value
+
+    def _persist_job_payload(self, job: dict):
+        task_id = str(job.get("task_id", "") or "").strip()
+        if not task_id:
+            return
+        payload = {
+            "version": 1,
+            "task_id": task_id,
+            "saved_at": now_ts(),
+            "job": self._serialize_job_value(dict(job)),
+        }
+        spool_path = self._task_spool_path(task_id)
+        _write_json_file(spool_path, payload)
+        self.store.update_task(task_id, job_spool_path=self.store._rel(spool_path))
+
+    def _load_job_payload(self, task_id: str) -> dict | None:
+        spool_path = self._task_spool_path(task_id)
+        raw = _read_json_file(spool_path, {})
+        if not isinstance(raw, dict):
+            return None
+        payload = raw.get("job", {})
+        if not isinstance(payload, dict):
+            return None
+        job = self._deserialize_job_value(payload)
+        return dict(job) if isinstance(job, dict) else None
+
+    def _drop_job_payload(self, task_id: str):
+        try:
+            self._task_spool_path(task_id).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _cleanup_task_inbox(self, task_id: str):
+        prefix = str(task_id or "").strip()
+        if not prefix:
+            return
+        try:
+            targets = list(self.store.inbox_root.glob(f"{prefix}*"))
+        except Exception:
+            targets = []
+        for path in targets:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _cleanup_finished_job_artifacts(self):
+        cleaned = 0
+        with self.store.lock:
+            rows = [dict(x) for x in self.store.tasks]
+        live_ids = {
+            str(row.get("id", "") or "").strip()
+            for row in rows
+            if str(row.get("status", "") or "").strip().lower() in {"queued", "running"}
+        }
+        for row in rows:
+            task_id = str(row.get("id", "") or "").strip()
+            if not task_id or task_id in live_ids:
+                continue
+            self._cleanup_task_inbox(task_id)
+            self._drop_job_payload(task_id)
+            cleaned += 1
+        try:
+            for spool_path in self.store.queue_root.glob("*.json"):
+                if spool_path.stem not in live_ids:
+                    try:
+                        spool_path.unlink(missing_ok=True)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        self.resume_report["cleaned"] = int(cleaned)
+
+    def _resolve_job_session(self, session_id: str, user_id: str, current=None):
+        if isinstance(current, SessionState):
+            return current
+        if not callable(self.session_resolver):
+            return None
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        try:
+            return self.session_resolver(uid, str(session_id or "").strip())
+        except Exception:
+            return None
+
+    def _fallback_job_from_task(self, task: dict) -> dict | None:
+        row = dict(task or {})
+        task_id = str(row.get("id", "") or "").strip()
+        task_type = str(row.get("type", "") or "").strip()
+        session_id = str(row.get("session_id", "") or "").strip()
+        user_id = str(row.get("user_id", "") or "").strip()
+        source_path = str(row.get("source_path", "") or "").strip()
+        if task_type == "session_upload" and source_path:
+            return {
+                "type": "session_upload",
+                "task_id": task_id,
+                "source_path": source_path,
+                "parsed_path": str(row.get("parsed_path", "") or ""),
+                "filename": str(row.get("filename", row.get("label", Path(source_path).name)) or Path(source_path).name),
+                "mime": str(row.get("mime", "") or ""),
+                "session_id": session_id,
+                "user_id": user_id,
+                "source_mode": str(row.get("source_mode", "session_upload") or "session_upload"),
+            }
+        if task_type == "manual_import" and source_path:
+            return {
+                "type": "manual_import",
+                "task_id": task_id,
+                "path": source_path,
+                "recursive": bool(row.get("recursive", True)),
+                "title": str(row.get("label", "") or ""),
+                "filename": str(row.get("filename", "") or ""),
+                "mime": str(row.get("mime", "") or ""),
+                "session_id": session_id,
+                "user_id": user_id,
+                "source_mode": str(row.get("source_mode", "manual") or "manual"),
+                "tags": [str(x).strip() for x in (row.get("tags", []) or []) if str(x).strip()],
+                "strict_local_only": bool(row.get("strict_local_only", False)),
+            }
+        return None
+
+    def _resume_task_job(self, task: dict) -> bool:
+        row = dict(task or {})
+        task_id = str(row.get("id", "") or "").strip()
+        if not task_id:
+            return False
+        job = self._load_job_payload(task_id)
+        if not isinstance(job, dict):
+            job = self._fallback_job_from_task(row)
+        if not isinstance(job, dict):
+            self.store.update_task(
+                task_id,
+                status="failed",
+                finished_at=now_ts(),
+                error="pending import payload missing after restart; please submit the import again",
+            )
+            self._cleanup_task_inbox(task_id)
+            self._drop_job_payload(task_id)
+            self.resume_report["failed"] = int(self.resume_report.get("failed", 0) or 0) + 1
+            return False
+        session_id = str(job.get("session_id", row.get("session_id", "")) or "").strip()
+        user_id = str(job.get("user_id", row.get("user_id", "")) or "").strip()
+        session = self._resolve_job_session(session_id, user_id, job.get("session"))
+        if isinstance(session, SessionState):
+            job["session"] = session
+        else:
+            job.pop("session", None)
+        job["task_id"] = task_id
+        if not self._task_spool_path(task_id).exists():
+            self._persist_job_payload(job)
+        resume_count = int(row.get("resume_count", 0) or 0) + 1
+        self.store.update_task(
+            task_id,
+            status="queued",
+            started_at=0,
+            finished_at=0,
+            heartbeat_at=0,
+            error="",
+            resumed_at=now_ts(),
+            resume_count=resume_count,
+        )
+        self.queue.put(job)
+        self.resume_report["resumed"] = int(self.resume_report.get("resumed", 0) or 0) + 1
+        return True
+
+    def _resume_incomplete_tasks(self):
+        for row in self.store.incomplete_tasks():
+            try:
+                self._resume_task_job(row)
+            except Exception:
+                task_id = str(row.get("id", "") or "").strip()
+                if task_id:
+                    self.store.update_task(
+                        task_id,
+                        status="failed",
+                        finished_at=now_ts(),
+                        error="resume failed after restart",
+                    )
+                    self._cleanup_task_inbox(task_id)
+                    self._drop_job_payload(task_id)
+                    self.resume_report["failed"] = int(self.resume_report.get("failed", 0) or 0) + 1
+
+    def _queue_job(self, job: dict, *, persist: bool = True):
+        if persist:
+            self._persist_job_payload(job)
+        self.queue.put(job)
+
+    def shutdown(self, timeout: float = 2.0):
+        self.stop_event.set()
+        for _ in range(max(1, self.worker_count)):
+            try:
+                self.queue.put_nowait({"type": "__stop__"})
+            except Exception:
+                pass
+        per_thread_timeout = max(0.1, float(timeout or 0.1)) / max(1, len(self.threads))
+        for thread in self.threads:
+            try:
+                thread.join(timeout=per_thread_timeout)
+            except Exception:
+                pass
+
+    def enqueue_upload(self, session: SessionState, upload_meta: dict, workspace_target: Path, parsed_target: Path | None) -> dict:
+        task = self.store.register_task(
+            {
+                "type": "session_upload",
+                "label": str(upload_meta.get("filename", workspace_target.name)),
+                "source_path": str(workspace_target),
+                "filename": str(upload_meta.get("filename", workspace_target.name)),
+                "mime": str(upload_meta.get("mime", "") or ""),
+                "parsed_path": str(parsed_target) if parsed_target else "",
+                "session_id": str(getattr(session, "id", "") or ""),
+                "user_id": str(getattr(session, "owner_user_id", "") or ""),
+                "source_mode": "session_upload",
+            }
+        )
+        self._queue_job(
+            {
+                "type": "session_upload",
+                "task_id": str(task.get("id", "")),
+                "session": session,
+                "source_path": str(workspace_target),
+                "parsed_path": str(parsed_target) if parsed_target else "",
+                "filename": str(upload_meta.get("filename", workspace_target.name)),
+                "mime": str(upload_meta.get("mime", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+                "user_id": str(getattr(session, "owner_user_id", "") or ""),
+                "source_mode": "session_upload",
+            }
+        )
+        return {
+            "ok": True,
+            "queued": True,
+            "task_id": str(task.get("id", "")),
+            "library_root": str(self.store.root),
+        }
+
+    def enqueue_import(
+        self,
+        *,
+        path: str = "",
+        session: SessionState | None = None,
+        session_id: str = "",
+        user_id: str = "",
+        recursive: bool = True,
+        title: str = "",
+        text: str = "",
+        filename: str = "",
+        mime: str = "",
+        content_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        tags: list[str] | None = None,
+        items: list[dict] | None = None,
+        strict_local_only: bool = False,
+    ) -> dict:
+        normalized_items: list[dict] = []
+        for row in (items or []):
+            if not isinstance(row, dict):
+                continue
+            raw_bytes = row.get("content_bytes")
+            item_text = str(row.get("text", "") or "")
+            if not item_text.strip() and not isinstance(raw_bytes, (bytes, bytearray)):
+                continue
+            if len(normalized_items) >= RAG_MAX_IMPORT_BATCH_ITEMS:
+                raise ValueError(f"too many import items in one batch (max {RAG_MAX_IMPORT_BATCH_ITEMS})")
+            normalized_items.append(
+                {
+                    "filename": str(row.get("filename", "") or "").strip(),
+                    "mime": str(row.get("mime", "") or "").strip(),
+                    "text": item_text,
+                    "relative_path": str(row.get("relative_path", "") or "").strip().replace("\\", "/").lstrip("/"),
+                    "content_bytes": bytes(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray)) else None,
+                }
+            )
+        item_count = len(normalized_items)
+        label = (
+            title
+            or filename
+            or path
+            or (
+                normalized_items[0].get("relative_path")
+                or normalized_items[0].get("filename")
+                or "manual-import"
+                if item_count == 1
+                else ""
+            )
+            or (f"batch-import ({item_count} items)" if item_count > 1 else "manual-import")
+        )
+        task = self.store.register_task(
+            {
+                "type": "manual_import",
+                "label": trim(label, 120),
+                "source_path": str(path or ""),
+                "filename": str(filename or ""),
+                "mime": str(mime or ""),
+                "session_id": str(session_id or getattr(session, "id", "") or ""),
+                "user_id": str(user_id or getattr(session, "owner_user_id", "") or ""),
+                "item_count": item_count or 1,
+                "strict_local_only": bool(strict_local_only),
+                "recursive": bool(recursive),
+                "source_mode": str(source_mode or "manual"),
+                "tags": [str(x).strip() for x in (tags or []) if str(x).strip()],
+            }
+        )
+        self._queue_job(
+            {
+                "type": "manual_import",
+                "task_id": str(task.get("id", "")),
+                "session": session,
+                "session_id": str(session_id or getattr(session, "id", "") or ""),
+                "user_id": str(user_id or getattr(session, "owner_user_id", "") or ""),
+                "path": str(path or ""),
+                "recursive": bool(recursive),
+                "title": str(title or ""),
+                "text": str(text or ""),
+                "filename": str(filename or ""),
+                "mime": str(mime or ""),
+                "content_bytes": content_bytes,
+                "source_mode": str(source_mode or "manual"),
+                "tags": [str(x).strip() for x in (tags or []) if str(x).strip()],
+                "items": normalized_items,
+                "strict_local_only": bool(strict_local_only),
+            }
+        )
+        return {
+            "ok": True,
+            "queued": True,
+            "task_id": str(task.get("id", "")),
+            "library_root": str(self.store.root),
+            "item_count": item_count or 1,
+            "strict_local_only": bool(strict_local_only),
+        }
+
+    def _parse_file_safe(self, source_path: Path, *, mime: str = "", text_override: str = "") -> dict:
+        kind = self.parser.detect_kind(source_path, mime=mime)
+        if kind in {"text", "csv", "image", "audio", "video"}:
+            return self.parser.parse_file(source_path, mime=mime, text_override=text_override)
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_rag_parse_file_worker,
+            args=(child_conn, str(source_path), str(mime or ""), str(text_override or "")),
+        )
+        try:
+            proc.start()
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+            if not parent_conn.poll(self.parse_timeout_seconds):
+                raise TimeoutError(f"parse timeout after {self.parse_timeout_seconds}s ({kind or 'document'})")
+            payload = parent_conn.recv()
+            if not isinstance(payload, dict):
+                raise RuntimeError("parser worker returned invalid payload")
+            if not bool(payload.get("ok", False)):
+                raise RuntimeError(str(payload.get("error", "parse failed") or "parse failed"))
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("parser worker returned invalid result")
+            return dict(result)
+        finally:
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.5)
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=0.5)
+            except Exception:
+                pass
+
+    def _session_capabilities(self, session: SessionState | None) -> dict[str, bool]:
+        if not isinstance(session, SessionState):
+            return default_multimodal_capabilities()
+        try:
+            return session._capabilities_from_profile()
+        except Exception:
+            return default_multimodal_capabilities()
+
+    def _multimodal_enrich(self, session: SessionState | None, title: str, parse_result: dict, media_rows: list[dict]) -> dict:
+        if not isinstance(session, SessionState):
+            return {"status": "skipped", "reason": "no_session"}
+        caps = self._session_capabilities(session)
+        selected: list[dict] = []
+        skipped: list[str] = []
+        kind = str(parse_result.get("kind", "") or "")
+        for row in media_rows:
+            media_type = str(row.get("type", "") or "").strip().lower()
+            cap_key = {
+                "image": "input_image",
+                "audio": "input_audio",
+                "video": "input_video",
+            }.get(media_type, "")
+            if not cap_key or not bool(caps.get(cap_key, False)):
+                skipped.append(f"{media_type}:capability_disabled")
+                continue
+            fp = Path(str(row.get("path", "") or ""))
+            if not fp.exists() or not fp.is_file():
+                skipped.append(f"{media_type}:missing")
+                continue
+            if fp.stat().st_size > RAG_MODEL_MEDIA_MAX_BYTES:
+                skipped.append(f"{media_type}:too_large")
+                continue
+            try:
+                selected.append(
+                    {
+                        "type": media_type,
+                        "name": str(row.get("name", fp.name) or fp.name),
+                        "mime": str(row.get("mime", guess_mime_from_name(fp.name, "application/octet-stream")) or ""),
+                        "data_b64": base64.b64encode(fp.read_bytes()).decode("ascii"),
+                    }
+                )
+            except Exception:
+                skipped.append(f"{media_type}:read_failed")
+                continue
+            if media_type in {"audio", "video"}:
+                break
+            if sum(1 for item in selected if str(item.get("type", "")) == "image") >= 3:
+                break
+        if not selected:
+            return {"status": "skipped", "reason": "no_compatible_media", "skipped": skipped}
+        context_text = trim(str(parse_result.get("text", "") or parse_result.get("summary", "") or ""), 1800)
+        prompt = (
+            "Analyze these uploaded knowledge-base assets and return strict JSON with keys "
+            "summary, tags, entities, category, confidence, findings. "
+            f"Title: {title}\nKind: {kind}\nExisting text context:\n{context_text}"
+        )
+        try:
+            rsp = session.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=700,
+                temperature=0.1,
+                think=False,
+                stream_thinking=False,
+                media_inputs=selected,
+            )
+            payload = parse_json_object(str(rsp.get("content", "") or ""), {})
+            summary = trim(str(payload.get("summary", "") or rsp.get("content", "") or ""), 2400)
+            tags = [str(x).strip() for x in (payload.get("tags", []) or []) if str(x).strip()]
+            entities = [str(x).strip() for x in (payload.get("entities", []) or []) if str(x).strip()]
+            if not entities:
+                entities = _rag_extract_entities(summary)
+            return {
+                "status": "completed",
+                "summary": summary,
+                "tags": tags[:16],
+                "entities": entities[:24],
+                "category": str(payload.get("category", parse_result.get("category", "")) or ""),
+                "confidence": str(payload.get("confidence", "medium") or "medium"),
+                "findings": payload.get("findings", []) if isinstance(payload.get("findings"), list) else [],
+                "used_media": [str(x.get("name", "")) for x in selected],
+                "skipped": skipped,
+            }
+        except Exception as exc:
+            return {"status": "failed", "error": trim(str(exc), 240), "skipped": skipped}
+
+    def _collect_supported_files(self, root: Path, recursive: bool) -> list[Path]:
+        files: list[Path] = []
+        iterator = root.rglob("*") if recursive else root.glob("*")
+        for path in iterator:
+            if len(files) >= RAG_MAX_IMPORT_FILES:
+                break
+            try:
+                if not path.is_file():
+                    continue
+            except Exception:
+                continue
+            if self.parser.supported_file(path):
+                files.append(path)
+        return files
+
+    def _ingest_one_file(
+        self,
+        *,
+        task_id: str,
+        source_path: Path,
+        session: SessionState | None,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        mime: str,
+        source_mode: str,
+        tags: list[str],
+        source_rel_path: str = "",
+        strict_local_only: bool = False,
+        content_bytes: bytes | None = None,
+        text_override: str = "",
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        parse_result = self._parse_file_safe(source_path, mime=mime, text_override=text_override)
+        doc_id = make_id("ragdoc")
+        media_rows: list[dict] = []
+        asset_sources: list[dict] = []
+        kind = str(parse_result.get("kind", "") or "")
+        if kind in {"image", "audio", "video"}:
+            media_rows.append(
+                {
+                    "type": kind,
+                    "path": str(source_path),
+                    "name": filename or source_path.name,
+                    "mime": parse_result.get("mime", mime),
+                }
+            )
+        elif kind == "pdf":
+            pdf_asset_dir = self.store.inbox_root / f"{task_id}_{source_path.stem}_pdf_assets"
+            pdf_assets = self.parser.extract_pdf_images(source_path, pdf_asset_dir, limit=RAG_PDF_IMAGE_LIMIT)
+            media_rows.extend(pdf_assets)
+            asset_sources.extend(pdf_assets)
+        multimodal = (
+            {"status": "skipped", "reason": "strict_local_only"}
+            if bool(strict_local_only)
+            else self._multimodal_enrich(session, filename or source_path.name, parse_result, media_rows)
+        )
+        return self.store.ingest_document(
+            doc_id=doc_id,
+            source_path=source_path,
+            original_name=filename or source_path.name,
+            parse_result=parse_result,
+            raw_bytes=content_bytes,
+            source_mode=source_mode,
+            session_id=session_id,
+            user_id=user_id,
+            source_rel_path=source_rel_path,
+            tags=tags,
+            multimodal=multimodal,
+            asset_sources=asset_sources,
+            persist_now=persist_now,
+            rebuild_index_now=rebuild_index_now,
+        )
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            if not isinstance(job, dict):
+                self.queue.task_done()
+                continue
+            if str(job.get("type", "")) == "__stop__":
+                self.queue.task_done()
+                break
+            task_id = str(job.get("task_id", "") or "")
+            self._cleanup_task_inbox(task_id)
+            self.store.update_task(task_id, status="running", started_at=now_ts())
+            try:
+                result_rows: list[dict] = []
+                item_errors: list[str] = []
+                pending_flushes = 0
+                pending_rebuild = False
+                last_progress_at = 0.0
+                session = job.get("session") if isinstance(job.get("session"), SessionState) else None
+                session_id = str(job.get("session_id", "") or getattr(session, "id", "") or "")
+                user_id = str(job.get("user_id", "") or getattr(session, "owner_user_id", "") or "")
+                session = self._resolve_job_session(session_id, user_id, session)
+                if isinstance(session, SessionState):
+                    session_id = str(session_id or getattr(session, "id", "") or "")
+                    user_id = str(user_id or getattr(session, "owner_user_id", "") or "")
+                source_mode = str(job.get("source_mode", "manual") or "manual")
+                tags = [str(x).strip() for x in (job.get("tags", []) or []) if str(x).strip()]
+                strict_local_only = bool(job.get("strict_local_only", False))
+                batch_items = [dict(x) for x in (job.get("items", []) or []) if isinstance(x, dict)][:RAG_MAX_IMPORT_BATCH_ITEMS]
+
+                def _update_progress(current: int, total: int, label: str):
+                    nonlocal last_progress_at
+                    now = now_ts()
+                    current_item = int(current or 0)
+                    total_items = int(total or 0)
+                    force = total_items <= 1 or current_item <= 1 or current_item >= total_items
+                    if not force and current_item % 8 != 0 and (now - last_progress_at) < 0.75:
+                        return
+                    last_progress_at = now
+                    self.store.update_task(
+                        task_id,
+                        heartbeat_at=now,
+                        current_item=current_item,
+                        total_items=total_items,
+                        progress_label=trim(str(label or ""), 220),
+                    )
+
+                def _flush_ingest_state():
+                    nonlocal pending_flushes, pending_rebuild
+                    if pending_flushes <= 0:
+                        return
+                    self.store.flush_content_state()
+                    if pending_rebuild:
+                        self.store.rebuild_index()
+                    pending_flushes = 0
+                    pending_rebuild = False
+
+                def _capture_ingest(**kwargs):
+                    nonlocal pending_flushes, pending_rebuild
+                    try:
+                        row = self._ingest_one_file(
+                            persist_now=False,
+                            rebuild_index_now=False,
+                            **kwargs,
+                        )
+                        result_rows.append(row)
+                        pending_flushes += 1
+                        if bool(row.get("ok", False)) and not bool(row.get("duplicate", False)):
+                            pending_rebuild = True
+                        if pending_flushes >= 12:
+                            _flush_ingest_state()
+                    except Exception as exc:
+                        label = str(
+                            kwargs.get("source_rel_path", "")
+                            or kwargs.get("filename", "")
+                            or Path(str(kwargs.get("source_path", "") or "")).name
+                            or "item"
+                        )
+                        item_errors.append(f"{label}: {trim(str(exc), 220)}")
+
+                if str(job.get("type", "")) == "session_upload":
+                    src = Path(str(job.get("source_path", "") or "")).resolve()
+                    parsed_path = Path(str(job.get("parsed_path", "") or "")).resolve() if str(job.get("parsed_path", "") or "").strip() else None
+                    text_override = ""
+                    if parsed_path and parsed_path.exists():
+                        text_override = try_read_text(parsed_path, max_bytes=300_000) or ""
+                    _update_progress(1, 1, str(job.get("filename", src.name) or src.name))
+                    _capture_ingest(
+                        task_id=task_id,
+                        source_path=src,
+                        session=session,
+                        session_id=session_id,
+                        user_id=user_id,
+                        filename=str(job.get("filename", src.name) or src.name),
+                        mime=str(job.get("mime", "") or ""),
+                        source_mode=source_mode,
+                        tags=tags,
+                        strict_local_only=strict_local_only,
+                        text_override=text_override,
+                    )
+                elif batch_items:
+                    total_batch_items = len(batch_items)
+                    for idx, item in enumerate(batch_items, 1):
+                        rel_path = str(item.get("relative_path", "") or "").strip().replace("\\", "/").lstrip("/")
+                        base_name = rel_path.rsplit("/", 1)[-1] if rel_path else str(item.get("filename", "") or "").strip()
+                        filename = _rag_safe_name(base_name or f"uploaded_{idx}.bin", f"uploaded_{idx}.bin")
+                        item_text = str(item.get("text", "") or "")
+                        item_bytes = item.get("content_bytes") if isinstance(item.get("content_bytes"), (bytes, bytearray)) else None
+                        temp_path = self.store.inbox_root / f"{task_id}_{make_id('ragitem')}_{filename}"
+                        _update_progress(idx, total_batch_items, rel_path or filename)
+                        if item_text.strip():
+                            temp_path.write_text(item_text, encoding="utf-8")
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=temp_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=filename,
+                                mime=str(item.get("mime", "text/plain") or "text/plain"),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=rel_path or filename,
+                                strict_local_only=strict_local_only,
+                                text_override=item_text,
+                            )
+                        elif item_bytes is not None:
+                            temp_path.write_bytes(bytes(item_bytes))
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=temp_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=filename,
+                                mime=str(item.get("mime", "") or ""),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=rel_path or filename,
+                                strict_local_only=strict_local_only,
+                                content_bytes=bytes(item_bytes),
+                            )
+                else:
+                    text = str(job.get("text", "") or "")
+                    content_bytes = job.get("content_bytes") if isinstance(job.get("content_bytes"), (bytes, bytearray)) else None
+                    if text:
+                        filename = _rag_safe_name(str(job.get("filename", "") or job.get("title", "") or "manual_note.txt"), "manual_note.txt")
+                        temp_path = self.store.inbox_root / f"{task_id}_{filename}"
+                        temp_path.write_text(text, encoding="utf-8")
+                        _capture_ingest(
+                            task_id=task_id,
+                            source_path=temp_path,
+                            session=session,
+                            session_id=session_id,
+                            user_id=user_id,
+                            filename=filename,
+                            mime=str(job.get("mime", "text/plain") or "text/plain"),
+                            source_mode=source_mode,
+                            tags=tags,
+                            source_rel_path=filename,
+                            strict_local_only=strict_local_only,
+                            text_override=text,
+                        )
+                    elif content_bytes is not None:
+                        filename = _rag_safe_name(str(job.get("filename", "") or "uploaded.bin"), "uploaded.bin")
+                        temp_path = self.store.inbox_root / f"{task_id}_{filename}"
+                        temp_path.write_bytes(bytes(content_bytes))
+                        _capture_ingest(
+                            task_id=task_id,
+                            source_path=temp_path,
+                            session=session,
+                            session_id=session_id,
+                            user_id=user_id,
+                            filename=filename,
+                            mime=str(job.get("mime", "") or ""),
+                            source_mode=source_mode,
+                            tags=tags,
+                            source_rel_path=filename,
+                            strict_local_only=strict_local_only,
+                            content_bytes=bytes(content_bytes),
+                        )
+                    else:
+                        raw_path = str(job.get("path", "") or "").strip()
+                        if not raw_path:
+                            raise ValueError("import path required")
+                        source_path = Path(raw_path).expanduser().resolve()
+                        if source_path.is_dir():
+                            files = self._collect_supported_files(source_path, recursive=bool(job.get("recursive", True)))
+                            total_files = len(files)
+                            for idx, fp in enumerate(files, 1):
+                                try:
+                                    rel_path = fp.relative_to(source_path).as_posix()
+                                except Exception:
+                                    rel_path = fp.name
+                                _update_progress(idx, total_files, rel_path)
+                                _capture_ingest(
+                                    task_id=task_id,
+                                    source_path=fp,
+                                    session=session,
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                    filename=fp.name,
+                                    mime="",
+                                    source_mode=source_mode,
+                                    tags=tags,
+                                    source_rel_path=rel_path,
+                                    strict_local_only=strict_local_only,
+                                )
+                        else:
+                            _update_progress(1, 1, source_path.name)
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=source_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=source_path.name,
+                                mime=str(job.get("mime", "") or ""),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=source_path.name,
+                                strict_local_only=strict_local_only,
+                            )
+                _flush_ingest_state()
+                ok_count = sum(1 for row in result_rows if bool(row.get("ok", False)))
+                duplicate_count = sum(1 for row in result_rows if bool(row.get("duplicate", False)))
+                failed_count = len(item_errors)
+                if failed_count and ok_count <= 0:
+                    raise ValueError("\n".join(item_errors[:12]))
+                self.store.update_task(
+                    task_id,
+                    status="completed_with_errors" if failed_count else "completed",
+                    finished_at=now_ts(),
+                    imported_count=ok_count,
+                    duplicate_count=duplicate_count,
+                    failed_count=failed_count,
+                    error="\n".join(item_errors[:12]),
+                    doc_ids=[str(x.get("doc_id", "")) for x in result_rows if str(x.get("doc_id", "")).strip()],
+                )
+            except Exception as exc:
+                self.store.update_task(
+                    task_id,
+                    status="failed",
+                    finished_at=now_ts(),
+                    error=trim(str(exc), 320),
+                )
+            finally:
+                self._cleanup_task_inbox(task_id)
+                current = self.store.get_task(task_id)
+                status = str((current or {}).get("status", "") or "").strip().lower()
+                if status and status not in {"queued", "running"}:
+                    self._drop_job_payload(task_id)
+                self.queue.task_done()
+
+
+class CodeGraphIndex(TFGraphIDFIndex):
+    def __init__(self):
+        super().__init__()
+        self.import_edges: dict[tuple[str, str], int] = {}
+        self.symbol_to_docs: dict[str, list[str]] = {}
+        self.path_to_doc: dict[str, str] = {}
+        self.module_to_docs: dict[str, list[str]] = {}
+
+    def snapshot(self) -> dict:
+        payload = super().snapshot()
+        payload["import_edges"] = [
+            {"left": str(left), "right": str(right), "weight": int(weight or 0)}
+            for (left, right), weight in self.import_edges.items()
+            if str(left).strip() and str(right).strip()
+        ]
+        payload["symbol_to_docs"] = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in self.symbol_to_docs.items()
+        }
+        payload["path_to_doc"] = {str(k): str(v) for k, v in self.path_to_doc.items() if str(k).strip() and str(v).strip()}
+        payload["module_to_docs"] = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in self.module_to_docs.items()
+        }
+        return payload
+
+    def restore(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        ok = super().restore(payload)
+        if not ok:
+            return False
+        import_edges: dict[tuple[str, str], int] = {}
+        for row in (payload.get("import_edges", []) or []):
+            if not isinstance(row, dict):
+                continue
+            left = str(row.get("left", "") or "").strip()
+            right = str(row.get("right", "") or "").strip()
+            if not left or not right:
+                continue
+            import_edges[(left, right)] = int(row.get("weight", 0) or 0)
+        self.import_edges = import_edges
+        self.symbol_to_docs = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in (payload.get("symbol_to_docs", {}) or {}).items()
+            if isinstance(v, list)
+        }
+        self.path_to_doc = {
+            str(k): str(v)
+            for k, v in (payload.get("path_to_doc", {}) or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
+        self.module_to_docs = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in (payload.get("module_to_docs", {}) or {}).items()
+            if isinstance(v, list)
+        }
+        return True
+
+    def _import_aliases(self, value: object) -> set[str]:
+        raw = str(value or "").strip().strip("\"'`")
+        raw = raw.replace("\\", "/")
+        raw = re.sub(r"^\.+/", "", raw)
+        raw = raw.strip("./")
+        if not raw:
+            return set()
+        base = raw
+        no_ext = raw.rsplit(".", 1)[0] if "." in raw and "/" in raw else raw
+        aliases = {
+            base,
+            no_ext,
+            base.replace("/", "."),
+            no_ext.replace("/", "."),
+            base.replace(".", "/"),
+            no_ext.replace(".", "/"),
+            base.split("/")[-1],
+            no_ext.split("/")[-1],
+            base.split(".")[-1],
+            no_ext.split(".")[-1],
+        }
+        return {str(x).strip().lower() for x in aliases if str(x).strip()}
+
+    def _rebuild_code_community_links(self):
+        community_links: dict[str, dict[str, int]] = defaultdict(dict)
+        for doc_id, related_map in self.related_docs.items():
+            left = str(self.doc_meta.get(doc_id, {}).get("community", "") or "").strip()
+            if not left:
+                continue
+            for other_id, weight in related_map.items():
+                right = str(self.doc_meta.get(other_id, {}).get("community", "") or "").strip()
+                if (not right) or right == left:
+                    continue
+                community_links[left][right] = int(community_links[left].get(right, 0) or 0) + int(weight or 0)
+        self.community_links = {k: dict(v) for k, v in community_links.items()}
+        for community, report in list(self.community_reports.items()):
+            links = sorted((self.community_links.get(community, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+            patched = dict(report)
+            patched["links"] = [{"community": name, "weight": int(weight or 0)} for name, weight in links[:6]]
+            self.community_reports[community] = patched
+
+    def build(self, documents: list[dict], chunks: list[dict]):
+        self.import_edges = {}
+        self.symbol_to_docs = {}
+        self.path_to_doc = {}
+        self.module_to_docs = {}
+        docs_by_id = {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in documents
+            if isinstance(row, dict) and str(row.get("id", "") or "").strip()
+        }
+        chunks_by_id = {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in chunks
+            if isinstance(row, dict) and str(row.get("id", "") or "").strip()
+        }
+        super().build(documents, chunks)
+        alias_map: dict[str, set[str]] = defaultdict(set)
+        symbol_map: dict[str, set[str]] = defaultdict(set)
+        for doc_id, row in self.doc_meta.items():
+            src = docs_by_id.get(doc_id, {})
+            rel_path = str(src.get("relative_path", src.get("source_rel_path", src.get("filename", ""))) or "").strip().replace("\\", "/")
+            module_name = str(src.get("module_name", "") or "").strip()
+            imports = [str(x).strip() for x in (src.get("imports", []) or []) if str(x).strip()]
+            exports = [str(x).strip() for x in (src.get("exports", []) or []) if str(x).strip()]
+            labels = [str(x).strip() for x in (src.get("labels", []) or []) if str(x).strip()]
+            symbols = [dict(x) for x in (src.get("symbols", []) or []) if isinstance(x, dict)]
+            row.update(
+                {
+                    "relative_path": rel_path,
+                    "module_name": module_name,
+                    "imports": imports[:64],
+                    "exports": exports[:64],
+                    "labels": labels[:24],
+                    "symbols": symbols[:200],
+                    "line_count": int(src.get("line_count", src.get("metadata", {}).get("line_count", 0)) or 0)
+                    if isinstance(src.get("metadata", {}), dict)
+                    else int(src.get("line_count", 0) or 0),
+                }
+            )
+            if rel_path:
+                self.path_to_doc[rel_path] = doc_id
+            for alias in self._import_aliases(rel_path):
+                alias_map[alias].add(doc_id)
+            for alias in self._import_aliases(module_name):
+                alias_map[alias].add(doc_id)
+            for alias in self._import_aliases(Path(rel_path).stem if rel_path else row.get("filename", "")):
+                alias_map[alias].add(doc_id)
+            if module_name:
+                self.module_to_docs.setdefault(module_name, []).append(doc_id)
+            for sym in symbols:
+                name = str(sym.get("name", "") or "").strip()
+                if not name:
+                    continue
+                symbol_map[name.lower()].add(doc_id)
+        for name, doc_ids in symbol_map.items():
+            self.symbol_to_docs[name] = sorted(doc_ids)
+        for chunk_id, row in self.chunk_meta.items():
+            src = chunks_by_id.get(chunk_id, {})
+            row.update(
+                {
+                    "line_start": int(src.get("line_start", 0) or 0),
+                    "line_end": int(src.get("line_end", 0) or 0),
+                    "symbol": str(src.get("symbol", "") or ""),
+                    "symbol_kind": str(src.get("symbol_kind", "") or ""),
+                    "relative_path": str(src.get("relative_path", "") or ""),
+                }
+            )
+        import_edges: dict[tuple[str, str], int] = defaultdict(int)
+        for doc_id, row in self.doc_meta.items():
+            for token in list(row.get("imports", []) or [])[:64]:
+                candidates: set[str] = set()
+                for alias in self._import_aliases(token):
+                    candidates.update(alias_map.get(alias, set()))
+                for target_id in list(candidates)[:6]:
+                    if target_id == doc_id:
+                        continue
+                    import_edges[(doc_id, target_id)] += 1
+                    self.related_docs.setdefault(doc_id, {})
+                    self.related_docs.setdefault(target_id, {})
+                    self.related_docs[doc_id][target_id] = int(self.related_docs[doc_id].get(target_id, 0) or 0) + 1
+                    self.related_docs[target_id][doc_id] = int(self.related_docs[target_id].get(doc_id, 0) or 0) + 1
+        self.import_edges = {tuple(k): int(v or 0) for k, v in import_edges.items()}
+        for doc_id, row in self.doc_meta.items():
+            row["graph_degree"] = (
+                len(self.doc_to_chunks.get(doc_id, []) or [])
+                + len(row.get("symbols", []) or [])
+                + len(self.related_docs.get(doc_id, {}) or {})
+            )
+        self._rebuild_code_community_links()
+
+    def _fast_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        allowed_communities: set[str] | None = None,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        qsymbols = _code_query_terms(query)
+        query_low = query.lower()
+        allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for chunk_id, cweight in self.inverted.get(token, []):
+                scores[chunk_id] += qweight * cweight
+        rows: list[dict] = []
+        for chunk_id, dot in scores.items():
+            chunk = self.chunk_meta.get(chunk_id, {})
+            doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
+            if not doc:
+                continue
+            if category and str(doc.get("category", "")) != str(category):
+                continue
+            if kind and str(doc.get("kind", "")) != str(kind):
+                continue
+            if allowed and str(doc.get("community", "") or "") not in allowed:
+                continue
+            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or "").strip()
+            chunk_entities = {str(x).strip().lower() for x in (chunk.get("entities", []) or []) if str(x).strip()}
+            doc_symbols = {
+                str((row or {}).get("name", "") or "").strip().lower()
+                for row in (doc.get("symbols", []) or [])
+                if isinstance(row, dict) and str((row or {}).get("name", "") or "").strip()
+            }
+            chunk_symbol = str(chunk.get("symbol", "") or "").strip().lower()
+            if chunk_symbol:
+                chunk_entities.add(chunk_symbol)
+            ent_overlap = len({str(x).lower() for x in qentities}.intersection(chunk_entities))
+            symbol_overlap = len(qsymbols.intersection(chunk_entities.union(doc_symbols)))
+            graph_bonus = (0.12 * ent_overlap) + (0.16 * symbol_overlap)
+            if rel_path:
+                rel_low = rel_path.lower()
+                base_low = Path(rel_path).name.lower()
+                module_low = str(doc.get("module_name", "") or "").strip().lower()
+                if rel_low and rel_low in query_low:
+                    graph_bonus += 0.28
+                elif base_low and base_low in query_low:
+                    graph_bonus += 0.20
+                elif module_low and module_low in query_low:
+                    graph_bonus += 0.14
+            graph_bonus += min(0.12, math.log1p(len(self.related_docs.get(str(doc.get("id", "")), {}) or {})) / 9.0)
+            final_score = lexical * 0.78 + graph_bonus
+            line_start = int(chunk.get("line_start", 0) or 0)
+            line_end = int(chunk.get("line_end", 0) or 0)
+            if rel_path and line_start > 0:
+                citation = f"[{rel_path}:{line_start}-{max(line_start, line_end)}]"
+            else:
+                citation = f"[{rel_path or doc.get('id', '')}]"
+            rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": str(doc.get("id", "")),
+                    "chunk_id": chunk_id,
+                    "title": rel_path or str(doc.get("title", "")),
+                    "filename": str(doc.get("filename", "")),
+                    "relative_path": rel_path,
+                    "kind": str(doc.get("kind", "")),
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "language": str(doc.get("language", "")),
+                    "anchor": str(chunk.get("anchor", "") or chunk.get("symbol", "") or ""),
+                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "entities": list(chunk.get("entities", []) or [])[:12],
+                    "symbol": str(chunk.get("symbol", "") or ""),
+                    "symbol_kind": str(chunk.get("symbol_kind", "") or ""),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "citation": citation,
+                    "route_evidence": "chunk",
+                    "sort_bias": 0.18 if rel_path and rel_path.lower() in query_low else 0.0,
+                }
+            )
+        if not rows:
+            for doc in sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True):
+                if category and str(doc.get("category", "")) != str(category):
+                    continue
+                if kind and str(doc.get("kind", "")) != str(kind):
+                    continue
+                rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or "")
+                hay = "\n".join(
+                    [
+                        rel_path,
+                        str(doc.get("module_name", "") or ""),
+                        str(doc.get("summary", "") or ""),
+                        " ".join(
+                            str((row or {}).get("name", "") or "")
+                            for row in (doc.get("symbols", []) or [])[:16]
+                            if isinstance(row, dict)
+                        ),
+                    ]
+                ).lower()
+                ratio = difflib.SequenceMatcher(None, query_low[:280], hay[:1200]).ratio()
+                if rel_path and Path(rel_path).name.lower() in query_low:
+                    ratio += 0.16
+                if ratio < 0.16:
+                    continue
+                rows.append(
+                    {
+                        "score": round(ratio, 6),
+                        "lexical_score": round(ratio, 6),
+                        "graph_score": 0.0,
+                        "doc_id": str(doc.get("id", "")),
+                        "chunk_id": "",
+                        "title": rel_path or str(doc.get("title", "")),
+                        "filename": str(doc.get("filename", "")),
+                        "relative_path": rel_path,
+                        "kind": str(doc.get("kind", "")),
+                        "category": str(doc.get("category", "")),
+                        "community": str(doc.get("community", "")),
+                        "language": str(doc.get("language", "")),
+                        "anchor": "",
+                        "text": trim(str(doc.get("summary", "")), 1200),
+                        "entities": [
+                            str((row or {}).get("name", "") or "")
+                            for row in (doc.get("symbols", []) or [])[:8]
+                            if isinstance(row, dict)
+                        ],
+                        "citation": f"[{rel_path or doc.get('id', '')}]",
+                        "route_evidence": "document",
+                    }
+                )
+        return self._finalize_query_rows(
+            query,
+            rows,
+            qentities,
+            top_k=top_k,
+            route="fast",
+            route_meta={"mode": "fast", "allowed_communities": sorted(allowed)[:8]},
+        )
+
+    def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        community_nodes: dict[str, str] = {}
+        symbol_nodes: dict[str, str] = {}
+        try:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES if max_nodes is None else max_nodes)
+        except Exception:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES or 0)
+        node_budget = None if max_nodes_int <= 0 else max(20, max_nodes_int)
+        for doc in docs:
+            if node_budget is not None and len(nodes) >= node_budget:
+                break
+            doc_id = str(doc.get("id", ""))
+            rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or doc_id)
+            file_node = f"file:{doc_id}"
+            nodes.append(
+                {
+                    "id": file_node,
+                    "label": Path(rel_path).name or rel_path,
+                    "path": rel_path,
+                    "type": "file",
+                    "language": str(doc.get("language", "")),
+                    "community": str(doc.get("community", "")),
+                }
+            )
+            community = str(doc.get("community", "") or "")
+            if community and community not in community_nodes and (node_budget is None or len(nodes) < node_budget):
+                community_id = f"community:{len(community_nodes)+1}"
+                community_nodes[community] = community_id
+                nodes.append({"id": community_id, "label": community, "type": "community"})
+            if community in community_nodes:
+                edges.append({"source": file_node, "target": community_nodes[community], "type": "belongs_to"})
+            for sym in (doc.get("symbols", []) or [])[:4]:
+                if node_budget is not None and len(nodes) >= node_budget:
+                    break
+                if not isinstance(sym, dict):
+                    continue
+                name = str(sym.get("name", "") or "").strip()
+                if not name:
+                    continue
+                key = f"{rel_path}:{name}"
+                node_id = symbol_nodes.get(key)
+                if not node_id:
+                    node_id = f"symbol:{hashlib.sha1(key.encode('utf-8', errors='ignore')).hexdigest()[:10]}"
+                    symbol_nodes[key] = node_id
+                    nodes.append({"id": node_id, "label": name, "type": "symbol", "kind": str(sym.get("kind", "") or "")})
+                edges.append({"source": file_node, "target": node_id, "type": "defines"})
+        active_doc_rows = docs if node_budget is None else docs[: max(1, node_budget // 2)]
+        active_files = {str(row.get("id", "")) for row in active_doc_rows if str(row.get("id", "")).strip()}
+        import_edge_rows = self.import_edges.items() if node_budget is None else list(self.import_edges.items())[: max(12, node_budget)]
+        for (left, right), weight in import_edge_rows:
+            if left not in active_files or right not in active_files:
+                continue
+            edges.append({"source": f"file:{left}", "target": f"file:{right}", "type": "imports", "weight": int(weight or 0)})
+        node_ids = {str(row.get("id", "")) for row in nodes if str(row.get("id", "")).strip()}
+        edges = [dict(row) for row in edges if str(row.get("source", "")).strip() in node_ids and str(row.get("target", "")).strip() in node_ids]
+        return {
+            "built_at": self.built_at,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "communities": dict(self.community_counts),
+        }
+
+
+class CodeLibraryStore(RAGLibraryStore):
+    def __init__(self, root: Path):
+        self._init_storage_layout(root)
+        self.lock = threading.RLock()
+        self.created_at = now_ts()
+        self.updated_at = now_ts()
+        self.content_updated_at = now_ts()
+        self.documents: dict[str, dict] = {}
+        self.chunks: dict[str, dict] = {}
+        self.tasks: list[dict] = []
+        self.index = CodeGraphIndex()
+        self._load()
+        if not self._restore_index_snapshot():
+            self.rebuild_index(persist_snapshot=True)
+
+    def register_task(self, task: dict) -> dict:
+        row = dict(task or {})
+        row["id"] = str(row.get("id") or make_id("codetask"))
+        row["status"] = str(row.get("status", "queued") or "queued")
+        row["submitted_at"] = float(row.get("submitted_at", now_ts()) or now_ts())
+        with self.lock:
+            self.tasks.append(row)
+            self.tasks = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+            self.updated_at = now_ts()
+            self._save_locked(write_documents=False, write_chunks=False)
+        return row
+
+    def library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        payload = super().library_payload(limit=limit, offset=offset)
+        docs = list(self.documents.values())
+        languages = Counter(str(x.get("language", "unknown") or "unknown") for x in docs)
+        symbol_total = sum(len(x.get("symbols", []) or []) for x in docs if isinstance(x, dict))
+        import_total = sum(len(x.get("imports", []) or []) for x in docs if isinstance(x, dict))
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        stats.update(
+            {
+                "languages": dict(languages.most_common(12)),
+                "symbols": int(symbol_total),
+                "imports": int(import_total),
+            }
+        )
+        payload["stats"] = stats
+        return payload
+
+    def ingest_document(
+        self,
+        *,
+        doc_id: str,
+        source_path: Path | None,
+        original_name: str,
+        parse_result: dict,
+        raw_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        session_id: str = "",
+        user_id: str = "",
+        source_rel_path: str = "",
+        tags: list[str] | None = None,
+        multimodal: dict | None = None,
+        asset_sources: list[dict] | None = None,
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        source_fp = Path(source_path).resolve() if isinstance(source_path, Path) else None
+        rel_path_clean = str(source_rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if raw_bytes is None and source_fp and source_fp.exists():
+            raw_bytes = source_fp.read_bytes()
+        sha256 = str(parse_result.get("sha256", "") or "").strip()
+        if not sha256:
+            if raw_bytes is not None:
+                sha256 = _sha256_bytes(raw_bytes)
+            elif source_fp and source_fp.exists():
+                sha256 = _sha256_file(source_fp)
+        with self.lock:
+            existing_doc_id = self._find_doc_by_sha_locked(sha256)
+            if existing_doc_id:
+                row = dict(self.documents.get(existing_doc_id, {}))
+                stamp = now_ts()
+                source_links = row.get("source_links", [])
+                if not isinstance(source_links, list):
+                    source_links = []
+                source_links.append(
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                )
+                row["source_links"] = source_links[-24:]
+                if rel_path_clean:
+                    row["source_rel_path"] = rel_path_clean
+                    row["relative_path"] = rel_path_clean
+                row["updated_at"] = stamp
+                row["duplicate_hits"] = int(row.get("duplicate_hits", 0) or 0) + 1
+                self.documents[existing_doc_id] = row
+                self.updated_at = stamp
+                if persist_now:
+                    self._save_locked(write_chunks=False, write_tasks=False)
+                return {
+                    "ok": True,
+                    "doc_id": existing_doc_id,
+                    "duplicate": True,
+                    "title": str(row.get("title", "")),
+                    "backup_path": str(row.get("backup_path", "")),
+                }
+        safe_name = _rag_safe_name(original_name or (source_fp.name if source_fp else "source.txt"))
+        backup_dir = self.backup_root / doc_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_rel = rel_path_clean or safe_name
+        backup_path = backup_dir / backup_rel
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        if raw_bytes is not None:
+            backup_path.write_bytes(raw_bytes)
+        elif source_fp and source_fp.exists():
+            shutil.copy2(source_fp, backup_path)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 220_000)
+        parsed_path = self.parsed_root / f"{doc_id}.md"
+        summary = trim(str(parse_result.get("summary", "") or semantic_text), 2400)
+        parsed_path.write_text(
+            "\n".join(
+                part
+                for part in [
+                    f"# {rel_path_clean or safe_name}",
+                    "",
+                    f"language: {str(parse_result.get('language', 'unknown') or 'unknown')}",
+                    f"module: {_code_module_name(rel_path_clean or safe_name, str(parse_result.get('language', '') or ''))}",
+                    "",
+                    summary,
+                ]
+                if part is not None
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        symbols = [dict(x) for x in (parse_result.get("symbols", []) or []) if isinstance(x, dict)]
+        imports = [str(x).strip() for x in (parse_result.get("imports", []) or []) if str(x).strip()]
+        exports = [str(x).strip() for x in (parse_result.get("exports", []) or []) if str(x).strip()]
+        labels = sorted(
+            {
+                str(x).strip()
+                for x in list(parse_result.get("labels", []) or []) + list(tags or [])
+                if str(x).strip()
+            }
+        )
+        if _code_is_test_path(rel_path_clean):
+            labels = sorted(set(labels + ["test"]))
+        language = str(parse_result.get("language", "unknown") or "unknown")
+        module_name = _code_module_name(rel_path_clean or safe_name, language)
+        community = _code_choose_community(rel_path_clean or safe_name, language, labels)
+        entity_candidates = list(parse_result.get("entities", []) or [])
+        entity_candidates.extend(str(row.get("name", "") or "") for row in symbols[:24])
+        entity_candidates.extend(imports[:24])
+        combined_entities: list[str] = []
+        seen_entities: set[str] = set()
+        for token in entity_candidates:
+            clean = re.sub(r"\s+", "", str(token or "").strip())
+            if not clean or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:.#/-]{1,119}", clean):
+                continue
+            key = clean.lower()
+            if key in seen_entities:
+                continue
+            seen_entities.add(key)
+            combined_entities.append(clean)
+            if len(combined_entities) >= 48:
+                break
+        chunk_rows = [dict(x) for x in (parse_result.get("chunks", []) or []) if isinstance(x, dict)]
+        if not chunk_rows:
+            chunk_rows = _rag_chunk_text(semantic_text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
+        chunk_ids: list[str] = []
+        with self.lock:
+            stamp = now_ts()
+            for chunk_idx, chunk in enumerate(chunk_rows[:CODE_MAX_CHUNKS_PER_DOC], 1):
+                chunk_id = f"{doc_id}_c{chunk_idx:03d}"
+                chunk_text = str(chunk.get("text", "") or "")
+                symbol = str(chunk.get("symbol", "") or "").strip()
+                chunk_entities: list[str] = []
+                seen_chunk_entities: set[str] = set()
+                for token in [symbol] + re.findall(r"[A-Za-z_][A-Za-z0-9_:.#/-]{1,80}", chunk_text[:2400]):
+                    clean = str(token or "").strip()
+                    if not clean:
+                        continue
+                    key = clean.lower()
+                    if key in seen_chunk_entities:
+                        continue
+                    seen_chunk_entities.add(key)
+                    chunk_entities.append(clean)
+                    if len(chunk_entities) >= 18:
+                        break
+                row = {
+                    "id": chunk_id,
+                    "doc_id": doc_id,
+                    "seq": chunk_idx,
+                    "anchor": str(chunk.get("anchor", "") or symbol or f"chunk {chunk_idx}"),
+                    "text": chunk_text,
+                    "entities": chunk_entities,
+                    "line_start": int(chunk.get("line_start", 0) or 0),
+                    "line_end": int(chunk.get("line_end", 0) or 0),
+                    "symbol": symbol,
+                    "symbol_kind": str(chunk.get("symbol_kind", "") or ""),
+                    "relative_path": rel_path_clean,
+                }
+                self.chunks[chunk_id] = row
+                chunk_ids.append(chunk_id)
+            doc_row = {
+                "id": doc_id,
+                "title": rel_path_clean or safe_name,
+                "filename": safe_name,
+                "relative_path": rel_path_clean,
+                "module_name": module_name,
+                "kind": "source_code",
+                "category": "code",
+                "labels": labels,
+                "language": language,
+                "mime": str(parse_result.get("mime", guess_mime_from_name(safe_name, "text/plain")) or ""),
+                "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
+                "sha256": sha256,
+                "source_mode": str(source_mode or "manual"),
+                "source_path": str(source_fp or ""),
+                "source_rel_path": rel_path_clean,
+                "backup_path": self._rel(backup_path),
+                "parsed_text_path": self._rel(parsed_path),
+                "summary": summary,
+                "entities": combined_entities,
+                "community": community,
+                "chunk_count": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+                "symbols": symbols[:200],
+                "imports": imports[:64],
+                "exports": exports[:64],
+                "line_count": int(parse_result.get("metadata", {}).get("line_count", 0) or 0)
+                if isinstance(parse_result.get("metadata", {}), dict)
+                else 0,
+                "session_id": str(session_id or ""),
+                "user_id": str(user_id or ""),
+                "source_links": [
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                ],
+                "created_at": stamp,
+                "updated_at": stamp,
+                "import_mark": True,
+            }
+            self.documents[doc_id] = doc_row
+            self.updated_at = stamp
+            self.content_updated_at = stamp
+            if persist_now:
+                self._save_locked(write_tasks=False)
+        if rebuild_index_now:
+            self.rebuild_index()
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "duplicate": False,
+            "title": rel_path_clean or safe_name,
+            "backup_path": self._rel(backup_path),
+            "parsed_text_path": self._rel(parsed_path),
+            "chunk_count": len(chunk_ids),
+        }
+
+
+class CodeIngestionService(RAGIngestionService):
+    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None):
+        self.store = store
+        self.parser = parser
+        self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
+        self.parse_timeout_seconds = int(CODE_PARSE_TIMEOUT_SECONDS)
+        self.resume_report = {"resumed": 0, "failed": 0, "cleaned": 0}
+        self.threads = [
+            threading.Thread(target=self._worker_loop, name=f"code-ingestion-{idx+1}", daemon=True)
+            for idx in range(self.worker_count)
+        ]
+        for thread in self.threads:
+            thread.start()
+        self._cleanup_finished_job_artifacts()
+        self._resume_incomplete_tasks()
+
+    def _collect_supported_files(self, root: Path, recursive: bool) -> list[Path]:
+        files: list[Path] = []
+        if not root.exists():
+            return files
+        if not recursive:
+            for path in sorted(root.glob("*")):
+                try:
+                    if path.is_file() and self.parser.supported_file(path):
+                        files.append(path)
+                except Exception:
+                    continue
+                if len(files) >= RAG_MAX_IMPORT_FILES:
+                    break
+            return files
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name.lower() not in CODE_LIBRARY_IGNORED_DIRS and not name.startswith(".")]
+            current_path = Path(current_root)
+            for name in sorted(filenames):
+                fp = current_path / name
+                try:
+                    if fp.is_file() and self.parser.supported_file(fp):
+                        files.append(fp)
+                except Exception:
+                    continue
+                if len(files) >= RAG_MAX_IMPORT_FILES:
+                    return files
+        return files
+
+    def _ingest_one_file(
+        self,
+        *,
+        task_id: str,
+        source_path: Path,
+        session: SessionState | None,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        mime: str,
+        source_mode: str,
+        tags: list[str],
+        source_rel_path: str = "",
+        strict_local_only: bool = False,
+        content_bytes: bytes | None = None,
+        text_override: str = "",
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        if not self.parser.supported_file(source_path):
+            raise ValueError(f"unsupported code file: {source_path.name}")
+        parse_result = self.parser.parse_file(source_path, mime=mime, text_override=text_override)
+        doc_id = make_id("codedoc")
+        return self.store.ingest_document(
+            doc_id=doc_id,
+            source_path=source_path,
+            original_name=filename or source_path.name,
+            parse_result=parse_result,
+            raw_bytes=content_bytes,
+            source_mode=source_mode,
+            session_id=session_id,
+            user_id=user_id,
+            source_rel_path=source_rel_path,
+            tags=tags,
+            persist_now=persist_now,
+            rebuild_index_now=rebuild_index_now,
+        )
+
+RAG_ADMIN_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clouds Coder RAG Admin</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/rag-admin.js"></script>
+</head>
+<body>
+  <main class="rag-shell">
+    <header class="rag-hero">
+      <div>
+        <p class="eyebrow">Clouds Coder</p>
+        <h1>TF-Graph_IDF RAG Admin</h1>
+        <p class="subtitle">Global knowledge library, graph view, batch import, backup, and retrieval control.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn" class="btn">Refresh</button>
+        <button id="rebuildBtn" class="btn btn-accent">Rebuild Index</button>
+      </div>
+    </header>
+
+    <section class="rag-grid stats-grid" id="statsGrid"></section>
+
+    <section class="rag-grid form-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Import</h2>
+          <span id="importStatus" class="status-chip">idle</span>
+        </div>
+        <div class="field">
+          <label for="sessionSelect">Session Context</label>
+          <select id="sessionSelect"></select>
+        </div>
+        <div class="field">
+          <label for="tagInput">Tags</label>
+          <input id="tagInput" type="text" placeholder="research, multimodal, finance">
+        </div>
+        <div class="field">
+          <label class="check"><input id="importLocalOnly" type="checkbox"> Import without LLM / Strict local-only import</label>
+          <p class="field-note">Forces import to use only local parsers, local backup, local chunking, and local indexing. Multimodal LLM enrichment is disabled.</p>
+        </div>
+        <div class="field">
+          <label for="pathInput">Path / Directory</label>
+          <div class="inline">
+            <input id="pathInput" type="text" placeholder="/absolute/path or relative/path">
+            <label class="check"><input id="recursiveInput" type="checkbox" checked> recursive</label>
+          </div>
+          <button id="importPathBtn" class="btn btn-wide">Import Path</button>
+        </div>
+        <div class="field">
+          <label for="fileInput">Upload Files</label>
+          <input id="fileInput" type="file" multiple>
+          <p class="field-note">Single upload entry supports multiple files in one batch.</p>
+          <button id="importFileBtn" class="btn btn-wide">Upload Files To Library</button>
+        </div>
+        <div class="field">
+          <label for="folderInput">Upload Folder</label>
+          <input id="folderInput" type="file" webkitdirectory directory multiple>
+          <p class="field-note">Recursively traverses nested subdirectories and preserves relative paths in metadata.</p>
+          <button id="importFolderBtn" class="btn btn-wide">Upload Folder To Library</button>
+        </div>
+        <div class="field">
+          <label for="manualTitle">Manual Text</label>
+          <input id="manualTitle" type="text" placeholder="knowledge-note.md">
+          <textarea id="manualText" rows="7" placeholder="Paste text / report / notes here"></textarea>
+          <button id="importTextBtn" class="btn btn-wide">Save Text Into RAG</button>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Query</h2>
+          <span id="queryStatus" class="status-chip">ready</span>
+        </div>
+        <div class="field">
+          <label for="queryInput">Query</label>
+          <textarea id="queryInput" rows="7" placeholder="Ask the multilingual RAG system"></textarea>
+        </div>
+        <div class="inline split">
+          <div class="field grow">
+            <label for="queryRouteInput">Route</label>
+            <select id="queryRouteInput">
+              <option value="auto" selected>Auto</option>
+              <option value="fast">Fast</option>
+              <option value="global">Global</option>
+              <option value="hybrid">Hybrid</option>
+            </select>
+          </div>
+          <div class="field grow">
+            <label for="topKInput">Top K</label>
+            <input id="topKInput" type="number" min="1" max="12" value="8">
+          </div>
+          <label class="check top-gap"><input id="querySynthesize" type="checkbox" checked> synthesize answer</label>
+        </div>
+        <button id="queryBtn" class="btn btn-accent btn-wide">Run Query</button>
+        <div id="querySummary" class="query-summary"></div>
+        <div id="queryResults" class="stack-list"></div>
+      </article>
+    </section>
+
+    <section class="rag-grid content-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Documents</h2>
+          <span id="docCount" class="status-chip">0</span>
+        </div>
+        <div id="docList" class="stack-list"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Tasks</h2>
+          <span id="taskCount" class="status-chip">0</span>
+        </div>
+        <div id="taskList" class="stack-list"></div>
+      </article>
+    </section>
+
+    <section class="rag-grid graph-grid">
+      <article class="panel panel-graph">
+        <div class="panel-head">
+          <h2>Knowledge Graph</h2>
+          <span id="graphCount" class="status-chip">0/0</span>
+        </div>
+        <div class="graph-toolbar">
+          <div class="graph-modes" role="tablist" aria-label="Graph views">
+            <button id="graphModeStaticBtn" class="graph-mode is-active" type="button">Static 2D</button>
+            <button id="graphMode3dBtn" class="graph-mode" type="button">3D View</button>
+            <button id="graphModeJsonBtn" class="graph-mode" type="button">JSON</button>
+          </div>
+          <div class="graph-meta">
+            <span id="graphPerfTag" class="status-chip">render-on-demand</span>
+            <span id="graphRuntimeTag" class="status-chip">ready</span>
+          </div>
+        </div>
+        <div id="graphStage" class="graph-stage">
+          <canvas id="graphCanvas2d" class="graph-layer"></canvas>
+          <div id="graph3dHost" class="graph-layer hidden"></div>
+          <pre id="graphView" class="code-block graph-json hidden"></pre>
+          <div id="graphOverlay" class="graph-overlay">
+            Static 2D by default. 3D loads three.js from local js_lib only when requested.
+          </div>
+        </div>
+        <div id="graphLegend" class="graph-legend"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>File System</h2>
+          <span class="status-chip">library</span>
+        </div>
+        <pre id="fsView" class="code-block"></pre>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+RAG_ADMIN_CSS = """
+:root{
+  --bg:#eef3ea;
+  --bg-strong:#dde8d4;
+  --panel:#fbfcf8;
+  --ink:#173122;
+  --muted:#607565;
+  --line:#c9d8c6;
+  --accent:#1f7a4d;
+  --accent-2:#8d4f22;
+  --danger:#b44434;
+  --radius:18px;
+  --shadow:0 22px 55px rgba(38,62,46,.10);
+  --mono:"SFMono-Regular","Menlo","Monaco","Consolas",monospace;
+  --sans:"Avenir Next","Helvetica Neue","PingFang SC","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:radial-gradient(circle at top left,#f8fbf3 0,#eef3ea 42%,#dde8d4 100%);color:var(--ink);font-family:var(--sans)}
+body{min-height:100vh}
+.rag-shell{max-width:1520px;margin:0 auto;padding:24px}
+.rag-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px;padding:24px;border:1px solid rgba(23,49,34,.08);border-radius:28px;background:linear-gradient(135deg,rgba(255,255,255,.92),rgba(236,244,229,.88));box-shadow:var(--shadow)}
+.eyebrow{margin:0 0 6px;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent)}
+.rag-hero h1{margin:0;font-size:34px;line-height:1.05}
+.subtitle{margin:10px 0 0;max-width:760px;color:var(--muted)}
+.hero-actions{display:flex;gap:10px;flex-wrap:wrap}
+.rag-grid{display:grid;gap:18px;margin-bottom:18px}
+.stats-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.form-grid{grid-template-columns:1.15fr 1fr}
+.content-grid,.graph-grid{grid-template-columns:1fr 1fr}
+.panel{background:rgba(251,252,248,.94);border:1px solid rgba(23,49,34,.08);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}
+.panel h2{margin:0;font-size:18px}
+.stat-card{padding:16px;border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.95),rgba(236,244,229,.88));border:1px solid rgba(23,49,34,.08)}
+.stat-label{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted)}
+.stat-value{margin-top:8px;font-size:28px;font-weight:700}
+.stat-meta{margin-top:8px;font-size:12px;color:var(--muted)}
+.field{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.field label{font-size:13px;color:var(--muted)}
+.field-note{margin:0;font-size:12px;line-height:1.5;color:var(--muted)}
+.inline{display:flex;gap:10px;align-items:center}
+.split{justify-content:space-between;align-items:flex-end}
+.grow{flex:1}
+.top-gap{margin-top:28px}
+input,select,textarea,button{font:inherit}
+input,select,textarea{width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:#fff;color:var(--ink)}
+textarea{resize:vertical;min-height:120px}
+.check{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
+.check input{width:auto}
+.btn{border:0;border-radius:999px;padding:12px 18px;background:#dcead6;color:var(--ink);cursor:pointer;font-weight:700}
+.btn:hover{filter:brightness(.98)}
+.btn-accent{background:linear-gradient(135deg,var(--accent),#3aa56f);color:#fff}
+.btn-wide{width:100%}
+.status-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:var(--bg-strong);color:var(--muted);font-size:12px}
+.status-chip.bad{background:#f7d8d2;color:var(--danger)}
+.stack-list{display:grid;gap:10px;max-height:560px;overflow:auto}
+.item{padding:12px;border:1px solid rgba(23,49,34,.08);border-radius:14px;background:rgba(255,255,255,.82)}
+.item-title{font-weight:700}
+.item-sub{margin-top:6px;color:var(--muted);font-size:12px;line-height:1.5}
+.item-text{margin-top:8px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.55}
+.item-tags{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
+.tag{display:inline-flex;padding:4px 8px;border-radius:999px;background:var(--bg-strong);font-size:11px;color:var(--muted)}
+.query-summary{margin:12px 0;padding:12px 14px;border-left:4px solid var(--accent-2);background:rgba(141,79,34,.08);border-radius:12px;white-space:pre-wrap;min-height:44px}
+.code-block{margin:0;min-height:320px;max-height:620px;overflow:auto;padding:14px;border-radius:16px;background:#15231c;color:#dce9df;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word}
+.hidden{display:none!important}
+.panel-graph{min-height:0}
+.graph-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.graph-modes{display:inline-flex;gap:8px;padding:6px;border-radius:999px;background:rgba(23,49,34,.06);border:1px solid rgba(23,49,34,.08)}
+.graph-mode{border:0;border-radius:999px;padding:10px 14px;background:transparent;color:var(--muted);cursor:pointer;font-weight:700}
+.graph-mode.is-active{background:#163b29;color:#eef7f0;box-shadow:0 10px 24px rgba(22,59,41,.22)}
+.graph-mode:disabled{opacity:.45;cursor:not-allowed}
+.graph-meta{display:flex;gap:8px;flex-wrap:wrap}
+.graph-stage{position:relative;min-height:520px;height:520px;border-radius:18px;border:1px solid rgba(23,49,34,.08);overflow:hidden;background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.92),rgba(230,239,225,.92) 45%,rgba(214,228,208,.96))}
+.graph-layer{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+#graphCanvas2d{display:block}
+#graph3dHost canvas{display:block;width:100%!important;height:100%!important}
+.graph-stage.is-3d #graph3dHost{cursor:grab}
+.graph-stage.is-3d #graph3dHost.dragging{cursor:grabbing}
+.graph-json{min-height:100%;max-height:none;border-radius:0;background:transparent;color:#173122;padding:18px;font-size:12px}
+.graph-overlay{position:absolute;left:14px;bottom:14px;max-width:min(420px,78%);padding:10px 12px;border-radius:14px;background:rgba(21,35,28,.82);color:#dce9df;font-size:12px;line-height:1.5;backdrop-filter:blur(8px)}
+.graph-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.legend-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.82);border:1px solid rgba(23,49,34,.08);font-size:12px;color:var(--muted)}
+.legend-swatch{width:12px;height:12px;border-radius:999px;display:inline-block;box-shadow:0 0 0 1px rgba(23,49,34,.12)}
+@media (max-width:1180px){
+  .form-grid,.content-grid,.graph-grid{grid-template-columns:1fr}
+  .rag-hero{flex-direction:column}
+}
+@media (max-width:720px){
+  .graph-stage{height:380px;min-height:380px}
+  .graph-toolbar{align-items:flex-start}
+}
+"""
+
+RAG_ADMIN_JS = """
+const S={config:null,library:null,tasks:null,graph:null,filesystem:null,query:null};
+const G={
+  mode:'static',
+  layout:null,
+  layouts:{},
+  hoverId:'',
+  screenNodes:[],
+  bound:false,
+  renderKey:'',
+  three:{
+    lib:null,
+    loading:null,
+    renderer:null,
+    scene:null,
+    camera:null,
+    root:null,
+    raycaster:null,
+    meshes:new Map(),
+    dragging:false,
+    lastX:0,
+    lastY:0,
+    azimuth:0.72,
+    elevation:0.56,
+    distance:360,
+    fitDistance:360,
+    minDistance:96,
+    maxDistance:4200,
+    pending:false,
+    graphKey:'',
+    activeHoverId:'',
+    resizeObserver:null,
+  },
+};
+const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
+const GRAPH_STATIC_NODE_LIMIT=300;
+const GRAPH_STATIC_HERO_COUNT=30;
+const E=id=>document.getElementById(id);
+async function api(path,init){
+  const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
+  const text=await res.text();
+  let data=text;
+  try{data=text?JSON.parse(text):{}}catch{}
+  if(!res.ok){
+    const msg=(data&&typeof data==='object'&&data.error)?String(data.error):String(text||`HTTP ${res.status}`);
+    throw new Error(msg);
+  }
+  return data;
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
+function fmtTs(v){const n=Number(v||0);if(!n)return '-';const d=new Date(n*1000);return isNaN(d.getTime())?'-':d.toLocaleString()}
+function ab2b64(buf){let out='';const bytes=new Uint8Array(buf);const step=0x8000;for(let i=0;i<bytes.length;i+=step){out+=String.fromCharCode.apply(null,bytes.subarray(i,i+step))}return btoa(out)}
+function setChip(id,text,bad=false){const el=E(id);if(!el)return;el.textContent=String(text||'');el.classList.toggle('bad',!!bad)}
+function selectedSession(){return String(E('sessionSelect')?.value||'').trim()}
+function parseTags(){return String(E('tagInput')?.value||'').split(',').map(x=>x.trim()).filter(Boolean)}
+function strictLocalOnlyImport(){return Boolean(E('importLocalOnly')?.checked)}
+function selectedQueryRoute(){return String(E('queryRouteInput')?.value||'auto').trim().toLowerCase()||'auto'}
+function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
+async function submitImportItems(items,batchIndex,batchCount){
+  const batchItems=Array.isArray(items)?items.filter(Boolean):[];
+  if(!batchItems.length)return {task_ids:[],task_count:0,item_count:0};
+  setChip('importStatus',`queue ${batchIndex}/${batchCount} · ${batchItems.length} item(s)`);
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({items:batchItems,session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  const ids=Array.isArray(out.task_ids)?out.task_ids.filter(Boolean):[];
+  const taskIds=ids.length?ids.map(x=>String(x)):(out.task_id?[String(out.task_id)]:[]);
+  return {task_ids:taskIds,task_count:taskIds.length,item_count:Number(out.item_count||batchItems.length||0)};
+}
+async function uploadFileListInBatches(fileList,label='encoding',requireRelative=false){
+  const files=Array.from(fileList||[]).filter(Boolean);
+  if(!files.length)throw new Error('select files first');
+  if(requireRelative&&!files.some(file=>normalizeUploadPath(file.webkitRelativePath||'')))throw new Error('select a folder first');
+  const maxBatchItems=Math.max(1,Number(S.config?.limits?.max_import_batch_items||500));
+  const maxBatchBytes=Math.max(1024*1024,Number(S.config?.limits?.max_import_batch_bytes||50331648));
+  const softMaxFiles=Math.max(maxBatchItems,Number(S.config?.limits?.max_import_files||20000));
+  const batchCount=Math.max(1,Math.ceil(files.length/maxBatchItems));
+  if(files.length>softMaxFiles){
+    setChip('importStatus',`${label} ${files.length} file(s) · auto batching beyond ${softMaxFiles}`);
+  }
+  const taskIds=[];
+  let queuedTasks=0;
+  let itemCount=0;
+  let items=[];
+  let batchBytes=0;
+  let batchIndex=0;
+  const flush=async()=>{
+    if(!items.length)return;
+    batchIndex+=1;
+    const out=await submitImportItems(items,batchIndex,batchCount);
+    if(out.task_ids?.length)taskIds.push(...out.task_ids);
+    queuedTasks+=Number(out.task_count||0);
+    itemCount+=Number(out.item_count||items.length||0);
+    items=[];
+    batchBytes=0;
+  };
+  for(let i=0;i<files.length;i+=1){
+    const file=files[i];
+    setChip('importStatus',`${label} ${i+1}/${files.length}`);
+    const buf=await file.arrayBuffer();
+    const encoded=ab2b64(buf);
+    const row={filename:String(file.name||`upload_${i+1}`),mime:String(file.type||''),content_b64:encoded};
+    const rel=normalizeUploadPath(file.webkitRelativePath||'');
+    if(rel)row.relative_path=rel;
+    const nextBytes=Number(encoded.length||0);
+    if(items.length&&((items.length+1)>maxBatchItems||(batchBytes+nextBytes)>maxBatchBytes)){
+      await flush();
+    }
+    items.push(row);
+    batchBytes+=nextBytes;
+  }
+  await flush();
+  return {task_ids:taskIds,task_count:queuedTasks||taskIds.length,item_count:itemCount};
+}
+function renderStats(){
+  const stats=S.library?.stats||{};
+  const cards=[
+    ['Documents',stats.documents||0,`${Object.keys(stats.categories||{}).length} categories`],
+    ['Chunks',stats.chunks||0,'chunk-level retrieval'],
+    ['Tasks',S.tasks?.length||0,'async import queue'],
+    ['Communities',Object.keys(stats.communities||{}).length||0,'graph communities'],
+  ];
+  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('');
+}
+function renderSessions(){
+  const sel=E('sessionSelect'); if(!sel) return;
+  const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
+  const current=selectedSession()||String(S.config?.default_session_id||'');
+  sel.innerHTML=`<option value="">(none)</option>`+sessions.map(s=>`<option value="${esc(s.id)}" ${String(s.id)===current?'selected':''}>${esc(s.title||s.id)} · ${esc(s.id)}</option>`).join('');
+}
+function renderDocs(){
+  const docs=Array.isArray(S.library?.documents)?S.library.documents:[];
+  const totalDocs=Number(S.library?.total_documents ?? S.library?.stats?.documents ?? docs.length ?? 0);
+  const returnedDocs=Number(S.library?.returned_documents ?? docs.length ?? 0);
+  setChip('docCount',returnedDocs===totalDocs?String(totalDocs):`${returnedDocs}/${totalDocs}`);
+  E('docList').innerHTML=docs.map(doc=>{
+    const rel=String(doc.source_rel_path||'').trim();
+    const relLine=rel?`<br>source rel: ${esc(rel)}`:'';
+    return `<div class="item"><div class="item-title">${esc(doc.title||doc.filename||doc.id)}</div><div class="item-sub">${esc(doc.id)} · ${esc(doc.category)} · ${esc(doc.kind)} · ${esc(doc.language)} · chunks=${esc(doc.chunk_count||0)} · assets=${esc(doc.assets_count||0)}<br>${esc(doc.backup_path||'')}${relLine}<br>updated: ${esc(fmtTs(doc.updated_at))}</div><div class="item-text">${esc(doc.summary||'')}</div></div>`;
+  }).join('')||'<div class="item">No documents yet.</div>';
+}
+function renderTasks(){
+  const tasks=Array.isArray(S.tasks)?S.tasks:[];
+  setChip('taskCount',String(tasks.length));
+  E('taskList').innerHTML=tasks.map(task=>{
+    const counts=[
+      task.item_count?`items=${task.item_count}`:'',
+      task.imported_count!==undefined?`imported=${task.imported_count}`:'',
+      task.duplicate_count!==undefined?`duplicates=${task.duplicate_count}`:'',
+      task.failed_count!==undefined?`failed=${task.failed_count}`:'',
+      (task.current_item&&task.total_items)?`progress=${task.current_item}/${task.total_items}`:'',
+      task.strict_local_only?`strict-local-only`:'' ,
+    ].filter(Boolean).join(' · ');
+    const progressLabel=String(task.progress_label||'').trim();
+    const sub=`${esc(task.id)} · ${esc(task.status||'queued')} · submitted: ${esc(fmtTs(task.submitted_at))}${counts?`<br>${esc(counts)}`:''}${progressLabel?`<br>${esc(progressLabel)}`:''}`;
+    return `<div class="item"><div class="item-title">${esc(task.label||task.type||task.id)}</div><div class="item-sub">${sub}</div><div class="item-text">${esc(task.error||'')}${task.doc_ids?`\\n${esc((task.doc_ids||[]).join(', '))}`:''}</div></div>`;
+  }).join('')||'<div class="item">No tasks.</div>';
+}
+function clamp(v,min,max){return Math.max(min,Math.min(max,Number(v||0)))}
+function hashText(text){let h=2166136261>>>0;const s=String(text||'');for(let i=0;i<s.length;i+=1){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+function hslToHex(h,s,l){
+  const hh=((Number(h)||0)%360+360)%360/360;
+  const ss=clamp(s,0,100)/100;
+  const ll=clamp(l,0,100)/100;
+  let r=ll,g=ll,b=ll;
+  if(ss>0){
+    const q=ll<0.5?ll*(1+ss):ll+ss-ll*ss;
+    const p=2*ll-q;
+    const hue=t=>{
+      let x=t;
+      if(x<0)x+=1;
+      if(x>1)x-=1;
+      if(x<1/6)return p+(q-p)*6*x;
+      if(x<1/2)return q;
+      if(x<2/3)return p+(q-p)*(2/3-x)*6;
+      return p;
+    };
+    r=hue(hh+1/3);g=hue(hh);b=hue(hh-1/3);
+  }
+  return ((Math.round(r*255)&255)<<16)|((Math.round(g*255)&255)<<8)|(Math.round(b*255)&255)
+}
+function mixHex(a,b,t){
+  const aa=Number(a||0)&0xffffff;
+  const bb=Number(b||0)&0xffffff;
+  const tt=clamp(t,0,1);
+  const ar=(aa>>16)&255,ag=(aa>>8)&255,ab=aa&255;
+  const br=(bb>>16)&255,bg=(bb>>8)&255,bbv=bb&255;
+  return (((Math.round(ar+(br-ar)*tt)&255)<<16)|((Math.round(ag+(bg-ag)*tt)&255)<<8)|(Math.round(ab+(bbv-ab)*tt)&255))>>>0
+}
+function rgbaFromHex(hex,a=1){
+  const v=Number(hex||0)&0xffffff;
+  return `rgba(${(v>>16)&255},${(v>>8)&255},${v&255},${clamp(a,0,1)})`
+}
+function graphSignature(graph){
+  const nodes=Array.isArray(graph?.nodes)?graph.nodes:[];
+  const edges=Array.isArray(graph?.edges)?graph.edges:[];
+  return JSON.stringify({
+    built_at:Number(graph?.built_at||0),
+    node_count:Number(graph?.node_count||0),
+    edge_count:Number(graph?.edge_count||0),
+    nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
+    edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]),
+  })
+}
+function normalizeGraphType(v){
+  const t=String(v||'').trim().toLowerCase();
+  if(t==='community'||t==='document'||t==='entity')return t;
+  return 'document';
+}
+function communityHex(key){return hslToHex(hashText(key)%360,72,58)}
+function nodeRadius2D(type){if(type==='community')return 11.5;if(type==='entity')return 2.7;return 4.5}
+function nodeRadius3D(type){if(type==='community')return 8.4;if(type==='entity')return 1.9;return 3.4}
+function nodeCommunityKey(node){
+  const type=normalizeGraphType(node?.type);
+  if(type==='community')return String(node?.label||node?.community||node?.id||'community').trim()||'community';
+  return String(node?.community||node?.category||'unassigned').trim()||'unassigned';
+}
+function dominantCommunity(items){
+  const counts=new Map();
+  for(const item of items||[]){
+    const key=String(item?.communityKey||'').trim()||'unassigned';
+    counts.set(key,Number(counts.get(key)||0)+1);
+  }
+  let best='unassigned',score=-1;
+  for(const [key,val] of counts.entries()){
+    if(val>score){score=val;best=key}
+  }
+  return best;
+}
+function typePriority(type){
+  if(type==='community')return 0;
+  if(type==='document')return 1;
+  if(type==='entity')return 2;
+  return 3;
+}
+function signedHashUnit(key){
+  const bucket=hashText(String(key||''))%2001;
+  return bucket/1000-1;
+}
+function depthOrbit(angle,radius,key,boost=1){
+  const span=Math.max(18,Number(radius||0));
+  const wave=Math.sin(angle*1.41)*span*1.08+Math.cos(angle*0.73)*span*0.54;
+  const jitter=signedHashUnit(key)*Math.max(12,span*0.24);
+  return (wave+jitter)*Math.max(0.3,Number(boost||1));
+}
+function computeGraphBounds(items){
+  let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+  for(const item of items||[]){
+    minX=Math.min(minX,Number(item?.x||0));
+    minY=Math.min(minY,Number(item?.y||0));
+    minZ=Math.min(minZ,Number(item?.z||0));
+    maxX=Math.max(maxX,Number(item?.x||0));
+    maxY=Math.max(maxY,Number(item?.y||0));
+    maxZ=Math.max(maxZ,Number(item?.z||0));
+  }
+  if(!(items||[]).length){minX=minY=minZ=-1;maxX=maxY=maxZ=1}
+  const center={
+    x:(minX+maxX)/2,
+    y:(minY+maxY)/2,
+    z:(minZ+maxZ)/2,
+  };
+  const halfX=Math.max(1,(maxX-minX)/2);
+  const halfY=Math.max(1,(maxY-minY)/2);
+  const halfZ=Math.max(1,(maxZ-minZ)/2);
+  return {
+    bounds:{minX,maxX,minY,maxY,minZ,maxZ},
+    center,
+    spanX:maxX-minX,
+    spanY:maxY-minY,
+    spanZ:maxZ-minZ,
+    radius:Math.max(24,Math.sqrt(halfX*halfX+halfY*halfY+halfZ*halfZ)),
+  };
+}
+function buildGraphLayout(graph){
+  const rawNodes=Array.isArray(graph?.nodes)?graph.nodes:[];
+  const rawEdges=Array.isArray(graph?.edges)?graph.edges:[];
+  const nodeMap=new Map();
+  for(const raw of rawNodes){
+    const id=String(raw?.id||'').trim();
+    if(!id)continue;
+    nodeMap.set(id,{...raw,id,label:String(raw?.label||raw?.title||id),type:normalizeGraphType(raw?.type)});
+  }
+  const edges=[];
+  const mentionDocsByEntity=new Map();
+  for(const raw of rawEdges){
+    const source=String(raw?.source||'').trim();
+    const target=String(raw?.target||'').trim();
+    if(!source||!target||!nodeMap.has(source)||!nodeMap.has(target))continue;
+    const row={source,target,type:String(raw?.type||'related').trim().toLowerCase()||'related',weight:Number(raw?.weight||0)};
+    edges.push(row);
+    const s=nodeMap.get(source),t=nodeMap.get(target);
+    if(s?.type==='document'&&t?.type==='entity'){
+      if(!mentionDocsByEntity.has(target))mentionDocsByEntity.set(target,[]);
+      mentionDocsByEntity.get(target).push(source);
+    }else if(s?.type==='entity'&&t?.type==='document'){
+      if(!mentionDocsByEntity.has(source))mentionDocsByEntity.set(source,[]);
+      mentionDocsByEntity.get(source).push(target);
+    }
+  }
+  const nodes=[...nodeMap.values()];
+  const communities=nodes.filter(n=>n.type==='community').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const documents=nodes.filter(n=>n.type==='document').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const entities=nodes.filter(n=>n.type==='entity').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const other=nodes.filter(n=>!['community','document','entity'].includes(String(n.type||'')));
+  const communityKeys=[...new Set([
+    ...communities.map(n=>nodeCommunityKey(n)),
+    ...documents.map(n=>nodeCommunityKey(n)),
+  ])].filter(Boolean);
+  if(!communityKeys.length&&nodes.length)communityKeys.push('unassigned');
+  communityKeys.sort((a,b)=>String(a).localeCompare(String(b)));
+  const centers=new Map();
+  communityKeys.forEach((key,idx)=>{
+    const angle=GOLDEN_ANGLE*idx;
+    const radius=(idx===0?0:88*Math.sqrt(idx+1))+48;
+    const depthRadius=96+radius*0.82;
+    centers.set(
+      key,
+      {
+        x:Math.cos(angle)*radius*1.55,
+        y:Math.sin(angle)*radius*1.2,
+        z:depthOrbit(angle,depthRadius,key,1.28),
+        key,
+      }
+    )
+  });
+  if(!centers.has('unassigned'))centers.set('unassigned',{x:0,y:0,z:0,key:'unassigned'});
+  const items=[];
+  const itemById=new Map();
+  function pushNode(node,x,y,z,communityKey,colorHex){
+    const type=normalizeGraphType(node?.type);
+    const item={
+      id:String(node.id),
+      node,
+      type,
+      label:String(node.label||node.id),
+      communityKey:String(communityKey||'unassigned'),
+      x:Number(x||0),
+      y:Number(y||0),
+      z:Number(z||0),
+      colorHex:Number(colorHex||0),
+      radius2d:nodeRadius2D(type),
+      radius3d:nodeRadius3D(type),
+    };
+    items.push(item);
+    itemById.set(item.id,item);
+    return item;
+  }
+  for(const node of communities){
+    const key=nodeCommunityKey(node);
+    const center=centers.get(key)||centers.get('unassigned');
+    pushNode(node,center.x,center.y,center.z,key,communityHex(key));
+  }
+  const docsByCommunity=new Map();
+  for(const node of documents){
+    const key=nodeCommunityKey(node);
+    if(!docsByCommunity.has(key))docsByCommunity.set(key,[]);
+    docsByCommunity.get(key).push(node);
+  }
+  for(const [key,list] of docsByCommunity.entries()){
+    const center=centers.get(key)||centers.get('unassigned');
+    list.sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+    list.forEach((node,idx)=>{
+      const angle=GOLDEN_ANGLE*(idx+1)+(hashText(node.id)%37)*0.03;
+      const radius=26+9*Math.sqrt(idx+1);
+      const colorHex=mixHex(communityHex(key),0x13231d,0.18);
+      const depth=depthOrbit(angle,radius*1.9,node.id,1.18)+Math.cos(angle*0.92)*radius*0.38;
+      pushNode(
+        node,
+        center.x+Math.cos(angle)*radius*1.55,
+        center.y+Math.sin(angle)*radius*1.18,
+        center.z+depth,
+        key,
+        colorHex
+      )
+    })
+  }
+  entities.forEach((node,idx)=>{
+    const docIds=mentionDocsByEntity.get(String(node.id))||[];
+    const anchors=docIds.map(id=>itemById.get(String(id))).filter(Boolean);
+    const key=anchors.length?dominantCommunity(anchors):communityKeys[idx%Math.max(1,communityKeys.length)]||'unassigned';
+    let x=0,y=0,z=0;
+    if(anchors.length){
+      x=anchors.reduce((sum,row)=>sum+Number(row.x||0),0)/anchors.length;
+      y=anchors.reduce((sum,row)=>sum+Number(row.y||0),0)/anchors.length;
+      z=anchors.reduce((sum,row)=>sum+Number(row.z||0),0)/anchors.length;
+      const angle=GOLDEN_ANGLE*(idx+1)+(hashText(node.id)%41)*0.05;
+      const radius=18+6*Math.sqrt(anchors.length+1);
+      x+=Math.cos(angle)*radius*1.2;
+      y+=Math.sin(angle)*radius*0.96;
+      z+=depthOrbit(angle,radius*1.45,node.id,0.96);
+    }else{
+      const angle=GOLDEN_ANGLE*(idx+1);
+      const radius=170+7*Math.sqrt(idx+1);
+      x=Math.cos(angle)*radius;
+      y=Math.sin(angle)*radius*0.82;
+      z=depthOrbit(angle,radius*1.06,node.id,1.06);
+    }
+    pushNode(node,x,y,z,key,mixHex(communityHex(key),0xffffff,0.26))
+  });
+  other.forEach((node,idx)=>{
+    const angle=GOLDEN_ANGLE*(idx+1);
+    const radius=200+9*Math.sqrt(idx+1);
+    pushNode(
+      node,
+      Math.cos(angle)*radius,
+      Math.sin(angle)*radius,
+      depthOrbit(angle,radius*1.12,node.id,1.1),
+      'unassigned',
+      0x607565
+    )
+  });
+  const visibleEdges=edges.filter(edge=>itemById.has(edge.source)&&itemById.has(edge.target));
+  const nodeStats=new Map(items.map(item=>[String(item.id),{degree:0,score:0,weightedScore:0}]));
+  function bumpNodeScore(id,amount){
+    const row=nodeStats.get(String(id));
+    if(!row)return;
+    row.degree+=1;
+    row.weightedScore+=Number(amount||0);
+    row.score+=Number(amount||0);
+  }
+  for(const edge of visibleEdges){
+    const boost=edge.type==='related'
+      ? (1.2+Math.min(4.2,Math.log1p(Number(edge.weight||0))*1.25))
+      : (edge.type==='mentions'?1.05:0.82);
+    bumpNodeScore(edge.source,boost);
+    bumpNodeScore(edge.target,boost);
+  }
+  items.forEach(item=>{
+    const stat=nodeStats.get(String(item.id))||{degree:0,score:0,weightedScore:0};
+    const type=String(item.type||'document');
+    const communityKey=nodeCommunityKey(item.node||item);
+    const communityFreq=Number(graph?.communities?.[communityKey]||graph?.communities?.[String(item.label||'')]||0);
+    let base=0.6;
+    if(type==='community')base=3.2+communityFreq*0.95;
+    else if(type==='document')base=1.4+communityFreq*0.08;
+    else if(type==='entity')base=0.9;
+    item.degree=Number(stat.degree||0);
+    item.score=Number(stat.score||0)+base;
+  });
+  const layoutEdges=visibleEdges.map(edge=>{
+    const source=itemById.get(edge.source),target=itemById.get(edge.target);
+    let colorHex=0x173122;
+    let alpha=0.14;
+    let width=0.9;
+    if(edge.type==='mentions'){
+      colorHex=mixHex(Number(target?.colorHex||0x607565),0xffffff,0.18);
+      alpha=0.16;
+      width=0.85;
+    }else if(edge.type==='related'){
+      colorHex=mixHex(Number(source?.colorHex||0x607565),Number(target?.colorHex||0x607565),0.5);
+      alpha=0.26;
+      width=1.2+Math.min(1.2,Math.log1p(Number(edge.weight||0))/2.4);
+    }else if(edge.type==='belongs_to'){
+      colorHex=0x173122;
+      alpha=0.14;
+      width=1.05;
+    }
+    return {...edge,colorHex,alpha,width}
+  });
+  const geometry=computeGraphBounds(items);
+  return {
+    signature:graphSignature(graph),
+    items,
+    itemById,
+    edges:layoutEdges,
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts:{community:communities.length,document:documents.length,entity:entities.length},
+    communities:communityKeys,
+    totalNodeCount:items.length,
+    totalEdgeCount:layoutEdges.length,
+    visibleNodeCount:items.length,
+    visibleEdgeCount:layoutEdges.length,
+    heroCount:0,
+    sampled:false,
+  }
+}
+function buildStaticGraphLayout(fullLayout){
+  const base=fullLayout&&typeof fullLayout==='object'?fullLayout:null;
+  const totalNodes=Number(base?.items?.length||0);
+  if(!base||!totalNodes){
+    return {
+      signature:`${String(base?.signature||'empty')}::static`,
+      items:[],
+      itemById:new Map(),
+      edges:[],
+      bounds:{minX:-1,maxX:1,minY:-1,maxY:1,minZ:-1,maxZ:1},
+      center:{x:0,y:0,z:0},
+      spanX:2,
+      spanY:2,
+      spanZ:2,
+      radius:24,
+      counts:{community:0,document:0,entity:0},
+      communities:Array.isArray(base?.communities)?base.communities:[],
+      totalNodeCount:totalNodes,
+      totalEdgeCount:Number(base?.edges?.length||0),
+      visibleNodeCount:0,
+      visibleEdgeCount:0,
+      heroCount:0,
+      sampled:false,
+      labelIds:new Set(),
+    };
+  }
+  const limit=Math.max(1,Math.min(GRAPH_STATIC_NODE_LIMIT,totalNodes));
+  const ranked=[...(base.items||[])].sort((a,b)=>{
+    const scoreDiff=Number(b?.score||0)-Number(a?.score||0);
+    if(Math.abs(scoreDiff)>1e-9)return scoreDiff;
+    const degreeDiff=Number(b?.degree||0)-Number(a?.degree||0);
+    if(Math.abs(degreeDiff)>1e-9)return degreeDiff;
+    const typeDiff=typePriority(String(a?.type||''))-typePriority(String(b?.type||''));
+    if(typeDiff)return typeDiff;
+    return String(a?.label||a?.id||'').localeCompare(String(b?.label||b?.id||''));
+  });
+  const heroCount=Math.min(GRAPH_STATIC_HERO_COUNT,limit,ranked.length);
+  const heroIds=new Set(ranked.slice(0,heroCount).map(item=>String(item.id||'')));
+  const selectedIds=new Set();
+  const addSelected=item=>{
+    const id=String(item?.id||'').trim();
+    if(!id||selectedIds.has(id)||selectedIds.size>=limit)return;
+    selectedIds.add(id);
+  };
+  ranked.slice(0,heroCount).forEach(addSelected);
+  ranked.filter(item=>String(item?.type||'')==='community').slice(0,Math.min(24,limit)).forEach(addSelected);
+  ranked.forEach(addSelected);
+  const visibleRatio=Math.min(1,limit/Math.max(limit,totalNodes));
+  const spreadScale=1/Math.max(0.4,Math.sqrt(visibleRatio));
+  const densityScale=1/Math.max(1,spreadScale);
+  const selectedItems=(base.items||[]).filter(item=>selectedIds.has(String(item.id||'')));
+  const scoreMax=Math.max(1,...selectedItems.map(item=>Math.log1p(Math.max(0,Number(item?.score||0)))));
+  const labelIds=new Set();
+  const items=selectedItems.map(item=>{
+    const logScore=Math.log1p(Math.max(0,Number(item?.score||0)));
+    const scoreNorm=clamp(logScore/scoreMax,0,1);
+    const hero=heroIds.has(String(item.id||''));
+    let radiusScale=0.78+scoreNorm*1.34;
+    if(String(item.type||'')==='community')radiusScale*=1.18;
+    if(hero)radiusScale*=1.52;
+    radiusScale*=densityScale;
+    const minRadius=String(item.type||'')==='entity'?1.5:(String(item.type||'')==='community'?5.8:3.2);
+    const maxRadius=String(item.type||'')==='community'?26:18;
+    const next={
+      ...item,
+      x:Number(item.x||0)*spreadScale,
+      y:Number(item.y||0)*spreadScale,
+      z:Number(item.z||0)*Math.max(1,spreadScale*0.94),
+      radius2d:clamp(Number(item.radius2d||3)*radiusScale,minRadius,maxRadius),
+      hero,
+      scoreNorm,
+    };
+    if(hero||String(next.type||'')==='community')labelIds.add(String(next.id||''));
+    return next;
+  });
+  const itemById=new Map(items.map(item=>[String(item.id),item]));
+  const edges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const geometry=computeGraphBounds(items);
+  const counts={community:0,document:0,entity:0};
+  items.forEach(item=>{
+    const type=String(item?.type||'document');
+    if(type==='community'||type==='document'||type==='entity')counts[type]+=1;
+  });
+  return {
+    signature:`${String(base.signature||'graph')}::static::${limit}/${totalNodes}`,
+    items,
+    itemById,
+    edges,
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts,
+    communities:Array.isArray(base.communities)?base.communities:[],
+    totalNodeCount:totalNodes,
+    totalEdgeCount:Number(base.edges?.length||0),
+    visibleNodeCount:items.length,
+    visibleEdgeCount:edges.length,
+    heroCount,
+    sampled:items.length<totalNodes,
+    labelIds,
+  };
+}
+function getGraphLayout(force=false,view='auto'){
+  const target=(view==='3d'||view==='json'||view==='full')?'full':'static';
+  const sig=graphSignature(S.graph||{});
+  if(force||!G.layouts||G.layouts.signature!==sig){
+    G.layouts={signature:sig,full:null,static:null};
+    G.layout=null;
+    G.renderKey=sig;
+    G.screenNodes=[];
+    G.hoverId='';
+    G.three.graphKey='';
+  }
+  if(!G.layouts.full)G.layouts.full=buildGraphLayout(S.graph||{});
+  if(!G.layouts.static)G.layouts.static=buildStaticGraphLayout(G.layouts.full);
+  G.layout=G.layouts[target]||G.layouts.full;
+  return G.layout;
+}
+function setGraphRuntime(text,bad=false){
+  const raw=String(text||'');
+  const label=raw.length>36?`${raw.slice(0,33)}...`:raw;
+  setChip('graphRuntimeTag',label,bad);
+}
+function setGraphOverlay(){
+  const layout=getGraphLayout(false,G.mode==='3d'||G.mode==='json'?'full':'static');
+  const fullLayout=getGraphLayout(false,'full');
+  const active=layout.itemById.get(String(G.hoverId||''))||null;
+  let text='';
+  if(G.mode==='static'){
+    text='Static 2D: simplified top-frequency layout.';
+    if(layout.sampled)text+=` sample ${Number(layout.visibleNodeCount||0)}/${Number(layout.totalNodeCount||0)} nodes, top ${Number(layout.heroCount||0)} highlighted.`;
+  }else if(G.mode==='3d')text='3D View: local three.js, render-on-demand only, camera auto-fits graph span.';
+  else text='JSON: raw graph payload for audit and debugging.';
+  text+=` nodes=${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  if(active){
+    const node=active.node||{};
+    const extra=[active.type,active.label];
+    if(String(node.community||'').trim())extra.push(String(node.community));
+    if(String(node.category||'').trim())extra.push(`cat=${String(node.category)}`);
+    if(String(node.kind||'').trim())extra.push(`kind=${String(node.kind)}`);
+    text+=`\\n${extra.join(' • ')}`
+  }else if(G.mode==='3d'){
+    text+='\\nDrag to orbit. Wheel to zoom. Static frame does not keep rendering.'
+  }
+  const el=E('graphOverlay');
+  if(el)el.textContent=text;
+}
+function activateGraphModeButton(){
+  const pairs=[['graphModeStaticBtn','static'],['graphMode3dBtn','3d'],['graphModeJsonBtn','json']];
+  pairs.forEach(([id,mode])=>{
+    const el=E(id);
+    if(el)el.classList.toggle('is-active',G.mode===mode);
+  })
+}
+function applyGraphModeAvailability(){
+  const three=E('graphMode3dBtn');
+  const available=Boolean(S.config?.three?.available);
+  if(three){
+    three.disabled=!available;
+    three.title=available?'Load local three.js from js_lib':'three.js not available in local js_lib';
+  }
+  if(G.mode==='3d'&&!available)G.mode='static';
+}
+function renderGraphLegend(){
+  const layout=getGraphLayout(false,G.mode==='static'?'static':'full');
+  const fullLayout=getGraphLayout(false,'full');
+  const communities=Object.entries(S.graph?.communities||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
+  const chips=[
+    {label:G.mode==='static'&&layout.sampled?`Communities ${layout.counts.community}/${fullLayout.counts.community}`:`Communities ${fullLayout.counts.community}`,color:communityHex('community')},
+    {label:G.mode==='static'&&layout.sampled?`Documents ${layout.counts.document}/${fullLayout.counts.document}`:`Documents ${fullLayout.counts.document}`,color:mixHex(communityHex('document'),0x13231d,0.18)},
+    {label:G.mode==='static'&&layout.sampled?`Entities ${layout.counts.entity}/${fullLayout.counts.entity}`:`Entities ${fullLayout.counts.entity}`,color:mixHex(communityHex('entity'),0xffffff,0.26)},
+    ...communities.map(([name,count])=>({label:`${name} ${count}`,color:communityHex(name)})),
+  ];
+  const legend=E('graphLegend');
+  if(legend)legend.innerHTML=chips.map(row=>`<span class="legend-chip"><span class="legend-swatch" style="background:${rgbaFromHex(row.color,0.96)}"></span>${esc(row.label)}</span>`).join('');
+}
+function syncGraphStage(){
+  const stage=E('graphStage');
+  const canvas=E('graphCanvas2d');
+  const host=E('graph3dHost');
+  const view=E('graphView');
+  if(stage){
+    stage.classList.toggle('is-3d',G.mode==='3d');
+    stage.classList.toggle('is-json',G.mode==='json');
+  }
+  if(canvas)canvas.classList.toggle('hidden',G.mode!=='static');
+  if(host)host.classList.toggle('hidden',G.mode!=='3d');
+  if(view)view.classList.toggle('hidden',G.mode!=='json');
+  activateGraphModeButton();
+}
+function renderGraphJson(){
+  const view=E('graphView');
+  if(view)view.textContent=JSON.stringify(S.graph||{},null,2);
+  setChip('graphPerfTag','json-view');
+  setGraphRuntime('json ready');
+  setGraphOverlay();
+}
+function ensureCanvasMetrics(){
+  const canvas=E('graphCanvas2d');
+  const stage=E('graphStage');
+  if(!canvas||!stage)return null;
+  const rect=stage.getBoundingClientRect();
+  const width=Math.max(320,Math.round(rect.width||0));
+  const height=Math.max(240,Math.round(rect.height||0));
+  const dpr=Math.max(1,Math.min(window.devicePixelRatio||1,2));
+  const bw=Math.round(width*dpr);
+  const bh=Math.round(height*dpr);
+  if(canvas.width!==bw||canvas.height!==bh){
+    canvas.width=bw;canvas.height=bh;
+    canvas.style.width=`${width}px`;
+    canvas.style.height=`${height}px`;
+  }
+  return {canvas,ctx:canvas.getContext('2d'),width,height,dpr}
+}
+function projectGraphTo2D(layout,width,height){
+  const pad=48;
+  const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
+  const dy=Math.max(1,Number(layout.bounds.maxY||0)-Number(layout.bounds.minY||0));
+  const scale=Math.max(0.1,Math.min((width-pad*2)/dx,(height-pad*2)/dy));
+  const cx=(Number(layout.bounds.minX||0)+Number(layout.bounds.maxX||0))/2;
+  const cy=(Number(layout.bounds.minY||0)+Number(layout.bounds.maxY||0))/2;
+  return layout.items.map(item=>({
+    ...item,
+    sx:width/2+(Number(item.x||0)-cx)*scale,
+    sy:height/2+(Number(item.y||0)-cy)*scale,
+    sr:Number(item.radius2d||3),
+  }))
+}
+function drawGraph2D(reason='draw'){
+  const metrics=ensureCanvasMetrics();
+  if(!metrics||G.mode!=='static')return;
+  const {ctx,width,height,dpr}=metrics;
+  const layout=getGraphLayout(false,'static');
+  const nodes=projectGraphTo2D(layout,width,height);
+  G.screenNodes=nodes;
+  const byId=new Map(nodes.map(row=>[row.id,row]));
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,metrics.canvas.width,metrics.canvas.height);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.lineCap='round';
+  for(const edge of layout.edges){
+    const a=byId.get(edge.source),b=byId.get(edge.target);
+    if(!a||!b)continue;
+    const hot=String(G.hoverId||'')&&(G.hoverId===edge.source||G.hoverId===edge.target);
+    ctx.beginPath();
+    ctx.moveTo(a.sx,a.sy);
+    ctx.lineTo(b.sx,b.sy);
+    ctx.strokeStyle=rgbaFromHex(edge.colorHex,hot?Math.min(0.42,Number(edge.alpha||0.16)+0.14):Number(edge.alpha||0.16));
+    ctx.lineWidth=hot?Number(edge.width||1)+0.7:Number(edge.width||1);
+    ctx.stroke();
+  }
+  const order={entity:0,document:1,community:2};
+  nodes.sort((a,b)=>(Number(order[a.type]||0)-Number(order[b.type]||0))||(Number(a.sr||0)-Number(b.sr||0)));
+  for(const node of nodes){
+    const hot=String(G.hoverId||'')===String(node.id);
+    if(hot){
+      ctx.beginPath();
+      ctx.arc(node.sx,node.sy,node.sr+5,0,Math.PI*2);
+      ctx.fillStyle=rgbaFromHex(node.colorHex,0.14);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(node.sx,node.sy,node.sr+(hot?1.5:0),0,Math.PI*2);
+    ctx.fillStyle=rgbaFromHex(node.colorHex,node.type==='entity'?0.82:0.94);
+    ctx.fill();
+    ctx.strokeStyle=hot?'rgba(21,35,28,0.92)':'rgba(255,255,255,0.74)';
+    ctx.lineWidth=hot?2.2:(node.type==='community'?1.4:0.75);
+    ctx.stroke();
+  }
+  ctx.font='12px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+  ctx.fillStyle='rgba(23,49,34,0.72)';
+  ctx.textBaseline='top';
+  const labelIds=layout.labelIds instanceof Set?layout.labelIds:new Set();
+  nodes
+    .filter(node=>labelIds.has(String(node.id||'')))
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+    .slice(0,Math.max(16,Number(layout.heroCount||0)))
+    .forEach(node=>ctx.fillText(node.label,node.sx+node.sr+6,node.sy-node.sr-6));
+  const active=byId.get(String(G.hoverId||''))||null;
+  if(active){
+    ctx.font='13px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+    ctx.fillStyle='rgba(21,35,28,0.96)';
+    ctx.fillText(active.label,active.sx+active.sr+8,active.sy+active.sr+4)
+  }
+  setChip('graphPerfTag','zero-idle');
+  setGraphRuntime(`2d ${reason}`);
+  setGraphOverlay();
+}
+function findGraphNodeAt(clientX,clientY){
+  const canvas=E('graphCanvas2d');
+  if(!canvas)return '';
+  const rect=canvas.getBoundingClientRect();
+  const x=clientX-rect.left;
+  const y=clientY-rect.top;
+  let best='',dist=Infinity;
+  for(const node of G.screenNodes){
+    const dx=x-Number(node.sx||0);
+    const dy=y-Number(node.sy||0);
+    const r=Number(node.sr||0)+6;
+    const d=dx*dx+dy*dy;
+    if(d<=r*r&&d<dist){dist=d;best=String(node.id||'')}
+  }
+  return best;
+}
+function clearGraphHover(){
+  if(!String(G.hoverId||''))return;
+  G.hoverId='';
+  if(G.mode==='static')drawGraph2D('hover');
+  else if(G.mode==='3d')applyThreeHover('');
+  else setGraphOverlay();
+}
+async function ensureThreeLib(){
+  const info=S.config?.three||{};
+  if(!info.available||!String(info.url||'').trim())throw new Error('local three.js unavailable');
+  if(G.three.lib)return G.three.lib;
+  if(G.three.loading)return G.three.loading;
+  setGraphRuntime('three loading');
+  G.three.loading=(async()=>{
+    if(info.module){
+      const mod=await import(String(info.url));
+      if(!mod||typeof mod!=='object'||!mod.Scene)throw new Error('three module load failed');
+      G.three.lib=mod;
+      return mod;
+    }
+    if(window.THREE&&window.THREE.Scene){G.three.lib=window.THREE;return window.THREE}
+    await new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      script.src=String(info.url);
+      script.async=true;
+      script.onload=()=>resolve(true);
+      script.onerror=()=>reject(new Error('three script load failed'));
+      document.head.appendChild(script);
+    });
+    if(!(window.THREE&&window.THREE.Scene))throw new Error('three init failed');
+    G.three.lib=window.THREE;
+    return window.THREE;
+  })().finally(()=>{G.three.loading=null});
+  return G.three.loading;
+}
+function disposeThreeObject(obj){
+  if(!obj)return;
+  if(typeof obj.traverse==='function'){
+    obj.traverse(node=>{
+      if(node.geometry&&typeof node.geometry.dispose==='function')node.geometry.dispose();
+      const material=node.material;
+      if(Array.isArray(material))material.forEach(m=>m&&typeof m.dispose==='function'&&m.dispose());
+      else if(material&&typeof material.dispose==='function')material.dispose();
+    })
+  }
+}
+function updateThreeCamera(){
+  if(!G.three.camera)return;
+  const layout=getGraphLayout(false,'full');
+  const cx=Number(layout.center?.x||0);
+  const cy=Number(layout.center?.y||0);
+  const cz=Number(layout.center?.z||0);
+  const planar=Math.cos(G.three.elevation);
+  G.three.camera.position.set(
+    cx+Math.cos(G.three.azimuth)*planar*G.three.distance,
+    cy+Math.sin(G.three.elevation)*G.three.distance,
+    cz+Math.sin(G.three.azimuth)*planar*G.three.distance,
+  );
+  G.three.camera.lookAt(cx,cy,cz);
+  G.three.camera.updateProjectionMatrix();
+}
+function computeThreeFitDistance(layout,aspect=1){
+  const radius=Math.max(24,Number(layout?.radius||24));
+  const spanZ=Math.max(1,Number(layout?.spanZ||0));
+  const fovDeg=Number(G.three.camera?.fov||42);
+  const vFov=Math.max(0.42,(fovDeg*Math.PI)/180);
+  const hFov=Math.max(0.42,2*Math.atan(Math.tan(vFov/2)*Math.max(0.75,Number(aspect||1))));
+  const fitVertical=radius/Math.sin(vFov/2);
+  const fitHorizontal=radius/Math.sin(hFov/2);
+  return Math.max(260,Math.max(fitVertical,fitHorizontal)*1.15+spanZ*0.58+36);
+}
+function fitThreeCameraToLayout(resetDistance=false){
+  if(!G.three.camera)return;
+  const host=E('graph3dHost');
+  const rect=host?host.getBoundingClientRect():{width:1,height:1};
+  const aspect=Math.max(0.75,Number(rect.width||1)/Math.max(1,Number(rect.height||1)));
+  const layout=getGraphLayout(false,'full');
+  const fitDistance=computeThreeFitDistance(layout,aspect);
+  const radius=Math.max(24,Number(layout.radius||24));
+  G.three.fitDistance=fitDistance;
+  G.three.minDistance=Math.max(92,fitDistance*0.16);
+  G.three.maxDistance=Math.max(3200,fitDistance*8.8);
+  if(resetDistance||!Number.isFinite(G.three.distance)||G.three.distance<G.three.minDistance||G.three.distance>G.three.maxDistance){
+    G.three.distance=fitDistance;
+  }else{
+    G.three.distance=clamp(G.three.distance,G.three.minDistance,G.three.maxDistance);
+  }
+  G.three.camera.near=Math.max(0.1,Math.min(16,radius/340));
+  G.three.camera.far=Math.max(12000,fitDistance+radius*24);
+  G.three.camera.updateProjectionMatrix();
+}
+function scheduleThreeRender(reason='render'){
+  if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
+  setChip('graphPerfTag','render-on-demand');
+  G.three.lastReason=String(reason||'render');
+  if(G.three.pending)return;
+  G.three.pending=true;
+  requestAnimationFrame(()=>{
+    G.three.pending=false;
+    if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
+    updateThreeCamera();
+    G.three.renderer.render(G.three.scene,G.three.camera);
+    setGraphRuntime(`3d ${G.three.lastReason}`);
+    setGraphOverlay();
+  })
+}
+function applyThreeHover(id){
+  const next=String(id||'').trim();
+  if(String(G.three.activeHoverId||'')===next)return;
+  const prevMesh=G.three.meshes.get(String(G.three.activeHoverId||''));
+  if(prevMesh){
+    prevMesh.scale.setScalar(Number(prevMesh.userData?.baseScale||1));
+    prevMesh.material.opacity=Number(prevMesh.userData?.baseOpacity||0.95);
+    prevMesh.material.color.setHex(Number(prevMesh.userData?.baseColor||0x607565));
+  }
+  G.hoverId=next;
+  G.three.activeHoverId=next;
+  const mesh=G.three.meshes.get(next);
+  if(mesh){
+    mesh.scale.setScalar(Number(mesh.userData?.baseScale||1)*1.28);
+    mesh.material.opacity=1;
+    mesh.material.color.setHex(mixHex(Number(mesh.userData?.baseColor||0x607565),0xffffff,0.18));
+  }
+  scheduleThreeRender('hover');
+}
+function pickThreeNode(ev){
+  if(!G.three.renderer||!G.three.camera||!G.three.raycaster||!G.three.meshes.size)return '';
+  const rect=G.three.renderer.domElement.getBoundingClientRect();
+  const x=((ev.clientX-rect.left)/Math.max(1,rect.width))*2-1;
+  const y=-(((ev.clientY-rect.top)/Math.max(1,rect.height))*2-1);
+  G.three.raycaster.setFromCamera({x,y},G.three.camera);
+  const hits=G.three.raycaster.intersectObjects([...G.three.meshes.values()],false);
+  return String(hits?.[0]?.object?.userData?.id||'').trim();
+}
+function resizeThreeRenderer(){
+  if(!G.three.renderer||!G.three.camera)return;
+  const host=E('graph3dHost');
+  if(!host)return;
+  const rect=host.getBoundingClientRect();
+  const width=Math.max(240,Math.round(rect.width||0));
+  const height=Math.max(220,Math.round(rect.height||0));
+  G.three.renderer.setPixelRatio(Math.max(1,Math.min(window.devicePixelRatio||1,1.5)));
+  G.three.renderer.setSize(width,height,false);
+  G.three.camera.aspect=width/Math.max(1,height);
+  fitThreeCameraToLayout(false);
+  scheduleThreeRender('resize');
+}
+function buildThreeSceneGraph(){
+  const THREE=G.three.lib;
+  if(!THREE||!G.three.root)return;
+  const layout=getGraphLayout(false,'full');
+  while(G.three.root.children.length){
+    const child=G.three.root.children.pop();
+    disposeThreeObject(child);
+  }
+  G.three.meshes=new Map();
+  const edgeBuckets={belongs_to:[],mentions:[],related:[]};
+  for(const edge of layout.edges){
+    const source=layout.itemById.get(edge.source),target=layout.itemById.get(edge.target);
+    if(!source||!target)continue;
+    const key=edge.type==='mentions'||edge.type==='belongs_to'||edge.type==='related'?edge.type:'related';
+    edgeBuckets[key].push({edge,source,target});
+  }
+  Object.entries(edgeBuckets).forEach(([kind,list])=>{
+    if(!list.length)return;
+    const pos=[];
+    const col=[];
+    list.forEach(({edge,source,target})=>{
+      const hex=Number(edge.colorHex||0x607565);
+      const r=((hex>>16)&255)/255,g=((hex>>8)&255)/255,b=(hex&255)/255;
+      pos.push(Number(source.x||0),Number(source.y||0),Number(source.z||0),Number(target.x||0),Number(target.y||0),Number(target.z||0));
+      col.push(r,g,b,r,g,b);
+    });
+    const geometry=new THREE.BufferGeometry();
+    geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+    geometry.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+    const opacity=kind==='related'?0.32:(kind==='mentions'?0.18:0.14);
+    const material=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity,depthWrite:false});
+    G.three.root.add(new THREE.LineSegments(geometry,material));
+  });
+  layout.items.forEach(item=>{
+    const opacity=item.type==='entity'?0.86:0.95;
+    const material=new THREE.MeshBasicMaterial({color:Number(item.colorHex||0x607565),transparent:true,opacity});
+    const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
+    mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
+    mesh.scale.setScalar(Number(item.radius3d||2));
+    mesh.userData={id:item.id,baseScale:Number(item.radius3d||2),baseColor:Number(item.colorHex||0x607565),baseOpacity:opacity};
+    G.three.root.add(mesh);
+    G.three.meshes.set(String(item.id),mesh);
+  });
+  fitThreeCameraToLayout(true);
+  G.three.graphKey=layout.signature;
+}
+async function ensureThreeRenderer(){
+  const THREE=await ensureThreeLib();
+  const host=E('graph3dHost');
+  if(!host)throw new Error('graph 3d host missing');
+  if(!G.three.renderer){
+    G.three.scene=new THREE.Scene();
+    G.three.camera=new THREE.PerspectiveCamera(42,1,0.1,5000);
+    G.three.root=new THREE.Group();
+    G.three.scene.add(G.three.root);
+    G.three.raycaster=new THREE.Raycaster();
+    G.three.renderer=new THREE.WebGLRenderer({alpha:true,antialias:true,powerPreference:'low-power'});
+    G.three.renderer.setClearColor(0x000000,0);
+    host.innerHTML='';
+    host.appendChild(G.three.renderer.domElement);
+  }
+  if(G.three.graphKey!==getGraphLayout(false,'full').signature)buildThreeSceneGraph();
+  resizeThreeRenderer();
+}
+function bindThreeEvents(){
+  if(G.three.resizeObserver)return;
+  const host=E('graph3dHost');
+  if(!host)return;
+  host.addEventListener('pointerdown',ev=>{
+    if(G.mode!=='3d')return;
+    G.three.dragging=true;
+    G.three.lastX=Number(ev.clientX||0);
+    G.three.lastY=Number(ev.clientY||0);
+    host.classList.add('dragging');
+    try{host.setPointerCapture(ev.pointerId)}catch{}
+  });
+  host.addEventListener('pointermove',ev=>{
+    if(G.mode!=='3d')return;
+    if(G.three.dragging){
+      const dx=Number(ev.clientX||0)-G.three.lastX;
+      const dy=Number(ev.clientY||0)-G.three.lastY;
+      G.three.lastX=Number(ev.clientX||0);
+      G.three.lastY=Number(ev.clientY||0);
+      G.three.azimuth+=dx*0.01;
+      G.three.elevation=clamp(G.three.elevation-dy*0.008,-1.2,1.2);
+      scheduleThreeRender('drag');
+      return;
+    }
+    const hit=pickThreeNode(ev);
+    if(String(hit||'')!==String(G.hoverId||''))applyThreeHover(hit);
+  });
+  const finishDrag=()=>{
+    if(!G.three.dragging)return;
+    G.three.dragging=false;
+    host.classList.remove('dragging');
+    scheduleThreeRender('idle');
+  };
+  host.addEventListener('pointerup',finishDrag);
+  host.addEventListener('pointercancel',finishDrag);
+  host.addEventListener('mouseleave',()=>{
+    if(!G.three.dragging&&String(G.hoverId||''))applyThreeHover('');
+  });
+  host.addEventListener('wheel',ev=>{
+    if(G.mode!=='3d')return;
+    ev.preventDefault();
+    const factor=ev.deltaY>0?1.08:0.92;
+    G.three.distance=clamp(G.three.distance*factor,Number(G.three.minDistance||92),Number(G.three.maxDistance||4200));
+    scheduleThreeRender('zoom');
+  },{passive:false});
+  if(typeof ResizeObserver==='function'){
+    G.three.resizeObserver=new ResizeObserver(()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+    });
+    G.three.resizeObserver.observe(E('graphStage'));
+  }else{
+    window.addEventListener('resize',()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+    });
+    G.three.resizeObserver={disconnect(){}};
+  }
+}
+async function renderGraph3D(reason='build'){
+  if(G.mode!=='3d')return;
+  await ensureThreeRenderer();
+  bindThreeEvents();
+  setChip('graphPerfTag','render-on-demand');
+  applyThreeHover(String(G.hoverId||''));
+  scheduleThreeRender(reason);
+}
+function setGraphMode(mode){
+  const target=(mode==='3d'||mode==='json')?mode:'static';
+  if(target==='3d'&&!Boolean(S.config?.three?.available)){
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime('three unavailable',true);
+    return;
+  }
+  G.mode=target;
+  syncGraphStage();
+  if(target==='json')renderGraphJson();
+  else if(target==='3d')renderGraph3D('mode-switch').catch(err=>{
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime(err.message,true);
+  });
+  else drawGraph2D('mode-switch');
+}
+function initGraphUi(){
+  if(G.bound)return;
+  G.bound=true;
+  const canvas=E('graphCanvas2d');
+  if(canvas){
+    canvas.addEventListener('mousemove',ev=>{
+      if(G.mode!=='static')return;
+      const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+      if(String(hit||'')!==String(G.hoverId||'')){G.hoverId=String(hit||'');drawGraph2D('hover')}
+    });
+    canvas.addEventListener('mouseleave',()=>{if(G.mode==='static')clearGraphHover()});
+  }
+  const staticBtn=E('graphModeStaticBtn');
+  const threeBtn=E('graphMode3dBtn');
+  const jsonBtn=E('graphModeJsonBtn');
+  if(staticBtn)staticBtn.onclick=()=>setGraphMode('static');
+  if(threeBtn)threeBtn.onclick=()=>setGraphMode('3d');
+  if(jsonBtn)jsonBtn.onclick=()=>setGraphMode('json');
+  window.addEventListener('resize',()=>{
+    clearTimeout(G.resizeTimer);
+    G.resizeTimer=setTimeout(()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+      else setGraphOverlay();
+    },40);
+  });
+}
+function renderGraph(force=false){
+  const graph=S.graph||{};
+  setChip('graphCount',`${Number(graph.node_count||0)}/${Number(graph.edge_count||0)}`);
+  const view=E('graphView');
+  if(view)view.textContent=JSON.stringify(graph,null,2);
+  getGraphLayout(force,'full');
+  getGraphLayout(force,'static');
+  renderGraphLegend();
+  applyGraphModeAvailability();
+  syncGraphStage();
+  if(G.mode==='json')renderGraphJson();
+  else if(G.mode==='3d')renderGraph3D(force?'refresh':'data').catch(err=>{
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime(err.message,true);
+  });
+  else drawGraph2D(force?'refresh':'data');
+}
+function renderFilesystem(){
+  E('fsView').textContent=JSON.stringify(S.filesystem||{},null,2);
+}
+function renderQuery(){
+  const route=String(S.query?.route||'').trim();
+  const requested=String(S.query?.requested_route||'').trim();
+  const routeMeta=S.query?.route_meta||{};
+  const routeParts=[];
+  if(route)routeParts.push(`Route: ${route}${requested&&requested!==route?` (requested ${requested})`:''}`);
+  if(Array.isArray(routeMeta?.selected_communities)&&routeMeta.selected_communities.length)routeParts.push(`Communities: ${routeMeta.selected_communities.join(', ')}`);
+  if(routeMeta?.reduce_mode)routeParts.push(`Global path: ${routeMeta.reduce_mode}`);
+  if(Array.isArray(routeMeta?.reasons)&&routeMeta.reasons.length)routeParts.push(`Signals: ${routeMeta.reasons.join(', ')}`);
+  const summary=String(S.query?.answer||S.query?.summary||'').trim();
+  E('querySummary').textContent=(routeParts.length?(routeParts.join('\\n')+'\\n\\n'):'')+(summary||'No answer yet.');
+  const results=Array.isArray(S.query?.results)?S.query.results:[];
+  E('queryResults').innerHTML=results.map(row=>`<div class="item"><div class="item-title">${esc(row.title||row.doc_id)}</div><div class="item-sub">${esc(row.citation||'')} · score=${esc(row.score||0)} · lexical=${esc(row.lexical_score||0)} · graph=${esc(row.graph_score||0)} · ${esc(row.category||'')}</div><div class="item-text">${esc(row.text||'')}</div><div class="item-tags">${(row.entities||[]).map(tag=>`<span class="tag">${esc(tag)}</span>`).join('')}</div></div>`).join('')||'<div class="item">No query results.</div>';
+}
+async function refreshAll(){
+  const [config,library,tasks,graph,filesystem]=await Promise.all([
+    api('/api/rag/config'),
+    api('/api/rag/library?limit=-1'),
+    api('/api/rag/tasks'),
+    api('/api/rag/graph'),
+    api('/api/rag/filesystem'),
+  ]);
+  S.config=config; S.library=library; S.tasks=tasks.tasks||[]; S.graph=graph; S.filesystem=filesystem;
+  renderSessions(); renderStats(); renderDocs(); renderTasks(); renderGraph(); renderFilesystem();
+}
+async function runImportPath(){
+  setChip('importStatus','running');
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({path:String(E('pathInput')?.value||'').trim(),recursive:Boolean(E('recursiveInput')?.checked),session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  setChip('importStatus',`${out.task_id||'queued'} · ${Number(out.item_count||1)} item(s)`); await refreshAll();
+}
+async function runImportFile(){
+  const out=await uploadFileListInBatches(E('fileInput')?.files,'encoding');
+  setChip('importStatus',out.task_count>1?`queued ${out.task_count} batches · ${Number(out.item_count||0)} item(s)`:`${out.task_ids?.[0]||'queued'} · ${Number(out.item_count||0)} item(s)`); await refreshAll();
+}
+async function runImportFolder(){
+  const folderInput=E('folderInput');
+  const out=await uploadFileListInBatches(folderInput?.files,'folder',true);
+  if(folderInput)folderInput.value='';
+  setChip('importStatus',out.task_count>1?`queued ${out.task_count} batches · ${Number(out.item_count||0)} item(s)`:`${out.task_ids?.[0]||'queued'} · ${Number(out.item_count||0)} item(s)`); await refreshAll();
+}
+function folderUploadSupported(){
+  const input=E('folderInput');
+  if(!input)return false;
+  return input.hasAttribute('webkitdirectory') || input.hasAttribute('directory') || ('webkitdirectory' in input);
+}
+async function triggerFolderImportFlow(){
+  const input=E('folderInput');
+  if(!input) throw new Error('folder input missing');
+  const files=input.files;
+  if(files&&files.length){
+    return await runImportFolder();
+  }
+  if(!folderUploadSupported()) throw new Error('folder upload is not supported in this browser');
+  setChip('importStatus','choose folder');
+  input.click();
+}
+async function onFolderInputChange(){
+  const input=E('folderInput');
+  const count=Number(input?.files?.length||0);
+  if(!count)return;
+  setChip('importStatus',`folder selected · ${count} file(s)`);
+  await runImportFolder();
+}
+async function runImportText(){
+  const title=String(E('manualTitle')?.value||'').trim()||'manual_note.txt';
+  const text=String(E('manualText')?.value||'').trim();
+  if(!text) throw new Error('manual text required');
+  setChip('importStatus','saving');
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({title,filename:title,text,session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  setChip('importStatus',`${out.task_id||'queued'} · ${Number(out.item_count||1)} item(s)`); await refreshAll();
+}
+async function runQuery(){
+  setChip('queryStatus','running');
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||8),route:selectedQueryRoute(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked)})});
+  S.query=out; renderQuery(); setChip('queryStatus','done');
+}
+async function rebuildIndex(){
+  setChip('importStatus','rebuilding');
+  await api('/api/rag/rebuild',{method:'POST',body:JSON.stringify({})});
+  setChip('importStatus','rebuilt'); await refreshAll();
+}
+window.addEventListener('DOMContentLoaded',async()=>{
+  initGraphUi();
+  E('refreshBtn').onclick=()=>refreshAll().catch(err=>setChip('importStatus',err.message,true));
+  E('rebuildBtn').onclick=()=>rebuildIndex().catch(err=>setChip('importStatus',err.message,true));
+  E('importPathBtn').onclick=()=>runImportPath().catch(err=>setChip('importStatus',err.message,true));
+  E('importFileBtn').onclick=()=>runImportFile().catch(err=>setChip('importStatus',err.message,true));
+  E('importFolderBtn').onclick=()=>triggerFolderImportFlow().catch(err=>setChip('importStatus',err.message,true));
+  if(E('folderInput'))E('folderInput').onchange=()=>onFolderInputChange().catch(err=>setChip('importStatus',err.message,true));
+  E('importTextBtn').onclick=()=>runImportText().catch(err=>setChip('importStatus',err.message,true));
+  E('queryBtn').onclick=()=>runQuery().catch(err=>setChip('queryStatus',err.message,true));
+  try{await refreshAll()}catch(err){setChip('importStatus',err.message,true)}
+});
+"""
+
+CODE_ADMIN_INDEX_HTML = (
+    RAG_ADMIN_INDEX_HTML
+    .replace("Clouds Coder RAG Admin", "Clouds Coder Code Library Admin")
+    .replace("/assets/rag-admin.js", "/assets/code-admin.js")
+    .replace("TF-Graph_IDF RAG Admin", "Code Graph Library Admin")
+    .replace(
+        "Global knowledge library, graph view, batch import, backup, and retrieval control.",
+        "Independent code library, repository graph view, batch import, backup, and developer retrieval control.",
+    )
+)
+CODE_ADMIN_CSS = (
+    RAG_ADMIN_CSS
+    + """
+:root{
+  --bg:#fff7fb;
+  --bg-strong:#ffe8f2;
+  --panel:#fffafb;
+  --line:#f1cadc;
+  --ink:#4d2433;
+  --muted:#8f6274;
+  --accent:#d95c8a;
+  --accent-2:#f08db0;
+  --danger:#c94b73;
+  --shadow:0 18px 48px rgba(193,94,136,.14);
+}
+html,body{background:radial-gradient(circle at top left,#fff8fc 0,#ffeef5 42%,#f9d9e6 100%);color:var(--ink)}
+.rag-hero{border:1px solid rgba(120,42,72,.08);background:linear-gradient(135deg,rgba(255,255,255,.95),rgba(255,236,244,.9));box-shadow:var(--shadow)}
+.panel{background:rgba(255,250,252,.95);border:1px solid rgba(120,42,72,.08);box-shadow:var(--shadow)}
+.stat-card{background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,236,244,.88));border:1px solid rgba(120,42,72,.08)}
+.btn{background:#ffe3ef}
+.btn-accent{background:linear-gradient(135deg,var(--accent),#f08db0);color:#fff}
+.item{border:1px solid rgba(120,42,72,.08);background:rgba(255,255,255,.84)}
+.query-summary{border-left:4px solid var(--accent);background:rgba(217,92,138,.09)}
+.graph-modes{background:rgba(217,92,138,.08);border:1px solid rgba(120,42,72,.1)}
+.graph-mode.is-active{background:#9c2f5e;color:#fff4f8;box-shadow:0 10px 24px rgba(156,47,94,.24)}
+.graph-stage{border:1px solid rgba(120,42,72,.08);background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.94),rgba(255,233,242,.94) 44%,rgba(248,214,228,.98))}
+.graph-json{color:#4d2433}
+.graph-overlay{background:rgba(88,31,53,.84);color:#ffeaf1}
+.legend-chip{background:rgba(255,255,255,.84);border:1px solid rgba(120,42,72,.08)}
+"""
+)
+CODE_ADMIN_JS = (
+    RAG_ADMIN_JS
+    .replace("/api/rag/", "/api/code/")
+    .replace("No query results.", "No code library results.")
+)
+
 class AppContext:
+    def _discover_external_code_source_roots(self) -> list[str]:
+        home = Path.home()
+        candidate_seeds = [
+            self.workspace / "code_corpora",
+            self.workspace.parent / "code_corpora",
+            self.workspace.parent.parent / "code_corpora",
+            self.workspace.parent / "Skills_Master" / "code_corpora",
+            self.workspace.parent.parent / "Skills_Master" / "code_corpora",
+            REPO_ROOT / "code_corpora",
+            home / "Downloads" / "Skills_Master" / "code_corpora",
+            home / "Downloads" / "code_corpora",
+        ]
+        seen: set[str] = set()
+        roots: list[str] = []
+
+        def _append(path: Path):
+            try:
+                resolved = path.resolve()
+            except Exception:
+                return
+            raw = str(resolved)
+            if raw in seen or not resolved.exists() or not resolved.is_dir():
+                return
+            seen.add(raw)
+            roots.append(raw)
+
+        for seed in candidate_seeds:
+            try:
+                base = seed.resolve()
+            except Exception:
+                continue
+            if not base.exists() or not base.is_dir():
+                continue
+            if (base / "repos").exists() and (base / "repos").is_dir():
+                _append(base / "repos")
+                continue
+            try:
+                children = sorted((child for child in base.iterdir() if child.is_dir()), key=lambda p: p.name.lower())
+            except Exception:
+                children = []
+            for child in children:
+                if (child / "repos").exists() and (child / "repos").is_dir():
+                    _append(child / "repos")
+        return roots
+
     def _sync_global_ollama_defaults(self, active_profile: dict | None = None):
         picked: dict = {}
         if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
@@ -29939,7 +38357,8 @@ class AppContext:
         max_user: int = 0,
         max_user_sessions: int = 0,
     ):
-        self.workspace = workspace
+        self.workspace = Path(workspace).resolve()
+        self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
         self.base_url = base_url
         self.model = model
         self.thinking = False
@@ -29985,7 +38404,7 @@ class AppContext:
         ensure_runtime_skills(self.skills_root)
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
-        self.default_llm_config = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
+        self.default_llm_config = parse_json_object(try_read_text(self.workspace / "LLM.config.json") or "{}", {})
         self.global_profiles_payload = parse_llm_config_profiles(
             self.default_llm_config, self.base_url, self.model
         )
@@ -29999,7 +38418,7 @@ class AppContext:
         active = self.global_profiles.get(self.global_active_profile_id, {})
         self._sync_global_ollama_defaults(active if isinstance(active, dict) else {})
         self.thinking = False
-        self.codes_root = CODES_ROOT
+        self.codes_root = (self.workspace / "Codes").resolve()
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
         self._session_mgrs: dict[str, SessionManager] = {}
@@ -30016,6 +38435,15 @@ class AppContext:
         self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
         self.web_ui_assets_override: dict[str, str] = {}
         self.show_upload_list = False
+        self.rag_parser = RAGContentParser()
+        self.rag_root = self.workspace / RAG_LIBRARY_DIRNAME
+        self.rag_store = RAGLibraryStore(self.rag_root)
+        self.rag_service = RAGIngestionService(self.rag_store, self.rag_parser, session_resolver=self._resolve_session_for_user)
+        self.code_parser = CodeContentParser()
+        self.code_root = self.workspace / CODE_LIBRARY_DIRNAME
+        self.code_store = CodeLibraryStore(self.code_root)
+        self.code_service = CodeIngestionService(self.code_store, self.code_parser, session_resolver=self._resolve_session_for_user)
+        self.code_source_roots = self._discover_external_code_source_roots()
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -30220,6 +38648,768 @@ class AppContext:
 
     def web_ui_skills_js(self) -> str:
         return self._web_ui_asset("skills.js")
+
+    def web_ui_rag_admin_index_html(self) -> str:
+        return RAG_ADMIN_INDEX_HTML
+
+    def web_ui_rag_admin_style_css(self) -> str:
+        return RAG_ADMIN_CSS
+
+    def web_ui_rag_admin_js(self) -> str:
+        return RAG_ADMIN_JS
+
+    def web_ui_code_admin_index_html(self) -> str:
+        return CODE_ADMIN_INDEX_HTML
+
+    def web_ui_code_admin_style_css(self) -> str:
+        return CODE_ADMIN_CSS
+
+    def web_ui_code_admin_js(self) -> str:
+        return CODE_ADMIN_JS
+
+    def rag_js_lib_asset_path(self, filename: str) -> Path | None:
+        safe = _safe_js_filename(str(filename or "").strip(), "lib.js")
+        fp = (self.js_lib_root / safe).resolve()
+        try:
+            if not fp.is_relative_to(self.js_lib_root):
+                return None
+        except Exception:
+            return None
+        if not fp.exists() or (not fp.is_file()):
+            return None
+        return fp
+
+    def rag_three_asset_info(self) -> dict:
+        picks = [
+            ("three.min.js", False),
+            ("three.module.js", True),
+        ]
+        for filename, is_module in picks:
+            fp = self.rag_js_lib_asset_path(filename)
+            if fp and fp.stat().st_size > 40:
+                return {
+                    "available": True,
+                    "filename": filename,
+                    "module": bool(is_module),
+                    "url": f"/assets/js_lib/{filename}",
+                    "size": int(fp.stat().st_size),
+                }
+        return {
+            "available": False,
+            "filename": "",
+            "module": False,
+            "url": "",
+            "size": 0,
+        }
+
+    def _latest_session_for_user(self, user_id: str) -> SessionState | None:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = list(mgr.sessions.values())
+        if not sessions:
+            return None
+        return max(sessions, key=lambda s: float(getattr(s, "updated_at", 0.0) or 0.0))
+
+    def _resolve_session_for_user(self, user_id: str, session_id: str = "") -> SessionState | None:
+        sid = str(session_id or "").strip()
+        mgr = self.manager_for_user(user_id)
+        if sid:
+            return mgr.get(sid)
+        return self._latest_session_for_user(user_id)
+
+    def _on_session_upload(self, session: SessionState, upload_meta: dict, workspace_target: Path, parsed_target: Path | None) -> dict:
+        return self.rag_service.enqueue_upload(session, upload_meta, workspace_target, parsed_target)
+
+    def rag_config(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = sorted(
+                (
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                    }
+                    for s in mgr.sessions.values()
+                ),
+                key=lambda x: float(x.get("updated_at", 0.0) or 0.0),
+                reverse=True,
+            )
+        session = self._latest_session_for_user(user_id)
+        caps = default_multimodal_capabilities()
+        if isinstance(session, SessionState):
+            try:
+                caps = session._capabilities_from_profile()
+            except Exception:
+                caps = default_multimodal_capabilities()
+        return {
+            "workspace": str(self.workspace),
+            "rag_root": str(self.rag_root),
+            "sessions": sessions,
+            "default_session_id": str(getattr(session, "id", "") or ""),
+            "active_capabilities": caps,
+            "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "agent_port": int(getattr(self, "agent_port", 0) or 0),
+            "skills_port": int(getattr(self, "skills_port", 0) or 0),
+            "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
+            "three": self.rag_three_asset_info(),
+            "limits": {
+                "max_import_files": RAG_MAX_IMPORT_FILES,
+                "max_import_batch_items": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "max_import_batch_bytes": RAG_MAX_IMPORT_BATCH_BYTES,
+                "max_query_results": RAG_MAX_QUERY_RESULTS,
+                "max_global_communities": RAG_MAX_GLOBAL_COMMUNITIES,
+                "parse_timeout_seconds": RAG_PARSE_TIMEOUT_SECONDS,
+                "import_workers": RAG_IMPORT_WORKER_COUNT,
+            },
+            "features": {
+                "strict_local_import": True,
+            },
+        }
+
+    def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        return self.rag_store.library_payload(limit=limit, offset=offset)
+
+    def rag_tasks_payload(self, limit: int = 80) -> dict:
+        return {"tasks": self.rag_store.list_tasks(limit=limit)}
+
+    def rag_graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        return self.rag_store.index.graph_payload(max_nodes=max_nodes)
+
+    def rag_filesystem_payload(self, max_nodes: int = 320) -> dict:
+        return self.rag_store.filesystem_payload(max_nodes=max_nodes)
+
+    def _knowledge_library_status_for_session(self, session: SessionState | None = None) -> dict:
+        payload = self.rag_store.library_payload(limit=0)
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", payload.get("total_documents", 0)) or 0)
+        chunks = int(stats.get("chunks", 0) or 0)
+        tasks = int(stats.get("tasks", 0) or 0)
+        ready = bool(
+            docs > 0
+            or chunks > 0
+            or self.rag_store.state_path.exists()
+            or self.rag_store.index_snapshot_path.exists()
+        )
+        return {
+            "root": str(self.rag_root),
+            "ready": ready,
+            "documents": docs,
+            "chunks": chunks,
+            "tasks": tasks,
+            "stats": stats,
+            "session_id": str(getattr(session, "id", "") or ""),
+        }
+
+    def _code_library_status_for_session(self, session: SessionState | None = None) -> dict:
+        payload = self.code_store.library_payload(limit=0)
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", payload.get("total_documents", 0)) or 0)
+        chunks = int(stats.get("chunks", 0) or 0)
+        tasks = int(stats.get("tasks", 0) or 0)
+        source_roots = [str(x).strip() for x in (self.code_source_roots or []) if str(x).strip()]
+        initialized = bool(self.code_store.state_path.exists() or self.code_store.index_snapshot_path.exists())
+        ready = bool(docs > 0 or chunks > 0)
+        return {
+            "root": str(self.code_root),
+            "ready": ready,
+            "initialized": initialized,
+            "documents": docs,
+            "chunks": chunks,
+            "tasks": tasks,
+            "stats": stats,
+            "source_roots": source_roots,
+            "source_root_count": len(source_roots),
+            "session_id": str(getattr(session, "id", "") or ""),
+        }
+
+    def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
+        if not isinstance(session, SessionState) or not rows:
+            return ""
+        evidence_rows = [
+            row
+            for row in rows
+            if str(row.get("route_evidence", "") or "") in {"chunk", "document"}
+        ]
+        if not evidence_rows:
+            evidence_rows = list(rows)
+        evidence = []
+        for idx, row in enumerate(evidence_rows[:5], 1):
+            evidence.append(
+                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')}\n"
+                f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
+            )
+        prompt = (
+            "Use the retrieved evidence to answer the query. "
+            "Cite with the provided citation strings exactly as given. "
+            "If evidence is insufficient, say so explicitly.\n\n"
+            f"Query:\n{query}\n\nEvidence:\n" + "\n\n".join(evidence)
+        )
+        try:
+            rsp = session.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=900,
+                temperature=0.1,
+                think=False,
+                stream_thinking=False,
+            )
+            return trim(str(rsp.get("content", "") or ""), 6000)
+        except Exception:
+            return ""
+
+    def rag_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        category = str(body.get("category", "") or "").strip()
+        kind = str(body.get("kind", "") or "").strip()
+        route = str(
+            body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
+            or "auto"
+        ).strip().lower()
+        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route)
+        synthesize = bool(body.get("synthesize", False))
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        if synthesize:
+            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
+            if answer:
+                result["answer"] = answer
+        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        return result
+
+    def rag_import_request(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        path_raw = str(body.get("path", "") or "").strip()
+        title = str(body.get("title", "") or "").strip()
+        text = str(body.get("text", "") or "")
+        filename = str(body.get("filename", "") or "").strip()
+        mime = str(body.get("mime", "") or "").strip()
+        tags = [str(x).strip() for x in (body.get("tags", []) or []) if str(x).strip()]
+        content_b64_present = "content_b64" in body
+        content_b64 = str(body.get("content_b64", "") or "").strip()
+        strict_local_only = bool(body.get("strict_local_only", body.get("import_without_llm", body.get("local_only", False))))
+        items_raw = body.get("items", [])
+        if isinstance(items_raw, list) and items_raw:
+            if len(items_raw) > RAG_MAX_IMPORT_FILES:
+                raise ValueError(f"too many import items (max {RAG_MAX_IMPORT_FILES})")
+            items: list[dict] = []
+            for idx, row in enumerate(items_raw, 1):
+                if not isinstance(row, dict):
+                    continue
+                item_text = str(row.get("text", "") or "")
+                item_b64_present = "content_b64" in row
+                item_b64 = str(row.get("content_b64", "") or "").strip()
+                rel_path = str(row.get("relative_path", row.get("webkit_relative_path", "")) or "").strip().replace("\\", "/").lstrip("/")
+                item_filename = str(row.get("filename", "") or row.get("title", "") or f"upload_{idx}.bin").strip()
+                if item_b64_present:
+                    try:
+                        raw = base64.b64decode(item_b64.encode("ascii"), validate=True)
+                    except Exception:
+                        raise ValueError(f"invalid base64 payload in item {idx}")
+                    items.append(
+                        {
+                            "filename": item_filename,
+                            "mime": str(row.get("mime", "") or "").strip(),
+                            "content_bytes": raw,
+                            "relative_path": rel_path,
+                        }
+                    )
+                elif item_text.strip():
+                    items.append(
+                        {
+                            "filename": item_filename or (rel_path.rsplit("/", 1)[-1] if rel_path else f"upload_{idx}.txt"),
+                            "mime": str(row.get("mime", "text/plain") or "text/plain").strip(),
+                            "text": item_text,
+                            "relative_path": rel_path,
+                        }
+                    )
+            if not items:
+                raise ValueError("items payload did not contain importable content")
+            source_mode = "admin_batch_upload" if len(items) > 1 else "admin_upload"
+            if len(items) <= RAG_MAX_IMPORT_BATCH_ITEMS:
+                return self.rag_service.enqueue_import(
+                    session=session,
+                    session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                    user_id=user_id,
+                    source_mode=source_mode,
+                    tags=tags,
+                    items=items,
+                    strict_local_only=strict_local_only,
+                )
+            task_rows: list[dict] = []
+            for start in range(0, len(items), RAG_MAX_IMPORT_BATCH_ITEMS):
+                chunk = items[start : start + RAG_MAX_IMPORT_BATCH_ITEMS]
+                task_rows.append(
+                    self.rag_service.enqueue_import(
+                        session=session,
+                        session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                        user_id=user_id,
+                        source_mode=source_mode,
+                        tags=tags,
+                        items=chunk,
+                        strict_local_only=strict_local_only,
+                    )
+                )
+            return {
+                "ok": True,
+                "queued": True,
+                "task_ids": [str(row.get("task_id", "")) for row in task_rows if str(row.get("task_id", "")).strip()],
+                "task_count": len(task_rows),
+                "item_count": len(items),
+                "batch_size": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "strict_local_only": bool(strict_local_only),
+                "library_root": str(self.rag_store.root),
+            }
+        if content_b64_present:
+            try:
+                raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+            except Exception:
+                raise ValueError("invalid base64 payload")
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                filename=filename or "uploaded.bin",
+                mime=mime,
+                content_bytes=raw,
+                source_mode="admin_upload",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        if text.strip():
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                title=title or filename or "manual_note.txt",
+                text=text,
+                filename=filename or title or "manual_note.txt",
+                mime=mime or "text/plain",
+                source_mode="manual_text",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        if path_raw:
+            p = Path(path_raw).expanduser()
+            if not p.is_absolute():
+                p = (self.workspace / p).resolve()
+            else:
+                p = p.resolve()
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                path=str(p),
+                recursive=bool(body.get("recursive", True)),
+                source_mode="manual_path",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        raise ValueError("path, text, content_b64, or items required")
+
+    def rag_rebuild(self) -> dict:
+        self.rag_store.rebuild_index()
+        return {
+            "ok": True,
+            "built_at": self.rag_store.index.built_at,
+            "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+        }
+
+    def code_config(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = sorted(
+                (
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                    }
+                    for s in mgr.sessions.values()
+                ),
+                key=lambda x: float(x.get("updated_at", 0.0) or 0.0),
+                reverse=True,
+            )
+        session = self._latest_session_for_user(user_id)
+        return {
+            "workspace": str(self.workspace),
+            "repo_root": str(REPO_ROOT),
+            "code_root": str(self.code_root),
+            "code_source_roots": list(self.code_source_roots or []),
+            "status": self._code_library_status_for_session(session),
+            "sessions": sessions,
+            "default_session_id": str(getattr(session, "id", "") or ""),
+            "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+            "agent_port": int(getattr(self, "agent_port", 0) or 0),
+            "skills_port": int(getattr(self, "skills_port", 0) or 0),
+            "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
+            "code_admin_port": int(getattr(self, "code_admin_port", 0) or 0),
+            "three": self.rag_three_asset_info(),
+            "limits": {
+                "max_import_files": RAG_MAX_IMPORT_FILES,
+                "max_import_batch_items": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "max_import_batch_bytes": RAG_MAX_IMPORT_BATCH_BYTES,
+                "max_query_results": RAG_MAX_QUERY_RESULTS,
+                "max_global_communities": RAG_MAX_GLOBAL_COMMUNITIES,
+                "parse_timeout_seconds": CODE_PARSE_TIMEOUT_SECONDS,
+                "import_workers": CODE_IMPORT_WORKER_COUNT,
+            },
+            "features": {
+                "llm_enrichment": False,
+                "strict_local_import": True,
+                "repo_import": True,
+            },
+        }
+
+    def code_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        return self.code_store.library_payload(limit=limit, offset=offset)
+
+    def code_tasks_payload(self, limit: int = 80) -> dict:
+        return {"tasks": self.code_store.list_tasks(limit=limit)}
+
+    def code_graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        return self.code_store.index.graph_payload(max_nodes=max_nodes)
+
+    def code_filesystem_payload(self, max_nodes: int = 320) -> dict:
+        return self.code_store.filesystem_payload(max_nodes=max_nodes)
+
+    def code_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
+        language_filter = str(body.get("language", "") or "").strip().lower()
+        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route)
+        if language_filter:
+            filtered = [
+                dict(row)
+                for row in (result.get("results", []) or [])
+                if str(row.get("language", "") or "").strip().lower() == language_filter
+            ]
+            result = dict(result)
+            result["results"] = filtered[:top_k]
+        synthesize = bool(body.get("synthesize", False))
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        if synthesize:
+            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
+            if answer:
+                result["answer"] = answer
+        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        return result
+
+    def code_import_request(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        path_raw = str(body.get("path", "") or "").strip()
+        title = str(body.get("title", "") or "").strip()
+        text = str(body.get("text", "") or "")
+        filename = str(body.get("filename", "") or "").strip()
+        mime = str(body.get("mime", "") or "").strip()
+        tags = [str(x).strip() for x in (body.get("tags", []) or []) if str(x).strip()]
+        content_b64_present = "content_b64" in body
+        content_b64 = str(body.get("content_b64", "") or "").strip()
+        items_raw = body.get("items", [])
+        if isinstance(items_raw, list) and items_raw:
+            if len(items_raw) > RAG_MAX_IMPORT_FILES:
+                raise ValueError(f"too many import items (max {RAG_MAX_IMPORT_FILES})")
+            items: list[dict] = []
+            for idx, row in enumerate(items_raw, 1):
+                if not isinstance(row, dict):
+                    continue
+                item_text = str(row.get("text", "") or "")
+                item_b64_present = "content_b64" in row
+                item_b64 = str(row.get("content_b64", "") or "").strip()
+                rel_path = str(row.get("relative_path", row.get("webkit_relative_path", "")) or "").strip().replace("\\", "/").lstrip("/")
+                item_filename = str(row.get("filename", "") or row.get("title", "") or f"upload_{idx}.bin").strip()
+                if item_b64_present:
+                    try:
+                        raw = base64.b64decode(item_b64.encode("ascii"), validate=True)
+                    except Exception:
+                        raise ValueError(f"invalid base64 payload in item {idx}")
+                    items.append(
+                        {
+                            "filename": item_filename,
+                            "mime": str(row.get("mime", "") or "").strip(),
+                            "content_bytes": raw,
+                            "relative_path": rel_path,
+                        }
+                    )
+                elif item_text.strip():
+                    items.append(
+                        {
+                            "filename": item_filename or (rel_path.rsplit("/", 1)[-1] if rel_path else f"upload_{idx}.txt"),
+                            "mime": str(row.get("mime", "text/plain") or "text/plain").strip(),
+                            "text": item_text,
+                            "relative_path": rel_path,
+                        }
+                    )
+            if not items:
+                raise ValueError("items payload did not contain importable content")
+            source_mode = "code_admin_batch_upload" if len(items) > 1 else "code_admin_upload"
+            if len(items) <= RAG_MAX_IMPORT_BATCH_ITEMS:
+                return self.code_service.enqueue_import(
+                    session=session,
+                    session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                    user_id=user_id,
+                    source_mode=source_mode,
+                    tags=tags,
+                    items=items,
+                    strict_local_only=True,
+                )
+            task_rows: list[dict] = []
+            for start in range(0, len(items), RAG_MAX_IMPORT_BATCH_ITEMS):
+                chunk = items[start : start + RAG_MAX_IMPORT_BATCH_ITEMS]
+                task_rows.append(
+                    self.code_service.enqueue_import(
+                        session=session,
+                        session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                        user_id=user_id,
+                        source_mode=source_mode,
+                        tags=tags,
+                        items=chunk,
+                        strict_local_only=True,
+                    )
+                )
+            return {
+                "ok": True,
+                "queued": True,
+                "task_ids": [str(row.get("task_id", "")) for row in task_rows if str(row.get("task_id", "")).strip()],
+                "task_count": len(task_rows),
+                "item_count": len(items),
+                "batch_size": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "library_root": str(self.code_store.root),
+            }
+        if content_b64_present:
+            try:
+                raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+            except Exception:
+                raise ValueError("invalid base64 payload")
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                filename=filename or "uploaded.bin",
+                mime=mime,
+                content_bytes=raw,
+                source_mode="code_admin_upload",
+                tags=tags,
+                strict_local_only=True,
+            )
+        if text.strip():
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                title=title or filename or "manual_code.txt",
+                text=text,
+                filename=filename or title or "manual_code.txt",
+                mime=mime or "text/plain",
+                source_mode="manual_text",
+                tags=tags,
+                strict_local_only=True,
+            )
+        if path_raw:
+            p = Path(path_raw).expanduser()
+            if not p.is_absolute():
+                p = (self.workspace / p).resolve()
+            else:
+                p = p.resolve()
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                path=str(p),
+                recursive=bool(body.get("recursive", True)),
+                source_mode="manual_path",
+                tags=tags,
+                strict_local_only=True,
+            )
+        raise ValueError("path, text, content_b64, or items required")
+
+    def code_rebuild(self) -> dict:
+        self.code_store.rebuild_index()
+        return {
+            "ok": True,
+            "built_at": self.code_store.index.built_at,
+            "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+        }
+
+    def _looks_like_code_task(self, text: str) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        if re.search(r"`[^`\n]+\.(py|js|ts|tsx|jsx|java|go|rs|cpp|c|hpp|kt|swift|php|rb|sh|sql)`", raw):
+            return True
+        if re.search(r"\b[a-z0-9_./-]+\.(py|js|ts|tsx|jsx|java|go|rs|cpp|c|hpp|kt|swift|php|rb|sh|sql)\b", low):
+            return True
+        code_terms = [
+            "bug", "fix", "error", "traceback", "stack trace", "compile", "build", "test",
+            "refactor", "implement", "function", "class", "method", "module", "interface", "api",
+            "代码", "报错", "修复", "函数", "类", "方法", "模块", "接口", "重构", "编译", "构建", "测试",
+        ]
+        return any(term in low for term in code_terms)
+
+    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        if not rows:
+            return {}
+        lines = []
+        for idx, row in enumerate(rows[:limit], 1):
+            citation = str(row.get("citation", "") or "").strip()
+            title = str(row.get("title", "") or "").strip()
+            symbol = str(row.get("symbol", "") or "").strip()
+            anchor = str(row.get("anchor", "") or "").strip()
+            snippet = trim(str(row.get("text", "") or ""), 420)
+            header = f"{idx}. {citation} {title}".strip()
+            if symbol:
+                header += f" | symbol={symbol}"
+            elif anchor:
+                header += f" | anchor={anchor}"
+            lines.append(header)
+            if snippet:
+                lines.append(snippet)
+        return {
+            "code_text": "\n".join(lines),
+            "code_meta": {
+                "route": str(result.get("route", "") or ""),
+                "requested_route": str(result.get("requested_route", "") or ""),
+                "result_count": len(rows[:limit]),
+                "summary": trim(str(result.get("summary", "") or ""), 600),
+            },
+        }
+
+    def _prepare_runtime_references(self, session: SessionState, text: str) -> dict:
+        query = trim(str(text or "").strip(), 4000)
+        if not query or not self._looks_like_code_task(query):
+            return {}
+        if not self.code_store.documents:
+            return {}
+        try:
+            result = self.code_query(
+                str(getattr(session, "owner_user_id", "") or ""),
+                {
+                    "query": query,
+                    "top_k": 6,
+                    "route": "auto",
+                    "session_id": str(getattr(session, "id", "") or ""),
+                },
+            )
+        except Exception:
+            return {}
+        return self._format_code_reference_payload(result, limit=6)
+
+    def _query_code_library_tool(self, session: SessionState, args: dict) -> str:
+        status = self._code_library_status_for_session(session)
+        query = str((args or {}).get("query", "") or "").strip()
+        if not query:
+            lines = [
+                f"code_library_root={status.get('root', '')}",
+                (
+                    "ready="
+                    + ("yes" if bool(status.get("ready", False)) else "no")
+                    + f" initialized={'yes' if bool(status.get('initialized', False)) else 'no'}"
+                    + f" documents={int(status.get('documents', 0) or 0)}"
+                    + f" chunks={int(status.get('chunks', 0) or 0)}"
+                    + f" tasks={int(status.get('tasks', 0) or 0)}"
+                ),
+            ]
+            source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
+            if source_roots:
+                lines.append("source_roots=" + " | ".join(source_roots[:8]))
+            return "\n".join(lines)
+        result = self.code_query(
+            str(getattr(session, "owner_user_id", "") or ""),
+            {
+                "query": query,
+                "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
+                "route": str((args or {}).get("route", "auto") or "auto"),
+                "language": str((args or {}).get("language", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+            },
+        )
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        lines = [
+            f"code_library_root={status.get('root', '')}",
+            (
+                "ready="
+                + ("yes" if bool(status.get("ready", False)) else "no")
+                + f" initialized={'yes' if bool(status.get('initialized', False)) else 'no'}"
+                + f" documents={int(status.get('documents', 0) or 0)}"
+                + f" chunks={int(status.get('chunks', 0) or 0)}"
+                + f" tasks={int(status.get('tasks', 0) or 0)}"
+            ),
+        ]
+        source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
+        if source_roots:
+            lines.append("source_roots=" + " | ".join(source_roots[:8]))
+        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        if not rows:
+            lines.append("No code library results.")
+            return "\n".join(lines)
+        for row in rows[: min(8, len(rows))]:
+            lines.append(
+                f"{str(row.get('citation', '') or '').strip()} "
+                f"{str(row.get('title', '') or '').strip()} "
+                f"score={str(row.get('score', 0) or 0)}"
+            )
+            if str(row.get("symbol", "") or "").strip():
+                lines.append(f"symbol={str(row.get('symbol', '') or '').strip()}")
+            snippet = trim(str(row.get("text", "") or ""), 320)
+            if snippet:
+                lines.append(snippet)
+        return "\n".join(lines)
+
+    def _query_knowledge_library_tool(self, session: SessionState, args: dict) -> str:
+        status = self._knowledge_library_status_for_session(session)
+        query = str((args or {}).get("query", "") or "").strip()
+        lines = [
+            f"knowledge_library_root={status.get('root', '')}",
+            (
+                "ready="
+                + ("yes" if bool(status.get("ready", False)) else "no")
+                + f" documents={int(status.get('documents', 0) or 0)}"
+                + f" chunks={int(status.get('chunks', 0) or 0)}"
+                + f" tasks={int(status.get('tasks', 0) or 0)}"
+            ),
+        ]
+        if not query:
+            return "\n".join(lines)
+        result = self.rag_query(
+            str(getattr(session, "owner_user_id", "") or ""),
+            {
+                "query": query,
+                "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
+                "route": str((args or {}).get("route", "auto") or "auto"),
+                "category": str((args or {}).get("category", "") or ""),
+                "kind": str((args or {}).get("kind", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+            },
+        )
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        if not rows:
+            lines.append("No knowledge library results.")
+            return "\n".join(lines)
+        for row in rows[: min(8, len(rows))]:
+            lines.append(
+                f"{str(row.get('citation', '') or '').strip()} "
+                f"{str(row.get('title', '') or '').strip()} "
+                f"score={str(row.get('score', 0) or 0)}"
+            )
+            snippet = trim(str(row.get("text", "") or ""), 320)
+            if snippet:
+                lines.append(snippet)
+        return "\n".join(lines)
+
+    def shutdown_services(self):
+        try:
+            self.rag_service.shutdown()
+        except Exception:
+            pass
+        try:
+            self.code_service.shutdown()
+        except Exception:
+            pass
 
     def user_root(self, user_id: str) -> Path:
         root = self.codes_root / user_id
@@ -30455,7 +39645,15 @@ class AppContext:
                 self.arbiter_temperature,
                 self.execution_mode,
                 self.max_output_tokens,
+                upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
+                reference_prepare_callback=self._prepare_runtime_references,
+                query_code_library_callback=self._query_code_library_tool,
+                query_knowledge_library_callback=self._query_knowledge_library_tool,
+                code_library_root=self.code_root,
+                code_library_status_callback=self._code_library_status_for_session,
+                knowledge_library_root=self.rag_root,
+                knowledge_library_status_callback=self._knowledge_library_status_for_session,
             )
             self._session_mgrs[user_id] = mgr
             return mgr
@@ -31500,6 +40698,8 @@ class Handler(BaseHTTPRequestHandler):
                     "llm_config_path": str(LLM_CONFIG_PATH),
                     "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
                     "skills_port": skills_port,
+                    "rag_admin_port": int(getattr(self.app, "rag_admin_port", 0) or 0),
+                    "code_admin_port": int(getattr(self.app, "code_admin_port", 0) or 0),
                     "skills_ui_enabled": skills_enabled,
                     "skills_ui_url": skills_url,
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
@@ -31797,8 +40997,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             filename = str(payload.get("filename", "")).strip()
             mime = str(payload.get("mime", "")).strip()
+            content_b64_present = "content_b64" in payload
             content_b64 = str(payload.get("content_b64", "")).strip()
-            if not filename or not content_b64:
+            if not filename or not content_b64_present:
                 return self._send_json({"error": "filename and content_b64 required"}, status=400)
             try:
                 raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
@@ -32141,10 +41342,11 @@ class SkillsHandler(BaseHTTPRequestHandler):
         if path == "/api/skillslab/upload":
             payload = self._read_json()
             filename = str(payload.get("filename", "")).strip()
+            content_b64_present = "content_b64" in payload
             content_b64 = str(payload.get("content_b64", "")).strip()
             mime = str(payload.get("mime", "")).strip()
             overwrite = bool(payload.get("overwrite", False))
-            if not filename or not content_b64:
+            if not filename or not content_b64_present:
                 return self._send_json({"error": "filename and content_b64 required"}, status=400)
             try:
                 raw = base64.b64decode(content_b64, validate=True)
@@ -32154,6 +41356,319 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "max upload size is 30MB"}, status=413)
             try:
                 out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+class RagAdminHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebRAG/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.handle"):
+                return
+            raise
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_json"):
+                return
+            raise
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_text"):
+                return
+            raise
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_inline_bytes"):
+                return
+            raise
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_rag_admin_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_rag_admin_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/rag-admin.js":
+            return self._send_text(self.app.web_ui_rag_admin_js(), "application/javascript; charset=utf-8")
+        if path.startswith("/assets/js_lib/"):
+            filename = path.rsplit("/", 1)[-1]
+            fp = self.app.rag_js_lib_asset_path(filename)
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() == ".js":
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
+        if path == "/api/rag/config":
+            return self._send_json(self.app.rag_config(self._user_id()))
+        if path == "/api/rag/library":
+            try:
+                limit = int((query.get("limit", ["-1"]) or ["-1"])[0] or -1)
+            except Exception:
+                limit = -1
+            try:
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+            except Exception:
+                offset = 0
+            return self._send_json(self.app.rag_library_payload(limit=limit, offset=offset))
+        if path == "/api/rag/tasks":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            return self._send_json(self.app.rag_tasks_payload(limit=limit))
+        if path == "/api/rag/graph":
+            try:
+                max_nodes = int((query.get("max_nodes", [str(RAG_GRAPH_MAX_NODES)]) or [str(RAG_GRAPH_MAX_NODES)])[0] or RAG_GRAPH_MAX_NODES)
+            except Exception:
+                max_nodes = RAG_GRAPH_MAX_NODES
+            return self._send_json(self.app.rag_graph_payload(max_nodes=max_nodes))
+        if path == "/api/rag/filesystem":
+            try:
+                max_nodes = int((query.get("max_nodes", ["320"]) or ["320"])[0] or 320)
+            except Exception:
+                max_nodes = 320
+            return self._send_json(self.app.rag_filesystem_payload(max_nodes=max_nodes))
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/rag/import":
+            try:
+                out = self.app.rag_import_request(self._user_id(), self._read_json())
+                return self._send_json(out, status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/query":
+            try:
+                out = self.app.rag_query(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/rebuild":
+            try:
+                out = self.app.rag_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+
+class CodeAdminHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebCode/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.handle"):
+                return
+            raise
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_json"):
+                return
+            raise
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_text"):
+                return
+            raise
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_inline_bytes"):
+                return
+            raise
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_code_admin_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_code_admin_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/code-admin.js":
+            return self._send_text(self.app.web_ui_code_admin_js(), "application/javascript; charset=utf-8")
+        if path.startswith("/assets/js_lib/"):
+            filename = path.rsplit("/", 1)[-1]
+            fp = self.app.rag_js_lib_asset_path(filename)
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() == ".js":
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "code-admin", "version": APP_VERSION})
+        if path == "/api/code/config":
+            return self._send_json(self.app.code_config(self._user_id()))
+        if path == "/api/code/library":
+            try:
+                limit = int((query.get("limit", ["-1"]) or ["-1"])[0] or -1)
+            except Exception:
+                limit = -1
+            try:
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+            except Exception:
+                offset = 0
+            return self._send_json(self.app.code_library_payload(limit=limit, offset=offset))
+        if path == "/api/code/tasks":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            return self._send_json(self.app.code_tasks_payload(limit=limit))
+        if path == "/api/code/graph":
+            try:
+                max_nodes = int((query.get("max_nodes", [str(RAG_GRAPH_MAX_NODES)]) or [str(RAG_GRAPH_MAX_NODES)])[0] or RAG_GRAPH_MAX_NODES)
+            except Exception:
+                max_nodes = RAG_GRAPH_MAX_NODES
+            return self._send_json(self.app.code_graph_payload(max_nodes=max_nodes))
+        if path == "/api/code/filesystem":
+            try:
+                max_nodes = int((query.get("max_nodes", ["320"]) or ["320"])[0] or 320)
+            except Exception:
+                max_nodes = 320
+            return self._send_json(self.app.code_filesystem_payload(max_nodes=max_nodes))
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/code/import":
+            try:
+                out = self.app.code_import_request(self._user_id(), self._read_json())
+                return self._send_json(out, status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/query":
+            try:
+                out = self.app.code_query(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/rebuild":
+            try:
+                out = self.app.code_rebuild()
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -32248,6 +41763,18 @@ def main():
         help="Skills Studio web port (default: agent port + 1)",
     )
     parser.add_argument(
+        "--rag_admin_port",
+        default=None,
+        type=int,
+        help=f"RAG admin web port (default: agent port + {RAG_ADMIN_PORT_OFFSET})",
+    )
+    parser.add_argument(
+        "--code_admin_port",
+        default=None,
+        type=int,
+        help=f"Code library admin web port (default: agent port + {CODE_ADMIN_PORT_OFFSET})",
+    )
+    parser.add_argument(
         "--skills_root",
         default="",
         help="Override skills root directory. Supports relative paths and both 'skills'/'Skills' naming.",
@@ -32258,6 +41785,20 @@ def main():
         dest="no_skills_ui",
         action="store_true",
         help="Disable Skills Studio web UI server startup",
+    )
+    parser.add_argument(
+        "--no_rag_admin",
+        "--no-rag-admin",
+        dest="no_rag_admin",
+        action="store_true",
+        help="Disable RAG admin web UI server startup",
+    )
+    parser.add_argument(
+        "--no_code_admin",
+        "--no-code-admin",
+        dest="no_code_admin",
+        action="store_true",
+        help="Disable Code Library admin web UI server startup",
     )
     parser.add_argument(
         "--web_ui_config",
@@ -32666,9 +42207,15 @@ def main():
         show_upload_list=resolved_show_upload_list,
     )
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
+    rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
+    code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
+    setattr(app, "rag_admin_port", int(rag_admin_port))
+    setattr(app, "rag_admin_enabled", False)
+    setattr(app, "code_admin_port", int(code_admin_port))
+    setattr(app, "code_admin_enabled", False)
     server = AgentHTTPServer((args.host, args.port), Handler, app)
     skills_server = None
     skills_thread = None
@@ -32692,9 +42239,68 @@ def main():
             print(f"[web-agent] skills studio failed to start on {args.host}:{skills_port}: {exc}")
     else:
         print("[web-agent] skills studio disabled: skills_port equals agent port")
+    rag_admin_server = None
+    rag_admin_thread = None
+    if args.no_rag_admin:
+        print("[web-agent] rag admin disabled by --no_rag_admin")
+    elif int(rag_admin_port) in {int(args.port), int(skills_port)}:
+        print("[web-agent] rag admin disabled: rag_admin_port conflicts with existing server port")
+    else:
+        try:
+            rag_admin_server = AgentHTTPServer((args.host, rag_admin_port), RagAdminHandler, app)
+
+            def _rag_admin_serve_loop():
+                try:
+                    rag_admin_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "rag-admin-server.serve_forever"):
+                        raise
+
+            rag_admin_thread = threading.Thread(target=_rag_admin_serve_loop, daemon=True)
+            rag_admin_thread.start()
+            setattr(app, "rag_admin_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] rag admin failed to start on {args.host}:{rag_admin_port}: {exc}")
+    code_admin_server = None
+    code_admin_thread = None
+    if args.no_code_admin:
+        print("[web-agent] code admin disabled by --no_code_admin")
+    elif int(code_admin_port) in {int(args.port), int(skills_port), int(rag_admin_port)}:
+        print("[web-agent] code admin disabled: code_admin_port conflicts with existing server port")
+    else:
+        try:
+            code_admin_server = AgentHTTPServer((args.host, code_admin_port), CodeAdminHandler, app)
+
+            def _code_admin_serve_loop():
+                try:
+                    code_admin_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "code-admin-server.serve_forever"):
+                        raise
+
+            code_admin_thread = threading.Thread(target=_code_admin_serve_loop, daemon=True)
+            code_admin_thread.start()
+            setattr(app, "code_admin_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] code admin failed to start on {args.host}:{code_admin_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
+    migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
+    if isinstance(migration, dict):
+        moved = [str(x) for x in (migration.get("moved", []) or []) if str(x).strip()]
+        errors = [str(x) for x in (migration.get("errors", []) or []) if str(x).strip()]
+        if moved:
+            print(
+                "[web-agent] workspace_migration moved="
+                + ",".join(moved)
+                + f" from {migration.get('legacy_root', '')}"
+            )
+        if errors:
+            print(
+                "[web-agent] workspace_migration errors="
+                + " | ".join(errors[:6])
+            )
     print(f"[web-agent] skills_root={skills_root} (source={skills_root_source})")
     print(f"[web-agent] web_ui_config={web_ui_config_path}")
     print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
@@ -32781,6 +42387,14 @@ def main():
         "[web-agent] skills_ui="
         + ("enabled" if bool(getattr(app, "skills_ui_enabled", False)) else "disabled")
     )
+    print(
+        "[web-agent] rag_admin="
+        + ("enabled" if bool(getattr(app, "rag_admin_enabled", False)) else "disabled")
+    )
+    print(
+        "[web-agent] code_admin="
+        + ("enabled" if bool(getattr(app, "code_admin_enabled", False)) else "disabled")
+    )
     if str(args.host).strip() in {"0.0.0.0", "::"}:
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
@@ -32789,10 +42403,20 @@ def main():
         if skills_server:
             print(f"[skills-studio] open local: http://127.0.0.1:{skills_port}")
             print(f"[skills-studio] open lan:   http://{lan_ip}:{skills_port}")
+        if rag_admin_server:
+            print(f"[rag-admin] open local: http://127.0.0.1:{rag_admin_port}")
+            print(f"[rag-admin] open lan:   http://{lan_ip}:{rag_admin_port}")
+        if code_admin_server:
+            print(f"[code-admin] open local: http://127.0.0.1:{code_admin_port}")
+            print(f"[code-admin] open lan:   http://{lan_ip}:{code_admin_port}")
     else:
         print(f"[web-agent] open http://{args.host}:{args.port}")
         if skills_server:
             print(f"[skills-studio] open http://{args.host}:{skills_port}")
+        if rag_admin_server:
+            print(f"[rag-admin] open http://{args.host}:{rag_admin_port}")
+        if code_admin_server:
+            print(f"[code-admin] open http://{args.host}:{code_admin_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -32828,6 +42452,25 @@ def main():
                 skills_server.server_close()
             except Exception:
                 pass
+        if rag_admin_server:
+            try:
+                rag_admin_server.shutdown()
+            except Exception:
+                pass
+            try:
+                rag_admin_server.server_close()
+            except Exception:
+                pass
+        if code_admin_server:
+            try:
+                code_admin_server.shutdown()
+            except Exception:
+                pass
+            try:
+                code_admin_server.server_close()
+            except Exception:
+                pass
+        app.shutdown_services()
         server.server_close()
 
 if __name__ == "__main__":
