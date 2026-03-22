@@ -36,6 +36,10 @@ from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
+try:
+    import yaml as _yaml
+except Exception:
+    _yaml = None
 APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
@@ -293,6 +297,33 @@ SKILL_PROMPT_MAX_ITEMS = 40
 SKILL_PROMPT_MAX_CHARS = 2600
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
+AUTO_SKILLS_ROOT_CANDIDATES = ("skills", "Skills")
+SKILL_DEFAULT_ATTACHMENT_GLOBS = (
+    "references/**/*.md",
+    "routes/**/*.md",
+    "agents/**/*.md",
+    "scripts/**/*.py",
+    "scripts/**/*.sh",
+    "scripts/**/*.js",
+    "scripts/**/*.cjs",
+    "scripts/**/*.mjs",
+    "scripts/**/*.ts",
+    "scripts/**/*.json",
+    "scripts/**/*.md",
+    "scripts/*",
+    "templates/**/*.md",
+    "templates/**/*.html",
+    "templates/**/*.json",
+    "*.md",
+    "*.txt",
+    "LICENSE*",
+)
+SKILL_INLINE_ATTACHMENT_MAX_FILES = 6
+SKILL_INLINE_ATTACHMENT_MAX_CHARS = 24_000
+SKILL_RESOURCE_MANIFEST_MAX_ITEMS = 120
+SKILL_BODY_COMPACT_THRESHOLD_CHARS = 12_000
+SKILL_BODY_PREVIEW_CHARS = 4_000
+SKILLS_VIRTUAL_PREFIX = "/skills"
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
 PLAN_MODE_FORCED_LEVELS = {4, 5}
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
@@ -524,6 +555,8 @@ IMAGE_EXTS = {
     ".heic",
     ".heif",
 }
+IMAGE_FORMATS_NEED_CONVERSION = {".svg", ".heic", ".heif", ".tiff", ".tif", ".bmp", ".avif"}
+IMAGE_SAFE_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 AUDIO_EXTS = {
     ".mp3",
     ".wav",
@@ -903,6 +936,7 @@ def _detect_os_shell_instruction() -> str:
             "'where' (not 'which'), 'echo %VAR%' (not 'echo $VAR'). "
             "To list files recursively use 'dir /s /b'. "
             "Path separator is backslash (\\). "
+            "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Do NOT use POSIX paths like /workspace, /tmp, /usr, ~/... — they do not exist. "
             "Working directory is already set; use relative paths or the absolute session root shown above."
         )
@@ -911,6 +945,8 @@ def _detect_os_shell_instruction() -> str:
             "Shell environment: macOS (bash/zsh). "
             "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
             "Package manager is 'brew'. "
+            "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
+            "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
             "Use relative paths or the absolute session root shown above."
         )
@@ -918,6 +954,8 @@ def _detect_os_shell_instruction() -> str:
     return (
         "Shell environment: Linux (bash). "
         "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
+        "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
+        "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
         "Use relative paths or the absolute session root shown above."
     )
 
@@ -939,6 +977,67 @@ def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
     if p.is_absolute():
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
+
+
+def resolve_skills_root_path(raw: str, base_dir: Path | None = None) -> Path:
+    txt = str(raw or "").strip()
+    if not txt:
+        txt = "skills"
+    p = Path(txt).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return ((base_dir or WORKDIR).resolve() / p).resolve()
+
+
+def _count_skill_markdown_files(root: Path, limit: int = 2048) -> int:
+    if not root.exists() or not root.is_dir():
+        return 0
+    total = 0
+    try:
+        for _ in root.rglob("SKILL.md"):
+            total += 1
+            if total >= limit:
+                break
+    except Exception:
+        return 0
+    return total
+
+
+def select_preferred_skills_root(
+    workdir: Path = WORKDIR,
+    *,
+    explicit: str = "",
+    external_config: dict | None = None,
+    web_ui_config: dict | None = None,
+) -> tuple[Path, str]:
+    external_config = external_config if isinstance(external_config, dict) else {}
+    web_ui_config = web_ui_config if isinstance(web_ui_config, dict) else {}
+    explicit_candidates = [
+        ("cli", explicit),
+        ("env", os.getenv("AGENT_SKILLS_ROOT", "")),
+        ("config", external_config.get("skills_root", external_config.get("skills_dir", ""))),
+        ("web_ui_config", web_ui_config.get("skills_root", web_ui_config.get("skills_dir", ""))),
+    ]
+    for source, raw in explicit_candidates:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        return resolve_skills_root_path(txt, workdir), source
+
+    auto_rows: list[tuple[bool, int, int, Path]] = []
+    for idx, name in enumerate(AUTO_SKILLS_ROOT_CANDIDATES):
+        candidate = (workdir / name).resolve()
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        skill_count = _count_skill_markdown_files(candidate)
+        embedded = (candidate / ".embedded_bundle_state.json").exists()
+        auto_rows.append((not embedded and skill_count > 0, skill_count, -idx, candidate))
+    if auto_rows:
+        auto_rows.sort(reverse=True)
+        chosen = auto_rows[0][3]
+        return chosen, "auto-detect"
+
+    return ensure_embedded_skills(workdir), "embedded-default"
 
 
 def load_web_ui_config_file(path: Path) -> dict:
@@ -1109,6 +1208,26 @@ def parse_media_endpoints(raw: object) -> dict[str, str]:
 def guess_mime_from_name(name: str, fallback: str = "application/octet-stream") -> str:
     mime, _ = mimetypes.guess_type(str(name or ""))
     return str(mime or fallback)
+
+
+def _convert_image_to_safe_format(fp) -> tuple:
+    """Try to convert image to a model-safe format. Returns (bytes|None, mime, method)."""
+    ext = str(getattr(fp, "suffix", "") or "").lower()
+    if ext == ".svg":
+        return None, "", "svg-text-fallback"
+    try:
+        from PIL import Image as _PILImage
+        img = _PILImage.open(fp)
+        if img.mode in ("RGBA", "LA", "PA"):
+            target_fmt, out_mime = "PNG", "image/png"
+        else:
+            img = img.convert("RGB")
+            target_fmt, out_mime = "JPEG", "image/jpeg"
+        buf = io.BytesIO()
+        img.save(buf, format=target_fmt, quality=90)
+        return buf.getvalue(), out_mime, f"pillow-{target_fmt.lower()}"
+    except Exception:
+        return None, "", ""
 
 
 def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:
@@ -2517,29 +2636,169 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
         return {}, text.strip()
     raw_meta = text[4:end]
     body = text[end + 5 :].strip()
-    meta: dict[str, str] = {}
-    lines = raw_meta.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip():
-            i += 1
-            continue
-        if ":" in line and not line.startswith((" ", "\t")):
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value == "|":
-                i += 1
-                block = []
-                while i < len(lines) and lines[i].startswith(("  ", "\t")):
-                    block.append(lines[i].lstrip())
+
+    def _normalize_front_matter_value(value: object):
+        if isinstance(value, dict):
+            out: dict[str, object] = {}
+            for key, row in value.items():
+                out[str(key)] = _normalize_front_matter_value(row)
+            return out
+        if isinstance(value, list):
+            return [_normalize_front_matter_value(x) for x in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def _parse_scalar(raw: str):
+        txt = str(raw or "").strip()
+        if not txt:
+            return ""
+        if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in {"'", '"'}:
+            return txt[1:-1]
+        low = txt.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        if low in {"null", "none"}:
+            return ""
+        if re.fullmatch(r"-?\d+", txt):
+            try:
+                return int(txt)
+            except Exception:
+                return txt
+        if re.fullmatch(r"-?\d+\.\d+", txt):
+            try:
+                return float(txt)
+            except Exception:
+                return txt
+        return txt
+
+    def _parse_simple_yaml_block(raw: str) -> dict:
+        lines = str(raw or "").splitlines()
+
+        def _indent_of(line: str) -> int:
+            return len(line) - len(line.lstrip(" "))
+
+        def _next_significant(start: int):
+            j = start
+            while j < len(lines):
+                if lines[j].strip():
+                    return j
+                j += 1
+            return len(lines)
+
+        def _parse_block(start: int, indent: int):
+            j = _next_significant(start)
+            if j >= len(lines):
+                return {}, j
+            stripped = lines[j].strip()
+            is_list = stripped.startswith("- ")
+            if is_list:
+                items: list[object] = []
+                i = j
+                while i < len(lines):
+                    if not lines[i].strip():
+                        i += 1
+                        continue
+                    cur_indent = _indent_of(lines[i])
+                    if cur_indent < indent:
+                        break
+                    if cur_indent != indent or not lines[i].lstrip().startswith("- "):
+                        break
+                    item_txt = lines[i].lstrip()[2:].strip()
                     i += 1
-                meta[key] = "\n".join(block).strip()
-                continue
-            meta[key] = value
-        i += 1
-    return meta, body
+                    if not item_txt:
+                        nested, i = _parse_block(i, indent + 2)
+                        items.append(nested)
+                        continue
+                    if item_txt.endswith(":") and ":" not in item_txt[:-1]:
+                        nested, i = _parse_block(i, indent + 2)
+                        items.append({item_txt[:-1].strip(): nested})
+                        continue
+                    if ":" in item_txt and not item_txt.startswith(("'", '"')):
+                        key, rest = item_txt.split(":", 1)
+                        rest = rest.strip()
+                        if rest:
+                            items.append({key.strip(): _parse_scalar(rest)})
+                            continue
+                        nested, i = _parse_block(i, indent + 2)
+                        items.append({key.strip(): nested})
+                        continue
+                    items.append(_parse_scalar(item_txt))
+                return items, i
+
+            obj: dict[str, object] = {}
+            i = j
+            while i < len(lines):
+                if not lines[i].strip():
+                    i += 1
+                    continue
+                cur_indent = _indent_of(lines[i])
+                if cur_indent < indent:
+                    break
+                if cur_indent != indent:
+                    break
+                stripped_line = lines[i].strip()
+                if ":" not in stripped_line:
+                    i += 1
+                    continue
+                key, rest = stripped_line.split(":", 1)
+                key = key.strip()
+                rest = rest.strip()
+                i += 1
+                if rest in {"|", ">"}:
+                    block_lines: list[str] = []
+                    while i < len(lines):
+                        if not lines[i].strip():
+                            block_lines.append("")
+                            i += 1
+                            continue
+                        next_indent = _indent_of(lines[i])
+                        if next_indent <= cur_indent:
+                            break
+                        block_lines.append(lines[i][cur_indent + 2 :] if len(lines[i]) >= cur_indent + 2 else "")
+                        i += 1
+                    if rest == ">":
+                        folded = " ".join(x.strip() for x in block_lines if x.strip())
+                        obj[key] = folded.strip()
+                    else:
+                        obj[key] = "\n".join(block_lines).strip()
+                    continue
+                if rest:
+                    obj[key] = _parse_scalar(rest)
+                    continue
+                nested, i = _parse_block(i, cur_indent + 2)
+                obj[key] = nested
+            return obj, i
+
+        parsed, _ = _parse_block(0, 0)
+        return parsed if isinstance(parsed, dict) else {}
+
+    if _yaml is not None:
+        try:
+            parsed = _yaml.safe_load(raw_meta)
+            if isinstance(parsed, dict):
+                return _normalize_front_matter_value(parsed), body
+        except Exception:
+            pass
+
+    meta = _parse_simple_yaml_block(raw_meta)
+    return _normalize_front_matter_value(meta), body
+
+
+def _meta_string_list(value: object) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            txt = str(item or "").strip()
+            if txt:
+                out.append(txt)
+    elif isinstance(value, str):
+        txt = value.strip()
+        if txt:
+            out.append(txt)
+    return out
 
 def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
     try:
@@ -3721,11 +3980,17 @@ EMBEDDED_SKILLS_ARCHIVE_FILES = [
 ]
 
 
-def ensure_embedded_skills(workdir: Path) -> Path:
-    target = workdir / "skills"
+def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, overwrite_existing: bool = False) -> Path:
+    target = skills_root.resolve()
+    target.mkdir(parents=True, exist_ok=True)
     state_path = target / ".embedded_bundle_state.json"
     expected_hash = EMBEDDED_SKILLS_ARCHIVE_SHA256
-    expected_files = EMBEDDED_SKILLS_ARCHIVE_FILES
+    expected_files = []
+    for rel in EMBEDDED_SKILLS_ARCHIVE_FILES:
+        p = Path(rel)
+        if p.parts and p.parts[0] == "skills":
+            p = Path(*p.parts[1:])
+        expected_files.append(p.as_posix())
 
     if state_path.exists():
         state_hash = ""
@@ -3735,12 +4000,12 @@ def ensure_embedded_skills(workdir: Path) -> Path:
         except Exception:
             state_hash = ""
         if state_hash == expected_hash:
-            missing = [rel for rel in expected_files if not (workdir / rel).exists()]
+            missing = [rel for rel in expected_files if not (target / rel).exists()]
             if not missing:
                 return target
 
     raw = base64.b64decode(EMBEDDED_SKILLS_ARCHIVE_B64.encode("ascii"))
-    root_resolved = workdir.resolve()
+    root_resolved = target.resolve()
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -3748,20 +4013,30 @@ def ensure_embedded_skills(workdir: Path) -> Path:
             rel = Path(info.filename)
             if rel.is_absolute() or ".." in rel.parts:
                 continue
-            target_path = (workdir / rel).resolve()
+            if rel.parts and rel.parts[0] == "skills":
+                rel = Path(*rel.parts[1:])
+            if not rel.parts:
+                continue
+            target_path = (target / rel).resolve()
             if not target_path.is_relative_to(root_resolved):
+                continue
+            if target_path.exists() and not overwrite_existing:
                 continue
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_bytes(zf.read(info.filename))
 
-    target.mkdir(parents=True, exist_ok=True)
     state_payload = {
         "sha256": expected_hash,
         "file_count": len(expected_files),
         "updated_at": int(time.time()),
+        "root": str(target),
     }
     state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
+
+
+def ensure_embedded_skills(workdir: Path) -> Path:
+    return ensure_embedded_skills_at_root(workdir / "skills", workdir=workdir, overwrite_existing=False)
 
 def _module_exists(name: str) -> bool:
     try:
@@ -4963,6 +5238,7 @@ def ensure_embedded_clawhub_skills(skills_root: Path):
             target.write_bytes(zf.read(info.filename))
 
 def ensure_runtime_skills(skills_root: Path):
+    ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
     ensure_generated_document_skills(skills_root)
     ensure_generated_image_coding_feedback_skill(skills_root)
     ensure_generated_skills_gen_skill(skills_root)
@@ -5019,9 +5295,10 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "# Workspace Paths Guide\n"
             "- Always use relative paths (e.g. src/main.py) for file tools.\n"
             "- Runtime maps relative paths to session absolute root automatically.\n"
-            "- '/workspace/...' is a virtual alias for tool arguments only; never create OS-level /workspace.\n"
+            "- '/workspace/...' is a virtual alias for the session workspace; file tools and POSIX shell commands can use it.\n"
+            "- '/skills/...' is a virtual alias for the global skills root; file tools and POSIX shell commands can use it.\n"
             "- When user references uploaded files, prioritize workspace uploads directory.\n"
-            "- For shell commands, use relative paths or $PWD-based references.\n"
+            "- On macOS/Linux shell commands, '/workspace/...' and '/skills/...' are rewritten to real filesystem paths before execution.\n"
         ),
     },
     "task-management": {
@@ -5042,7 +5319,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "- Prefer write_file/edit_file for code changes (UI renders line-level diffs).\n"
             "- If write_file/edit_file fails due to malformed arguments, regenerate complete JSON.\n"
             "- If output looks truncated, split into smaller subtasks.\n"
-            "- For shell commands: use bash_command for execution, not file tools.\n"
+            "- For shell commands: use bash for execution, not file tools.\n"
             "- Always end thinking sections with either a final answer or one tool call.\n"
             "- Never stop at thinking-only content without an action.\n"
         ),
@@ -5118,6 +5395,194 @@ class SkillStore:
     def _provider_exists(self, provider_id: str) -> bool:
         return provider_id in self.providers
 
+    def _skill_meta_section(self, meta: dict, key: str) -> dict:
+        section = meta.get(key) if isinstance(meta, dict) else {}
+        return section if isinstance(section, dict) else {}
+
+    def _skill_aliases(self, meta: dict) -> list[str]:
+        aliases = _meta_string_list(meta.get("aliases"))
+        aliases.extend(_meta_string_list(meta.get("alias")))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        aliases.extend(_meta_string_list(cc.get("aliases")))
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in aliases:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _skill_triggers(self, meta: dict) -> list[str]:
+        triggers = _meta_string_list(meta.get("triggers"))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        triggers.extend(_meta_string_list(cc.get("triggers")))
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in triggers:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _skill_entrypoints(self, meta: dict) -> list[str]:
+        entrypoints = _meta_string_list(meta.get("entrypoints"))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        entrypoints.extend(_meta_string_list(cc.get("entrypoints")))
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in entrypoints:
+            rel = str(PurePosixPath(str(item).replace("\\", "/"))).strip()
+            if not rel or rel in {".", ".."}:
+                continue
+            if rel.startswith("/"):
+                rel = rel.lstrip("/")
+            if ".." in PurePosixPath(rel).parts:
+                continue
+            key = rel.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rel)
+        return out
+
+    def _skill_runtime_contract(self, meta: dict) -> str:
+        contract = str(meta.get("runtime_contract", "") or "").strip()
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        if not contract:
+            contract = str(cc.get("runtime_contract", "") or "").strip()
+        return contract
+
+    def _skill_attachment_globs(self, meta: dict) -> list[str]:
+        globs = _meta_string_list(meta.get("attachments"))
+        if not globs:
+            globs = _meta_string_list(meta.get("resource_globs"))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        if not globs:
+            globs = _meta_string_list(cc.get("attachments"))
+        if not globs:
+            globs = _meta_string_list(cc.get("resource_globs"))
+        return globs
+
+    def _register_alias(self, alias: str, key: str):
+        alias_name = str(alias or "").strip()
+        if not alias_name:
+            return
+        if alias_name in self.aliases:
+            existing = self.aliases.pop(alias_name)
+            items = self.ambiguous.setdefault(alias_name, [])
+            if existing not in items:
+                items.append(existing)
+            if key not in items:
+                items.append(key)
+            return
+        if alias_name in self.ambiguous:
+            items = self.ambiguous.setdefault(alias_name, [])
+            if key not in items:
+                items.append(key)
+            return
+        self.aliases[alias_name] = key
+
+    def _inline_skill_attachments(self, attachments: list[dict]) -> list[dict]:
+        chosen: list[dict] = []
+        total_chars = 0
+        for item in sorted(
+            attachments,
+            key=lambda x: (
+                -int(x.get("priority", 0) or 0),
+                int(x.get("size", 0) or 0),
+                str(x.get("path", "")).lower(),
+            ),
+        ):
+            if not bool(item.get("text_available", False)):
+                continue
+            text = str(item.get("content", "") or "")
+            if not text:
+                continue
+            if len(chosen) >= SKILL_INLINE_ATTACHMENT_MAX_FILES:
+                continue
+            if chosen and (total_chars + len(text)) > SKILL_INLINE_ATTACHMENT_MAX_CHARS:
+                continue
+            if (not chosen) and len(text) > SKILL_INLINE_ATTACHMENT_MAX_CHARS:
+                continue
+            chosen.append(item)
+            total_chars += len(text)
+        return chosen
+
+    def _public_skill_locator(self, raw_locator: str) -> str:
+        raw = str(raw_locator or "").strip()
+        if not raw:
+            return ""
+        if raw == "(builtin)":
+            return raw
+        if _is_http_url(raw):
+            return raw
+        base, sep, frag = raw.partition("#")
+        if _is_http_url(base):
+            return raw
+        try:
+            candidate = Path(base)
+        except Exception:
+            return raw
+        resolved: Path | None = None
+        try:
+            resolved = candidate.resolve() if candidate.is_absolute() else (self.skills_root / candidate).resolve()
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            try:
+                rel = resolved.relative_to(self.skills_root.resolve()).as_posix()
+                public = SKILLS_VIRTUAL_PREFIX if rel in {"", "."} else f"{SKILLS_VIRTUAL_PREFIX}/{rel}"
+                public = public.replace("//", "/")
+                return public + (f"#{frag}" if sep else "")
+            except Exception:
+                pass
+        if candidate.is_absolute():
+            return "(external-local-path)"
+        rel = candidate.as_posix().strip().lstrip("/")
+        if rel in {"", "."}:
+            public = SKILLS_VIRTUAL_PREFIX
+            return public + (f"#{frag}" if sep else "")
+        if ".." not in PurePosixPath(rel).parts:
+            public = f"{SKILLS_VIRTUAL_PREFIX}/{rel}".replace("//", "/")
+            return public + (f"#{frag}" if sep else "")
+        return raw
+
+    def _absolute_skill_locator(self, raw_locator: str) -> str:
+        raw = str(raw_locator or "").strip()
+        if not raw or raw == "(builtin)":
+            return ""
+        if _is_http_url(raw):
+            return ""
+        base = raw.partition("#")[0].strip()
+        if not base or _is_http_url(base):
+            return ""
+        try:
+            candidate = Path(base)
+        except Exception:
+            return ""
+        try:
+            resolved = candidate.resolve() if candidate.is_absolute() else (self.skills_root / candidate).resolve()
+        except Exception:
+            return ""
+        return str(resolved)
+
+    def _public_attachment_locator(self, item: dict) -> tuple[str, str]:
+        source = str(item.get("virtual_path", "") or "").strip()
+        if not source:
+            source = self._public_skill_locator(str(item.get("abs_path", "") or ""))
+        virtual_path = source if source.startswith(f"{SKILLS_VIRTUAL_PREFIX}/") else ""
+        return source, virtual_path
+
+    def _public_provider_locator(self, raw_locator: str) -> str:
+        public = self._public_skill_locator(raw_locator)
+        if public == "(external-local-path)":
+            return ""
+        return public
+
     def _register_provider(
         self,
         provider_id: str,
@@ -5152,35 +5617,52 @@ class SkillStore:
         skip_name: str = "SKILL.md",
         globs: list[str] | None = None,
         base_dir: Path | None = None,
+        entrypoints: list[str] | None = None,
     ) -> list[dict]:
         attachments: list[dict] = []
         seen: set[str] = set()
         base = base_dir or skill_dir
+        entrypoint_set = {str(x).strip() for x in (entrypoints or []) if str(x).strip()}
         candidates: list[Path] = []
-        if globs:
-            for pattern in globs:
+        effective_globs = globs or list(SKILL_DEFAULT_ATTACHMENT_GLOBS)
+        if effective_globs:
+            for pattern in effective_globs:
                 for fp in sorted(base.glob(pattern)):
                     candidates.append(fp)
-        else:
-            for fp in sorted(skill_dir.rglob("*")):
-                candidates.append(fp)
+        for rel in sorted(entrypoint_set):
+            target = (skill_dir / rel).resolve()
+            if target.exists():
+                candidates.append(target)
         for fp in candidates:
             if not fp.is_file():
                 continue
             if fp.name in {skip_name, ".DS_Store"}:
                 continue
-            text = try_read_text(fp)
-            if text is None:
-                continue
             rel = fp.relative_to(base).as_posix() if fp.is_relative_to(base) else fp.name
             if rel in seen:
                 continue
             seen.add(rel)
+            text = try_read_text(fp)
+            if text is None and rel not in entrypoint_set:
+                continue
+            try:
+                skill_rel = fp.resolve().relative_to(self.skills_root.resolve()).as_posix()
+            except Exception:
+                skill_rel = rel
+            size = 0
+            try:
+                size = int(fp.stat().st_size or 0)
+            except Exception:
+                size = len(text or "")
             attachments.append(
                 {
                     "path": rel,
                     "abs_path": str(fp.resolve()),
-                    "content": text,
+                    "virtual_path": f"{SKILLS_VIRTUAL_PREFIX}/{skill_rel}".replace("//", "/"),
+                    "content": text or "",
+                    "text_available": text is not None,
+                    "size": size,
+                    "priority": 2 if rel in entrypoint_set else 1,
                 }
             )
         return attachments
@@ -5215,26 +5697,18 @@ class SkillStore:
             "protocol_version": protocol_version,
             "meta": dict(meta or {}),
             "body": (body or "").strip(),
-            "skill_path": skill_path,
+            "skill_path": self._public_skill_locator(skill_path),
+            "skill_abs_path": self._absolute_skill_locator(skill_path),
             "attachments": attachments,
         }
         self.skills[key] = record
         p = self.providers.get(provider_id)
         if p:
             p["skill_count"] = int(p.get("skill_count", 0)) + 1
-        if skill_name in self.aliases:
-            existing = self.aliases.pop(skill_name)
-            items = self.ambiguous.setdefault(skill_name, [])
-            if existing not in items:
-                items.append(existing)
-            if key not in items:
-                items.append(key)
-        elif skill_name in self.ambiguous:
-            items = self.ambiguous.setdefault(skill_name, [])
-            if key not in items:
-                items.append(key)
-        else:
-            self.aliases[skill_name] = key
+        self._register_alias(skill_name, key)
+        for alias in self._skill_aliases(meta):
+            if alias != skill_name:
+                self._register_alias(alias, key)
 
     def _load_skill_file(self, skill_file: Path, provider_id: str, protocol: str, protocol_version: str):
         raw = try_read_text(skill_file)
@@ -5244,7 +5718,12 @@ class SkillStore:
         skill_dir = skill_file.parent
         name = str(meta.get("name", "")).strip() or skill_dir.name
         desc = str(meta.get("description", "-"))
-        attachments = self._collect_attachments(skill_dir, skip_name=skill_file.name)
+        attachments = self._collect_attachments(
+            skill_dir,
+            skip_name=skill_file.name,
+            globs=self._skill_attachment_globs(meta),
+            entrypoints=self._skill_entrypoints(meta),
+        )
         self._register_skill(
             provider_id=provider_id,
             protocol=protocol,
@@ -5364,6 +5843,7 @@ class SkillStore:
                     skip_name=source_path.name if source_path else "SKILL.md",
                     globs=globs,
                     base_dir=root if globs else None,
+                    entrypoints=self._skill_entrypoints(meta),
                 )
                 self._register_skill(
                     provider_id=provider_id,
@@ -5448,7 +5928,7 @@ class SkillStore:
             return ""
         sha = hashlib.sha256()
         files: list[Path] = []
-        files.extend(sorted(self.skills_root.rglob("SKILL.md")))
+        files.extend(sorted(self.skills_root.rglob("*")))
         providers_dir = self.skills_root / "providers"
         if providers_dir.exists():
             files.extend(sorted(providers_dir.rglob("*.json")))
@@ -5464,6 +5944,8 @@ class SkillStore:
             if resolved in seen:
                 continue
             seen.add(resolved)
+            if not fp.exists() or not fp.is_file():
+                continue
             try:
                 rel = fp.resolve().relative_to(self.skills_root.resolve()).as_posix()
             except Exception:
@@ -5542,6 +6024,12 @@ class SkillStore:
             simple = data.get("name", key)
             label = simple if self.aliases.get(simple) == key else key
             desc = data.get("description", "-")
+            aliases = [
+                x for x in self._skill_aliases(data.get("meta", {}))
+                if x and x != simple
+            ][:2]
+            if aliases:
+                desc = f"{desc} (aliases: {', '.join(aliases)})"
             lines.append(f"- {label}: {desc} [{data.get('provider_id')} | {data.get('protocol')}]")
             shown += 1
         remaining = max(0, len(self.skills) - shown)
@@ -5573,8 +6061,11 @@ class SkillStore:
                     "protocol_version": data.get("protocol_version", ""),
                     "meta": meta,
                     "skill_path": data.get("skill_path", ""),
+                    "virtual_path": data.get("skill_path", ""),
                     "attachments": [x["path"] for x in data.get("attachments", [])],
                     "aliases": [n for n, sid in self.aliases.items() if sid == key],
+                    "triggers": self._skill_triggers(meta),
+                    "entrypoints": self._skill_entrypoints(meta),
                 }
             )
         if self.ambiguous:
@@ -5589,6 +6080,7 @@ class SkillStore:
                     "protocol_version": "1.0",
                     "meta": {"ambiguous": self.ambiguous, "warnings": self.warnings},
                     "skill_path": "",
+                    "virtual_path": "",
                     "attachments": [],
                     "aliases": [],
                 }
@@ -5598,7 +6090,10 @@ class SkillStore:
     def list_providers(self) -> list[dict]:
         out = []
         for provider in sorted(self.providers.values(), key=lambda x: x["provider_id"]):
-            out.append(dict(provider))
+            row = dict(provider)
+            row["root"] = self._public_provider_locator(str(row.get("root", "") or ""))
+            row["config_path"] = self._public_provider_locator(str(row.get("config_path", "") or ""))
+            out.append(row)
         return out
 
     def list_protocols(self) -> list[dict]:
@@ -5657,7 +6152,7 @@ class SkillStore:
                 "version": "1.0",
             },
             "placement": {
-                "path": str((self.skills_root / "providers").resolve()),
+                "path": f"{SKILLS_VIRTUAL_PREFIX}/providers",
                 "rule": "Drop provider JSON manifests under this folder; reload/list_skills will auto-detect them.",
             },
         }
@@ -5680,6 +6175,22 @@ class SkillStore:
         if err or not key:
             return err or "Error: skill not found"
         skill = self.skills[key]
+        meta = skill.get("meta", {}) if isinstance(skill.get("meta"), dict) else {}
+        skill_path = str(skill.get("skill_path", "") or "")
+        skill_abs_path = str(skill.get("skill_abs_path", "") or "")
+        body_text = str(skill.get("body", "") or "")
+        runtime_contract = self._skill_runtime_contract(meta)
+        compact_mode = bool(runtime_contract) and len(body_text) > SKILL_BODY_COMPACT_THRESHOLD_CHARS
+        if compact_mode:
+            body_render = (
+                "[Clouds_Coder compact skill load]\n"
+                "This skill has a long reference body. Follow the runtime contract and resource manifest first.\n"
+                f"Full source remains available at: {skill_path or '(builtin)'}\n"
+                "Use read_file on /skills/... entrypoints or the skill file itself only when the task needs deeper detail.\n\n"
+                + trim(body_text, SKILL_BODY_PREVIEW_CHARS)
+            )
+        else:
+            body_render = body_text
         lines = [
             (
                 f"<skill name=\"{skill.get('name','')}\" "
@@ -5687,22 +6198,78 @@ class SkillStore:
                 f"provider=\"{skill.get('provider_id','')}\" "
                 f"protocol=\"{skill.get('protocol','')}\" "
                 f"protocol_version=\"{skill.get('protocol_version','')}\" "
-                f"path=\"{skill.get('skill_path', '')}\">"
+                f"path=\"{skill_path}\" "
+                f"compact_mode=\"{'true' if compact_mode else 'false'}\">"
             ),
-            skill["body"],
+            body_render,
             "</skill>",
             "<skill_meta>",
-            json_dumps(skill.get("meta", {}), indent=2),
+            json_dumps(meta, indent=2),
             "</skill_meta>",
         ]
+        if runtime_contract:
+            lines.extend(
+                [
+                    "<skill_runtime_contract>",
+                    runtime_contract,
+                    "</skill_runtime_contract>",
+                ]
+            )
         attachments = skill.get("attachments", [])
+        entrypoints = self._skill_entrypoints(meta)
+        if entrypoints:
+            lines.append("<skill_entrypoints>")
+            att_map = {str(x.get("path", "")): x for x in attachments if isinstance(x, dict)}
+            for rel in entrypoints:
+                row = att_map.get(rel, {})
+                try:
+                    if not skill_abs_path:
+                        raise ValueError("skill has no local absolute path")
+                    base = Path(skill_abs_path).resolve().parent
+                    vp_rel = (base / rel).resolve().relative_to(self.skills_root.resolve()).as_posix()
+                    virtual_path = f"{SKILLS_VIRTUAL_PREFIX}/{vp_rel}".replace("//", "/")
+                except Exception:
+                    virtual_path = str(row.get("virtual_path", "") or "")
+                lines.append(
+                    f"<entrypoint path=\"{rel}\" virtual_path=\"{virtual_path}\" />"
+                )
+            lines.append("</skill_entrypoints>")
         if attachments:
-            lines.append("<skill_attachments>")
-            for item in attachments:
-                lines.append(f"<file path=\"{item['path']}\" abs_path=\"{item['abs_path']}\">")
-                lines.append(item["content"])
-                lines.append("</file>")
-            lines.append("</skill_attachments>")
+            lines.append("<skill_resources>")
+            for item in sorted(
+                attachments,
+                key=lambda x: (
+                    -int(x.get("priority", 0) or 0),
+                    str(x.get("path", "")).lower(),
+                ),
+            )[:SKILL_RESOURCE_MANIFEST_MAX_ITEMS]:
+                source_path, virtual_path = self._public_attachment_locator(item)
+                lines.append(
+                    f"<resource path=\"{item['path']}\" "
+                    f"source=\"{source_path}\" "
+                    f"virtual_path=\"{virtual_path}\" "
+                    f"text=\"{'true' if item.get('text_available') else 'false'}\" "
+                    f"size=\"{int(item.get('size', 0) or 0)}\" "
+                    f"priority=\"{int(item.get('priority', 0) or 0)}\" />"
+                )
+            remaining = max(0, len(attachments) - SKILL_RESOURCE_MANIFEST_MAX_ITEMS)
+            if remaining > 0:
+                lines.append(f"<resource_omitted count=\"{remaining}\" />")
+            lines.append("</skill_resources>")
+            inline_attachments = self._inline_skill_attachments(attachments)
+            if inline_attachments:
+                lines.append("<skill_attachments>")
+                for item in inline_attachments:
+                    source_path, virtual_path = self._public_attachment_locator(item)
+                    lines.append(
+                        f"<file path=\"{item['path']}\" "
+                        f"source=\"{source_path}\" "
+                        f"virtual_path=\"{virtual_path}\" "
+                        f"size=\"{int(item.get('size', 0) or 0)}\">"
+                    )
+                    lines.append(str(item.get("content", "") or ""))
+                    lines.append("</file>")
+                lines.append("</skill_attachments>")
         return "\n".join(lines)
 
 class TaskManager:
@@ -7678,6 +8245,9 @@ class SessionState:
                 continue
             if not fp.exists() or not fp.is_file():
                 continue
+            # Skip image formats that need conversion — handled by _run_read_media
+            if kind == "image" and fp.suffix.lower() in IMAGE_FORMATS_NEED_CONVERSION:
+                continue
             size = int(fp.stat().st_size or 0)
             if size <= 0 or size > 20 * 1024 * 1024:
                 continue
@@ -7807,6 +8377,8 @@ class SessionState:
             if not fp.exists() or (not fp.is_file()):
                 return
             if fp.suffix.lower() not in IMAGE_EXTS:
+                return
+            if fp.suffix.lower() in IMAGE_FORMATS_NEED_CONVERSION:
                 return
             try:
                 rel = self._session_rel(fp)
@@ -9228,6 +9800,64 @@ class SessionState:
             "summary": f"skill '{skill_key}' loaded and broadcast to all agents"
         })
 
+    def _loaded_skills_goal_signature(self, goal_text: str) -> str:
+        goal = trim(str(goal_text or ""), 1200).strip().lower()
+        if not goal:
+            return ""
+        return hashlib.sha1(goal.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _clear_loaded_skill_contexts(self):
+        def _filter_rows(rows: list[dict]) -> list[dict]:
+            kept: list[dict] = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                content = str(row.get("content", "") or "")
+                if "<loaded-skill name=" in content:
+                    continue
+                kept.append(row)
+            return kept
+        for role in AGENT_ROLES:
+            self.contexts[role] = _filter_rows(list(self.contexts.get(role, [])))[-400:]
+        self.manager_context = _filter_rows(list(self.manager_context))[-400:]
+
+    def _prepare_loaded_skills_for_goal(self, goal_text: str, trigger: str = "") -> dict:
+        goal_sig = self._loaded_skills_goal_signature(goal_text)
+        bb = self._ensure_blackboard()
+        current_sig = str(bb.get("loaded_skills_goal_sig", "") or "")
+        loaded = bb.get("loaded_skills", {})
+        if not isinstance(loaded, dict):
+            loaded = {}
+        changed = bool(goal_sig and current_sig and goal_sig != current_sig)
+        if changed:
+            bb["loaded_skills"] = {}
+            bb["loaded_skills_goal_sig"] = goal_sig
+            bb["loaded_skills_goal_preview"] = trim(str(goal_text or ""), 240)
+            self.blackboard = bb
+            self._blackboard_touch()
+            self._clear_loaded_skill_contexts()
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "loaded skills reset for new goal"
+                        + (f" ({trigger})" if str(trigger or "").strip() else "")
+                    )
+                },
+            )
+            loaded = {}
+        elif goal_sig and current_sig != goal_sig:
+            bb["loaded_skills_goal_sig"] = goal_sig
+            bb["loaded_skills_goal_preview"] = trim(str(goal_text or ""), 240)
+            self.blackboard = bb
+            self._blackboard_touch()
+        return {
+            "goal_sig": goal_sig,
+            "current_sig": current_sig,
+            "goal_changed": changed,
+            "loaded": loaded,
+        }
+
     def _auto_discover_and_load_skills(self, goal_text: str, trigger: str = ""):
         """Skill discovery: LLM semantic match (with timeout) → keyword fallback → lazy load."""
         try:
@@ -9237,13 +9867,12 @@ class SessionState:
         skill_meta = self.skills.list_metadata()
         if not skill_meta:
             return
-        # Skip if already loaded skills for this goal
-        bb = self._ensure_blackboard()
-        already_loaded = bb.get("loaded_skills", {})
-        if isinstance(already_loaded, dict) and len(already_loaded) >= 3:
-            return
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 600)
         if not goal:
+            return
+        prep = self._prepare_loaded_skills_for_goal(goal, trigger=trigger)
+        already_loaded = prep.get("loaded", {})
+        if isinstance(already_loaded, dict) and len(already_loaded) >= 3 and not bool(prep.get("goal_changed", False)):
             return
         goal_low = goal.lower()
         # Build skill catalog
@@ -9252,8 +9881,20 @@ class SessionState:
             name = str(s.get("name", "")).strip()
             qname = str(s.get("qualified_name", name)).strip()
             desc = trim(str(s.get("description", "")).strip(), 200)
+            meta = s.get("meta", {}) if isinstance(s.get("meta"), dict) else {}
+            keywords: list[str] = []
+            keywords.append(name.lower())
+            keywords.extend(str(x).strip().lower() for x in self.skills._skill_aliases(meta))
+            keywords.extend(str(x).strip().lower() for x in self.skills._skill_triggers(meta))
             if name and desc and desc != "-":
-                skill_catalog.append({"name": name, "qname": qname, "desc": desc})
+                skill_catalog.append(
+                    {
+                        "name": name,
+                        "qname": qname,
+                        "desc": desc,
+                        "keywords": [x for x in keywords if x],
+                    }
+                )
         if not skill_catalog:
             return
 
@@ -9316,6 +9957,33 @@ class SessionState:
 
     def _keyword_match_skills(self, goal_low: str, skill_catalog: list[dict]) -> list[str]:
         """Keyword-based skill matching as fallback when LLM fails."""
+        scored: list[tuple[int, int, str]] = []
+        for s in skill_catalog:
+            qname = str(s.get("qname", "")).strip()
+            if not qname:
+                continue
+            score = 0
+            longest = 0
+            for kw in s.get("keywords", []) or []:
+                token = str(kw or "").strip().lower()
+                if not token or token in {"skill", "skills"}:
+                    continue
+                if token in goal_low:
+                    longest = max(longest, len(token))
+                    score += 3 if " " in token else 1
+            if score > 0:
+                scored.append((score, longest, qname))
+        if scored:
+            scored.sort(reverse=True)
+            matched: list[str] = []
+            for _, _, qname in scored:
+                if qname not in matched:
+                    matched.append(qname)
+                if len(matched) >= 2:
+                    break
+            if matched:
+                return matched[:2]
+
         # Mapping: goal keywords → skill name patterns
         keyword_skill_map = [
             # PPT/Presentation
@@ -10914,10 +11582,15 @@ class SessionState:
         if low.startswith("/workspace/"):
             rel = raw[len("/workspace/") :].lstrip("/")
             return rel or "."
+        if low in {SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}:
+            return ".__skills__"
+        if low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/"):
+            rel = raw[len(SKILLS_VIRTUAL_PREFIX) :].lstrip("/")
+            return f".__skills__/{rel}" if rel else ".__skills__"
         candidate = Path(raw)
         if candidate.is_absolute():
             raise ValueError(
-                "illegal absolute path. use relative path or '/workspace/<relative>' only"
+                "illegal absolute path. use relative path, '/workspace/<relative>', or '/skills/<relative>' only"
             )
         norm = candidate.as_posix().strip()
         if not norm:
@@ -10931,15 +11604,22 @@ class SessionState:
         if not txt.startswith("/"):
             return ""
         low = txt.lower()
-        if low in {"/workspace", "/workspace/"} or low.startswith("/workspace/"):
+        if (
+            low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}
+            or low.startswith("/workspace/")
+            or low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/")
+        ):
             return ""
         return (
             "Error: illegal absolute path for agent tool call. "
-            "Use relative path or '/workspace/<relative>' only."
+            "Use relative path, '/workspace/<relative>', or '/skills/<relative>' only."
         )
 
     def _session_path(self, path_text: str) -> Path:
         normalized = self._normalize_tool_path_text(path_text)
+        if normalized == ".__skills__" or normalized.startswith(".__skills__/"):
+            rel = normalized[len(".__skills__") :].lstrip("/")
+            return safe_path(rel or ".", self.skills.skills_root)
         return safe_path(normalized, self.files_root)
 
     def _session_rel(self, path: Path) -> str:
@@ -10947,6 +11627,13 @@ class SessionState:
         root = self.files_root.resolve()
         if target.is_relative_to(root):
             return target.relative_to(root).as_posix()
+        try:
+            skills_root = self.skills.skills_root.resolve()
+            if target.is_relative_to(skills_root):
+                rel = target.relative_to(skills_root).as_posix()
+                return f"{SKILLS_VIRTUAL_PREFIX}/{rel}".replace("//", "/")
+        except Exception:
+            pass
         return str(target)
 
     def _code_preview_bucket_dir(self, rel_path: str) -> Path:
@@ -13030,6 +13717,48 @@ class SessionState:
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
+                # Detect media format incompatibility and auto-fallback
+                exc_str = str(exc).lower()
+                _media_fmt_err = media_inputs and any(
+                    kw in exc_str for kw in (
+                        "unknown format", "unsupported image", "invalid image",
+                        "cannot process image", "image format",
+                        "failed to process inputs: image",
+                    )
+                )
+                if _media_fmt_err:
+                    media_desc = ", ".join(
+                        str(m.get("name", "unknown"))
+                        for m in media_inputs
+                        if isinstance(m, dict)
+                    )
+                    self._emit("status", {
+                        "summary": f"media format not supported by model ({media_desc}), retrying without media"
+                    })
+                    fallback_note = {
+                        "role": "user",
+                        "content": (
+                            f"[Note: The following files could not be processed as images "
+                            f"by the model: {media_desc}. "
+                            f"Please analyze them using text-based tools (bash/read_file) instead.]"
+                        ),
+                    }
+                    try:
+                        return self._call_interruptible(
+                            lambda: self.ollama.chat(
+                                list(messages) + [fallback_note],
+                                tools=tools,
+                                system=system,
+                                max_tokens=max_tokens,
+                                think=False,
+                                stream_thinking=bool(stream_thinking),
+                                on_thinking_chunk=on_thinking_chunk,
+                                media_inputs=None,
+                            ),
+                            progress_label=f"{context_label} model call (no-media fallback)",
+                        )
+                    except OllamaError:
+                        pass  # fallback also failed, continue normal retry
                 wake_note = ""
                 status = int(getattr(exc, "status", 0) or 0)
                 if (
@@ -13083,6 +13812,89 @@ class SessionState:
             except Exception:
                 continue
         return False
+
+    def _shell_virtual_prefix_start_boundary(self, ch: str) -> bool:
+        if not ch:
+            return True
+        return not (ch.isalnum() or ch in "._~-/%")
+
+    def _shell_virtual_prefix_end_boundary(self, ch: str) -> bool:
+        if not ch:
+            return True
+        if ch == "/":
+            return True
+        return not (ch.isalnum() or ch in "._~-")
+
+    def _shell_quote_virtual_root(self, path_text: str, quote_mode: str) -> str:
+        txt = str(path_text or "")
+        if quote_mode == "double":
+            return (
+                txt.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("$", "\\$")
+                .replace("`", "\\`")
+            )
+        if quote_mode == "single":
+            return txt.replace("'", "'\"'\"'")
+        return shlex.quote(txt)
+
+    def _rewrite_shell_virtual_paths(self, command: str, cwd: Path) -> str:
+        raw = str(command or "")
+        if not raw or os.name == "nt":
+            return raw
+        try:
+            workspace_root = str(cwd.resolve())
+        except Exception:
+            workspace_root = str(cwd)
+        try:
+            skills_root = str(self.skills.skills_root.resolve())
+        except Exception:
+            skills_root = str(self.skills.skills_root)
+        mappings = [
+            ("/workspace", workspace_root),
+            (SKILLS_VIRTUAL_PREFIX, skills_root),
+        ]
+        out: list[str] = []
+        mode = "plain"
+        i = 0
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            if mode in {"plain", "double"} and ch == "\\" and (i + 1) < n:
+                out.append(raw[i : i + 2])
+                i += 2
+                continue
+            replaced = False
+            if ch == "/":
+                prev = raw[i - 1] if i > 0 else ""
+                if self._shell_virtual_prefix_start_boundary(prev):
+                    for prefix, target in mappings:
+                        if not raw.startswith(prefix, i):
+                            continue
+                        next_idx = i + len(prefix)
+                        next_ch = raw[next_idx] if next_idx < n else ""
+                        if not self._shell_virtual_prefix_end_boundary(next_ch):
+                            continue
+                        out.append(self._shell_quote_virtual_root(target, mode))
+                        i += len(prefix)
+                        replaced = True
+                        break
+            if replaced:
+                continue
+            out.append(ch)
+            if mode == "plain":
+                if ch == "'":
+                    mode = "single"
+                elif ch == '"':
+                    mode = "double"
+            elif mode == "double":
+                if ch == '"':
+                    mode = "plain"
+            else:
+                if ch == "'":
+                    mode = "plain"
+            i += 1
+        return "".join(out)
 
     def _shell_write_targets_outside_scope(self, command: str) -> list[str]:
         cmd = str(command or "")
@@ -13167,8 +13979,9 @@ class SessionState:
                 blocked.append(p)
         return blocked
 
-    def _guard_shell_write_scope(self, command: str) -> str:
-        blocked = self._shell_write_targets_outside_scope(command)
+    def _guard_shell_write_scope(self, command: str, cwd: Path | None = None) -> str:
+        effective = self._rewrite_shell_virtual_paths(command, cwd or self.files_root)
+        blocked = self._shell_write_targets_outside_scope(effective)
         if not blocked:
             return ""
         preview = ", ".join(blocked[:3])
@@ -13180,8 +13993,10 @@ class SessionState:
         )
 
     def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
+        effective_command = self._rewrite_shell_virtual_paths(command, cwd)
         meta = {
             "command": command,
+            "effective_command": effective_command,
             "cwd": str(cwd),
             "timeout": timeout,
             "exit_code": None,
@@ -13190,7 +14005,7 @@ class SessionState:
             "output": "",
             "error": "",
         }
-        if any(x in command for x in DANGEROUS_PATTERNS):
+        if any(x in effective_command for x in DANGEROUS_PATTERNS):
             meta["error"] = "Error: dangerous command blocked"
             meta["output"] = meta["error"]
             return meta
@@ -13363,6 +14178,12 @@ class SessionState:
                 meta["output"] = trim(merged or "(no output)")
 
         try:
+            proc_env = os.environ.copy()
+            proc_env["WORKSPACE_ROOT"] = str(self.root)
+            proc_env["SESSION_ROOT"] = str(self.files_root)
+            proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
+            proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
+            proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
@@ -13371,12 +14192,13 @@ class SessionState:
                 "text": False,
                 "bufsize": 0,
                 "start_new_session": (os.name == "posix"),
+                "env": proc_env,
             }
             if os.name == "nt":
                 create_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
                 if create_group > 0:
                     popen_kwargs["creationflags"] = create_group
-            proc = subprocess.Popen(command, **popen_kwargs)
+            proc = subprocess.Popen(effective_command, **popen_kwargs)
             if os.name == "nt":
                 # Windows: read PIPE output via blocking reader threads + queue.
                 _collect_with_reader_threads(proc)
@@ -13497,27 +14319,53 @@ class SessionState:
         file_size = fp.stat().st_size
         size_kb = file_size / 1024
         if bool(caps.get(cap_key, False)) and file_size < 20 * 1024 * 1024:
-            # Model supports this media type — encode and inject as multimodal input
-            try:
-                b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
-                mime = guess_mime_from_name(fp.name)
-                media_item = {
-                    "type": media_type,
-                    "data_b64": b64,
-                    "mime": mime,
-                    "name": fp.name,
-                    "workspace_path": str(rel),
-                }
-                # Store for injection into next API call
-                with self.lock:
-                    self._pending_media_inputs.append(media_item)
-                return (
-                    f"[{media_type} file loaded: {rel} ({size_kb:.1f} KB, {mime})] "
-                    f"The {media_type} has been attached to the conversation for native {media_type} analysis. "
-                    f"Describe or analyze it directly."
-                )
-            except Exception as exc:
-                return f"Error reading {media_type} file: {exc}"
+            # Model supports this media type — check format compatibility first
+            ext = fp.suffix.lower()
+            if media_type == "image" and ext == ".svg":
+                # SVG: read as text source code instead of injecting as image
+                try:
+                    svg_text = fp.read_text(encoding="utf-8", errors="replace")
+                    return (
+                        f"[SVG file: {rel} ({size_kb:.1f} KB)]\n"
+                        f"SVG source code (use for analysis, do not send as image):\n"
+                        f"```svg\n{trim(svg_text, 12000)}\n```"
+                    )
+                except Exception as exc:
+                    return f"Error reading SVG file: {exc}"
+            if media_type == "image" and ext in IMAGE_FORMATS_NEED_CONVERSION:
+                # Try converting to a safe format via Pillow
+                converted, conv_mime, method = _convert_image_to_safe_format(fp)
+                if converted:
+                    b64 = base64.b64encode(converted).decode("ascii")
+                    mime = conv_mime
+                else:
+                    return (
+                        f"[{media_type} file: {rel} ({size_kb:.1f} KB, format={ext})] "
+                        f"Note: format {ext} could not be converted for native vision. "
+                        f"File exists at {fp}. Use bash tools to process it if needed."
+                    )
+            else:
+                # Safe format — encode directly
+                try:
+                    b64 = base64.b64encode(fp.read_bytes()).decode("ascii")
+                    mime = guess_mime_from_name(fp.name)
+                except Exception as exc:
+                    return f"Error reading {media_type} file: {exc}"
+            media_item = {
+                "type": media_type,
+                "data_b64": b64,
+                "mime": mime,
+                "name": fp.name,
+                "workspace_path": str(rel),
+            }
+            # Store for injection into next API call
+            with self.lock:
+                self._pending_media_inputs.append(media_item)
+            return (
+                f"[{media_type} file loaded: {rel} ({size_kb:.1f} KB, {mime})] "
+                f"The {media_type} has been attached to the conversation for native {media_type} analysis. "
+                f"Describe or analyze it directly."
+            )
         else:
             # Model doesn't support this media type — return metadata only
             reason = "model does not support" if not caps.get(cap_key) else "file too large"
@@ -15460,6 +16308,12 @@ class SessionState:
                     }
             if clean_skills:
                 board["loaded_skills"] = clean_skills
+        goal_sig = trim(str(src.get("loaded_skills_goal_sig", "") or ""), 80)
+        if goal_sig:
+            board["loaded_skills_goal_sig"] = goal_sig
+        goal_preview = trim(str(src.get("loaded_skills_goal_preview", "") or ""), 240)
+        if goal_preview:
+            board["loaded_skills_goal_preview"] = goal_preview
         return board
 
     def _normalize_failure_ledger(self, raw: dict) -> dict:
@@ -15868,16 +16722,25 @@ class SessionState:
         self.blackboard = board
 
     def _blackboard_reset_for_goal(self, goal: str):
-        # Preserve loaded skills and plan data across goal reset
+        # Preserve plan state when safe, but refresh loaded skills on goal change.
         old_bb = self._ensure_blackboard()
         preserved_skills = old_bb.get("loaded_skills", {})
+        preserved_skills_sig = str(old_bb.get("loaded_skills_goal_sig", "") or "")
+        new_goal_sig = self._loaded_skills_goal_signature(goal)
         preserved_plan = old_bb.get("plan", {})
         preserved_todos = old_bb.get("project_todos", [])
         preserved_cursor = old_bb.get("plan_step_cursor", None)
         preserved_total = old_bb.get("plan_step_total", None)
         self.blackboard = self._new_blackboard(goal)
-        if isinstance(preserved_skills, dict) and preserved_skills:
+        if (
+            isinstance(preserved_skills, dict)
+            and preserved_skills
+            and preserved_skills_sig
+            and preserved_skills_sig == new_goal_sig
+        ):
             self.blackboard["loaded_skills"] = preserved_skills
+            self.blackboard["loaded_skills_goal_sig"] = preserved_skills_sig
+            self.blackboard["loaded_skills_goal_preview"] = trim(str(goal or ""), 240)
         # Restore plan state if plan is in executing phase
         if isinstance(preserved_plan, dict) and preserved_plan.get("phase") == "executing":
             self.blackboard["plan"] = preserved_plan
@@ -20871,7 +21734,7 @@ class SessionState:
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
         if name == "bash":
-            guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""))
+            guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, 120)
@@ -20880,6 +21743,7 @@ class SessionState:
                 {
                     "name": "bash",
                     "command": meta["command"],
+                    "effective_command": meta.get("effective_command", meta["command"]),
                     "cwd": meta["cwd"],
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
@@ -21133,18 +21997,21 @@ class SessionState:
             except Exception as exc:
                 return f"Error: generate_media failed: {exc}"
         if name == "background_run":
-            guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""))
+            raw_command = str(args.get("command", "") or "")
+            guard_error = self._guard_shell_write_scope(raw_command, self.files_root)
             if guard_error:
                 return guard_error
-            out = self.bg.run(args["command"], int(args.get("timeout", 120)))
+            effective_command = self._rewrite_shell_virtual_paths(raw_command, self.files_root)
+            out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
             self._emit(
                 "command",
                 {
                     "name": "background_run",
-                    "command": args["command"],
+                    "command": raw_command,
+                    "effective_command": effective_command,
                     "cwd": str(self.files_root),
-                    "summary": f"background_run: {args['command'][:80]}",
+                    "summary": f"background_run: {raw_command[:80]}",
                 },
             )
             return trim(out_filtered or "(no output)")
@@ -21292,7 +22159,7 @@ class SessionState:
             wt_path = self.worktrees.resolve_path(args["name"])
             if wt_path is None:
                 return f"Error: unknown worktree '{args['name']}'"
-            guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""))
+            guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), wt_path)
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, 300)
@@ -21302,6 +22169,7 @@ class SessionState:
                     "name": "worktree_run",
                     "worktree": args["name"],
                     "command": meta["command"],
+                    "effective_command": meta.get("effective_command", meta["command"]),
                     "cwd": meta["cwd"],
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
@@ -23243,6 +24111,10 @@ class SessionState:
             )
             # ── Auto-discover and load relevant skills BEFORE classification ──
             try:
+                self._emit(
+                    "status",
+                    {"summary": "initial skill discovery started"},
+                )
                 self._auto_discover_and_load_skills(
                     self.runtime_reclassify_goal or self._latest_user_goal_text(),
                     trigger="pre-classify",
@@ -25810,7 +26682,7 @@ window.MathJax={
       </div>
       <div class="llm-modal-footer">
         <button id="llmConfigConfirm" class="llm-modal-btn-primary">Confirm</button>
-        <button id="llmConfigImport" class="llm-modal-btn-secondary">Import config</button>
+        <label for="configInput" id="llmConfigImport" class="llm-modal-btn-secondary" style="cursor:pointer;margin:0">Import config</label>
       </div>
     </div>
   </div>
@@ -28637,7 +29509,7 @@ async function createSession(){showError('');const title=prompt(t('session_title
 async function renameSession(){if(!S.activeId){showError(t('select_session_first'));return}const old=S.sessions.find(x=>x.id===S.activeId)?.title||t('session_default');const s=prompt(t('rename_session_prompt'),old);if(!s)return;await api('/api/sessions/'+S.activeId,{method:'PATCH',body:JSON.stringify({title:s})});await refreshSessions();await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
-async function importDefaultConfig(){try{if(!S.activeId){showError(t('select_session_first'));return}const res=await api('/api/sessions/'+S.activeId+'/config/import-default',{method:'POST'});if(res?.ok&&res?.catalog){showError('');const cat=res.catalog;if(applyModelCatalog(cat)){const modal=E('llmConfigModal');if(modal)modal.style.display='none';await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return}applyModelCatalog(cat)||renderModelControls();await refreshSnapshot({forceFull:true,allowWhenFrozen:true});const modal=E('llmConfigModal');if(modal)modal.style.display='none';return}const ci=E('configInput');if(ci)ci.click()}catch(err){const ci=E('configInput');if(ci)ci.click()}}
+
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
@@ -28646,7 +29518,7 @@ async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_fir
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);bindClick('llmConfigImport',importDefaultConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -29826,8 +30698,15 @@ class AppContext:
                 for fp in sorted(self.skills_root.rglob("*")):
                     if not fp.is_file() or fp.name == ".DS_Store":
                         continue
-                    rel = fp.relative_to(self.workspace).as_posix()
-                    zf.writestr(rel, fp.read_text(encoding="utf-8"))
+                    try:
+                        rel = fp.relative_to(self.workspace).as_posix()
+                    except Exception:
+                        rel = f"external_skills/{fp.relative_to(self.skills_root).as_posix()}"
+                    text = try_read_text(fp, max_bytes=2_000_000)
+                    if text is not None:
+                        zf.writestr(rel, text)
+                    else:
+                        zf.writestr(rel, fp.read_bytes())
             try:
                 ensure_offline_js_libs(self.workspace, force=False)
             except Exception:
@@ -29946,6 +30825,9 @@ class AppContext:
             skill_desc = str(meta.get("description", "") or "").strip()
             provider = str(meta.get("provider_id", "") or "")
             protocol = str(meta.get("protocol", "") or "")
+            aliases = self.skills_store._skill_aliases(meta) if hasattr(self, "skills_store") else []
+            triggers = self.skills_store._skill_triggers(meta) if hasattr(self, "skills_store") else []
+            entrypoints = self.skills_store._skill_entrypoints(meta) if hasattr(self, "skills_store") else []
             skill_row = {
                 "name": skill_name,
                 "description": skill_desc,
@@ -29953,6 +30835,9 @@ class AppContext:
                 "skill_file": rel_file,
                 "provider": provider,
                 "protocol": protocol,
+                "aliases": aliases,
+                "triggers": triggers,
+                "entrypoints": entrypoints,
                 "preview": trim(text, 1600),
             }
             skill_rows.append(skill_row)
@@ -29976,6 +30861,9 @@ class AppContext:
                     "skill_file": rel_file,
                     "provider": provider,
                     "protocol": protocol,
+                    "aliases": aliases,
+                    "triggers": triggers,
+                    "entrypoints": entrypoints,
                     "preview": trim(text, 800),
                 }
             )
@@ -31360,6 +32248,11 @@ def main():
         help="Skills Studio web port (default: agent port + 1)",
     )
     parser.add_argument(
+        "--skills_root",
+        default="",
+        help="Override skills root directory. Supports relative paths and both 'skills'/'Skills' naming.",
+    )
+    parser.add_argument(
         "--no_Skills_UI",
         "--no_skills_ui",
         dest="no_skills_ui",
@@ -31725,7 +32618,14 @@ def main():
                 f"{requested_max_user_sessions}->{resolved_max_user_sessions} (minimum 0)"
             )
     resolved_language = normalize_ui_language(getattr(args, "language", DEFAULT_UI_LANGUAGE))
-    skills_root = ensure_embedded_skills(WORKDIR)
+    skills_root, skills_root_source = select_preferred_skills_root(
+        WORKDIR,
+        explicit=str(getattr(args, "skills_root", "") or ""),
+        external_config=external_config,
+        web_ui_config=web_ui_config,
+    )
+    skills_root.mkdir(parents=True, exist_ok=True)
+    ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
     ensure_runtime_skills(skills_root)
     app = AppContext(
         WORKDIR,
@@ -31795,7 +32695,7 @@ def main():
     print(f"[web-agent] workspace={WORKDIR}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
-    print(f"[web-agent] skills_root={skills_root}")
+    print(f"[web-agent] skills_root={skills_root} (source={skills_root_source})")
     print(f"[web-agent] web_ui_config={web_ui_config_path}")
     print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
     print(f"[web-agent] show_upload_list={'on' if resolved_show_upload_list else 'off'}")
