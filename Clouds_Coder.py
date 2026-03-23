@@ -11000,26 +11000,33 @@ class SessionState:
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
         self._blackboard_touch()
-        # 2. Inject skill content into global context and all agent contexts
-        inject_msg = (
+        # 2. Inject skill into agent context (full content) — NOT into user-visible messages
+        skill_desc = str(skill_row.get("description", "-")).strip()
+        agent_inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
             f"A skill has been loaded. Follow its instructions precisely.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
+        # User-visible message: concise one-line notification only
+        user_notify_msg = (
+            f"[skill loaded: {skill_name}] {trim(skill_desc, 120)}"
+        )
         self.messages.append(
             {
                 "role": "user",
-                "content": inject_msg,
+                "content": user_notify_msg,
                 "ts": now_ts(),
                 "agent_role": "shared",
+                "_skill_notify": True,
             }
         )
         self.messages = self.messages[-400:]
+        # Full skill content goes only to agent_messages (internal context)
         self.agent_messages.append(
             {
                 "role": "user",
-                "content": inject_msg,
+                "content": agent_inject_msg,
                 "ts": now_ts(),
                 "agent_role": "shared",
             }
@@ -11028,7 +11035,7 @@ class SessionState:
         if len(self.agent_messages) > int(am_limit * 1.5):
             self.agent_messages = self.agent_messages[-am_limit:]
         self._emit("status", {
-            "summary": f"skill '{skill_key}' loaded and broadcast to all agents"
+            "summary": f"skill loaded: {skill_name}" + (f" ({load_source})" if load_source and load_source != "manual" else ""),
         })
 
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
