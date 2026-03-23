@@ -652,6 +652,9 @@ SUPPORTED_UI_LANGUAGES = [
 ]
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 DEFAULT_UI_LANGUAGE = "zh-CN"
+UI_STYLE_CHOICES = ("trad", "neo")
+UI_STYLE_LABELS = {"trad": "Trad", "neo": "Neo"}
+DEFAULT_UI_STYLE = "neo"
 DEFAULT_WEB_UI_DIR = "./web_UI"
 DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
 WEB_UI_REQUIRED_FILES = (
@@ -740,6 +743,16 @@ CODE_PREVIEW_EXTS = {
     ".kt",
     ".kts",
     ".scala",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".stylus",
+    ".pcss",
+    ".postcss",
+    ".xhtml",
+    ".astro",
     ".sh",
     ".bash",
     ".zsh",
@@ -803,6 +816,8 @@ CODE_PREVIEW_FILENAMES = {
     "rakefile",
     "pipfile",
     "requirements.txt",
+    "go.mod",
+    "go.work",
 }
 MEDIA_CAPABILITY_KEYS = {
     "input_image",
@@ -987,6 +1002,26 @@ def normalize_ui_language(raw: str | None) -> str:
     if mapped and mapped in UI_LANGUAGE_LABELS:
         return mapped
     return DEFAULT_UI_LANGUAGE
+
+
+def normalize_ui_style(raw: str | None) -> str:
+    key = str(raw or "").strip().lower().replace("-", "_")
+    aliases = {
+        "neo": "neo",
+        "modern": "neo",
+        "new": "neo",
+        "cards": "neo",
+        "card": "neo",
+        "trad": "trad",
+        "traditional": "trad",
+        "classic": "trad",
+        "legacy": "trad",
+        "old": "trad",
+    }
+    mapped = aliases.get(key)
+    if mapped in UI_STYLE_CHOICES:
+        return mapped
+    return DEFAULT_UI_STYLE
 
 
 def supported_ui_languages_payload() -> list[dict]:
@@ -1194,6 +1229,23 @@ def extract_show_upload_list_setting(raw: object) -> bool | None:
         for key in keys:
             if key in section:
                 return _to_bool_like(section.get(key), default=False)
+    return None
+
+
+def extract_ui_style_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = ("UI_Style", "ui_style", "uiStyle", "style_mode", "chat_ui_style")
+    for key in keys:
+        if key in raw:
+            return normalize_ui_style(str(raw.get(key) or ""))
+    for section_key in ("web_ui", "ui", "frontend"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_ui_style(str(section.get(key) or ""))
     return None
 
 
@@ -11000,33 +11052,33 @@ class SessionState:
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
         self._blackboard_touch()
-        # 2. Inject skill into agent context (full content) — NOT into user-visible messages
+        # 2. Inject full skill content into messages (model needs it to follow instructions)
+        #    but mark it so the frontend renders only a compact card
         skill_desc = str(skill_row.get("description", "-")).strip()
-        agent_inject_msg = (
+        inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
             f"A skill has been loaded. Follow its instructions precisely.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
-        # User-visible message: concise one-line notification only
-        user_notify_msg = (
-            f"[skill loaded: {skill_name}] {trim(skill_desc, 120)}"
-        )
+        # UI display text: concise format that matches frontend's skill_loaded card regex
+        ui_display = f"[skill loaded: {skill_name}] {trim(skill_desc, 200)}"
         self.messages.append(
             {
                 "role": "user",
-                "content": user_notify_msg,
+                "content": inject_msg,
                 "ts": now_ts(),
                 "agent_role": "shared",
                 "_skill_notify": True,
+                "_ui_text": ui_display,
             }
         )
         self.messages = self.messages[-400:]
-        # Full skill content goes only to agent_messages (internal context)
+        # Also inject into agent_messages for multi-agent mode
         self.agent_messages.append(
             {
                 "role": "user",
-                "content": agent_inject_msg,
+                "content": inject_msg,
                 "ts": now_ts(),
                 "agent_role": "shared",
             }
@@ -11365,7 +11417,8 @@ class SessionState:
             return
         prep = self._prepare_loaded_skills_for_goal(goal, trigger=trigger)
         already_loaded = prep.get("loaded", {})
-        if isinstance(already_loaded, dict) and len(already_loaded) >= 3 and not bool(prep.get("goal_changed", False)):
+        # Allow up to 5 concurrent non-conflicting skills for complex tasks
+        if isinstance(already_loaded, dict) and len(already_loaded) >= 5 and not bool(prep.get("goal_changed", False)):
             return
         goal_low = goal.lower()
         # Build skill catalog
@@ -11445,18 +11498,129 @@ class SessionState:
                                 pass
                 threading.Thread(target=_deferred_llm_pickup, daemon=True).start()
 
-        # --- Load matched skills ---
+        # --- Load matched skills: multi-skill with conflict detection ---
+        # Filter out infrastructure/recovery skills that shouldn't be auto-triggered
+        _INFRA_SKILL_PATTERNS = {
+            "execution-degradation", "context-management", "context-recall",
+            "skill-creator", "skills_gen", "agent-builder",
+        }
+        task_skills: list[str] = []
+        infra_skills: list[str] = []
+        for name_str in matched_names[:6]:
+            name_low = str(name_str or "").strip().lower()
+            is_infra = any(pat in name_low for pat in _INFRA_SKILL_PATTERNS)
+            if is_infra:
+                infra_skills.append(name_str)
+            else:
+                task_skills.append(name_str)
+        if not task_skills:
+            return
+        # Detect conflicts among candidate skills before loading
+        to_load: list[str] = []
+        conflicts: list[tuple[str, str, str]] = []  # (skill_a, skill_b, reason)
+        for candidate in task_skills:
+            # Check conflict with already-loaded skills
+            conflict_with = self._detect_skill_conflict(candidate, already_loaded)
+            if conflict_with:
+                conflicts.append((candidate, conflict_with[0], conflict_with[1]))
+                continue
+            # Check conflict with skills we're about to load
+            conflict_with_pending = None
+            for pending in to_load:
+                reason = self._check_skill_pair_conflict(candidate, pending)
+                if reason:
+                    conflict_with_pending = (pending, reason)
+                    break
+            if conflict_with_pending:
+                conflicts.append((candidate, conflict_with_pending[0], conflict_with_pending[1]))
+                continue
+            to_load.append(candidate)
+        # Load all non-conflicting skills
         loaded_count = 0
-        for name_str in matched_names[:3]:
+        loaded_names: list[str] = []
+        for name_str in to_load:
             if isinstance(already_loaded, dict) and any(name_str in k for k in already_loaded):
                 continue
             result = self._load_skill_with_cache(name_str, load_source=f"auto:{trigger or 'discovery'}")
             if result and not str(result).startswith("Error:"):
                 loaded_count += 1
+                loaded_names.append(name_str)
+        # If conflicts found, emit to frontend for user decision
+        if conflicts:
+            conflict_details = []
+            for skill_a, skill_b, reason in conflicts[:3]:
+                conflict_details.append({"blocked": skill_a, "conflicts_with": skill_b, "reason": reason})
+            self._emit("skill_conflict", {
+                "loaded": loaded_names,
+                "conflicts": conflict_details,
+                "summary": (
+                    f"Skill conflict detected: "
+                    + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
+                    + ". Please choose which to keep."
+                ),
+            })
         if loaded_count > 0:
             self._emit("status", {
-                "summary": f"skill auto-discovery: {loaded_count} skill(s) loaded ({trigger})"
+                "summary": f"skills loaded: {', '.join(loaded_names)}" + (
+                    f" | conflicts deferred to user: {', '.join(c[0] for c in conflicts[:3])}" if conflicts else ""
+                ) + (f" ({trigger})" if trigger else ""),
             })
+
+    def _detect_skill_conflict(self, candidate: str, loaded: dict) -> tuple[str, str] | None:
+        """Check if candidate skill conflicts with any already-loaded skill.
+        Returns (conflicting_skill_key, reason) or None."""
+        if not isinstance(loaded, dict) or not loaded:
+            return None
+        for skill_key, row in loaded.items():
+            if not isinstance(row, dict):
+                continue
+            reason = self._check_skill_pair_conflict(candidate, str(row.get("skill_name", skill_key)))
+            if reason:
+                return (str(row.get("skill_name", skill_key)), reason)
+        return None
+
+    def _check_skill_pair_conflict(self, skill_a: str, skill_b: str) -> str:
+        """Check if two skills conflict (overlapping functionality).
+        Returns conflict reason string, or empty string if no conflict."""
+        a_low = str(skill_a or "").strip().lower()
+        b_low = str(skill_b or "").strip().lower()
+        if not a_low or not b_low or a_low == b_low:
+            return ""
+        # Define conflict groups: skills in the same group are mutually exclusive
+        _CONFLICT_GROUPS = [
+            # PDF processors
+            ({"pdf", "kimi-pdf", "minimax-pdf"}, "PDF processing"),
+            # Word/DOCX processors
+            ({"docx", "kimi-docx", "minimax-docx"}, "Word document processing"),
+            # Excel/XLSX processors
+            ({"xlsx", "kimi-xlsx", "minimax-xlsx"}, "Excel/spreadsheet processing"),
+            # PPT/PPTX processors
+            ({"ppt", "ppt-master", "pptx", "academic-pptx", "slide-making-skill"}, "Presentation/PPT processing"),
+            # Research orchestrators
+            ({"deep-research-orchestrator", "research-orchestrator-pro"}, "Research orchestration"),
+            # Frontend design
+            ({"frontend-design", "frontend-composition-algorithm", "canvas-design", "web-artifacts-builder"}, "Frontend/web design"),
+        ]
+        # Normalize: strip common prefixes/suffixes for matching
+        def _norm(name: str) -> set[str]:
+            tokens = set()
+            tokens.add(name)
+            # Strip provider prefix
+            if ":" in name:
+                tokens.add(name.split(":", 1)[-1])
+            # Strip common prefixes
+            for prefix in ("local:", "ext-", "minimax-", "kimi-"):
+                if name.startswith(prefix):
+                    tokens.add(name[len(prefix):])
+            return tokens
+        a_tokens = _norm(a_low)
+        b_tokens = _norm(b_low)
+        for group, reason in _CONFLICT_GROUPS:
+            a_in = bool(a_tokens & group)
+            b_in = bool(b_tokens & group)
+            if a_in and b_in:
+                return reason
+        return ""
 
     def _keyword_match_skills(self, goal_low: str, skill_catalog: list[dict]) -> list[str]:
         """Metadata-driven keyword skill matching — no hardcoded mappings.
@@ -11537,6 +11701,7 @@ class SessionState:
         """Unified skill awareness hint for any system prompt. Reads blackboard loaded_skills."""
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
+        skill_count = len(self.skills.skills) if hasattr(self.skills, "skills") else 0
         if isinstance(loaded, dict) and loaded:
             skill_names = []
             for skill_key, row in list(loaded.items())[:5]:
@@ -11550,11 +11715,20 @@ class SessionState:
                 "Follow loaded skill instructions precisely. "
                 "If a skill is pending-entry, you must concretely enter that skill chain by reading an entrypoint "
                 "or using a skill resource/script before claiming completion. "
-                "Use load_skill to load additional skills if needed. "
+                f"DYNAMIC SKILL CHAIN: You have {skill_count} skills available. You can load MULTIPLE skills simultaneously "
+                "to form a complete workflow chain (e.g., pdf + ppt for analyzing a paper then making slides). "
+                "If you discover the current task needs a capability not covered by loaded skills, "
+                "call load_skill immediately — don't try to work around missing skills. "
+                "Skills are automatically re-evaluated when you complete each todo step. "
             )
         return (
-            "Use list_skills to discover available skills for your task, then load_skill to load them. "
-            "Skills provide domain-specific workflows for professional outputs. "
+            f"SKILL SYSTEM: {skill_count} skills are available for specialized workflows. "
+            "IMPORTANT: Before starting any professional output task (documents, presentations, data analysis, "
+            "code generation, research, etc.), call list_skills to check what skills exist, "
+            "then load_skill to activate ALL skills your task chain requires. "
+            "You can load multiple complementary skills (e.g., pdf + xlsx for data extraction). "
+            "Common skills: ppt (presentations), pdf (PDF creation/processing), docx (Word documents), "
+            "xlsx (Excel/spreadsheets), code-review, research, frontend-design, etc. "
         )
 
     def _refresh_runtime_code_reference(self, text: str):
@@ -20637,10 +20811,16 @@ class SessionState:
             "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
             "all done->finish. Set is_mandatory=true when concrete execution is required. "
             "Role capabilities: "
-            "Explorer=read-only (bash/read_file/search/blackboard, NO write_file/edit_file); "
-            "Developer=all tools (write_file/edit_file/bash/read_file/etc); "
+            "Explorer=read-only (bash/read_file/search/blackboard, TodoWrite, NO write_file/edit_file); "
+            "Developer=all tools (write_file/edit_file/bash/read_file/TodoWrite/load_skill/etc); "
             f"{'Reviewer=DEBUG MODE (bash/read_file/write_file/edit_file/finish_task — can fix bugs directly). ' if bool(self.reviewer_debug_mode) else 'Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). '}"
             f"{'NEVER delegate file-writing tasks to Explorer. Reviewer is in debug mode and can fix bugs. ' if bool(self.reviewer_debug_mode) else 'NEVER delegate file-writing tasks to Explorer or Reviewer. '}"
+            "TODO & SKILL CHAIN MANAGEMENT: "
+            "When delegating to Developer, ALWAYS instruct them to update TodoWrite after completing each step. "
+            "This triggers automatic skill re-evaluation — the system loads new skills for the next phase. "
+            "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), ensure each phase is a separate delegation "
+            "with explicit instruction to mark the previous step completed via TodoWrite before starting the next. "
+            "If the task needs skills not yet loaded, instruct Developer to call load_skill first. "
             f"{coding_hint}"
             f"{project_todo_hint}"
             f"{plan_context}"
@@ -23024,6 +23204,12 @@ class SessionState:
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
+            "TODO TRACKING (mandatory): "
+            "After completing each logical step, call TodoWrite to update progress — "
+            "mark completed items as 'completed' and set the next item to 'in_progress'. "
+            "This is critical because skill re-evaluation is triggered on step completion. "
+            "If the task has multiple phases (e.g., analyze PDF then make PPT), "
+            "each phase must be a separate todo item so the right skills get loaded for each phase. "
             "EDIT METHODOLOGY (follow strictly): "
             "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
             "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
@@ -23986,10 +24172,29 @@ class SessionState:
                     for item in items:
                         if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
                             item["owner"] = str(role_key or "developer")
-                return self.todo.update(items)
-            return self.todo.update(args["items"])
+                result = self.todo.update(items)
+            else:
+                result = self.todo.update(args["items"])
+            # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
+            # This fires in ALL modes (single/sync/plan) when developer writes todos
+            try:
+                new_items = args.get("items", [])
+                if isinstance(new_items, list) and any(
+                    isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
+                    for it in new_items
+                ):
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")
+            except Exception:
+                pass
+            return result
         if name == "TodoWriteRescue":
-            return self._todo_write_rescue(args)
+            result = self._todo_write_rescue(args)
+            # Also recheck skills on rescue write (likely a recovery situation)
+            try:
+                self._refresh_loaded_skills_for_execution_focus(trigger="todo-rescue")
+            except Exception:
+                pass
+            return result
         if name in {"finish_task", "finish_current_task", "mark_done"}:
             skill_blocker = self._skill_chain_completion_blocker(context="finish")
             if skill_blocker:
@@ -27608,6 +27813,9 @@ class SessionState:
                     and all(str(name or "").strip().lower() in {"route_to_next_agent", "routetonext_agent"} for name in tool_names)
                 )
                 text = msg.get("content", "")
+                # For skill-loaded messages: model sees full content, UI sees compact card
+                if isinstance(msg, dict) and msg.get("_skill_notify") and msg.get("_ui_text"):
+                    text = str(msg.get("_ui_text", ""))
                 if (not str(text or "").strip()) and manager_route_tool_only:
                     continue
                 if not text and tool_names:
@@ -29016,9 +29224,12 @@ window.MathJax={
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 :root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
+body[data-ui-style="trad"]{--bg:#f5f7fb;--card:#ffffffee;--line:#d7deea;--muted:#64748b}
 *{box-sizing:border-box}
 body{margin:0;font-family:'Space Grotesk','Noto Sans SC',sans-serif;background:var(--bg);color:var(--fg)}
+body[data-ui-style="trad"]{font-family:'Noto Sans SC','Segoe UI',sans-serif}
 .bg-layer{position:fixed;inset:0;background:radial-gradient(1200px 520px at 0% 0%,#dbe9ff 0,#f3f5f8 55%),radial-gradient(1000px 520px at 100% 100%,#d9fff2 0,#f3f5f8 55%);z-index:-1}
+body[data-ui-style="trad"] .bg-layer{background:linear-gradient(180deg,#f8fbff 0%,#eef3fb 100%)}
 .app{max-width:1540px;margin:0 auto;padding:20px}
 header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
 h1{margin:0;font-size:1.8rem}
@@ -29026,6 +29237,7 @@ header p{margin:.2rem 0 0;color:var(--muted)}
 .actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
 button,a{border:1px solid var(--line);padding:10px 14px;border-radius:12px;background:#fff;color:var(--fg);text-decoration:none;cursor:pointer;font-weight:600;transition:transform .15s ease,box-shadow .15s ease}
 button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27,45,.08)}
+body[data-ui-style="trad"] button,body[data-ui-style="trad"] a{border-radius:10px}
 #sendBtn,#newSessionBtn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0}
 .subtle{background:#f6f8fa}
 .export-item:hover{background:#f0f4f8}
@@ -29039,6 +29251,7 @@ button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27
 .stat .v{font-size:1.25rem;font-weight:700}
 main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
 .panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;height:100%}
+body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
@@ -29109,7 +29322,16 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-agent-badge.reviewer{background:#fff3d4;border-color:#efd692;color:#8a6213}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
-.manager-delegate-card{border:1px solid #d7bbff;background:#f8f3ff;border-radius:10px;padding:10px}
+.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
+.msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
+.msg.agent-reviewer .msg-agent-shell{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
+.msg.agent-manager .msg-agent-shell{background:linear-gradient(180deg,#fcfaff 0%,#f2eaff 100%);border-color:#dcc6ff}
+.msg.agent-planner .msg-agent-shell{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
+.msg-agent-shell .msg-agent-badge{margin:0 0 10px 0}
+.msg-agent-shell .msg-thinking{margin-top:10px}
+.manager-delegate-card{border:1px solid #d7bbff;background:linear-gradient(180deg,#fcf8ff 0%,#f3ebff 100%);border-radius:12px;padding:10px;box-shadow:0 8px 20px rgba(109,67,184,.08)}
 .manager-delegate-head{font-weight:800;font-size:.86rem;color:#5a2fa6}
 .manager-delegate-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0 8px}
 .manager-delegate-pills{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 8px}
@@ -29121,7 +29343,7 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .agent-control-head{font-size:.78rem;font-weight:700;color:#38557a;margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em}
 .agent-control-pills{display:flex;flex-wrap:wrap;gap:6px}
 .agent-control-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:700;border:1px solid #cfdaeb;background:#eef4ff;color:#2d4f77}
-.agent-bus-card{border:1px solid #cde0f7;background:#f4f8ff;border-radius:10px;padding:9px}
+.agent-bus-card{border:1px solid #cde0f7;background:linear-gradient(180deg,#f9fbff 0%,#edf4ff 100%);border-radius:12px;padding:9px;box-shadow:0 8px 20px rgba(47,87,149,.08)}
 .agent-bus-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px}
 .agent-bus-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;border:1px solid #d0dbe8;background:#f5f8fd;color:#2f4765}
 .agent-bus-pill.explorer{background:#ffe6f0;border-color:#ffbdd5;color:#9b275e}
@@ -29151,11 +29373,62 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-md .md-table th{background:#f5f8fc;font-weight:700}
 .msg-md a{color:#1f5cc4;text-decoration:underline}
 .msg-md a:hover{color:#17479b}
+.msg-md .md-callout{display:flex;flex-direction:column;gap:6px;margin:.55rem 0;padding:10px 12px;border-radius:12px;border:1px solid #d9e4f1;background:linear-gradient(180deg,#f8fbff,#eef5ff)}
+.msg-md .md-callout-head{font-size:.72rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#355071}
+.msg-md .md-callout-body{font-size:.88rem;line-height:1.5;color:#1f314b;white-space:normal}
+.msg-md .md-callout.reminder{border-color:#bfd4ff;background:linear-gradient(180deg,#f7fbff,#edf4ff)}
+.msg-md .md-callout.warning{border-color:#ffd69b;background:linear-gradient(180deg,#fff9ef,#fff1d8)}
+.msg-md .md-callout.notice{border-color:#cfe3d8;background:linear-gradient(180deg,#f5fcf7,#ebf8ef)}
+.msg-md .md-callout.instruction{border-color:#d9ccff;background:linear-gradient(180deg,#faf7ff,#f1ebff)}
+body[data-ui-style="trad"] .msg{border-radius:10px}
+body[data-ui-style="trad"] .msg-agent-badge{border-radius:8px;padding:3px 8px}
+body[data-ui-style="trad"] .msg-agent-shell,body[data-ui-style="trad"] .manager-delegate-card,body[data-ui-style="trad"] .agent-bus-card,body[data-ui-style="trad"] .msg-event-card{border-radius:11px;box-shadow:none}
+body[data-ui-style="trad"] .msg-agent-shell{background:#ffffff;border-color:#d8e2ef}
+body[data-ui-style="trad"] .msg.agent-explorer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-explorer .msg-event-card{background:#fff5fa;border-color:#f1cada}
+body[data-ui-style="trad"] .msg.agent-developer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-developer .msg-event-card{background:#f4fbf4;border-color:#cfe3d3}
+body[data-ui-style="trad"] .msg.agent-reviewer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-reviewer .msg-event-card{background:#fff9eb;border-color:#e8d7a4}
+body[data-ui-style="trad"] .msg.agent-manager .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-manager .msg-event-card{background:#f8f3ff;border-color:#dac8f6}
+body[data-ui-style="trad"] .msg.agent-planner .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-planner .msg-event-card{background:#fff3ef;border-color:#efcfc4}
+body[data-ui-style="trad"] .manager-delegate-card{background:#f8f3ff;border-color:#dac8f6}
+body[data-ui-style="trad"] .agent-bus-card{background:#f7faff;border-color:#d7e3f1}
+body[data-ui-style="trad"] .msg-event-pill{border-radius:8px;font-weight:600}
+body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-thinking{margin-top:8px;border:1px solid #d8dde6;background:#f1f3f7;border-radius:8px;padding:6px 8px}
 .msg-thinking-label{font-size:.7rem;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
 .msg-thinking pre{margin:0;max-height:140px;overflow:auto;font-size:.72rem;line-height:1.35;color:#4b5563;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
 .msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
 .msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
+.msg.msg-event-wrap{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg.agent-explorer .msg-event-card{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
+.msg.agent-developer .msg-event-card{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
+.msg.agent-reviewer .msg-event-card{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
+.msg.agent-manager .msg-event-card{background:linear-gradient(180deg,#fcfaff 0%,#f2eaff 100%);border-color:#dcc6ff}
+.msg.agent-planner .msg-event-card{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
+.msg-event-card-skill{background:linear-gradient(180deg,#f9fcff 0%,#edf6ff 100%);border-color:#cadff7}
+.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.msg-event-title{font-size:.94rem;font-weight:800;line-height:1.2;color:#1f314b}
+.msg-event-sub{margin-top:3px;font-size:.76rem;line-height:1.4;color:#627790}
+.msg-event-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
+.msg-event-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.72rem;font-weight:700;line-height:1}
+.msg-event-pill.ok{background:#ebf8ef;border-color:#c7e6ce;color:#21623a}
+.msg-event-pill.warn{background:#fff4e3;border-color:#ffd5a4;color:#8a4b08}
+.msg-event-pill.error{background:#fff0f0;border-color:#f1c5c5;color:#a12d2d}
+.msg-event-pill.info{background:#eef4ff;border-color:#d7e3f2;color:#355071}
+.msg-event-pill.live{background:#eefaf8;border-color:#bfe8df;color:#0f6e62}
+.msg-event-pill.neutral{background:#f5f8fd;border-color:#dce5f1;color:#55687f}
+.msg-event-pill.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px}
+.msg-event-cell{padding:9px 10px;border:1px solid #e1eaf5;border-radius:12px;background:rgba(255,255,255,.78)}
+.msg-event-label{font-size:.68rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#6a7e96;margin-bottom:4px}
+.msg-event-value{font-size:.83rem;line-height:1.45;color:#1f314b;white-space:pre-wrap;word-break:break-word}
+.msg-event-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem}
+.msg-event-body{display:grid;gap:10px}
+.msg-event-note{font-size:.79rem;line-height:1.48;color:#60748d}
+.msg-event-tool-grid{display:flex;flex-wrap:wrap;gap:8px}
+.msg-run-dot{width:8px;height:8px;border-radius:999px;background:#13b8a6;box-shadow:0 0 0 0 rgba(19,184,166,.38);animation:msgRunPulse 1.6s ease-out infinite}
+@keyframes msgRunPulse{0%{box-shadow:0 0 0 0 rgba(19,184,166,.36)}70%{box-shadow:0 0 0 9px rgba(19,184,166,0)}100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}}
+@media (prefers-reduced-motion:reduce){.msg-run-dot{animation:none}}
 .msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
@@ -29344,10 +29617,10 @@ const RENDER={queue:[],raf:0,canvas:null,ctx:null,lastSeq:0,lastPaintAt:0,lastMe
 const CODE_PREVIEW_VIRT_THRESHOLD=1800;
 const CODE_PREVIEW_VIRT_EST_ROW_PX=24;
 const CODE_PREVIEW_VIRT_OVERSCAN=160;
-const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties','.f','.f90','.f95','.f03','.f08','.for','.fpp','.hs','.lhs','.erl','.hrl','.ex','.exs','.ml','.mli','.vhd','.vhdl','.v','.sv','.asm','.s','.proto','.tf','.tfvars','.prisma','.graphql','.gql','.zig','.nim','.jl','.cr','.d','.clj','.cljs','.cljc','.lisp','.cl','.el','.rkt','.pas','.pp','.wgsl','.glsl','.hlsl','.groovy','.cmake','.dockerfile']);
-const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt']);
-const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini','.f':'fortran','.f90':'fortran','.f95':'fortran','.f03':'fortran','.f08':'fortran','.for':'fortran','.fpp':'fortran','.hs':'haskell','.lhs':'haskell','.erl':'erlang','.hrl':'erlang','.ex':'elixir','.exs':'elixir','.ml':'ocaml','.mli':'ocaml','.vhd':'vhdl','.vhdl':'vhdl','.v':'verilog','.sv':'verilog','.asm':'asm','.s':'asm','.proto':'protobuf','.tf':'hcl','.tfvars':'hcl','.zig':'zig','.nim':'nim','.jl':'julia','.cr':'crystal','.d':'dlang','.clj':'clojure','.cljs':'clojure','.cljc':'clojure','.lisp':'lisp','.cl':'lisp','.el':'lisp','.rkt':'racket','.pas':'pascal','.pp':'pascal','.wgsl':'wgsl','.glsl':'glsl','.hlsl':'hlsl','.groovy':'groovy','.cmake':'cmake','.dockerfile':'shell','.prisma':'prisma','.graphql':'graphql','.gql':'graphql'};
-const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini'};
+const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.css','.scss','.sass','.less','.styl','.stylus','.pcss','.postcss','.xhtml','.astro','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties','.f','.f90','.f95','.f03','.f08','.for','.fpp','.hs','.lhs','.erl','.hrl','.ex','.exs','.ml','.mli','.vhd','.vhdl','.v','.sv','.asm','.s','.proto','.tf','.tfvars','.prisma','.graphql','.gql','.zig','.nim','.jl','.cr','.d','.clj','.cljs','.cljc','.lisp','.cl','.el','.rkt','.pas','.pp','.wgsl','.glsl','.hlsl','.groovy','.cmake','.dockerfile']);
+const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt','go.mod','go.work']);
+const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.html':'html','.htm':'html','.xhtml':'html','.astro':'html','.css':'css','.scss':'css','.sass':'css','.less':'css','.styl':'css','.stylus':'css','.pcss':'css','.postcss':'css','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini','.f':'fortran','.f90':'fortran','.f95':'fortran','.f03':'fortran','.f08':'fortran','.for':'fortran','.fpp':'fortran','.hs':'haskell','.lhs':'haskell','.erl':'erlang','.hrl':'erlang','.ex':'elixir','.exs':'elixir','.ml':'ocaml','.mli':'ocaml','.vhd':'vhdl','.vhdl':'vhdl','.v':'verilog','.sv':'verilog','.asm':'asm','.s':'asm','.proto':'protobuf','.tf':'hcl','.tfvars':'hcl','.zig':'zig','.nim':'nim','.jl':'julia','.cr':'crystal','.d':'dlang','.clj':'clojure','.cljs':'clojure','.cljc':'clojure','.lisp':'lisp','.cl':'lisp','.el':'lisp','.rkt':'racket','.pas':'pascal','.pp':'pascal','.wgsl':'wgsl','.glsl':'glsl','.hlsl':'hlsl','.groovy':'groovy','.cmake':'cmake','.dockerfile':'shell','.prisma':'prisma','.graphql':'graphql','.gql':'graphql'};
+const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini','go.mod':'go','go.work':'go'};
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
 const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library']),fortran:new Set(['program','module','subroutine','function','end','use','implicit','none','integer','real','character','logical','complex','dimension','allocatable','intent','in','out','inout','do','if','then','else','elseif','endif','call','return','write','read','format','type','class','interface','contains','allocate','deallocate']),haskell:new Set(['module','where','import','qualified','as','hiding','data','type','newtype','class','instance','deriving','if','then','else','case','of','let','in','do','return','where','infixl','infixr','infix','forall','default']),erlang:new Set(['module','export','import','if','case','of','end','receive','after','when','fun','try','catch','throw','begin','andalso','orelse','not','band','bor','bxor','bnot','bsl','bsr']),elixir:new Set(['def','defp','defmodule','defmacro','defstruct','defprotocol','defimpl','if','else','unless','case','cond','do','end','fn','when','with','for','raise','rescue','import','use','alias','require']),ocaml:new Set(['let','in','if','then','else','match','with','fun','function','type','module','struct','sig','end','open','val','rec','and','or','not','begin','do','done','for','while','to','downto','mutable','ref']),vhdl:new Set(['library','use','entity','architecture','is','of','begin','end','signal','variable','constant','port','in','out','inout','process','if','then','else','elsif','case','when','for','generate','component','generic','map']),verilog:new Set(['module','endmodule','input','output','inout','wire','reg','assign','always','begin','end','if','else','case','endcase','for','while','parameter','localparam','initial','posedge','negedge','task','function']),asm:new Set([]),protobuf:new Set(['syntax','package','import','option','message','enum','service','rpc','returns','repeated','optional','required','map','oneof','reserved','extend']),hcl:new Set(['resource','data','variable','output','locals','module','provider','terraform','backend','required_providers','for_each','count','depends_on','lifecycle','dynamic','content','block']),zig:new Set(['const','var','fn','pub','return','if','else','for','while','break','continue','switch','struct','enum','union','error','defer','errdefer','try','catch','import','comptime','inline','test','unreachable']),nim:new Set(['proc','func','method','type','var','let','const','if','elif','else','case','of','for','while','break','continue','return','import','include','from','object','ref','ptr','template','macro','iterator','yield','discard']),julia:new Set(['function','end','if','elseif','else','for','while','break','continue','return','module','using','import','export','struct','mutable','abstract','type','const','let','do','begin','try','catch','finally','throw','macro','quote']),crystal:new Set(['def','class','module','struct','enum','if','elsif','else','unless','case','when','while','until','for','do','end','return','yield','begin','rescue','ensure','require','include','extend','abstract','private','protected']),dlang:new Set(['module','import','class','struct','enum','interface','if','else','for','foreach','while','do','switch','case','default','break','continue','return','void','auto','const','immutable','static','public','private','protected','override','template','mixin','alias']),clojure:new Set(['def','defn','defmacro','fn','let','if','cond','case','do','loop','recur','for','doseq','when','when-not','ns','require','use','import','try','catch','throw','finally']),lisp:new Set(['defun','defmacro','defvar','defparameter','defconstant','let','let*','if','cond','case','when','unless','lambda','progn','loop','do','dolist','dotimes','setq','setf','funcall','apply','require','provide']),racket:new Set(['define','lambda','let','let*','letrec','if','cond','case','when','unless','begin','do','for','for/list','for/hash','match','struct','class','require','provide','module','import','export']),pascal:new Set(['program','unit','uses','interface','implementation','begin','end','var','const','type','procedure','function','if','then','else','for','to','downto','while','repeat','until','case','of','with','record','class','array','set','nil']),wgsl:new Set(['fn','var','let','const','struct','if','else','for','while','loop','break','continue','return','switch','case','default','override','enable','type','alias','discard','continuing','fallthrough']),glsl:new Set(['void','float','int','bool','vec2','vec3','vec4','mat2','mat3','mat4','sampler2D','uniform','varying','attribute','in','out','inout','if','else','for','while','do','break','continue','return','struct','const','precision','highp','mediump','lowp']),hlsl:new Set(['float','float2','float3','float4','int','bool','void','struct','cbuffer','Texture2D','SamplerState','if','else','for','while','do','break','continue','return','in','out','inout','uniform','static','const','register','semantic']),prisma:new Set(['model','enum','datasource','generator','type','relation','default','unique','id','map','index','ignore','updatedAt']),graphql:new Set(['type','query','mutation','subscription','input','enum','interface','union','scalar','schema','fragment','on','directive','extend','implements'])};
 S.staticMode=STATIC_UI;
@@ -29505,6 +29778,8 @@ const I18N={
   }
 };
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
+function normalizeUiStyle(raw){const key=String(raw||'').trim().toLowerCase().replace(/-/g,'_');if(['trad','traditional','classic','legacy','old'].includes(key))return'trad';return'neo'}
+function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');if(document.body)document.body.setAttribute('data-ui-style',style);document.documentElement.setAttribute('data-ui-style',style)}
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
@@ -29718,6 +29993,17 @@ function _deltaApplyRuntimeEvent(evt){
     S.snap.live_truncation_tool=String(data.tool||'');
     _deltaAppendActivity(typ,data,ts);
     _deltaScheduleRender({chat:true,boards:true});
+    return{handled:true,needsSnapshot:false};
+  }
+  if(typ==='skill_candidates'){
+    const loaded=String(data.loaded||'').trim();
+    const candidates=Array.isArray(data.candidates)?data.candidates:[];
+    const filtered=Array.isArray(data.infra_filtered)?data.infra_filtered:[];
+    if(loaded||candidates.length){
+      const summary=String(data.summary||'').trim();
+      _deltaAppendActivity('skill_candidates',{loaded,candidates,filtered,summary},ts);
+      _deltaScheduleRender({boards:true});
+    }
     return{handled:true,needsSnapshot:false};
   }
   if(typ==='message'){
@@ -30073,7 +30359,121 @@ function renderInlineMarkdown(raw){
   s=s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g,(_,txt,url)=>`<a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${txt}</a>`);
   return _mathRestore(s,pack.tokens);
 }
-function renderMarkdown(text){const src=String(text||'').replace(/\\r\\n?/g,'\\n');const codeBlocks=[];let body=src.replace(/```([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)```/g,(_,lang,code)=>{const idx=codeBlocks.length;const langTag=String(lang||'').trim();const codeHtml=`<pre class=\"md-code\"><code>${esc(String(code||'').replace(/\\n$/,''))}</code></pre>`;codeBlocks.push(langTag?`<div class=\"md-code-lang\">${esc(langTag)}</div>${codeHtml}`:codeHtml);return `\\u0000CODE${idx}\\u0000`});const lines=body.split('\\n');const out=[];let para=[];let inUl=false;let inOl=false;const flushPara=()=>{if(!para.length)return;out.push(`<p>${renderInlineMarkdown(para.join(' '))}</p>`);para=[]};const closeLists=()=>{if(inUl){out.push('</ul>');inUl=false}if(inOl){out.push('</ol>');inOl=false}};for(let i=0;i<lines.length;i++){const line=String(lines[i]||'');const trimLine=line.trim();if(!trimLine){flushPara();closeLists();continue}if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){flushPara();closeLists();const header=splitTableRow(line);const rows=[];i+=2;while(i<lines.length&&String(lines[i]||'').includes('|')&&String(lines[i]||'').trim()){rows.push(splitTableRow(lines[i]));i+=1}i-=1;const th=header.map(cell=>`<th>${renderInlineMarkdown(cell)}</th>`).join('');const tb=rows.map(r=>`<tr>${r.map(c=>`<td>${renderInlineMarkdown(c)}</td>`).join('')}</tr>`).join('');out.push(`<table class=\"md-table\"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);continue}const hm=trimLine.match(/^(#{1,6})\\s+(.+)$/);if(hm){flushPara();closeLists();const lv=Math.max(1,Math.min(6,hm[1].length));out.push(`<h${lv}>${renderInlineMarkdown(hm[2])}</h${lv}>`);continue}if(/^>\\s?/.test(trimLine)){flushPara();closeLists();out.push(`<blockquote>${renderInlineMarkdown(trimLine.replace(/^>\\s?/,''))}</blockquote>`);continue}const om=trimLine.match(/^\\d+\\.\\s+(.+)$/);if(om){flushPara();if(inUl){out.push('</ul>');inUl=false}if(!inOl){out.push('<ol>');inOl=true}out.push(`<li>${renderInlineMarkdown(om[1])}</li>`);continue}const um=trimLine.match(/^[-*+]\\s+(.+)$/);if(um){flushPara();if(inOl){out.push('</ol>');inOl=false}if(!inUl){out.push('<ul>');inUl=true}out.push(`<li>${renderInlineMarkdown(um[1])}</li>`);continue}para.push(trimLine)}flushPara();closeLists();let html=out.join('');html=html.replace(/\\u0000CODE(\\d+)\\u0000/g,(_,n)=>codeBlocks[Number(n)]||'');return html||'<p></p>'}
+function _mdCalloutLabel(tag){
+  const low=String(tag||'').toLowerCase();
+  if(low==='warning')return 'Warning';
+  if(low==='notice')return 'Notice';
+  if(low==='instruction')return 'Instruction';
+  if(low==='tip')return 'Tip';
+  return 'Reminder';
+}
+function _mdExtractCallouts(src,inlineRenderer){
+  const blocks=[];
+  const text=String(src||'').replace(/<(reminder|warning|notice|tip|instruction)>([\\s\\S]*?)<\\/\\1>/gi,(_,tag,content)=>{
+    const idx=blocks.length;
+    const tone=String(tag||'reminder').toLowerCase();
+    const body=String(content||'').trim();
+    const rendered=body?body.split(/\\n+/).map(line=>inlineRenderer(String(line||'').trim())).join('<br>'):'';
+    blocks.push(`<div class=\"md-callout ${esc(tone)}\"><div class=\"md-callout-head\">${esc(_mdCalloutLabel(tone))}</div><div class=\"md-callout-body\">${rendered}</div></div>`);
+    return `\\u0000CALLOUT${idx}\\u0000`;
+  });
+  return {text,blocks};
+}
+function renderMarkdown(text){
+  const src=String(text||'').replace(/\\r\\n?/g,'\\n');
+  const codeBlocks=[];
+  let body=src.replace(/```([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)```/g,(_,lang,code)=>{
+    const idx=codeBlocks.length;
+    const langTag=String(lang||'').trim();
+    const codeHtml=`<pre class=\"md-code\"><code>${esc(String(code||'').replace(/\\n$/,''))}</code></pre>`;
+    codeBlocks.push(langTag?`<div class=\"md-code-lang\">${esc(langTag)}</div>${codeHtml}`:codeHtml);
+    return `\\u0000CODE${idx}\\u0000`;
+  });
+  const calloutPack=_mdExtractCallouts(body,renderInlineMarkdown);
+  body=calloutPack.text;
+  const lines=body.split('\\n');
+  const out=[];
+  let para=[];
+  let inUl=false;
+  let inOl=false;
+  const flushPara=()=>{
+    if(!para.length)return;
+    out.push(`<p>${renderInlineMarkdown(para.join(' '))}</p>`);
+    para=[];
+  };
+  const closeLists=()=>{
+    if(inUl){out.push('</ul>');inUl=false}
+    if(inOl){out.push('</ol>');inOl=false}
+  };
+  for(let i=0;i<lines.length;i++){
+    const line=String(lines[i]||'');
+    const trimLine=line.trim();
+    if(!trimLine){
+      flushPara();
+      closeLists();
+      continue;
+    }
+    const calloutMatch=trimLine.match(/^\\u0000CALLOUT(\\d+)\\u0000$/);
+    if(calloutMatch){
+      flushPara();
+      closeLists();
+      out.push(calloutPack.blocks[Number(calloutMatch[1])]||'');
+      continue;
+    }
+    if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){
+      flushPara();
+      closeLists();
+      const header=splitTableRow(line);
+      const rows=[];
+      i+=2;
+      while(i<lines.length&&String(lines[i]||'').includes('|')&&String(lines[i]||'').trim()){
+        rows.push(splitTableRow(lines[i]));
+        i+=1;
+      }
+      i-=1;
+      const th=header.map(cell=>`<th>${renderInlineMarkdown(cell)}</th>`).join('');
+      const tb=rows.map(r=>`<tr>${r.map(c=>`<td>${renderInlineMarkdown(c)}</td>`).join('')}</tr>`).join('');
+      out.push(`<table class=\"md-table\"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      continue;
+    }
+    const hm=trimLine.match(/^(#{1,6})\\s+(.+)$/);
+    if(hm){
+      flushPara();
+      closeLists();
+      const lv=Math.max(1,Math.min(6,hm[1].length));
+      out.push(`<h${lv}>${renderInlineMarkdown(hm[2])}</h${lv}>`);
+      continue;
+    }
+    if(/^>\\s?/.test(trimLine)){
+      flushPara();
+      closeLists();
+      out.push(`<blockquote>${renderInlineMarkdown(trimLine.replace(/^>\\s?/,''))}</blockquote>`);
+      continue;
+    }
+    const om=trimLine.match(/^\\d+\\.\\s+(.+)$/);
+    if(om){
+      flushPara();
+      if(inUl){out.push('</ul>');inUl=false}
+      if(!inOl){out.push('<ol>');inOl=true}
+      out.push(`<li>${renderInlineMarkdown(om[1])}</li>`);
+      continue;
+    }
+    const um=trimLine.match(/^[-*+]\\s+(.+)$/);
+    if(um){
+      flushPara();
+      if(inOl){out.push('</ol>');inOl=false}
+      if(!inUl){out.push('<ul>');inUl=true}
+      out.push(`<li>${renderInlineMarkdown(um[1])}</li>`);
+      continue;
+    }
+    para.push(trimLine);
+  }
+  flushPara();
+  closeLists();
+  let html=out.join('');
+  html=html.replace(/\\u0000CODE(\\d+)\\u0000/g,(_,n)=>codeBlocks[Number(n)]||'');
+  return html||'<p></p>';
+}
 function _mdCacheSet(key,html){const k=String(key||'');if(!k)return;MD_CACHE.set(k,String(html||''));if(MD_CACHE.size>MD_CACHE_MAX){const first=MD_CACHE.keys().next().value;MD_CACHE.delete(first)}}
 function _mdWorkerCleanupStale(){const now=Date.now();const pending=S.mdPending||{};for(const [id,row] of Object.entries(pending)){const ts=Number(row?.ts||0);if(!ts||now-ts>MARKDOWN_WORKER_REQ_TTL_MS){delete pending[id]}}}
 function _mdWorkerEnsure(){
@@ -30103,6 +30503,26 @@ function isTableSeparator(line){
   if(!cells.length)return false;
   return cells.every(cell=>/^:?-{3,}:?$/.test(cell));
 }
+function calloutLabel(tag){
+  const low=String(tag||'').toLowerCase();
+  if(low==='warning')return 'Warning';
+  if(low==='notice')return 'Notice';
+  if(low==='instruction')return 'Instruction';
+  if(low==='tip')return 'Tip';
+  return 'Reminder';
+}
+function extractCallouts(src){
+  const blocks=[];
+  const text=String(src||'').replace(/<(reminder|warning|notice|tip|instruction)>([\\s\\S]*?)<\\/\\1>/gi,(_,tag,content)=>{
+    const idx=blocks.length;
+    const tone=String(tag||'reminder').toLowerCase();
+    const body=String(content||'').trim();
+    const rendered=body?body.split(/\\n+/).map(line=>inline(String(line||'').trim())).join('<br>'):'';
+    blocks.push('<div class=\"md-callout '+esc(tone)+'\"><div class=\"md-callout-head\">'+esc(calloutLabel(tone))+'</div><div class=\"md-callout-body\">'+rendered+'</div></div>');
+    return '\\u0000CALLOUT'+idx+'\\u0000';
+  });
+  return {text,blocks};
+}
 function render(text){
   const src=String(text||'').replace(/\\r\\n?/g,'\\n');
   const bt=String.fromCharCode(96);
@@ -30115,6 +30535,8 @@ function render(text){
     codeBlocks.push(tag?('<div class="md-code-lang">'+esc(tag)+'</div>'+html):html);
     return '\\u0000CODE'+idx+'\\u0000';
   });
+  const calloutPack=extractCallouts(body);
+  body=calloutPack.text;
   const lines=body.split('\\n');
   const out=[];
   let para=[];
@@ -30126,6 +30548,8 @@ function render(text){
     const line=String(lines[i]||'');
     const t=line.trim();
     if(!t){flush();close();continue}
+    const calloutMatch=t.match(/^\\u0000CALLOUT(\\d+)\\u0000$/);
+    if(calloutMatch){flush();close();out.push(calloutPack.blocks[Number(calloutMatch[1])]||'');continue}
     if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){
       flush();
       close();
@@ -30822,8 +31246,58 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','file_patch','upload','command','live_truncation','live_run_notice','skill_loaded']);
+function _chatVirtFormatDurationMs(ms){
+  const n=Number(ms||0);
+  if(!Number.isFinite(n)||n<=0)return '';
+  if(n<1000)return `${Math.round(n)}ms`;
+  const sec=n/1000;
+  if(sec<10)return `${sec.toFixed(2)}s`;
+  if(sec<90)return `${sec.toFixed(1)}s`;
+  return `${Math.round(sec)}s`;
+}
+function _chatVirtEventPillHtml(label,tone='neutral',extraCls=''){
+  const txt=String(label||'').trim();
+  if(!txt)return '';
+  const classes=['msg-event-pill'];
+  if(tone)classes.push(String(tone));
+  if(extraCls)classes.push(String(extraCls));
+  const dot=(String(tone||'')==='live')?'<span class="msg-run-dot"></span>':'';
+  return `<span class="${classes.join(' ')}">${dot}${esc(txt)}</span>`;
+}
+function _chatVirtEventCellHtml(label,value,opts){
+  const options=(opts&&typeof opts==='object')?opts:{};
+  if(value===undefined||value===null)return '';
+  const raw=String(value||'');
+  if(!raw.trim())return '';
+  const valueHtml=options.html?raw:esc(raw);
+  return `<div class="msg-event-cell"><div class="msg-event-label">${esc(label)}</div><div class="msg-event-value${options.mono?' mono':''}">${valueHtml}</div></div>`;
+}
+function _chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,cardCls=''){
+  const pillHtml=(Array.isArray(pills)?pills.filter(Boolean):[]).join('');
+  const gridHtml=(Array.isArray(grid)?grid.filter(Boolean):[]).join('');
+  const safeCardCls=String(cardCls||'').trim();
+  const cardClassAttr=safeCardCls?`msg-event-card ${safeCardCls}`:'msg-event-card';
+  return `<div class="${cardClassAttr}"><div class="msg-event-head"><div><div class="msg-event-title">${esc(title||'')}</div>${subtitle?`<div class="msg-event-sub">${esc(subtitle)}</div>`:''}</div>${pillHtml?`<div class="msg-event-pills">${pillHtml}</div>`:''}</div>${gridHtml?`<div class="msg-event-grid">${gridHtml}</div>`:''}${bodyHtml||''}</div>`;
+}
+function _chatVirtParseSkillLoaded(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^\\[skill loaded:\\s*([^\\]]+)\\]\\s*([\\s\\S]*)$/i);
+  if(!m)return null;
+  let desc=String(m[2]||'').trim();
+  let truncated=false;
+  if(/\\n?\\.\\.\\.\\(truncated\\)\\s*$/i.test(desc)){
+    truncated=true;
+    desc=desc.replace(/\\n?\\.\\.\\.\\(truncated\\)\\s*$/i,'').trim();
+  }
+  return {
+    name:String(m[1]||'').trim(),
+    desc:desc,
+    truncated:truncated,
+  };
+}
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const pre=node.querySelector('pre');if(!pre)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));pre.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');if(!target)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));target.textContent=_chatVirtLiveRunText(label,elapsed)}}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
@@ -30957,6 +31431,7 @@ function _chatVirtBuildMessageNode(m){
   else if(m.type==='agent_bus')kind='agent_bus';
   else if(m.type==='tool_calls')kind='tool_calls';
   else if(/^\\[tool calls\\]/i.test(String(m.text||'')))kind='tool_calls';
+  else if(/^\\[skill loaded:\\s*[^\\]]+\\]/i.test(String(m.text||'')))kind='skill_loaded';
   else if(m.type==='file_patch'&&m.data)kind='file_patch';
   else if(m.type==='upload'&&m.data)kind='upload';
   else if(m.type==='command'&&m.data)kind='command';
@@ -30976,7 +31451,8 @@ function _chatVirtBuildMessageNode(m){
   d.removeAttribute('data-run-last-sec');
   const baseRole=(m.role==='user'?'user':m.role==='assistant'?'assistant':'system');
   const agentRole=_chatVirtAgentRoleKey(m.agent_role);
-  d.className='msg '+baseRole+(agentRole?(' agent-'+agentRole):'');
+  d.className='msg '+baseRole+(agentRole?(' agent-'+agentRole):'')+` msg-kind-${kind}`+(CHAT_EVENT_CARD_KINDS.has(kind)?' msg-event-wrap':'');
+  d.setAttribute('data-msg-kind',kind);
   const roleBadge=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-badge ${agentRole}\">${esc(_chatVirtAgentRoleLabel(agentRole))}</div>`:'';
   if(m.type==='manager_delegate'){
     const info=(m&&typeof m.data==='object')?m.data:{};
@@ -31029,8 +31505,28 @@ function _chatVirtBuildMessageNode(m){
       const txt=String(m.text||'').trim().replace(/^\\[tool calls\\]\\s*/i,'');
       tools=txt?txt.split(',').map(x=>String(x||'').trim()).filter(Boolean):[];
     }
-    const pills=tools.slice(0,10).map(name=>`<span class=\"agent-control-pill\">${esc(String(name||'?'))}</span>`).join('');
-    d.innerHTML=`${roleBadge}<div class=\"agent-control-card\"><div class=\"agent-control-head\">Tool Calls</div><div class=\"agent-control-pills\">${pills||'<span class=\"agent-control-pill\">(none)</span>'}</div></div>`;
+    const pills=[_chatVirtEventPillHtml(`${tools.length||0} tool${tools.length===1?'':'s'}`,'neutral')];
+    const bodyHtml=tools.length
+      ? `<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model scheduled these tools for the current turn.</div><div class=\"msg-event-tool-grid\">${tools.slice(0,24).map(name=>_chatVirtEventPillHtml(String(name||'?'),'info')).join('')}</div></div>`
+      : `<div class=\"msg-event-body\"><div class=\"msg-event-note\">No structured tool metadata was attached to this turn.</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Tool Calls',tools.length?`Auto-triggered chain for this turn`:'Tool dispatch metadata',pills,[],bodyHtml,'msg-event-card-tools')}`;
+    return d;
+  }
+  if(kind==='skill_loaded'){
+    const parsed=_chatVirtParseSkillLoaded(String(m.text||''))||{name:'skill',desc:String(m.text||''),truncated:false};
+    const pills=[
+      _chatVirtEventPillHtml('loaded','ok'),
+      parsed.truncated?_chatVirtEventPillHtml('preview truncated','warn'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml('skill',String(parsed.name||''),{mono:true}),
+    ];
+    const descHtml=String(parsed.desc||'').trim()
+      ? `<div class="msg-md">${renderMarkdownCached(String(parsed.desc||''),`${String(m._vk||'')}:skill`)}</div>`
+      : `<div class="msg-event-note">No public description was attached to this skill notification.</div>`;
+    const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">Skill context was auto-loaded into the current run.</div>${descHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Skill Loaded',String(parsed.name||'').trim()||'skill context',pills,grid,bodyHtml,'msg-event-card-skill')}`;
+    d.setAttribute('data-math-request',`${String(m._vk||'')}:skill`);
     return d;
   }
   if(m.type==='file_patch'&&m.data){
@@ -31038,23 +31534,59 @@ function _chatVirtBuildMessageNode(m){
     const loc=p.session_rel_path||p.path||'';
     const root=p.session_root||'';
     const preview=previewButtonHtml(loc);
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">file_patch · ${esc(loc)} (+${esc(p.added??0)} / -${esc(p.deleted??0)})</div><div class=\"msg-system-meta\">${esc(t('rel_path'))}: ${esc(loc)}\\nsession: ${esc(root)}</div>${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div>`;
+    const pills=[_chatVirtEventPillHtml(`+${p.added??0}`,'ok'),_chatVirtEventPillHtml(`-${p.deleted??0}`,'warn')];
+    const grid=[
+      _chatVirtEventCellHtml(t('rel_path'),String(loc||''),{mono:true}),
+      _chatVirtEventCellHtml('session',String(root||''),{mono:true}),
+    ];
+    const bodyHtml=`<div class=\"msg-event-body\">${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('File Patch',String(loc||'').trim()||'workspace update',pills,grid,bodyHtml,'msg-event-card-diff')}`;
     return d;
   }
   if(m.type==='upload'&&m.data){
     const u=m.data;
     const upath=u.workspace_path||'';
     const preview=previewButtonHtml(upath);
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">path: ${esc(upath)} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    const pills=[_chatVirtEventPillHtml(String(u.kind||'file'),'info'),_chatVirtEventPillHtml(`size ${u.size||0}`,'neutral')];
+    const grid=[
+      _chatVirtEventCellHtml('path',String(upath||''),{mono:true}),
+      _chatVirtEventCellHtml('filename',String(u.filename||''),{mono:true}),
+    ];
+    const previewHtml=String(u.preview||'').trim()?`<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`:`<div class=\"msg-event-note\">Preview unavailable for this upload.</div>`;
+    const bodyHtml=`<div class=\"msg-event-body\">${preview}${previewHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Upload',String(u.filename||'').trim()||'session upload',pills,grid,bodyHtml,'msg-event-card-upload')}`;
     return d;
   }
   if(m.type==='command'&&m.data){
     const x=m.data;
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">command · ${esc(x.name||'command')} · exit=${esc(x.exit_code??'-')}</div><div class=\"msg-system-meta\">$ ${esc(x.command||'')}\\ncwd: ${esc(x.cwd||'')}</div><pre class=\"msg-code-shell\">${esc(x.output||'')}</pre>`;
+    const exitTxt=String(x.exit_code??'-');
+    const exitTone=(exitTxt==='0')?'ok':((exitTxt==='-'||exitTxt==='')?'neutral':'error');
+    const durationTxt=_chatVirtFormatDurationMs(x.duration_ms);
+    const pageCount=Math.max(0,Number(x.output_page_count||0));
+    const pageIndex=Math.max(0,Number(x.output_page_index||0));
+    const changedFiles=Array.isArray(x.changed_files)?x.changed_files.filter(Boolean).map(v=>String(v)).join(', '):'';
+    const pills=[
+      _chatVirtEventPillHtml(`exit ${exitTxt}`,exitTone),
+      durationTxt?_chatVirtEventPillHtml(durationTxt,'neutral','mono'):'',
+      pageCount>1?_chatVirtEventPillHtml(`page ${pageIndex||1}/${pageCount}`,'info','mono'):'',
+      x.ui_truncated?_chatVirtEventPillHtml('UI truncated','warn'):'',
+      x.model_truncated?_chatVirtEventPillHtml('Model truncated','warn'):'',
+      x.temp_output_path?_chatVirtEventPillHtml('Temp read_file','info'):'',
+      x.buffer_ref?_chatVirtEventPillHtml('Buffered','neutral'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml('command',`$ ${String(x.command||'')}`,{mono:true}),
+      _chatVirtEventCellHtml('cwd',String(x.cwd||''),{mono:true}),
+      changedFiles?_chatVirtEventCellHtml('changed',changedFiles,{mono:true}):'',
+    ];
+    const outputTxt=String(x.output||'');
+    const bodyHtml=`<div class=\"msg-event-body\">${outputTxt?`<pre class=\"msg-code-shell\">${esc(outputTxt)}</pre>`:'<div class=\"msg-event-note\">No command output captured.</div>'}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Command',String(x.name||'command'),pills,grid,bodyHtml,'msg-event-card-command')}`;
     return d;
   }
   if(m.type==='live_thinking'){
-    d.innerHTML=`${roleBadge}<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
+    const liveThinkingHtml=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveThinkingHtml}</div>`:`${roleBadge}${liveThinkingHtml}`;
     d.setAttribute('data-math-request',`${String(m._vk||'')}:live-thinking`);
     return d;
   }
@@ -31070,7 +31602,15 @@ function _chatVirtBuildMessageNode(m){
     const label=lang.startsWith('zh')?'截断恢复':(lang.startsWith('ja')?'切り詰め復旧':'Truncation Recovery');
     const stateTxt=lang.startsWith('zh')?(active?'进行中':'已完成'):(lang.startsWith('ja')?(active?'進行中':'完了'):(active?'active':'done'));
     const key=`${m._vk}:live-trunc`;
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">${esc(label)} · ${esc(stateTxt)} · passes=${esc(attempts)} · tokens≈${esc(tk)}${extraTxt}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div>`;
+    const pills=[
+      _chatVirtEventPillHtml(stateTxt,active?'live':'neutral'),
+      _chatVirtEventPillHtml(`passes ${attempts}`,'info'),
+      _chatVirtEventPillHtml(`tokens≈${tk}`,'neutral','mono'),
+      kindTxt?_chatVirtEventPillHtml(`kind ${kindTxt}`,'neutral'):'',
+      toolTxt?_chatVirtEventPillHtml(`tool ${toolTxt}`,'info'):'',
+    ];
+    const noteHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model output hit a truncation boundary and entered recovery mode.${extraTxt?` ${extraTxt}`:''}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(label,'Structured truncation recovery state',pills,[],noteHtml,'msg-event-card-truncation')}`;
     d.setAttribute('data-math-request',key);
     return d;
   }
@@ -31084,12 +31624,20 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-run-elapsed',String(elapsedNow));
     d.setAttribute('data-run-anchor',String(Date.now()/1000));
     d.setAttribute('data-run-last-sec',String(Math.floor(elapsedNow)));
-    d.innerHTML=`${roleBadge}<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(label)}</div><pre>${esc(_chatVirtLiveRunText(label,elapsedNow))}</pre></div>`;
+    const pills=[
+      _chatVirtEventPillHtml(t('running'),'live'),
+      _chatVirtEventPillHtml(_chatVirtLiveRunText(label,elapsedNow),'neutral','mono'),
+    ];
+    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">The active agent is in a model call. This timer updates live while generation is in progress.</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Agent Turn Model Call',label,pills,[],bodyHtml,'msg-event-card-live')}`;
+    const elapsedEl=d.querySelector('.msg-event-pill.mono');
+    if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
     return d;
   }
   if(m.role==='assistant'&&m.thinking){
     const key=`${m._vk}:assistant-thinking`;
-    d.innerHTML=`${roleBadge}<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;
+    const thinkingHtml=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${thinkingHtml}</div>`:`${roleBadge}${thinkingHtml}`;
     d.setAttribute('data-math-request',key);
     return d;
   }
@@ -31100,7 +31648,8 @@ function _chatVirtBuildMessageNode(m){
     const cleaned=_stripObjectiveInstructionForWorker(finalText);
     if(cleaned)finalText=cleaned;
   }
-  d.innerHTML=`${roleBadge}<div class=\"msg-md\">${renderMarkdownCached(finalText,textKey)}</div>`;
+  const plainHtml=`<div class=\"msg-md\">${renderMarkdownCached(finalText,textKey)}</div>`;
+  d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${plainHtml}</div>`:`${roleBadge}${plainHtml}`;
   if(m.role==='assistant'||m.role==='user'){
     d.setAttribute('data-math-request',textKey);
   }
@@ -31755,9 +32304,9 @@ async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)re
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
-async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');applyUiStyle();renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -39032,6 +39581,7 @@ class AppContext:
         skills_root: Path,
         thinking: bool = False,
         default_language: str = DEFAULT_UI_LANGUAGE,
+        ui_style: str = DEFAULT_UI_STYLE,
         context_token_limit: int = TOKEN_THRESHOLD,
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
@@ -39068,6 +39618,7 @@ class AppContext:
                 "error": trim(str(exc), 220),
             }
         self.default_language = normalize_ui_language(default_language)
+        self.ui_style = normalize_ui_style(ui_style)
         self.context_token_limit = max(
             MIN_CONTEXT_TOKEN_LIMIT,
             min(TOKEN_THRESHOLD, int(context_token_limit or TOKEN_THRESHOLD)),
@@ -39246,6 +39797,7 @@ class AppContext:
             "config_path": str(self.web_ui_config_path or ""),
             "dir": str(self.web_ui_dir),
             "show_upload_list": bool(getattr(self, "show_upload_list", False)),
+            "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "validation": dict(self.web_ui_validation or {}),
         }
 
@@ -41466,6 +42018,11 @@ class Handler(BaseHTTPRequestHandler):
                     "model": model_cat.get("selected", mgr.model),
                     "thinking": model_cat.get("thinking", mgr.thinking),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "ui_style_label": UI_STYLE_LABELS.get(
+                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        "Neo",
+                    ),
                     "supported_languages": supported_ui_languages_payload(),
                     "repo_root": str(REPO_ROOT),
                     "skills_root": str(self.app.skills_root),
@@ -42059,6 +42616,11 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "skills_port": int(getattr(self.app, "skills_port", 0) or 0),
                     "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "ui_style_label": UI_STYLE_LABELS.get(
+                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        "Neo",
+                    ),
                     "supported_languages": supported_ui_languages_payload(),
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
@@ -42630,6 +43192,13 @@ def main():
         help="Default UI/model language (zh-CN|zh-TW|ja|en)",
     )
     parser.add_argument(
+        "--UI_Style",
+        "--ui-style",
+        dest="ui_style",
+        default="",
+        help="Frontend chat UI style (Trad|Neo). Default Neo.",
+    )
+    parser.add_argument(
         "--config",
         default="",
         help="LLM config source (URL or local file path)",
@@ -42774,6 +43343,12 @@ def main():
     web_ui_show_upload_list = extract_show_upload_list_setting(web_ui_config)
     if web_ui_show_upload_list is not None:
         resolved_show_upload_list = bool(web_ui_show_upload_list)
+    raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
+    if not raw_ui_style:
+        raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
+    if not raw_ui_style:
+        raw_ui_style = str(extract_ui_style_setting(web_ui_config) or "").strip()
+    resolved_ui_style = normalize_ui_style(raw_ui_style or DEFAULT_UI_STYLE)
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
@@ -42989,6 +43564,7 @@ def main():
         skills_root,
         resolved_thinking,
         resolved_language,
+        resolved_ui_style,
         resolved_ctx_limit,
         ctx_limit_locked,
         resolved_max_rounds,
@@ -43168,6 +43744,7 @@ def main():
         if config_apply_result.get("persist_warning"):
             print(f"[web-agent] llm_config persist warning: {config_apply_result.get('persist_warning')}")
     print(f"[web-agent] language={resolved_language} ({UI_LANGUAGE_LABELS.get(resolved_language, resolved_language)})")
+    print(f"[web-agent] UI_Style={UI_STYLE_LABELS.get(resolved_ui_style, 'Neo')}")
     print(f"[web-agent] ctx_limit={resolved_ctx_limit}")
     print(f"[web-agent] ctx_limit_lock={'on' if ctx_limit_locked else 'off'}")
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
