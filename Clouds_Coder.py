@@ -8941,6 +8941,11 @@ TOOLS = [
                     "review_feedback",
                     "conversation_history",
                     "status",
+                    "plan_findings",
+                    "plan_proposal",
+                    "plan_steps",
+                    "plan_risks",
+                    "skill_analysis",
                 ],
             },
             "content": {"type": "string"},
@@ -18948,7 +18953,10 @@ class SessionState:
 
     def _blackboard_append_section(self, section: str, actor: str, content: str):
         key = str(section or "").strip()
-        if key not in {"research_notes", "execution_logs", "review_feedback"}:
+        _ALLOWED = {"research_notes", "execution_logs", "review_feedback",
+                     "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
+                     "skill_analysis"}
+        if key not in _ALLOWED:
             return
         txt = trim(str(content or "").strip(), BLACKBOARD_MAX_TEXT)
         if not txt:
@@ -24490,7 +24498,12 @@ class SessionState:
             actor = role_key or "developer"
             if not section or not content:
                 return "Error: section and content are required"
-            if section in {"research_notes", "execution_logs", "review_feedback"}:
+            # Normalize plan-mode sections: plan.findings → plan_findings, etc.
+            section = section.replace(".", "_")
+            if section in {"research_notes", "execution_logs", "review_feedback",
+                           "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
+                           "skill_analysis"}:
+                self._blackboard_append_section(section, actor, content)
                 self._blackboard_append_section(section, actor, content)
             elif section == "conversation_history":
                 self._blackboard_history(actor, content)
@@ -25791,7 +25804,7 @@ class SessionState:
             f"3. Assess risks and potential side effects\n"
             f"4. Note any ambiguities or decisions that need user input\n"
             f"5. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"6. Write your findings to the blackboard under 'plan.findings'.\n\n"
+            f"6. Write your findings to the blackboard under 'plan_findings'.\n\n"
             f"Workspace: {self.files_root}\n"
             f"{os_note}\n"
             f"{lang_note}"
