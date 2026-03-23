@@ -11447,56 +11447,67 @@ class SessionState:
 
         matched_names: list[str] = []
 
-        # --- Path 1 (fast): Keyword match first — runs in milliseconds ---
-        matched_names = self._keyword_match_skills(goal_low, skill_catalog)
-        if matched_names:
-            self._emit("status", {"summary": f"skill discovery (keyword-fast): matched {matched_names} ({trigger})"})
+        # --- Path 1 (primary): LLM task analysis → skill selection (5s timeout) ---
+        # LLM analyzes the task type and autonomously decides which skills to load
+        llm_result: list[str] = []
+        def _llm_match():
+            try:
+                catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:40])
+                rsp = self.ollama.chat(
+                    [{"role": "user", "content": (
+                        f"/no_think\n"
+                        f"## Available Skills\n{catalog_text}\n\n"
+                        f"## User Task\n{goal}\n\n"
+                        f"## Instructions\n"
+                        f"Analyze this task. Determine:\n"
+                        f"1. What type of task is this? (document creation, data analysis, coding, research, etc.)\n"
+                        f"2. What are the key steps needed?\n"
+                        f"3. Which skills from the list above are needed for EACH step?\n\n"
+                        f"Return ONLY a JSON array of skill names needed, in execution order. "
+                        f"Max 4 skills. Return [] if no skills are needed.\n"
+                        f"Example: [\"pdf\", \"ppt-master\"] for 'analyze this PDF and make slides'\n"
+                        f"Example: [\"xlsx\"] for 'create an Excel report'\n"
+                        f"Example: [] for 'write a Python script'"
+                    )}],
+                    system="/no_think\nYou are a task analyzer. Analyze the task type and select the right skills. Output ONLY a JSON array.",
+                    max_tokens=200,
+                    think=False,
+                )
+                answer = str(rsp.get("content", "") or "").strip()
+                m = re.search(r'\[([^\]]*)\]', answer)
+                if m:
+                    try:
+                        names = json.loads(f"[{m.group(1)}]")
+                        if isinstance(names, list):
+                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:4])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        t = threading.Thread(target=_llm_match, daemon=True)
+        t.start()
+        t.join(timeout=5.0)
+        if llm_result:
+            matched_names = llm_result
+            self._emit("status", {"summary": f"skill discovery (LLM task analysis): {matched_names} ({trigger})"})
 
-        # --- Path 2: LLM semantic match only if keywords found nothing (2s timeout) ---
+        # --- Path 2 (fallback): Keyword match only if LLM returned nothing ---
         if not matched_names:
-            llm_result: list[str] = []
-            def _llm_match():
-                try:
-                    catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:30])
-                    rsp = self.ollama.chat(
-                        [{"role": "user", "content": (
-                            f"/no_think\nAvailable skills:\n{catalog_text}\n\n"
-                            f"User's task: {goal}\n\n"
-                            f"Which skills are relevant? Reply JSON array of names only. Max 3. "
-                            f"Example: [\"ppt-master\"] or []"
-                        )}],
-                        system="/no_think\nOutput only a JSON array of skill names.",
-                        max_tokens=200,
-                        think=False,
-                    )
-                    answer = str(rsp.get("content", "") or "").strip()
-                    m = re.search(r'\[([^\]]*)\]', answer)
-                    if m:
+            matched_names = self._keyword_match_skills(goal_low, skill_catalog)
+            if matched_names:
+                self._emit("status", {"summary": f"skill discovery (keyword fallback): {matched_names} ({trigger})"})
+
+        # --- Path 3: Deferred LLM pickup if still running ---
+        if not matched_names and t.is_alive():
+            def _deferred_llm_pickup():
+                t.join(timeout=8.0)
+                if llm_result and not self._loaded_skill_rows():
+                    for name_str in llm_result[:4]:
                         try:
-                            names = json.loads(f"[{m.group(1)}]")
-                            if isinstance(names, list):
-                                llm_result.extend([str(n).strip() for n in names if str(n).strip()][:3])
+                            self._load_skill_with_cache(name_str, load_source=f"auto:llm-deferred:{trigger or 'discovery'}")
                         except Exception:
                             pass
-                except Exception:
-                    pass
-            t = threading.Thread(target=_llm_match, daemon=True)
-            t.start()
-            t.join(timeout=2.0)
-            if llm_result:
-                matched_names = llm_result
-                self._emit("status", {"summary": f"skill discovery (LLM): matched {matched_names} ({trigger})"})
-            elif t.is_alive():
-                # LLM still running — register callback to pick up result in next round
-                def _deferred_llm_pickup():
-                    t.join(timeout=8.0)
-                    if llm_result and not self._loaded_skill_rows():
-                        for name_str in llm_result[:3]:
-                            try:
-                                self._load_skill_with_cache(name_str, load_source=f"auto:llm-deferred:{trigger or 'discovery'}")
-                            except Exception:
-                                pass
-                threading.Thread(target=_deferred_llm_pickup, daemon=True).start()
+            threading.Thread(target=_deferred_llm_pickup, daemon=True).start()
 
         # --- Load matched skills: multi-skill with conflict detection ---
         # Filter out infrastructure/recovery skills that shouldn't be auto-triggered
