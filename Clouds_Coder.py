@@ -1106,7 +1106,9 @@ def _detect_os_shell_instruction() -> str:
             "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
-            "Use relative paths or the absolute session root shown above."
+            "IMPORTANT: The workspace path contains spaces. Always use relative paths "
+            "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
+            "If you must use absolute paths, always quote them with double quotes."
         )
     # Linux / other POSIX
     return (
@@ -1114,7 +1116,9 @@ def _detect_os_shell_instruction() -> str:
         "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
         "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
         "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
-        "Use relative paths or the absolute session root shown above."
+        "IMPORTANT: The workspace path may contain spaces. Always use relative paths "
+        "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
+        "If you must use absolute paths, always quote them with double quotes."
     )
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -5255,101 +5259,115 @@ name: research-orchestrator-pro
 aliases:
   - research
   - research-pro
-  - literature-lab
 triggers:
-  - research
+  - research workflow
   - literature review
-  - survey
+  - evidence synthesis
   - experiment design
-  - uploaded pdf
-  - uploaded data
-  - scientific report
-  - 科研
-  - 综述
-  - 实验设计
-  - 数据分析
-entrypoints:
-  - references/workflow.md
-  - references/report-interfaces.md
-  - references/experiment-design.md
-  - scripts/render_research_bundle.py
-attachments:
-  - references/*.md
-  - scripts/*.py
+  - systematic analysis
+  - 科研工作流
+  - 证据综合
+  - 文献综述
+  - 系统性分析
 clouds_coder:
   preferred_tools:
     - read_file
     - bash
-    - load_skill
     - TodoWrite
     - write_file
-  runtime_contract: |
-    - Treat this as the authoritative research workflow for Clouds_Coder.
-    - Enter this skill chain concretely by reading `references/workflow.md` first.
-    - Route uploaded files early: PDFs -> `pdf-vision-literature-integrator` or `upload-office-parser`; spreadsheets -> `upload-tabular-parser` or `xlsx`.
-    - Maintain workspace-local research artifacts: question, evidence table, experiment ledger, and report bundle.
-    - If the final deliverable includes `.docx`, `.xlsx`, `.pdf`, `.pptx`, or `.ppt`, immediately load the matching output skill and hand off through `references/report-interfaces.md`.
-    - Keep generated files in the current workspace, never inside `/skills`.
-description: Professional research orchestration for uploaded PDFs and data, evidence synthesis, experiment planning, and handoff into docx/xlsx/pdf/pptx/ppt report pipelines.
+description: >
+  Research orchestration for evidence synthesis, literature analysis,
+  and structured report preparation. TRIGGER when task involves
+  systematic analysis of multiple sources with structured evidence output.
+  DO NOT TRIGGER for simple PDF summaries, single-file analysis, or
+  straightforward document creation tasks.
 ---
 
 # Research Orchestrator Pro
 
-Use this skill for serious research workflows inside Clouds_Coder, especially when the task mixes uploaded literature, uploaded tables, experiment design, and multi-format report delivery.
+Professional research orchestration for multi-source analysis, evidence synthesis, and structured report preparation.
 
-## Mandatory Flow
-1. Read `references/workflow.md`.
-2. Build a concrete todo chain.
-3. Parse uploaded sources and classify them into literature / tabular / notes / output requirements.
-4. Build an evidence table before drafting conclusions.
-5. If experiments are requested, read `references/experiment-design.md` and create an explicit experiment ledger.
-6. If report files are requested, read `references/report-interfaces.md` and hand off to the correct document skill.
+## When to Use
+- Systematic analysis of multiple uploaded documents requiring cross-reference
+- Evidence-based synthesis where claims need traceable sources
+- Experiment design with explicit variables and controls
+- Literature reviews comparing findings across papers
 
-## Minimum Artifact Set
-Keep these workspace artifacts unless the user already defined an equivalent structure:
-- `research/question.md`
-- `research/evidence_table.csv`
-- `research/analysis.md`
-- `research/report_bundle.json`
+## When NOT to Use
+- Simple "summarize this file" tasks — just read and summarize directly
+- Single-file analysis — no orchestration needed
+- Direct document creation (use pptx, docx, xlsx skills instead)
 
-## Quality Bar
-- Every important claim needs traceable evidence.
-- Distinguish verified facts, inferred conclusions, and open questions.
-- Never jump straight from raw uploads to polished reports without an intermediate evidence structure.
+## Pipeline Routes
+
+### Route A: Literature Synthesis
+When: Multiple PDFs/documents need comparative analysis
+
+1. List uploaded files: `ls uploaded/` to identify all inputs
+2. Read each `.parsed.md` file to extract key findings, methods, and conclusions
+3. Create evidence table: `research/evidence_table.csv` with columns: claim, evidence, source, confidence, caveat
+4. Write synthesis: `research/analysis.md` covering themes, agreements, contradictions, and gaps
+5. If presentation/document output needed: prepare structured data for the output skill
+
+### Route B: Data Analysis
+When: CSV/Excel data files need systematic analysis
+
+1. Read uploaded data files to understand structure and variables
+2. Identify patterns, trends, outliers, and statistical relationships
+3. Create analysis summary with data-backed claims
+4. Generate charts or tables if needed via bash scripts
+
+### Route C: Experiment Design
+When: Task requires experimental planning
+
+1. Define hypothesis clearly (H0 and H1)
+2. Specify independent/dependent variables and controls
+3. Define measurements, instruments, and data collection methods
+4. Set success criteria and failure conditions
+5. Write experiment ledger to `research/experiment_ledger.md`
+
+## Workspace Artifacts
+Create these files in the workspace as needed:
+- `research/question.md` — scope, assumptions, constraints
+- `research/evidence_table.csv` — claim, evidence, source, confidence, caveat
+- `research/analysis.md` — synthesis and conclusions
+- `research/report_bundle.json` — structured data for downstream formatting
+
+## Quality Rules
+- Every important claim needs traceable evidence with source attribution
+- Separate: verified facts / inferred conclusions / open questions
+- Never jump from raw uploads to polished output without intermediate evidence structure
+- Record contradictions between sources explicitly instead of silently ignoring them
 """
 
-    research_workflow = """# Workflow
+    research_workflow = """# Workflow Reference
 
-## 1. Intake and routing
+This file provides additional depth for the research workflow. The core workflow is in SKILL.md.
+
+## 1. Intake and Routing
 - Identify the research question, constraints, deliverables, and deadline pressure.
-- Detect which source lanes exist:
-  - uploaded PDF / paper / literature
-  - uploaded CSV / XLS / XLSX
-  - uploaded DOCX / PPTX
+- Detect which source types are present:
+  - uploaded PDF / paper / literature → read .parsed.md files
+  - uploaded CSV / XLS / XLSX → analyze data directly
+  - uploaded DOCX / PPTX → extract content
   - raw notes or conversation-only requirements
-  - requested report outputs (`docx`, `xlsx`, `pdf`, `pptx`, `ppt`)
+  - requested output formats (docx, xlsx, pdf, pptx)
 
-## 2. Mandatory skill coupling
-- If PDFs matter, load `pdf-vision-literature-integrator` for text-plus-figure evidence when available.
-- If Office uploads matter, load `upload-office-parser`.
-- If spreadsheets matter, load `upload-tabular-parser` and usually `xlsx`.
-- If output files are required, load the matching delivery skill before final artifact generation.
-
-## 3. Workspace artifact discipline
+## 2. Workspace Artifact Discipline
 Create or maintain:
 - `research/question.md` for scope and assumptions
 - `research/evidence_table.csv` with `claim,evidence,source,confidence,caveat`
 - `research/analysis.md` for synthesis
-- `research/report_bundle.json` for downstream handoff into report skills
+- `research/report_bundle.json` for downstream formatting
 
-## 4. Evidence synthesis
+## 3. Evidence Synthesis
 - Merge textual evidence, extracted tables, and visual figure notes when available.
 - Keep a separation between direct evidence and your own inference.
 - Record unresolved contradictions explicitly.
 
-## 5. Report handoff
-- Use `references/report-interfaces.md` to prepare the bundle.
-- Pass report generation to `docx`, `xlsx`, `pdf`, `pptx`, or `ppt` instead of ad hoc file writing.
+## 4. Report Preparation
+- Use `research/report_bundle.json` to structure data for output formatting.
+- Keep generated files in the workspace, never inside `/skills`.
 """
 
     research_interfaces = """# Report Interfaces
@@ -5528,61 +5546,85 @@ name: scientific-reasoning-lab
 aliases:
   - scientific
   - theorem-lab
-  - deep-science
 triggers:
+  - mathematical derivation
+  - theorem proof
   - scientific reasoning
-  - theorem
-  - proof
-  - derivation
-  - formula
-  - mechanism
+  - mechanistic model
+  - conjecture testing
   - 数学推导
-  - 理论基础
-  - 科学推理
-  - 深度思考
-entrypoints:
-  - references/proof-ledger.md
-  - references/review-loop.md
-  - references/autoresearch-patterns.md
-  - scripts/build_reasoning_packet.py
-attachments:
-  - references/*.md
-  - scripts/*.py
+  - 定理证明
+  - 科学论证
+  - 机理建模
 clouds_coder:
   preferred_tools:
     - read_file
     - bash
-    - ask_colleague
     - TodoWrite
-    - load_skill
-  runtime_contract: |
-    - Use this skill for mathematical derivation, theoretical analysis, mechanistic modeling, and deep scientific reasoning.
-    - Enter this skill chain concretely by reading `references/proof-ledger.md` first.
-    - Keep reasoning explicit: assumptions, symbols, derivations, counterexamples, falsification tests, and open questions.
-    - For non-trivial conclusions, request at least one colleague audit via `ask_colleague` or the manager/reviewer path.
-    - Do not present speculative theory as established fact.
-    - If the final answer must become a document or slide deck, hand off the stabilized reasoning packet into `research-orchestrator-pro`, `docx`, `pdf`, or `pptx`.
-description: Deep scientific reasoning workflow for derivations, theory exploration, mechanistic models, conjecture testing, and multi-agent audit inspired by autonomous research loops.
+    - write_file
+description: >
+  Deep scientific reasoning for derivations, proofs, and mechanistic models.
+  TRIGGER when task requires formal mathematical reasoning, theory building,
+  or rigorous proof structure. DO NOT TRIGGER for general analysis, summaries,
+  report writing, or data analysis tasks.
 ---
 
 # Scientific Reasoning Lab
 
-Use this skill when the task is not just "write a report" but actually requires theory building, proof structure, derivation, mechanism exploration, or rigorous scientific argumentation.
+Structured workflow for mathematical derivation, proof construction, mechanistic modeling, and rigorous scientific argumentation.
 
-## Mandatory Flow
-1. Read `references/proof-ledger.md`.
-2. Formalize the problem: notation, assumptions, objective, known constraints.
-3. Produce a derivation or theory path with explicit intermediate steps.
-4. Run a counterexample / falsification pass.
-5. Read `references/review-loop.md` and trigger an audit if the result matters.
-6. Package the stable reasoning into a reusable reasoning packet.
+## When to Use
+- Mathematical derivation or proof construction
+- Mechanistic model building with explicit assumptions
+- Theory testing with counterexamples and falsification
+- Formal logic or symbolic reasoning tasks
 
-## Output Contract
-- Separate:
-  - proven / derived results
-  - plausible but unverified conjectures
-  - external facts that still need retrieval validation
-- Keep an `open questions` section instead of hiding uncertainty.
+## When NOT to Use
+- General report writing or document creation
+- Data analysis or statistics (use research-orchestrator-pro instead)
+- Simple summaries or explanations
+
+## Reasoning Framework
+
+### Step 1: Formalize the Problem
+- State the problem precisely with mathematical notation
+- Define all symbols and notation used
+- List all assumptions explicitly (mark which are standard vs task-specific)
+- State the objective: what needs to be proven, derived, or modeled
+
+### Step 2: Build the Derivation
+- Proceed with explicit intermediate steps
+- For each step, note the justification: axiom, known theorem, assumption, or definition
+- If a step requires hand-waving, mark it as a **gap** rather than pretending it is rigorous
+- Keep notation consistent throughout
+
+### Step 3: Validate
+- Test the result with at least one concrete counterexample attempt
+- Check edge cases (zero, infinity, boundary conditions)
+- Verify dimensional consistency if applicable
+- Look for hidden assumptions or unstated constraints
+
+### Step 4: Classify the Result
+- **Proven**: rigorous derivation with no gaps, all assumptions stated
+- **Plausible**: logical chain but with unverified assumptions or gaps
+- **Rejected**: valid counterexample found
+- **Open**: insufficient information to decide; list what is missing
+
+## Output Format
+Structure results as a proof ledger:
+- Problem statement
+- Notation and definitions
+- Assumptions (standard + task-specific)
+- Derivation steps with justifications
+- Counterexamples tested
+- Final status: proven / plausible / rejected / open
+- Open questions and next steps
+
+## Quality Rules
+- Never present speculative theory as established fact
+- Keep an explicit "open questions" section instead of hiding uncertainty
+- Distinguish between: proven results, plausible conjectures, and unverified external facts
+- If the reasoning packet needs to become a document, prepare structured data and let the user decide the output format
 """
 
     scientific_ledger = """# Proof Ledger
@@ -10928,61 +10970,6 @@ class SessionState:
             self._broadcast_loaded_skill(key, text, load_source=load_source)
         return text
 
-    def _build_skill_focus_tokens(
-        self,
-        skill_key: str,
-        *,
-        skill_name: str = "",
-        aliases: list[str] | None = None,
-        triggers: list[str] | None = None,
-        skill_dir_rel: str = "",
-    ) -> list[str]:
-        generic_low_signal = {
-            "skill",
-            "skills",
-            "document",
-            "documents",
-            "word",
-            "report",
-            "paper",
-            "presentation",
-            "presentations",
-            "slide",
-            "slides",
-            "deck",
-            "analysis",
-            "data",
-        }
-        raw_items: list[str] = []
-        raw_items.extend(
-            [
-                str(skill_name or "").strip(),
-                str(skill_key or "").strip(),
-                str(PurePosixPath(str(skill_dir_rel or "")).name).strip(),
-            ]
-        )
-        if isinstance(aliases, list):
-            raw_items.extend(str(x).strip() for x in aliases)
-        if isinstance(triggers, list):
-            raw_items.extend(str(x).strip() for x in triggers)
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in raw_items:
-            token = re.sub(r"\s+", " ", str(item or "").strip().lower()).strip()
-            if not token:
-                continue
-            if ":" in token:
-                token = token.split(":", 1)[-1].strip()
-            token = token.replace("_", " ").replace("-", " ")
-            token = re.sub(r"\s+", " ", token).strip()
-            if not token or token in seen or token in generic_low_signal:
-                continue
-            if token.isascii() and len(token) < 3:
-                continue
-            seen.add(token)
-            out.append(token)
-        return out
-
     def _broadcast_loaded_skill(self, skill_key: str, skill_text: str, *, load_source: str = "manual"):
         """Broadcast a loaded skill to blackboard, global single-agent context, and agent contexts."""
         # 1. Write skill reference to blackboard so all agents are aware
@@ -10994,65 +10981,14 @@ class SessionState:
         meta = skill_row.get("meta", {}) if isinstance(skill_row.get("meta"), dict) else {}
         skill_name = str(skill_row.get("name", skill_key) or skill_key).strip() or skill_key
         skill_path = str(skill_row.get("skill_path", "") or "").strip()
-        skill_abs_path = str(skill_row.get("skill_abs_path", "") or "").strip()
         aliases = self.skills._skill_aliases(meta)
-        triggers = self.skills._skill_triggers(meta)
-        runtime_contract = self.skills._skill_runtime_contract(meta)
-        attachments = skill_row.get("attachments", [])
-        if not isinstance(attachments, list):
-            attachments = []
-        entrypoints = self.skills._skill_entrypoints(meta)
-        entrypoint_rows: list[dict] = []
-        skill_dir_rel = ""
-        skill_dir_virtual = ""
-        try:
-            if skill_abs_path:
-                skill_dir_rel = (
-                    Path(skill_abs_path).resolve().parent.relative_to(self.skills.skills_root.resolve()).as_posix()
-                )
-                skill_dir_virtual = f"{SKILLS_VIRTUAL_PREFIX}/{skill_dir_rel}".replace("//", "/")
-        except Exception:
-            skill_dir_rel = ""
-            skill_dir_virtual = ""
-        for rel in entrypoints:
-            virtual_path = ""
-            if skill_abs_path:
-                try:
-                    base = Path(skill_abs_path).resolve().parent
-                    vp_rel = (base / rel).resolve().relative_to(self.skills.skills_root.resolve()).as_posix()
-                    virtual_path = f"{SKILLS_VIRTUAL_PREFIX}/{vp_rel}".replace("//", "/")
-                except Exception:
-                    virtual_path = ""
-            entrypoint_rows.append({"path": rel, "virtual_path": virtual_path})
-        existing_row = loaded_skills.get(skill_key, {}) if isinstance(loaded_skills.get(skill_key, {}), dict) else {}
         loaded_skills[skill_key] = {
             "loaded_at": now_ts(),
             "size": len(skill_text),
             "preview": trim(skill_text, 300),
             "skill_name": skill_name,
             "skill_path": skill_path,
-            "skill_dir_rel": skill_dir_rel,
-            "skill_dir_virtual": skill_dir_virtual,
             "aliases": aliases,
-            "triggers": triggers,
-            "focus_tokens": self._build_skill_focus_tokens(
-                skill_key,
-                skill_name=skill_name,
-                aliases=aliases,
-                triggers=triggers,
-                skill_dir_rel=skill_dir_rel,
-            ),
-            "entrypoints": entrypoint_rows,
-            "runtime_contract": trim(runtime_contract, 2400),
-            "chain_required": bool(entrypoint_rows or attachments),
-            "chain_started": bool(existing_row.get("chain_started", False)),
-            "chain_started_at": float(existing_row.get("chain_started_at", 0.0) or 0.0),
-            "chain_evidence": list(existing_row.get("chain_evidence", []) or [])[-8:],
-            "last_chain_tool": str(existing_row.get("last_chain_tool", "") or "").strip(),
-            "last_chain_event": trim(str(existing_row.get("last_chain_event", "") or "").strip(), 240),
-            "load_source": trim(str(load_source or "").strip(), 80),
-            "focus_goal_sig": str(bb.get("loaded_skills_goal_sig", "") or ""),
-            "focus_goal_preview": trim(str(bb.get("loaded_skills_goal_preview", "") or ""), 240),
         }
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
@@ -11155,204 +11091,6 @@ class SessionState:
         loaded = bb.get("loaded_skills", {})
         return loaded if isinstance(loaded, dict) else {}
 
-    def _skill_chain_focus_match(self, skill_key: str, row: dict, focus_text: str) -> bool:
-        if str(row.get("load_source", "") or "").strip().lower() == "manual":
-            return True
-        low = re.sub(r"\s+", " ", str(focus_text or "").lower()).strip()
-        if not low:
-            return False
-        tokens = row.get("focus_tokens", [])
-        if not isinstance(tokens, list):
-            tokens = []
-        for token in tokens:
-            probe = re.sub(r"\s+", " ", str(token or "").strip().lower()).strip()
-            if probe and probe in low:
-                return True
-        skill_name = str(row.get("skill_name", skill_key) or skill_key).strip().lower()
-        return bool(skill_name and skill_name in low)
-
-    def _skill_chain_entry_examples(self, rows: list[tuple[str, dict]]) -> list[str]:
-        examples: list[str] = []
-        for _, row in rows[:2]:
-            entrypoints = row.get("entrypoints", [])
-            if not isinstance(entrypoints, list):
-                entrypoints = []
-            for item in entrypoints:
-                if not isinstance(item, dict):
-                    continue
-                ref = trim(
-                    str(item.get("virtual_path", "") or item.get("path", "") or "").strip(),
-                    160,
-                )
-                if ref:
-                    examples.append(ref)
-                    break
-        return examples[:2]
-
-    def _skill_chain_completion_blocker(self, *, focus_text: str = "", context: str = "finish") -> str:
-        board = self._ensure_blackboard()
-        loaded = self._loaded_skill_rows(board)
-        if not loaded:
-            return ""
-        current_focus = focus_text or self._current_execution_focus_text()
-        pending: list[tuple[str, dict]] = []
-        for skill_key, row in loaded.items():
-            if not isinstance(row, dict):
-                continue
-            if not bool(row.get("chain_required", False)):
-                continue
-            if bool(row.get("chain_started", False)):
-                continue
-            if not self._skill_chain_focus_match(skill_key, row, current_focus):
-                continue
-            pending.append((skill_key, row))
-        if not pending:
-            return ""
-        names = ", ".join(
-            str(row.get("skill_name", skill_key) or skill_key)
-            for skill_key, row in pending[:3]
-        )
-        examples = self._skill_chain_entry_examples(pending)
-        example_note = f" Suggested entrypoints: {', '.join(examples)}." if examples else ""
-        action = (
-            "before marking the current plan step complete"
-            if context == "plan-step"
-            else "before finishing the task"
-        )
-        return (
-            f"Loaded skill chain not yet entered for current focus ({names}). "
-            "Read a skill entrypoint or use a skill resource/script under /skills/... "
-            f"{action}.{example_note}"
-        )
-
-    def _loaded_skill_matches_path(self, path: Path) -> list[str]:
-        loaded = self._loaded_skill_rows()
-        if not loaded:
-            return []
-        try:
-            target = path.resolve()
-            root = self.skills.skills_root.resolve()
-            if not target.is_relative_to(root):
-                return []
-            rel = target.relative_to(root).as_posix()
-        except Exception:
-            return []
-        matches: list[str] = []
-        for skill_key, row in loaded.items():
-            skill_dir_rel = str(row.get("skill_dir_rel", "") or "").strip().strip("/")
-            if not skill_dir_rel:
-                continue
-            if rel == skill_dir_rel or rel.startswith(f"{skill_dir_rel}/"):
-                matches.append(skill_key)
-        return matches
-
-    def _loaded_skill_matches_command(self, raw_command: str, effective_command: str = "") -> list[str]:
-        loaded = self._loaded_skill_rows()
-        if not loaded:
-            return []
-        try:
-            skills_root = str(self.skills.skills_root.resolve())
-        except Exception:
-            skills_root = str(self.skills.skills_root)
-        combined: list[str] = []
-        for item in (raw_command, effective_command):
-            txt = str(item or "").strip()
-            if txt:
-                combined.append(txt)
-        raw = str(raw_command or "")
-        if raw:
-            expanded = (
-                raw.replace("${SKILLS_ROOT}", skills_root)
-                .replace("$SKILLS_ROOT", skills_root)
-            )
-            if expanded and expanded not in combined:
-                combined.append(expanded)
-        if not combined:
-            return []
-        matches: list[str] = []
-        for skill_key, row in loaded.items():
-            skill_dir_rel = str(row.get("skill_dir_rel", "") or "").strip().strip("/")
-            if not skill_dir_rel:
-                continue
-            markers = [
-                str(row.get("skill_dir_virtual", "") or f"{SKILLS_VIRTUAL_PREFIX}/{skill_dir_rel}"),
-                str((self.skills.skills_root / skill_dir_rel).resolve()),
-                f"$SKILLS_ROOT/{skill_dir_rel}",
-                f"${{SKILLS_ROOT}}/{skill_dir_rel}",
-            ]
-            entrypoints = row.get("entrypoints", [])
-            if isinstance(entrypoints, list):
-                for item in entrypoints:
-                    if not isinstance(item, dict):
-                        continue
-                    ref = str(item.get("virtual_path", "") or "").strip()
-                    if ref:
-                        markers.append(ref)
-            low_combined = [txt.lower() for txt in combined]
-            hit = False
-            for marker in markers:
-                probe = str(marker or "").strip().lower()
-                if not probe:
-                    continue
-                if any(probe in txt for txt in low_combined):
-                    hit = True
-                    break
-            if hit and skill_key not in matches:
-                matches.append(skill_key)
-        return matches
-
-    def _record_skill_chain_entry(self, skill_keys: list[str], *, tool_name: str, evidence: str):
-        if not isinstance(skill_keys, list) or not skill_keys:
-            return
-        bb = self._ensure_blackboard()
-        loaded = self._loaded_skill_rows(bb)
-        if not loaded:
-            return
-        changed = False
-        started_now: list[str] = []
-        stamp = float(now_ts())
-        detail = trim(str(evidence or "").strip(), 240)
-        for skill_key in skill_keys:
-            row = loaded.get(skill_key, {})
-            if not isinstance(row, dict):
-                continue
-            row = dict(row)
-            evidence_rows = row.get("chain_evidence", [])
-            if not isinstance(evidence_rows, list):
-                evidence_rows = []
-            evidence_rows.append(
-                {
-                    "ts": stamp,
-                    "tool": str(tool_name or "").strip(),
-                    "detail": detail,
-                }
-            )
-            was_started = bool(row.get("chain_started", False))
-            row["chain_started"] = True
-            if not row.get("chain_started_at"):
-                row["chain_started_at"] = stamp
-            row["chain_evidence"] = evidence_rows[-8:]
-            row["last_chain_tool"] = str(tool_name or "").strip()
-            row["last_chain_event"] = detail
-            loaded[skill_key] = row
-            changed = True
-            if not was_started:
-                started_now.append(str(row.get("skill_name", skill_key) or skill_key))
-        if not changed:
-            return
-        bb["loaded_skills"] = loaded
-        self.blackboard = bb
-        self._blackboard_touch()
-        if started_now:
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        f"skill chain entered: {', '.join(started_now[:3])} via {trim(tool_name, 40)}"
-                    )
-                },
-            )
-
     def _clear_loaded_skill_contexts(self):
         def _filter_rows(rows: list[dict]) -> list[dict]:
             kept: list[dict] = []
@@ -11422,8 +11160,8 @@ class SessionState:
             return
         prep = self._prepare_loaded_skills_for_goal(goal, trigger=trigger)
         already_loaded = prep.get("loaded", {})
-        # Allow up to 5 concurrent non-conflicting skills for complex tasks
-        if isinstance(already_loaded, dict) and len(already_loaded) >= 5 and not bool(prep.get("goal_changed", False)):
+        # Allow up to 4 concurrent non-conflicting skills for complex tasks
+        if isinstance(already_loaded, dict) and len(already_loaded) >= 4 and not bool(prep.get("goal_changed", False)):
             return
         goal_low = goal.lower()
         # Build skill catalog
@@ -11453,29 +11191,19 @@ class SessionState:
         matched_names: list[str] = []
 
         # --- Path 1 (primary): LLM task analysis → skill selection (5s timeout) ---
-        # LLM analyzes the task type and autonomously decides which skills to load
         llm_result: list[str] = []
         def _llm_match():
             try:
-                catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:40])
+                catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:30])
                 rsp = self.ollama.chat(
                     [{"role": "user", "content": (
                         f"/no_think\n"
-                        f"## Available Skills\n{catalog_text}\n\n"
-                        f"## User Task\n{goal}\n\n"
-                        f"## Instructions\n"
-                        f"Analyze this task. Determine:\n"
-                        f"1. What type of task is this? (document creation, data analysis, coding, research, etc.)\n"
-                        f"2. What are the key steps needed?\n"
-                        f"3. Which skills from the list above are needed for EACH step?\n\n"
-                        f"Return ONLY a JSON array of skill names needed, in execution order. "
-                        f"Max 4 skills. Return [] if no skills are needed.\n"
-                        f"Example: [\"pdf\", \"ppt-master\"] for 'analyze this PDF and make slides'\n"
-                        f"Example: [\"xlsx\"] for 'create an Excel report'\n"
-                        f"Example: [] for 'write a Python script'"
+                        f"Available skills:\n{catalog_text}\n\n"
+                        f"Task: {goal}\n\n"
+                        f"Which skills are relevant? Reply ONLY a JSON array. Max 3. [] if none."
                     )}],
-                    system="/no_think\nYou are a task analyzer. Analyze the task type and select the right skills. Output ONLY a JSON array.",
-                    max_tokens=200,
+                    system="/no_think\nOutput ONLY a JSON array.",
+                    max_tokens=120,
                     think=False,
                 )
                 answer = str(rsp.get("content", "") or "").strip()
@@ -11484,7 +11212,7 @@ class SessionState:
                     try:
                         names = json.loads(f"[{m.group(1)}]")
                         if isinstance(names, list):
-                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:4])
+                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:3])
                     except Exception:
                         pass
             except Exception:
@@ -11507,7 +11235,7 @@ class SessionState:
             def _deferred_llm_pickup():
                 t.join(timeout=8.0)
                 if llm_result and not self._loaded_skill_rows():
-                    for name_str in llm_result[:4]:
+                    for name_str in llm_result[:3]:
                         try:
                             self._load_skill_with_cache(name_str, load_source=f"auto:llm-deferred:{trigger or 'discovery'}")
                         except Exception:
@@ -11522,7 +11250,7 @@ class SessionState:
         }
         task_skills: list[str] = []
         infra_skills: list[str] = []
-        for name_str in matched_names[:6]:
+        for name_str in matched_names[:4]:
             name_low = str(name_str or "").strip().lower()
             is_infra = any(pat in name_low for pat in _INFRA_SKILL_PATTERNS)
             if is_infra:
@@ -11714,37 +11442,24 @@ class SessionState:
         return matched[:3]
 
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
-        """Unified skill awareness hint for any system prompt. Reads blackboard loaded_skills."""
+        """Unified skill awareness hint for any system prompt."""
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
         skill_count = len(self.skills.skills) if hasattr(self.skills, "skills") else 0
         if isinstance(loaded, dict) and loaded:
-            skill_names = []
-            for skill_key, row in list(loaded.items())[:5]:
-                status = "entered" if bool((row or {}).get("chain_started", False)) else (
-                    "pending-entry" if bool((row or {}).get("chain_required", False)) else "loaded"
-                )
-                label = str((row or {}).get("skill_name", skill_key) or skill_key).strip() or skill_key
-                skill_names.append(f"{label}({status})")
+            names = ", ".join(
+                str((row or {}).get("skill_name", key) or key).strip() or key
+                for key, row in list(loaded.items())[:5]
+            )
             return (
-                f"ACTIVE SKILLS: {', '.join(skill_names)} have been loaded into your context. "
+                f"ACTIVE SKILLS: {names}. "
                 "Follow loaded skill instructions precisely. "
-                "If a skill is pending-entry, you must concretely enter that skill chain by reading an entrypoint "
-                "or using a skill resource/script before claiming completion. "
-                f"DYNAMIC SKILL CHAIN: You have {skill_count} skills available. You can load MULTIPLE skills simultaneously "
-                "to form a complete workflow chain (e.g., pdf + ppt for analyzing a paper then making slides). "
-                "If you discover the current task needs a capability not covered by loaded skills, "
-                "call load_skill immediately — don't try to work around missing skills. "
-                "Skills are automatically re-evaluated when you complete each todo step. "
+                f"If you encounter a step requiring a workflow you don't know, call load_skill ({skill_count} available). "
             )
         return (
-            f"SKILL SYSTEM: {skill_count} skills are available for specialized workflows. "
-            "IMPORTANT: Before starting any professional output task (documents, presentations, data analysis, "
-            "code generation, research, etc.), call list_skills to check what skills exist, "
-            "then load_skill to activate ALL skills your task chain requires. "
-            "You can load multiple complementary skills (e.g., pdf + xlsx for data extraction). "
-            "Common skills: ppt (presentations), pdf (PDF creation/processing), docx (Word documents), "
-            "xlsx (Excel/spreadsheets), code-review, research, frontend-design, etc. "
+            f"SKILL SYSTEM: {skill_count} skills available. "
+            "Use list_skills to discover, load_skill to activate. "
+            "If unsure how to produce professional output (docs, slides, analysis), check skills first. "
         )
 
     def _refresh_runtime_code_reference(self, text: str):
@@ -14468,6 +14183,7 @@ class SessionState:
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
             "parse_status": "pending" if needs_async_parse else "done",
+            "parse_error": "",
         }
         with self.lock:
             self.uploads.append(meta)
@@ -14477,18 +14193,21 @@ class SessionState:
         if parsed_excerpt:
             bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
             self._blackboard_append_section("research_notes", "system", bb_content)
-        self._emit(
-            "upload",
-            {
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": meta["parse_status"],
-                "summary": f"upload: {safe_name} -> {workspace_rel}" + (" (parsing...)" if needs_async_parse else ""),
-                "preview": trim(parsed_excerpt, 500),
-            },
-        )
+        if not needs_async_parse:
+            self._emit(
+                "upload",
+                {
+                    "id": upload_id,
+                    "filename": safe_name,
+                    "workspace_path": workspace_rel,
+                    "kind": kind,
+                    "size": len(raw),
+                    "parse_status": meta["parse_status"],
+                    "parse_error": "",
+                    "summary": f"upload: {safe_name} -> {workspace_rel}",
+                    "preview": trim(parsed_excerpt, 500),
+                },
+            )
         # --- Config detection (kept synchronous as per user preference) ---
         loaded_config = None
         low_name = safe_name.lower()
@@ -14601,6 +14320,7 @@ class SessionState:
                     patched = dict(row)
                     patched["parsed_excerpt"] = parsed_excerpt
                     patched["parse_status"] = "done"
+                    patched["parse_error"] = ""
                     self.uploads[idx] = patched
                     self.updated_at = now_ts()
                     self._persist()
@@ -14610,12 +14330,15 @@ class SessionState:
                 self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
             workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload_parsed", {
+            self._emit("upload", {
+                "id": upload_id,
                 "filename": safe_name,
                 "workspace_path": workspace_rel,
                 "kind": kind,
+                "size": len(raw),
                 "parse_status": "done",
-                "summary": f"parsed: {safe_name}" + (f" ({len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
+                "parse_error": "",
+                "summary": f"upload: {safe_name} -> {workspace_rel}" + (f" (parsed {len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
                 "preview": trim(parsed_excerpt, 500),
             })
             # RAG/Code library ingestion
@@ -14654,10 +14377,18 @@ class SessionState:
                     self.updated_at = now_ts()
                     self._persist()
                     break
-            self._emit("upload_parsed", {
+            workspace_rel = self._session_rel(workspace_target)
+            self._emit("upload", {
+                "id": upload_id,
                 "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
                 "parse_status": "failed",
+                "summary": f"upload: {safe_name} -> {workspace_rel} (parse failed)",
                 "error": trim(str(exc), 300),
+                "parse_error": trim(str(exc), 300),
+                "preview": "",
             })
 
     def _auto_switch_model(self, reason: str) -> bool:
@@ -15972,6 +15703,11 @@ class SessionState:
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
         ]
+        # Auto-quote raw absolute paths that contain spaces (prevents word-splitting)
+        if " " in workspace_root and workspace_root not in ("/workspace",):
+            mappings.append((workspace_root, workspace_root))
+        if " " in skills_root and skills_root != SKILLS_VIRTUAL_PREFIX:
+            mappings.append((skills_root, skills_root))
         out: list[str] = []
         mode = "plain"
         i = 0
@@ -19459,14 +19195,6 @@ class SessionState:
                 break
         if not current:
             return False
-        skill_blocker = self._skill_chain_completion_blocker(
-            focus_text=self._current_execution_focus_text(),
-            context="plan-step",
-        )
-        if skill_blocker:
-            self._emit("status", {"summary": trim(f"plan step advance blocked: {skill_blocker}", 220)})
-            self._sync_todos_from_blackboard(reason="plan-step-skill-chain-blocked", board=bb)
-            return False
         current["status"] = "completed"
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
@@ -21709,16 +21437,7 @@ class SessionState:
             board["manager_summary_attempts"] = 0
             self.blackboard = board
         if target == "finish":
-            skill_blocker = self._skill_chain_completion_blocker(context="finish")
-            if skill_blocker:
-                target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
-                instruction = trim(
-                    f"{skill_blocker} Enter the referenced skill chain concretely now, then continue execution.",
-                    1200,
-                )
-                row["reason"] = "finish-blocked-skill-chain"
-                row["source"] = "policy"
-                self._emit("status", {"summary": trim(f"manager finish blocked: {skill_blocker}", 220)})
+            pass  # proceed to finish normally
         if target != "finish" and objective:
             low_instruction = instruction.lower()
             low_objective = objective.lower()
@@ -23992,14 +23711,6 @@ class SessionState:
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, 120)
-            self._record_skill_chain_entry(
-                self._loaded_skill_matches_command(
-                    str(args.get("command", "") or ""),
-                    str(meta.get("effective_command", "") or ""),
-                ),
-                tool_name="bash",
-                evidence=f"bash: {trim(str(args.get('command', '') or '').strip(), 180)}",
-            )
             self._emit(
                 "command",
                 {
@@ -24043,12 +23754,6 @@ class SessionState:
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
             out = self._run_read(rel, args.get("limit"), args.get("offset"))
-            if not str(out).startswith("Error:"):
-                self._record_skill_chain_entry(
-                    self._loaded_skill_matches_path(fp),
-                    tool_name="read_file",
-                    evidence=f"read_file: {rel}",
-                )
             limit_val = int(args.get("limit", 0) or 0) if args.get("limit") is not None else 0
             offset_val = int(args.get("offset", 0) or 0) if args.get("offset") is not None else 0
             summary = f"read file: {rel}"
@@ -24075,12 +23780,6 @@ class SessionState:
             existed = fp.exists()
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
-            if not str(out).startswith("Error:"):
-                self._record_skill_chain_entry(
-                    self._loaded_skill_matches_path(fp),
-                    tool_name="write_file",
-                    evidence=f"write_file: {rel}",
-                )
             if not out.startswith("Error"):
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
@@ -24132,12 +23831,6 @@ class SessionState:
                 return f"Error: {type(exc).__name__}: {exc}"
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_edit(rel, args["old_text"], args["new_text"])
-            if not str(out).startswith("Error:"):
-                self._record_skill_chain_entry(
-                    self._loaded_skill_matches_path(fp),
-                    tool_name="edit_file",
-                    evidence=f"edit_file: {rel}",
-                )
             if not out.startswith("Error"):
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
@@ -24215,9 +23908,6 @@ class SessionState:
                 pass
             return result
         if name in {"finish_task", "finish_current_task", "mark_done"}:
-            skill_blocker = self._skill_chain_completion_blocker(context="finish")
-            if skill_blocker:
-                return f"Error: {skill_blocker}"
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
             if role_key == "explorer":
                 bb = self._ensure_blackboard()
@@ -24354,11 +24044,6 @@ class SessionState:
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
             payload = self._prepare_shell_output_payload(raw_command, out_filtered or "(no output)", cwd=self.files_root)
-            self._record_skill_chain_entry(
-                self._loaded_skill_matches_command(raw_command, effective_command),
-                tool_name="background_run",
-                evidence=f"background_run: {trim(raw_command, 180)}",
-            )
             self._emit(
                 "command",
                 {
@@ -24541,14 +24226,6 @@ class SessionState:
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, 300)
-            self._record_skill_chain_entry(
-                self._loaded_skill_matches_command(
-                    str(args.get("command", "") or ""),
-                    str(meta.get("effective_command", "") or ""),
-                ),
-                tool_name="worktree_run",
-                evidence=f"worktree_run[{trim(str(args.get('name', '') or '').strip(), 40)}]: {trim(str(args.get('command', '') or '').strip(), 180)}",
-            )
             self._emit(
                 "command",
                 {
@@ -25788,10 +25465,13 @@ class SessionState:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Loaded Skills (use these to guide your research and plan design)\n"
+                    f"\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
-                    + "\n\nThese skills have been injected into your context. "
-                    "Leverage their instructions to produce a more professional and complete plan.\n"
+                    + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
+                    "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
+                    "2. Identify the skill's concrete workflow steps (e.g., what scripts to run, what files to read/write)\n"
+                    "3. List the specific tool calls and file paths each skill requires\n"
+                    "4. Include these details in your plan_findings so the synthesis phase can produce actionable steps\n"
                 )
         return (
             f"You are in plan-mode research phase. Your task is to analyze the following request "
@@ -25799,12 +25479,17 @@ class SessionState:
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. Analyze the impact scope — which files, modules, and systems are affected\n"
-            f"2. Identify key files that need to be read and understood\n"
-            f"3. Assess risks and potential side effects\n"
-            f"4. Note any ambiguities or decisions that need user input\n"
-            f"5. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"6. Write your findings to the blackboard under 'plan_findings'.\n\n"
+            f"1. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
+            f"2. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"3. If skills are loaded, analyze their <loaded-skill> content to identify concrete workflow steps, "
+            f"scripts, tools, and file paths each skill requires\n"
+            f"4. Identify key technical details, data points, and structure needed for the output\n"
+            f"5. Assess risks and note any ambiguities that need user input\n"
+            f"6. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"7. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"   - File inventory (uploaded files, their types, sizes, key content)\n"
+            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each loaded skill)\n"
+            f"   - Content analysis (key themes, structure, data points extracted from inputs)\n\n"
             f"Workspace: {self.files_root}\n"
             f"{os_note}\n"
             f"{lang_note}"
@@ -26236,8 +25921,11 @@ class SessionState:
                 skills_section = (
                     f"\n## Available Skills\n"
                     + "\n".join(skill_previews)
-                    + "\n\nIncorporate these skills' capabilities into your plan options. "
-                    "Each option's steps should reference using the relevant skills.\n\n"
+                    + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
+                    "- Which tool to call (bash, read_file, write_file, etc.)\n"
+                    "- Which specific file paths to use (e.g., 'Read uploaded/IEDM_.parsed.md')\n"
+                    "- What output to produce at each step\n"
+                    "Decompose each skill's workflow into 3-5 substeps based on the skill's instructions.\n\n"
                 )
         synthesis_prompt = (
             f"Based on the research findings below, generate a structured plan proposal "
@@ -26250,6 +25938,13 @@ class SessionState:
             f"- context: brief background analysis\n"
             f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
             f"- recommended: id of the recommended option\n\n"
+            f"STEP QUALITY REQUIREMENTS:\n"
+            f"- Each step must be a concrete, actionable instruction (NOT vague like 'analyze reports')\n"
+            f"- Include specific file paths (e.g., 'Read uploaded/IEDM_.parsed.md to extract key findings')\n"
+            f"- Include specific tool calls (e.g., 'Run bash: node generate_pptx.js to produce output.pptx')\n"
+            f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
+            f"- Each step should be completable in 1-3 tool calls\n"
+            f"- Group related substeps under numbered headings (e.g., '2.1 Read report 1', '2.2 Read report 2')\n"
             f"Make options meaningfully different (e.g. different approaches, scope levels, or trade-offs).\n"
             f"{model_language_instruction(self.ui_language)}"
         )
@@ -26438,7 +26133,9 @@ class SessionState:
             f"## {chosen.get('title', '')}\n"
             f"{chosen.get('summary', '')}\n\n"
             f"### Steps:\n{steps_text}\n\n"
-            f"Follow these steps. Use tools to implement each step concretely."
+            f"Follow these steps. Use tools to implement each step concretely.\n"
+            f"If a step references a skill or workflow you don't fully understand, "
+            f"call load_skill to load it and read its instructions before proceeding."
         )
         self.messages.append({
             "role": "system",
@@ -26462,7 +26159,7 @@ class SessionState:
         if steps and isinstance(steps, list):
             plan_todos = []
             for i, step in enumerate(steps):
-                step_text = trim(str(step or "").strip(), 400)
+                step_text = trim(str(step or "").strip(), 600)
                 if not step_text:
                     continue
                 plan_todos.append({
@@ -26477,7 +26174,7 @@ class SessionState:
                     "evidence": "",
                 })
             if plan_todos:
-                bb["project_todos"] = plan_todos[:10]
+                bb["project_todos"] = plan_todos[:20]
                 bb["plan_step_cursor"] = 0
                 bb["plan_step_total"] = len(plan_todos)
                 self.blackboard = bb
@@ -26486,7 +26183,7 @@ class SessionState:
                 try:
                     self.todo.update([
                         {"content": t["content"], "status": t["status"], "owner": "developer"}
-                        for t in plan_todos[:10]
+                        for t in plan_todos[:20]
                     ])
                 except Exception:
                     pass
@@ -26494,6 +26191,46 @@ class SessionState:
             self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
         except Exception:
             pass
+        # Pre-load skills explicitly mentioned in plan steps
+        try:
+            self._preload_skills_from_plan_steps(chosen.get("steps", []))
+        except Exception:
+            pass
+
+    def _preload_skills_from_plan_steps(self, steps: list):
+        """Scan plan step text for skill names and auto-load any that aren't already loaded."""
+        if not steps or not isinstance(steps, list):
+            return
+        self._ensure_skills_ready(force=False)
+        available = self.skills.list_metadata()
+        if not available:
+            return
+        # Build name → qualified_name lookup
+        name_map: dict[str, str] = {}
+        for s in available:
+            name = str(s.get("name", "")).strip().lower()
+            qname = str(s.get("qualified_name", name)).strip()
+            if name:
+                name_map[name] = qname
+                # Also map without hyphens/underscores for fuzzy match
+                name_map[name.replace("-", "")] = qname
+                name_map[name.replace("_", "")] = qname
+        already_loaded = set(
+            k.lower() for k in (self._ensure_blackboard().get("loaded_skills", {}) or {}).keys()
+        )
+        combined_text = " ".join(str(s or "") for s in steps).lower()
+        to_load: list[str] = []
+        for name_low, qname in name_map.items():
+            if len(name_low) < 3:
+                continue
+            if name_low in combined_text and qname.lower() not in already_loaded:
+                if qname not in to_load:
+                    to_load.append(qname)
+        for skill_name in to_load[:4]:
+            try:
+                self._load_skill_with_cache(skill_name, load_source="auto:plan-step-mention")
+            except Exception:
+                pass
 
     def _agent_worker(self):
         single_role = "developer"
@@ -27817,6 +27554,8 @@ class SessionState:
                 role = msg.get("role")
                 if role == "tool":
                     continue
+                if isinstance(msg, dict) and bool(msg.get("_ui_hidden", False)):
+                    continue
                 role_key = str(role or "").strip().lower()
                 msg_type = trim(str(msg.get("type", "message") or "").strip(), 40) if isinstance(msg, dict) else "message"
                 if not msg_type:
@@ -27840,6 +27579,8 @@ class SessionState:
                 # For skill-loaded messages: model sees full content, UI sees compact card
                 if isinstance(msg, dict) and msg.get("_skill_notify") and msg.get("_ui_text"):
                     text = str(msg.get("_ui_text", ""))
+                if re.match(r"^\[SKILL EXECUTION GUIDE:\s*[^\]]+\]", str(text or "").strip(), flags=re.IGNORECASE):
+                    continue
                 if (not str(text or "").strip()) and manager_route_tool_only:
                     continue
                 if not text and tool_names:
@@ -27987,6 +27728,8 @@ class SessionState:
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
                         "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                        "parse_status": item.get("parse_status"),
+                        "parse_error": item.get("parse_error"),
                     }
                 )
             operations_view = []
@@ -29902,7 +29645,10 @@ function _deltaConversationTextByType(type,data){
     return `[file_patch] ${String(d.path||'')}\nlocation: ${String(d.session_rel_path||d.path||'')}\nsession_root: ${String(d.session_root||'')}\n+${String(d.added??0)} / -${String(d.deleted??0)}\n${String(d.diff_numbered||d.diff||'')}`;
   }
   if(type==='upload'){
-    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}\n${String(d.preview||'')}`;
+    const status=String(d.parse_status||'').trim();
+    const err=String(d.parse_error||d.error||'').trim();
+    const note=status?`status: ${status}`:'';
+    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}${note?`\n${note}`:''}${err?`\nerror: ${err}`:''}\n${String(d.preview||'')}`;
   }
   return String(d.text||'');
 }
@@ -30057,12 +29803,25 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='command'||typ==='file_patch'||typ==='upload'){
     _deltaAppendOperation(typ,data,ts);
-    const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
-    _deltaAppendConversationRow(row);
+    if(!(typ==='upload'&&String(data.parse_status||'').trim().toLowerCase()==='pending')){
+      const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
+      _deltaAppendConversationRow(row);
+    }
     _deltaAppendActivity(typ,data,ts);
     if(typ==='upload'){
-      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||'')};
-      _deltaPushLimited(S.snap.uploads,uploadRow,DELTA_MAX_UPLOADS);
+      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||''),parse_status:String(data.parse_status||''),parse_error:String(data.parse_error||data.error||'')};
+      const targetId=String(uploadRow.id||'').trim();
+      let replaced=false;
+      if(targetId&&Array.isArray(S.snap.uploads)){
+        for(let i=S.snap.uploads.length-1;i>=0;i--){
+          const row=S.snap.uploads[i]||{};
+          if(String(row.id||'').trim()!==targetId)continue;
+          S.snap.uploads[i]={...row,...uploadRow};
+          replaced=true;
+          break;
+        }
+      }
+      if(!replaced)_deltaPushLimited(S.snap.uploads,uploadRow,DELTA_MAX_UPLOADS);
     }
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
@@ -31328,6 +31087,8 @@ function _chatVirtCollectRows(){
   const rows=[];
   for(let i=0;i<feed.length;i++){
     const r=feed[i]||{};
+    const txt=String(r.text||'').trim();
+    if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
     rows.push({...r,_vk:_chatVirtRowKey(r,i)});
   }
   const activeAgentRole=_chatVirtAgentRoleKey(S.snap?.agent_active_role);
@@ -31448,6 +31209,32 @@ function _stripObjectiveInstructionForWorker(raw){
   txt=txt.replace(/^Direct objective:\\s*[^\\n]*(?:\\n|$)/i,'').trim();
   txt=_stripLanguagePolicyLines(txt);
   return txt;
+}
+const RUNTIME_HINT_RENDER_META={
+  'auto-continue':{label:'Auto Continue',tone:'instruction'},
+  'arbiter-continue':{label:'Arbiter Continue',tone:'instruction'},
+  'continuation-briefing':{label:'Continuation Briefing',tone:'instruction'},
+  'reminder':{label:'Reminder',tone:'reminder'},
+  'todo-rescue':{label:'Todo Rescue',tone:'warning'},
+  'tool-retry':{label:'Tool Retry',tone:'warning'},
+  'segmented-retry':{label:'Segmented Retry',tone:'warning'},
+  'forced-converge':{label:'Forced Converge',tone:'warning'},
+  'no-tool-recovery':{label:'No-Tool Recovery',tone:'warning'},
+  'auto-context-recall':{label:'Context Recall',tone:'notice'},
+  'failure-recovery':{label:'Failure Recovery',tone:'warning'},
+  'truncate-rescue':{label:'Truncation Rescue',tone:'warning'},
+  'thinking-empty-recovery':{label:'Thinking Recovery',tone:'warning'},
+  'fault-prefill':{label:'Fault Prefill',tone:'warning'},
+  'edit-recovery':{label:'Edit Recovery',tone:'warning'},
+};
+function _chatVirtParseRuntimeHint(raw){
+  const txt=String(raw||'').trim();
+  if(!txt||txt[0]!=='<')return null;
+  const m=txt.match(/^<([a-z0-9_-]+)(?:\\s+[^>]*)?>([\\s\\S]*)<\\/\\1>$/i);
+  if(!m)return null;
+  const name=String(m[1]||'').trim().toLowerCase();
+  if(!Object.prototype.hasOwnProperty.call(RUNTIME_HINT_RENDER_META,name))return null;
+  return {name,body:String(m[2]||'').trim(),meta:RUNTIME_HINT_RENDER_META[name]||{label:'Runtime Hint',tone:'notice'}};
 }
 function _chatVirtBuildMessageNode(m){
   let kind='assistant_text';
@@ -31570,13 +31357,26 @@ function _chatVirtBuildMessageNode(m){
   if(m.type==='upload'&&m.data){
     const u=m.data;
     const upath=u.workspace_path||'';
+    const parseStatus=String(u.parse_status||'').trim().toLowerCase();
+    const parseError=String(u.parse_error||u.error||'').trim();
     const preview=previewButtonHtml(upath);
-    const pills=[_chatVirtEventPillHtml(String(u.kind||'file'),'info'),_chatVirtEventPillHtml(`size ${u.size||0}`,'neutral')];
+    const pills=[
+      _chatVirtEventPillHtml(String(u.kind||'file'),'info'),
+      _chatVirtEventPillHtml(`size ${u.size||0}`,'neutral'),
+      parseStatus?_chatVirtEventPillHtml(`parse ${parseStatus}`,parseStatus==='done'?'ok':(parseStatus==='failed'?'error':'warn')):'',
+    ];
     const grid=[
       _chatVirtEventCellHtml('path',String(upath||''),{mono:true}),
       _chatVirtEventCellHtml('filename',String(u.filename||''),{mono:true}),
     ];
-    const previewHtml=String(u.preview||'').trim()?`<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`:`<div class=\"msg-event-note\">Preview unavailable for this upload.</div>`;
+    let previewHtml=`<div class=\"msg-event-note\">Preview unavailable for this upload.</div>`;
+    if(parseStatus==='pending'){
+      previewHtml=`<div class=\"msg-event-note\">Parsing uploaded file in background. The bubble will refresh when parsing completes.</div>`;
+    }else if(parseStatus==='failed'){
+      previewHtml=`<div class=\"msg-event-note\">Upload parsing failed${parseError?`: ${esc(parseError)}`:''}</div>`;
+    }else if(String(u.preview||'').trim()){
+      previewHtml=`<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    }
     const bodyHtml=`<div class=\"msg-event-body\">${preview}${previewHtml}</div>`;
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Upload',String(u.filename||'').trim()||'session upload',pills,grid,bodyHtml,'msg-event-card-upload')}`;
     return d;
@@ -31667,10 +31467,21 @@ function _chatVirtBuildMessageNode(m){
   }
   const textKey=`${m._vk}:text`;
   let finalText=String(m.text||'');
+  const runtimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(finalText):null;
   finalText=_stripLeadingAgentTitle(finalText,agentRole);
   if(agentRole&&agentRole!=='manager'){
     const cleaned=_stripObjectiveInstructionForWorker(finalText);
     if(cleaned)finalText=cleaned;
+  }
+  if(runtimeHint){
+    const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
+    const hintTone=String(runtimeHint.meta?.tone||'notice');
+    const bodyKey=`${textKey}:runtime-hint`;
+    const hintBody=runtimeHint.body||finalText;
+    const plainHtml=`<div class=\"msg-md\"><div class=\"md-callout ${esc(hintTone)}\"><div class=\"md-callout-head\">${esc(hintLabel)}</div><div class=\"md-callout-body\">${renderMarkdownCached(hintBody,bodyKey)}</div></div></div>`;
+    d.innerHTML=`${plainHtml}`;
+    d.setAttribute('data-math-request',bodyKey);
+    return d;
   }
   const plainHtml=`<div class=\"msg-md\">${renderMarkdownCached(finalText,textKey)}</div>`;
   d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${plainHtml}</div>`:`${roleBadge}${plainHtml}`;
@@ -32035,7 +31846,7 @@ function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==
 function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='code')return'⌘';return'📄'}
 function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(kids.length)} item(s)</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
 function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=`nodes=${Number(st.nodeCount||0)}${st.inflight?' · loading...':''}`;const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">tree truncated at ${esc(Number(st.maxNodes||0))} nodes</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
-function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>`<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div></div>`).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
+function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>{const status=String(u.parse_status||'').trim();const statusTxt=status?` · parse=${status}`:'';const err=String(u.parse_error||'').trim();return `<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}${esc(statusTxt)}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div>${err?`<div class="upload-entry-path">${esc(err)}</div>`:''}</div>`}).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
 function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
 function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
