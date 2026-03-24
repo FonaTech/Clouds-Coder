@@ -5265,10 +5265,14 @@ triggers:
   - evidence synthesis
   - experiment design
   - systematic analysis
+  - uploaded pdf
+  - uploaded data
+  - scientific report
   - 科研工作流
-  - 证据综合
-  - 文献综述
   - 系统性分析
+  - 证据综合
+  - 数据分析
+  - 文献综述
   - 实验设计
 clouds_coder:
   preferred_tools:
@@ -5282,8 +5286,9 @@ description: >
   Modular research engine with 4 composable phases. Autonomously select which
   phases to activate based on task complexity. Integrates RAG knowledge library,
   web search, scientific reasoning, and report generation.
-  TRIGGER when: systematic multi-source research, experiment design, evidence-based analysis.
-  DO NOT TRIGGER for: simple summaries, single-file analysis, straightforward document creation.
+  TRIGGER when: dedicated research workflow, experiment design, evidence synthesis across many sources.
+  DO NOT TRIGGER for: simple summaries, making PPT/slides, single-file analysis, document creation,
+  or any task where the primary goal is producing a specific output format (use the format skill directly).
 ---
 
 # Research Orchestrator Pro
@@ -5296,6 +5301,7 @@ Assess the task before starting and choose the appropriate phase combination:
 
 | Complexity | Example | Phases |
 |-----------|---------|--------|
+| Quick | "Summarize this PDF" | Phase 1 only |
 | Light | "Summarize and compare these two papers" | 1 → 4 |
 | Medium | "Analyze this data and write a report" | 1 → 2 → 4 |
 | Heavy | "Design experiment based on literature review" | 1 → 2 → 3 → 4 |
@@ -26060,7 +26066,10 @@ class SessionState:
             f"STEP QUALITY REQUIREMENTS:\n"
             f"- Each step must be a concrete, actionable instruction (NOT vague like 'analyze reports')\n"
             f"- Include specific file paths (e.g., 'Read uploaded/IEDM_.parsed.md to extract key findings')\n"
-            f"- Include specific tool calls (e.g., 'Run bash: node generate_pptx.js to produce output.pptx')\n"
+            f"- CRITICAL: Only reference scripts and tools that ACTUALLY EXIST in the skill directories or workspace. "
+            f"DO NOT invent script names like 'analyze_reports.py' or 'generate_pptx.js' that don't exist. "
+            f"Use the real scripts found in /skills/ directories (e.g., project_manager.py, svg_to_pptx.py).\n"
+            f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
             f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
             f"- Each step should be completable in 1-3 tool calls\n"
             f"- Group related substeps under numbered headings (e.g., '2.1 Read report 1', '2.2 Read report 2')\n"
