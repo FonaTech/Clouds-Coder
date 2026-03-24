@@ -5269,105 +5269,166 @@ triggers:
   - 证据综合
   - 文献综述
   - 系统性分析
+  - 实验设计
 clouds_coder:
   preferred_tools:
-    - read_file
+    - query_knowledge_library
     - bash
-    - TodoWrite
+    - read_file
     - write_file
+    - TodoWrite
+    - load_skill
 description: >
-  Research orchestration for evidence synthesis, literature analysis,
-  and structured report preparation. TRIGGER when task involves
-  systematic analysis of multiple sources with structured evidence output.
-  DO NOT TRIGGER for simple PDF summaries, single-file analysis, or
-  straightforward document creation tasks.
+  Modular research engine with 4 composable phases. Autonomously select which
+  phases to activate based on task complexity. Integrates RAG knowledge library,
+  web search, scientific reasoning, and report generation.
+  TRIGGER when: systematic multi-source research, experiment design, evidence-based analysis.
+  DO NOT TRIGGER for: simple summaries, single-file analysis, straightforward document creation.
 ---
 
 # Research Orchestrator Pro
 
-Professional research orchestration for multi-source analysis, evidence synthesis, and structured report preparation.
+Modular experimental exploration engine. Analyze the task and autonomously select which phases to activate — simple tasks may need only Phase 1+4, complex tasks may chain all four phases.
 
-## When to Use
-- Systematic analysis of multiple uploaded documents requiring cross-reference
-- Evidence-based synthesis where claims need traceable sources
-- Experiment design with explicit variables and controls
-- Literature reviews comparing findings across papers
+## Task Complexity Router
 
-## When NOT to Use
-- Simple "summarize this file" tasks — just read and summarize directly
-- Single-file analysis — no orchestration needed
-- Direct document creation (use pptx, docx, xlsx skills instead)
+Assess the task before starting and choose the appropriate phase combination:
 
-## Pipeline Routes
+| Complexity | Example | Phases |
+|-----------|---------|--------|
+| Light | "Summarize and compare these two papers" | 1 → 4 |
+| Medium | "Analyze this data and write a report" | 1 → 2 → 4 |
+| Heavy | "Design experiment based on literature review" | 1 → 2 → 3 → 4 |
+| Full | "Research, analyze, design experiments, produce report" | 1 → 2 → 3 → 4 |
 
-### Route A: Literature Synthesis
-When: Multiple PDFs/documents need comparative analysis
+You may also revisit earlier phases (e.g., return to Phase 1 from Phase 3 if new knowledge is needed).
 
-1. List uploaded files: `ls uploaded/` to identify all inputs
-2. Read each `.parsed.md` file to extract key findings, methods, and conclusions
-3. Create evidence table: `research/evidence_table.csv` with columns: claim, evidence, source, confidence, caveat
-4. Write synthesis: `research/analysis.md` covering themes, agreements, contradictions, and gaps
-5. If presentation/document output needed: prepare structured data for the output skill
+---
 
-### Route B: Data Analysis
-When: CSV/Excel data files need systematic analysis
+## Phase 1: Knowledge Exploration (always start here)
 
-1. Read uploaded data files to understand structure and variables
-2. Identify patterns, trends, outliers, and statistical relationships
-3. Create analysis summary with data-backed claims
-4. Generate charts or tables if needed via bash scripts
+Goal: Build knowledge foundation from available sources.
 
-### Route C: Experiment Design
-When: Task requires experimental planning
+1. **Inventory inputs**: `ls uploaded/` to list all available files
+2. **Read sources**: Read each `.parsed.md` file to extract key findings
+3. **RAG knowledge retrieval**: `query_knowledge_library(query="<topic>", top_k=10, route="hybrid")` for background knowledge from the ingested library
+4. **Web literature search** (if more context needed): `bash` with `curl` to search academic APIs
+5. **Load research skills** if task is complex:
+   - `load_skill('deep-research-orchestrator')` for deep retrieval
+   - `load_skill('pdf-vision-literature-integrator')` for PDF figure analysis
+6. **Output**: `research/knowledge_base.md` — organized findings with sources
 
-1. Define hypothesis clearly (H0 and H1)
-2. Specify independent/dependent variables and controls
-3. Define measurements, instruments, and data collection methods
-4. Set success criteria and failure conditions
-5. Write experiment ledger to `research/experiment_ledger.md`
+## Phase 2: Data Analysis (when data/theory work is needed)
 
-## Workspace Artifacts
-Create these files in the workspace as needed:
-- `research/question.md` — scope, assumptions, constraints
-- `research/evidence_table.csv` — claim, evidence, source, confidence, caveat
-- `research/analysis.md` — synthesis and conclusions
-- `research/report_bundle.json` — structured data for downstream formatting
+Goal: Rigorous analysis with evidence traceability.
+
+1. **Parse data**: `load_skill('upload-tabular-parser')` for CSV/XLSX if needed
+2. **RAG data context**: `query_knowledge_library(query="<specific data query>", route="hybrid")` for benchmarks and historical data
+3. **Statistical analysis**: `bash` with Python for statistics, trends, correlations
+4. **Theory & formula**: When derivation/verification is needed, `load_skill('scientific-reasoning-lab')`:
+   - RAG-backed theory foundation retrieval
+   - Step-by-step derivation with SymPy verification
+   - Programmatic validation against known data
+   - Self-audit iteration (up to 3 rounds)
+5. **Synthesize**: Integrate findings, identify patterns and contradictions
+6. **Output**: `research/evidence_table.csv` + `research/data_analysis.md`
+
+## Phase 3: Experiment Design (when experiments are requested)
+
+Goal: Design or refine experiments with scientific rigor.
+
+1. **Split-table comparison**: Current data vs. target/baseline in structured table
+2. **RAG feasibility check**: `query_knowledge_library(query="<approach> feasibility lessons", route="hybrid")` for historical lessons and known pitfalls
+3. **Experiment specification**: hypothesis, variables, controls, measurements, success criteria
+4. **Auxiliary skills**: `load_skill` for domain-specific enhancement
+5. **Iterative refinement**: Adjust design based on evidence table and RAG feedback
+6. **Output**: `research/experiment_ledger.md` with split-table
+
+## Phase 4: Report & Deliverables (when output is requested)
+
+Goal: Produce professional deliverables with verified conclusions.
+
+1. **Load output skill** based on format:
+   - Slides → `load_skill('pptx')` or `load_skill('ppt')`
+   - Word → `load_skill('kimi-docx')` or `load_skill('docx')`
+   - PDF → `load_skill('kimi-pdf')` or `load_skill('pdf')`
+   - Excel → `load_skill('kimi-xlsx')` or `load_skill('xlsx')`
+   - HTML → `load_skill('html-report-engineering')`
+2. **Build references**: `query_knowledge_library` + `bash` curl for bibliography
+3. **Prepare bundle**: `research/report_bundle.json` with structured data
+4. **Audit**: Cross-check conclusions vs evidence_table vs original sources
+5. **Output**: Final deliverable in requested format
+
+---
+
+## RAG Knowledge Library Guide
+
+Use the built-in TF-Graph_IDF RAG library at every phase:
+
+```
+query_knowledge_library(query="search text", top_k=5, route="hybrid")
+```
+
+- `query`: Search text. Use specific technical terms for better precision
+- `top_k`: Results count (5 default; 10-15 for broad exploration)
+- `route`: `"hybrid"` (recommended) | `"fast"` (exact terms) | `"global"` (semantic) | `"auto"`
+- `category`: Filter by type ("paper", "report", "code")
+- `kind`: Filter by format ("pdf", "docx", "csv")
+
+**Strategy**: hybrid first → narrow based on results → fast for precision → retry with synonyms if empty
+
+---
 
 ## Quality Rules
-- Every important claim needs traceable evidence with source attribution
+- Every claim needs traceable evidence with source attribution
 - Separate: verified facts / inferred conclusions / open questions
-- Never jump from raw uploads to polished output without intermediate evidence structure
-- Record contradictions between sources explicitly instead of silently ignoring them
+- Formula derivations require programmatic verification
+- Experiments require split-table comparison
+- References require proper citations
+- Never skip from raw data to polished output without evidence structure
 """
 
-    research_workflow = """# Workflow Reference
+    research_workflow = """# Tool & Skill Quick Reference
 
-This file provides additional depth for the research workflow. The core workflow is in SKILL.md.
+This reference supplements the main SKILL.md. Core workflow is self-contained in SKILL.md.
 
-## 1. Intake and Routing
-- Identify the research question, constraints, deliverables, and deadline pressure.
-- Detect which source types are present:
-  - uploaded PDF / paper / literature → read .parsed.md files
-  - uploaded CSV / XLS / XLSX → analyze data directly
-  - uploaded DOCX / PPTX → extract content
-  - raw notes or conversation-only requirements
-  - requested output formats (docx, xlsx, pdf, pptx)
+## RAG Knowledge Library
+```
+query_knowledge_library(query="search terms", top_k=5, route="hybrid")
+```
+Routes: auto | fast (keyword) | global (semantic) | hybrid (recommended)
 
-## 2. Workspace Artifact Discipline
-Create or maintain:
-- `research/question.md` for scope and assumptions
-- `research/evidence_table.csv` with `claim,evidence,source,confidence,caveat`
-- `research/analysis.md` for synthesis
-- `research/report_bundle.json` for downstream formatting
+## Web Search via bash
+```
+bash: curl -s "https://api.semanticscholar.org/graph/v1/paper/search?query=DRAM+scaling&limit=5" | python3 -m json.tool
+```
 
-## 3. Evidence Synthesis
-- Merge textual evidence, extracted tables, and visual figure notes when available.
-- Keep a separation between direct evidence and your own inference.
-- Record unresolved contradictions explicitly.
+## Complementary Skills (load as needed)
+| Skill | Use When |
+|-------|----------|
+| deep-research-orchestrator | Deep online/offline literature retrieval |
+| retrieval-synthesis-fallback | Web retrieval with confidence cards |
+| scientific-reasoning-lab | Math derivation, formula verification |
+| upload-tabular-parser | CSV/XLSX data parsing |
+| pdf-vision-literature-integrator | PDF figure + text analysis |
+| visualization-report-pipeline | Chart and visualization generation |
 
-## 4. Report Preparation
-- Use `research/report_bundle.json` to structure data for output formatting.
-- Keep generated files in the workspace, never inside `/skills`.
+## Output Skills (load when producing deliverables)
+| Format | Skills |
+|--------|--------|
+| Slides | pptx, ppt, ppt-master |
+| Word | kimi-docx, minimax-docx, docx |
+| PDF | kimi-pdf, minimax-pdf, pdf |
+| Excel | kimi-xlsx, minimax-xlsx, xlsx |
+| HTML | html-report-engineering |
+
+## Workspace Artifacts
+- `research/knowledge_base.md` — Phase 1 knowledge map
+- `research/evidence_table.csv` — claim, evidence, source, confidence, caveat
+- `research/data_analysis.md` — Phase 2 synthesis
+- `research/experiment_ledger.md` — Phase 3 experiment design
+- `research/report_bundle.json` — Phase 4 handoff data
+- `reasoning/` — scientific-reasoning-lab outputs (derivations, verification scripts)
 """
 
     research_interfaces = """# Report Interfaces
@@ -5551,80 +5612,138 @@ triggers:
   - theorem proof
   - scientific reasoning
   - mechanistic model
+  - formula verification
   - conjecture testing
   - 数学推导
   - 定理证明
   - 科学论证
   - 机理建模
+  - 公式验证
 clouds_coder:
   preferred_tools:
-    - read_file
+    - query_knowledge_library
     - bash
-    - TodoWrite
+    - read_file
     - write_file
+    - TodoWrite
 description: >
-  Deep scientific reasoning for derivations, proofs, and mechanistic models.
-  TRIGGER when task requires formal mathematical reasoning, theory building,
-  or rigorous proof structure. DO NOT TRIGGER for general analysis, summaries,
-  report writing, or data analysis tasks.
+  Self-iterating formula derivation and verification engine. Retrieves theory via RAG,
+  derives with step-by-step justification, verifies programmatically, and audits iteratively.
+  Deeply embedded in research-orchestrator-pro's data analysis pipeline.
+  TRIGGER when: formal math reasoning, formula derivation, theory verification, mechanism modeling.
+  DO NOT TRIGGER for: general analysis, summaries, report writing.
 ---
 
 # Scientific Reasoning Lab
 
-Structured workflow for mathematical derivation, proof construction, mechanistic modeling, and rigorous scientific argumentation.
+Self-iterating derivation and verification engine. Called standalone or chained from research-orchestrator-pro Phase 2 when mathematical/theoretical work is needed.
 
 ## When to Use
 - Mathematical derivation or proof construction
-- Mechanistic model building with explicit assumptions
-- Theory testing with counterexamples and falsification
-- Formal logic or symbolic reasoning tasks
+- Formula verification and mechanism modeling
+- Theory testing with counterexamples and programmatic validation
+- Innovative theoretical exploration with reliability guarantees
 
 ## When NOT to Use
 - General report writing or document creation
-- Data analysis or statistics (use research-orchestrator-pro instead)
-- Simple summaries or explanations
+- Simple data statistics (use research-orchestrator-pro Phase 2 directly)
+- Non-mathematical summaries
 
-## Reasoning Framework
+---
 
-### Step 1: Formalize the Problem
-- State the problem precisely with mathematical notation
-- Define all symbols and notation used
-- List all assumptions explicitly (mark which are standard vs task-specific)
-- State the objective: what needs to be proven, derived, or modeled
+## 5-Step Self-Iterating Reasoning Chain
 
-### Step 2: Build the Derivation
-- Proceed with explicit intermediate steps
-- For each step, note the justification: axiom, known theorem, assumption, or definition
-- If a step requires hand-waving, mark it as a **gap** rather than pretending it is rigorous
+### Step 1: Theory Foundation Retrieval
+- `query_knowledge_library(query="<theory/formula topic>", top_k=10, route="hybrid")` to retrieve related theorems, formulas, known results
+- Read context data and constraints from the current task
+- Formalize the problem: notation, symbols, assumptions, objective
+- Identify what is known vs. what needs derivation
+- **Output**: `reasoning/problem_formalization.md`
+
+### Step 2: Derivation & Solving
+- Build derivation with explicit intermediate steps
+- For each step, note justification: axiom | known theorem | assumption | definition
+- Mark any hand-wavy steps as **[GAP]** — do not pretend they are rigorous
+- `bash` with Python/SymPy for symbolic computation:
+  ```
+  bash: python3 -c "from sympy import *; x = symbols('x'); print(solve(...))"
+  ```
+- `bash` with numerical computation for verification
 - Keep notation consistent throughout
+- **Output**: `reasoning/derivation.md`
 
-### Step 3: Validate
-- Test the result with at least one concrete counterexample attempt
-- Check edge cases (zero, infinity, boundary conditions)
-- Verify dimensional consistency if applicable
-- Look for hidden assumptions or unstated constraints
+### Step 3: Programmatic Verification
+- Write Python script implementing the derived formula/model
+- Test against known data points and boundary conditions
+- Compare theoretical predictions vs. actual data
+- Check dimensional consistency, sign correctness, limiting cases
+- `bash` to execute: `python3 reasoning/verification_script.py`
+- **Output**: `reasoning/verification_script.py` + verification report
 
-### Step 4: Classify the Result
-- **Proven**: rigorous derivation with no gaps, all assumptions stated
-- **Plausible**: logical chain but with unverified assumptions or gaps
-- **Rejected**: valid counterexample found
-- **Open**: insufficient information to decide; list what is missing
+### Step 4: Audit & Iteration (up to 3 rounds)
+Self-check against this audit checklist:
+- [ ] Hidden assumptions not explicitly stated?
+- [ ] Algebraic or calculus errors?
+- [ ] Missing edge cases (zero, infinity, singularities)?
+- [ ] Unsupported causal leaps?
+- [ ] Notation inconsistencies?
 
-## Output Format
-Structure results as a proof ledger:
-- Problem statement
-- Notation and definitions
-- Assumptions (standard + task-specific)
-- Derivation steps with justifications
-- Counterexamples tested
-- Final status: proven / plausible / rejected / open
+Then cross-validate:
+- `query_knowledge_library(query="<conclusion> verification", route="hybrid")` to check against literature
+- If issues found → return to Step 2 with corrections (max 3 iterations)
+- Log each iteration in audit log
+- **Output**: `reasoning/audit_log.md`
+
+### Step 5: Result Classification & Output
+Classify the final result:
+- **Proven**: Rigorous derivation + programmatic verification passed + audit clean
+- **Plausible**: Logical chain complete but unverified assumptions remain
+- **Rejected**: Valid counterexample found or verification failed
+- **Open**: Insufficient information; list what is missing
+
+**Output**: `reasoning/conclusion.md` with:
+- Final status and confidence level
+- Complete derivation chain
+- Verification evidence
 - Open questions and next steps
 
+---
+
+## Integration with research-orchestrator-pro
+
+When called from research-orchestrator-pro Phase 2:
+1. Receive the mathematical/theoretical sub-task
+2. Execute Steps 1-5 above
+3. Write conclusions to `research/evidence_table.csv` (claim + evidence + confidence)
+4. Keep verification scripts in `reasoning/` for audit trail
+5. Return control to research-orchestrator-pro
+
+---
+
+## RAG Knowledge Library Guide
+
+Use the built-in TF-Graph_IDF RAG library for theory retrieval:
+
+```
+query_knowledge_library(query="search text", top_k=5, route="hybrid")
+```
+
+- `query`: Use specific mathematical/theoretical terms
+- `top_k`: 5 for focused, 10-15 for broad exploration
+- `route`: `"hybrid"` (recommended) | `"fast"` (exact terms) | `"global"` (semantic)
+- `category`: Filter by "paper", "report" for academic sources
+
+**Strategy**: Query related theorems first → verify known results → then attempt novel derivation
+
+---
+
 ## Quality Rules
-- Never present speculative theory as established fact
-- Keep an explicit "open questions" section instead of hiding uncertainty
-- Distinguish between: proven results, plausible conjectures, and unverified external facts
-- If the reasoning packet needs to become a document, prepare structured data and let the user decide the output format
+- Never present speculation as established fact
+- Every derivation step needs explicit justification
+- Programmatic verification is mandatory for non-trivial results
+- Keep "open questions" section — uncertainty is a valid outcome
+- Distinguish: proven results / plausible conjectures / unverified claims
+- Innovation is encouraged, but reliability comes first
 """
 
     scientific_ledger = """# Proof Ledger
