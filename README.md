@@ -8,9 +8,10 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-  <a href="./CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
-  <a href="./CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
-  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
+  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog</a> ·
+  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
+  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -22,7 +23,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md) | Previous: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
+Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | Previous: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -102,6 +103,9 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - **Native multimodal support** — read_file auto-detects image/audio/video and injects as native model input when supported
 - **Real-time user input merge** — mid-execution feedback adjusts plan direction without restart
 - **Restart intent fusion** — user > plan > context priority when resuming after finish/abort
+- **Universal Skills ecosystem** — compatible with 5 major skill ecosystems (awesome-claude-skills, Minimax-skills, skills-main, kimi-agent-internals, academic-pptx); LLM-driven autonomous discovery and loading with multi-skill support and conflict detection
+- **Dual RAG knowledge architecture** — Code RAG (`CodeIngestionService`) + Data RAG (`RAGIngestionService`), both built on TF_G_IDF_RAG, with unified `query_knowledge_library` retrieval interface and injected retrieval guides in built-in skills
+- **Multi-factor priority context compression** — 10-factor message importance scoring (recency, role, task progress, errors, goal relevance, skills, compact-resume) replaces chronological-only trimming
 - Built-in Web UI + optional external Web UI loading
 - Skills Studio (separate UI/port) for skill scanning, editing, and generation
 - Ollama integration with model probing and catalog loading
@@ -453,7 +457,7 @@ Priority-ordered updates merged into this architecture:
 - Added system-level imports for orchestration and non-blocking control paths: `deque`, `selectors`, `signal`, `shlex`.
 - Expanded `RUNTIME_CONTROL_HINT_PREFIXES` with `<arbiter-continue>` and `<fault-prefill>` for richer recovery loops.
 
-The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md).
+The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md).
 
 ### 3.6 2026-03-16 Critical Fix: Single-Mode Agent Leak & Termination Signal
 
@@ -471,7 +475,7 @@ Two interrelated critical bugs were fixed in the multi-agent orchestration layer
   - Layer 3 — Sync-loop interception: post-turn conclusive-reply detection in `_multi_agent_sync_blackboard_worker()` with auto-approval and immediate break.
 - Safety guards: conclusive-reply finish is suppressed when error logs exist or open todo items remain.
 
-Full trilingual details: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md)
+Full trilingual details: [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
 
 ### 3.7 2026-03-20 Major Update: Plan Mode Architecture & Core Overhaul
 
@@ -512,11 +516,109 @@ The largest architecture update since project inception — 7 modules, 60+ modif
 - `_run_read()` detects image/audio/video files and injects as native multimodal input when model supports it.
 - TodoWrite in plan mode creates sub-items tagged with owner, preventing plan_step overwrite.
 
-Full trilingual details: [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md)
+Full trilingual details: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+
+### 3.8 2026-03-25 Update: Universal Skills Ecosystem + Dual RAG Architecture + Core Fixes
+
+**Universal Skills Ecosystem Compatibility**
+- Now compatible with 5 major skill ecosystems — no per-provider adapters needed:
+  - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — curated community Claude skills collection
+  - [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax official skills (frontend/fullstack/iOS/Android/PDF/PPTX)
+  - [anthropics/skills](https://github.com/anthropics/skills) — Anthropic official skills repository (`skills-main`)
+  - [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent skill system analysis and extracted skill artifacts
+  - [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — academic presentation skill with action titles, citation standards, and argument structure
+- Root cause of prior failures fixed: Execution Guide injection (removed) was forcing `read_file` on virtual skill paths that don't exist, causing infinite loops instead of skill execution.
+- Chain Tracking system removed (7 methods); `_broadcast_loaded_skill` simplified from 16→6 fields; `_loaded_skills_prompt_hint` reduced from ~350→~120 tokens.
+- LLM-driven autonomous discovery: the model decides which skill fits the task based on task type, not keyword triggers. Multi-skill loading enabled with conflict pair detection.
+- Sync-mode Manager gains `TodoWrite` capability for plan-skill coordination.
+- New `_preload_skills_from_plan_steps` proactively scans plan steps for skill name mentions and preloads before execution.
+- Plan steps limit raised 10→20; per-step limit 400→600 chars; anti-hallucination constraint added to plan synthesis.
+
+**Dual RAG Knowledge Architecture**
+- `RAGIngestionService` (Data RAG): handles documents, PDFs, structured data — general knowledge base.
+- `CodeIngestionService` (Code RAG): handles source code files with code-aware tokenization — code knowledge base.
+- Both built on TF_G_IDF_RAG; `query_knowledge_library(query, top_k)` provides a unified retrieval interface that searches both libraries in parallel.
+- Full RAG retrieval guide injected into `research-orchestrator-pro` and `scientific-reasoning-lab` built-in skills.
+
+Dual RAG architecture:
+
+```mermaid
+flowchart TB
+  subgraph Ingestion
+    DF["Documents / PDF / Data Files"]
+    CF["Source Code Files"]
+    DR["RAGIngestionService<br/>(Data RAG)"]
+    CR["CodeIngestionService<br/>(Code RAG)"]
+    DF --> DR
+    CF --> CR
+  end
+  subgraph Storage
+    TG1["TF_G_IDF_RAG<br/>(Data Knowledge Base)"]
+    TG2["TF_G_IDF_RAG<br/>(Code Knowledge Base)"]
+    DR --> TG1
+    CR --> TG2
+  end
+  subgraph Retrieval
+    Q["query_knowledge_library(query, top_k)"]
+    TG1 -->|parallel search| Q
+    TG2 -->|parallel search| Q
+    Q --> R["Merged Ranked Results"]
+  end
+  subgraph Consumption
+    SK1["research-orchestrator-pro<br/>(RAG guide injected)"]
+    SK2["scientific-reasoning-lab<br/>(RAG guide injected)"]
+    AG["Agent (LLM)"]
+    R --> SK1
+    R --> SK2
+    SK1 --> AG
+    SK2 --> AG
+  end
+```
+
+RAG retrieval flow:
+
+```mermaid
+sequenceDiagram
+  participant M as Agent (LLM)
+  participant S as Built-in Skill (RAG guide)
+  participant Q as query_knowledge_library
+  participant DR as Data RAG (RAGIngestionService)
+  participant CR as Code RAG (CodeIngestionService)
+  participant BB as Blackboard
+
+  M->>S: execute task (skill loaded)
+  S->>Q: query_knowledge_library("search terms", top_k=5)
+  Q->>DR: parallel search — document/PDF knowledge base
+  Q->>CR: parallel search — code knowledge base
+  DR-->>Q: matches (TF_G_IDF ranked)
+  CR-->>Q: matches (TF_G_IDF ranked)
+  Q-->>S: merged top_k results
+  S->>M: inject results as background knowledge
+  M->>BB: write(research_notes / code_artifacts)
+```
+
+**Built-in Skills Overhaul**
+- `research-orchestrator-pro` rewritten as a cooperative analysis decision hub: focuses on evidence synthesis, delegates output formatting to output-type skills (ppt, report), and includes anti-hallucination posture.
+- `scientific-reasoning-lab` rebuilt as a 5-phase self-iterating reasoning engine (decompose → derive → verify → evaluate → integrate), embedded as Phase 2 sub-engine of research-orchestrator-pro.
+
+**Multi-Factor Priority Context Compression**
+- New `_classify_message_priority`: 10-factor scoring (recency 0–3, role weight, task progress markers +2, errors +2, goal relevance +1, skills +1, compact-resume =10).
+- New `_priority_compress_messages`: high-score (≥7) kept intact, mid-score (4–6) truncated to 500-char summary, low-score (0–3) collapsed to one-liner.
+- `_build_state_handoff` enhanced with PLAN_PROGRESS, CURRENT_STEP, ACTIVE_SKILLS, RECENT_TOOLS fields.
+- `_auto_compact` integrates priority compression first, with chronological `pop(0)` as safety fallback.
+
+**Anti-stall Mechanism Optimization**
+- Threshold raised from 2→3 consecutive same-target delegations before triggering.
+- Instruction softened from "CHANGE YOUR APPROACH" to collaborative guidance (ask_colleague / try different tool / call finish_current_task).
+
+**Critical Bug Fixes**
+- `CodeIngestionService._flush_lock`: added missing `threading.Lock()` — previously caused `AttributeError` when uploading to Code Library.
+- Frontend `setTaskLevel()`: added `scheduleSnapshot()` after level update — previously caused the task-level selector to revert to "Auto" on next SSE refresh.
+- `_sync_todos_from_blackboard`: worker items (`owner ∈ {developer, explorer, reviewer}`) now preserved separately across blackboard syncs — previously lost every cycle.
+
+Full trilingual details: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
 
 ## 4. Key Runtime Components
-
-Main runtime file: `Clouds_Coder.py`.
 
 - `AppContext`: global runtime container (config, model catalog, server runtime state)
 - `SessionManager`: session lifecycle and lookup
@@ -527,6 +629,231 @@ Main runtime file: `Clouds_Coder.py`.
 - `TodoManager` / `TaskManager` / `BackgroundManager`: planning and async execution
 - `WorktreeManager`: isolated work directory coordination for task execution
 - `Handler` / `SkillsHandler`: HTTP API endpoints for Agent UI and Skills Studio
+- `RAGIngestionService` (Data RAG) + `CodeIngestionService` (Code RAG): dual knowledge base ingestion and retrieval engines built on `TFGraphIDFIndex` / `CodeGraphIndex`
+
+## 4.1 RAG Knowledge Architecture: TF-Graph_IDF Engine
+
+Clouds Coder ships with a retrieval engine called **TF-Graph_IDF** that combines lexical scoring, knowledge graph topology, automatic community detection, and multi-route query orchestration — offering meaningfully better recall quality than standard TF-IDF or BM25.
+
+### Dual-Library Design
+
+```mermaid
+flowchart TB
+  subgraph INPUT["Input Sources"]
+    D["Documents / PDFs / CSVs<br/>(uploaded or session files)"]
+    C["Source Code Files<br/>(.py .js .ts .go .java ...)"]
+  end
+
+  subgraph INGEST["Ingestion Layer"]
+    direction TB
+    RI["RAGIngestionService<br/>(Data RAG)<br/>4 worker threads, batch flush"]
+    CI["CodeIngestionService<br/>(Code RAG)<br/>code-aware tokenizer + symbol extractor"]
+  end
+
+  subgraph INDEX["TF-Graph_IDF Index Layer"]
+    direction TB
+    TGI["TFGraphIDFIndex<br/>─────────────────────────────<br/>① Lexical layer<br/>  inverted index · IDF · chunk_norms<br/>② Graph layer<br/>  entity_to_docs · related_docs · graph_degree<br/>③ Community layer<br/>  auto-detect · community_reports<br/>  community_inverted · cross-community bridges<br/>④ Dynamic noise layer<br/>  hard_tokens · soft_penalties[0.1–1.0]"]
+    CGI["CodeGraphIndex ⊇ TFGraphIDFIndex<br/>─────────────────────────────<br/>+ import_edges (module dependency graph)<br/>+ symbol_to_docs (function/class → files)<br/>+ path_to_doc (filepath → doc_id)<br/>+ per-chunk: line_start/end · symbol · kind"]
+  end
+
+  subgraph QUERY["Query Layer"]
+    direction TB
+    QR["Query Router<br/>_decide_query_route()<br/>global_score vs local_score"]
+    F["FAST path<br/>vector retrieval<br/>lexical × 0.82 + graph_bonus"]
+    G["GLOBAL path<br/>community ranking<br/>→ Map: per-community retrieval<br/>→ Bridge: cross-community links<br/>→ Reduce: global synthesis row"]
+    H["HYBRID path<br/>1 global + 2 fast<br/>interleaved merge"]
+  end
+
+  subgraph OUT["Consumption"]
+    SK["Built-in Skills<br/>research-orchestrator-pro<br/>scientific-reasoning-lab"]
+    AG["Agent (LLM)"]
+  end
+
+  D --> RI --> TGI
+  C --> CI --> CGI
+  TGI & CGI --> QR
+  QR -->|"local query<br/>short / precise"| F
+  QR -->|"cross-domain<br/>global_score ≥ 5"| G
+  QR -->|"balanced<br/>global_score 3–4"| H
+  F & G & H --> SK --> AG
+```
+
+### TF-Graph_IDF Scoring Formula
+
+Every retrieved chunk receives a score composed of a **lexical component** and a **graph bonus**:
+
+```
+final_score = lexical × 0.82 + graph_bonus         (Data RAG)
+final_score = lexical × 0.78 + graph_bonus         (Code RAG — more graph weight)
+
+lexical     = Σ(q_weight_i × c_weight_i) / (query_norm × chunk_norm)
+
+graph_bonus = 0.18 × entity_overlap                 (shared named entities)
+            + 0.10 × doc_entity_overlap              (doc-level entity match)
+            + min(0.16, log(doc_graph_degree+1)/12) (hub document boost)
+            + 0.08  (if query category == doc category)
+            + min(0.08, log(community_doc_count+1)/16)
+
+Code RAG additional bonuses:
+            + 0.16 × symbol_overlap                  (function/class name match)
+            + 0.28  (if file path appears in query)
+            + 0.20  (if filename appears in query)
+            + 0.14  (if module name appears in query)
+            + min(0.12, log(import_degree+1)/9)      (import graph centrality)
+```
+
+Token weight with dynamic noise:
+
+```
+idf[token]    = log((1 + N_chunks) / (1 + df[token])) + 1.0
+tf_weight     = (1 + log(freq)) × idf[token] × dynamic_noise_penalty[token]
+chunk_norm    = √Σ(tf_weight²)
+
+dynamic_noise_penalty ∈ [0.10, 1.0]  — computed per corpus, not a static stopword list
+```
+
+### Dynamic Noise Suppression — Corpus-Adaptive Token Weighting
+
+```mermaid
+flowchart LR
+  T["Token: 't'"] --> A{"doc_ratio\n≥ 65%\nAND\ncommunity_ratio\n≥ 90%?"}
+  A -->|"YES (both)"| HT["Hard token\npenalty = 0 (filtered)"]
+  A -->|"NO"| B{"doc_ratio ≥ 55%\nOR\ncommunity_ratio\n≥ 85%?"}
+  B -->|"YES"| C["Compute pressure:\n= max(doc_pressure, community_pressure)"]
+  C --> D["penalty = max(0.10, 0.58 − 0.42 × pressure)\n→ range [0.10, 0.58]"]
+  B -->|"NO"| E["penalty = 1.0\n(no suppression)"]
+```
+
+This replaces the hard-coded stopword lists used in standard TF-IDF: tokens like "the" or "and" are penalized when corpus evidence confirms they are uninformative **in this specific knowledge base**, not because they appear in a pre-built list. Domain-specific common terms get the right penalty level derived from actual document distribution.
+
+### Three-Route Query Orchestration
+
+```mermaid
+flowchart TD
+  Q["User Query"] --> W["_query_weights()\nTokenize + apply noise penalties"]
+  W --> RD["_decide_query_route()\nScore: global indicators vs local indicators"]
+
+  RD -->|"global_score ≥ 5\nAND > local_score+1"| G
+  RD -->|"global_score 3–4\nAND > local_score"| H
+  RD -->|"otherwise\nor ≤1 community"| F
+
+  subgraph F["FAST — Precise retrieval"]
+    F1["Dot-product on inverted index"] --> F2["Score: lexical × 0.82 + graph_bonus"]
+    F2 --> F3["Return top-K chunks"]
+  end
+
+  subgraph G["GLOBAL — Cross-community synthesis"]
+    G1["Rank communities on community_inverted"] --> G2["Select top-3 communities"]
+    G2 --> G3["MAP: FAST query within each community"]
+    G3 --> G4["BRIDGE: traverse cross-community entity links\nscore = 0.26 + log(link_weight+1)/5.2"]
+    G4 --> G5["REDUCE: Global Synthesis row\n= [map rows + bridge rows + support chunks]"]
+  end
+
+  subgraph H["HYBRID — Balanced"]
+    H1["Run FAST (top-8)"] & H2["Run GLOBAL (top-6)"]
+    H1 & H2 --> H3["Interleave: 1 global + 2 fast + 1 global + 2 fast ..."]
+  end
+
+  F & G & H --> OUT["Deduplicate → Sort → Return top-K"]
+```
+
+**Route decision signals:**
+- Global indicators (+score): query length ≥ 18 tokens, ≥ 2 named entities, keywords like "compare"/"overall"/"trend"/"survey"
+- Local indicators (+score): keywords like "what is"/"which file"/file extension in query, short queries ≤ 10 tokens
+
+### Automatic Community Detection
+
+Documents are automatically grouped into communities based on `(category, language, top_entities)` — no manual taxonomy required.
+
+```mermaid
+flowchart LR
+  subgraph Docs["Ingested Documents"]
+    D1["paper_A.pdf\ncategory=research\nlang=en\nentities=[ML,LSTM]"]
+    D2["paper_B.pdf\ncategory=research\nlang=en\nentities=[ML,CNN]"]
+    D3["train.py\ncategory=code\nlang=python\nentities=[model,dataset]"]
+    D4["data_analysis.py\ncategory=code\nlang=python\nentities=[pandas,numpy]"]
+  end
+
+  subgraph Communities["Auto-detected Communities"]
+    C1["research:en:ML\n= D1 + D2\ncross-link: CNN↔LSTM shared entity"]
+    C2["code:python:model\n= D3"]
+    C3["code:python:pandas\n= D4"]
+  end
+
+  subgraph Reports["Community Reports (for GLOBAL queries)"]
+    R1["Community: research:en:ML\nDocs: 2, Top entities: ML, CNN, LSTM\nBridge → code:python:model (shared: model)"]
+  end
+
+  D1 & D2 --> C1
+  D3 --> C2
+  D4 --> C3
+  C1 --> R1
+```
+
+Each community generates a **Community Report** — a structured text summary of member documents, top entities, and cross-community links. GLOBAL queries retrieve at the community level first, then drill into chunks.
+
+### Code RAG: Module Dependency Graph
+
+`CodeGraphIndex` extends `TFGraphIDFIndex` with a code-native knowledge graph:
+
+```mermaid
+flowchart LR
+  subgraph FILES["Source Files"]
+    A["session_state.py\nimports: threading, json\nexports: SessionState, _run_bash\nsymbols: 847 (methods + classes)"]
+    B["event_hub.py\nimports: threading, queue\nexports: EventHub, publish\nsymbols: 124"]
+    C["rag_service.py\nimports: threading, json, session_state\nexports: RAGIngestionService\nsymbols: 312"]
+  end
+
+  subgraph GRAPH["Import Dependency Graph"]
+    N1["session_state"] -->|"import weight: 3"| N2["threading"]
+    N1 -->|"weight: 1"| N3["json"]
+    N4["rag_service"] -->|"weight: 1"| N1
+    N4 -->|"weight: 1"| N3
+    N5["event_hub"] -->|"weight: 2"| N2
+  end
+
+  subgraph SYMBOLS["Symbol Index"]
+    S1["SessionState → session_state.py"]
+    S2["EventHub → event_hub.py"]
+    S3["RAGIngestionService → rag_service.py"]
+    S4["_run_bash:L1842 → session_state.py"]
+  end
+
+  A --> N1 & SYMBOLS
+  B --> N5 & SYMBOLS
+  C --> N4 & SYMBOLS
+```
+
+When a query mentions `"RAGIngestionService"`, the symbol index directly surfaces `rag_service.py`, with bonus scores for import-graph centrality (highly imported files rank higher).
+
+### Advantages Over Standard RAG Approaches
+
+| Capability | Standard TF-IDF | BM25 | Embedding / Vector RAG | **TF-Graph_IDF (Clouds Coder)** |
+|---|---|---|---|---|
+| Stopword handling | Static list | Static list | Implicit (embedding space) | **Corpus-adaptive dynamic penalties** |
+| IDF smoothing | `log(N/df)` | Saturated BM25 | N/A | `log((1+N)/(1+df)) + 1.0` |
+| TF saturation | None | BM25 k₁ parameter | N/A | `log(freq)` + noise penalty |
+| Knowledge graph | ✗ | ✗ | ✗ | **Entity overlap + doc graph degree + community topology** |
+| Multi-tier retrieval | Flat | Flat | Flat | **chunk → document → community** |
+| Community synthesis | ✗ | ✗ | ✗ | **Auto community detection + Map-Reduce across communities** |
+| Cross-domain bridges | ✗ | ✗ | ✗ | **Entity-linked community bridges** |
+| Code-native graph | ✗ | ✗ | ✗ | **Import edges + symbol table + line ranges** |
+| Query routing | Fixed | Fixed | Fixed | **Auto: fast / global / hybrid** |
+| Out-of-vocabulary | Fails | Fails | Handles via embedding | Handled via entity extraction |
+| Explainability | Score decomposition | Score decomposition | Black box | **Full score breakdown: lexical + entity + graph + community** |
+| Requires GPU/embedding model | ✗ | ✗ | ✓ (required) | **✗ — pure in-process, no external model** |
+
+**Key design choices and their rationale:**
+
+1. **No embedding model required** — TF-Graph_IDF is fully in-process (Python + JSON snapshots). No GPU, no API call, no vector DB. Retrieval latency is sub-millisecond for typical knowledge bases.
+
+2. **Dynamic noise > static stopwords** — A token like "model" is essential in a code RAG context but irrelevant noise in a domain where every document discusses "models". The corpus-derived penalty adapts to the actual knowledge base, not a universal list.
+
+3. **Graph bonus makes hub documents discoverable** — A central file that many other files import (`graph_degree` high) is naturally surfaced even for loosely matching queries. This solves the "important file buried in results" problem common in pure lexical retrieval.
+
+4. **Community Map-Reduce for synthesis queries** — When a user asks "compare ML frameworks across projects", FAST retrieval returns scattered chunks. GLOBAL retrieval groups by community, generates per-community summaries, and synthesizes a unified view — closer to what a human analyst would do.
+
+5. **Code RAG path match bonus (+0.28)** — When a query explicitly names a file path, the retrieval weights that file almost certainly to top-1, eliminating irrelevant results caused by overlapping token content between files.
 
 ## 5. Complex-Task Reliability Design
 
@@ -593,21 +920,32 @@ Clouds Coder Web UI is designed for long sessions and frequent state updates.
 
 ## 7. Skills System
 
-Two layers:
+Two capability layers:
 
-- Runtime skill loading (agent execution): local skill files + provider protocols
-- Skills Studio (authoring): scan, inspect, generate, save, upload skills
+- **Runtime skill loading** (agent execution): local skill files + HTTP JSON provider manifest protocol
+- **Skills Studio** (authoring): scan, inspect, generate, save, upload skills
+
+**Universal ecosystem compatibility** — skills from any of these ecosystems load and execute without adapters:
+- [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — curated community Claude skills collection
+- [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax official skills (frontend/fullstack/iOS/Android/PDF/PPTX)
+- [anthropics/skills](https://github.com/anthropics/skills) — Anthropic official skills repository
+- [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent skill system analysis and extracted skill artifacts
+- [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — academic presentation skill with action titles, citation standards, and argument structure
+
+**Loading mechanics**:
+- LLM-driven autonomous discovery: the model judges task type and selects the appropriate skill — no keyword-based forced triggers
+- Multi-skill loading: multiple skills can be active simultaneously; directly conflicting skill pairs are blocked
+- Plan-step preloading: `_preload_skills_from_plan_steps` scans plan step text and proactively preloads referenced skills before execution begins
+
+**Built-in skills** (bundled and updated in this release):
+- `research-orchestrator-pro`: cooperative analysis decision hub with injected RAG retrieval guide
+- `scientific-reasoning-lab`: 5-phase self-iterating reasoning engine (decompose → derive → verify → evaluate → integrate) with injected RAG retrieval guide
 
 Current skill composition in this repository:
 
 - Reusable baseline skills: `skills/code-review`, `skills/agent-builder`, `skills/mcp-builder`, `skills/pdf`
 - Generated/extended skills: `skills/generated/*`
 - Protocol and indexing assets: `skills/clawhub/`, `skills/skills_Gen/`
-
-Supported protocol directions in code include:
-
-- Local file-based skill protocol
-- HTTP JSON provider manifest protocol
 
 ## 8. API Surface (Summary)
 
