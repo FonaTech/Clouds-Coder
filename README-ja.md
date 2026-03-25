@@ -7,6 +7,11 @@
   <a href="./README-ja.md">日本語</a>
 </p>
 <p align="center">
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/v/clouds-coder.svg" alt="PyPI バージョン" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/pyversions/clouds-coder.svg" alt="Python バージョン" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
+</p>
+<p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
@@ -939,7 +944,24 @@ flowchart LR
 
 ## 9. クイックスタート
 
-### 9.1 必要環境
+### 9.0 PyPI インストール（推奨）
+
+```bash
+pip install clouds-coder
+```
+
+インストール後、直接起動：
+
+```bash
+clouds-coder --host 0.0.0.0 --port 8080
+```
+
+- Agent UI：`http://127.0.0.1:8080`
+- Skills Studio：`http://127.0.0.1:8081`（無効化可能）
+
+> PyPI ページ：https://pypi.org/project/clouds-coder/
+
+### 9.1 必要環境（ソースインストール）
 
 - Python 3.10+
 - Ollama（ローカルモデル運用向け、推奨）
@@ -949,7 +971,7 @@ flowchart LR
 pip install -r requirements.txt
 ```
 
-### 9.2 起動
+### 9.2 起動（ソースインストール）
 
 ```bash
 python Clouds_Coder.py --host 0.0.0.0 --port 8080

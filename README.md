@@ -7,6 +7,11 @@
   <a href="./README-ja.md">日本語</a>
 </p>
 <p align="center">
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/v/clouds-coder.svg" alt="PyPI version" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/pyversions/clouds-coder.svg" alt="Python versions" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
+</p>
+<p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog</a> ·
@@ -961,7 +966,24 @@ Major endpoint groups:
 
 ## 9. Quick Start
 
-### 9.1 Requirements
+### 9.0 Install from PyPI (Recommended)
+
+```bash
+pip install clouds-coder
+```
+
+Then start directly:
+
+```bash
+clouds-coder --host 0.0.0.0 --port 8080
+```
+
+- Agent UI: `http://127.0.0.1:8080`
+- Skills Studio: `http://127.0.0.1:8081` (unless disabled)
+
+> PyPI page: https://pypi.org/project/clouds-coder/
+
+### 9.1 Requirements (Source Install)
 
 - Python 3.10+
 - Ollama (for local model serving, optional but recommended)
@@ -971,7 +993,7 @@ Major endpoint groups:
 pip install -r requirements.txt
 ```
 
-### 9.2 Run
+### 9.2 Run (Source Install)
 
 ```bash
 python Clouds_Coder.py --host 0.0.0.0 --port 8080
