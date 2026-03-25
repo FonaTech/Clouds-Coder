@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import ast
 import base64
-from collections import deque
+from collections import Counter, defaultdict, deque
+import concurrent.futures
 import csv
 import difflib
 import errno
@@ -12,6 +14,8 @@ import hmac
 import io
 import importlib.util
 import json
+import math
+import multiprocessing
 import mimetypes
 import os
 import queue
@@ -23,6 +27,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -43,11 +48,100 @@ except Exception:
 APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
-WORKDIR = Path(os.getenv("AGENT_WORKDIR", os.getcwd())).resolve()
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _resolve_default_agent_workdir() -> Path:
+    raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return SCRIPT_DIR
+
+def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
+    root = Path(workspace).resolve()
+    legacy_root = (root / "skills").resolve()
+    moved: list[str] = []
+    errors: list[str] = []
+    if legacy_root == root or (not legacy_root.exists()) or (not legacy_root.is_dir()):
+        return {
+            "root": str(root),
+            "legacy_root": str(legacy_root),
+            "moved": moved,
+            "errors": errors,
+        }
+    # Earlier builds could incorrectly place runtime data under workspace/skills when started from that cwd.
+    for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
+        src = legacy_root / name
+        dst = root / name
+        try:
+            if (not src.exists()) or dst.exists():
+                continue
+            shutil.move(str(src), str(dst))
+            moved.append(name)
+        except Exception as exc:
+            errors.append(f"{name}:{trim(str(exc), 220)}")
+    return {
+        "root": str(root),
+        "legacy_root": str(legacy_root),
+        "moved": moved,
+        "errors": errors,
+    }
+
+WORKDIR = _resolve_default_agent_workdir()
 CODES_ROOT = WORKDIR / "Codes"
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 MAX_TOOL_OUTPUT = 50_000
+LONG_OUTPUT_MODEL_PAGE_CHARS = 12_000
+LONG_OUTPUT_UI_PAGE_CHARS = 2_400
+LONG_OUTPUT_UI_PREVIEW_MAX_PAGES = 4
+LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
+LONG_OUTPUT_READ_PAGE_LINES = 240
+LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
+LONG_OUTPUT_TEMP_MAX_FILES = 160
+JSON_FSYNC_ENABLED = str(os.getenv("AGENT_JSON_FSYNC", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+RAG_LIBRARY_DIRNAME = "RAG_Library"
+RAG_ADMIN_PORT_OFFSET = 2
+CODE_LIBRARY_DIRNAME = "Code_Library"
+CODE_ADMIN_PORT_OFFSET = 3
+RAG_CHUNK_CHARS = 1200
+RAG_CHUNK_OVERLAP = 180
+RAG_MAX_CHUNKS_PER_DOC = 200
+CODE_CHUNK_CHARS = 1800
+CODE_CHUNK_OVERLAP = 120
+CODE_MAX_CHUNKS_PER_DOC = 260
+RAG_MAX_QUERY_RESULTS = 12
+RAG_GRAPH_MAX_NODES = 2000
+RAG_TASK_HISTORY_LIMIT = 400
+RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
+RAG_MAX_IMPORT_FILES = 20_000
+RAG_MAX_IMPORT_BATCH_ITEMS = 500
+RAG_MAX_IMPORT_BATCH_BYTES = 48 * 1024 * 1024
+RAG_PDF_IMAGE_LIMIT = 8
+RAG_QUERY_CONTEXT_CHARS = 1600
+RAG_MAX_GLOBAL_COMMUNITIES = 5
+RAG_MAX_COMMUNITY_MAP_SUPPORT = 4
+RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT = False
+RAG_DYNAMIC_NOISE_MIN_DOC_FREQ = 6
+RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ = 2
+RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO = 0.18
+RAG_DYNAMIC_NOISE_HARD_DOC_RATIO = 0.42
+RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
+RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
+RAG_IMPORT_WORKER_COUNT = max(
+    1,
+    min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
+)
+CODE_IMPORT_WORKER_COUNT = max(
+    1,
+    min(4, int(str(os.getenv("AGENT_CODE_IMPORT_WORKERS", str(RAG_IMPORT_WORKER_COUNT)) or str(RAG_IMPORT_WORKER_COUNT)))),
+)
+RAG_PARSE_TIMEOUT_SECONDS = max(
+    15,
+    min(240, int(str(os.getenv("AGENT_RAG_PARSE_TIMEOUT", "75") or "75"))),
+)
+CODE_PARSE_TIMEOUT_SECONDS = max(
+    10,
+    min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
+)
 TOKEN_THRESHOLD = 1_000_000
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
@@ -101,6 +195,25 @@ WATCHDOG_STEP_MAX_ATTEMPTS = 2
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2
 THINKING_BUDGET_FORCE_RATIO = 0.85
+# --- Tool timeout configuration ---
+_TOOL_TIMEOUT_MAP = {
+    "read_file": 30,
+    "write_file": 30,
+    "edit_file": 30,
+    "list_files": 15,
+    "search_files": 30,
+    "query_knowledge_library": 60,
+    "query_code_library": 60,
+    "generate_media": 120,
+    "load_skill": 20,
+    "list_skills": 10,
+    "finish_task": 10,
+    "finish_current_task": 10,
+    "update_plan": 10,
+    "update_todos": 10,
+    "compress": 30,
+}
+_DEFAULT_TOOL_TIMEOUT = 90
 TRUNCATION_CONTINUATION_MAX_PASSES = 3
 TRUNCATION_CONTINUATION_MAX_TOKENS = 1800
 TRUNCATION_CONTINUATION_TAIL_CHARS = 2800
@@ -314,6 +427,17 @@ SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "templates/**/*.md",
     "templates/**/*.html",
     "templates/**/*.json",
+    # Kimi-style: assets/templates with code files
+    "assets/**/*.md",
+    "assets/**/*.json",
+    "assets/**/*.cs",
+    "assets/**/*.html",
+    # Kimi-style: validator configs
+    "validator/**/*.json",
+    "validator/**/*.md",
+    # Academic-style: root-level guideline files
+    "*_guidelines.md",
+    "*_patterns.md",
     "*.md",
     "*.txt",
     "LICENSE*",
@@ -529,6 +653,9 @@ SUPPORTED_UI_LANGUAGES = [
 ]
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 DEFAULT_UI_LANGUAGE = "zh-CN"
+UI_STYLE_CHOICES = ("trad", "neo")
+UI_STYLE_LABELS = {"trad": "Trad", "neo": "Neo"}
+DEFAULT_UI_STYLE = "neo"
 DEFAULT_WEB_UI_DIR = "./web_UI"
 DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
 WEB_UI_REQUIRED_FILES = (
@@ -617,6 +744,16 @@ CODE_PREVIEW_EXTS = {
     ".kt",
     ".kts",
     ".scala",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".stylus",
+    ".pcss",
+    ".postcss",
+    ".xhtml",
+    ".astro",
     ".sh",
     ".bash",
     ".zsh",
@@ -680,6 +817,8 @@ CODE_PREVIEW_FILENAMES = {
     "rakefile",
     "pipfile",
     "requirements.txt",
+    "go.mod",
+    "go.work",
 }
 MEDIA_CAPABILITY_KEYS = {
     "input_image",
@@ -836,9 +975,212 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
         ],
         "match_tokens": ["cdn.tailwindcss.com", "@tailwindcss/browser", "tailwindcss"],
     },
+    {
+        "id": "mathjax",
+        "filename": "tex-mml-chtml.js",
+        "relative_path": "mathjax/es5/tex-mml-chtml.js",
+        "package_urls": [
+            "https://registry.npmjs.org/mathjax/-/mathjax-3.2.2.tgz",
+        ],
+        "package_install_dir": "mathjax",
+        "package_required_paths": [
+            "package.json",
+            "es5/core.js",
+            "es5/loader.js",
+            "es5/startup.js",
+            "es5/tex-mml-chtml.js",
+        ],
+        "match_tokens": ["mathjax", "tex-mml-chtml.js", "/mathjax@"],
+    },
+    {
+        "id": "katex",
+        "filename": "katex.min.js",
+        "relative_path": "katex/dist/katex.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/katex/-/katex-0.16.11.tgz",
+        ],
+        "package_install_dir": "katex",
+        "package_required_paths": [
+            "package.json",
+            "dist/katex.min.js",
+            "dist/katex.min.css",
+            "dist/contrib/auto-render.min.js",
+        ],
+        "match_tokens": ["katex", "katex.min.js", "/katex@"],
+    },
+    {
+        "id": "katex_auto_render",
+        "filename": "auto-render.min.js",
+        "relative_path": "katex/dist/contrib/auto-render.min.js",
+        "match_tokens": ["auto-render.min.js", "katex/contrib/auto-render", "katex-auto-render"],
+    },
+    {
+        "id": "html2canvas",
+        "filename": "html2canvas.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+            "https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js",
+        ],
+        "match_tokens": ["html2canvas", "html2canvas.min.js"],
+    },
+    {
+        "id": "jspdf",
+        "filename": "jspdf.umd.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+            "https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js",
+        ],
+        "match_tokens": ["jspdf", "jspdf.umd.min.js"],
+    },
+    {
+        "id": "xlsx",
+        "filename": "xlsx.full.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+            "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+        ],
+        "match_tokens": ["xlsx", "xlsx.full.min.js", "sheetjs"],
+    },
+    {
+        "id": "jszip",
+        "filename": "jszip.min.js",
+        "relative_path": "node_modules/jszip/dist/jszip.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+        ],
+        "package_install_dir": "node_modules/jszip",
+        "package_required_paths": [
+            "package.json",
+            "dist/jszip.min.js",
+        ],
+        "package_postprocess": "jszip-main-to-dist",
+        "match_tokens": ["jszip", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "package_urls": [
+            "https://registry.npmjs.org/pptxgenjs/-/pptxgenjs-4.0.1.tgz",
+        ],
+        "package_install_dir": "pptxgenjs",
+        "package_required_paths": [
+            "package.json",
+            "dist/pptxgen.bundle.js",
+            "dist/pptxgen.cjs.js",
+            "dist/pptxgen.es.js",
+            "dist/pptxgen.min.js",
+        ],
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.cjs.js", "pptxgen.es.js", "pptxgen.min.js", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs_bundle",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.bundle"],
+    },
+    {
+        "id": "pptxgenjs_cjs",
+        "filename": "pptxgen.cjs.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.cjs.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.cjs.js", "pptxgen.cjs"],
+    },
+    {
+        "id": "pptxgenjs_es",
+        "filename": "pptxgen.es.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.es.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.es.js", "pptxgen.es"],
+    },
+    {
+        "id": "pptxgenjs_min",
+        "filename": "pptxgen.min.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.min.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.min.js", "pptxgen.min"],
+    },
 ]
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 OFFLINE_JS_LIB_README_FILE = "README.md"
+
+
+def _normalize_js_lib_asset_ref(value: str) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if not raw:
+        return ""
+    raw = raw.lstrip("/")
+    pure = PurePosixPath(raw)
+    parts: list[str] = []
+    for part in pure.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _resolve_js_lib_asset_path(js_root: Path, asset_ref: str) -> Path | None:
+    rel = _normalize_js_lib_asset_ref(asset_ref)
+    if not rel:
+        return None
+    exact = (js_root / rel).resolve()
+    try:
+        if exact.is_file() and exact.is_relative_to(js_root):
+            return exact
+    except Exception:
+        pass
+    basename = _safe_js_filename(Path(rel).name, "lib.js")
+    candidates: list[Path] = []
+    try:
+        for fp in js_root.rglob(basename):
+            try:
+                resolved = fp.resolve()
+            except Exception:
+                continue
+            if resolved.is_file():
+                try:
+                    if resolved.is_relative_to(js_root):
+                        candidates.append(resolved)
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (len(p.relative_to(js_root).parts), p.relative_to(js_root).as_posix()))
+    return candidates[0]
+
+
+def _discover_extra_js_lib_files(js_root: Path, known_relative_paths: set[str]) -> list[dict]:
+    rows: list[dict] = []
+    if not js_root.exists():
+        return rows
+    seen: set[str] = set()
+    for fp in sorted(js_root.rglob("*")):
+        if not fp.is_file() or fp.name in {".DS_Store", OFFLINE_JS_LIB_INDEX_FILE, OFFLINE_JS_LIB_README_FILE}:
+            continue
+        if fp.suffix.lower() not in {".js", ".mjs", ".cjs"}:
+            continue
+        rel = fp.relative_to(js_root).as_posix()
+        if rel in known_relative_paths or rel in seen:
+            continue
+        seen.add(rel)
+        stem = fp.stem.replace(".min", "").replace(".umd", "").replace(".bundle", "")
+        rows.append(
+            {
+                "id": f"local:{stem or fp.name}",
+                "filename": fp.name,
+                "relative_path": rel,
+                "available": True,
+                "size": int(fp.stat().st_size),
+                "sha256": _sha256_file(fp),
+                "source": "existing-local",
+                "error": "",
+                "match_tokens": [fp.name.lower(), stem.lower(), rel.lower()],
+                "urls": [],
+                "catalog": False,
+            }
+        )
+    return rows
 
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -864,6 +1206,26 @@ def normalize_ui_language(raw: str | None) -> str:
     if mapped and mapped in UI_LANGUAGE_LABELS:
         return mapped
     return DEFAULT_UI_LANGUAGE
+
+
+def normalize_ui_style(raw: str | None) -> str:
+    key = str(raw or "").strip().lower().replace("-", "_")
+    aliases = {
+        "neo": "neo",
+        "modern": "neo",
+        "new": "neo",
+        "cards": "neo",
+        "card": "neo",
+        "trad": "trad",
+        "traditional": "trad",
+        "classic": "trad",
+        "legacy": "trad",
+        "old": "trad",
+    }
+    mapped = aliases.get(key)
+    if mapped in UI_STYLE_CHOICES:
+        return mapped
+    return DEFAULT_UI_STYLE
 
 
 def supported_ui_languages_payload() -> list[dict]:
@@ -948,7 +1310,9 @@ def _detect_os_shell_instruction() -> str:
             "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
-            "Use relative paths or the absolute session root shown above."
+            "IMPORTANT: The workspace path contains spaces. Always use relative paths "
+            "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
+            "If you must use absolute paths, always quote them with double quotes."
         )
     # Linux / other POSIX
     return (
@@ -956,7 +1320,9 @@ def _detect_os_shell_instruction() -> str:
         "Standard POSIX commands are available (ls, cat, grep, find, etc.). "
         "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
         "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
-        "Use relative paths or the absolute session root shown above."
+        "IMPORTANT: The workspace path may contain spaces. Always use relative paths "
+        "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
+        "If you must use absolute paths, always quote them with double quotes."
     )
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -1071,6 +1437,23 @@ def extract_show_upload_list_setting(raw: object) -> bool | None:
         for key in keys:
             if key in section:
                 return _to_bool_like(section.get(key), default=False)
+    return None
+
+
+def extract_ui_style_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = ("UI_Style", "ui_style", "uiStyle", "style_mode", "chat_ui_style")
+    for key in keys:
+        if key in raw:
+            return normalize_ui_style(str(raw.get(key) or ""))
+    for section_key in ("web_ui", "ui", "frontend"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_ui_style(str(section.get(key) or ""))
     return None
 
 
@@ -1439,20 +1822,194 @@ def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
 def offline_js_lib_root(workdir: Path = WORKDIR) -> Path:
     return (workdir / "js_lib").resolve()
 
+def _offline_js_entry_relative_path(entry: dict[str, object], fallback_name: str) -> str:
+    rel = _normalize_js_lib_asset_ref(str(entry.get("relative_path", "") or ""))
+    if rel:
+        return rel
+    return _safe_js_filename(fallback_name, fallback_name)
+
+def _archive_member_relative_path(name: str) -> str:
+    raw = _normalize_js_lib_asset_ref(name)
+    if not raw:
+        return ""
+    parts = [part for part in PurePosixPath(raw).parts if part not in {"", "."}]
+    while parts and parts[0].lower() == "package":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return "/".join(parts)
+
+def _path_size_bytes(target: Path) -> int:
+    try:
+        if target.is_file():
+            return int(target.stat().st_size)
+        if not target.exists():
+            return 0
+        total = 0
+        for fp in target.rglob("*"):
+            try:
+                if fp.is_file():
+                    total += int(fp.stat().st_size)
+            except Exception:
+                continue
+        return total
+    except Exception:
+        return 0
+
+def _extract_archive_to_dir(raw: bytes, install_root: Path) -> list[str]:
+    install_root.mkdir(parents=True, exist_ok=True)
+    install_root_resolved = install_root.resolve()
+    written: list[str] = []
+
+    def _write_bytes(rel: str, data: bytes):
+        target = (install_root / rel).resolve()
+        if not target.is_relative_to(install_root_resolved):
+            raise ValueError(f"archive member escapes target dir: {rel}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        written.append(rel)
+
+    bio = io.BytesIO(raw)
+    try:
+        if zipfile.is_zipfile(bio):
+            bio.seek(0)
+            with zipfile.ZipFile(bio, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    rel = _archive_member_relative_path(info.filename)
+                    if not rel:
+                        continue
+                    _write_bytes(rel, zf.read(info))
+            return written
+    except Exception:
+        pass
+
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            rel = _archive_member_relative_path(member.name)
+            if not rel:
+                continue
+            extracted = tf.extractfile(member)
+            if extracted is None:
+                continue
+            _write_bytes(rel, extracted.read())
+    return written
+
+def _package_required_paths(entry: dict[str, object]) -> list[str]:
+    rows: list[str] = []
+    for item in entry.get("package_required_paths") or []:
+        rel = _normalize_js_lib_asset_ref(str(item or ""))
+        if rel:
+            rows.append(rel)
+    return rows
+
+def _package_install_ready(install_root: Path, required_paths: list[str]) -> bool:
+    if not install_root.exists():
+        return False
+    if required_paths:
+        return all((install_root / rel).is_file() for rel in required_paths)
+    try:
+        return any(fp.is_file() for fp in install_root.rglob("*"))
+    except Exception:
+        return False
+
+def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path):
+    action = str(entry.get("package_postprocess", "") or "").strip().lower()
+    if action != "jszip-main-to-dist":
+        return
+    pkg_json = (install_root / "package.json").resolve()
+    dist_fp = (install_root / "dist" / "jszip.min.js").resolve()
+    if not pkg_json.exists():
+        if not dist_fp.exists():
+            return
+        obj: dict[str, object] = {
+            "name": "jszip",
+            "version": "offline-local",
+            "main": "./dist/jszip.min.js",
+            "exports": {".": "./dist/jszip.min.js"},
+        }
+    else:
+        try:
+            raw = pkg_json.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                return
+            obj = loaded
+        except Exception:
+            return
+    changed = False
+    if obj.get("main") != "./dist/jszip.min.js":
+        obj["main"] = "./dist/jszip.min.js"
+        changed = True
+    exports = obj.get("exports")
+    desired_exports = {".": "./dist/jszip.min.js"}
+    if exports != desired_exports:
+        obj["exports"] = desired_exports
+        changed = True
+    if changed or (not pkg_json.exists()):
+        pkg_json.parent.mkdir(parents=True, exist_ok=True)
+        pkg_json.write_text(json_dumps(obj, indent=2), encoding="utf-8")
+
+def _ensure_offline_js_package(root: Path, entry: dict[str, object], force: bool = False) -> tuple[bool, str, str, str]:
+    package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
+    if not package_urls:
+        return True, "", "", ""
+    install_dir = _normalize_js_lib_asset_ref(str(entry.get("package_install_dir", "") or ""))
+    if not install_dir:
+        install_dir = _normalize_js_lib_asset_ref(str(entry.get("id", "") or "package"))
+    if not install_dir:
+        return False, "missing", "package install dir is empty", ""
+    install_root = (root / install_dir).resolve()
+    if not install_root.is_relative_to(root):
+        return False, "missing", f"package install dir escapes js_lib: {install_dir}", install_dir
+    required_paths = _package_required_paths(entry)
+    if not force and install_root.exists():
+        _postprocess_offline_js_package(entry, install_root)
+        if _package_install_ready(install_root, required_paths):
+            return True, "existing-package", "", install_dir
+        try:
+            if any(fp.is_file() for fp in install_root.rglob("*")):
+                return True, "existing-package", "", install_dir
+        except Exception:
+            pass
+    error = ""
+    source = "missing"
+    for url in package_urls:
+        try:
+            data, _ = _download_http_bytes(url, timeout=90.0)
+            if len(data) < 200:
+                error = f"archive too small from {url}"
+                continue
+            _extract_archive_to_dir(data, install_root)
+            _postprocess_offline_js_package(entry, install_root)
+            if _package_install_ready(install_root, required_paths):
+                return True, url, "", install_dir
+            error = f"package install incomplete from {url}"
+            source = url
+        except Exception as exc:
+            error = trim(str(exc), 220)
+            source = url
+    return False, source, error, install_dir
+
 def _render_offline_js_catalog_md() -> str:
     rows = [
         "# Offline JS Library Catalog",
         "",
         "Pre-fetched common JS libraries for offline HTML deliverables.",
+        "Additional local `.js/.mjs/.cjs` files placed anywhere under `js_lib/` are auto-indexed in `index.json` and can be served by relative path.",
         "",
-        "| id | filename | source urls |",
-        "|---|---|---|",
+        "| id | relative path | file urls | package urls |",
+        "|---|---|---|---|",
     ]
     for row in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(row.get("id", "") or "").strip()
-        filename = str(row.get("filename", "") or "").strip()
+        filename = _offline_js_entry_relative_path(row, str(row.get("filename", "") or lib_id or "lib.js"))
         urls = [str(x).strip() for x in (row.get("urls") or []) if str(x).strip()]
-        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} |")
+        package_urls = [str(x).strip() for x in (row.get("package_urls") or []) if str(x).strip()]
+        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} | {'<br>'.join(package_urls)} |")
     return "\n".join(rows) + "\n"
 
 def load_offline_js_lib_index(js_root: Path) -> dict:
@@ -1473,16 +2030,50 @@ def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict
     available = 0
     missing = 0
     rows: list[dict] = []
+    known_relative_paths: set[str] = set()
     for entry in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(entry.get("id", "") or "").strip() or "lib"
         filename = _safe_js_filename(str(entry.get("filename", "") or f"{lib_id}.js"), f"{lib_id}.js")
+        relative_path = _offline_js_entry_relative_path(entry, filename)
         urls = [str(x).strip() for x in (entry.get("urls") or []) if str(x).strip()]
+        package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
         match_tokens = [str(x).strip().lower() for x in (entry.get("match_tokens") or []) if str(x).strip()]
-        target = root / filename
+        target = (root / relative_path).resolve()
+        if not target.is_relative_to(root):
+            rows.append(
+                {
+                    "id": lib_id,
+                    "filename": filename,
+                    "available": False,
+                    "size": 0,
+                    "sha256": "",
+                    "source": "missing",
+                    "error": f"relative path escapes js_lib: {relative_path}",
+                    "match_tokens": match_tokens,
+                    "urls": urls,
+                    "package_urls": package_urls,
+                    "relative_path": relative_path,
+                    "package_install_dir": "",
+                    "package_required_paths": [],
+                    "package_available": not package_urls,
+                    "package_size": 0,
+                    "catalog": True,
+                }
+            )
+            missing += 1
+            continue
+        known_relative_paths.add(relative_path)
         source = "existing"
         error = ""
-        ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
-        if not ok:
+        effective_target = target
+        file_ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
+        if (not file_ok) and (not force):
+            resolved_existing = _resolve_js_lib_asset_path(root, relative_path)
+            if resolved_existing and resolved_existing.exists() and resolved_existing.is_file() and resolved_existing.stat().st_size > 40:
+                effective_target = resolved_existing
+                file_ok = True
+                source = "existing-local"
+        if not file_ok and urls:
             for url in urls:
                 try:
                     data, _ = _download_http_bytes(url, timeout=35.0)
@@ -1493,39 +2084,64 @@ def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict
                     if "<html" in probe and "<script" not in probe and "tailwind" not in probe:
                         error = f"unexpected html payload from {url}"
                         continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
-                    ok = True
+                    effective_target = target
+                    file_ok = True
                     source = url
                     fetched += 1
                     break
                 except Exception as exc:
                     error = trim(str(exc), 220)
-            if not ok:
+            if not file_ok:
                 source = "missing"
+        package_ok, package_source, package_error, package_install_dir = _ensure_offline_js_package(root, entry, force=force)
+        if package_urls and package_source and package_source not in {"existing-package", "missing"}:
+            fetched += 1
+        if package_error:
+            error = package_error if not error else f"{error}; {package_error}"
+        ok = bool((file_ok or (not urls)) and package_ok and effective_target.exists() and effective_target.is_file() and effective_target.stat().st_size > 40)
         if ok:
             available += 1
         else:
             missing += 1
+            if package_urls and package_source == "missing" and not source.strip():
+                source = "missing"
+        package_root = (root / package_install_dir).resolve() if package_install_dir else None
         rows.append(
             {
                 "id": lib_id,
                 "filename": filename,
                 "available": ok,
-                "size": int(target.stat().st_size) if target.exists() else 0,
-                "sha256": _sha256_file(target) if target.exists() else "",
-                "source": source,
+                "size": int(effective_target.stat().st_size) if effective_target.exists() else 0,
+                "sha256": _sha256_file(effective_target) if effective_target.exists() else "",
+                "source": source if source != "existing" or file_ok else package_source or source,
                 "error": error,
                 "match_tokens": match_tokens,
                 "urls": urls,
+                "package_urls": package_urls,
+                "relative_path": relative_path,
+                "resolved_path": effective_target.relative_to(root).as_posix() if effective_target.exists() else "",
+                "package_install_dir": package_install_dir,
+                "package_required_paths": _package_required_paths(entry),
+                "package_available": package_ok,
+                "package_size": _path_size_bytes(package_root) if package_root else 0,
+                "package_source": package_source,
+                "catalog": True,
             }
         )
+    extra_rows = _discover_extra_js_lib_files(root, known_relative_paths)
+    rows.extend(extra_rows)
     payload = {
         "generated_at": int(now_ts()),
         "js_lib_root": str(root),
-        "total": len(OFFLINE_JS_LIB_CATALOG),
+        "total": len(rows),
         "available": available,
         "missing": missing,
         "fetched": fetched,
+        "catalog_total": len(OFFLINE_JS_LIB_CATALOG),
+        "catalog_missing": missing,
+        "extra_local": len(extra_rows),
         "libs": rows,
     }
     (root / OFFLINE_JS_LIB_INDEX_FILE).write_text(json_dumps(payload, indent=2), encoding="utf-8")
@@ -1890,7 +2506,14 @@ def parse_tool_arguments_with_error(raw: object) -> tuple[dict, str]:
                 try:
                     parsed_repaired = json.loads(repaired)
                     if isinstance(parsed_repaired, dict):
-                        return parsed_repaired, "arguments JSON auto-repaired from invalid/truncated input"
+                        # Check repair confidence: count fields that look truncated
+                        truncated_fields = sum(
+                            1 for v in parsed_repaired.values()
+                            if isinstance(v, str) and (v.endswith("...") or v.endswith("\\"))
+                        )
+                        if truncated_fields == 0:
+                            return parsed_repaired, "arguments JSON auto-repaired from invalid/truncated input"
+                        return parsed_repaired, f"arguments JSON auto-repaired (low confidence: {truncated_fields} possibly truncated fields)"
                 except Exception:
                     pass
             brief = trim(text.replace("\n", "\\n"), 240)
@@ -1938,15 +2561,32 @@ def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refres
             cached_tags = list(tags) if isinstance(tags, list) else []
         if (not force_refresh) and row and (now - float(row.get("ts", 0.0))) <= ttl_seconds:
             return list(cached_tags)
-    ok, tags, _ = probe_ollama_environment(base_url)
-    if ok:
+        # Double-check lock: if another thread is already fetching, return stale cache
+        if row and row.get("_fetching"):
+            return list(cached_tags)
+        # Mark as fetching to prevent concurrent probes
+        if row is None:
+            row = {"ts": 0.0, "tags": []}
+        row["_fetching"] = True
+        _OLLAMA_TAG_CACHE[key] = row
+    try:
+        ok, tags, _ = probe_ollama_environment(base_url)
+    except Exception:
+        ok, tags = False, []
+    finally:
         with _OLLAMA_TAG_CACHE_LOCK:
-            _OLLAMA_TAG_CACHE[key] = {"ts": now, "tags": list(tags)}
+            if ok:
+                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
+            else:
+                # Clear fetching flag, keep old cache if available
+                row_now = _OLLAMA_TAG_CACHE.get(key, {})
+                row_now.pop("_fetching", None)
+                if not cached_tags:
+                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
+    if ok:
         return list(tags)
     if cached_tags:
         return list(cached_tags)
-    with _OLLAMA_TAG_CACHE_LOCK:
-        _OLLAMA_TAG_CACHE[key] = {"ts": now, "tags": []}
     return []
 
 def resolve_ollama_model(base_url: str, preferred: str) -> str:
@@ -2528,6 +3168,12 @@ class CryptoBox:
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.key_file = self.codes_root / ".encryption_key"
         self.key = self._load_or_create_key()
+        self.json_fsync_enabled = str(os.getenv("AGENT_JSON_FSYNC", "") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _load_or_create_key(self) -> bytes:
         if self.key_file.exists():
@@ -2576,6 +3222,14 @@ class CryptoBox:
         pt = self._stream_xor(ct, nonce)
         return pt.decode("utf-8")
 
+    def _fsync_json_file(self, fileobj) -> None:
+        if not self.json_fsync_enabled:
+            return
+        try:
+            os.fsync(fileobj.fileno())
+        except Exception:
+            pass
+
     def write_json(self, path: Path, obj: object):
         path.parent.mkdir(parents=True, exist_ok=True)
         enc = self.encrypt_text(json_dumps(obj, indent=2))
@@ -2585,7 +3239,7 @@ class CryptoBox:
             with tmp.open("w", encoding="utf-8") as f:
                 f.write(enc)
                 f.flush()
-                os.fsync(f.fileno())
+                self._fsync_json_file(f)
             if path.exists():
                 try:
                     os.replace(path, bak)
@@ -2629,13 +3283,43 @@ class CryptoBox:
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
     text = text or ""
-    if not text.startswith("---\n"):
+    # Strip leading HTML/XML comments (kimi-agent-internals format)
+    stripped = text
+    while stripped.lstrip().startswith("<!--"):
+        end_comment = stripped.find("-->")
+        if end_comment < 0:
+            break
+        stripped = stripped[end_comment + 3:].lstrip()
+    # Standard YAML frontmatter: ---\n...\n---\n
+    if stripped.startswith("---\n"):
+        end = stripped.find("\n---\n", 4)
+        if end < 0:
+            # Try alternate ending: \n--- followed by EOF or \n--\n
+            end = stripped.find("\n---", 4)
+            if end >= 0 and (end + 4 >= len(stripped) or stripped[end + 4] in ('\n', '\r', ' ')):
+                raw_meta = stripped[4:end]
+                body = stripped[end + 4:].strip()
+            else:
+                return {}, text.strip()
+        else:
+            raw_meta = stripped[4:end]
+            body = stripped[end + 5:].strip()
+    # Kimi xlsx format: no --- delimiters, but starts with "name:" and "description:"
+    elif re.match(r'\s*name\s*:', stripped):
+        # Find where the frontmatter-like section ends (blank line, markdown heading, XML tag, or bare --)
+        lines = stripped.splitlines()
+        meta_end = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if s == "" or s.startswith("#") or s.startswith("<") or s in ("--", "---"):
+                meta_end = i
+                break
+        else:
+            meta_end = min(5, len(lines))
+        raw_meta = "\n".join(lines[:meta_end])
+        body = "\n".join(lines[meta_end:]).strip()
+    else:
         return {}, text.strip()
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        return {}, text.strip()
-    raw_meta = text[4:end]
-    body = text[end + 5 :].strip()
 
     def _normalize_front_matter_value(value: object):
         if isinstance(value, dict):
@@ -2809,6 +3493,64 @@ def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
         return path.read_text(encoding="utf-8")
     except Exception:
         return None
+
+def _json_default_copy(default: object) -> object:
+    if isinstance(default, dict):
+        return dict(default)
+    if isinstance(default, list):
+        return list(default)
+    return default
+
+def _read_json_file(path: Path, default: object) -> object:
+    bak = path.with_name(f"{path.name}.bak")
+    expected_dict = isinstance(default, dict)
+    expected_list = isinstance(default, list)
+    for fp in (path, bak):
+        if not fp.exists() or (not fp.is_file()):
+            continue
+        try:
+            raw = fp.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if expected_dict and not isinstance(obj, dict):
+            continue
+        if expected_list and not isinstance(obj, list):
+            continue
+        return obj
+    return _json_default_copy(default)
+
+def _write_json_file(path: Path, obj: object):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bak = path.with_name(f"{path.name}.bak")
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(json_dumps(obj, indent=2))
+            f.flush()
+            if JSON_FSYNC_ENABLED:
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+        if path.exists():
+            try:
+                os.replace(path, bak)
+            except Exception:
+                try:
+                    shutil.copy2(path, bak)
+                except Exception:
+                    pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -3241,12 +3983,15 @@ def build_code_preview_rows(
     return out, truncated
 
 class EventHub:
+    _MAXSIZE = 512
+
     def __init__(self):
         self._subs: list[queue.Queue] = []
         self._lock = threading.Lock()
+        self._seq = 0
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
+        q: queue.Queue = queue.Queue(maxsize=self._MAXSIZE)
         with self._lock:
             self._subs.append(q)
         return q
@@ -3257,12 +4002,32 @@ class EventHub:
 
     def publish(self, event: dict):
         with self._lock:
+            self._seq += 1
+            seq = self._seq
             subs = list(self._subs)
+        if isinstance(event, dict):
+            event["seq"] = seq
         for q in subs:
             try:
                 q.put_nowait(event)
             except queue.Full:
-                pass
+                # Evict oldest half then insert gap marker + new event
+                evicted = 0
+                half = max(1, self._MAXSIZE // 2)
+                while not q.empty() and evicted < half:
+                    try:
+                        q.get_nowait()
+                        evicted += 1
+                    except queue.Empty:
+                        break
+                try:
+                    q.put_nowait({"type": "gap", "dropped": evicted, "seq": seq})
+                except queue.Full:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    pass
 
 class TodoManager:
     def __init__(self):
@@ -3273,7 +4038,10 @@ class TodoManager:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         validated = []
-        in_progress_seen = False
+        # Plan-step items (bb:proj: key) and worker/non-plan items each get their
+        # own in_progress slot, so a plan step in_progress doesn't demote worker subtasks.
+        plan_in_progress_seen = False
+        worker_in_progress_seen = False
         status_alias = {
             "todo": "pending",
             "doing": "in_progress",
@@ -3311,11 +4079,18 @@ class TodoManager:
             if owner not in {"manager", "explorer", "developer", "reviewer"}:
                 owner = ""
             key = trim(str(raw.get("key", "") or "").strip(), 120)
+            is_plan_step = key.startswith("bb:proj:")
             if status == "in_progress":
-                if in_progress_seen:
-                    status = "pending"
+                if is_plan_step:
+                    if plan_in_progress_seen:
+                        status = "pending"
+                    else:
+                        plan_in_progress_seen = True
                 else:
-                    in_progress_seen = True
+                    if worker_in_progress_seen:
+                        status = "pending"
+                    else:
+                        worker_in_progress_seen = True
             if not active_form:
                 if status == "in_progress":
                     active_form = f"Working on: {content}"
@@ -4921,6 +5696,644 @@ if __name__ == "__main__":
         ),
     )
 
+def ensure_generated_research_scientific_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+    research_root = generated_root / "research-orchestrator-pro"
+    scientific_root = generated_root / "scientific-reasoning-lab"
+
+    research_skill = """---
+name: research-orchestrator-pro
+aliases:
+  - research
+  - research-pro
+triggers:
+  - research workflow
+  - literature review
+  - evidence synthesis
+  - experiment design
+  - systematic analysis
+  - uploaded pdf
+  - uploaded data
+  - scientific report
+  - 科研工作流
+  - 系统性分析
+  - 证据综合
+  - 数据分析
+  - 文献综述
+  - 实验设计
+clouds_coder:
+  preferred_tools:
+    - query_knowledge_library
+    - bash
+    - read_file
+    - write_file
+    - TodoWrite
+    - load_skill
+description: >
+  Modular research engine with 4 composable phases. Autonomously select which
+  phases to activate based on task complexity. Integrates RAG knowledge library,
+  web search, scientific reasoning, and report generation.
+  TRIGGER when: dedicated research workflow, experiment design, evidence synthesis across many sources.
+  DO NOT TRIGGER for: simple summaries, making PPT/slides, single-file analysis, document creation,
+  or any task where the primary goal is producing a specific output format (use the format skill directly).
+---
+
+# Research Orchestrator Pro
+
+Modular experimental exploration engine. Analyze the task and autonomously select which phases to activate — simple tasks may need only Phase 1+4, complex tasks may chain all four phases.
+
+## Task Complexity Router
+
+Assess the task before starting and choose the appropriate phase combination:
+
+| Complexity | Example | Phases |
+|-----------|---------|--------|
+| Quick | "Summarize this PDF" | Phase 1 only |
+| Light | "Summarize and compare these two papers" | 1 → 4 |
+| Medium | "Analyze this data and write a report" | 1 → 2 → 4 |
+| Heavy | "Design experiment based on literature review" | 1 → 2 → 3 → 4 |
+| Full | "Research, analyze, design experiments, produce report" | 1 → 2 → 3 → 4 |
+
+You may also revisit earlier phases (e.g., return to Phase 1 from Phase 3 if new knowledge is needed).
+
+---
+
+## Phase 1: Knowledge Exploration (always start here)
+
+Goal: Build knowledge foundation from available sources.
+
+1. **Inventory inputs**: `ls uploaded/` to list all available files
+2. **Read sources**: Read each `.parsed.md` file to extract key findings
+3. **RAG knowledge retrieval**: `query_knowledge_library(query="<topic>", top_k=10, route="hybrid")` for background knowledge from the ingested library
+4. **Web literature search** (if more context needed): `bash` with `curl` to search academic APIs
+5. **Load research skills** if task is complex:
+   - `load_skill('deep-research-orchestrator')` for deep retrieval
+   - `load_skill('pdf-vision-literature-integrator')` for PDF figure analysis
+6. **Output**: `research/knowledge_base.md` — organized findings with sources
+
+## Phase 2: Data Analysis (when data/theory work is needed)
+
+Goal: Rigorous analysis with evidence traceability.
+
+1. **Parse data**: `load_skill('upload-tabular-parser')` for CSV/XLSX if needed
+2. **RAG data context**: `query_knowledge_library(query="<specific data query>", route="hybrid")` for benchmarks and historical data
+3. **Statistical analysis**: `bash` with Python for statistics, trends, correlations
+4. **Theory & formula**: When derivation/verification is needed, `load_skill('scientific-reasoning-lab')`:
+   - RAG-backed theory foundation retrieval
+   - Step-by-step derivation with SymPy verification
+   - Programmatic validation against known data
+   - Self-audit iteration (up to 3 rounds)
+5. **Synthesize**: Integrate findings, identify patterns and contradictions
+6. **Output**: `research/evidence_table.csv` + `research/data_analysis.md`
+
+## Phase 3: Experiment Design (when experiments are requested)
+
+Goal: Design or refine experiments with scientific rigor.
+
+1. **Split-table comparison**: Current data vs. target/baseline in structured table
+2. **RAG feasibility check**: `query_knowledge_library(query="<approach> feasibility lessons", route="hybrid")` for historical lessons and known pitfalls
+3. **Experiment specification**: hypothesis, variables, controls, measurements, success criteria
+4. **Auxiliary skills**: `load_skill` for domain-specific enhancement
+5. **Iterative refinement**: Adjust design based on evidence table and RAG feedback
+6. **Output**: `research/experiment_ledger.md` with split-table
+
+## Phase 4: Report & Deliverables (when output is requested)
+
+Goal: Produce professional deliverables with verified conclusions.
+
+1. **Load output skill** based on format:
+   - Slides → `load_skill('pptx')` or `load_skill('ppt')`
+   - Word → `load_skill('kimi-docx')` or `load_skill('docx')`
+   - PDF → `load_skill('kimi-pdf')` or `load_skill('pdf')`
+   - Excel → `load_skill('kimi-xlsx')` or `load_skill('xlsx')`
+   - HTML → `load_skill('html-report-engineering')`
+2. **Build references**: `query_knowledge_library` + `bash` curl for bibliography
+3. **Prepare bundle**: `research/report_bundle.json` with structured data
+4. **Audit**: Cross-check conclusions vs evidence_table vs original sources
+5. **Output**: Final deliverable in requested format
+
+---
+
+## RAG Knowledge Library Guide
+
+Use the built-in TF-Graph_IDF RAG library at every phase:
+
+```
+query_knowledge_library(query="search text", top_k=5, route="hybrid")
+```
+
+- `query`: Search text. Use specific technical terms for better precision
+- `top_k`: Results count (5 default; 10-15 for broad exploration)
+- `route`: `"hybrid"` (recommended) | `"fast"` (exact terms) | `"global"` (semantic) | `"auto"`
+- `category`: Filter by type ("paper", "report", "code")
+- `kind`: Filter by format ("pdf", "docx", "csv")
+
+**Strategy**: hybrid first → narrow based on results → fast for precision → retry with synonyms if empty
+
+---
+
+## Quality Rules
+- Every claim needs traceable evidence with source attribution
+- Separate: verified facts / inferred conclusions / open questions
+- Formula derivations require programmatic verification
+- Experiments require split-table comparison
+- References require proper citations
+- Never skip from raw data to polished output without evidence structure
+"""
+
+    research_workflow = """# Tool & Skill Quick Reference
+
+This reference supplements the main SKILL.md. Core workflow is self-contained in SKILL.md.
+
+## RAG Knowledge Library
+```
+query_knowledge_library(query="search terms", top_k=5, route="hybrid")
+```
+Routes: auto | fast (keyword) | global (semantic) | hybrid (recommended)
+
+## Web Search via bash
+```
+bash: curl -s "https://api.semanticscholar.org/graph/v1/paper/search?query=DRAM+scaling&limit=5" | python3 -m json.tool
+```
+
+## Complementary Skills (load as needed)
+| Skill | Use When |
+|-------|----------|
+| deep-research-orchestrator | Deep online/offline literature retrieval |
+| retrieval-synthesis-fallback | Web retrieval with confidence cards |
+| scientific-reasoning-lab | Math derivation, formula verification |
+| upload-tabular-parser | CSV/XLSX data parsing |
+| pdf-vision-literature-integrator | PDF figure + text analysis |
+| visualization-report-pipeline | Chart and visualization generation |
+
+## Output Skills (load when producing deliverables)
+| Format | Skills |
+|--------|--------|
+| Slides | pptx, ppt, ppt-master |
+| Word | kimi-docx, minimax-docx, docx |
+| PDF | kimi-pdf, minimax-pdf, pdf |
+| Excel | kimi-xlsx, minimax-xlsx, xlsx |
+| HTML | html-report-engineering |
+
+## Workspace Artifacts
+- `research/knowledge_base.md` — Phase 1 knowledge map
+- `research/evidence_table.csv` — claim, evidence, source, confidence, caveat
+- `research/data_analysis.md` — Phase 2 synthesis
+- `research/experiment_ledger.md` — Phase 3 experiment design
+- `research/report_bundle.json` — Phase 4 handoff data
+- `reasoning/` — scientific-reasoning-lab outputs (derivations, verification scripts)
+"""
+
+    research_interfaces = """# Report Interfaces
+
+Downstream report skills should receive a workspace-local `research/report_bundle.json` with a structure like:
+
+```json
+{
+  "title": "Project title",
+  "language": "zh-CN",
+  "question": "Core research question",
+  "deliverables": ["docx", "pdf", "pptx"],
+  "audience": "technical leadership",
+  "summary_points": ["..."],
+  "evidence_rows": [
+    {
+      "claim": "...",
+      "evidence": "...",
+      "source": "...",
+      "confidence": "high",
+      "caveat": "..."
+    }
+  ],
+  "experiment_plan": {
+    "hypothesis": "...",
+    "variables": ["..."],
+    "controls": ["..."],
+    "measurements": ["..."],
+    "success_criteria": ["..."]
+  }
+}
+```
+
+## Handoff rules
+- `docx`: narrative report, proposal, memo, technical brief
+- `xlsx`: evidence tables, experiment tables, source registries, metrics sheets
+- `pdf`: publication-style report, paper-like summary, printable deliverable
+- `pptx` / `ppt`: presentation-ready summary for leadership, defense, or lecture
+
+Prepare the bundle first, then load the matching output skill and let that skill own file production.
+"""
+
+    research_experiment = """# Experiment Design
+
+When the task asks for experiment design or validation planning, produce an explicit ledger with:
+- hypothesis
+- primary objective
+- independent variables
+- dependent variables
+- controls / baseline
+- confounders
+- required datasets or instruments
+- evaluation metrics
+- success criteria
+- failure conditions
+- next-step decisions
+
+Do not hide unknowns. If a variable or dataset is missing, write it down as a blocker or assumption.
+"""
+
+    research_script = r"""#!/usr/bin/env python3
+import argparse
+import csv
+import json
+from pathlib import Path
+
+
+def _normalize_rows(rows):
+    out = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            out.append(
+                {
+                    "claim": str(row.get("claim", "")).strip(),
+                    "evidence": str(row.get("evidence", "")).strip(),
+                    "source": str(row.get("source", "")).strip(),
+                    "confidence": str(row.get("confidence", "")).strip(),
+                    "caveat": str(row.get("caveat", "")).strip(),
+                }
+            )
+    return out
+
+
+def _write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _render_summary(payload: dict) -> str:
+    lines = [f"# {str(payload.get('title') or 'Research Summary').strip()}", ""]
+    question = str(payload.get("question") or "").strip()
+    if question:
+        lines.extend(["## Research Question", question, ""])
+    summary_points = payload.get("summary_points") if isinstance(payload.get("summary_points"), list) else []
+    lines.append("## Summary")
+    if summary_points:
+        lines.extend(f"- {str(item).strip()}" for item in summary_points if str(item).strip())
+    else:
+        lines.append("- (pending)")
+    lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_experiment(payload: dict) -> str:
+    plan = payload.get("experiment_plan")
+    if not isinstance(plan, dict):
+        return "# Experiment Plan\n\n- (pending)\n"
+    lines = ["# Experiment Plan", ""]
+    for key in (
+        "hypothesis",
+        "objective",
+        "variables",
+        "controls",
+        "measurements",
+        "success_criteria",
+        "failure_conditions",
+    ):
+        value = plan.get(key)
+        lines.append(f"## {key}")
+        if isinstance(value, list):
+            lines.extend(f"- {str(item).strip()}" for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+            lines.append(text or "- (pending)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render a workspace-local research bundle from JSON input.")
+    parser.add_argument("--input", required=True, help="Input JSON file")
+    parser.add_argument("--outdir", required=True, help="Output directory")
+    args = parser.parse_args()
+
+    src = Path(args.input).expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"input not found: {src}")
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("input JSON must be an object")
+
+    rows = _normalize_rows(payload.get("evidence_rows"))
+    _write_text(outdir / "summary.md", _render_summary(payload))
+    _write_text(outdir / "experiment_plan.md", _render_experiment(payload))
+
+    csv_path = outdir / "evidence_table.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["claim", "evidence", "source", "confidence", "caveat"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    bundle = {
+        "title": str(payload.get("title") or "Research Bundle").strip(),
+        "language": str(payload.get("language") or "").strip(),
+        "question": str(payload.get("question") or "").strip(),
+        "deliverables": payload.get("deliverables") if isinstance(payload.get("deliverables"), list) else [],
+        "summary_md": str((outdir / "summary.md").name),
+        "evidence_csv": str(csv_path.name),
+        "experiment_md": str((outdir / "experiment_plan.md").name),
+    }
+    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
+    print(str(outdir))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    scientific_skill = """---
+name: scientific-reasoning-lab
+aliases:
+  - scientific
+  - theorem-lab
+triggers:
+  - mathematical derivation
+  - theorem proof
+  - scientific reasoning
+  - mechanistic model
+  - formula verification
+  - conjecture testing
+  - 数学推导
+  - 定理证明
+  - 科学论证
+  - 机理建模
+  - 公式验证
+clouds_coder:
+  preferred_tools:
+    - query_knowledge_library
+    - bash
+    - read_file
+    - write_file
+    - TodoWrite
+description: >
+  Self-iterating formula derivation and verification engine. Retrieves theory via RAG,
+  derives with step-by-step justification, verifies programmatically, and audits iteratively.
+  Deeply embedded in research-orchestrator-pro's data analysis pipeline.
+  TRIGGER when: formal math reasoning, formula derivation, theory verification, mechanism modeling.
+  DO NOT TRIGGER for: general analysis, summaries, report writing.
+---
+
+# Scientific Reasoning Lab
+
+Self-iterating derivation and verification engine. Called standalone or chained from research-orchestrator-pro Phase 2 when mathematical/theoretical work is needed.
+
+## When to Use
+- Mathematical derivation or proof construction
+- Formula verification and mechanism modeling
+- Theory testing with counterexamples and programmatic validation
+- Innovative theoretical exploration with reliability guarantees
+
+## When NOT to Use
+- General report writing or document creation
+- Simple data statistics (use research-orchestrator-pro Phase 2 directly)
+- Non-mathematical summaries
+
+---
+
+## 5-Step Self-Iterating Reasoning Chain
+
+### Step 1: Theory Foundation Retrieval
+- `query_knowledge_library(query="<theory/formula topic>", top_k=10, route="hybrid")` to retrieve related theorems, formulas, known results
+- Read context data and constraints from the current task
+- Formalize the problem: notation, symbols, assumptions, objective
+- Identify what is known vs. what needs derivation
+- **Output**: `reasoning/problem_formalization.md`
+
+### Step 2: Derivation & Solving
+- Build derivation with explicit intermediate steps
+- For each step, note justification: axiom | known theorem | assumption | definition
+- Mark any hand-wavy steps as **[GAP]** — do not pretend they are rigorous
+- `bash` with Python/SymPy for symbolic computation:
+  ```
+  bash: python3 -c "from sympy import *; x = symbols('x'); print(solve(...))"
+  ```
+- `bash` with numerical computation for verification
+- Keep notation consistent throughout
+- **Output**: `reasoning/derivation.md`
+
+### Step 3: Programmatic Verification
+- Write Python script implementing the derived formula/model
+- Test against known data points and boundary conditions
+- Compare theoretical predictions vs. actual data
+- Check dimensional consistency, sign correctness, limiting cases
+- `bash` to execute: `python3 reasoning/verification_script.py`
+- **Output**: `reasoning/verification_script.py` + verification report
+
+### Step 4: Audit & Iteration (up to 3 rounds)
+Self-check against this audit checklist:
+- [ ] Hidden assumptions not explicitly stated?
+- [ ] Algebraic or calculus errors?
+- [ ] Missing edge cases (zero, infinity, singularities)?
+- [ ] Unsupported causal leaps?
+- [ ] Notation inconsistencies?
+
+Then cross-validate:
+- `query_knowledge_library(query="<conclusion> verification", route="hybrid")` to check against literature
+- If issues found → return to Step 2 with corrections (max 3 iterations)
+- Log each iteration in audit log
+- **Output**: `reasoning/audit_log.md`
+
+### Step 5: Result Classification & Output
+Classify the final result:
+- **Proven**: Rigorous derivation + programmatic verification passed + audit clean
+- **Plausible**: Logical chain complete but unverified assumptions remain
+- **Rejected**: Valid counterexample found or verification failed
+- **Open**: Insufficient information; list what is missing
+
+**Output**: `reasoning/conclusion.md` with:
+- Final status and confidence level
+- Complete derivation chain
+- Verification evidence
+- Open questions and next steps
+
+---
+
+## Integration with research-orchestrator-pro
+
+When called from research-orchestrator-pro Phase 2:
+1. Receive the mathematical/theoretical sub-task
+2. Execute Steps 1-5 above
+3. Write conclusions to `research/evidence_table.csv` (claim + evidence + confidence)
+4. Keep verification scripts in `reasoning/` for audit trail
+5. Return control to research-orchestrator-pro
+
+---
+
+## RAG Knowledge Library Guide
+
+Use the built-in TF-Graph_IDF RAG library for theory retrieval:
+
+```
+query_knowledge_library(query="search text", top_k=5, route="hybrid")
+```
+
+- `query`: Use specific mathematical/theoretical terms
+- `top_k`: 5 for focused, 10-15 for broad exploration
+- `route`: `"hybrid"` (recommended) | `"fast"` (exact terms) | `"global"` (semantic)
+- `category`: Filter by "paper", "report" for academic sources
+
+**Strategy**: Query related theorems first → verify known results → then attempt novel derivation
+
+---
+
+## Quality Rules
+- Never present speculation as established fact
+- Every derivation step needs explicit justification
+- Programmatic verification is mandatory for non-trivial results
+- Keep "open questions" section — uncertainty is a valid outcome
+- Distinguish: proven results / plausible conjectures / unverified claims
+- Innovation is encouraged, but reliability comes first
+"""
+
+    scientific_ledger = """# Proof Ledger
+
+Always build a ledger with these sections:
+- problem statement
+- notation and symbols
+- assumptions
+- known facts / imported results
+- derivation steps
+- edge cases
+- possible counterexamples
+- falsification tests
+- final claim status: proven / plausible / rejected / unresolved
+
+If a step is hand-wavy, mark it as a gap instead of pretending it is proven.
+"""
+
+    scientific_review = """# Review Loop
+
+For important results, request an explicit audit from another agent or role after the first derivation pass.
+
+## Audit focus
+- hidden assumptions
+- algebra / calculus mistakes
+- missing edge cases
+- confusing notation
+- unsupported causal leap
+- external fact that still needs retrieval
+
+Do not ask for a generic review. Ask for a targeted audit with the exact conjecture or derivation under scrutiny.
+"""
+
+    scientific_autoresearch = """# Autoresearch Patterns
+
+Use these high-level patterns inspired by autonomous research systems such as `karpathy/autoresearch`:
+- maintain an agenda of open questions instead of one monolithic thought dump
+- alternate between proposing an explanation and criticizing it
+- convert uncertainty into explicit experiments or falsification tests
+- archive intermediate artifacts so later report-generation skills receive a clean packet
+- treat "unknown" as a first-class outcome, not as failure
+
+This reference is for workflow inspiration, not for copying any external implementation.
+"""
+
+    scientific_script = r"""#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+
+def _render_list(items):
+    rows = [str(item).strip() for item in (items or []) if str(item).strip()]
+    return rows or ["(pending)"]
+
+
+def render_packet(payload: dict) -> str:
+    title = str(payload.get("title") or "Scientific Reasoning Packet").strip()
+    lines = [f"# {title}", ""]
+    mapping = [
+        ("Problem", payload.get("problem")),
+        ("Assumptions", _render_list(payload.get("assumptions"))),
+        ("Definitions", _render_list(payload.get("definitions"))),
+        ("Derivations", _render_list(payload.get("derivations"))),
+        ("Counterexamples", _render_list(payload.get("counterexamples"))),
+        ("Falsification Tests", _render_list(payload.get("falsification_tests"))),
+        ("Open Questions", _render_list(payload.get("open_questions"))),
+        ("Audit Requests", _render_list(payload.get("audit_requests"))),
+    ]
+    for heading, value in mapping:
+        lines.append(f"## {heading}")
+        if isinstance(value, list):
+            lines.extend(f"- {item}" for item in value)
+        else:
+            text = str(value or "").strip()
+            lines.append(text or "(pending)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a scientific reasoning packet from JSON input.")
+    parser.add_argument("--input", required=True, help="Input JSON file")
+    parser.add_argument("--output", required=True, help="Output markdown file")
+    args = parser.parse_args()
+
+    src = Path(args.input).expanduser().resolve()
+    if not src.exists():
+        raise SystemExit(f"input not found: {src}")
+    payload = json.loads(src.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit("input JSON must be an object")
+
+    out = Path(args.output).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_packet(payload), encoding="utf-8")
+    print(str(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+    _write_text_if_changed(research_root / "SKILL.md", research_skill)
+    _write_text_if_changed(research_root / "references" / "workflow.md", research_workflow)
+    _write_text_if_changed(research_root / "references" / "report-interfaces.md", research_interfaces)
+    _write_text_if_changed(research_root / "references" / "experiment-design.md", research_experiment)
+    _write_text_if_changed(research_root / "scripts" / "render_research_bundle.py", research_script)
+
+    _write_text_if_changed(scientific_root / "SKILL.md", scientific_skill)
+    _write_text_if_changed(scientific_root / "references" / "proof-ledger.md", scientific_ledger)
+    _write_text_if_changed(scientific_root / "references" / "review-loop.md", scientific_review)
+    _write_text_if_changed(scientific_root / "references" / "autoresearch-patterns.md", scientific_autoresearch)
+    _write_text_if_changed(scientific_root / "scripts" / "build_reasoning_packet.py", scientific_script)
+
+    _write_text_if_changed(
+        generated_root / "research-science-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": [
+                    "research-orchestrator-pro",
+                    "scientific-reasoning-lab",
+                ],
+                "focus": [
+                    "uploaded_pdf_and_data_research",
+                    "experiment_design",
+                    "report_bundle_handoff",
+                    "scientific_derivation",
+                    "multi_agent_audit",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
 def ensure_generated_runtime_skills_manifest(skills_root: Path):
     generated_root = skills_root / "generated"
     tracked = [
@@ -4934,6 +6347,10 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/retrieval-synthesis-fallback/SKILL.md",
         "generated/pdf-vision-literature-integrator/SKILL.md",
         "generated/deep-research-orchestrator/scripts/render_deep_research_report.py",
+        "generated/research-orchestrator-pro/SKILL.md",
+        "generated/research-orchestrator-pro/scripts/render_research_bundle.py",
+        "generated/scientific-reasoning-lab/SKILL.md",
+        "generated/scientific-reasoning-lab/scripts/build_reasoning_packet.py",
         "generated/html-report-engineering/SKILL.md",
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
@@ -5245,6 +6662,7 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_execution_recovery_skill(skills_root)
     ensure_generated_html_frontend_report_skills(skills_root)
     ensure_generated_deep_research_skills(skills_root)
+    ensure_generated_research_scientific_skills(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -5418,11 +6836,151 @@ class SkillStore:
         triggers = _meta_string_list(meta.get("triggers"))
         cc = self._skill_meta_section(meta, "clouds_coder")
         triggers.extend(_meta_string_list(cc.get("triggers")))
+        # Minimax nested metadata support
+        mm = self._skill_meta_section(meta, "metadata")
+        triggers.extend(_meta_string_list(mm.get("triggers")))
+        # Extract trigger keywords from description (for skills-main / awesome-claude-skills format)
+        if not triggers:
+            desc = str(meta.get("description", "") or "").strip()
+            triggers.extend(self._extract_triggers_from_description(desc))
         seen: set[str] = set()
         out: list[str] = []
         for item in triggers:
             key = item.lower()
             if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _extract_triggers_from_description(desc: str) -> list[str]:
+        """Extract trigger keywords from description text.
+
+        Handles ALL skill ecosystems:
+        - Minimax fullstack: "TRIGGER when: building a full-stack app, creating REST API..."
+        - skills-main: "Triggers include: 'Word doc', 'word document', '.docx'..."
+        - Kimi: Pure descriptive — "Excel文件操作（创建、验证、透视表）"
+        - awesome-claude-skills: "Comprehensive PDF manipulation toolkit for..."
+        - academic-pptx: "学术演讲内容和结构指南"
+        """
+        if not desc or len(desc) < 20:
+            return []
+        triggers: list[str] = []
+        # Pattern 1: "TRIGGER when:" or "triggers include:" followed by comma list
+        for m in re.finditer(r'(?:TRIGGER\s+when|triggers?\s+include|DO\s+NOT\s+TRIGGER)[:\s]+([^\n.]{10,600})', desc, re.IGNORECASE):
+            segment = m.group(1).strip()
+            # Extract quoted phrases
+            for qm in re.finditer(r"'([^']{2,40})'|\"([^\"]{2,40})\"", segment):
+                token = (qm.group(1) or qm.group(2) or "").strip()
+                if token:
+                    triggers.append(token)
+            # Extract comma-separated items
+            if not triggers:
+                for item in re.split(r'[,;]', segment):
+                    cleaned = item.strip().strip('"\'').strip()
+                    if 3 <= len(cleaned) <= 50 and not cleaned.startswith("or "):
+                        triggers.append(cleaned)
+        # Pattern 2: "Use this skill when ... mentions of 'X', 'Y', 'Z'"
+        for m in re.finditer(r"mention[s]?\s+of\s+([^\n.]{5,300})", desc, re.IGNORECASE):
+            for qm in re.finditer(r"'([^']{2,40})'|\"([^\"]{2,40})\"", m.group(1)):
+                token = (qm.group(1) or qm.group(2) or "").strip()
+                if token:
+                    triggers.append(token)
+        # Pattern 3: "Use this skill when the user wants to <verb> <object>" — extract verb phrases
+        for m in re.finditer(r'(?:use this skill|MUST use)[^.]*?(?:wants?\s+to|needs?\s+to|asks?\s+to)\s+([^.]{5,200})', desc, re.IGNORECASE):
+            segment = m.group(1).strip()
+            for item in re.split(r'[,;]|(?:\bor\b)', segment):
+                cleaned = item.strip().strip('"\'').strip()
+                if 3 <= len(cleaned) <= 60:
+                    triggers.append(cleaned)
+        # Pattern 4: Quoted terms anywhere — "make a PDF", "fill in the form", etc.
+        if not triggers:
+            for qm in re.finditer(r'"([^"]{3,40})"', desc):
+                token = qm.group(1).strip()
+                if token and not token.startswith("http"):
+                    triggers.append(token)
+        # Pattern 5: File extension mentions — .docx, .pdf, .xlsx, .pptx
+        # Only match standalone extensions, not library names like "Paged.js" or "D3.js"
+        for m in re.finditer(r'(?<![A-Za-z])\.(docx?|pdf|xlsx?|xls|pptx?|csv|tex|html?)\b', desc, re.IGNORECASE):
+            ext = f".{m.group(1).lower()}"
+            triggers.append(ext)
+        # Pattern 6 (Kimi/generic fallback): Extract key terms from description
+        if not triggers:
+            # Use first 2 sentences for broader context
+            sentences = re.split(r'(?<=[.!?])\s+', desc[:500])
+            context = " ".join(sentences[:2]).strip() if sentences else desc[:300]
+            # Chinese: extract terms
+            cn_terms = re.findall(r'[\u4e00-\u9fff]{2,8}', context)
+            triggers.extend(cn_terms[:5])
+            # English: extract capitalized tech/domain terms
+            tech_words = re.findall(r'\b([A-Z][a-zA-Z]{2,})\b', context)
+            _GENERIC_CAPS = {"Use", "The", "This", "When", "For", "And", "But", "Not", "All",
+                             "Any", "Has", "Are", "Was", "Can", "May", "Will", "Also", "Each",
+                             "Professional", "Comprehensive", "Academic", "Supports", "Core",
+                             "Create", "Process", "Includes", "Generate", "Suitable",
+                             "Tools", "Specialized"}
+            for w in tech_words:
+                if w not in _GENERIC_CAPS:
+                    triggers.append(w)
+            # Extract compound terms: "full-stack", "track-changes"
+            compound = re.findall(r'\b([a-zA-Z]+-[a-zA-Z]+)\b', context)
+            triggers.extend(c for c in compound if len(c) >= 5)
+            # Extract terms in parentheses: "(HTML+Paged.js)", "(read, extract, merge)"
+            for m in re.finditer(r'\(([^)]{3,80})\)', desc[:500]):
+                inner = m.group(1).strip()
+                # Split by Chinese comma or +
+                for part in re.split(r'[、+,/]', inner):
+                    part = part.strip()
+                    if 2 <= len(part) <= 30:
+                        triggers.append(part)
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for t in triggers:
+            low = t.lower()
+            if low not in seen:
+                seen.add(low)
+                deduped.append(t)
+        return deduped[:20]
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for t in triggers:
+            low = t.lower()
+            if low not in seen:
+                seen.add(low)
+                deduped.append(t)
+        return deduped[:20]
+
+    def _skill_keywords(self, meta: dict) -> list[str]:
+        """Extract keywords from SKILL.md metadata for universal skill matching.
+
+        Supports all three skill ecosystems:
+        - Minimax: metadata.category, metadata.keywords, triggers array
+        - skills-main: description-embedded triggers
+        - awesome-claude-skills: description-embedded triggers
+        """
+        keywords = _meta_string_list(meta.get("keywords"))
+        keywords.extend(_meta_string_list(meta.get("keyword")))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        keywords.extend(_meta_string_list(cc.get("keywords")))
+        # Minimax nested metadata: extract category and sources as keywords
+        mm = self._skill_meta_section(meta, "metadata")
+        if mm:
+            cat = str(mm.get("category", "") or "").strip()
+            if cat:
+                # "document-processing" → ["document-processing", "document", "processing"]
+                keywords.append(cat)
+                keywords.extend(cat.replace("-", " ").replace("_", " ").split())
+            keywords.extend(_meta_string_list(mm.get("keywords")))
+        # Also include runtime_compat tags
+        keywords.extend(_meta_string_list(meta.get("runtime_compat")))
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in keywords:
+            key = item.lower().strip()
+            if key in seen or not key or len(key) < 2:
                 continue
             seen.add(key)
             out.append(item)
@@ -5754,6 +7312,60 @@ class SkillStore:
             if any(resolved.is_relative_to(root) for root in excluded):
                 continue
             self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_LOCAL, "1.0")
+        # Extended discovery: plugins/*/skills/*/SKILL.md (Minimax format)
+        plugins_dir = self.skills_root / "plugins"
+        if plugins_dir.exists() and plugins_dir.is_dir():
+            for skill_file in sorted(plugins_dir.rglob("SKILL.md")):
+                resolved = skill_file.resolve()
+                if any(resolved.is_relative_to(root) for root in excluded):
+                    continue
+                # Skip if already loaded (may overlap with rglob above)
+                candidate_key = f"local:{skill_file.parent.name}"
+                if candidate_key in self.skills:
+                    continue
+                self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_LOCAL, "1.0")
+        # Load .claude-plugin manifests for skill discovery
+        self._load_claude_plugin_manifests()
+
+    def _load_claude_plugin_manifests(self):
+        """Load skills referenced in .claude-plugin/plugin.json or marketplace.json.
+
+        Supports Minimax plugin.json and Anthropic marketplace.json formats.
+        This enables discovery of skills in nested plugin directories.
+        """
+        for manifest_name in ("plugin.json", "marketplace.json"):
+            manifest_path = self.skills_root / ".claude-plugin" / manifest_name
+            if not manifest_path.exists():
+                continue
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+            except Exception:
+                continue
+            # Anthropic marketplace.json: plugins[].skills[] → paths
+            plugins = raw.get("plugins", [])
+            if isinstance(plugins, list):
+                for plugin in plugins:
+                    if not isinstance(plugin, dict):
+                        continue
+                    skill_paths = plugin.get("skills", [])
+                    if not isinstance(skill_paths, list):
+                        continue
+                    for skill_rel in skill_paths:
+                        skill_dir = (self.skills_root / str(skill_rel).strip()).resolve()
+                        skill_file = skill_dir / "SKILL.md"
+                        if skill_file.exists():
+                            # Check if already loaded
+                            try:
+                                name = skill_dir.name
+                                if any(name == s.get("name") for s in self.skills.values()):
+                                    continue
+                            except Exception:
+                                pass
+                            self._load_skill_file(
+                                skill_file, "local", SKILL_PROTOCOL_LOCAL, "1.0",
+                            )
 
     def _load_http_provider(self, manifest_path: Path, cfg: dict):
         endpoint = str(cfg.get("endpoint", "")).strip()
@@ -5985,9 +7597,94 @@ class SkillStore:
         self._load_local_skills()
         self._load_manifest_providers()
         self._load_clawhub_autodetect()
+        self._load_external_skill_roots()
         self._inject_builtin_skills()
         self.fingerprint = fp
         self.last_reload_ts = now
+
+    def _load_external_skill_roots(self):
+        """Discover and load skills from external directories adjacent to skills_root.
+
+        Scans the parent directory of skills_root for known skill library patterns:
+        - Directories containing SKILL.md at root (e.g., academic-pptx-skill-main/)
+        - Directories containing skills/*/SKILL.md (e.g., skills-main/skills/, Minimax/skills/)
+        - Directories containing source-code/skills/*/SKILL.md (e.g., kimi-agent-internals-main/)
+        - Directories containing plugins/*/skills/*/SKILL.md (e.g., Minimax/plugins/)
+
+        Each external directory is registered as a separate provider for clean namespacing.
+        """
+        workspace = self.skills_root.parent
+        if not workspace.exists():
+            return
+        skills_root_resolved = self.skills_root.resolve()
+        already_loaded_names = {s.get("name", "") for s in self.skills.values() if s.get("name")}
+        # Scan workspace for directories that look like skill libraries
+        try:
+            candidates = sorted(
+                (d for d in workspace.iterdir() if d.is_dir() and d.resolve() != skills_root_resolved),
+                key=lambda p: p.name.lower(),
+            )
+        except Exception:
+            return
+        for candidate in candidates:
+            skill_files: list[Path] = []
+            # Pattern 1: Root-level SKILL.md (e.g., academic-pptx-skill-main/SKILL.md)
+            root_skill = candidate / "SKILL.md"
+            if root_skill.exists():
+                skill_files.append(root_skill)
+            # Pattern 2: skills/*/SKILL.md (e.g., skills-main/skills/docx/SKILL.md)
+            skills_subdir = candidate / "skills"
+            if skills_subdir.exists() and skills_subdir.is_dir():
+                try:
+                    for sf in sorted(skills_subdir.rglob("SKILL.md")):
+                        skill_files.append(sf)
+                except Exception:
+                    pass
+            # Pattern 3: source-code/skills/*/SKILL.md (e.g., kimi-agent-internals-main/)
+            source_skills = candidate / "source-code" / "skills"
+            if source_skills.exists() and source_skills.is_dir():
+                try:
+                    for sf in sorted(source_skills.rglob("SKILL.md")):
+                        skill_files.append(sf)
+                except Exception:
+                    pass
+            # Pattern 4: plugins/*/skills/*/SKILL.md (e.g., Minimax/plugins/pptx-plugin/)
+            plugins_dir = candidate / "plugins"
+            if plugins_dir.exists() and plugins_dir.is_dir():
+                try:
+                    for sf in sorted(plugins_dir.rglob("SKILL.md")):
+                        skill_files.append(sf)
+                except Exception:
+                    pass
+            if not skill_files:
+                continue
+            # Register this external directory as a provider
+            provider_name = re.sub(r"[^A-Za-z0-9]+", "-", candidate.name.lower()).strip("-") or "external"
+            provider_id = self._register_provider(
+                provider_id=f"ext-{provider_name}",
+                protocol=SKILL_PROTOCOL_LOCAL,
+                version="1.0",
+                description=f"External skill library: {candidate.name}",
+                root=candidate,
+            )
+            loaded = 0
+            for skill_file in skill_files:
+                try:
+                    raw = try_read_text(skill_file)
+                    if raw is None:
+                        continue
+                    meta, _ = parse_front_matter(raw)
+                    name = str(meta.get("name", "")).strip() or skill_file.parent.name
+                    # Skip duplicates (same name already loaded from local skills)
+                    if name in already_loaded_names:
+                        continue
+                    self._load_skill_file(skill_file, provider_id, SKILL_PROTOCOL_LOCAL, "1.0")
+                    already_loaded_names.add(name)
+                    loaded += 1
+                except Exception:
+                    continue
+            if loaded > 0:
+                self.providers[provider_id]["skill_count"] = loaded
 
     def _inject_builtin_skills(self):
         """Register built-in skill guides for small-model support."""
@@ -7712,7 +9409,12 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
 
 TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
-    tool_def("read_file", "Read file content.", {"path": {"type": "string"}, "limit": {"type": "integer"}}, ["path"]),
+    tool_def(
+        "read_file",
+        "Read file content with optional line pagination.",
+        {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+        ["path"],
+    ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     tool_def("edit_file", "Edit a file by replacing first match.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
     tool_def("TodoWrite", "Update todo list.", {"items": {"type": "array", "items": {"type": "object"}}}, ["items"]),
@@ -7763,6 +9465,28 @@ TOOLS = [
             "max_messages": {"type": "integer"},
             "offset": {"type": "integer"},
             "include_tools": {"type": "boolean"},
+        },
+    ),
+    tool_def(
+        "query_code_library",
+        "Query the independent code library for repo/file/symbol references before implementing or reviewing code.",
+        {
+            "query": {"type": "string"},
+            "top_k": {"type": "integer"},
+            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "language": {"type": "string"},
+        },
+        ["query"],
+    ),
+    tool_def(
+        "query_knowledge_library",
+        "Read current global knowledge-library status or query the TF-Graph_IDF RAG library for grounded document references.",
+        {
+            "query": {"type": "string"},
+            "top_k": {"type": "integer"},
+            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "category": {"type": "string"},
+            "kind": {"type": "string"},
         },
     ),
     tool_def(
@@ -7830,6 +9554,11 @@ TOOLS = [
                     "review_feedback",
                     "conversation_history",
                     "status",
+                    "plan_findings",
+                    "plan_proposal",
+                    "plan_steps",
+                    "plan_risks",
+                    "skill_analysis",
                 ],
             },
             "content": {"type": "string"},
@@ -7915,6 +9644,8 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "read_from_blackboard",
         "write_to_blackboard",
         "compress",
+        "query_code_library",
+        "query_knowledge_library",
     },
     "developer": {str(name) for name in TOOL_SPEC_BY_NAME.keys()},
     "reviewer": {
@@ -7933,6 +9664,8 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "read_from_blackboard",
         "write_to_blackboard",
         "compress",
+        "query_code_library",
+        "query_knowledge_library",
     },
 }
 
@@ -7964,7 +9697,15 @@ class SessionState:
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
+        upload_callback=None,
         run_finished_callback=None,
+        reference_prepare_callback=None,
+        query_code_library_callback=None,
+        query_knowledge_library_callback=None,
+        code_library_root: Path | str | None = None,
+        code_library_status_callback=None,
+        knowledge_library_root: Path | str | None = None,
+        knowledge_library_status_callback=None,
     ):
         self.id = session_id
         self.title = title
@@ -7980,6 +9721,8 @@ class SessionState:
         self.context_archive_dir.mkdir(parents=True, exist_ok=True)
         self.code_preview_dir = self.root / "code_preview"
         self.code_preview_dir.mkdir(parents=True, exist_ok=True)
+        self.long_output_dir = self.files_root / ".clouds_coder" / "long_output"
+        self.long_output_dir.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.root / "meta.json"
         self.state_path = self.root / "state.json"
         self.crypto = crypto
@@ -7987,7 +9730,25 @@ class SessionState:
         # Use re-entrant lock to avoid self-deadlock.
         self.lock = threading.RLock()
         self.owner_user_id = str(owner_user_id or "")
+        self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
+        self.reference_prepare_callback = reference_prepare_callback
+        self.query_code_library_callback = query_code_library_callback
+        self.query_knowledge_library_callback = query_knowledge_library_callback
+        try:
+            self.code_library_root = (
+                str(Path(code_library_root).resolve()) if code_library_root else ""
+            )
+        except Exception:
+            self.code_library_root = str(code_library_root or "").strip()
+        self.code_library_status_callback = code_library_status_callback
+        try:
+            self.knowledge_library_root = (
+                str(Path(knowledge_library_root).resolve()) if knowledge_library_root else ""
+            )
+        except Exception:
+            self.knowledge_library_root = str(knowledge_library_root or "").strip()
+        self.knowledge_library_status_callback = knowledge_library_status_callback
         self.events = EventHub()
         self.ollama = OllamaClient(ollama_base, model)
         self.auto_model_switch = bool(auto_model_switch)
@@ -8028,6 +9789,8 @@ class SessionState:
         self.operations: list[dict] = []
         self.code_preview_index: dict[str, list[dict]] = {}
         self.uploads: list[dict] = []
+        self.runtime_code_reference_text = ""
+        self.runtime_code_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
         self.cancel_requested = False
@@ -8079,6 +9842,7 @@ class SessionState:
         self.stall_escalation_triggered = False
         self.stall_escalation_round = 0
         self._cached_llm_complexity = ""
+        self._cached_complexity_dimensions: dict = {}  # scope/steps/skill/output dimensions
         self._pending_media_inputs: list[dict] = []
         self.tool_retry_counts: dict[str, int] = {}
         self.last_auto_title_ts = 0.0
@@ -9449,6 +11213,8 @@ class SessionState:
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
         self.runtime_plan_mode_needed = False
+        self.runtime_code_reference_text = ""
+        self.runtime_code_reference_meta = {}
         return removed_hints
 
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
@@ -9727,6 +11493,18 @@ class SessionState:
             now - self.skills_last_refresh_ts
         ) < SKILL_REFRESH_MIN_INTERVAL_SECONDS:
             return
+        # Fast path: if already prepared, check skills dir mtime only
+        if (not force) and self.skills_runtime_prepared:
+            try:
+                skills_dir = self.skills.skills_root
+                dir_mtime = skills_dir.stat().st_mtime if skills_dir.exists() else 0.0
+                cached_mtime = getattr(self, "_skills_dir_mtime_cache", 0.0)
+                if dir_mtime > 0 and dir_mtime == cached_mtime:
+                    self.skills_last_refresh_ts = now
+                    return
+                self._skills_dir_mtime_cache = dir_mtime
+            except Exception:
+                pass
         if force or (not self.skills_runtime_prepared):
             ensure_runtime_skills(self.skills.skills_root)
             self.skills_runtime_prepared = True
@@ -9736,7 +11514,7 @@ class SessionState:
         if prev_fp and self.skills.fingerprint and prev_fp != self.skills.fingerprint:
             self.skill_load_cache = {}
 
-    def _load_skill_with_cache(self, name: str) -> str:
+    def _load_skill_with_cache(self, name: str, load_source: str = "manual") -> str:
         self._ensure_skills_ready(force=False)
         key, err = self.skills._resolve_name(name)
         if err or not key:
@@ -9749,7 +11527,7 @@ class SessionState:
             if body_z and cached_fp and cached_fp == fp:
                 restored = decompress_text_blob(body_z)
                 if restored:
-                    self._broadcast_loaded_skill(key, restored)
+                    self._broadcast_loaded_skill(key, restored, load_source=load_source)
                     return restored
         text = self.skills.load(name)
         if text and not str(text).startswith("Error:"):
@@ -9761,43 +11539,68 @@ class SessionState:
             self._prune_skill_load_cache()
             self.updated_at = now_ts()
             self._persist()
-            self._broadcast_loaded_skill(key, text)
+            self._broadcast_loaded_skill(key, text, load_source=load_source)
         return text
 
-    def _broadcast_loaded_skill(self, skill_key: str, skill_text: str):
-        """Broadcast a loaded skill to blackboard and all agent contexts."""
+    def _broadcast_loaded_skill(self, skill_key: str, skill_text: str, *, load_source: str = "manual"):
+        """Broadcast a loaded skill to blackboard, global single-agent context, and agent contexts."""
         # 1. Write skill reference to blackboard so all agents are aware
         bb = self._ensure_blackboard()
         loaded_skills = bb.get("loaded_skills", {})
         if not isinstance(loaded_skills, dict):
             loaded_skills = {}
+        skill_row = self.skills.skills.get(skill_key, {}) if isinstance(getattr(self.skills, "skills", {}), dict) else {}
+        meta = skill_row.get("meta", {}) if isinstance(skill_row.get("meta"), dict) else {}
+        skill_name = str(skill_row.get("name", skill_key) or skill_key).strip() or skill_key
+        skill_path = str(skill_row.get("skill_path", "") or "").strip()
+        aliases = self.skills._skill_aliases(meta)
         loaded_skills[skill_key] = {
             "loaded_at": now_ts(),
             "size": len(skill_text),
             "preview": trim(skill_text, 300),
+            "skill_name": skill_name,
+            "skill_path": skill_path,
+            "aliases": aliases,
         }
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
         self._blackboard_touch()
-        # 2. Inject skill content into all agent contexts (not just the caller)
-        caller_role = str(self.active_agent_role or "").strip().lower()
+        # 2. Inject full skill content into messages (model needs it to follow instructions)
+        #    but mark it so the frontend renders only a compact card
+        skill_desc = str(skill_row.get("description", "-")).strip()
         inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
             f"A skill has been loaded. Follow its instructions precisely.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
-        for role in ("explorer", "developer", "reviewer"):
-            if role == caller_role:
-                continue  # caller already gets it as tool result
-            self._append_agent_context_message(role, {
+        # UI display text: concise format that matches frontend's skill_loaded card regex
+        ui_display = f"[skill loaded: {skill_name}] {trim(skill_desc, 200)}"
+        self.messages.append(
+            {
                 "role": "user",
                 "content": inject_msg,
                 "ts": now_ts(),
-                "agent_role": role,
-            }, mirror_to_global=False)
+                "agent_role": "shared",
+                "_skill_notify": True,
+                "_ui_text": ui_display,
+            }
+        )
+        self.messages = self.messages[-400:]
+        # Also inject into agent_messages for multi-agent mode
+        self.agent_messages.append(
+            {
+                "role": "user",
+                "content": inject_msg,
+                "ts": now_ts(),
+                "agent_role": "shared",
+            }
+        )
+        am_limit = self._tier_agent_context_limits(self._context_compression_tier())["agent_messages"]
+        if len(self.agent_messages) > int(am_limit * 1.5):
+            self.agent_messages = self.agent_messages[-am_limit:]
         self._emit("status", {
-            "summary": f"skill '{skill_key}' loaded and broadcast to all agents"
+            "summary": f"skill loaded: {skill_name}" + (f" ({load_source})" if load_source and load_source != "manual" else ""),
         })
 
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
@@ -9805,6 +11608,60 @@ class SessionState:
         if not goal:
             return ""
         return hashlib.sha1(goal.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _current_plan_step_row(self, board: dict | None = None) -> dict | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", [])
+        if not isinstance(todos, list):
+            return None
+        for row in todos:
+            if isinstance(row, dict) and row.get("category") == "plan_step" and row.get("status") == "in_progress":
+                return row
+        return None
+
+    def _current_plan_step_text(self, board: dict | None = None) -> str:
+        row = self._current_plan_step_row(board)
+        return trim(str((row or {}).get("content", "") or "").strip(), 400)
+
+    def _current_execution_focus_text(self) -> str:
+        bb = self._ensure_blackboard()
+        parts: list[str] = []
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 1200)
+        if goal:
+            parts.append(goal)
+        step_text = self._current_plan_step_text(bb)
+        if step_text:
+            parts.append(f"Current plan step: {step_text}")
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        objective = trim(str(profile.get("direct_objective", "") or "").strip(), 600)
+        if objective:
+            parts.append(f"Direct objective: {objective}")
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = trim(str(plan.get("phase", "") or "").strip(), 60)
+        if plan_phase:
+            parts.append(f"Plan phase: {plan_phase}")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in parts:
+            norm = re.sub(r"\s+", " ", str(item or "").strip()).strip()
+            if not norm:
+                continue
+            low = norm.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            deduped.append(norm)
+        return "\n".join(deduped)
+
+    def _refresh_loaded_skills_for_execution_focus(self, trigger: str = ""):
+        focus = self._current_execution_focus_text()
+        if focus:
+            self._auto_discover_and_load_skills(focus, trigger=trigger)
+
+    def _loaded_skill_rows(self, board: dict | None = None) -> dict[str, dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        loaded = bb.get("loaded_skills", {})
+        return loaded if isinstance(loaded, dict) else {}
 
     def _clear_loaded_skill_contexts(self):
         def _filter_rows(rows: list[dict]) -> list[dict]:
@@ -9817,6 +11674,9 @@ class SessionState:
                     continue
                 kept.append(row)
             return kept
+        self.messages = _filter_rows(list(self.messages))[-400:]
+        am_limit = self._tier_agent_context_limits(self._context_compression_tier())["agent_messages"]
+        self.agent_messages = _filter_rows(list(self.agent_messages))[-am_limit:]
         for role in AGENT_ROLES:
             self.contexts[role] = _filter_rows(list(self.contexts.get(role, [])))[-400:]
         self.manager_context = _filter_rows(list(self.manager_context))[-400:]
@@ -9870,9 +11730,16 @@ class SessionState:
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 600)
         if not goal:
             return
-        prep = self._prepare_loaded_skills_for_goal(goal, trigger=trigger)
+        # Sig = user goal + current plan step text.
+        # Plan step text changes per node → triggers per-node skill reload (desired).
+        # direct_objective changes every manager round → excluded to prevent per-round reload.
+        _user_goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or goal), 600)
+        _plan_step = self._current_plan_step_text()
+        stable_sig = trim((_user_goal + "::step::" + _plan_step) if _plan_step else _user_goal, 600)
+        prep = self._prepare_loaded_skills_for_goal(stable_sig, trigger=trigger)
         already_loaded = prep.get("loaded", {})
-        if isinstance(already_loaded, dict) and len(already_loaded) >= 3 and not bool(prep.get("goal_changed", False)):
+        # Allow up to 4 concurrent non-conflicting skills for complex tasks
+        if isinstance(already_loaded, dict) and len(already_loaded) >= 4 and not bool(prep.get("goal_changed", False)):
             return
         goal_low = goal.lower()
         # Build skill catalog
@@ -9886,6 +11753,7 @@ class SessionState:
             keywords.append(name.lower())
             keywords.extend(str(x).strip().lower() for x in self.skills._skill_aliases(meta))
             keywords.extend(str(x).strip().lower() for x in self.skills._skill_triggers(meta))
+            keywords.extend(str(x).strip().lower() for x in self.skills._skill_keywords(meta))
             if name and desc and desc != "-":
                 skill_catalog.append(
                     {
@@ -9900,31 +11768,29 @@ class SessionState:
 
         matched_names: list[str] = []
 
-        # --- Path 1: LLM semantic match (5s timeout) ---
-        import threading
+        # --- Path 1 (primary): LLM task analysis → skill selection (5s timeout) ---
         llm_result: list[str] = []
         def _llm_match():
             try:
                 catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:30])
                 rsp = self.ollama.chat(
                     [{"role": "user", "content": (
-                        f"/no_think\nAvailable skills:\n{catalog_text}\n\n"
-                        f"User's task: {goal}\n\n"
-                        f"Which skills are relevant? Reply JSON array of names only. Max 2. "
-                        f"Example: [\"ppt-master\"] or []"
+                        f"/no_think\n"
+                        f"Available skills:\n{catalog_text}\n\n"
+                        f"Task: {goal}\n\n"
+                        f"Which skills are relevant? Reply ONLY a JSON array. Max 3. [] if none."
                     )}],
-                    system="/no_think\nOutput only a JSON array of skill names.",
-                    max_tokens=200,
+                    system="/no_think\nOutput ONLY a JSON array.",
+                    max_tokens=120,
                     think=False,
                 )
                 answer = str(rsp.get("content", "") or "").strip()
                 m = re.search(r'\[([^\]]*)\]', answer)
                 if m:
-                    import json as _json
                     try:
-                        names = _json.loads(f"[{m.group(1)}]")
+                        names = json.loads(f"[{m.group(1)}]")
                         if isinstance(names, list):
-                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:2])
+                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:3])
                     except Exception:
                         pass
             except Exception:
@@ -9934,29 +11800,168 @@ class SessionState:
         t.join(timeout=5.0)
         if llm_result:
             matched_names = llm_result
-            self._emit("status", {"summary": f"skill discovery (LLM): matched {matched_names} ({trigger})"})
+            self._emit("status", {"summary": f"skill discovery (LLM task analysis): {matched_names} ({trigger})"})
 
-        # --- Path 2: Keyword fallback if LLM returned nothing ---
+        # --- Path 2 (fallback): Keyword match only if LLM returned nothing ---
         if not matched_names:
             matched_names = self._keyword_match_skills(goal_low, skill_catalog)
             if matched_names:
-                self._emit("status", {"summary": f"skill discovery (keyword): matched {matched_names} ({trigger})"})
+                self._emit("status", {"summary": f"skill discovery (keyword fallback): {matched_names} ({trigger})"})
 
-        # --- Load matched skills ---
+        # --- Path 3: Deferred LLM pickup if still running ---
+        if not matched_names and t.is_alive():
+            def _deferred_llm_pickup():
+                t.join(timeout=8.0)
+                if llm_result and not self._loaded_skill_rows():
+                    for name_str in llm_result[:3]:
+                        try:
+                            self._load_skill_with_cache(name_str, load_source=f"auto:llm-deferred:{trigger or 'discovery'}")
+                        except Exception:
+                            pass
+            threading.Thread(target=_deferred_llm_pickup, daemon=True).start()
+
+        # --- Load matched skills: multi-skill with conflict detection ---
+        # Filter out infrastructure/recovery skills that shouldn't be auto-triggered
+        _INFRA_SKILL_PATTERNS = {
+            "execution-degradation", "context-management", "context-recall",
+            "skill-creator", "skills_gen", "agent-builder",
+        }
+        task_skills: list[str] = []
+        infra_skills: list[str] = []
+        for name_str in matched_names[:4]:
+            name_low = str(name_str or "").strip().lower()
+            is_infra = any(pat in name_low for pat in _INFRA_SKILL_PATTERNS)
+            if is_infra:
+                infra_skills.append(name_str)
+            else:
+                task_skills.append(name_str)
+        if not task_skills:
+            return
+        # Detect conflicts among candidate skills before loading
+        to_load: list[str] = []
+        conflicts: list[tuple[str, str, str]] = []  # (skill_a, skill_b, reason)
+        for candidate in task_skills:
+            # Check conflict with already-loaded skills
+            conflict_with = self._detect_skill_conflict(candidate, already_loaded)
+            if conflict_with:
+                conflicts.append((candidate, conflict_with[0], conflict_with[1]))
+                continue
+            # Check conflict with skills we're about to load
+            conflict_with_pending = None
+            for pending in to_load:
+                reason = self._check_skill_pair_conflict(candidate, pending)
+                if reason:
+                    conflict_with_pending = (pending, reason)
+                    break
+            if conflict_with_pending:
+                conflicts.append((candidate, conflict_with_pending[0], conflict_with_pending[1]))
+                continue
+            to_load.append(candidate)
+        # Load all non-conflicting skills
         loaded_count = 0
-        for name_str in matched_names[:2]:
+        loaded_names: list[str] = []
+        for name_str in to_load:
             if isinstance(already_loaded, dict) and any(name_str in k for k in already_loaded):
                 continue
-            result = self._load_skill_with_cache(name_str)
+            result = self._load_skill_with_cache(name_str, load_source=f"auto:{trigger or 'discovery'}")
             if result and not str(result).startswith("Error:"):
                 loaded_count += 1
+                loaded_names.append(name_str)
+        # If conflicts found, emit to frontend for user decision
+        if conflicts:
+            conflict_details = []
+            for skill_a, skill_b, reason in conflicts[:3]:
+                conflict_details.append({"blocked": skill_a, "conflicts_with": skill_b, "reason": reason})
+            self._emit("skill_conflict", {
+                "loaded": loaded_names,
+                "conflicts": conflict_details,
+                "summary": (
+                    "Skill conflict detected: "
+                    + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
+                    + ". Please choose which to keep."
+                ),
+            })
         if loaded_count > 0:
             self._emit("status", {
-                "summary": f"skill auto-discovery: {loaded_count} skill(s) loaded ({trigger})"
+                "summary": f"skills loaded: {', '.join(loaded_names)}" + (
+                    f" | conflicts deferred to user: {', '.join(c[0] for c in conflicts[:3])}" if conflicts else ""
+                ) + (f" ({trigger})" if trigger else ""),
             })
 
+    def _detect_skill_conflict(self, candidate: str, loaded: dict) -> tuple[str, str] | None:
+        """Check if candidate skill conflicts with any already-loaded skill.
+        Returns (conflicting_skill_key, reason) or None."""
+        if not isinstance(loaded, dict) or not loaded:
+            return None
+        for skill_key, row in loaded.items():
+            if not isinstance(row, dict):
+                continue
+            reason = self._check_skill_pair_conflict(candidate, str(row.get("skill_name", skill_key)))
+            if reason:
+                return (str(row.get("skill_name", skill_key)), reason)
+        return None
+
+    def _check_skill_pair_conflict(self, skill_a: str, skill_b: str) -> str:
+        """Check if two skills conflict (overlapping functionality).
+        Returns conflict reason string, or empty string if no conflict."""
+        a_low = str(skill_a or "").strip().lower()
+        b_low = str(skill_b or "").strip().lower()
+        if not a_low or not b_low or a_low == b_low:
+            return ""
+        # Define conflict groups: skills in the same group are mutually exclusive
+        _CONFLICT_GROUPS = [
+            # PDF processors
+            ({"pdf", "kimi-pdf", "minimax-pdf"}, "PDF processing"),
+            # Word/DOCX processors
+            ({"docx", "kimi-docx", "minimax-docx"}, "Word document processing"),
+            # Excel/XLSX processors
+            ({"xlsx", "kimi-xlsx", "minimax-xlsx"}, "Excel/spreadsheet processing"),
+            # PPT/PPTX processors
+            ({"ppt", "ppt-master", "pptx", "academic-pptx", "slide-making-skill"}, "Presentation/PPT processing"),
+            # Research orchestrators
+            ({"deep-research-orchestrator", "research-orchestrator-pro"}, "Research orchestration"),
+            # Frontend design
+            ({"frontend-design", "frontend-composition-algorithm", "canvas-design", "web-artifacts-builder"}, "Frontend/web design"),
+        ]
+        # Normalize: strip common prefixes/suffixes for matching
+        def _norm(name: str) -> set[str]:
+            tokens = set()
+            tokens.add(name)
+            # Strip provider prefix
+            if ":" in name:
+                tokens.add(name.split(":", 1)[-1])
+            # Strip common prefixes
+            for prefix in ("local:", "ext-", "minimax-", "kimi-"):
+                if name.startswith(prefix):
+                    tokens.add(name[len(prefix):])
+            return tokens
+        a_tokens = _norm(a_low)
+        b_tokens = _norm(b_low)
+        for group, reason in _CONFLICT_GROUPS:
+            a_in = bool(a_tokens & group)
+            b_in = bool(b_tokens & group)
+            if a_in and b_in:
+                return reason
+        return ""
+
     def _keyword_match_skills(self, goal_low: str, skill_catalog: list[dict]) -> list[str]:
-        """Keyword-based skill matching as fallback when LLM fails."""
+        """Metadata-driven keyword skill matching — no hardcoded mappings.
+
+        Compatible with all three skill ecosystems:
+        - Minimax: explicit triggers arrays + metadata.category
+        - skills-main: triggers extracted from description text
+        - awesome-claude-skills: triggers extracted from description text
+
+        All matching is based on keywords/aliases/triggers declared in each
+        skill's SKILL.md YAML front-matter or extracted from description,
+        making it compatible with any agent runtime (claude-code, codex, opencode).
+        """
+        _STOP_WORDS = frozenset({
+            "skill", "skills", "this", "that", "with", "from", "your", "will",
+            "used", "tool", "when", "use", "the", "and", "for", "any", "also",
+            "file", "files", "want", "wants", "user", "like", "make", "create",
+            "should", "include", "including", "mention", "need", "needs",
+        })
         scored: list[tuple[int, int, str]] = []
         for s in skill_catalog:
             qname = str(s.get("qname", "")).strip()
@@ -9964,87 +11969,185 @@ class SessionState:
                 continue
             score = 0
             longest = 0
+            # Phase 1: Match explicit keywords (from triggers + aliases + keywords metadata)
             for kw in s.get("keywords", []) or []:
                 token = str(kw or "").strip().lower()
-                if not token or token in {"skill", "skills"}:
+                if not token or token in _STOP_WORDS:
                     continue
                 if token in goal_low:
                     longest = max(longest, len(token))
-                    score += 3 if " " in token else 1
+                    # Multi-word matches get higher score
+                    score += 5 if " " in token else 2
+            # Phase 2: Match skill name tokens
+            name = str(s.get("name", "")).strip().lower()
+            if name and name not in _STOP_WORDS:
+                name_tokens = [t for t in re.split(r"[-_\s]+", name) if t and len(t) >= 3 and t not in _STOP_WORDS]
+                for nt in name_tokens:
+                    if nt in goal_low:
+                        score += 2
+                        longest = max(longest, len(nt))
+            # Phase 3: Description-based matching (for skills without explicit keywords)
+            desc = str(s.get("desc", "")).strip().lower()
+            if score == 0 and desc:
+                # Extract meaningful words from description (4+ chars, not stop words)
+                desc_words = set()
+                for w in re.split(r"[\s,;/|().\"']+", desc):
+                    w = w.strip()
+                    if len(w) >= 4 and w not in _STOP_WORDS:
+                        desc_words.add(w)
+                for w in desc_words:
+                    if w in goal_low:
+                        score += 1
+                        longest = max(longest, len(w))
+                # Also try 2-gram phrases from description
+                desc_tokens = desc.split()
+                for i in range(len(desc_tokens) - 1):
+                    bigram = f"{desc_tokens[i]} {desc_tokens[i+1]}"
+                    if len(bigram) >= 6 and bigram in goal_low:
+                        score += 3
+                        longest = max(longest, len(bigram))
             if score > 0:
                 scored.append((score, longest, qname))
-        if scored:
-            scored.sort(reverse=True)
-            matched: list[str] = []
-            for _, _, qname in scored:
-                if qname not in matched:
-                    matched.append(qname)
-                if len(matched) >= 2:
-                    break
-            if matched:
-                return matched[:2]
-
-        # Mapping: goal keywords → skill name patterns
-        keyword_skill_map = [
-            # PPT/Presentation
-            (["ppt", "pptx", "演示", "幻灯片", "presentation", "slide", "keynote"], ["ppt"]),
-            # Word/Document
-            (["docx", "word", "文档", "document", "合同", "简历", "resume"], ["docx", "kimi-docx", "doc"]),
-            # Excel/Spreadsheet
-            (["excel", "xlsx", "表格", "spreadsheet", "数据表"], ["xlsx", "kimi-xlsx"]),
-            # PDF
-            (["pdf", "论文", "paper", "报告"], ["pdf", "kimi-pdf"]),
-            # Frontend/Design
-            (["前端", "frontend", "页面", "网页", "landing", "ui设计", "界面"], ["frontend", "canvas", "web-artifacts"]),
-            # Visualization/Chart
-            (["可视化", "图表", "chart", "dashboard", "plotly", "echarts", "matplotlib"], ["visualization", "html-report"]),
-            # API/MCP
-            (["mcp", "model context protocol"], ["mcp-builder"]),
-            (["api", "rest", "graphql", "endpoint"], ["api-dev", "claude-api"]),
-            # Agent
-            (["agent", "智能体", "助手", "bot"], ["agent-builder"]),
-            # Code review
-            (["review", "审查", "代码审查", "code review"], ["code-review"]),
-            # Testing
-            (["playwright", "selenium", "e2e", "端到端测试", "webapp test"], ["webapp-testing"]),
-            # Skill creation
-            (["skill", "技能"], ["skill-creator", "skills_gen"]),
-            # Art/Design
-            (["art", "艺术", "p5", "算法艺术"], ["algorithmic-art"]),
-            (["gif", "动图", "slack"], ["slack-gif"]),
-            (["brand", "品牌", "logo"], ["brand"]),
-            (["theme", "主题", "样式"], ["theme-factory"]),
-            # Research
-            (["深度研究", "deep research", "综述"], ["deep-research"]),
-        ]
+        if not scored:
+            return []
+        scored.sort(reverse=True)
         matched: list[str] = []
-        for keywords, skill_patterns in keyword_skill_map:
-            if any(kw in goal_low for kw in keywords):
-                # Find matching skill in catalog
-                for pattern in skill_patterns:
-                    for s in skill_catalog:
-                        if pattern in s["name"].lower() or pattern in s["qname"].lower():
-                            if s["qname"] not in matched:
-                                matched.append(s["qname"])
-                            break
-                if len(matched) >= 2:
-                    break
-        return matched[:2]
+        for _, _, qname in scored:
+            if qname not in matched:
+                matched.append(qname)
+            if len(matched) >= 3:
+                break
+        return matched[:3]
 
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
-        """Unified skill awareness hint for any system prompt. Reads blackboard loaded_skills."""
+        """Unified skill awareness hint for any system prompt."""
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
+        skill_count = len(self.skills.skills) if hasattr(self.skills, "skills") else 0
         if isinstance(loaded, dict) and loaded:
-            skill_names = list(loaded.keys())[:5]
+            names = ", ".join(
+                str((row or {}).get("skill_name", key) or key).strip() or key
+                for key, row in list(loaded.items())[:5]
+            )
             return (
-                f"ACTIVE SKILLS: {', '.join(skill_names)} have been loaded into your context. "
+                f"ACTIVE SKILLS: {names}. "
                 "Follow loaded skill instructions precisely. "
-                "Use load_skill to load additional skills if needed. "
+                f"If you encounter a step requiring a workflow you don't know, call load_skill ({skill_count} available). "
             )
         return (
-            "Use list_skills to discover available skills for your task, then load_skill to load them. "
-            "Skills provide domain-specific workflows for professional outputs. "
+            f"SKILL SYSTEM: {skill_count} skills available. "
+            "Use list_skills to discover, load_skill to activate. "
+            "If unsure how to produce professional output (docs, slides, analysis), check skills first. "
+        )
+
+    def _refresh_runtime_code_reference(self, text: str):
+        cb = getattr(self, "reference_prepare_callback", None)
+        payload: dict = {}
+        if callable(cb):
+            try:
+                raw = cb(self, str(text or ""))
+                payload = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                payload = {}
+        self.runtime_code_reference_text = trim(str(payload.get("code_text", payload.get("text", "")) or ""), 8000)
+        meta = payload.get("code_meta", payload.get("meta", {}))
+        self.runtime_code_reference_meta = dict(meta) if isinstance(meta, dict) else {}
+
+    def _runtime_code_reference_prompt_block(self, max_chars: int = 4200) -> str:
+        text = trim(str(getattr(self, "runtime_code_reference_text", "") or ""), max_chars)
+        if not text:
+            return ""
+        meta = dict(getattr(self, "runtime_code_reference_meta", {}) or {})
+        tags: list[str] = []
+        route = str(meta.get("route", meta.get("requested_route", "")) or "").strip()
+        if route:
+            tags.append(f"route={route}")
+        result_count = int(meta.get("result_count", meta.get("top_results", 0)) or 0)
+        if result_count > 0:
+            tags.append(f"results={result_count}")
+        header = "Code Library Context"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "Prioritize these code-library references for code implementation/review tasks before generic reasoning. "
+            "If a reference conflicts with the current workspace file, trust the current workspace after verification.\n"
+            f"{text}"
+        )
+
+    def _knowledge_library_prompt_block(self) -> str:
+        info: dict = {}
+        cb = getattr(self, "knowledge_library_status_callback", None)
+        if callable(cb):
+            try:
+                raw = cb(self)
+                info = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                info = {}
+        root = str(info.get("root", "") or getattr(self, "knowledge_library_root", "") or "").strip()
+        stats = info.get("stats", {}) if isinstance(info.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", info.get("documents", 0)) or 0)
+        chunks = int(stats.get("chunks", info.get("chunks", 0)) or 0)
+        tasks = int(stats.get("tasks", info.get("tasks", 0)) or 0)
+        ready = bool(info.get("ready", False) or docs > 0 or chunks > 0)
+        tags = [f"ready={'yes' if ready else 'no'}", f"documents={docs}", f"chunks={chunks}"]
+        if root:
+            tags.insert(0, f"root={root}")
+        if tasks > 0:
+            tags.append(f"tasks={tasks}")
+        header = "Knowledge Library"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "This is the global TF-Graph_IDF RAG knowledge library for imported documents and research material. "
+            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`. "
+            "Do not infer knowledge-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
+            "Use `query_knowledge_library` to check readiness or retrieve grounded references from the global library."
+        )
+
+    def _code_library_prompt_block(self) -> str:
+        info: dict = {}
+        cb = getattr(self, "code_library_status_callback", None)
+        if callable(cb):
+            try:
+                raw = cb(self)
+                info = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:
+                info = {}
+        root = str(info.get("root", "") or getattr(self, "code_library_root", "") or "").strip()
+        stats = info.get("stats", {}) if isinstance(info.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", info.get("documents", 0)) or 0)
+        chunks = int(stats.get("chunks", info.get("chunks", 0)) or 0)
+        tasks = int(stats.get("tasks", info.get("tasks", 0)) or 0)
+        source_roots = [str(x).strip() for x in (info.get("source_roots", []) or []) if str(x).strip()]
+        ready = bool(info.get("ready", False) or docs > 0 or chunks > 0)
+        tags = [f"ready={'yes' if ready else 'no'}", f"documents={docs}", f"chunks={chunks}"]
+        if root:
+            tags.insert(0, f"root={root}")
+        if tasks > 0:
+            tags.append(f"tasks={tasks}")
+        if source_roots:
+            tags.append(f"source_roots={len(source_roots)}")
+        header = "Code Library"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        source_hint = ""
+        if source_roots:
+            preview = ", ".join(source_roots[:3])
+            if len(source_roots) > 3:
+                preview += ", ..."
+            source_hint = (
+                f" Discovered external raw code-corpus roots: {preview}. "
+                "Those raw corpora are source trees, not the query index itself, unless they have been imported into the Code Library."
+            )
+        return (
+            f"{header}:\n"
+            "This is the global Code Graph Library for imported source-code references used in implementation and review tasks. "
+            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`."
+            f"{source_hint} "
+            "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
+            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
         )
 
     def _system_prompt(self) -> str:
@@ -10055,11 +12158,17 @@ class SessionState:
         uploads_ctx = self._uploads_prompt_block()
         html_hint = self._html_frontend_boost_instruction()
         research_hint = self._deep_research_boost_instruction()
+        knowledge_hint = self._knowledge_library_prompt_block()
+        code_hint = self._code_library_prompt_block()
+        code_ref_block = self._runtime_code_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
         html_block = f"{html_hint}\n\n" if html_hint else ""
         research_block = f"{research_hint}\n\n" if research_hint else ""
+        knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
+        code_hint_block = f"{code_hint}\n\n" if code_hint else ""
+        code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
             and not self.single_advance_prompt_enhance
@@ -10087,6 +12196,9 @@ class SessionState:
             f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
+            f"{knowledge_block}"
+            f"{code_hint_block}"
+            f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
             f"Skills:\n{self.skills.descriptions()}"
@@ -11125,19 +13237,19 @@ class SessionState:
 
     # --- File buffer methods (修改 7) ---
 
-    def _offload_to_file_buffer(self, content: str, label: str = "") -> str:
-        """Write large content to disk, return compact reference placeholder."""
-        if len(content) < FILE_BUFFER_CONTENT_THRESHOLD:
-            return content
+    def _write_file_buffer_entry(self, content: str, label: str = "") -> dict:
+        """Write large content to disk and return entry metadata."""
         ref_id = f"fb_{int(now_ts())}_{uuid.uuid4().hex[:6]}"
         fp = self.file_buffer_dir / f"{ref_id}.txt"
         fp.write_text(content, encoding="utf-8")
         summary = trim(content, 120).replace("\n", " ")
-        self.file_buffer_index[ref_id] = {
+        entry = {
             "path": fp.relative_to(self.root).as_posix(),
             "chars": len(content),
             "summary": summary,
+            "label": str(label or ""),
         }
+        self.file_buffer_index[ref_id] = entry
         # Prune old entries if over limit
         if len(self.file_buffer_index) > FILE_BUFFER_MAX_FILES:
             oldest_keys = sorted(self.file_buffer_index.keys())[:len(self.file_buffer_index) - FILE_BUFFER_MAX_FILES]
@@ -11149,7 +13261,19 @@ class SessionState:
                     except Exception:
                         pass
                 del self.file_buffer_index[k]
-        return f"[file_buffer:{ref_id} chars={len(content)} summary={summary}]"
+        return {
+            "ref_id": ref_id,
+            "path": entry["path"],
+            "chars": int(entry["chars"]),
+            "summary": summary,
+            "placeholder": f"[file_buffer:{ref_id} chars={len(content)} summary={summary}]",
+        }
+
+    def _offload_to_file_buffer(self, content: str, label: str = "") -> str:
+        """Write large content to disk, return compact reference placeholder."""
+        if len(content) < FILE_BUFFER_CONTENT_THRESHOLD:
+            return content
+        return str(self._write_file_buffer_entry(content, label=label).get("placeholder", content))
 
     def _load_from_file_buffer(self, ref_id: str) -> str:
         """Load content from file buffer by reference ID."""
@@ -11163,6 +13287,164 @@ class SessionState:
             return fp.read_text(encoding="utf-8")
         except Exception as exc:
             return f"[file_buffer:{ref_id} read error: {exc}]"
+
+    def _is_long_listing_command(self, command: str) -> bool:
+        text = str(command or "").strip().lower()
+        if not text:
+            return False
+        segments = re.split(r"(?:&&|\|\||;|\||\n)+", text)
+        wrappers = {"env", "command", "builtin", "time", "nohup"}
+        for seg in segments:
+            part = seg.strip()
+            if not part:
+                continue
+            try:
+                tokens = shlex.split(part, posix=(os.name != "nt"))
+            except Exception:
+                tokens = part.split()
+            if not tokens:
+                continue
+            cmd_name = ""
+            for tok in tokens:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tok):
+                    continue
+                base = Path(tok).name.lower()
+                if base in wrappers:
+                    continue
+                cmd_name = base
+                break
+            if cmd_name in {"ls", "find", "rg", "fd", "tree"}:
+                return True
+        return False
+
+    def _paginate_text(self, text: str, page_chars: int, max_pages: int | None = None) -> list[str]:
+        src = str(text or "")
+        if not src:
+            return [""]
+        page_chars = max(256, int(page_chars or 0))
+        pages: list[str] = []
+        cursor = 0
+        total = len(src)
+        while cursor < total:
+            end = min(total, cursor + page_chars)
+            if end < total:
+                newline = src.rfind("\n", cursor, end)
+                if newline > cursor + int(page_chars * 0.55):
+                    end = newline + 1
+            chunk = src[cursor:end].rstrip("\n")
+            pages.append(chunk)
+            cursor = end
+            while cursor < total and src[cursor] == "\n":
+                cursor += 1
+            if max_pages is not None and len(pages) >= max_pages:
+                break
+        return pages or [""]
+
+    def _prune_long_output_files(self):
+        try:
+            files = sorted(
+                self.long_output_dir.glob("*.txt"),
+                key=lambda fp: fp.stat().st_mtime,
+            )
+        except Exception:
+            return
+        overflow = len(files) - LONG_OUTPUT_TEMP_MAX_FILES
+        if overflow <= 0:
+            return
+        for fp in files[:overflow]:
+            try:
+                fp.unlink()
+            except Exception:
+                pass
+
+    def _write_long_output_artifact(self, content: str, command: str) -> str:
+        base = ""
+        try:
+            tokens = shlex.split(str(command or ""), posix=(os.name != "nt"))
+        except Exception:
+            tokens = str(command or "").split()
+        for tok in tokens:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tok):
+                continue
+            base = Path(tok).name.lower()
+            if base in {"env", "command", "builtin", "time", "nohup"}:
+                continue
+            break
+        stem = re.sub(r"[^a-z0-9._-]+", "-", base or "output").strip("-") or "output"
+        fp = self.long_output_dir / f"{int(now_ts() * 1000)}_{stem}_{uuid.uuid4().hex[:6]}.txt"
+        fp.write_text(str(content or ""), encoding="utf-8")
+        self._prune_long_output_files()
+        return self._session_rel(fp)
+
+    def _prepare_shell_output_payload(self, command: str, output_text: str, cwd: Path | None = None) -> dict:
+        clean = str(output_text or "").strip()
+        if not clean:
+            clean = "(no output)"
+        is_listing = self._is_long_listing_command(command)
+        model_pages = self._paginate_text(clean, LONG_OUTPUT_MODEL_PAGE_CHARS)
+        ui_pages_all = self._paginate_text(clean, LONG_OUTPUT_UI_PAGE_CHARS)
+        ui_pages = ui_pages_all[:LONG_OUTPUT_UI_PREVIEW_MAX_PAGES]
+        temp_output_path = ""
+        buffer_ref = ""
+        buffer_chars = 0
+        strategy = "inline"
+        model_truncated = False
+        ui_truncated = len(ui_pages_all) > len(ui_pages)
+        should_temp = is_listing and (
+            len(clean) > LONG_OUTPUT_LISTING_OFFLOAD_CHARS or len(model_pages) > 1 or ui_truncated
+        )
+        should_buffer = should_temp or len(model_pages) > 1 or ui_truncated or len(clean) >= FILE_BUFFER_CONTENT_THRESHOLD * 4
+        if should_temp:
+            temp_output_path = self._write_long_output_artifact(clean, command)
+            strategy = "temp-read_file"
+        elif len(model_pages) > 1:
+            strategy = "paged-inline"
+        if should_buffer:
+            entry = self._write_file_buffer_entry(clean, label="shell-output")
+            buffer_ref = str(entry.get("ref_id", ""))
+            buffer_chars = int(entry.get("chars", 0) or 0)
+        model_output = clean
+        if len(model_pages) > 1 or should_temp:
+            model_truncated = True
+            preview = (
+                self._run_read(temp_output_path, LONG_OUTPUT_READ_PAGE_LINES, 0)
+                if temp_output_path
+                else model_pages[0]
+            )
+            parts = [
+                (
+                    f"[long_output chars={len(clean)} pages={len(model_pages)} "
+                    f"strategy={strategy}{f' cwd={cwd}' if cwd else ''}]"
+                )
+            ]
+            if temp_output_path:
+                parts.append(
+                    f"use read_file path=\"{temp_output_path}\" offset=0 limit={LONG_OUTPUT_READ_PAGE_LINES}"
+                )
+            if buffer_ref:
+                parts.append(f"buffer_ref={buffer_ref}")
+            parts.append(f"preview_page=1/{len(model_pages)}")
+            parts.append(preview)
+            if len(model_pages) > 1:
+                parts.append(f"... ({len(model_pages) - 1} more page(s) omitted from model context)")
+            model_output = "\n".join(parts)
+        return {
+            "output": model_output,
+            "output_full_chars": len(clean),
+            "output_full_lines": clean.count("\n") + (1 if clean else 0),
+            "ui_output_preview": ui_pages[0] if ui_pages else "",
+            "ui_output_pages": ui_pages,
+            "ui_output_page_count": len(ui_pages),
+            "ui_output_page_total": len(ui_pages_all),
+            "ui_truncated": bool(ui_truncated),
+            "model_truncated": bool(model_truncated),
+            "buffer_ref": buffer_ref,
+            "buffer_chars": buffer_chars,
+            "temp_output_path": temp_output_path,
+            "long_output_strategy": strategy,
+            "output_page_index": 1,
+            "output_page_count": len(model_pages),
+        }
 
     def _offload_agent_message_content(self, messages: list[dict]):
         """Scan messages and offload large string content to file buffer."""
@@ -11372,6 +13654,86 @@ class SessionState:
         bb["checkpoints"] = cps[-CHECKPOINT_MAX_COUNT:]
         self.blackboard = bb
 
+    def _classify_message_priority(self, msg: dict, index: int, total: int) -> int:
+        """Return 0-10 priority score. Higher = more important to keep during compression."""
+        score = 0
+        role = str(msg.get("role", ""))
+        content = str(msg.get("content", "") or "")
+        content_low = content[:2000].lower()
+        # Factor 1: Recency (0-3 points) — newest messages most valuable
+        recency = index / max(1, total - 1) if total > 1 else 1.0
+        score += int(recency * 3)
+        # Factor 2: Role weight — system/user messages more important than tool output
+        role_weights = {"system": 3, "user": 2, "assistant": 2, "tool": 1}
+        score += role_weights.get(role, 1)
+        # Factor 3: Task progress markers (+2)
+        if any(kw in content_low for kw in ("todowrite", "plan_step", "finish_task", "finish_current_task", "approved-plan")):
+            score += 2
+        # Factor 4: Error/critical info (+2) — essential for debugging continuity
+        if "error:" in content_low or "traceback" in content_low or "exception" in content_low:
+            score += 2
+        # Factor 5: Goal/task context (+1)
+        goal = str(getattr(self, "runtime_reclassify_goal", "") or self._latest_user_goal_text() or "").lower()[:200]
+        if goal:
+            goal_words = [w for w in goal.split() if len(w) > 3]
+            matches = sum(1 for w in goal_words if w in content_low)
+            if matches >= 2:
+                score += 1
+        # Factor 6: Skill content (+1) — preserve loaded skill context
+        if "<loaded-skill" in content or "_skill_notify" in str(msg):
+            score += 1
+        # Factor 7: Compact-resume notes are always max priority
+        if "<compact-resume>" in content or "<STATE_HANDOFF>" in content:
+            score = 10
+        return min(10, score)
+
+    def _priority_compress_messages(self, messages: list[dict], target_tokens: int, tier: int) -> list[dict]:
+        """Priority-based message compression: high-priority messages kept intact,
+        mid-priority compressed to summaries, low-priority reduced to one-liners."""
+        total = len(messages)
+        scored: list[tuple[int, int, dict]] = []
+        for i, msg in enumerate(messages):
+            priority = self._classify_message_priority(msg, i, total)
+            scored.append((priority, i, msg))
+        # Sort by priority descending, then by index descending (recent first)
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # Build result respecting token budget
+        kept: list[tuple[int, dict]] = []
+        current_tokens = 0
+        for priority, idx, msg in scored:
+            content = str(msg.get("content", "") or "")
+            msg_tokens = max(1, len(content) // 4)
+            if priority >= 7:
+                # High priority: keep intact
+                kept.append((idx, dict(msg)))
+                current_tokens += msg_tokens
+            elif priority >= 4:
+                # Mid priority: compress content to 500 chars if over budget
+                compressed = dict(msg)
+                if current_tokens + msg_tokens > target_tokens and len(content) > 500:
+                    role = msg.get("role", "tool")
+                    compressed["content"] = trim(content, 500) + " [compressed]"
+                kept.append((idx, compressed))
+                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+            else:
+                # Low priority: one-liner summary if over budget
+                if current_tokens > target_tokens * 0.8:
+                    continue  # Drop entirely if way over budget
+                compressed = dict(msg)
+                role = msg.get("role", "tool")
+                if role == "tool" and len(content) > 120:
+                    # Extract tool name from nearby assistant message
+                    compressed["content"] = f"[tool output, {len(content)} chars]"
+                elif len(content) > 200:
+                    compressed["content"] = trim(content, 200) + " [truncated]"
+                kept.append((idx, compressed))
+                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+            if current_tokens > target_tokens:
+                break
+        # Re-sort by original index to maintain conversation order
+        kept.sort(key=lambda x: x[0])
+        return [msg for _, msg in kept]
+
     def _auto_compact(self, reason: str):
         context_before = self._context_budget_metrics()
         tier = self._context_compression_tier(context_before)
@@ -11430,14 +13792,16 @@ class SessionState:
             target_tokens = max(3000, min(12_000, int(self.context_token_upper_bound * 0.45)))
         else:
             target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
+        # Priority-based compression: keep important messages, compress/drop low-value ones
+        if self._estimate_messages_tokens(tail) > target_tokens:
+            compact_note_msg = tail[-1]  # preserve the compact-resume note
+            tail_without_note = tail[:-1]
+            compressed_tail = self._priority_compress_messages(tail_without_note, target_tokens, tier)
+            compressed_tail.append(compact_note_msg)
+            tail = compressed_tail
+        # Final safety: if still over budget, trim from front
         while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
             tail.pop(0)
-        if self._estimate_messages_tokens(tail) > target_tokens:
-            for msg in tail:
-                if msg.get("role") == "tool":
-                    msg["content"] = trim(msg.get("content", ""), 1800 if tier < 2 else 600)
-            while len(tail) > 2 and self._estimate_messages_tokens(tail) > target_tokens:
-                tail.pop(0)
         self.messages = tail
         # Compact agent contexts in sync (critical fix for re-wall prevention)
         self._compact_agent_contexts(max(tier, 1))
@@ -11524,6 +13888,37 @@ class SessionState:
         if self.developer_edit_fail_streaks:
             stuck = ", ".join(f"{k}({v}x)" for k, v in self.developer_edit_fail_streaks.items())
             parts.append(f"EDIT_STALLS: {stuck}")
+        # 8. Plan step progress
+        plan_todos = bb.get("project_todos", [])
+        if isinstance(plan_todos, list) and plan_todos:
+            completed = sum(1 for t in plan_todos if isinstance(t, dict) and t.get("status") == "completed")
+            total_steps = len(plan_todos)
+            cursor = int(bb.get("plan_step_cursor", 0) or 0)
+            current_step = ""
+            for t in plan_todos:
+                if isinstance(t, dict) and t.get("status") == "in_progress":
+                    current_step = trim(str(t.get("content", "")), 200)
+                    break
+            parts.append(f"PLAN_PROGRESS: {completed}/{total_steps} completed, cursor={cursor}")
+            if current_step:
+                parts.append(f"CURRENT_STEP: {current_step}")
+        # 9. Loaded skills
+        loaded_skills = bb.get("loaded_skills", {})
+        if isinstance(loaded_skills, dict) and loaded_skills:
+            skill_names = [str(v.get("skill_name", k)) for k, v in list(loaded_skills.items())[:5] if isinstance(v, dict)]
+            parts.append(f"ACTIVE_SKILLS: {', '.join(skill_names)}")
+        # 10. Recent tool calls summary
+        recent_tools: list[str] = []
+        for msg in self.messages[-20:]:
+            tc = msg.get("tool_calls", [])
+            if isinstance(tc, list):
+                for call in tc:
+                    if isinstance(call, dict):
+                        fname = str(call.get("function", {}).get("name", "")).strip()
+                        if fname and fname not in recent_tools:
+                            recent_tools.append(fname)
+        if recent_tools:
+            parts.append(f"RECENT_TOOLS: {', '.join(recent_tools[-8:])}")
         parts.append("</STATE_HANDOFF>")
         return "\n".join(parts)
 
@@ -12435,7 +14830,7 @@ class SessionState:
             ".graphql", ".gql",
             ".prisma", ".svg",
         }
-        parsed_excerpt = ""
+        # --- Fast phase: determine kind without heavy parsing ---
         kind = "binary"
         mime_low = str(mime or "").strip().lower()
         if ext in IMAGE_EXTS or mime_low.startswith("image/"):
@@ -12446,43 +14841,26 @@ class SessionState:
             kind = "audio"
         elif ext == ".pdf" or "pdf" in mime_low:
             kind = "pdf"
-            parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
         elif ext == ".csv":
             kind = "csv"
-            parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
-        elif ext == ".xlsx":
+        elif ext in (".xlsx", ".xls"):
             kind = "excel"
-            parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
-        elif ext == ".xls":
-            kind = "excel"
-            parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
-        elif ext == ".pptx":
+        elif ext in (".pptx", ".ppt"):
             kind = "presentation"
-            parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
-        elif ext == ".ppt":
-            kind = "presentation"
-            parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
-        elif ext == ".docx":
+        elif ext in (".docx", ".doc"):
             kind = "document"
-            parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
-        elif ext == ".doc":
-            kind = "document"
-            parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
         elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
             kind = "text"
+        # For small text files, parse inline (fast); for everything else, defer
+        parsed_excerpt = ""
+        needs_async_parse = False
+        if kind == "text":
             parsed_excerpt = trim(self._decode_text_bytes(raw), 24_000)
+        elif kind in ("pdf", "csv", "excel", "presentation", "document"):
+            needs_async_parse = True
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
-        # 当 parsed_excerpt 非空且原始文件不是纯文本时，保存解析结果为 .parsed.md
-        parsed_target: Path | None = None
-        if parsed_excerpt and kind not in ("text", "code"):
-            parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
-            try:
-                header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
-                parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
-            except Exception:
-                parsed_target = None  # 解析文件保存失败不影响主流程
         workspace_rel = self._session_rel(workspace_target)
         meta = {
             "id": upload_id,
@@ -12495,6 +14873,8 @@ class SessionState:
             "stored_path": str(stored),
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
+            "parse_status": "pending" if needs_async_parse else "done",
+            "parse_error": "",
         }
         with self.lock:
             self.uploads.append(meta)
@@ -12504,20 +14884,22 @@ class SessionState:
         if parsed_excerpt:
             bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
             self._blackboard_append_section("research_notes", "system", bb_content)
-        self._emit(
-            "upload",
-            {
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "summary": (
-                    f"upload: {safe_name} -> {workspace_rel}"
-                    + (f" (parsed text: {self._session_rel(parsed_target)})" if parsed_target else "")
-                ),
-                "preview": trim(parsed_excerpt, 500),
-            },
-        )
+        if not needs_async_parse:
+            self._emit(
+                "upload",
+                {
+                    "id": upload_id,
+                    "filename": safe_name,
+                    "workspace_path": workspace_rel,
+                    "kind": kind,
+                    "size": len(raw),
+                    "parse_status": meta["parse_status"],
+                    "parse_error": "",
+                    "summary": f"upload: {safe_name} -> {workspace_rel}",
+                    "preview": trim(parsed_excerpt, 500),
+                },
+            )
+        # --- Config detection (kept synchronous as per user preference) ---
         loaded_config = None
         low_name = safe_name.lower()
         cfg_obj = {}
@@ -12530,7 +14912,54 @@ class SessionState:
             or low_name.endswith("llm_config.json")
         )
         if cfg_obj and (named_config or looks_like_llm_config(cfg_obj)):
-            loaded_config = self.load_llm_config(cfg_obj, source=workspace_rel)
+            # Check if agent is running — delay config if so
+            config_delayed = False
+            with self.lock:
+                if self.running:
+                    config_delayed = True
+                    self._pending_media_inputs.append({
+                        "type": "deferred_config",
+                        "config": cfg_obj,
+                        "source": workspace_rel,
+                    })
+            if not config_delayed:
+                loaded_config = self.load_llm_config(cfg_obj, source=workspace_rel)
+            self._emit("config_applied", {
+                "filename": safe_name,
+                "summary": f"LLM config {'queued (agent running)' if config_delayed else 'applied'} from {safe_name}",
+                "delayed": config_delayed,
+            })
+        # --- Slow phase: async parsing + library ingestion ---
+        if needs_async_parse:
+            threading.Thread(
+                target=self._parse_upload_async,
+                args=(upload_id, safe_name, stored, workspace_target, kind, ext, raw, mime),
+                daemon=True,
+            ).start()
+        else:
+            # Inline RAG/Code callback for already-parsed files
+            parsed_target: Path | None = None
+            rag_info: dict = {}
+            if callable(self.upload_callback):
+                try:
+                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                    if isinstance(maybe, dict):
+                        rag_info = dict(maybe)
+                except Exception as exc:
+                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
+            if rag_info:
+                meta["rag"] = dict(rag_info)
+                with self.lock:
+                    for idx in range(len(self.uploads) - 1, -1, -1):
+                        row = self.uploads[idx]
+                        if str(row.get("id", "")) != upload_id:
+                            continue
+                        patched = dict(row)
+                        patched["rag"] = dict(rag_info)
+                        self.uploads[idx] = patched
+                        self.updated_at = now_ts()
+                        self._persist()
+                        break
         return {
             "id": upload_id,
             "filename": safe_name,
@@ -12539,8 +14968,119 @@ class SessionState:
             "size": len(raw),
             "uploaded_at": meta["uploaded_at"],
             "preview": trim(parsed_excerpt, 1200),
+            "parse_status": meta["parse_status"],
+            "rag": meta.get("rag", {}),
             "model_catalog": loaded_config,
         }
+
+    def _parse_upload_async(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, raw: bytes, mime: str):
+        """Async parsing phase — runs in background thread for heavy file types."""
+        try:
+            parsed_excerpt = ""
+            if kind == "pdf":
+                parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
+            elif kind == "csv":
+                parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
+            elif kind == "excel" and ext == ".xlsx":
+                parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
+            elif kind == "excel" and ext == ".xls":
+                parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
+            elif kind == "presentation" and ext == ".pptx":
+                parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
+            elif kind == "presentation" and ext == ".ppt":
+                parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
+            elif kind == "document" and ext == ".docx":
+                parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
+            elif kind == "document" and ext == ".doc":
+                parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
+            # Save parsed.md
+            parsed_target: Path | None = None
+            if parsed_excerpt and kind not in ("text", "code"):
+                parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
+                try:
+                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
+                    parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
+                except Exception:
+                    parsed_target = None
+            # Update meta in uploads list
+            with self.lock:
+                for idx in range(len(self.uploads) - 1, -1, -1):
+                    row = self.uploads[idx]
+                    if str(row.get("id", "")) != upload_id:
+                        continue
+                    patched = dict(row)
+                    patched["parsed_excerpt"] = parsed_excerpt
+                    patched["parse_status"] = "done"
+                    patched["parse_error"] = ""
+                    self.uploads[idx] = patched
+                    self.updated_at = now_ts()
+                    self._persist()
+                    break
+            if parsed_excerpt:
+                bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
+                self._blackboard_append_section("research_notes", "system", bb_content)
+            # Emit parse completed event
+            workspace_rel = self._session_rel(workspace_target)
+            self._emit("upload", {
+                "id": upload_id,
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "parse_status": "done",
+                "parse_error": "",
+                "summary": f"upload: {safe_name} -> {workspace_rel}" + (f" (parsed {len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
+                "preview": trim(parsed_excerpt, 500),
+            })
+            # RAG/Code library ingestion
+            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": len(raw)}
+            rag_info: dict = {}
+            if callable(self.upload_callback):
+                try:
+                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                    if isinstance(maybe, dict):
+                        rag_info = dict(maybe)
+                except Exception as exc:
+                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
+            if rag_info:
+                with self.lock:
+                    for idx in range(len(self.uploads) - 1, -1, -1):
+                        row = self.uploads[idx]
+                        if str(row.get("id", "")) != upload_id:
+                            continue
+                        patched = dict(row)
+                        patched["rag"] = dict(rag_info)
+                        self.uploads[idx] = patched
+                        self.updated_at = now_ts()
+                        self._persist()
+                        break
+        except Exception as exc:
+            # Mark parse as failed
+            with self.lock:
+                for idx in range(len(self.uploads) - 1, -1, -1):
+                    row = self.uploads[idx]
+                    if str(row.get("id", "")) != upload_id:
+                        continue
+                    patched = dict(row)
+                    patched["parse_status"] = "failed"
+                    patched["parse_error"] = trim(str(exc), 300)
+                    self.uploads[idx] = patched
+                    self.updated_at = now_ts()
+                    self._persist()
+                    break
+            workspace_rel = self._session_rel(workspace_target)
+            self._emit("upload", {
+                "id": upload_id,
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "parse_status": "failed",
+                "summary": f"upload: {safe_name} -> {workspace_rel} (parse failed)",
+                "error": trim(str(exc), 300),
+                "parse_error": trim(str(exc), 300),
+                "preview": "",
+            })
 
     def _auto_switch_model(self, reason: str) -> bool:
         if not bool(self.auto_model_switch):
@@ -13224,8 +15764,8 @@ class SessionState:
         return any(x in t for x in markers)
 
     def _llm_classify_task_complexity(self, goal_text: str) -> str:
-        """LLM semantic pre-screening: classify task as simple/complex. 3s timeout."""
-        goal = trim(str(goal_text or ""), 300)
+        """LLM semantic pre-screening: classify task as simple/complex via 4-dimension analysis. 5s timeout."""
+        goal = trim(str(goal_text or ""), 400)
         if not goal or len(goal) < 6:
             return "simple"
         import threading
@@ -13234,18 +15774,29 @@ class SessionState:
             try:
                 rsp = self.ollama.chat(
                     [{"role": "user", "content": (
-                        f"/no_think\nClassify this task as SIMPLE or COMPLEX.\n"
-                        f"COMPLEX = needs multiple steps, file creation, code generation, document production, "
-                        f"multi-agent collaboration, design work, data processing, API development, testing.\n"
-                        f"SIMPLE = direct Q&A, lookup, single-line fix, short explanation.\n\n"
+                        f"/no_think\nRate this task on 4 dimensions (1=low 2=med 3=high), then classify.\n\n"
                         f"Task: {goal}\n\n"
-                        f"Reply with ONLY one word: SIMPLE or COMPLEX"
+                        f"SCOPE: how many files/components/systems are touched?\n"
+                        f"STEPS: how many distinct execution steps are needed?\n"
+                        f"SKILL: does it need specialized tools, skills, research, or APIs?\n"
+                        f"OUTPUT: what is expected (1=text answer, 2=single file, 3=system/multi-file)?\n\n"
+                        f"Output exactly one line:\n"
+                        f"SCOPE:N STEPS:N SKILL:N OUTPUT:N VERDICT:SIMPLE|COMPLEX\n"
+                        f"(COMPLEX if any dimension >= 2)"
                     )}],
-                    system="/no_think\nClassify tasks. Output one word only.",
-                    max_tokens=30,
+                    system="/no_think\nAnalyze task dimensions. One line output only.",
+                    max_tokens=40,
                     think=False,
                 )
                 answer = str(rsp.get("content", "") or "").strip().upper()
+                # Parse dimension scores
+                dims: dict = {}
+                for dim in ("SCOPE", "STEPS", "SKILL", "OUTPUT"):
+                    m = re.search(rf"{dim}:(\d)", answer)
+                    if m:
+                        dims[dim.lower()] = int(m.group(1))
+                if dims:
+                    self._cached_complexity_dimensions = dims
                 if "COMPLEX" in answer:
                     result_box[0] = "complex"
             except Exception:
@@ -13854,6 +16405,11 @@ class SessionState:
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
         ]
+        # Auto-quote raw absolute paths that contain spaces (prevents word-splitting)
+        if " " in workspace_root and workspace_root not in ("/workspace",):
+            mappings.append((workspace_root, workspace_root))
+        if " " in skills_root and skills_root != SKILLS_VIRTUAL_PREFIX:
+            mappings.append((skills_root, skills_root))
         out: list[str] = []
         mode = "plain"
         i = 0
@@ -14063,6 +16619,14 @@ class SessionState:
             err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
 
+        def _store_shell_output(output_value: str, exit_code: int | None = None):
+            text = str(output_value or "").strip()
+            if not text:
+                text = str(meta.get("error") or "(no output)")
+            if exit_code is not None:
+                meta["exit_code"] = int(exit_code)
+            meta.update(self._prepare_shell_output_payload(command, text, cwd=cwd))
+
         def _collect_with_reader_threads(proc: subprocess.Popen):
             nonlocal next_progress_emit
             reader_threads: list[threading.Thread] = []
@@ -14172,10 +16736,12 @@ class SessionState:
             merged_raw = _merge_output_text()
             merged, _ = filter_runtime_noise_lines(merged_raw)
             if meta.get("error"):
-                meta["output"] = trim(merged or str(meta["error"]))
+                _store_shell_output(merged or str(meta["error"]))
             else:
-                meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                meta["output"] = trim(merged or "(no output)")
+                _store_shell_output(
+                    merged or "(no output)",
+                    int(proc.returncode if proc.returncode is not None else 0),
+                )
 
         try:
             proc_env = os.environ.copy()
@@ -14263,10 +16829,12 @@ class SessionState:
                         merged_raw = _merge_output_text()
                         merged, _ = filter_runtime_noise_lines(merged_raw)
                         if meta.get("error"):
-                            meta["output"] = trim(merged or str(meta["error"]))
+                            _store_shell_output(merged or str(meta["error"]))
                         else:
-                            meta["exit_code"] = int(proc.returncode if proc.returncode is not None else 0)
-                            meta["output"] = trim(merged or "(no output)")
+                            _store_shell_output(
+                                merged or "(no output)",
+                                int(proc.returncode if proc.returncode is not None else 0),
+                            )
                 except Exception as exc:
                     # Some platforms may reject selector registration for PIPEs.
                     # On Windows, also catch any OSError (e.g. WinError 10093 WSANOTINITIALISED).
@@ -14286,12 +16854,20 @@ class SessionState:
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
+        if not meta.get("ui_output_pages"):
+            meta.update(
+                self._prepare_shell_output_payload(
+                    command,
+                    str(meta.get("output") or meta.get("error") or "(no output)"),
+                    cwd=cwd,
+                )
+            )
         return meta
 
     def _run_bash(self, command: str) -> str:
         return self._run_shell_meta(command, self.files_root, 120)["output"]
 
-    def _run_read(self, path: str, limit: int | None = None) -> str:
+    def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._session_path(rel)
@@ -14304,9 +16880,51 @@ class SessionState:
             if ext in VIDEO_EXTS:
                 return self._run_read_media(fp, rel, "video")
             lines = fp.read_text(encoding="utf-8").splitlines()
-            if limit and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-            return trim("\n".join(lines))
+            total_lines = len(lines)
+            if total_lines == 0:
+                return ""
+            offset_val = max(0, int(offset or 0))
+            requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
+            if offset_val >= total_lines:
+                return (
+                    f"[read_file page path={rel} lines=0 of {total_lines} offset={offset_val}]\n"
+                    "[end_of_file]"
+                )
+            full_text = "\n".join(lines)
+            auto_paginate = limit is None and offset_val == 0 and len(full_text) > LONG_OUTPUT_READ_PAGE_MAX_CHARS
+            if not auto_paginate and limit is None and offset_val == 0 and len(full_text) <= MAX_TOOL_OUTPUT:
+                return full_text
+            page_parts: list[str] = []
+            chars = 0
+            idx = offset_val
+            while idx < total_lines and len(page_parts) < requested_limit:
+                line = lines[idx]
+                piece = line if not page_parts else "\n" + line
+                if page_parts and (chars + len(piece)) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
+                    break
+                if (not page_parts) and len(line) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
+                    page_parts.append(line[:LONG_OUTPUT_READ_PAGE_MAX_CHARS])
+                    idx += 1
+                    break
+                page_parts.append(piece if page_parts else line)
+                chars += len(piece)
+                idx += 1
+            body = "".join(page_parts)
+            page_no = (offset_val // requested_limit) + 1
+            total_pages = max(1, (total_lines + requested_limit - 1) // requested_limit)
+            out = [
+                (
+                    f"[read_file page path={rel} lines={offset_val + 1}-{idx} of {total_lines} "
+                    f"page={page_no}/{total_pages} offset={offset_val} limit={requested_limit}]"
+                ),
+                body,
+            ]
+            if idx < total_lines:
+                out.append(f"[next_page read_file path=\"{rel}\" offset={idx} limit={requested_limit}]")
+            if offset_val > 0:
+                prev_offset = max(0, offset_val - requested_limit)
+                out.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
+            return "\n".join(part for part in out if part != "")
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
@@ -14628,7 +17246,12 @@ class SessionState:
     def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
         subtools = [
             tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
-            tool_def("read_file", "Read file.", {"path": {"type": "string"}}, ["path"]),
+            tool_def(
+                "read_file",
+                "Read file with optional line pagination.",
+                {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+                ["path"],
+            ),
         ]
         if agent_type != "Explore":
             subtools.extend(
@@ -14702,7 +17325,7 @@ class SessionState:
                 if name == "bash":
                     out = self._run_bash(args.get("command", ""))
                 elif name == "read_file":
-                    out = self._run_read(args.get("path", ""))
+                    out = self._run_read(args.get("path", ""), args.get("limit"), args.get("offset"))
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
                 elif name == "edit_file":
@@ -16267,12 +18890,26 @@ class SessionState:
                     "content": trim(str(pt.get("content", "") or ""), 400),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
+                    "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
                     "created_at": float(pt.get("created_at", 0.0) or 0.0),
                     "completed_at": float(pt.get("completed_at", 0.0) or 0.0) if pt.get("completed_at") else None,
                     "completed_by": trim(str(pt.get("completed_by", "") or ""), 40),
                     "evidence": trim(str(pt.get("evidence", "") or ""), 200),
                 })
             board["project_todos"] = clean_todos
+        # Preserve plan step cursor/total (used by _advance_plan_step and UI progress)
+        raw_cursor = src.get("plan_step_cursor")
+        if raw_cursor is not None:
+            try:
+                board["plan_step_cursor"] = int(raw_cursor)
+            except Exception:
+                pass
+        raw_total = src.get("plan_step_total")
+        if raw_total is not None:
+            try:
+                board["plan_step_total"] = int(raw_total)
+            except Exception:
+                pass
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -16768,7 +19405,10 @@ class SessionState:
 
     def _blackboard_append_section(self, section: str, actor: str, content: str):
         key = str(section or "").strip()
-        if key not in {"research_notes", "execution_logs", "review_feedback"}:
+        _ALLOWED = {"research_notes", "execution_logs", "review_feedback",
+                     "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
+                     "skill_analysis"}
+        if key not in _ALLOWED:
             return
         txt = trim(str(content or "").strip(), BLACKBOARD_MAX_TEXT)
         if not txt:
@@ -17244,18 +19884,28 @@ class SessionState:
             "step completed", "step done", "step passed",
             "现在进入", "开始 step", "开始step",
             "阶段完成", "阶段通过", "phase complete",
+            # extended: manager says "now do step X.Y" implying prior step is done
+            "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "执行步骤 2",
+            "进入下一步", "next step", "proceed to step",
+            "步骤 1.1 已完成", "步骤 1.2 已完成",
         )
         # Also detect "Step N 通过" or "进入 Step N+1" patterns
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
         # "Step 2 已通过" / "Step 2 完成" / "进入 Step 3"
         next_step_pattern = re.search(
-            r'(?:进入|enter|move\s+to|start)\s*step\s*(\d+)',
+            r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
         )
         if next_step_pattern:
             mentioned_step = int(next_step_pattern.group(1))
             if mentioned_step > current_idx + 1:
+                return True
+        # Pattern: "继续步骤 1.2" / "完成步骤 1.1，开始 1.2"
+        step_ref = re.search(r'步骤\s*1\.(\d+)', text)
+        if step_ref:
+            ref_sub = int(step_ref.group(1))
+            if ref_sub > (current_idx + 1):
                 return True
         return any(pat in text for pat in step_done_patterns)
 
@@ -17292,8 +19942,28 @@ class SessionState:
             })
         self.blackboard = bb
         self._blackboard_touch()
+        # 步骤推进时清除 in_progress/pending 的 worker 子任务，防止跨步骤堆积
+        # 保留 completed 的 worker 项，让 UI 保持已完成记录可见
+        try:
+            _snap = self.todo.snapshot()
+            _worker_owners = {"developer", "explorer", "reviewer"}
+            _clean = [
+                r for r in _snap
+                if str(r.get("owner", "") or "").lower() not in _worker_owners
+                or str(r.get("status", "") or "").lower() == "completed"
+            ]
+            if len(_clean) < len(_snap):
+                with self.todo.lock:
+                    self.todo.items = _clean
+        except Exception:
+            pass
         # Immediately sync todos so UI reflects plan step advancement
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
+        if next_step:
+            try:
+                self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-advanced")
+            except Exception:
+                pass
         return True
 
     def _single_agent_plan_step_check(self, tool_results: list[dict]):
@@ -17354,6 +20024,27 @@ class SessionState:
         if should_advance:
             evidence = f"single-agent auto-advance: phase={phase}, wrote={wrote_files}, bash_ok={ran_bash_ok}"
             self._advance_plan_step(evidence=evidence, actor="single")
+            # 步骤推进后注入 hint，提示 LLM 为新步骤调用 TodoWrite 更新子任务
+            try:
+                _bb_after = self._ensure_blackboard()
+                _new_step = next(
+                    (t for t in _bb_after.get("project_todos", [])
+                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                    None,
+                )
+                if _new_step:
+                    _step_idx = int(_new_step.get("plan_step_index", 0) or 0) + 1
+                    _total = int(_bb_after.get("plan_step_total", 0) or 0)
+                    _step_text = trim(str(_new_step.get("content", "") or ""), 200)
+                    _step_label = f"Step {_step_idx}" + (f"/{_total}" if _total else "")
+                    _hint = (
+                        f"[plan-step-advance] Previous step completed. Now at {_step_label}: {_step_text}\n"
+                        "Call TodoWrite to set your task breakdown for this step "
+                        "(3-5 subtask items, one marked in_progress) before proceeding."
+                    )
+                    self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
+            except Exception:
+                pass
         else:
             self._sync_todos_from_blackboard(reason="single-agent-round")
 
@@ -17389,17 +20080,24 @@ class SessionState:
         self._update_project_todo_status(bb)
         system_rows = self._todo_project_rows_from_blackboard(bb)
         existing = self.todo.snapshot()
+        worker_rows: list[dict] = []
         non_system_rows: list[dict] = []
         for row in existing:
             if not isinstance(row, dict):
                 continue
             key = str(row.get("key", "") or "").strip()
             owner = str(row.get("owner", "") or "").strip().lower()
-            if key.startswith(("bb:owner:", "bb:node:", "bb:proj:")) or owner in {"manager", "explorer", "developer", "reviewer"}:
+            is_system_key = key.startswith(("bb:owner:", "bb:node:", "bb:proj:"))
+            # Preserve worker-owned items (from TodoWrite) separately
+            is_worker_item = owner in ("developer", "explorer", "reviewer") and not is_system_key
+            if is_worker_item:
+                worker_rows.append(dict(row))
+                continue
+            if is_system_key or owner == "manager":
                 continue
             non_system_rows.append(dict(row))
-        remaining_cap = max(0, 20 - len(system_rows))
-        merged = list(system_rows) + non_system_rows[:remaining_cap]
+        remaining_cap = max(0, 20 - len(system_rows) - len(worker_rows))
+        merged = list(system_rows) + worker_rows + non_system_rows[:remaining_cap]
         try:
             todo_out = self.todo.update(merged)
         except Exception:
@@ -17935,34 +20633,91 @@ class SessionState:
 
     def _manager_classification_system_prompt(self) -> str:
         base = (
-            "You are Manager. Classify the latest user request by semantic intent, not by keyword templates. "
-            "Decide whether this latest turn should inherit the previous blackboard/task state. "
+            "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
+            "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
-            "set it false for a new independent objective. "
-            "If this turn is only a continuation signal, preserve current task level/mode/participants/budget. "
-            "If this turn both continues previous work and adds new requirements, keep inherit_previous_state=true "
-            "but re-evaluate level/participants/budget according to the new requirements. "
-            "Select one level:\n"
-            "1=simple direct answer (single agent)\n"
-            "2=simple multi-turn answer (single agent, larger budget)\n"
-            "3=simple collaborative execution (sync mode, limited budget)\n"
-            "4=complex collaborative execution (sync mode, larger budget)\n"
-            "5=system-level collaborative execution (sync mode, unlimited tier budget; require confirmation before actions)\n"
-            "Also infer user scale preference: fast|balanced|thorough. "
-            "If user clearly indicates speed vs completeness preference, that preference has higher priority than your default strategy. "
-            "Budgets are internal efficiency controls to reduce overthinking and idle loops; "
-            "they must not be treated as a user-visible early-stop reason. "
+            "set it false for a new independent objective.\n\n"
+            "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
+            "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
+            "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
+            "Level 2 — Multi-turn answer / light task: longer explanation, code snippet review, minor single-file edit, "
+            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds.\n"
+            "Level 3 — Coordinated execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
+            "API integration, documentation generation, data processing script. Sync mode with 2 participants. Budget: 8-15 rounds.\n"
+            "Level 4 — Full-stack collaborative: system-level feature implementation, architecture change, "
+            "multi-component refactoring, research-and-implement workflow, PPT/report generation from raw materials, "
+            "crawler/agent/service development. Sync mode with 3 participants. Budget: 15-25 rounds.\n"
+            "Level 5 — System-critical / risky: production deployment, DB schema migration, mass file deletion, "
+            "external API write operations with side effects, irreversible system changes. "
+            "Requires explicit user confirmation before actions start. Unlimited budget.\n\n"
+            "BOUNDARY SIGNALS:\n"
+            "• Requests containing 'all', 'entire', 'full system', 'migrate', 'deploy' → lean level 4-5.\n"
+            "• Requests with clear output artifact (ppt, report, app, service, test suite) → at least level 3.\n"
+            "• Requests asking 'how' or 'what' with no action words → level 1-2.\n"
+            "• Requests with 'quick', 'simple', 'just', 'only' from user → can lower by 1 level.\n"
+            "• Requests with 'thorough', 'comprehensive', 'detailed', 'production-ready' → raise by 1 level.\n\n"
+            "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
+            "User-stated preference overrides your default strategy. "
+            "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
             "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
-            "and semantic_confidence(high|medium|low). "
-            "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly. "
+            "and semantic_confidence (high|medium|low). "
+            "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
             f"{model_language_instruction(self.ui_language)}"
         )
         if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
             base += (
-                " NOTE: User has configured Single-agent mode. "
+                "\nNOTE: User has configured Single-agent mode. "
                 "Favor level 1-2 for straightforward tasks; only assign level 3+ when genuine multi-step complexity demands it."
             )
         return base
+
+    def _skill_aware_reeval_task_level(
+        self,
+        goal_text: str,
+        low_conf_row: dict,
+        pinned_selection: str,
+    ) -> dict:
+        """Second-pass skill-aware re-evaluation when primary classifier has low confidence.
+        Loads skill names + dimension scores into a focused prompt to re-anchor the level.
+        Returns an updated row dict (may be same as low_conf_row if re-eval fails/times out)."""
+        try:
+            # Build skill context
+            available_names = sorted(self.skills.list_names())[:15]
+            loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
+            active_names = [str(k) for k in loaded_skills.keys()][:4]
+            dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
+            dim_str = " ".join(f"{k.upper()}={v}" for k, v in dims.items()) if dims else "unavailable"
+            skill_list = ", ".join(active_names) if active_names else ("none active; available: " + ", ".join(available_names[:10]))
+            prev_level = int(low_conf_row.get("level", 0) or 0)
+            reeval_prompt = (
+                f"/no_think\nRe-evaluate this task classification. Primary classifier was uncertain.\n\n"
+                f"Task: {trim(str(goal_text or ''), 600)}\n"
+                f"Pre-screen dimensions: {dim_str}\n"
+                f"Skills context: {skill_list}\n"
+                f"Previous tentative level: {prev_level}\n\n"
+                f"Level guide:\n"
+                f"1=Q&A only  2=light single-file task  3=multi-file/tool task  "
+                f"4=full feature/research+implement  5=risky/system-critical\n\n"
+                f"Output ONE integer (1-5) that best fits. No explanation."
+            )
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": reeval_prompt}],
+                system="/no_think\nOutput one integer 1-5.",
+                max_tokens=10,
+                think=False,
+            )
+            answer = str(rsp.get("content", "") or "").strip()
+            for ch in answer:
+                if ch.isdigit() and ch in "12345":
+                    new_level = int(ch)
+                    updated = dict(low_conf_row)
+                    updated["level"] = new_level
+                    updated["semantic_confidence"] = "medium"
+                    updated["source"] = "skill-reeval"
+                    return updated
+        except Exception:
+            pass
+        return dict(low_conf_row)
 
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
         row = dict(decision or {})
@@ -18244,6 +20999,38 @@ class SessionState:
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
+        # ── Build skills context ──
+        skills_ctx = ""
+        try:
+            loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
+            available_names = sorted(self.skills.list_names())[:20]
+            active_names = [str(k) for k in loaded_skills.keys()][:5]
+            if active_names:
+                skills_ctx += f"Currently loaded skills: {', '.join(active_names)}.\n"
+            if available_names:
+                skills_ctx += f"Available skills (first 20): {', '.join(available_names)}.\n"
+            if active_names or available_names:
+                skills_ctx += (
+                    "If the task clearly requires one of these skills (e.g. ppt skill for presentation, "
+                    "research skill for analysis), factor that into your level decision "
+                    "(skill-based tasks tend to be level 3-4).\n"
+                )
+        except Exception:
+            pass
+        # ── Build dimension hint from pre-screen ──
+        dims_ctx = ""
+        try:
+            dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
+            if dims:
+                dim_str = " ".join(f"{k.upper()}={v}" for k, v in dims.items())
+                max_dim = max(dims.values()) if dims else 0
+                dims_ctx = (
+                    f"Pre-screen dimension scores: {dim_str}. "
+                    f"Max dimension={max_dim} "
+                    f"({'high complexity signal' if max_dim >= 3 else 'moderate' if max_dim == 2 else 'simple'}).\n"
+                )
+        except Exception:
+            pass
         prompt = (
             "Classify this user request now and decide run topology/budget.\n\n"
             f"User request:\n{trim(str(goal_text or ''), 4000)}\n\n"
@@ -18254,6 +21041,8 @@ class SessionState:
             f"participants={','.join(self.runtime_participants or []) or '-'}, "
             f"assigned={self.runtime_assigned_expert or '-'}, "
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
+            f"{dims_ctx}"
+            f"{skills_ctx}"
             f"Workspace root: {self.files_root}\n"
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
@@ -18284,7 +21073,7 @@ class SessionState:
             [{"role": "user", "content": prompt, "ts": now_ts()}],
             tools=self._manager_task_classify_tools(),
             system=self._manager_classification_system_prompt(),
-            max_tokens=260,
+            max_tokens=320,
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -18310,8 +21099,10 @@ class SessionState:
                     default="medium",
                 )
                 if str(row.get("semantic_confidence", "medium")) == "low":
+                    # Skill-aware re-evaluation before falling back to keyword heuristic
+                    reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
                     fallback_row = self._fallback_task_level_decision(goal_text)
-                    merged = self._merge_task_decision_for_low_confidence(row, fallback_row)
+                    merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
                     return merged
                 row["source"] = "manager"
                 return row
@@ -18472,6 +21263,12 @@ class SessionState:
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
         lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        lines.append(
+            "STEP COMPLETION RULE: Set advance_plan_step=true when the worker has provided concrete evidence "
+            "that the current step is done — e.g., research_notes populated for a read/analyze step, "
+            "code_artifacts created for an implement step, or all worker TodoWrite subtasks marked completed. "
+            "Do NOT keep re-delegating the same step once this evidence exists. "
+        )
         lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
                      "Do NOT reinterpret or replace plan steps with your own objectives. ")
         # Add loaded skills enforcement
@@ -18482,6 +21279,8 @@ class SessionState:
                 f"LOADED SKILLS: {', '.join(skill_names)}. "
                 "Delegate agents to follow the loaded skill's workflow scripts and procedures. "
                 "The skill defines the correct execution path — do NOT deviate from it. "
+                "A skill-linked step is not complete until the agent has concretely entered the skill chain "
+                "by reading an entrypoint or using a skill resource/script. "
             )
         # Add current phase routing hint
         current_phase = self._infer_current_phase_from_blackboard()
@@ -18548,11 +21347,62 @@ class SessionState:
             cur = pending[0]
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
+            step_content_low = str(cur.get("content", "") or "").lower()
+            # ── Build blackboard evidence for step completion detection ──
+            research_count = len(bb.get("research_notes", []) or [])
+            code_count = len(bb.get("code_artifacts", {}) or {})
+            exec_count = len(bb.get("execution_logs", []) or [])
+            # ── Worker todo snapshot: show manager what workers wrote ──
+            worker_hint = ""
+            try:
+                worker_todos = [
+                    r for r in self.todo.snapshot()
+                    if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
+                    and not str(r.get("key", "") or "").startswith("bb:")
+                ]
+                if worker_todos:
+                    completed_w = [r for r in worker_todos if str(r.get("status", "")).lower() == "completed"]
+                    pending_w = [r for r in worker_todos if str(r.get("status", "")).lower() not in ("completed",)]
+                    if not pending_w and completed_w:
+                        worker_hint = (
+                            f"Worker subtasks: all {len(completed_w)} completed "
+                            f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
+                            "→ Worker has finished. Set advance_plan_step=true NOW. "
+                        )
+                    elif completed_w or pending_w:
+                        worker_hint = (
+                            f"Worker subtasks: {len(completed_w)} done, {len(pending_w)} pending. "
+                            "→ Do NOT advance yet. "
+                        )
+            except Exception:
+                pass
+            # ── Blackboard-evidence-based completion hint ──
+            bb_evidence_hint = ""
+            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "提取", "read", "analyze", "extract", "research", "summarize", "总结"))
+            is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
+            is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
+            if is_research_step and research_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {research_count} research_note(s) — "
+                    "if these were written for this step, set advance_plan_step=true. "
+                )
+            elif is_implement_step and code_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {code_count} code_artifact(s) — "
+                    "if these were created for this step, set advance_plan_step=true. "
+                )
+            elif is_test_step and exec_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {exec_count} execution_log(s) — "
+                    "if these reflect this step's test run, set advance_plan_step=true. "
+                )
             return (
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
                 f"({len(completed)} completed, {len(pending)} remaining) "
                 f"DO NOT finish until all {total} steps are completed. "
                 f"Focus on THIS step. When done, set advance_plan_step=true. "
+                f"{worker_hint}"
+                f"{bb_evidence_hint}"
             )
         # 原有逻辑
         pending = [t for t in todos if t.get("status") != "completed"]
@@ -18627,10 +21477,16 @@ class SessionState:
             "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
             "all done->finish. Set is_mandatory=true when concrete execution is required. "
             "Role capabilities: "
-            "Explorer=read-only (bash/read_file/search/blackboard, NO write_file/edit_file); "
-            "Developer=all tools (write_file/edit_file/bash/read_file/etc); "
+            "Explorer=read-only (bash/read_file/search/blackboard, TodoWrite, NO write_file/edit_file); "
+            "Developer=all tools (write_file/edit_file/bash/read_file/TodoWrite/load_skill/etc); "
             f"{'Reviewer=DEBUG MODE (bash/read_file/write_file/edit_file/finish_task — can fix bugs directly). ' if bool(self.reviewer_debug_mode) else 'Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). '}"
             f"{'NEVER delegate file-writing tasks to Explorer. Reviewer is in debug mode and can fix bugs. ' if bool(self.reviewer_debug_mode) else 'NEVER delegate file-writing tasks to Explorer or Reviewer. '}"
+            "TODO & SKILL CHAIN MANAGEMENT: "
+            "When delegating to Developer, ALWAYS instruct them to update TodoWrite after completing each step. "
+            "This triggers automatic skill re-evaluation — the system loads new skills for the next phase. "
+            "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), ensure each phase is a separate delegation "
+            "with explicit instruction to mark the previous step completed via TodoWrite before starting the next. "
+            "If the task needs skills not yet loaded, instruct Developer to call load_skill first. "
             f"{coding_hint}"
             f"{project_todo_hint}"
             f"{plan_context}"
@@ -19148,7 +22004,7 @@ class SessionState:
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
-        if len(recent) >= 2 and recent[-1] == target and recent[-2] == target:
+        if len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
             board = bb_for_routes
             low_reason = str(row.get("reason", "") or "").strip().lower()
             if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
@@ -19184,12 +22040,12 @@ class SessionState:
                 else:
                     row["target"] = "developer"
                     row["instruction"] = (
-                        "Anti-stall: CHANGE YOUR APPROACH. "
-                        "If edit_file keeps failing, use write_file. "
-                        "If reading without editing, make a concrete change now. "
-                        "If done, call finish_task."
+                        "You have been working on this for multiple rounds without visible progress. Consider: "
+                        "1) Use ask_colleague to request help from another agent. "
+                        "2) Try a completely different tool or approach. "
+                        "3) If the subtask is complete, call finish_current_task with what you have so far."
                     )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-change"
+                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
             row["source"] = "anti-stall"
             return row
         if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
@@ -19499,6 +22355,8 @@ class SessionState:
         if target not in {"finish", "reviewer"} and finish_gate_reason != "reviewer-summary-missing":
             board["manager_summary_attempts"] = 0
             self.blackboard = board
+        if target == "finish":
+            pass  # proceed to finish normally
         if target != "finish" and objective:
             low_instruction = instruction.lower()
             low_objective = objective.lower()
@@ -19976,6 +22834,9 @@ class SessionState:
                 evidence=trim(str(route.get("instruction", "") or ""), 200),
                 actor=str(route.get("target", "developer") or "developer"),
             )
+            # CRITICAL: re-anchor board to the updated blackboard so the
+            # self.blackboard = board at line ~22388 does NOT overwrite the advance.
+            board = self.blackboard
         self.manager_routes.append(route_row)
         self.manager_routes = self.manager_routes[-240:]
         # Failure ledger: persist route and record delegation
@@ -20226,6 +23087,14 @@ class SessionState:
                         f"Your work must directly execute THIS step. Do not skip or replace it.\n"
                     )
                     break
+        # developer 被调用时有活跃 plan step，要求在开始前调用 TodoWrite 刷新子任务
+        todo_update_note = ""
+        if role_key == "developer" and current_plan_step_note:
+            todo_update_note = (
+                "TODO UPDATE: Call TodoWrite at the start of your work to set your task breakdown "
+                "for this step (3-5 subtask items, one marked in_progress). "
+                "Mark each subtask completed as you finish it.\n"
+            )
         payload = (
             "<manager-delegate>\n"
             f"target={role_key}\n"
@@ -20239,6 +23108,7 @@ class SessionState:
             f"{role_capability_note}\n"
             f"{loaded_skills_note}"
             f"{current_plan_step_note}"
+            f"{todo_update_note}"
             f"{error_section}"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
@@ -20959,12 +23829,13 @@ class SessionState:
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
         skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: {self.files_root}. Use relative paths. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            f"{skills_note}"
+            f"{skills_note}{code_note + ' ' if code_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -21002,6 +23873,12 @@ class SessionState:
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
+            "TODO TRACKING (mandatory): "
+            "After completing each logical step, call TodoWrite to update progress — "
+            "mark completed items as 'completed' and set the next item to 'in_progress'. "
+            "This is critical because skill re-evaluation is triggered on step completion. "
+            "If the task has multiple phases (e.g., analyze PDF then make PPT), "
+            "each phase must be a separate todo item so the right skills get loaded for each phase. "
             "EDIT METHODOLOGY (follow strictly): "
             "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
             "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
@@ -21725,6 +24602,7 @@ class SessionState:
         return missing
 
     def _dispatch_tool(self, name: str, args: dict, agent_role: str = "") -> str:
+        """Top-level tool dispatcher with error isolation and per-tool timeout."""
         name = canonicalize_tool_name(name)
         if not name:
             return "Error: ValueError: tool name is required"
@@ -21733,6 +24611,32 @@ class SessionState:
         role_key = self._sanitize_agent_role(agent_role)
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
+        try:
+            # Bash has its own timeout mechanism; skip external timeout for it
+            if name == "bash":
+                return self._dispatch_tool_inner(name, args, role_key)
+            timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
+            if timeout <= 0:
+                return self._dispatch_tool_inner(name, args, role_key)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}") as pool:
+                future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
+                try:
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    self._emit("error", {
+                        "summary": f"tool '{name}' timed out after {timeout}s",
+                    })
+                    return f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
+        except Exception as exc:
+            tb_lines = traceback.format_exc()
+            self._emit("error", {
+                "summary": f"tool dispatch error: {name}: {trim(str(exc), 300)}",
+                "traceback": trim(tb_lines, 2000),
+            })
+            return f"Error: {type(exc).__name__}: {trim(str(exc), 500)}"
+
+    def _dispatch_tool_inner(self, name: str, args: dict, role_key: str = "") -> str:
+        """Inner tool dispatcher — all tool logic lives here."""
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
@@ -21748,8 +24652,25 @@ class SessionState:
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
-                    "output": trim(meta["output"], 1200),
-                    "summary": f"bash ({meta['exit_code']}) {meta['command'][:80]}",
+                    "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
+                    "ui_output_pages": meta.get("ui_output_pages", []),
+                    "ui_output_page_count": meta.get("ui_output_page_count", 0),
+                    "ui_output_page_total": meta.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(meta.get("ui_truncated", False)),
+                    "model_truncated": bool(meta.get("model_truncated", False)),
+                    "buffer_ref": meta.get("buffer_ref", ""),
+                    "buffer_chars": int(meta.get("buffer_chars", 0) or 0),
+                    "temp_output_path": meta.get("temp_output_path", ""),
+                    "long_output_strategy": meta.get("long_output_strategy", "inline"),
+                    "output_page_index": int(meta.get("output_page_index", 1) or 1),
+                    "output_page_count": int(meta.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"bash ({meta['exit_code']}) {meta['command'][:80]}"
+                        + (" · long-output buffered" if meta.get("temp_output_path") else "")
+                        + (" · model-paged" if meta.get("model_truncated") else "")
+                    ),
                 },
             )
             return meta["output"]
@@ -21763,8 +24684,19 @@ class SessionState:
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
-            out = self._run_read(rel, args.get("limit"))
-            self._emit("file_read", {"path": rel, "summary": f"read file: {rel}"})
+            out = self._run_read(rel, args.get("limit"), args.get("offset"))
+            limit_val = int(args.get("limit", 0) or 0) if args.get("limit") is not None else 0
+            offset_val = int(args.get("offset", 0) or 0) if args.get("offset") is not None else 0
+            summary = f"read file: {rel}"
+            if offset_val > 0 or limit_val > 0:
+                summary += (
+                    f" offset={offset_val}"
+                    + (f" limit={limit_val}" if limit_val > 0 else "")
+                )
+            self._emit(
+                "file_read",
+                {"path": rel, "offset": offset_val, "limit": limit_val, "summary": summary},
+            )
             return out
         if name == "write_file":
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
@@ -21883,10 +24815,29 @@ class SessionState:
                     for item in items:
                         if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
                             item["owner"] = str(role_key or "developer")
-                return self.todo.update(items)
-            return self.todo.update(args["items"])
+                result = self.todo.update(items)
+            else:
+                result = self.todo.update(args["items"])
+            # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
+            # This fires in ALL modes (single/sync/plan) when developer writes todos
+            try:
+                new_items = args.get("items", [])
+                if isinstance(new_items, list) and any(
+                    isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
+                    for it in new_items
+                ):
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")
+            except Exception:
+                pass
+            return result
         if name == "TodoWriteRescue":
-            return self._todo_write_rescue(args)
+            result = self._todo_write_rescue(args)
+            # Also recheck skills on rescue write (likely a recovery situation)
+            try:
+                self._refresh_loaded_skills_for_execution_focus(trigger="todo-rescue")
+            except Exception:
+                pass
+            return result
         if name in {"finish_task", "finish_current_task", "mark_done"}:
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
             if role_key == "explorer":
@@ -21948,7 +24899,8 @@ class SessionState:
             self._ensure_skills_ready(force=False)
             return ", ".join(self.skills.list_names())
         if name == "load_skill":
-            return self._load_skill_with_cache(args["name"])
+            source = f"manual:{role_key or 'single'}"
+            return self._load_skill_with_cache(args["name"], load_source=source)
         if name == "list_skill_providers":
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_providers(), indent=2)
@@ -21963,6 +24915,24 @@ class SessionState:
             return "Compress requested."
         if name == "context_recall":
             return self._context_recall(args)
+        if name == "query_code_library":
+            cb = getattr(self, "query_code_library_callback", None)
+            if not callable(cb):
+                return "Error: code library query is not available in this session"
+            try:
+                out = cb(self, dict(args or {}))
+                return str(out if out is not None else "")
+            except Exception as exc:
+                return f"Error: code library query failed: {exc}"
+        if name == "query_knowledge_library":
+            cb = getattr(self, "query_knowledge_library_callback", None)
+            if not callable(cb):
+                return "Error: knowledge library query is not available in this session"
+            try:
+                out = cb(self, dict(args or {}))
+                return str(out if out is not None else "")
+            except Exception as exc:
+                return f"Error: knowledge library query failed: {exc}"
         if name == "generate_media":
             media_type = str(args.get("media_type", "") or "").strip().lower()
             if media_type not in {"image", "audio", "video"}:
@@ -22004,6 +24974,7 @@ class SessionState:
             effective_command = self._rewrite_shell_virtual_paths(raw_command, self.files_root)
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
+            payload = self._prepare_shell_output_payload(raw_command, out_filtered or "(no output)", cwd=self.files_root)
             self._emit(
                 "command",
                 {
@@ -22011,10 +24982,28 @@ class SessionState:
                     "command": raw_command,
                     "effective_command": effective_command,
                     "cwd": str(self.files_root),
-                    "summary": f"background_run: {raw_command[:80]}",
+                    "output": payload.get("ui_output_preview", ""),
+                    "ui_output_pages": payload.get("ui_output_pages", []),
+                    "ui_output_page_count": payload.get("ui_output_page_count", 0),
+                    "ui_output_page_total": payload.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(payload.get("ui_truncated", False)),
+                    "model_truncated": bool(payload.get("model_truncated", False)),
+                    "buffer_ref": payload.get("buffer_ref", ""),
+                    "buffer_chars": int(payload.get("buffer_chars", 0) or 0),
+                    "temp_output_path": payload.get("temp_output_path", ""),
+                    "long_output_strategy": payload.get("long_output_strategy", "inline"),
+                    "output_page_index": int(payload.get("output_page_index", 1) or 1),
+                    "output_page_count": int(payload.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(payload.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(payload.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"background_run: {raw_command[:80]}"
+                        + (" · long-output buffered" if payload.get("temp_output_path") else "")
+                        + (" · model-paged" if payload.get("model_truncated") else "")
+                    ),
                 },
             )
-            return trim(out_filtered or "(no output)")
+            return str(payload.get("output", out_filtered or "(no output)"))
         if name == "check_background":
             return self.bg.check(args.get("task_id"))
         if name == "task_create":
@@ -22125,7 +25114,12 @@ class SessionState:
             actor = role_key or "developer"
             if not section or not content:
                 return "Error: section and content are required"
-            if section in {"research_notes", "execution_logs", "review_feedback"}:
+            # Normalize plan-mode sections: plan.findings → plan_findings, etc.
+            section = section.replace(".", "_")
+            if section in {"research_notes", "execution_logs", "review_feedback",
+                           "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
+                           "skill_analysis"}:
+                self._blackboard_append_section(section, actor, content)
                 self._blackboard_append_section(section, actor, content)
             elif section == "conversation_history":
                 self._blackboard_history(actor, content)
@@ -22174,8 +25168,25 @@ class SessionState:
                     "exit_code": meta["exit_code"],
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
-                    "output": trim(meta["output"], 1200),
-                    "summary": f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}",
+                    "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
+                    "ui_output_pages": meta.get("ui_output_pages", []),
+                    "ui_output_page_count": meta.get("ui_output_page_count", 0),
+                    "ui_output_page_total": meta.get("ui_output_page_total", 0),
+                    "ui_truncated": bool(meta.get("ui_truncated", False)),
+                    "model_truncated": bool(meta.get("model_truncated", False)),
+                    "buffer_ref": meta.get("buffer_ref", ""),
+                    "buffer_chars": int(meta.get("buffer_chars", 0) or 0),
+                    "temp_output_path": meta.get("temp_output_path", ""),
+                    "long_output_strategy": meta.get("long_output_strategy", "inline"),
+                    "output_page_index": int(meta.get("output_page_index", 1) or 1),
+                    "output_page_count": int(meta.get("output_page_count", 1) or 1),
+                    "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
+                    "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
+                    "summary": (
+                        f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}"
+                        + (" · long-output buffered" if meta.get("temp_output_path") else "")
+                        + (" · model-paged" if meta.get("model_truncated") else "")
+                    ),
                 },
             )
             return meta["output"]
@@ -22250,6 +25261,7 @@ class SessionState:
                 content = trim(str(row.get("content", "") or "").strip(), 6000)
                 if not content:
                     continue
+                self._refresh_runtime_code_reference(content)
                 applied = int(row.get("applied_count", 0) or 0) + 1
                 delay_rounds = int(row.get("delay_rounds", 0) or 0)
                 base_weight = (
@@ -22433,6 +25445,7 @@ class SessionState:
                     self.runtime_plan_mode_needed = True
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
+                self._refresh_runtime_code_reference(clean_goal or content)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
                 # Parse plan choice immediately after clean_goal is available
                 if _awaiting_plan_choice:
@@ -23314,10 +26327,7 @@ class SessionState:
 
         # Auto-discover and load relevant skills before research
         try:
-            self._auto_discover_and_load_skills(
-                self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                trigger="plan-mode-start",
-            )
+            self._refresh_loaded_skills_for_execution_focus(trigger="plan-mode-start")
         except Exception:
             pass
 
@@ -23386,10 +26396,13 @@ class SessionState:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Loaded Skills (use these to guide your research and plan design)\n"
+                    "\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
-                    + "\n\nThese skills have been injected into your context. "
-                    "Leverage their instructions to produce a more professional and complete plan.\n"
+                    + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
+                    "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
+                    "2. Identify the skill's concrete workflow steps (e.g., what scripts to run, what files to read/write)\n"
+                    "3. List the specific tool calls and file paths each skill requires\n"
+                    "4. Include these details in your plan_findings so the synthesis phase can produce actionable steps\n"
                 )
         return (
             f"You are in plan-mode research phase. Your task is to analyze the following request "
@@ -23397,12 +26410,17 @@ class SessionState:
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. Analyze the impact scope — which files, modules, and systems are affected\n"
-            f"2. Identify key files that need to be read and understood\n"
-            f"3. Assess risks and potential side effects\n"
-            f"4. Note any ambiguities or decisions that need user input\n"
-            f"5. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"6. Write your findings to the blackboard under 'plan.findings'.\n\n"
+            f"1. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
+            f"2. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"3. If skills are loaded, analyze their <loaded-skill> content to identify concrete workflow steps, "
+            f"scripts, tools, and file paths each skill requires\n"
+            f"4. Identify key technical details, data points, and structure needed for the output\n"
+            f"5. Assess risks and note any ambiguities that need user input\n"
+            f"6. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"7. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"   - File inventory (uploaded files, their types, sizes, key content)\n"
+            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each loaded skill)\n"
+            f"   - Content analysis (key themes, structure, data points extracted from inputs)\n\n"
             f"Workspace: {self.files_root}\n"
             f"{os_note}\n"
             f"{lang_note}"
@@ -23832,10 +26850,13 @@ class SessionState:
                     skill_previews.append(f"- {skey}: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Available Skills\n"
+                    "\n## Available Skills\n"
                     + "\n".join(skill_previews)
-                    + "\n\nIncorporate these skills' capabilities into your plan options. "
-                    "Each option's steps should reference using the relevant skills.\n\n"
+                    + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
+                    "- Which tool to call (bash, read_file, write_file, etc.)\n"
+                    "- Which specific file paths to use (e.g., 'Read uploaded/IEDM_.parsed.md')\n"
+                    "- What output to produce at each step\n"
+                    "Decompose each skill's workflow into 3-5 substeps based on the skill's instructions.\n\n"
                 )
         synthesis_prompt = (
             f"Based on the research findings below, generate a structured plan proposal "
@@ -23848,6 +26869,16 @@ class SessionState:
             f"- context: brief background analysis\n"
             f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
             f"- recommended: id of the recommended option\n\n"
+            f"STEP QUALITY REQUIREMENTS:\n"
+            f"- Each step must be a concrete, actionable instruction (NOT vague like 'analyze reports')\n"
+            f"- Include specific file paths (e.g., 'Read uploaded/IEDM_.parsed.md to extract key findings')\n"
+            f"- CRITICAL: Only reference scripts and tools that ACTUALLY EXIST in the skill directories or workspace. "
+            f"DO NOT invent script names like 'analyze_reports.py' or 'generate_pptx.js' that don't exist. "
+            f"Use the real scripts found in /skills/ directories (e.g., project_manager.py, svg_to_pptx.py).\n"
+            f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
+            f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
+            f"- Each step should be completable in 1-3 tool calls\n"
+            f"- Group related substeps under numbered headings (e.g., '2.1 Read report 1', '2.2 Read report 2')\n"
             f"Make options meaningfully different (e.g. different approaches, scope levels, or trade-offs).\n"
             f"{model_language_instruction(self.ui_language)}"
         )
@@ -23996,7 +27027,7 @@ class SessionState:
         recommended = str(proposal.get("recommended", "") or "").strip()
         rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
         prompt = (
-            f"The user was presented with these options:\n"
+            "The user was presented with these options:\n"
             + "\n".join(options_desc)
             + rec_hint
             + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"
@@ -24036,7 +27067,9 @@ class SessionState:
             f"## {chosen.get('title', '')}\n"
             f"{chosen.get('summary', '')}\n\n"
             f"### Steps:\n{steps_text}\n\n"
-            f"Follow these steps. Use tools to implement each step concretely."
+            f"Follow these steps. Use tools to implement each step concretely.\n"
+            f"If a step references a skill or workflow you don't fully understand, "
+            f"call load_skill to load it and read its instructions before proceeding."
         )
         self.messages.append({
             "role": "system",
@@ -24060,7 +27093,7 @@ class SessionState:
         if steps and isinstance(steps, list):
             plan_todos = []
             for i, step in enumerate(steps):
-                step_text = trim(str(step or "").strip(), 400)
+                step_text = trim(str(step or "").strip(), 600)
                 if not step_text:
                     continue
                 plan_todos.append({
@@ -24075,19 +27108,69 @@ class SessionState:
                     "evidence": "",
                 })
             if plan_todos:
-                bb["project_todos"] = plan_todos[:10]
+                bb["project_todos"] = plan_todos[:20]
                 bb["plan_step_cursor"] = 0
                 bb["plan_step_total"] = len(plan_todos)
                 self.blackboard = bb
                 self._blackboard_touch()
-                # 同步到 UI todo
+                # 同步到 UI todo — 使用 bb:proj: 键，与 _todo_project_rows_from_blackboard 保持一致
+                # 避免后续 _sync_todos_from_blackboard 把这些 items 误认为 worker_rows 造成重复
                 try:
                     self.todo.update([
-                        {"content": t["content"], "status": t["status"], "owner": "developer"}
-                        for t in plan_todos[:10]
+                        {
+                            "key": f"bb:proj:{t['id']}",
+                            "content": t["content"],
+                            "status": t["status"],
+                            "activeForm": f"Working on: {t['content']}" if t["status"] == "in_progress" else f"Pending: {t['content']}",
+                        }
+                        for t in plan_todos[:20]
                     ])
                 except Exception:
                     pass
+        try:
+            self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
+        except Exception:
+            pass
+        # Pre-load skills explicitly mentioned in plan steps
+        try:
+            self._preload_skills_from_plan_steps(chosen.get("steps", []))
+        except Exception:
+            pass
+
+    def _preload_skills_from_plan_steps(self, steps: list):
+        """Scan plan step text for skill names and auto-load any that aren't already loaded."""
+        if not steps or not isinstance(steps, list):
+            return
+        self._ensure_skills_ready(force=False)
+        available = self.skills.list_metadata()
+        if not available:
+            return
+        # Build name → qualified_name lookup
+        name_map: dict[str, str] = {}
+        for s in available:
+            name = str(s.get("name", "")).strip().lower()
+            qname = str(s.get("qualified_name", name)).strip()
+            if name:
+                name_map[name] = qname
+                # Also map without hyphens/underscores for fuzzy match
+                name_map[name.replace("-", "")] = qname
+                name_map[name.replace("_", "")] = qname
+        already_loaded = set(
+            k.lower() for k in (self._ensure_blackboard().get("loaded_skills", {}) or {}).keys()
+        )
+        combined_text = " ".join(str(s or "") for s in steps).lower()
+        to_load: list[str] = []
+        for name_low, qname in name_map.items():
+            if len(name_low) < 3:
+                continue
+            if name_low in combined_text and qname.lower() not in already_loaded:
+                if qname not in to_load:
+                    to_load.append(qname)
+        for skill_name in to_load[:4]:
+            try:
+                self._load_skill_with_cache(skill_name, load_source="auto:plan-step-mention")
+            except Exception:
+                pass
 
     def _agent_worker(self):
         single_role = "developer"
@@ -24115,10 +27198,7 @@ class SessionState:
                     "status",
                     {"summary": "initial skill discovery started"},
                 )
-                self._auto_discover_and_load_skills(
-                    self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                    trigger="pre-classify",
-                )
+                self._refresh_loaded_skills_for_execution_focus(trigger="pre-classify")
             except Exception:
                 pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()
@@ -25414,6 +28494,8 @@ class SessionState:
                 role = msg.get("role")
                 if role == "tool":
                     continue
+                if isinstance(msg, dict) and bool(msg.get("_ui_hidden", False)):
+                    continue
                 role_key = str(role or "").strip().lower()
                 msg_type = trim(str(msg.get("type", "message") or "").strip(), 40) if isinstance(msg, dict) else "message"
                 if not msg_type:
@@ -25434,6 +28516,11 @@ class SessionState:
                     and all(str(name or "").strip().lower() in {"route_to_next_agent", "routetonext_agent"} for name in tool_names)
                 )
                 text = msg.get("content", "")
+                # For skill-loaded messages: model sees full content, UI sees compact card
+                if isinstance(msg, dict) and msg.get("_skill_notify") and msg.get("_ui_text"):
+                    text = str(msg.get("_ui_text", ""))
+                if re.match(r"^\[SKILL EXECUTION GUIDE:\s*[^\]]+\]", str(text or "").strip(), flags=re.IGNORECASE):
+                    continue
                 if (not str(text or "").strip()) and manager_route_tool_only:
                     continue
                 if not text and tool_names:
@@ -25581,6 +28668,8 @@ class SessionState:
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
                         "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                        "parse_status": item.get("parse_status"),
+                        "parse_error": item.get("parse_error"),
                     }
                 )
             operations_view = []
@@ -25834,7 +28923,15 @@ class SessionManager:
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
+        upload_callback=None,
         run_finished_callback=None,
+        reference_prepare_callback=None,
+        query_code_library_callback=None,
+        query_knowledge_library_callback=None,
+        code_library_root: Path | str | None = None,
+        code_library_status_callback=None,
+        knowledge_library_root: Path | str | None = None,
+        knowledge_library_status_callback=None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -25871,6 +28968,14 @@ class SessionManager:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.single_advance_prompt_enhance = False
+        self.upload_callback = upload_callback
+        self.reference_prepare_callback = reference_prepare_callback
+        self.query_code_library_callback = query_code_library_callback
+        self.query_knowledge_library_callback = query_knowledge_library_callback
+        self.code_library_root = code_library_root
+        self.code_library_status_callback = code_library_status_callback
+        self.knowledge_library_root = knowledge_library_root
+        self.knowledge_library_status_callback = knowledge_library_status_callback
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -26209,7 +29314,15 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                upload_callback=self.upload_callback,
                 run_finished_callback=self.run_finished_callback,
+                reference_prepare_callback=self.reference_prepare_callback,
+                query_code_library_callback=self.query_code_library_callback,
+                query_knowledge_library_callback=self.query_knowledge_library_callback,
+                code_library_root=self.code_library_root,
+                code_library_status_callback=self.code_library_status_callback,
+                knowledge_library_root=self.knowledge_library_root,
+                knowledge_library_status_callback=self.knowledge_library_status_callback,
             )
             desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
             if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
@@ -26250,7 +29363,15 @@ class SessionManager:
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
+                upload_callback=self.upload_callback,
                 run_finished_callback=self.run_finished_callback,
+                reference_prepare_callback=self.reference_prepare_callback,
+                query_code_library_callback=self.query_code_library_callback,
+                query_knowledge_library_callback=self.query_knowledge_library_callback,
+                code_library_root=self.code_library_root,
+                code_library_status_callback=self.code_library_status_callback,
+                knowledge_library_root=self.knowledge_library_root,
+                knowledge_library_status_callback=self.knowledge_library_status_callback,
             )
             self._apply_user_defaults_to_session(sess)
             self.sessions[sid] = sess
@@ -26658,7 +29779,7 @@ window.MathJax={
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
-    <input id="configInput" type="file" accept=".json,application/json" style="display:none">
+    <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
   </div>
   <!-- LLM Config Modal -->
@@ -26681,7 +29802,7 @@ window.MathJax={
         <div id="llmFieldsContainer"></div>
       </div>
       <div class="llm-modal-footer">
-        <button id="llmConfigConfirm" class="llm-modal-btn-primary">Confirm</button>
+        <button id="llmConfigConfirm" type="button" class="llm-modal-btn-primary">Confirm</button>
         <label for="configInput" id="llmConfigImport" class="llm-modal-btn-secondary" style="cursor:pointer;margin:0">Import config</label>
       </div>
     </div>
@@ -26810,9 +29931,12 @@ window.MathJax={
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 :root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
+body[data-ui-style="trad"]{--bg:#f5f7fb;--card:#ffffffee;--line:#d7deea;--muted:#64748b}
 *{box-sizing:border-box}
 body{margin:0;font-family:'Space Grotesk','Noto Sans SC',sans-serif;background:var(--bg);color:var(--fg)}
+body[data-ui-style="trad"]{font-family:'Noto Sans SC','Segoe UI',sans-serif}
 .bg-layer{position:fixed;inset:0;background:radial-gradient(1200px 520px at 0% 0%,#dbe9ff 0,#f3f5f8 55%),radial-gradient(1000px 520px at 100% 100%,#d9fff2 0,#f3f5f8 55%);z-index:-1}
+body[data-ui-style="trad"] .bg-layer{background:linear-gradient(180deg,#f8fbff 0%,#eef3fb 100%)}
 .app{max-width:1540px;margin:0 auto;padding:20px}
 header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
 h1{margin:0;font-size:1.8rem}
@@ -26820,6 +29944,7 @@ header p{margin:.2rem 0 0;color:var(--muted)}
 .actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
 button,a{border:1px solid var(--line);padding:10px 14px;border-radius:12px;background:#fff;color:var(--fg);text-decoration:none;cursor:pointer;font-weight:600;transition:transform .15s ease,box-shadow .15s ease}
 button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27,45,.08)}
+body[data-ui-style="trad"] button,body[data-ui-style="trad"] a{border-radius:10px}
 #sendBtn,#newSessionBtn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0}
 .subtle{background:#f6f8fa}
 .export-item:hover{background:#f0f4f8}
@@ -26833,6 +29958,7 @@ button:hover,a:hover{transform:translateY(-1px);box-shadow:0 4px 10px rgba(15,27
 .stat .v{font-size:1.25rem;font-weight:700}
 main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
 .panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;height:100%}
+body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
@@ -26903,7 +30029,16 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-agent-badge.reviewer{background:#fff3d4;border-color:#efd692;color:#8a6213}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
-.manager-delegate-card{border:1px solid #d7bbff;background:#f8f3ff;border-radius:10px;padding:10px}
+.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
+.msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
+.msg.agent-reviewer .msg-agent-shell{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
+.msg.agent-manager .msg-agent-shell{background:linear-gradient(180deg,#fcfaff 0%,#f2eaff 100%);border-color:#dcc6ff}
+.msg.agent-planner .msg-agent-shell{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
+.msg-agent-shell .msg-agent-badge{margin:0 0 10px 0}
+.msg-agent-shell .msg-thinking{margin-top:10px}
+.manager-delegate-card{border:1px solid #d7bbff;background:linear-gradient(180deg,#fcf8ff 0%,#f3ebff 100%);border-radius:12px;padding:10px;box-shadow:0 8px 20px rgba(109,67,184,.08)}
 .manager-delegate-head{font-weight:800;font-size:.86rem;color:#5a2fa6}
 .manager-delegate-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0 8px}
 .manager-delegate-pills{display:flex;flex-wrap:wrap;gap:6px;margin:7px 0 8px}
@@ -26915,7 +30050,7 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .agent-control-head{font-size:.78rem;font-weight:700;color:#38557a;margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em}
 .agent-control-pills{display:flex;flex-wrap:wrap;gap:6px}
 .agent-control-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:.72rem;font-weight:700;border:1px solid #cfdaeb;background:#eef4ff;color:#2d4f77}
-.agent-bus-card{border:1px solid #cde0f7;background:#f4f8ff;border-radius:10px;padding:9px}
+.agent-bus-card{border:1px solid #cde0f7;background:linear-gradient(180deg,#f9fbff 0%,#edf4ff 100%);border-radius:12px;padding:9px;box-shadow:0 8px 20px rgba(47,87,149,.08)}
 .agent-bus-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px}
 .agent-bus-pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:.7rem;font-weight:700;border:1px solid #d0dbe8;background:#f5f8fd;color:#2f4765}
 .agent-bus-pill.explorer{background:#ffe6f0;border-color:#ffbdd5;color:#9b275e}
@@ -26945,11 +30080,62 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 .msg-md .md-table th{background:#f5f8fc;font-weight:700}
 .msg-md a{color:#1f5cc4;text-decoration:underline}
 .msg-md a:hover{color:#17479b}
+.msg-md .md-callout{display:flex;flex-direction:column;gap:6px;margin:.55rem 0;padding:10px 12px;border-radius:12px;border:1px solid #d9e4f1;background:linear-gradient(180deg,#f8fbff,#eef5ff)}
+.msg-md .md-callout-head{font-size:.72rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#355071}
+.msg-md .md-callout-body{font-size:.88rem;line-height:1.5;color:#1f314b;white-space:normal}
+.msg-md .md-callout.reminder{border-color:#bfd4ff;background:linear-gradient(180deg,#f7fbff,#edf4ff)}
+.msg-md .md-callout.warning{border-color:#ffd69b;background:linear-gradient(180deg,#fff9ef,#fff1d8)}
+.msg-md .md-callout.notice{border-color:#cfe3d8;background:linear-gradient(180deg,#f5fcf7,#ebf8ef)}
+.msg-md .md-callout.instruction{border-color:#d9ccff;background:linear-gradient(180deg,#faf7ff,#f1ebff)}
+body[data-ui-style="trad"] .msg{border-radius:10px}
+body[data-ui-style="trad"] .msg-agent-badge{border-radius:8px;padding:3px 8px}
+body[data-ui-style="trad"] .msg-agent-shell,body[data-ui-style="trad"] .manager-delegate-card,body[data-ui-style="trad"] .agent-bus-card,body[data-ui-style="trad"] .msg-event-card{border-radius:11px;box-shadow:none}
+body[data-ui-style="trad"] .msg-agent-shell{background:#ffffff;border-color:#d8e2ef}
+body[data-ui-style="trad"] .msg.agent-explorer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-explorer .msg-event-card{background:#fff5fa;border-color:#f1cada}
+body[data-ui-style="trad"] .msg.agent-developer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-developer .msg-event-card{background:#f4fbf4;border-color:#cfe3d3}
+body[data-ui-style="trad"] .msg.agent-reviewer .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-reviewer .msg-event-card{background:#fff9eb;border-color:#e8d7a4}
+body[data-ui-style="trad"] .msg.agent-manager .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-manager .msg-event-card{background:#f8f3ff;border-color:#dac8f6}
+body[data-ui-style="trad"] .msg.agent-planner .msg-agent-shell,body[data-ui-style="trad"] .msg.agent-planner .msg-event-card{background:#fff3ef;border-color:#efcfc4}
+body[data-ui-style="trad"] .manager-delegate-card{background:#f8f3ff;border-color:#dac8f6}
+body[data-ui-style="trad"] .agent-bus-card{background:#f7faff;border-color:#d7e3f1}
+body[data-ui-style="trad"] .msg-event-pill{border-radius:8px;font-weight:600}
+body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-thinking{margin-top:8px;border:1px solid #d8dde6;background:#f1f3f7;border-radius:8px;padding:6px 8px}
 .msg-thinking-label{font-size:.7rem;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
 .msg-thinking pre{margin:0;max-height:140px;overflow:auto;font-size:.72rem;line-height:1.35;color:#4b5563;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
 .msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
 .msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
+.msg.msg-event-wrap{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg.agent-explorer .msg-event-card{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
+.msg.agent-developer .msg-event-card{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
+.msg.agent-reviewer .msg-event-card{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
+.msg.agent-manager .msg-event-card{background:linear-gradient(180deg,#fcfaff 0%,#f2eaff 100%);border-color:#dcc6ff}
+.msg.agent-planner .msg-event-card{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
+.msg-event-card-skill{background:linear-gradient(180deg,#f9fcff 0%,#edf6ff 100%);border-color:#cadff7}
+.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.msg-event-title{font-size:.94rem;font-weight:800;line-height:1.2;color:#1f314b}
+.msg-event-sub{margin-top:3px;font-size:.76rem;line-height:1.4;color:#627790}
+.msg-event-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
+.msg-event-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.72rem;font-weight:700;line-height:1}
+.msg-event-pill.ok{background:#ebf8ef;border-color:#c7e6ce;color:#21623a}
+.msg-event-pill.warn{background:#fff4e3;border-color:#ffd5a4;color:#8a4b08}
+.msg-event-pill.error{background:#fff0f0;border-color:#f1c5c5;color:#a12d2d}
+.msg-event-pill.info{background:#eef4ff;border-color:#d7e3f2;color:#355071}
+.msg-event-pill.live{background:#eefaf8;border-color:#bfe8df;color:#0f6e62}
+.msg-event-pill.neutral{background:#f5f8fd;border-color:#dce5f1;color:#55687f}
+.msg-event-pill.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px}
+.msg-event-cell{padding:9px 10px;border:1px solid #e1eaf5;border-radius:12px;background:rgba(255,255,255,.78)}
+.msg-event-label{font-size:.68rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#6a7e96;margin-bottom:4px}
+.msg-event-value{font-size:.83rem;line-height:1.45;color:#1f314b;white-space:pre-wrap;word-break:break-word}
+.msg-event-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem}
+.msg-event-body{display:grid;gap:10px}
+.msg-event-note{font-size:.79rem;line-height:1.48;color:#60748d}
+.msg-event-tool-grid{display:flex;flex-wrap:wrap;gap:8px}
+.msg-run-dot{width:8px;height:8px;border-radius:999px;background:#13b8a6;box-shadow:0 0 0 0 rgba(19,184,166,.38);animation:msgRunPulse 1.6s ease-out infinite}
+@keyframes msgRunPulse{0%{box-shadow:0 0 0 0 rgba(19,184,166,.36)}70%{box-shadow:0 0 0 9px rgba(19,184,166,0)}100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}}
+@media (prefers-reduced-motion:reduce){.msg-run-dot{animation:none}}
 .msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
@@ -27047,6 +30233,14 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .cmd-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#f9fbff}
 .cmd-main{font-weight:600}
 .cmd-sub{color:var(--muted);font-size:.82rem}
+.cmd-flags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.cmd-flag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #d4deec;background:#eef4fb;color:#37506c;font-size:.72rem;font-weight:600}
+.cmd-flag.warn{background:#fff3e4;border-color:#ffd3a1;color:#8a4b08}
+.cmd-flag.info{background:#e8f2ff;border-color:#bfd4ff;color:#0f4ca8}
+.cmd-output{margin-top:6px;max-height:220px;overflow:auto;background:#fff;border:1px solid #e7edf5;border-radius:6px;padding:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-word}
+.cmd-pager{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cmd-pager button{border:1px solid #d7e2f0;background:#fff;border-radius:6px;padding:2px 8px;font-size:.75rem;cursor:pointer}
+.cmd-pager button:disabled{opacity:.45;cursor:default}
 .diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff}
 .diff-head{font-weight:600;margin-bottom:4px}
 .diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
@@ -27087,14 +30281,15 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-field select,.llm-field input[type="text"],.llm-field input[type="url"],.llm-field input[type="password"],.llm-field input[type="number"]{width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.88rem;background:#fff;color:var(--fg,#0f1b2d);box-sizing:border-box}
 .llm-field input:focus,.llm-field select:focus,.llm-field textarea:focus{outline:none;border-color:var(--brand,#1f6feb);box-shadow:0 0 0 2px rgba(31,111,235,.15)}
 .llm-field .llm-hint{font-size:.72rem;color:var(--muted,#6c7a8d);margin-top:3px}
-.llm-modal-footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line,#d9e1ec)}
+.llm-modal-footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line,#d9e1ec);align-items:stretch}
+.llm-modal-footer .llm-modal-btn-primary,.llm-modal-footer .llm-modal-btn-secondary{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;line-height:1.2;text-align:center;min-height:40px;margin:0}
 .llm-modal-btn-primary{flex:1;padding:9px 16px;border-radius:8px;border:none;background:var(--brand,#1f6feb);color:#fff;font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-primary:hover{opacity:.9}
 .llm-modal-btn-secondary{flex:1;padding:9px 16px;border-radius:8px;border:1px solid var(--line,#d9e1ec);background:var(--bg,#f5f7fa);color:var(--fg,#0f1b2d);font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -27129,14 +30324,14 @@ const RENDER={queue:[],raf:0,canvas:null,ctx:null,lastSeq:0,lastPaintAt:0,lastMe
 const CODE_PREVIEW_VIRT_THRESHOLD=1800;
 const CODE_PREVIEW_VIRT_EST_ROW_PX=24;
 const CODE_PREVIEW_VIRT_OVERSCAN=160;
-const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties','.f','.f90','.f95','.f03','.f08','.for','.fpp','.hs','.lhs','.erl','.hrl','.ex','.exs','.ml','.mli','.vhd','.vhdl','.v','.sv','.asm','.s','.proto','.tf','.tfvars','.prisma','.graphql','.gql','.zig','.nim','.jl','.cr','.d','.clj','.cljs','.cljc','.lisp','.cl','.el','.rkt','.pas','.pp','.wgsl','.glsl','.hlsl','.groovy','.cmake','.dockerfile']);
-const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt']);
-const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini','.f':'fortran','.f90':'fortran','.f95':'fortran','.f03':'fortran','.f08':'fortran','.for':'fortran','.fpp':'fortran','.hs':'haskell','.lhs':'haskell','.erl':'erlang','.hrl':'erlang','.ex':'elixir','.exs':'elixir','.ml':'ocaml','.mli':'ocaml','.vhd':'vhdl','.vhdl':'vhdl','.v':'verilog','.sv':'verilog','.asm':'asm','.s':'asm','.proto':'protobuf','.tf':'hcl','.tfvars':'hcl','.zig':'zig','.nim':'nim','.jl':'julia','.cr':'crystal','.d':'dlang','.clj':'clojure','.cljs':'clojure','.cljc':'clojure','.lisp':'lisp','.cl':'lisp','.el':'lisp','.rkt':'racket','.pas':'pascal','.pp':'pascal','.wgsl':'wgsl','.glsl':'glsl','.hlsl':'hlsl','.groovy':'groovy','.cmake':'cmake','.dockerfile':'shell','.prisma':'prisma','.graphql':'graphql','.gql':'graphql'};
-const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini'};
+const CODE_PREVIEW_EXTS=new Set(['.py','.pyi','.js','.mjs','.cjs','.ts','.tsx','.jsx','.java','.c','.cc','.cpp','.cxx','.h','.hh','.hpp','.hxx','.go','.rs','.rb','.php','.swift','.kt','.kts','.scala','.css','.scss','.sass','.less','.styl','.stylus','.pcss','.postcss','.xhtml','.astro','.sh','.bash','.zsh','.fish','.ps1','.bat','.sql','.json','.jsonc','.yaml','.yml','.toml','.ini','.cfg','.conf','.xml','.xsd','.xsl','.cs','.m','.mm','.r','.pl','.lua','.dart','.vue','.svelte','.gradle','.properties','.f','.f90','.f95','.f03','.f08','.for','.fpp','.hs','.lhs','.erl','.hrl','.ex','.exs','.ml','.mli','.vhd','.vhdl','.v','.sv','.asm','.s','.proto','.tf','.tfvars','.prisma','.graphql','.gql','.zig','.nim','.jl','.cr','.d','.clj','.cljs','.cljc','.lisp','.cl','.el','.rkt','.pas','.pp','.wgsl','.glsl','.hlsl','.groovy','.cmake','.dockerfile']);
+const CODE_PREVIEW_FILENAMES=new Set(['dockerfile','makefile','cmakelists.txt','justfile','gemfile','rakefile','pipfile','requirements.txt','go.mod','go.work']);
+const CODE_LANG_BY_EXT={'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.ts':'typescript','.tsx':'typescript','.jsx':'javascript','.java':'java','.c':'c','.cc':'cpp','.cpp':'cpp','.cxx':'cpp','.h':'c','.hh':'cpp','.hpp':'cpp','.hxx':'cpp','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.kts':'kotlin','.scala':'scala','.html':'html','.htm':'html','.xhtml':'html','.astro':'html','.css':'css','.scss':'css','.sass':'css','.less':'css','.styl':'css','.stylus':'css','.pcss':'css','.postcss':'css','.sh':'shell','.bash':'shell','.zsh':'shell','.fish':'shell','.ps1':'shell','.bat':'shell','.sql':'sql','.json':'json','.jsonc':'json','.yaml':'yaml','.yml':'yaml','.toml':'toml','.ini':'ini','.cfg':'ini','.conf':'ini','.xml':'xml','.xsd':'xml','.xsl':'xml','.cs':'csharp','.m':'objectivec','.mm':'objectivec','.r':'r','.pl':'perl','.lua':'lua','.dart':'dart','.vue':'javascript','.svelte':'javascript','.gradle':'groovy','.properties':'ini','.f':'fortran','.f90':'fortran','.f95':'fortran','.f03':'fortran','.f08':'fortran','.for':'fortran','.fpp':'fortran','.hs':'haskell','.lhs':'haskell','.erl':'erlang','.hrl':'erlang','.ex':'elixir','.exs':'elixir','.ml':'ocaml','.mli':'ocaml','.vhd':'vhdl','.vhdl':'vhdl','.v':'verilog','.sv':'verilog','.asm':'asm','.s':'asm','.proto':'protobuf','.tf':'hcl','.tfvars':'hcl','.zig':'zig','.nim':'nim','.jl':'julia','.cr':'crystal','.d':'dlang','.clj':'clojure','.cljs':'clojure','.cljc':'clojure','.lisp':'lisp','.cl':'lisp','.el':'lisp','.rkt':'racket','.pas':'pascal','.pp':'pascal','.wgsl':'wgsl','.glsl':'glsl','.hlsl':'hlsl','.groovy':'groovy','.cmake':'cmake','.dockerfile':'shell','.prisma':'prisma','.graphql':'graphql','.gql':'graphql'};
+const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.txt':'cmake','justfile':'makefile','gemfile':'ruby','rakefile':'ruby','pipfile':'ini','requirements.txt':'ini','go.mod':'go','go.work':'go'};
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
 const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library']),fortran:new Set(['program','module','subroutine','function','end','use','implicit','none','integer','real','character','logical','complex','dimension','allocatable','intent','in','out','inout','do','if','then','else','elseif','endif','call','return','write','read','format','type','class','interface','contains','allocate','deallocate']),haskell:new Set(['module','where','import','qualified','as','hiding','data','type','newtype','class','instance','deriving','if','then','else','case','of','let','in','do','return','where','infixl','infixr','infix','forall','default']),erlang:new Set(['module','export','import','if','case','of','end','receive','after','when','fun','try','catch','throw','begin','andalso','orelse','not','band','bor','bxor','bnot','bsl','bsr']),elixir:new Set(['def','defp','defmodule','defmacro','defstruct','defprotocol','defimpl','if','else','unless','case','cond','do','end','fn','when','with','for','raise','rescue','import','use','alias','require']),ocaml:new Set(['let','in','if','then','else','match','with','fun','function','type','module','struct','sig','end','open','val','rec','and','or','not','begin','do','done','for','while','to','downto','mutable','ref']),vhdl:new Set(['library','use','entity','architecture','is','of','begin','end','signal','variable','constant','port','in','out','inout','process','if','then','else','elsif','case','when','for','generate','component','generic','map']),verilog:new Set(['module','endmodule','input','output','inout','wire','reg','assign','always','begin','end','if','else','case','endcase','for','while','parameter','localparam','initial','posedge','negedge','task','function']),asm:new Set([]),protobuf:new Set(['syntax','package','import','option','message','enum','service','rpc','returns','repeated','optional','required','map','oneof','reserved','extend']),hcl:new Set(['resource','data','variable','output','locals','module','provider','terraform','backend','required_providers','for_each','count','depends_on','lifecycle','dynamic','content','block']),zig:new Set(['const','var','fn','pub','return','if','else','for','while','break','continue','switch','struct','enum','union','error','defer','errdefer','try','catch','import','comptime','inline','test','unreachable']),nim:new Set(['proc','func','method','type','var','let','const','if','elif','else','case','of','for','while','break','continue','return','import','include','from','object','ref','ptr','template','macro','iterator','yield','discard']),julia:new Set(['function','end','if','elseif','else','for','while','break','continue','return','module','using','import','export','struct','mutable','abstract','type','const','let','do','begin','try','catch','finally','throw','macro','quote']),crystal:new Set(['def','class','module','struct','enum','if','elsif','else','unless','case','when','while','until','for','do','end','return','yield','begin','rescue','ensure','require','include','extend','abstract','private','protected']),dlang:new Set(['module','import','class','struct','enum','interface','if','else','for','foreach','while','do','switch','case','default','break','continue','return','void','auto','const','immutable','static','public','private','protected','override','template','mixin','alias']),clojure:new Set(['def','defn','defmacro','fn','let','if','cond','case','do','loop','recur','for','doseq','when','when-not','ns','require','use','import','try','catch','throw','finally']),lisp:new Set(['defun','defmacro','defvar','defparameter','defconstant','let','let*','if','cond','case','when','unless','lambda','progn','loop','do','dolist','dotimes','setq','setf','funcall','apply','require','provide']),racket:new Set(['define','lambda','let','let*','letrec','if','cond','case','when','unless','begin','do','for','for/list','for/hash','match','struct','class','require','provide','module','import','export']),pascal:new Set(['program','unit','uses','interface','implementation','begin','end','var','const','type','procedure','function','if','then','else','for','to','downto','while','repeat','until','case','of','with','record','class','array','set','nil']),wgsl:new Set(['fn','var','let','const','struct','if','else','for','while','loop','break','continue','return','switch','case','default','override','enable','type','alias','discard','continuing','fallthrough']),glsl:new Set(['void','float','int','bool','vec2','vec3','vec4','mat2','mat3','mat4','sampler2D','uniform','varying','attribute','in','out','inout','if','else','for','while','do','break','continue','return','struct','const','precision','highp','mediump','lowp']),hlsl:new Set(['float','float2','float3','float4','int','bool','void','struct','cbuffer','Texture2D','SamplerState','if','else','for','while','do','break','continue','return','in','out','inout','uniform','static','const','register','semantic']),prisma:new Set(['model','enum','datasource','generator','type','relation','default','unique','id','map','index','ignore','updatedAt']),graphql:new Set(['type','query','mutation','subscription','input','enum','interface','union','scalar','schema','fragment','on','directive','extend','implements'])};
 S.staticMode=STATIC_UI;
-async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl)}catch(err){showError(err.message||String(err))}}
+async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
 const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
 function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}}
@@ -27290,6 +30485,8 @@ const I18N={
   }
 };
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
+function normalizeUiStyle(raw){const key=String(raw||'').trim().toLowerCase().replace(/-/g,'_');if(['trad','traditional','classic','legacy','old'].includes(key))return'trad';return'neo'}
+function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');if(document.body)document.body.setAttribute('data-ui-style',style);document.documentElement.setAttribute('data-ui-style',style)}
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
@@ -27375,13 +30572,23 @@ function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;c
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
   if(type==='command'){
-    return `[command] ${String(d.name||'')}\n$ ${String(d.command||'')}\ncwd: ${String(d.cwd||'')}\nexit: ${String(d.exit_code??'-')}  duration: ${String(d.duration_ms??'-')}ms\nchanged: ${Array.isArray(d.changed_files)?d.changed_files.join(', '):''}\n${String(d.output||'')}`;
+    const extra=[
+      d.temp_output_path?`temp_output: ${String(d.temp_output_path)}`:'',
+      d.buffer_ref?`buffer_ref: ${String(d.buffer_ref)}`:'',
+      d.ui_truncated?'ui_preview_truncated: yes':'',
+      d.model_truncated?'model_context_truncated: yes':'',
+      d.output_page_count&&Number(d.output_page_count)>1?`model_pages: ${String(d.output_page_index||1)}/${String(d.output_page_count||1)}`:''
+    ].filter(Boolean).join('\\n');
+    return `[command] ${String(d.name||'')}\n$ ${String(d.command||'')}\ncwd: ${String(d.cwd||'')}\nexit: ${String(d.exit_code??'-')}  duration: ${String(d.duration_ms??'-')}ms\nchanged: ${Array.isArray(d.changed_files)?d.changed_files.join(', '):''}${extra?`\n${extra}`:''}\n${String(d.output||'')}`;
   }
   if(type==='file_patch'){
     return `[file_patch] ${String(d.path||'')}\nlocation: ${String(d.session_rel_path||d.path||'')}\nsession_root: ${String(d.session_root||'')}\n+${String(d.added??0)} / -${String(d.deleted??0)}\n${String(d.diff_numbered||d.diff||'')}`;
   }
   if(type==='upload'){
-    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}\n${String(d.preview||'')}`;
+    const status=String(d.parse_status||'').trim();
+    const err=String(d.parse_error||d.error||'').trim();
+    const note=status?`status: ${status}`:'';
+    return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}${note?`\n${note}`:''}${err?`\nerror: ${err}`:''}\n${String(d.preview||'')}`;
   }
   return String(d.text||'');
 }
@@ -27498,6 +30705,17 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaScheduleRender({chat:true,boards:true});
     return{handled:true,needsSnapshot:false};
   }
+  if(typ==='skill_candidates'){
+    const loaded=String(data.loaded||'').trim();
+    const candidates=Array.isArray(data.candidates)?data.candidates:[];
+    const filtered=Array.isArray(data.infra_filtered)?data.infra_filtered:[];
+    if(loaded||candidates.length){
+      const summary=String(data.summary||'').trim();
+      _deltaAppendActivity('skill_candidates',{loaded,candidates,filtered,summary},ts);
+      _deltaScheduleRender({boards:true});
+    }
+    return{handled:true,needsSnapshot:false};
+  }
   if(typ==='message'){
     const role=String(data.role||'assistant').trim()||'assistant';
     const rowType=String(data.type||'message').trim()||'message';
@@ -27525,12 +30743,25 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='command'||typ==='file_patch'||typ==='upload'){
     _deltaAppendOperation(typ,data,ts);
-    const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
-    _deltaAppendConversationRow(row);
+    if(!(typ==='upload'&&String(data.parse_status||'').trim().toLowerCase()==='pending')){
+      const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
+      _deltaAppendConversationRow(row);
+    }
     _deltaAppendActivity(typ,data,ts);
     if(typ==='upload'){
-      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||'')};
-      _deltaPushLimited(S.snap.uploads,uploadRow,DELTA_MAX_UPLOADS);
+      const uploadRow={id:String(data.id||''),filename:String(data.filename||''),workspace_path:String(data.workspace_path||''),kind:String(data.kind||''),size:Number(data.size||0),uploaded_at:ts,preview:String(data.preview||''),parse_status:String(data.parse_status||''),parse_error:String(data.parse_error||data.error||'')};
+      const targetId=String(uploadRow.id||'').trim();
+      let replaced=false;
+      if(targetId&&Array.isArray(S.snap.uploads)){
+        for(let i=S.snap.uploads.length-1;i>=0;i--){
+          const row=S.snap.uploads[i]||{};
+          if(String(row.id||'').trim()!==targetId)continue;
+          S.snap.uploads[i]={...row,...uploadRow};
+          replaced=true;
+          break;
+        }
+      }
+      if(!replaced)_deltaPushLimited(S.snap.uploads,uploadRow,DELTA_MAX_UPLOADS);
     }
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
@@ -27787,16 +31018,32 @@ function _mathRunTypeset(root,key=''){
   if(!root)return;
   const k=String(key||'').trim();
   if(k&&root.getAttribute('data-math-key')===k)return;
+  const mathJaxCandidates=[
+    '/assets/js_lib/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/tex-mml-chtml.js',
+    '/assets/js_lib/es5/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/es5/tex-mml-chtml.js',
+    'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'
+  ];
+  const loadMathJax=(idx=0)=>{
+    const src=String(mathJaxCandidates[idx]||'').trim();
+    if(!src)return;
+    const s=document.createElement('script');
+    s.src=src;
+    s.async=true;
+    s.dataset.mathjaxCandidate=String(idx);
+    s.onerror=()=>{
+      if(idx+1<mathJaxCandidates.length)loadMathJax(idx+1);
+    };
+    document.head.appendChild(s);
+  };
   const run=(retry)=>{
     const mj=window.MathJax;
     if(!mj||typeof mj.typesetPromise!=='function'){
       // Lazy-load MathJax on first actual math demand
       if(!window._mjaxLoading){
         window._mjaxLoading=true;
-        const s=document.createElement('script');
-        s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
-        s.async=true;
-        document.head.appendChild(s);
+        loadMathJax(0);
       }
       if(retry<20)setTimeout(()=>run(retry+1),200);
       return;
@@ -27851,7 +31098,121 @@ function renderInlineMarkdown(raw){
   s=s.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g,(_,txt,url)=>`<a href=\"${url}\" target=\"_blank\" rel=\"noreferrer\">${txt}</a>`);
   return _mathRestore(s,pack.tokens);
 }
-function renderMarkdown(text){const src=String(text||'').replace(/\\r\\n?/g,'\\n');const codeBlocks=[];let body=src.replace(/```([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)```/g,(_,lang,code)=>{const idx=codeBlocks.length;const langTag=String(lang||'').trim();const codeHtml=`<pre class=\"md-code\"><code>${esc(String(code||'').replace(/\\n$/,''))}</code></pre>`;codeBlocks.push(langTag?`<div class=\"md-code-lang\">${esc(langTag)}</div>${codeHtml}`:codeHtml);return `\\u0000CODE${idx}\\u0000`});const lines=body.split('\\n');const out=[];let para=[];let inUl=false;let inOl=false;const flushPara=()=>{if(!para.length)return;out.push(`<p>${renderInlineMarkdown(para.join(' '))}</p>`);para=[]};const closeLists=()=>{if(inUl){out.push('</ul>');inUl=false}if(inOl){out.push('</ol>');inOl=false}};for(let i=0;i<lines.length;i++){const line=String(lines[i]||'');const trimLine=line.trim();if(!trimLine){flushPara();closeLists();continue}if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){flushPara();closeLists();const header=splitTableRow(line);const rows=[];i+=2;while(i<lines.length&&String(lines[i]||'').includes('|')&&String(lines[i]||'').trim()){rows.push(splitTableRow(lines[i]));i+=1}i-=1;const th=header.map(cell=>`<th>${renderInlineMarkdown(cell)}</th>`).join('');const tb=rows.map(r=>`<tr>${r.map(c=>`<td>${renderInlineMarkdown(c)}</td>`).join('')}</tr>`).join('');out.push(`<table class=\"md-table\"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);continue}const hm=trimLine.match(/^(#{1,6})\\s+(.+)$/);if(hm){flushPara();closeLists();const lv=Math.max(1,Math.min(6,hm[1].length));out.push(`<h${lv}>${renderInlineMarkdown(hm[2])}</h${lv}>`);continue}if(/^>\\s?/.test(trimLine)){flushPara();closeLists();out.push(`<blockquote>${renderInlineMarkdown(trimLine.replace(/^>\\s?/,''))}</blockquote>`);continue}const om=trimLine.match(/^\\d+\\.\\s+(.+)$/);if(om){flushPara();if(inUl){out.push('</ul>');inUl=false}if(!inOl){out.push('<ol>');inOl=true}out.push(`<li>${renderInlineMarkdown(om[1])}</li>`);continue}const um=trimLine.match(/^[-*+]\\s+(.+)$/);if(um){flushPara();if(inOl){out.push('</ol>');inOl=false}if(!inUl){out.push('<ul>');inUl=true}out.push(`<li>${renderInlineMarkdown(um[1])}</li>`);continue}para.push(trimLine)}flushPara();closeLists();let html=out.join('');html=html.replace(/\\u0000CODE(\\d+)\\u0000/g,(_,n)=>codeBlocks[Number(n)]||'');return html||'<p></p>'}
+function _mdCalloutLabel(tag){
+  const low=String(tag||'').toLowerCase();
+  if(low==='warning')return 'Warning';
+  if(low==='notice')return 'Notice';
+  if(low==='instruction')return 'Instruction';
+  if(low==='tip')return 'Tip';
+  return 'Reminder';
+}
+function _mdExtractCallouts(src,inlineRenderer){
+  const blocks=[];
+  const text=String(src||'').replace(/<(reminder|warning|notice|tip|instruction)>([\\s\\S]*?)<\\/\\1>/gi,(_,tag,content)=>{
+    const idx=blocks.length;
+    const tone=String(tag||'reminder').toLowerCase();
+    const body=String(content||'').trim();
+    const rendered=body?body.split(/\\n+/).map(line=>inlineRenderer(String(line||'').trim())).join('<br>'):'';
+    blocks.push(`<div class=\"md-callout ${esc(tone)}\"><div class=\"md-callout-head\">${esc(_mdCalloutLabel(tone))}</div><div class=\"md-callout-body\">${rendered}</div></div>`);
+    return `\\u0000CALLOUT${idx}\\u0000`;
+  });
+  return {text,blocks};
+}
+function renderMarkdown(text){
+  const src=String(text||'').replace(/\\r\\n?/g,'\\n');
+  const codeBlocks=[];
+  let body=src.replace(/```([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)```/g,(_,lang,code)=>{
+    const idx=codeBlocks.length;
+    const langTag=String(lang||'').trim();
+    const codeHtml=`<pre class=\"md-code\"><code>${esc(String(code||'').replace(/\\n$/,''))}</code></pre>`;
+    codeBlocks.push(langTag?`<div class=\"md-code-lang\">${esc(langTag)}</div>${codeHtml}`:codeHtml);
+    return `\\u0000CODE${idx}\\u0000`;
+  });
+  const calloutPack=_mdExtractCallouts(body,renderInlineMarkdown);
+  body=calloutPack.text;
+  const lines=body.split('\\n');
+  const out=[];
+  let para=[];
+  let inUl=false;
+  let inOl=false;
+  const flushPara=()=>{
+    if(!para.length)return;
+    out.push(`<p>${renderInlineMarkdown(para.join(' '))}</p>`);
+    para=[];
+  };
+  const closeLists=()=>{
+    if(inUl){out.push('</ul>');inUl=false}
+    if(inOl){out.push('</ol>');inOl=false}
+  };
+  for(let i=0;i<lines.length;i++){
+    const line=String(lines[i]||'');
+    const trimLine=line.trim();
+    if(!trimLine){
+      flushPara();
+      closeLists();
+      continue;
+    }
+    const calloutMatch=trimLine.match(/^\\u0000CALLOUT(\\d+)\\u0000$/);
+    if(calloutMatch){
+      flushPara();
+      closeLists();
+      out.push(calloutPack.blocks[Number(calloutMatch[1])]||'');
+      continue;
+    }
+    if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){
+      flushPara();
+      closeLists();
+      const header=splitTableRow(line);
+      const rows=[];
+      i+=2;
+      while(i<lines.length&&String(lines[i]||'').includes('|')&&String(lines[i]||'').trim()){
+        rows.push(splitTableRow(lines[i]));
+        i+=1;
+      }
+      i-=1;
+      const th=header.map(cell=>`<th>${renderInlineMarkdown(cell)}</th>`).join('');
+      const tb=rows.map(r=>`<tr>${r.map(c=>`<td>${renderInlineMarkdown(c)}</td>`).join('')}</tr>`).join('');
+      out.push(`<table class=\"md-table\"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      continue;
+    }
+    const hm=trimLine.match(/^(#{1,6})\\s+(.+)$/);
+    if(hm){
+      flushPara();
+      closeLists();
+      const lv=Math.max(1,Math.min(6,hm[1].length));
+      out.push(`<h${lv}>${renderInlineMarkdown(hm[2])}</h${lv}>`);
+      continue;
+    }
+    if(/^>\\s?/.test(trimLine)){
+      flushPara();
+      closeLists();
+      out.push(`<blockquote>${renderInlineMarkdown(trimLine.replace(/^>\\s?/,''))}</blockquote>`);
+      continue;
+    }
+    const om=trimLine.match(/^\\d+\\.\\s+(.+)$/);
+    if(om){
+      flushPara();
+      if(inUl){out.push('</ul>');inUl=false}
+      if(!inOl){out.push('<ol>');inOl=true}
+      out.push(`<li>${renderInlineMarkdown(om[1])}</li>`);
+      continue;
+    }
+    const um=trimLine.match(/^[-*+]\\s+(.+)$/);
+    if(um){
+      flushPara();
+      if(inOl){out.push('</ol>');inOl=false}
+      if(!inUl){out.push('<ul>');inUl=true}
+      out.push(`<li>${renderInlineMarkdown(um[1])}</li>`);
+      continue;
+    }
+    para.push(trimLine);
+  }
+  flushPara();
+  closeLists();
+  let html=out.join('');
+  html=html.replace(/\\u0000CODE(\\d+)\\u0000/g,(_,n)=>codeBlocks[Number(n)]||'');
+  return html||'<p></p>';
+}
 function _mdCacheSet(key,html){const k=String(key||'');if(!k)return;MD_CACHE.set(k,String(html||''));if(MD_CACHE.size>MD_CACHE_MAX){const first=MD_CACHE.keys().next().value;MD_CACHE.delete(first)}}
 function _mdWorkerCleanupStale(){const now=Date.now();const pending=S.mdPending||{};for(const [id,row] of Object.entries(pending)){const ts=Number(row?.ts||0);if(!ts||now-ts>MARKDOWN_WORKER_REQ_TTL_MS){delete pending[id]}}}
 function _mdWorkerEnsure(){
@@ -27881,6 +31242,26 @@ function isTableSeparator(line){
   if(!cells.length)return false;
   return cells.every(cell=>/^:?-{3,}:?$/.test(cell));
 }
+function calloutLabel(tag){
+  const low=String(tag||'').toLowerCase();
+  if(low==='warning')return 'Warning';
+  if(low==='notice')return 'Notice';
+  if(low==='instruction')return 'Instruction';
+  if(low==='tip')return 'Tip';
+  return 'Reminder';
+}
+function extractCallouts(src){
+  const blocks=[];
+  const text=String(src||'').replace(/<(reminder|warning|notice|tip|instruction)>([\\s\\S]*?)<\\/\\1>/gi,(_,tag,content)=>{
+    const idx=blocks.length;
+    const tone=String(tag||'reminder').toLowerCase();
+    const body=String(content||'').trim();
+    const rendered=body?body.split(/\\n+/).map(line=>inline(String(line||'').trim())).join('<br>'):'';
+    blocks.push('<div class=\"md-callout '+esc(tone)+'\"><div class=\"md-callout-head\">'+esc(calloutLabel(tone))+'</div><div class=\"md-callout-body\">'+rendered+'</div></div>');
+    return '\\u0000CALLOUT'+idx+'\\u0000';
+  });
+  return {text,blocks};
+}
 function render(text){
   const src=String(text||'').replace(/\\r\\n?/g,'\\n');
   const bt=String.fromCharCode(96);
@@ -27893,6 +31274,8 @@ function render(text){
     codeBlocks.push(tag?('<div class="md-code-lang">'+esc(tag)+'</div>'+html):html);
     return '\\u0000CODE'+idx+'\\u0000';
   });
+  const calloutPack=extractCallouts(body);
+  body=calloutPack.text;
   const lines=body.split('\\n');
   const out=[];
   let para=[];
@@ -27904,6 +31287,8 @@ function render(text){
     const line=String(lines[i]||'');
     const t=line.trim();
     if(!t){flush();close();continue}
+    const calloutMatch=t.match(/^\\u0000CALLOUT(\\d+)\\u0000$/);
+    if(calloutMatch){flush();close();out.push(calloutPack.blocks[Number(calloutMatch[1])]||'');continue}
     if(line.includes('|')&&i+1<lines.length&&isTableSeparator(lines[i+1])){
       flush();
       close();
@@ -28600,14 +31985,66 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','file_patch','upload','command','live_truncation','live_run_notice','skill_loaded']);
+function _chatVirtFormatDurationMs(ms){
+  const n=Number(ms||0);
+  if(!Number.isFinite(n)||n<=0)return '';
+  if(n<1000)return `${Math.round(n)}ms`;
+  const sec=n/1000;
+  if(sec<10)return `${sec.toFixed(2)}s`;
+  if(sec<90)return `${sec.toFixed(1)}s`;
+  return `${Math.round(sec)}s`;
+}
+function _chatVirtEventPillHtml(label,tone='neutral',extraCls=''){
+  const txt=String(label||'').trim();
+  if(!txt)return '';
+  const classes=['msg-event-pill'];
+  if(tone)classes.push(String(tone));
+  if(extraCls)classes.push(String(extraCls));
+  const dot=(String(tone||'')==='live')?'<span class="msg-run-dot"></span>':'';
+  return `<span class="${classes.join(' ')}">${dot}${esc(txt)}</span>`;
+}
+function _chatVirtEventCellHtml(label,value,opts){
+  const options=(opts&&typeof opts==='object')?opts:{};
+  if(value===undefined||value===null)return '';
+  const raw=String(value||'');
+  if(!raw.trim())return '';
+  const valueHtml=options.html?raw:esc(raw);
+  return `<div class="msg-event-cell"><div class="msg-event-label">${esc(label)}</div><div class="msg-event-value${options.mono?' mono':''}">${valueHtml}</div></div>`;
+}
+function _chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,cardCls=''){
+  const pillHtml=(Array.isArray(pills)?pills.filter(Boolean):[]).join('');
+  const gridHtml=(Array.isArray(grid)?grid.filter(Boolean):[]).join('');
+  const safeCardCls=String(cardCls||'').trim();
+  const cardClassAttr=safeCardCls?`msg-event-card ${safeCardCls}`:'msg-event-card';
+  return `<div class="${cardClassAttr}"><div class="msg-event-head"><div><div class="msg-event-title">${esc(title||'')}</div>${subtitle?`<div class="msg-event-sub">${esc(subtitle)}</div>`:''}</div>${pillHtml?`<div class="msg-event-pills">${pillHtml}</div>`:''}</div>${gridHtml?`<div class="msg-event-grid">${gridHtml}</div>`:''}${bodyHtml||''}</div>`;
+}
+function _chatVirtParseSkillLoaded(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^\\[skill loaded:\\s*([^\\]]+)\\]\\s*([\\s\\S]*)$/i);
+  if(!m)return null;
+  let desc=String(m[2]||'').trim();
+  let truncated=false;
+  if(/\\n?\\.\\.\\.\\(truncated\\)\\s*$/i.test(desc)){
+    truncated=true;
+    desc=desc.replace(/\\n?\\.\\.\\.\\(truncated\\)\\s*$/i,'').trim();
+  }
+  return {
+    name:String(m[1]||'').trim(),
+    desc:desc,
+    truncated:truncated,
+  };
+}
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const pre=node.querySelector('pre');if(!pre)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));pre.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');if(!target)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));target.textContent=_chatVirtLiveRunText(label,elapsed)}}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
   const rows=[];
   for(let i=0;i<feed.length;i++){
     const r=feed[i]||{};
+    const txt=String(r.text||'').trim();
+    if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
     rows.push({...r,_vk:_chatVirtRowKey(r,i)});
   }
   const activeAgentRole=_chatVirtAgentRoleKey(S.snap?.agent_active_role);
@@ -28729,12 +32166,39 @@ function _stripObjectiveInstructionForWorker(raw){
   txt=_stripLanguagePolicyLines(txt);
   return txt;
 }
+const RUNTIME_HINT_RENDER_META={
+  'auto-continue':{label:'Auto Continue',tone:'instruction'},
+  'arbiter-continue':{label:'Arbiter Continue',tone:'instruction'},
+  'continuation-briefing':{label:'Continuation Briefing',tone:'instruction'},
+  'reminder':{label:'Reminder',tone:'reminder'},
+  'todo-rescue':{label:'Todo Rescue',tone:'warning'},
+  'tool-retry':{label:'Tool Retry',tone:'warning'},
+  'segmented-retry':{label:'Segmented Retry',tone:'warning'},
+  'forced-converge':{label:'Forced Converge',tone:'warning'},
+  'no-tool-recovery':{label:'No-Tool Recovery',tone:'warning'},
+  'auto-context-recall':{label:'Context Recall',tone:'notice'},
+  'failure-recovery':{label:'Failure Recovery',tone:'warning'},
+  'truncate-rescue':{label:'Truncation Rescue',tone:'warning'},
+  'thinking-empty-recovery':{label:'Thinking Recovery',tone:'warning'},
+  'fault-prefill':{label:'Fault Prefill',tone:'warning'},
+  'edit-recovery':{label:'Edit Recovery',tone:'warning'},
+};
+function _chatVirtParseRuntimeHint(raw){
+  const txt=String(raw||'').trim();
+  if(!txt||txt[0]!=='<')return null;
+  const m=txt.match(/^<([a-z0-9_-]+)(?:\\s+[^>]*)?>([\\s\\S]*)<\\/\\1>$/i);
+  if(!m)return null;
+  const name=String(m[1]||'').trim().toLowerCase();
+  if(!Object.prototype.hasOwnProperty.call(RUNTIME_HINT_RENDER_META,name))return null;
+  return {name,body:String(m[2]||'').trim(),meta:RUNTIME_HINT_RENDER_META[name]||{label:'Runtime Hint',tone:'notice'}};
+}
 function _chatVirtBuildMessageNode(m){
   let kind='assistant_text';
   if(m.type==='manager_delegate')kind='manager_delegate';
   else if(m.type==='agent_bus')kind='agent_bus';
   else if(m.type==='tool_calls')kind='tool_calls';
   else if(/^\\[tool calls\\]/i.test(String(m.text||'')))kind='tool_calls';
+  else if(/^\\[skill loaded:\\s*[^\\]]+\\]/i.test(String(m.text||'')))kind='skill_loaded';
   else if(m.type==='file_patch'&&m.data)kind='file_patch';
   else if(m.type==='upload'&&m.data)kind='upload';
   else if(m.type==='command'&&m.data)kind='command';
@@ -28754,7 +32218,8 @@ function _chatVirtBuildMessageNode(m){
   d.removeAttribute('data-run-last-sec');
   const baseRole=(m.role==='user'?'user':m.role==='assistant'?'assistant':'system');
   const agentRole=_chatVirtAgentRoleKey(m.agent_role);
-  d.className='msg '+baseRole+(agentRole?(' agent-'+agentRole):'');
+  d.className='msg '+baseRole+(agentRole?(' agent-'+agentRole):'')+` msg-kind-${kind}`+(CHAT_EVENT_CARD_KINDS.has(kind)?' msg-event-wrap':'');
+  d.setAttribute('data-msg-kind',kind);
   const roleBadge=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-badge ${agentRole}\">${esc(_chatVirtAgentRoleLabel(agentRole))}</div>`:'';
   if(m.type==='manager_delegate'){
     const info=(m&&typeof m.data==='object')?m.data:{};
@@ -28807,8 +32272,28 @@ function _chatVirtBuildMessageNode(m){
       const txt=String(m.text||'').trim().replace(/^\\[tool calls\\]\\s*/i,'');
       tools=txt?txt.split(',').map(x=>String(x||'').trim()).filter(Boolean):[];
     }
-    const pills=tools.slice(0,10).map(name=>`<span class=\"agent-control-pill\">${esc(String(name||'?'))}</span>`).join('');
-    d.innerHTML=`${roleBadge}<div class=\"agent-control-card\"><div class=\"agent-control-head\">Tool Calls</div><div class=\"agent-control-pills\">${pills||'<span class=\"agent-control-pill\">(none)</span>'}</div></div>`;
+    const pills=[_chatVirtEventPillHtml(`${tools.length||0} tool${tools.length===1?'':'s'}`,'neutral')];
+    const bodyHtml=tools.length
+      ? `<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model scheduled these tools for the current turn.</div><div class=\"msg-event-tool-grid\">${tools.slice(0,24).map(name=>_chatVirtEventPillHtml(String(name||'?'),'info')).join('')}</div></div>`
+      : `<div class=\"msg-event-body\"><div class=\"msg-event-note\">No structured tool metadata was attached to this turn.</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Tool Calls',tools.length?`Auto-triggered chain for this turn`:'Tool dispatch metadata',pills,[],bodyHtml,'msg-event-card-tools')}`;
+    return d;
+  }
+  if(kind==='skill_loaded'){
+    const parsed=_chatVirtParseSkillLoaded(String(m.text||''))||{name:'skill',desc:String(m.text||''),truncated:false};
+    const pills=[
+      _chatVirtEventPillHtml('loaded','ok'),
+      parsed.truncated?_chatVirtEventPillHtml('preview truncated','warn'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml('skill',String(parsed.name||''),{mono:true}),
+    ];
+    const descHtml=String(parsed.desc||'').trim()
+      ? `<div class="msg-md">${renderMarkdownCached(String(parsed.desc||''),`${String(m._vk||'')}:skill`)}</div>`
+      : `<div class="msg-event-note">No public description was attached to this skill notification.</div>`;
+    const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">Skill context was auto-loaded into the current run.</div>${descHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Skill Loaded',String(parsed.name||'').trim()||'skill context',pills,grid,bodyHtml,'msg-event-card-skill')}`;
+    d.setAttribute('data-math-request',`${String(m._vk||'')}:skill`);
     return d;
   }
   if(m.type==='file_patch'&&m.data){
@@ -28816,23 +32301,72 @@ function _chatVirtBuildMessageNode(m){
     const loc=p.session_rel_path||p.path||'';
     const root=p.session_root||'';
     const preview=previewButtonHtml(loc);
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">file_patch · ${esc(loc)} (+${esc(p.added??0)} / -${esc(p.deleted??0)})</div><div class=\"msg-system-meta\">${esc(t('rel_path'))}: ${esc(loc)}\\nsession: ${esc(root)}</div>${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div>`;
+    const pills=[_chatVirtEventPillHtml(`+${p.added??0}`,'ok'),_chatVirtEventPillHtml(`-${p.deleted??0}`,'warn')];
+    const grid=[
+      _chatVirtEventCellHtml(t('rel_path'),String(loc||''),{mono:true}),
+      _chatVirtEventCellHtml('session',String(root||''),{mono:true}),
+    ];
+    const bodyHtml=`<div class=\"msg-event-body\">${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('File Patch',String(loc||'').trim()||'workspace update',pills,grid,bodyHtml,'msg-event-card-diff')}`;
     return d;
   }
   if(m.type==='upload'&&m.data){
     const u=m.data;
     const upath=u.workspace_path||'';
+    const parseStatus=String(u.parse_status||'').trim().toLowerCase();
+    const parseError=String(u.parse_error||u.error||'').trim();
     const preview=previewButtonHtml(upath);
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">upload · ${esc(u.filename||'')}</div><div class=\"msg-system-meta\">path: ${esc(upath)} | kind=${esc(u.kind||'')} | size=${esc(u.size||0)}</div>${preview}<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    const pills=[
+      _chatVirtEventPillHtml(String(u.kind||'file'),'info'),
+      _chatVirtEventPillHtml(`size ${u.size||0}`,'neutral'),
+      parseStatus?_chatVirtEventPillHtml(`parse ${parseStatus}`,parseStatus==='done'?'ok':(parseStatus==='failed'?'error':'warn')):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml('path',String(upath||''),{mono:true}),
+      _chatVirtEventCellHtml('filename',String(u.filename||''),{mono:true}),
+    ];
+    let previewHtml=`<div class=\"msg-event-note\">Preview unavailable for this upload.</div>`;
+    if(parseStatus==='pending'){
+      previewHtml=`<div class=\"msg-event-note\">Parsing uploaded file in background. The bubble will refresh when parsing completes.</div>`;
+    }else if(parseStatus==='failed'){
+      previewHtml=`<div class=\"msg-event-note\">Upload parsing failed${parseError?`: ${esc(parseError)}`:''}</div>`;
+    }else if(String(u.preview||'').trim()){
+      previewHtml=`<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
+    }
+    const bodyHtml=`<div class=\"msg-event-body\">${preview}${previewHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Upload',String(u.filename||'').trim()||'session upload',pills,grid,bodyHtml,'msg-event-card-upload')}`;
     return d;
   }
   if(m.type==='command'&&m.data){
     const x=m.data;
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">command · ${esc(x.name||'command')} · exit=${esc(x.exit_code??'-')}</div><div class=\"msg-system-meta\">$ ${esc(x.command||'')}\\ncwd: ${esc(x.cwd||'')}</div><pre class=\"msg-code-shell\">${esc(x.output||'')}</pre>`;
+    const exitTxt=String(x.exit_code??'-');
+    const exitTone=(exitTxt==='0')?'ok':((exitTxt==='-'||exitTxt==='')?'neutral':'error');
+    const durationTxt=_chatVirtFormatDurationMs(x.duration_ms);
+    const pageCount=Math.max(0,Number(x.output_page_count||0));
+    const pageIndex=Math.max(0,Number(x.output_page_index||0));
+    const changedFiles=Array.isArray(x.changed_files)?x.changed_files.filter(Boolean).map(v=>String(v)).join(', '):'';
+    const pills=[
+      _chatVirtEventPillHtml(`exit ${exitTxt}`,exitTone),
+      durationTxt?_chatVirtEventPillHtml(durationTxt,'neutral','mono'):'',
+      pageCount>1?_chatVirtEventPillHtml(`page ${pageIndex||1}/${pageCount}`,'info','mono'):'',
+      x.ui_truncated?_chatVirtEventPillHtml('UI truncated','warn'):'',
+      x.model_truncated?_chatVirtEventPillHtml('Model truncated','warn'):'',
+      x.temp_output_path?_chatVirtEventPillHtml('Temp read_file','info'):'',
+      x.buffer_ref?_chatVirtEventPillHtml('Buffered','neutral'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml('command',`$ ${String(x.command||'')}`,{mono:true}),
+      _chatVirtEventCellHtml('cwd',String(x.cwd||''),{mono:true}),
+      changedFiles?_chatVirtEventCellHtml('changed',changedFiles,{mono:true}):'',
+    ];
+    const outputTxt=String(x.output||'');
+    const bodyHtml=`<div class=\"msg-event-body\">${outputTxt?`<pre class=\"msg-code-shell\">${esc(outputTxt)}</pre>`:'<div class=\"msg-event-note\">No command output captured.</div>'}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Command',String(x.name||'command'),pills,grid,bodyHtml,'msg-event-card-command')}`;
     return d;
   }
   if(m.type==='live_thinking'){
-    d.innerHTML=`${roleBadge}<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
+    const liveThinkingHtml=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveThinkingHtml}</div>`:`${roleBadge}${liveThinkingHtml}`;
     d.setAttribute('data-math-request',`${String(m._vk||'')}:live-thinking`);
     return d;
   }
@@ -28848,7 +32382,15 @@ function _chatVirtBuildMessageNode(m){
     const label=lang.startsWith('zh')?'截断恢复':(lang.startsWith('ja')?'切り詰め復旧':'Truncation Recovery');
     const stateTxt=lang.startsWith('zh')?(active?'进行中':'已完成'):(lang.startsWith('ja')?(active?'進行中':'完了'):(active?'active':'done'));
     const key=`${m._vk}:live-trunc`;
-    d.innerHTML=`${roleBadge}<div class=\"msg-system-head\">${esc(label)} · ${esc(stateTxt)} · passes=${esc(attempts)} · tokens≈${esc(tk)}${extraTxt}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div>`;
+    const pills=[
+      _chatVirtEventPillHtml(stateTxt,active?'live':'neutral'),
+      _chatVirtEventPillHtml(`passes ${attempts}`,'info'),
+      _chatVirtEventPillHtml(`tokens≈${tk}`,'neutral','mono'),
+      kindTxt?_chatVirtEventPillHtml(`kind ${kindTxt}`,'neutral'):'',
+      toolTxt?_chatVirtEventPillHtml(`tool ${toolTxt}`,'info'):'',
+    ];
+    const noteHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model output hit a truncation boundary and entered recovery mode.${extraTxt?` ${extraTxt}`:''}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(label,'Structured truncation recovery state',pills,[],noteHtml,'msg-event-card-truncation')}`;
     d.setAttribute('data-math-request',key);
     return d;
   }
@@ -28862,23 +32404,43 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-run-elapsed',String(elapsedNow));
     d.setAttribute('data-run-anchor',String(Date.now()/1000));
     d.setAttribute('data-run-last-sec',String(Math.floor(elapsedNow)));
-    d.innerHTML=`${roleBadge}<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(label)}</div><pre>${esc(_chatVirtLiveRunText(label,elapsedNow))}</pre></div>`;
+    const pills=[
+      _chatVirtEventPillHtml(t('running'),'live'),
+      _chatVirtEventPillHtml(_chatVirtLiveRunText(label,elapsedNow),'neutral','mono'),
+    ];
+    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">The active agent is in a model call. This timer updates live while generation is in progress.</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Agent Turn Model Call',label,pills,[],bodyHtml,'msg-event-card-live')}`;
+    const elapsedEl=d.querySelector('.msg-event-pill.mono');
+    if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
     return d;
   }
   if(m.role==='assistant'&&m.thinking){
     const key=`${m._vk}:assistant-thinking`;
-    d.innerHTML=`${roleBadge}<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;
+    const thinkingHtml=`<div class=\"msg-md\">${renderMarkdownCached(m.text||'',key)}</div><div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking'))}</div><pre>${esc(m.thinking||'')}</pre></div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${thinkingHtml}</div>`:`${roleBadge}${thinkingHtml}`;
     d.setAttribute('data-math-request',key);
     return d;
   }
   const textKey=`${m._vk}:text`;
   let finalText=String(m.text||'');
+  const runtimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(finalText):null;
   finalText=_stripLeadingAgentTitle(finalText,agentRole);
   if(agentRole&&agentRole!=='manager'){
     const cleaned=_stripObjectiveInstructionForWorker(finalText);
     if(cleaned)finalText=cleaned;
   }
-  d.innerHTML=`${roleBadge}<div class=\"msg-md\">${renderMarkdownCached(finalText,textKey)}</div>`;
+  if(runtimeHint){
+    const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
+    const hintTone=String(runtimeHint.meta?.tone||'notice');
+    const bodyKey=`${textKey}:runtime-hint`;
+    const hintBody=runtimeHint.body||finalText;
+    const plainHtml=`<div class=\"msg-md\"><div class=\"md-callout ${esc(hintTone)}\"><div class=\"md-callout-head\">${esc(hintLabel)}</div><div class=\"md-callout-body\">${renderMarkdownCached(hintBody,bodyKey)}</div></div></div>`;
+    d.innerHTML=`${plainHtml}`;
+    d.setAttribute('data-math-request',bodyKey);
+    return d;
+  }
+  const plainHtml=`<div class=\"msg-md\">${renderMarkdownCached(finalText,textKey)}</div>`;
+  d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${plainHtml}</div>`:`${roleBadge}${plainHtml}`;
   if(m.role==='assistant'||m.role==='user'){
     d.setAttribute('data-math-request',textKey);
   }
@@ -29240,8 +32802,12 @@ function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==
 function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='code')return'⌘';return'📄'}
 function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(kids.length)} item(s)</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
 function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=`nodes=${Number(st.nodeCount||0)}${st.inflight?' · loading...':''}`;const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">tree truncated at ${esc(Number(st.maxNodes||0))} nodes</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
-function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>`<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div></div>`).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
+function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>{const status=String(u.parse_status||'').trim();const statusTxt=status?` · parse=${status}`:'';const err=String(u.parse_error||'').trim();return `<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}${esc(statusTxt)}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div>${err?`<div class="upload-entry-path">${esc(err)}</div>`:''}</div>`}).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
+function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
+function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
+function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
+function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | mode=${S.snap?.execution_mode||S.config?.execution_mode||'sync'} | active_agent=${S.snap?.agent_active_role||'-'} | bb=${S.snap?.blackboard?.status||'-'} | task=${S.snap?.blackboard?.task_profile?.task_type||'-'} | complexity=${S.snap?.blackboard?.task_profile?.complexity||'-'} | judgement=${S.snap?.blackboard?.manager_judgement?.progress||'-'} | budget=${S.snap?.blackboard?.task_profile?.round_budget??'-'} | remaining=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'} | bb_cycles=${S.snap?.blackboard?.manager_cycles??'-'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
@@ -29252,7 +32818,8 @@ setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
 setPanelHtml('activity',(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)).map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`);
 const ops=S.snap?.operations||[];
 const cmds=ops.filter(x=>x.type==='command').slice(-30).reverse();
-setPanelHtml('commands',cmds.map(e=>`<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(e.data.name||'command')} · exit=${esc(e.data.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(e.data.command||'')}<br>${esc(e.data.cwd||'')}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">UI preview truncated</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">Model context truncated</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">Temp read_file ready</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">Buffered copy</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>Prev</button><span class=\"cmd-sub\">preview ${esc(page)}/${esc(total)}${totalAll>total?` of ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>Next</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">read_file path: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">buffer_ref: ${esc(d.buffer_ref)} · chars=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">full_output: ${esc(d.output_full_chars)} chars · ${esc(d.output_full_lines||0)} lines · strategy=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||'command')} · exit=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+const cmdHost=E('commands');if(cmdHost){for(const btn of cmdHost.querySelectorAll('[data-cmd-page]')){btn.onclick=(ev)=>{ev.preventDefault();const key=String(btn.getAttribute('data-cmd-key')||'').trim();const step=Number(btn.getAttribute('data-cmd-page')||0);const total=Math.max(1,Number(btn.getAttribute('data-cmd-total')||1));if(!key||!step)return;if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const cur=Number(S.commandPageState[key]||1);S.commandPageState[key]=Math.max(1,Math.min(total,cur+step));renderBoards()}}}
 const diffs=ops.filter(x=>x.type==='file_patch').slice(-20).reverse();
 setPanelHtml('diffs',diffs.map(e=>`<div class=\"diff-item\"><div class=\"diff-head\">${esc(e.data.path)} (+${esc(e.data.added)} / -${esc(e.data.deleted)})</div><div class=\"cmd-sub\">${esc(e.data.session_rel_path||e.data.path||'')}<br>${esc(e.data.session_root||'')}</div><div class=\"diff-body\">${diffHtml(e.data.diff_numbered||e.data.diff)}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_diffs'))}</div>`);
 const protocols=(S.protocols||[]).map(x=>`<div><span class=\"tag\">protocol</span>${esc(x.protocol)} · providers=${esc(x.active_providers)} · skills=${esc(x.active_skills)}</div>`).join('');
@@ -29459,7 +33026,10 @@ function bindEvents(id){
   if(S.staticMode&&S.frozen){S.es=null;return}
   S.es=new EventSource('/api/sessions/'+id+'/events');
   const es=S.es;
+  let reconnectDelay=1000;
+  const MAX_RECONNECT_DELAY=30000;
   es.onopen=()=>{
+    reconnectDelay=1000;
     S.lastDeltaTs=Date.now();
     pullRenderState(id,true);
     _deltaStartWatchdog();
@@ -29469,6 +33039,14 @@ function bindEvents(id){
   es.onmessage=(ev)=>{
     try{
       const row=JSON.parse(ev.data);
+      if(row&&row.type==='gap'){
+        scheduleSnapshot({forceFull:true,delayMs:60,allowWhenFrozen:true});
+        return;
+      }
+      if(row&&row.type==='resync'){
+        scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true});
+        return;
+      }
       const rt=onRuntimeEvent(row);
       if(rt?.needsSnapshot){
         const hidden=(document.visibilityState==='hidden');
@@ -29499,7 +33077,8 @@ function bindEvents(id){
     if(es.readyState===2){
       setTimeout(()=>{
         if(S.esId===String(id||'')&&(!S.staticMode||!S.frozen))bindEvents(id);
-      },1000);
+      },reconnectDelay);
+      reconnectDelay=Math.min(reconnectDelay*2,MAX_RECONNECT_DELAY);
     }
   };
 }
@@ -29516,9 +33095,9 @@ async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)re
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
-async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function refreshAll(forceProbe=false){if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}S.config=await api('/api/config');applyUiStyle();renderLanguageControls();applyMainI18n();renderUploadList();S.skills=await api('/api/skills');S.tools=await api('/api/tools');S.providers=await api('/api/skills/providers');S.protocols=await api('/api/skills/protocols');renderSkillsEntryLink();await refreshSessions();const mc=await loadModelCatalog(forceProbe);if(!applyModelCatalog(mc)){renderModelControls()}if(S.activeId)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const promptEl=E('prompt');if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length)await createSession()}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -29897,7 +33476,6887 @@ window.addEventListener('resize',()=>scheduleFlowWrapAdjust())
 window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=addNode;E('removeNodeBtn').onclick=removeNode;E('addEdgeBtn').onclick=addEdge;E('resetFlowBtn').onclick=resetFlow;E('exportFlowBtn').onclick=exportFlow;E('importFlowBtn').onclick=importFlow;E('analyzeBtn').onclick=analyzeRules;E('scanBtn').onclick=scanSkills;E('generateBtn').onclick=generateSkill;E('saveBtn').onclick=saveSkill;E('applyModelBtn').onclick=applyModel;E('refreshBtn').onclick=()=>refreshAll(true);const langSel=E('skillsLangSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const tabNode=E('flowTabNodeBtn');const tabLink=E('flowTabLinkBtn');if(tabNode)tabNode.onclick=()=>switchFlowPanel('node');if(tabLink)tabLink.onclick=()=>switchFlowPanel('link');const loadBtn=E('previewToFlowBtn');if(loadBtn)loadBtn.onclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)));E('nodeTitle').oninput=syncNodeEditor;E('nodeType').onchange=syncNodeEditor;E('nodeContent').oninput=syncNodeEditor;bindSkillUpload();bindFlowZoom();bindFlowPan();switchFlowPanel('node');resetFlow();scheduleFlowWrapAdjust();applySkillsI18n();try{await refreshAll(false)}catch(err){showError(err.message||String(err))}})
 """
 
+RAG_TERM_GROUPS = (
+    ("rag", "retrieval", "retriever", "检索", "检索增强"),
+    ("graph", "graphrag", "graph_idf", "知识图谱", "图谱"),
+    ("research", "paper", "论文", "科研", "literature"),
+    ("experiment", "benchmark", "evaluation", "实验", "评测"),
+    ("equation", "formula", "theorem", "公式", "定理"),
+    ("dataset", "csv", "excel", "表格", "数据集"),
+    ("presentation", "ppt", "slides", "演示", "幻灯片"),
+    ("citation", "reference", "引用", "参考文献"),
+    ("pdf", "document", "文档"),
+)
+RAG_RESEARCH_HINTS = (
+    "abstract",
+    "introduction",
+    "related work",
+    "method",
+    "methods",
+    "experiment",
+    "experiments",
+    "result",
+    "results",
+    "conclusion",
+    "references",
+    "摘要",
+    "引言",
+    "方法",
+    "实验",
+    "结果",
+    "结论",
+    "参考文献",
+    "研究",
+    "论文",
+)
+RAG_CODE_HINTS = (
+    "def ",
+    "class ",
+    "import ",
+    "from ",
+    "#include",
+    "function ",
+    "const ",
+    "let ",
+    "public class",
+)
+RAG_SHORT_TOKEN_ALLOWLIST = {
+    "2d",
+    "3d",
+    "ai",
+    "ar",
+    "cv",
+    "kg",
+    "llm",
+    "ml",
+    "nlp",
+    "rl",
+    "tf",
+    "ui",
+    "ux",
+    "vr",
+}
+RAG_EN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "being",
+    "but",
+    "by",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "her",
+    "hers",
+    "him",
+    "his",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "ours",
+    "she",
+    "so",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "to",
+    "under",
+    "until",
+    "up",
+    "us",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "with",
+    "you",
+    "your",
+    "yours",
+}
+RAG_ZH_STOPWORDS = {
+    "一个",
+    "一种",
+    "一些",
+    "以及",
+    "但是",
+    "你们",
+    "他们",
+    "任何",
+    "使得",
+    "关于",
+    "其中",
+    "其余",
+    "因此",
+    "因为",
+    "如果",
+    "并且",
+    "我们",
+    "或者",
+    "是否",
+    "然后",
+    "现在",
+    "相关",
+    "研究",
+    "结果",
+    "通过",
+    "进行",
+    "这里",
+    "这些",
+    "这是",
+    "那个",
+    "那些",
+    "这种",
+    "部分",
+    "问题",
+    "可以",
+}
+RAG_GENERIC_ENTITY_TERMS_EN = {
+    "acknowledgment",
+    "acknowledgments",
+    "acknowledgement",
+    "acknowledgements",
+    "abstract",
+    "algorithm",
+    "algorithms",
+    "analysis",
+    "appendix",
+    "appendices",
+    "background",
+    "benchmark",
+    "chapter",
+    "citation",
+    "conclusion",
+    "content",
+    "dataset",
+    "definition",
+    "definitions",
+    "discussion",
+    "discussions",
+    "document",
+    "equation",
+    "equations",
+    "evaluation",
+    "fig",
+    "experiment",
+    "experiments",
+    "figure",
+    "figures",
+    "figs",
+    "finding",
+    "findings",
+    "graph",
+    "introduction",
+    "keyword",
+    "keywords",
+    "lemma",
+    "lemmas",
+    "literature",
+    "material",
+    "materials",
+    "method",
+    "methods",
+    "methodology",
+    "model",
+    "paper",
+    "pdf",
+    "preliminary",
+    "preliminaries",
+    "presentation",
+    "proof",
+    "proofs",
+    "proposition",
+    "propositions",
+    "reference",
+    "references",
+    "report",
+    "research",
+    "result",
+    "results",
+    "sec",
+    "section",
+    "sections",
+    "slide",
+    "slides",
+    "study",
+    "summary",
+    "supplement",
+    "supplemental",
+    "supplementary",
+    "supplements",
+    "survey",
+    "table",
+    "tables",
+    "theorem",
+    "theorems",
+}
+RAG_GENERIC_ENTITY_TERMS_ZH = {
+    "图",
+    "图谱",
+    "图示",
+    "图表",
+    "报告",
+    "定义",
+    "定理",
+    "小节",
+    "小结",
+    "式",
+    "公式",
+    "引理",
+    "实验",
+    "引言",
+    "方法",
+    "方法学",
+    "文档",
+    "文献",
+    "数据",
+    "数据集",
+    "推论",
+    "摘要",
+    "材料",
+    "算法",
+    "章节",
+    "致谢",
+    "讨论",
+    "补充实验",
+    "补充材料",
+    "补充说明",
+    "表",
+    "证明",
+    "附录",
+    "结果",
+    "结论",
+    "命题",
+    "参考文献",
+    "研究",
+    "论文",
+    "图像",
+    "表格",
+}
+RAG_STRUCTURAL_ENTITY_PATTERNS = (
+    re.compile(
+        r"^(?:fig(?:ure)?s?|table|tables|sec(?:tion)?s?|chapter|chapters|appendix|appendices|"
+        r"eq(?:uation)?s?|alg(?:orithm)?s?|lemma|lemmas|theorem|theorems|proof|proofs|"
+        r"corollary|corollaries|proposition|propositions|definition|definitions)\b"
+        r"(?:\s*[-#:,.]?\s*[\(\[]?[0-9ivxlcdmA-Za-z._-]+[\)\]]?)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:related(?:\s+|-)?work|future(?:\s+|-)?work|materials?(?:\s+|-)?and(?:\s+|-)?methods|"
+        r"results?(?:\s+|-)?and(?:\s+|-)?discussion|supplement(?:ary|al)?(?:\s+|-)?materials?|"
+        r"supplement(?:ary|al)?(?:\s+|-)?appendix|acknowledg(?:e)?ments?)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:图|图表|表|章节|小节|附录|式|公式|算法|引理|定理|命题|推论|定义|证明)"
+        r"(?:\s*[-#:：.]?\s*[A-Za-z0-9一二三四五六七八九十百千万IVXivx()（）._-]+)?$"
+    ),
+)
+
+
+def _rag_safe_name(name: str, fallback: str = "document") -> str:
+    raw = Path(str(name or fallback)).name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    return safe or fallback
+
+
+def _rag_detect_language(text: str) -> str:
+    sample = str(text or "")
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    cjk = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", sample))
+    if cjk > latin * 1.2 and cjk >= 8:
+        return "zh"
+    if latin > cjk * 1.5 and latin >= 12:
+        return "en"
+    if latin and cjk:
+        return "mixed"
+    if cjk:
+        return "zh"
+    if latin:
+        return "en"
+    return "unknown"
+
+
+def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 120) -> list[str]:
+    text = re.sub(r"\s+", "", str(seq or ""))
+    out: list[str] = []
+    if len(text) < min_n:
+        return out
+    for n in range(min_n, max_n + 1):
+        if len(out) >= limit:
+            break
+        for idx in range(0, max(0, len(text) - n + 1)):
+            out.append(text[idx : idx + n])
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _rag_is_noise_token(token: object) -> bool:
+    raw = re.sub(r"\s+", " ", str(token or "").strip())
+    if not raw:
+        return True
+    low = raw.lower()
+    if re.fullmatch(r"\d+(?:\.\d+)?", low):
+        return True
+    if re.fullmatch(r"[_./+\-=]+", low):
+        return True
+    for pattern in RAG_STRUCTURAL_ENTITY_PATTERNS:
+        if pattern.fullmatch(raw):
+            return True
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", raw))
+    if has_cjk:
+        return raw in RAG_ZH_STOPWORDS or raw in RAG_GENERIC_ENTITY_TERMS_ZH or len(raw) < 2
+    if low in RAG_EN_STOPWORDS or low in RAG_GENERIC_ENTITY_TERMS_EN:
+        return True
+    if len(low) <= 2 and low not in RAG_SHORT_TOKEN_ALLOWLIST:
+        return True
+    return False
+
+
+def _rag_entity_allowed(token: object) -> bool:
+    raw = re.sub(r"\s+", " ", str(token or "").strip())
+    if not raw or _rag_is_noise_token(raw):
+        return False
+    low = raw.lower()
+    for pattern in RAG_STRUCTURAL_ENTITY_PATTERNS:
+        if pattern.fullmatch(raw):
+            return False
+    if low in RAG_GENERIC_ENTITY_TERMS_EN or raw in RAG_GENERIC_ENTITY_TERMS_ZH:
+        return False
+    if re.fullmatch(r"[a-z][a-z0-9_./+-]{2,40}", low) and low in RAG_EN_STOPWORDS:
+        return False
+    return True
+
+
+def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        token = re.sub(r"\s+", " ", str(value or "").strip())
+        if not token or not _rag_entity_allowed(token):
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _rag_filename_entity_aliases(filename: object, source_rel_path: object = "", limit: int = 24) -> list[str]:
+    base_name = str(filename or "").strip()
+    if not base_name and str(source_rel_path or "").strip():
+        try:
+            base_name = PurePosixPath(str(source_rel_path or "").replace("\\", "/")).name
+        except Exception:
+            base_name = str(source_rel_path or "").strip().split("/")[-1]
+    if not base_name:
+        return []
+    stem = Path(base_name).stem or Path(base_name).name or base_name
+    stem = re.sub(r"\s+", " ", str(stem or "").strip())
+    if not stem:
+        return []
+    raw_parts = [stem]
+    camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", stem)
+    if camel and camel != stem:
+        raw_parts.append(camel)
+    normalized = re.sub(r"[_./\\-]+", " ", stem).strip()
+    if normalized and normalized != stem:
+        raw_parts.append(normalized)
+    pieces: list[str] = []
+    for raw in raw_parts:
+        token = re.sub(r"\s+", " ", str(raw or "").strip())
+        if token:
+            pieces.append(token)
+        split_tokens = [
+            str(x).strip()
+            for x in re.split(r"[^A-Za-z0-9\u4e00-\u9fff\u3040-\u30ff]+", token)
+            if str(x).strip()
+        ]
+        if len(split_tokens) >= 2:
+            pieces.append(" ".join(split_tokens))
+        pieces.extend(split_tokens)
+    return _rag_filter_entities(pieces, limit=limit)
+
+
+def _rag_apply_filename_entity_policy(
+    values: list[object],
+    filename: object = "",
+    *,
+    source_rel_path: object = "",
+    allow_filename_entities: bool = False,
+    limit: int = 32,
+) -> list[str]:
+    current = _rag_filter_entities(list(values or []), limit=max(limit * 4, 64))
+    aliases = _rag_filename_entity_aliases(filename, source_rel_path=source_rel_path, limit=max(8, min(24, limit)))
+    if not aliases:
+        return current[:limit]
+    alias_keys = {str(x).strip().lower() for x in aliases if str(x).strip()}
+    filtered = [token for token in current if str(token).strip().lower() not in alias_keys]
+    if allow_filename_entities:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            key = str(alias).strip().lower()
+            if not key or key in seen:
+                continue
+            merged.append(str(alias).strip())
+            seen.add(key)
+        for token in filtered:
+            key = str(token).strip().lower()
+            if not key or key in seen:
+                continue
+            merged.append(str(token).strip())
+            seen.add(key)
+        return merged[:limit]
+    return filtered[:limit]
+
+
+def _rag_choose_community(category: object, language: object, entities: list[object], raw_community: object = "") -> str:
+    cat = str(category or "document").strip() or "document"
+    lang = str(language or "unknown").strip() or "unknown"
+    raw = str(raw_community or "").strip()
+    if ":" in raw:
+        prefix, suffix = raw.split(":", 1)
+        if prefix.strip():
+            cat = prefix.strip()
+        suffix = suffix.strip()
+        if _rag_entity_allowed(suffix):
+            return f"{cat}:{suffix}"
+    elif raw and not _rag_is_noise_token(raw):
+        return f"{cat}:{raw}"
+    if cat == "research":
+        filtered = _rag_filter_entities(list(entities or []), limit=1)
+        if filtered:
+            return f"{cat}:{filtered[0]}"
+    return f"{cat}:{lang}"
+
+
+def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
+    raw = html.unescape(str(text or ""))
+    lowered = raw.lower()
+    out: list[str] = []
+    for token in re.findall(r"[a-z][a-z0-9_./+-]{1,40}", lowered):
+        if _rag_is_noise_token(token):
+            continue
+        out.append(token)
+        if len(out) >= max_terms:
+            return out
+    for token in re.findall(r"\b\d+(?:\.\d+)?\b", lowered):
+        if _rag_is_noise_token(token):
+            continue
+        out.append(token)
+        if len(out) >= max_terms:
+            return out
+    for seq in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]{2,}", raw):
+        for gram in _rag_cjk_ngrams(seq, limit=80):
+            if _rag_is_noise_token(gram):
+                continue
+            out.append(gram)
+            if len(out) >= max_terms:
+                return out
+    for token in re.findall(r"\b[A-Z]{2,}(?:-[A-Z0-9]{1,8})?\b", raw):
+        lowered_token = token.lower()
+        if _rag_is_noise_token(lowered_token):
+            continue
+        out.append(lowered_token)
+        if len(out) >= max_terms:
+            return out
+    return out
+
+
+def _rag_expand_tokens(tokens: list[str]) -> list[str]:
+    seen = {
+        str(x).strip().lower()
+        for x in tokens
+        if str(x).strip() and not _rag_is_noise_token(str(x).strip().lower())
+    }
+    out = list(seen)
+    for group in RAG_TERM_GROUPS:
+        gset = {str(x).strip().lower() for x in group if str(x).strip()}
+        if seen.intersection(gset):
+            for token in gset:
+                if token not in seen and not _rag_is_noise_token(token):
+                    seen.add(token)
+                    out.append(token)
+    return out
+
+
+def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
+    raw = str(text or "")
+    counter: Counter[str] = Counter()
+    for m in re.finditer(r"\b(?:[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3}|[A-Z]{2,}(?:-[A-Z0-9]{1,8})?)\b", raw):
+        token = trim(m.group(0).strip(), 80)
+        if _rag_entity_allowed(token):
+            counter[token] += 1
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,8}", raw):
+        token = trim(m.group(0).strip(), 32)
+        if _rag_entity_allowed(token):
+            counter[token] += 1
+    for token, freq in Counter(_rag_tokenize(raw, max_terms=600)).most_common(80):
+        if freq < 2:
+            continue
+        if re.fullmatch(r"[a-z][a-z0-9_./+-]{2,20}", token) and _rag_entity_allowed(token):
+            counter[token] += freq
+    return _rag_filter_entities([name for name, _ in counter.most_common(limit * 3)], limit=limit)
+
+
+def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
+    name = str(filename or "").lower()
+    body = str(text or "").lower()
+    labels: list[str] = []
+    category = "document"
+    if kind in {"image", "audio", "video"}:
+        category = "multimodal"
+        labels.append(kind)
+    elif kind in {"csv", "excel"}:
+        category = "dataset"
+        labels.extend(["table", "structured"])
+    elif kind == "presentation":
+        category = "presentation"
+        labels.append("slides")
+    elif any(x in name for x in (".py", ".js", ".ts", ".java", ".go", ".rs", ".cpp", ".c", ".hpp")):
+        category = "code"
+        labels.append("source")
+    elif any(h in body for h in RAG_RESEARCH_HINTS):
+        category = "research"
+        labels.extend(["paper", "literature"])
+    elif any(h in body for h in ("table", "column", "row", "字段", "列名", "样本", "dataset")):
+        category = "dataset"
+        labels.append("structured")
+    elif any(h in body for h in RAG_CODE_HINTS):
+        category = "code"
+        labels.append("source")
+    if "report" in name or "报告" in body:
+        labels.append("report")
+    if "citation" in body or "引用" in body or "参考文献" in body:
+        labels.append("citation")
+    if kind == "pdf":
+        labels.append("pdf")
+    if kind == "document":
+        labels.append("office")
+    return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
+
+
+def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
+    content = re.sub(r"\r\n?", "\n", str(text or "")).strip()
+    if not content:
+        return []
+    blocks = [x.strip() for x in re.split(r"\n\s*\n+", content) if x.strip()]
+    chunks: list[dict] = []
+    current = ""
+    for block in blocks:
+        if len(block) > max_chars:
+            pieces = [block[i : i + max_chars] for i in range(0, len(block), max(200, max_chars - overlap))]
+        else:
+            pieces = [block]
+        for piece in pieces:
+            if not current:
+                current = piece
+                continue
+            if len(current) + 2 + len(piece) <= max_chars:
+                current = current + "\n\n" + piece
+                continue
+            preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
+            chunks.append({"text": current.strip(), "anchor": preview})
+            tail = current[-overlap:].strip()
+            current = (tail + "\n\n" + piece).strip() if tail else piece
+            if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                break
+        if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+            break
+    if current and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
+        preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
+        chunks.append({"text": current.strip(), "anchor": preview})
+    return chunks[:RAG_MAX_CHUNKS_PER_DOC]
+
+
+CODE_LIBRARY_IGNORED_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode", ".next", ".nuxt", ".cache",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".turbo", ".yarn", ".pnpm-store",
+    "node_modules", "dist", "build", "vendor", "target", "coverage", "out", "bin", "obj",
+    "__pycache__", ".venv", "venv", "env", ".tox",
+}
+CODE_LIBRARY_LANGUAGE_BY_EXT = {
+    ".py": "python",
+    ".pyi": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".java": "java",
+    ".go": "go",
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php",
+    ".swift": "swift",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".h": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".cs": "csharp",
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".fish": "shell",
+    ".ps1": "powershell",
+    ".sql": "sql",
+    ".lua": "lua",
+    ".r": "r",
+    ".dart": "dart",
+    ".vue": "vue",
+    ".svelte": "svelte",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "css",
+    ".sass": "css",
+    ".less": "css",
+    ".xml": "xml",
+    ".json": "json",
+    ".jsonc": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".conf": "ini",
+    ".env": "env",
+    ".md": "markdown",
+}
+CODE_LIBRARY_SPECIAL_FILENAMES = {
+    "dockerfile": "docker",
+    "makefile": "make",
+    "cmakelists.txt": "cmake",
+    "requirements.txt": "requirements",
+    "package.json": "json",
+}
+
+
+def _code_language_from_name(name: str, text: str = "") -> str:
+    raw = str(name or "").strip()
+    low = raw.lower()
+    ext = Path(low).suffix.lower()
+    if ext in CODE_LIBRARY_LANGUAGE_BY_EXT:
+        return str(CODE_LIBRARY_LANGUAGE_BY_EXT.get(ext, "text"))
+    if low in CODE_LIBRARY_SPECIAL_FILENAMES:
+        return str(CODE_LIBRARY_SPECIAL_FILENAMES.get(low, "text"))
+    head = "\n".join(str(text or "").splitlines()[:2]).lower()
+    if head.startswith("#!/"):
+        if "python" in head:
+            return "python"
+        if "node" in head or "deno" in head:
+            return "javascript"
+        if "bash" in head or "sh" in head or "zsh" in head:
+            return "shell"
+    return "text"
+
+
+def _code_is_test_path(rel_path: str) -> bool:
+    low = str(rel_path or "").strip().lower()
+    return any(token in low for token in ("/tests/", "/test/", "_test.", ".spec.", ".test.", "/__tests__/"))
+
+
+def _code_module_name(rel_path: str, language: str = "") -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if not raw:
+        return ""
+    path = PurePosixPath(raw)
+    parts = [str(x) for x in path.parts if str(x).strip() and str(x) not in {".", ".."}]
+    if not parts:
+        return ""
+    stem = path.stem
+    if language == "python" and stem == "__init__":
+        stem = path.parent.name if path.parent.name else "__init__"
+        parts = [str(x) for x in path.parent.parts if str(x).strip() and str(x) not in {".", ".."}]
+    else:
+        parts = parts[:-1] + [stem]
+    return ".".join(part for part in parts if part)
+
+
+def _code_choose_community(rel_path: str, language: str, labels: list[str] | None = None) -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    parts = [part for part in raw.split("/") if part]
+    top = parts[0] if parts else "root"
+    label_set = {str(x).strip().lower() for x in (labels or []) if str(x).strip()}
+    if "test" in label_set or _code_is_test_path(raw):
+        return f"test:{top}"
+    return f"{str(language or 'code').strip() or 'code'}:{top}"
+
+
+def _code_query_terms(text: str, limit: int = 48) -> set[str]:
+    raw = str(text or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_./:-]{1,80}", raw):
+        low = token.strip().lower().strip(":/.")
+        if not low or low in seen or low in RAG_EN_STOPWORDS:
+            continue
+        seen.add(low)
+        out.append(low)
+        if len(out) >= limit:
+            break
+    return set(out)
+
+
+class CodeContentParser:
+    def _decode_text_bytes(self, data: bytes) -> str:
+        if not data:
+            return ""
+        if b"\x00" in data[:4096]:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
+
+    def detect_language(self, fp: Path, text: str = "") -> str:
+        return _code_language_from_name(fp.name, text=text)
+
+    def supported_file(self, fp: Path, mime: str = "") -> bool:
+        if not fp or not fp.name:
+            return False
+        low_name = fp.name.lower()
+        if low_name in {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock", "poetry.lock", "composer.lock"}:
+            return False
+        if low_name.endswith((".min.js", ".min.css", ".map")):
+            return False
+        if fp.name.startswith(".") and low_name not in CODE_LIBRARY_SPECIAL_FILENAMES:
+            return False
+        if fp.suffix.lower() in CODE_LIBRARY_LANGUAGE_BY_EXT:
+            return True
+        return low_name in CODE_LIBRARY_SPECIAL_FILENAMES
+
+    def _normalize_symbol(self, value: object) -> str:
+        token = str(value or "").strip()
+        token = re.sub(r"\s+", " ", token)
+        if not token:
+            return ""
+        token = token.strip(".:")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:.#-]{0,119}", token):
+            return ""
+        return token
+
+    def _extract_imports(self, text: str, language: str) -> list[str]:
+        raw = str(text or "")
+        found: list[str] = []
+        seen: set[str] = set()
+
+        def push(token: object):
+            val = str(token or "").strip().strip("\"'`")
+            val = re.sub(r"\s+", "", val)
+            val = val.strip(".")
+            if not val:
+                return
+            key = val.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            found.append(val)
+
+        if language == "python":
+            for m in re.finditer(r"(?m)^\s*import\s+([A-Za-z0-9_.,\s]+)", raw):
+                for part in str(m.group(1) or "").split(","):
+                    push(str(part).split(" as ", 1)[0])
+            for m in re.finditer(r"(?m)^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+", raw):
+                push(m.group(1))
+        elif language in {"javascript", "typescript", "vue", "svelte"}:
+            for m in re.finditer(r"""(?m)^\s*import\s+.*?\s+from\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+            for m in re.finditer(r"""(?m)^\s*export\s+.*?\s+from\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+            for m in re.finditer(r"""require\(\s*['"]([^'"]+)['"]\s*\)""", raw):
+                push(m.group(1))
+        elif language in {"java", "kotlin", "scala"}:
+            for m in re.finditer(r"(?m)^\s*import\s+([A-Za-z0-9_.*]+)", raw):
+                push(m.group(1))
+        elif language == "go":
+            for m in re.finditer(r'(?m)^\s*import\s+(?:\w+\s+)?["`]([^"`]+)["`]', raw):
+                push(m.group(1))
+            block = re.search(r'(?ms)^\s*import\s*\((.*?)\)', raw)
+            if block:
+                for token in re.findall(r'["`]([^"`]+)["`]', str(block.group(1) or "")):
+                    push(token)
+        elif language == "rust":
+            for m in re.finditer(r"(?m)^\s*use\s+([^;]+);", raw):
+                push(str(m.group(1) or "").split(" as ", 1)[0])
+        elif language in {"c", "cpp"}:
+            for m in re.finditer(r'(?m)^\s*#include\s+[<"]([^">]+)[">]', raw):
+                push(m.group(1))
+        elif language in {"ruby", "php"}:
+            for m in re.finditer(r"""(?m)^\s*(?:require|require_relative|include)\s+['"]([^'"]+)['"]""", raw):
+                push(m.group(1))
+        return found[:48]
+
+    def _split_large_chunk(
+        self,
+        lines: list[str],
+        *,
+        line_start: int,
+        symbol: str,
+        kind: str,
+        max_chars: int = CODE_CHUNK_CHARS,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        buf: list[str] = []
+        buf_start = int(line_start or 1)
+        for idx, line in enumerate(lines):
+            candidate = "\n".join(buf + [line]).strip()
+            if buf and len(candidate) > max_chars:
+                text = "\n".join(buf).strip()
+                if text:
+                    end_line = buf_start + len(buf) - 1
+                    rows.append(
+                        {
+                            "text": text,
+                            "anchor": f"{kind} {symbol} L{buf_start}-{end_line}".strip(),
+                            "line_start": buf_start,
+                            "line_end": end_line,
+                            "symbol": symbol,
+                            "symbol_kind": kind,
+                        }
+                    )
+                back = max(0, len(buf) - 4)
+                buf = buf[back:]
+                buf_start = int(line_start or 1) + idx - len(buf)
+            buf.append(line)
+        text = "\n".join(buf).strip()
+        if text:
+            end_line = buf_start + len(buf) - 1
+            rows.append(
+                {
+                    "text": text,
+                    "anchor": f"{kind} {symbol} L{buf_start}-{end_line}".strip(),
+                    "line_start": buf_start,
+                    "line_end": end_line,
+                    "symbol": symbol,
+                    "symbol_kind": kind,
+                }
+            )
+        return rows[:24]
+
+    def _python_chunks(self, text: str) -> tuple[list[dict], list[dict]]:
+        src = str(text or "")
+        lines = src.splitlines()
+        out: list[dict] = []
+        symbols: list[dict] = []
+        try:
+            tree = ast.parse(src)
+        except Exception:
+            return out, symbols
+        prelude_end = 0
+        for node in list(tree.body):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                prelude_end = max(prelude_end, int(getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1))
+        if prelude_end > 0:
+            prelude_text = "\n".join(lines[:prelude_end]).strip()
+            if prelude_text:
+                out.append(
+                    {
+                        "text": prelude_text,
+                        "anchor": f"module imports L1-{prelude_end}",
+                        "line_start": 1,
+                        "line_end": prelude_end,
+                        "symbol": "__imports__",
+                        "symbol_kind": "imports",
+                    }
+                )
+
+        def add_symbol(node: ast.AST, symbol: str, kind: str):
+            start = int(getattr(node, "lineno", 1) or 1)
+            end = int(getattr(node, "end_lineno", start) or start)
+            if start < 1 or end < start:
+                return
+            chunk_lines = lines[start - 1 : end]
+            if not chunk_lines:
+                return
+            symbols.append(
+                {
+                    "name": symbol,
+                    "kind": kind,
+                    "line_start": start,
+                    "line_end": end,
+                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180),
+                }
+            )
+            text_chunk = "\n".join(chunk_lines).strip()
+            if len(text_chunk) <= CODE_CHUNK_CHARS:
+                out.append(
+                    {
+                        "text": text_chunk,
+                        "anchor": f"{kind} {symbol} L{start}-{end}".strip(),
+                        "line_start": start,
+                        "line_end": end,
+                        "symbol": symbol,
+                        "symbol_kind": kind,
+                    }
+                )
+            else:
+                out.extend(self._split_large_chunk(chunk_lines, line_start=start, symbol=symbol, kind=kind))
+
+        for node in list(tree.body):
+            if isinstance(node, ast.ClassDef):
+                add_symbol(node, str(node.name), "class")
+                for child in list(node.body):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        prefix = f"{node.name}.{getattr(child, 'name', '')}"
+                        add_symbol(child, prefix.strip("."), "method")
+            elif isinstance(node, ast.FunctionDef):
+                add_symbol(node, str(node.name), "function")
+            elif isinstance(node, ast.AsyncFunctionDef):
+                add_symbol(node, str(node.name), "async_function")
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:160]
+
+    def _decl_matchers(self, language: str) -> list[tuple[re.Pattern[str], str]]:
+        common = [
+            (re.compile(r"^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_][$\w]*)"), "class"),
+            (re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_][$\w]*)"), "interface"),
+            (re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_][$\w]*)"), "type"),
+            (re.compile(r"^\s*(?:export\s+)?enum\s+([A-Za-z_][$\w]*)"), "enum"),
+            (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][$\w]*)"), "function"),
+            (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_][$\w]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][$\w]*)\s*=>"), "function"),
+            (re.compile(r"^\s*(?:public|private|protected|static|final|abstract|override|virtual|async|get|set|\s)*\s*([A-Za-z_][$\w]*)\s*\([^;{}]*\)\s*\{"), "method"),
+        ]
+        if language == "go":
+            return [
+                (re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+struct\b"), "struct"),
+                (re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+interface\b"), "interface"),
+                (re.compile(r"^\s*func\s*(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\("), "function"),
+            ]
+        if language == "rust":
+            return [
+                (re.compile(r"^\s*(?:pub\s+)?struct\s+([A-Za-z_]\w*)"), "struct"),
+                (re.compile(r"^\s*(?:pub\s+)?enum\s+([A-Za-z_]\w*)"), "enum"),
+                (re.compile(r"^\s*(?:pub\s+)?trait\s+([A-Za-z_]\w*)"), "trait"),
+                (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*\("), "function"),
+                (re.compile(r"^\s*impl\b.*?([A-Za-z_]\w*)?\s*\{?$"), "impl"),
+            ]
+        if language in {"java", "kotlin", "scala", "swift", "csharp"}:
+            return [
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*class\s+([A-Za-z_]\w*)"), "class"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*interface\s+([A-Za-z_]\w*)"), "interface"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|\s)*\s*enum\s+([A-Za-z_]\w*)"), "enum"),
+                (re.compile(r"^\s*(?:public|private|protected|internal|open|sealed|final|abstract|static|override|suspend|async|\s)+[A-Za-z0-9_<>,\[\]?]+\s+([A-Za-z_]\w*)\s*\("), "method"),
+            ]
+        if language in {"c", "cpp"}:
+            return [
+                (re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)"), "type"),
+                (re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_:<>\s*&]+\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?\{"), "function"),
+            ]
+        if language == "ruby":
+            return [
+                (re.compile(r"^\s*class\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)"), "class"),
+                (re.compile(r"^\s*module\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)"), "module"),
+                (re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_]\w*[!?=]?)"), "method"),
+            ]
+        if language == "php":
+            return [
+                (re.compile(r"^\s*(?:final\s+|abstract\s+)?class\s+([A-Za-z_]\w*)"), "class"),
+                (re.compile(r"^\s*(?:public|private|protected|static|\s)*function\s+([A-Za-z_]\w*)\s*\("), "function"),
+            ]
+        return common
+
+    def _generic_code_chunks(self, text: str, language: str) -> tuple[list[dict], list[dict]]:
+        src = str(text or "")
+        lines = src.splitlines()
+        if not lines:
+            return [], []
+        matchers = self._decl_matchers(language)
+        brace_depth = 0
+        depths: list[int] = []
+        for line in lines:
+            depths.append(brace_depth)
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
+        candidates: list[dict] = []
+        for idx, line in enumerate(lines):
+            for pattern, kind in matchers:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                name = self._normalize_symbol(m.group(1) if m.groups() else "")
+                if not name:
+                    continue
+                candidates.append({"index": idx, "depth": int(depths[idx] or 0), "name": name, "kind": kind})
+                break
+        out: list[dict] = []
+        symbols: list[dict] = []
+        if candidates and candidates[0]["index"] > 0:
+            prelude = "\n".join(lines[: int(candidates[0]["index"])]).strip()
+            if prelude:
+                end = int(candidates[0]["index"])
+                out.append(
+                    {
+                        "text": prelude,
+                        "anchor": f"module prelude L1-{end}",
+                        "line_start": 1,
+                        "line_end": end,
+                        "symbol": "__prelude__",
+                        "symbol_kind": "prelude",
+                    }
+                )
+        for pos, cand in enumerate(candidates):
+            start_idx = int(cand["index"] or 0)
+            end_idx = len(lines) - 1
+            for nxt in candidates[pos + 1 :]:
+                if int(nxt["depth"] or 0) <= int(cand["depth"] or 0):
+                    end_idx = max(start_idx, int(nxt["index"] or 0) - 1)
+                    break
+            chunk_lines = lines[start_idx : end_idx + 1]
+            chunk_text = "\n".join(chunk_lines).strip()
+            if not chunk_text:
+                continue
+            line_start = start_idx + 1
+            line_end = end_idx + 1
+            symbols.append(
+                {
+                    "name": str(cand.get("name", "") or ""),
+                    "kind": str(cand.get("kind", "") or ""),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), str(cand.get("name", ""))), 180),
+                }
+            )
+            if len(chunk_text) <= CODE_CHUNK_CHARS:
+                out.append(
+                    {
+                        "text": chunk_text,
+                        "anchor": f"{cand.get('kind','symbol')} {cand.get('name','')} L{line_start}-{line_end}".strip(),
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "symbol": str(cand.get("name", "") or ""),
+                        "symbol_kind": str(cand.get("kind", "") or ""),
+                    }
+                )
+            else:
+                out.extend(
+                    self._split_large_chunk(
+                        chunk_lines,
+                        line_start=line_start,
+                        symbol=str(cand.get("name", "") or ""),
+                        kind=str(cand.get("kind", "") or "symbol"),
+                    )
+                )
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                break
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:200]
+
+    def _fallback_chunks(self, text: str) -> list[dict]:
+        rows = _rag_chunk_text(text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
+        out: list[dict] = []
+        line_no = 1
+        for row in rows[:CODE_MAX_CHUNKS_PER_DOC]:
+            chunk_text = str(row.get("text", "") or "")
+            line_count = max(1, chunk_text.count("\n") + 1)
+            out.append(
+                {
+                    "text": chunk_text,
+                    "anchor": str(row.get("anchor", "") or ""),
+                    "line_start": line_no,
+                    "line_end": line_no + line_count - 1,
+                    "symbol": "",
+                    "symbol_kind": "chunk",
+                }
+            )
+            line_no += max(1, line_count - 1)
+        return out
+
+    def _comment_summary(self, text: str, language: str) -> str:
+        lines = str(text or "").splitlines()[:24]
+        picked: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if picked:
+                    break
+                continue
+            if stripped.startswith(("#", "//", "/*", "*", "--")):
+                picked.append(re.sub(r"^(#|//|/\*+|\*+|--)\s*", "", stripped).strip("*/ "))
+                if len(" ".join(picked)) >= 280:
+                    break
+            elif picked:
+                break
+        return trim(" ".join(x for x in picked if x), 320)
+
+    def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
+        raw_text = trim(str(text_override or ""), 300_000)
+        raw_bytes: bytes | None = None
+        if not raw_text:
+            try:
+                raw_bytes = fp.read_bytes()
+            except Exception:
+                raw_bytes = None
+            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), 300_000)
+        language = self.detect_language(fp, text=raw_text)
+        imports = self._extract_imports(raw_text, language)
+        if language == "python":
+            chunks, symbols = self._python_chunks(raw_text)
+        else:
+            chunks, symbols = self._generic_code_chunks(raw_text, language)
+        if not chunks:
+            chunks = self._fallback_chunks(raw_text)
+        exports = [
+            str(row.get("name", "") or "").strip()
+            for row in symbols
+            if str(row.get("kind", "") or "").strip() in {"class", "function", "async_function", "struct", "trait", "interface", "enum", "type"}
+        ]
+        entities: list[str] = []
+        seen_entities: set[str] = set()
+        for token in exports + [str(row.get("name", "") or "") for row in symbols] + imports:
+            clean = self._normalize_symbol(token)
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen_entities:
+                continue
+            seen_entities.add(key)
+            entities.append(clean)
+            if len(entities) >= 48:
+                break
+        labels: list[str] = []
+        low_name = fp.name.lower()
+        if language and language != "text":
+            labels.append(language)
+        if _code_is_test_path(fp.name):
+            labels.append("test")
+        if low_name.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env")):
+            labels.append("config")
+        if low_name.endswith((".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".html")):
+            labels.append("frontend")
+        summary_bits = [f"{language} file" if language else "code file"]
+        if exports:
+            summary_bits.append("exports: " + ", ".join(exports[:8]))
+        elif symbols:
+            summary_bits.append("symbols: " + ", ".join(str(row.get("name", "")) for row in symbols[:8]))
+        if imports:
+            summary_bits.append("imports: " + ", ".join(imports[:6]))
+        comment_summary = self._comment_summary(raw_text, language)
+        if comment_summary:
+            summary_bits.append(comment_summary)
+        return {
+            "filename": fp.name,
+            "path": str(fp),
+            "kind": "source_code",
+            "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
+            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
+            "language": language or "text",
+            "text": raw_text,
+            "text_chars": len(raw_text),
+            "summary": trim(" | ".join(bit for bit in summary_bits if bit), 1600),
+            "entities": entities,
+            "category": "code",
+            "labels": sorted({str(x).strip() for x in labels if str(x).strip()}),
+            "metadata": {
+                "line_count": max(0, raw_text.count("\n") + (1 if raw_text else 0)),
+                "symbol_count": len(symbols),
+                "import_count": len(imports),
+            },
+            "symbols": symbols[:200],
+            "imports": imports[:64],
+            "exports": exports[:64],
+            "chunks": chunks[:CODE_MAX_CHUNKS_PER_DOC],
+        }
+
+
+class RAGContentParser:
+    TEXT_EXTS = {
+        ".txt", ".md", ".rst", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".html", ".htm",
+        ".csv", ".tsv", ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".go", ".rs", ".rb", ".php",
+        ".swift", ".kt", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".toml", ".ini",
+        ".cfg", ".conf", ".env", ".properties", ".tex", ".bib", ".log",
+    }
+
+    def __init__(self, include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT):
+        self.include_filename_entities = bool(include_filename_entities)
+
+    def _decode_text_bytes(self, data: bytes) -> str:
+        if not data:
+            return ""
+        if b"\x00" in data[:4096]:
+            return ""
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
+
+    def _module_available(self, name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except Exception:
+            return False
+
+    def _run_text_extractor_cmd(self, cmd: list[str], timeout: int = 45) -> str:
+        if not cmd:
+            return ""
+        exe = shutil.which(str(cmd[0]))
+        if not exe:
+            return ""
+        try:
+            r = subprocess.run(
+                [exe] + [str(x) for x in cmd[1:]],
+                capture_output=True,
+                text=True,
+                errors="ignore",
+                timeout=timeout,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _extract_strings_fallback(self, fp: Path, min_len: int = 4) -> str:
+        text = self._run_text_extractor_cmd(["strings", "-n", str(min_len), str(fp)], timeout=30)
+        if text:
+            return trim(text, 80_000)
+        try:
+            raw = fp.read_bytes().decode("latin-1", errors="ignore")
+        except Exception:
+            return ""
+        chunks = re.findall(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff\s\-\_\.\,\:\;\(\)\[\]\/]{3,}", raw)
+        return trim("\n".join(chunks), 80_000)
+
+    def _extract_xml_text_tokens(self, xml_text: str, local_names: tuple[str, ...] = ("t",)) -> list[str]:
+        names = {x.lower() for x in local_names}
+        out: list[str] = []
+        if not xml_text.strip():
+            return out
+        try:
+            root = ET.fromstring(xml_text)
+            for node in root.iter():
+                tag = str(node.tag)
+                local = tag.rsplit("}", 1)[-1].split(":", 1)[-1].lower()
+                if local not in names:
+                    continue
+                text = (node.text or "").strip()
+                if text:
+                    out.append(html.unescape(text))
+        except Exception:
+            for name in names:
+                pattern = rf"(?is)<(?:\w+:)?{re.escape(name)}\b[^>]*>(.*?)</(?:\w+:)?{re.escape(name)}>"
+                for m in re.finditer(pattern, xml_text):
+                    raw = re.sub(r"(?is)<[^>]+>", "", m.group(1))
+                    val = html.unescape(raw).strip()
+                    if val:
+                        out.append(val)
+        return out
+
+    def _extract_pdf_text(self, pdf_path: Path) -> str:
+        try:
+            from pdfminer.high_level import extract_text
+
+            text = extract_text(str(pdf_path))
+            if text and text.strip():
+                return trim(text.strip(), 150_000)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        tool = shutil.which("pdftotext")
+        if tool:
+            try:
+                r = subprocess.run(
+                    [tool, "-layout", str(pdf_path), "-"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    return trim(r.stdout.strip(), 150_000)
+            except Exception:
+                pass
+        try:
+            raw = pdf_path.read_bytes()
+            text = raw.decode("latin-1", errors="ignore")
+            chunks = re.findall(r"\(([^()]{4,2000})\)", text)
+            return trim("\n".join(chunks), 80_000)
+        except Exception:
+            return ""
+
+    def _extract_csv_text(self, raw: bytes) -> str:
+        text = self._decode_text_bytes(raw)
+        if not text:
+            return ""
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        sample = "\n".join(lines[:40])
+        dialect = csv.excel
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            pass
+        table_lines: list[str] = []
+        try:
+            reader = csv.reader(io.StringIO(text), dialect)
+            for i, row in enumerate(reader):
+                if i >= 300:
+                    break
+                vals = [str(v).strip() for v in row]
+                if any(vals):
+                    table_lines.append("\t".join(vals))
+        except Exception:
+            table_lines = lines[:300]
+        return trim("\n".join(table_lines), 120_000)
+
+    def _extract_xlsx_text(self, fp: Path) -> str:
+        if self._module_available("openpyxl"):
+            try:
+                import openpyxl  # type: ignore
+
+                wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+                lines: list[str] = []
+                for ws in list(wb.worksheets)[:8]:
+                    lines.append(f"[Sheet] {ws.title}")
+                    rows = 0
+                    for row in ws.iter_rows(min_row=1, max_row=300, values_only=True):
+                        vals = [str(v).strip() for v in row if v not in (None, "")]
+                        if not vals:
+                            continue
+                        lines.append("\t".join(vals))
+                        rows += 1
+                        if rows >= 160:
+                            break
+                wb.close()
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                shared: list[str] = []
+                if "xl/sharedStrings.xml" in zf.namelist():
+                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                    shared = self._extract_xml_text_tokens(shared_xml, ("t",))
+                lines: list[str] = []
+                for name in sorted(zf.namelist()):
+                    if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
+                        continue
+                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    lines.append(f"[Sheet] {Path(name).stem}")
+                    taken = 0
+                    for row_raw in rows_raw:
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        vals: list[str] = []
+                        for attrs, body in cells:
+                            ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
+                            ctype = (ctype_m.group(1) if ctype_m else "").strip()
+                            token = ""
+                            if ctype == "inlineStr":
+                                token = " ".join(self._extract_xml_text_tokens(body, ("t",))).strip()
+                            else:
+                                vm = re.search(r"(?is)<v\b[^>]*>(.*?)</v>", body)
+                                if vm:
+                                    raw = re.sub(r"(?is)<[^>]+>", "", vm.group(1)).strip()
+                                    if ctype == "s" and raw.isdigit():
+                                        idx = int(raw)
+                                        token = shared[idx] if 0 <= idx < len(shared) else raw
+                                    else:
+                                        token = html.unescape(raw)
+                            token = token.strip()
+                            if token:
+                                vals.append(token)
+                        if vals:
+                            lines.append("\t".join(vals))
+                            taken += 1
+                        if taken >= 160:
+                            break
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_xls_text(self, fp: Path) -> str:
+        if self._module_available("xlrd"):
+            try:
+                import xlrd  # type: ignore
+
+                wb = xlrd.open_workbook(str(fp), on_demand=True)
+                lines: list[str] = []
+                for si in range(min(wb.nsheets, 8)):
+                    sh = wb.sheet_by_index(si)
+                    lines.append(f"[Sheet] {sh.name}")
+                    for r in range(min(sh.nrows, 160)):
+                        vals = [str(sh.cell_value(r, c)).strip() for c in range(sh.ncols) if sh.cell_value(r, c) not in ("", None)]
+                        if vals:
+                            lines.append("\t".join(vals))
+                wb.release_resources()
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+        if xls2csv_text:
+            return trim(xls2csv_text, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_docx_text(self, fp: Path) -> str:
+        if self._module_available("docx"):
+            try:
+                import docx  # type: ignore
+
+                doc = docx.Document(str(fp))
+                lines: list[str] = []
+                for p in doc.paragraphs:
+                    text = (p.text or "").strip()
+                    if text:
+                        lines.append(text)
+                for tb in doc.tables:
+                    for row in tb.rows:
+                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                        vals = [v for v in vals if v]
+                        if vals:
+                            lines.append("\t".join(vals))
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
+                lines: list[str] = []
+                for name in sorted(parts):
+                    tokens = self._extract_xml_text_tokens(zf.read(name).decode("utf-8", errors="ignore"), ("t",))
+                    if tokens:
+                        lines.append(f"[Part] {Path(name).name}")
+                        lines.extend(tokens[:3000])
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_doc_text(self, fp: Path) -> str:
+        for cmd in (
+            ["antiword", str(fp)],
+            ["catdoc", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def _extract_pptx_text(self, fp: Path) -> str:
+        if self._module_available("pptx"):
+            try:
+                import pptx  # type: ignore
+
+                pres = pptx.Presentation(str(fp))
+                lines: list[str] = []
+                for idx, slide in enumerate(pres.slides, 1):
+                    lines.append(f"[Slide {idx}]")
+                    for shape in slide.shapes:
+                        text = ""
+                        if hasattr(shape, "text"):
+                            text = str(getattr(shape, "text") or "").strip()
+                        if text:
+                            lines.append(text)
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+            except Exception:
+                pass
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
+                lines: list[str] = []
+                for name in sorted(slides):
+                    tokens = self._extract_xml_text_tokens(zf.read(name).decode("utf-8", errors="ignore"), ("t",))
+                    if tokens:
+                        lines.append(f"[Slide] {Path(name).stem}")
+                        lines.extend(tokens[:1200])
+                if lines:
+                    return trim("\n".join(lines), 120_000)
+        except Exception:
+            pass
+        return self._extract_strings_fallback(fp)
+
+    def _extract_ppt_text(self, fp: Path) -> str:
+        for cmd in (
+            ["catppt", str(fp)],
+            ["textutil", "-convert", "txt", "-stdout", str(fp)],
+        ):
+            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            if out:
+                return trim(out, 120_000)
+        return self._extract_strings_fallback(fp)
+
+    def detect_kind(self, fp: Path, mime: str = "") -> str:
+        ext = fp.suffix.lower()
+        mime_low = str(mime or "").strip().lower()
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            return "image"
+        if ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            return "video"
+        if ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            return "audio"
+        if ext == ".pdf" or "pdf" in mime_low:
+            return "pdf"
+        if ext == ".csv":
+            return "csv"
+        if ext in {".xlsx", ".xls"}:
+            return "excel"
+        if ext in {".pptx", ".ppt"}:
+            return "presentation"
+        if ext in {".docx", ".doc"}:
+            return "document"
+        if ext in self.TEXT_EXTS or mime_low.startswith("text/") or "json" in mime_low:
+            return "text"
+        return "binary"
+
+    def supported_file(self, fp: Path, mime: str = "") -> bool:
+        return self.detect_kind(fp, mime) != "binary"
+
+    def media_metadata(self, fp: Path, mime: str = "") -> dict:
+        kind = self.detect_kind(fp, mime)
+        guessed = str(mime or guess_mime_from_name(fp.name, "application/octet-stream") or "application/octet-stream")
+        out = {
+            "kind": kind,
+            "mime": guessed,
+            "size": int(fp.stat().st_size) if fp.exists() else 0,
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else "",
+        }
+        if kind == "image" and self._module_available("PIL"):
+            try:
+                from PIL import Image  # type: ignore
+
+                with Image.open(fp) as im:
+                    out["width"] = int(im.width)
+                    out["height"] = int(im.height)
+            except Exception:
+                pass
+        if kind in {"audio", "video"}:
+            ffprobe = shutil.which("ffprobe")
+            if ffprobe:
+                try:
+                    r = subprocess.run(
+                        [
+                            ffprobe,
+                            "-v",
+                            "error",
+                            "-show_format",
+                            "-show_streams",
+                            "-print_format",
+                            "json",
+                            str(fp),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    payload = parse_json_object(r.stdout, {})
+                    fmt = payload.get("format", {}) if isinstance(payload, dict) else {}
+                    if isinstance(fmt, dict):
+                        if fmt.get("duration") is not None:
+                            out["duration"] = float(fmt.get("duration") or 0.0)
+                        if fmt.get("bit_rate") is not None:
+                            out["bit_rate"] = int(float(fmt.get("bit_rate") or 0))
+                    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+                    if isinstance(streams, list) and streams:
+                        stream0 = streams[0] if isinstance(streams[0], dict) else {}
+                        if isinstance(stream0, dict):
+                            if stream0.get("width") is not None:
+                                out["width"] = int(stream0.get("width") or 0)
+                            if stream0.get("height") is not None:
+                                out["height"] = int(stream0.get("height") or 0)
+                            if stream0.get("codec_name"):
+                                out["codec"] = str(stream0.get("codec_name"))
+                except Exception:
+                    pass
+        return out
+
+    def extract_pdf_images(self, pdf_path: Path, target_dir: Path, limit: int = RAG_PDF_IMAGE_LIMIT) -> list[dict]:
+        rows: list[dict] = []
+        if limit <= 0 or not self._module_available("fitz"):
+            return rows
+        try:
+            import fitz  # type: ignore
+
+            doc = fitz.open(str(pdf_path))
+            target_dir.mkdir(parents=True, exist_ok=True)
+            seen_xrefs: set[int] = set()
+            for page_idx in range(len(doc)):
+                if len(rows) >= limit:
+                    break
+                page = doc.load_page(page_idx)
+                for img_idx, info in enumerate(page.get_images(full=True), 1):
+                    if len(rows) >= limit:
+                        break
+                    xref = int(info[0] or 0)
+                    if xref <= 0 or xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+                    base = doc.extract_image(xref)
+                    blob = base.get("image", b"")
+                    ext = str(base.get("ext", "png") or "png")
+                    if not blob:
+                        continue
+                    fp = target_dir / f"page_{page_idx+1}_{img_idx}.{ext}"
+                    fp.write_bytes(blob)
+                    rows.append(
+                        {
+                            "type": "image",
+                            "page": page_idx + 1,
+                            "path": str(fp),
+                            "name": fp.name,
+                            "mime": guess_mime_from_name(fp.name, "image/png"),
+                            "size": len(blob),
+                        }
+                    )
+            doc.close()
+        except Exception:
+            return rows
+        return rows
+
+    def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
+        kind = self.detect_kind(fp, mime)
+        text = trim(str(text_override or ""), 150_000)
+        raw: bytes | None = None
+        if not text and fp.exists() and fp.is_file():
+            try:
+                raw = fp.read_bytes()
+            except Exception:
+                raw = None
+        if not text:
+            if kind == "pdf":
+                text = self._extract_pdf_text(fp)
+            elif kind == "csv" and raw is not None:
+                text = self._extract_csv_text(raw)
+            elif kind == "excel" and fp.suffix.lower() == ".xlsx":
+                text = self._extract_xlsx_text(fp)
+            elif kind == "excel":
+                text = self._extract_xls_text(fp)
+            elif kind == "presentation" and fp.suffix.lower() == ".pptx":
+                text = self._extract_pptx_text(fp)
+            elif kind == "presentation":
+                text = self._extract_ppt_text(fp)
+            elif kind == "document" and fp.suffix.lower() == ".docx":
+                text = self._extract_docx_text(fp)
+            elif kind == "document":
+                text = self._extract_doc_text(fp)
+            elif kind == "text" and raw is not None:
+                text = trim(self._decode_text_bytes(raw), 150_000)
+        lang = _rag_detect_language(text)
+        cls = _rag_classify_document(fp.name, kind, text)
+        meta = self.media_metadata(fp, mime=mime)
+        entities = _rag_apply_filename_entity_policy(
+            _rag_extract_entities(text),
+            fp.name,
+            allow_filename_entities=self.include_filename_entities,
+            limit=32,
+        )
+        return {
+            "filename": fp.name,
+            "path": str(fp),
+            "kind": kind,
+            "mime": str(meta.get("mime", mime or "")),
+            "size": int(meta.get("size", 0) or 0),
+            "sha256": str(meta.get("sha256", "")),
+            "language": lang,
+            "text": text,
+            "text_chars": len(text),
+            "summary": trim(text, 1200),
+            "entities": entities,
+            "category": str(cls.get("category", "document")),
+            "labels": list(cls.get("labels", [])),
+            "metadata": meta,
+        }
+
+
+class TFGraphIDFIndex:
+    def __init__(self, include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT):
+        self.built_at = 0.0
+        self.include_filename_entities = bool(include_filename_entities)
+        self.idf: dict[str, float] = {}
+        self.inverted: dict[str, list[tuple[str, float]]] = {}
+        self.chunk_norms: dict[str, float] = {}
+        self.chunk_meta: dict[str, dict] = {}
+        self.doc_meta: dict[str, dict] = {}
+        self.doc_to_chunks: dict[str, list[str]] = {}
+        self.related_docs: dict[str, dict[str, int]] = {}
+        self.entity_to_docs: dict[str, list[str]] = {}
+        self.community_counts: dict[str, int] = {}
+        self.community_doc_ids: dict[str, list[str]] = {}
+        self.community_reports: dict[str, dict] = {}
+        self.community_links: dict[str, dict[str, int]] = {}
+        self.community_idf: dict[str, float] = {}
+        self.community_inverted: dict[str, list[tuple[str, float]]] = {}
+        self.community_norms: dict[str, float] = {}
+        self.token_doc_df: dict[str, int] = {}
+        self.token_community_df: dict[str, int] = {}
+        self.dynamic_noise_hard_tokens: set[str] = set()
+        self.dynamic_noise_penalties: dict[str, float] = {}
+        self.dynamic_noise_meta: dict[str, dict] = {}
+
+    def snapshot(self) -> dict:
+        return {
+            "built_at": float(self.built_at or 0.0),
+            "include_filename_entities": bool(self.include_filename_entities),
+            "idf": {str(k): float(v or 0.0) for k, v in self.idf.items()},
+            "inverted": {
+                str(token): [[str(chunk_id), float(weight or 0.0)] for chunk_id, weight in rows]
+                for token, rows in self.inverted.items()
+            },
+            "chunk_norms": {str(k): float(v or 0.0) for k, v in self.chunk_norms.items()},
+            "chunk_meta": {str(k): dict(v) for k, v in self.chunk_meta.items()},
+            "doc_meta": {str(k): dict(v) for k, v in self.doc_meta.items()},
+            "doc_to_chunks": {str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.doc_to_chunks.items()},
+            "related_docs": {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in self.related_docs.items()
+            },
+            "entity_to_docs": {str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.entity_to_docs.items()},
+            "community_counts": {str(k): int(v or 0) for k, v in self.community_counts.items()},
+            "community_doc_ids": {
+                str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.community_doc_ids.items()
+            },
+            "community_reports": {str(k): dict(v) for k, v in self.community_reports.items()},
+            "community_links": {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in self.community_links.items()
+            },
+            "community_idf": {str(k): float(v or 0.0) for k, v in self.community_idf.items()},
+            "community_inverted": {
+                str(token): [[str(community), float(weight or 0.0)] for community, weight in rows]
+                for token, rows in self.community_inverted.items()
+            },
+            "community_norms": {str(k): float(v or 0.0) for k, v in self.community_norms.items()},
+            "token_doc_df": {str(k): int(v or 0) for k, v in self.token_doc_df.items()},
+            "token_community_df": {str(k): int(v or 0) for k, v in self.token_community_df.items()},
+            "dynamic_noise_hard_tokens": sorted(str(x) for x in self.dynamic_noise_hard_tokens if str(x).strip()),
+            "dynamic_noise_penalties": {str(k): float(v or 0.0) for k, v in self.dynamic_noise_penalties.items()},
+            "dynamic_noise_meta": {str(k): dict(v) for k, v in self.dynamic_noise_meta.items()},
+        }
+
+    def restore(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        def _restore_weight_rows(raw: object) -> dict[str, list[tuple[str, float]]]:
+            out: dict[str, list[tuple[str, float]]] = {}
+            if not isinstance(raw, dict):
+                return out
+            for key, rows in raw.items():
+                norm_key = str(key or "").strip()
+                if not norm_key or not isinstance(rows, list):
+                    continue
+                pairs: list[tuple[str, float]] = []
+                for row in rows:
+                    if isinstance(row, (list, tuple)) and len(row) >= 2:
+                        left = str(row[0] or "").strip()
+                        if not left:
+                            continue
+                        try:
+                            weight = float(row[1] or 0.0)
+                        except Exception:
+                            weight = 0.0
+                        pairs.append((left, weight))
+                if pairs:
+                    out[norm_key] = pairs
+            return out
+
+        try:
+            self.built_at = float(payload.get("built_at", 0.0) or 0.0)
+            self.idf = {str(k): float(v or 0.0) for k, v in (payload.get("idf", {}) or {}).items()}
+            self.inverted = _restore_weight_rows(payload.get("inverted", {}))
+            self.chunk_norms = {str(k): float(v or 0.0) for k, v in (payload.get("chunk_norms", {}) or {}).items()}
+            self.chunk_meta = {
+                str(k): dict(v) for k, v in (payload.get("chunk_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.doc_meta = {
+                str(k): dict(v) for k, v in (payload.get("doc_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.doc_to_chunks = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("doc_to_chunks", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.related_docs = {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in (payload.get("related_docs", {}) or {}).items()
+                if isinstance(v, dict)
+            }
+            self.entity_to_docs = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("entity_to_docs", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.community_counts = {
+                str(k): int(v or 0) for k, v in (payload.get("community_counts", {}) or {}).items()
+            }
+            self.community_doc_ids = {
+                str(k): [str(x) for x in (v or []) if str(x).strip()]
+                for k, v in (payload.get("community_doc_ids", {}) or {}).items()
+                if isinstance(v, list)
+            }
+            self.community_reports = {
+                str(k): dict(v) for k, v in (payload.get("community_reports", {}) or {}).items() if isinstance(v, dict)
+            }
+            self.community_links = {
+                str(k): {str(ok): int(ov or 0) for ok, ov in (v or {}).items()}
+                for k, v in (payload.get("community_links", {}) or {}).items()
+                if isinstance(v, dict)
+            }
+            self.community_idf = {
+                str(k): float(v or 0.0) for k, v in (payload.get("community_idf", {}) or {}).items()
+            }
+            self.community_inverted = _restore_weight_rows(payload.get("community_inverted", {}))
+            self.community_norms = {
+                str(k): float(v or 0.0) for k, v in (payload.get("community_norms", {}) or {}).items()
+            }
+            self.token_doc_df = {
+                str(k): int(v or 0) for k, v in (payload.get("token_doc_df", {}) or {}).items()
+            }
+            self.token_community_df = {
+                str(k): int(v or 0) for k, v in (payload.get("token_community_df", {}) or {}).items()
+            }
+            self.dynamic_noise_hard_tokens = {
+                str(x).strip().lower()
+                for x in (payload.get("dynamic_noise_hard_tokens", []) or [])
+                if str(x).strip()
+            }
+            self.dynamic_noise_penalties = {
+                str(k): float(v or 0.0) for k, v in (payload.get("dynamic_noise_penalties", {}) or {}).items()
+            }
+            self.dynamic_noise_meta = {
+                str(k): dict(v) for k, v in (payload.get("dynamic_noise_meta", {}) or {}).items() if isinstance(v, dict)
+            }
+            return bool(self.doc_meta or self.chunk_meta or self.community_reports)
+        except Exception:
+            return False
+
+    def _dynamic_noise_penalty_factor(self, doc_ratio: float, community_ratio: float) -> float:
+        pressure = 0.0
+        if doc_ratio >= RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO:
+            pressure = max(
+                pressure,
+                min(
+                    1.0,
+                    (doc_ratio - RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO)
+                    / max(0.001, RAG_DYNAMIC_NOISE_HARD_DOC_RATIO - RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO),
+                ),
+            )
+        if community_ratio >= RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO:
+            pressure = max(
+                pressure,
+                min(
+                    1.0,
+                    (community_ratio - RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO)
+                    / max(
+                        0.001,
+                        RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO - RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO,
+                    ),
+                ),
+            )
+        return max(0.10, 0.58 - 0.42 * pressure)
+
+    def _derive_dynamic_noise_controls(
+        self,
+        doc_df: Counter[str],
+        doc_total: int,
+        community_df: Counter[str],
+        community_total: int,
+    ) -> tuple[set[str], dict[str, float], dict[str, dict]]:
+        hard_tokens: set[str] = set()
+        penalties: dict[str, float] = {}
+        meta: dict[str, dict] = {}
+        if doc_total < 8 and community_total < 3:
+            return hard_tokens, penalties, meta
+        token_pool = set(doc_df.keys()) | set(community_df.keys())
+        for token in token_pool:
+            doc_freq = int(doc_df.get(token, 0) or 0)
+            community_freq = int(community_df.get(token, 0) or 0)
+            doc_ratio = (float(doc_freq) / float(max(1, doc_total))) if doc_total > 0 else 0.0
+            community_ratio = (
+                float(community_freq) / float(max(1, community_total)) if community_total > 0 else 0.0
+            )
+            hard = (
+                doc_total >= 12
+                and community_total >= 3
+                and doc_freq >= max(RAG_DYNAMIC_NOISE_MIN_DOC_FREQ * 2, int(math.ceil(doc_total * RAG_DYNAMIC_NOISE_HARD_DOC_RATIO)))
+                and community_freq >= max(
+                    RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ + 1,
+                    int(math.ceil(community_total * RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO)),
+                )
+            )
+            soft = (
+                (doc_freq >= RAG_DYNAMIC_NOISE_MIN_DOC_FREQ and doc_ratio >= RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO)
+                or (
+                    community_total >= 2
+                    and community_freq >= RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ
+                    and community_ratio >= RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO
+                )
+            )
+            if hard:
+                hard_tokens.add(token)
+                meta[token] = {
+                    "policy": "hard",
+                    "doc_freq": doc_freq,
+                    "doc_ratio": round(doc_ratio, 6),
+                    "community_freq": community_freq,
+                    "community_ratio": round(community_ratio, 6),
+                }
+                continue
+            if soft:
+                factor = self._dynamic_noise_penalty_factor(doc_ratio, community_ratio)
+                penalties[token] = factor
+                meta[token] = {
+                    "policy": "soft",
+                    "factor": round(factor, 6),
+                    "doc_freq": doc_freq,
+                    "doc_ratio": round(doc_ratio, 6),
+                    "community_freq": community_freq,
+                    "community_ratio": round(community_ratio, 6),
+                }
+        return hard_tokens, penalties, meta
+
+    def _token_noise_factor(self, token: str) -> float:
+        key = str(token or "").strip().lower()
+        if not key:
+            return 0.0
+        if key in self.dynamic_noise_hard_tokens:
+            return 0.0
+        return float(self.dynamic_noise_penalties.get(key, 1.0) or 1.0)
+
+    def build(self, documents: list[dict], chunks: list[dict]):
+        self.built_at = now_ts()
+        self.idf = {}
+        self.inverted = {}
+        self.chunk_norms = {}
+        self.chunk_meta = {}
+        self.doc_meta = {}
+        self.doc_to_chunks = {}
+        self.related_docs = {}
+        self.entity_to_docs = {}
+        self.community_counts = {}
+        self.community_doc_ids = {}
+        self.community_reports = {}
+        self.community_links = {}
+        self.community_idf = {}
+        self.community_inverted = {}
+        self.community_norms = {}
+        self.token_doc_df = {}
+        self.token_community_df = {}
+        self.dynamic_noise_hard_tokens = set()
+        self.dynamic_noise_penalties = {}
+        self.dynamic_noise_meta = {}
+        if not documents:
+            return
+        entity_to_docs: dict[str, set[str]] = defaultdict(set)
+        community_counts: Counter[str] = Counter()
+        for doc in documents:
+            doc_id = str(doc.get("id", "") or "").strip()
+            if not doc_id:
+                continue
+            category = str(doc.get("category", "document") or "document")
+            language = str(doc.get("language", "unknown") or "unknown")
+            filename = str(doc.get("filename", "") or doc.get("title", "") or "")
+            source_rel_path = str(doc.get("source_rel_path", "") or "")
+            entities = _rag_apply_filename_entity_policy(
+                list(doc.get("entities", []) or []),
+                filename,
+                source_rel_path=source_rel_path,
+                allow_filename_entities=self.include_filename_entities,
+                limit=32,
+            )
+            community = _rag_choose_community(category, language, entities, doc.get("community", ""))
+            row = {
+                "id": doc_id,
+                "title": str(doc.get("title", doc.get("filename", doc_id)) or doc_id),
+                "filename": filename,
+                "kind": str(doc.get("kind", "document") or "document"),
+                "category": category,
+                "language": language,
+                "summary": str(doc.get("summary", "") or ""),
+                "entities": entities[:32],
+                "community": community,
+                "source_rel_path": source_rel_path,
+                "updated_at": float(doc.get("updated_at", doc.get("created_at", 0.0)) or 0.0),
+                "chunk_count": int(doc.get("chunk_count", 0) or 0),
+                "assets_count": len(doc.get("assets", []) or []),
+            }
+            self.doc_meta[doc_id] = row
+            self.doc_to_chunks[doc_id] = []
+            community_counts[community] += 1
+            for ent in row["entities"][:16]:
+                entity_to_docs[ent].add(doc_id)
+        token_rows: dict[str, Counter[str]] = {}
+        chunk_df: Counter[str] = Counter()
+        doc_token_sets: dict[str, set[str]] = defaultdict(set)
+        for chunk in chunks:
+            chunk_id = str(chunk.get("id", "") or "").strip()
+            doc_id = str(chunk.get("doc_id", "") or "").strip()
+            if not chunk_id or doc_id not in self.doc_meta:
+                continue
+            text = str(chunk.get("text", "") or "")
+            tokens = _rag_expand_tokens(_rag_tokenize(text))
+            counts = Counter(tokens)
+            if counts:
+                chunk_df.update(counts.keys())
+                doc_token_sets[doc_id].update(counts.keys())
+            token_rows[chunk_id] = counts
+            doc_info = self.doc_meta.get(doc_id, {})
+            entities = _rag_apply_filename_entity_policy(
+                list(chunk.get("entities", []) or []),
+                doc_info.get("filename", ""),
+                source_rel_path=doc_info.get("source_rel_path", ""),
+                allow_filename_entities=self.include_filename_entities,
+                limit=24,
+            )
+            self.chunk_meta[chunk_id] = {
+                "id": chunk_id,
+                "doc_id": doc_id,
+                "seq": int(chunk.get("seq", 0) or 0),
+                "text": text,
+                "anchor": str(chunk.get("anchor", "") or ""),
+                "entities": entities[:24],
+            }
+            self.doc_to_chunks.setdefault(doc_id, []).append(chunk_id)
+        doc_df: Counter[str] = Counter()
+        for tokens in doc_token_sets.values():
+            if tokens:
+                doc_df.update(tokens)
+        related: dict[str, dict[str, int]] = defaultdict(dict)
+        for entity, doc_ids in entity_to_docs.items():
+            ordered = sorted(doc_ids)
+            if len(ordered) <= 1:
+                continue
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    a = ordered[i]
+                    b = ordered[j]
+                    related[a][b] = int(related[a].get(b, 0) or 0) + 1
+                    related[b][a] = int(related[b].get(a, 0) or 0) + 1
+        self.related_docs = {k: dict(v) for k, v in related.items()}
+        self.entity_to_docs = {k: sorted(v) for k, v in entity_to_docs.items()}
+        self.community_counts = dict(community_counts)
+        for doc_id, row in self.doc_meta.items():
+            row["graph_degree"] = (
+                len(self.doc_to_chunks.get(doc_id, []) or [])
+                + len(row.get("entities", []) or [])
+                + len(self.related_docs.get(doc_id, {}) or {})
+            )
+        community_doc_ids: dict[str, list[str]] = defaultdict(list)
+        community_entities: dict[str, Counter[str]] = defaultdict(Counter)
+        community_categories: dict[str, Counter[str]] = defaultdict(Counter)
+        community_languages: dict[str, Counter[str]] = defaultdict(Counter)
+        community_kinds: dict[str, Counter[str]] = defaultdict(Counter)
+        for doc_id, row in self.doc_meta.items():
+            community = str(row.get("community", "") or "").strip() or "document:unknown"
+            community_doc_ids[community].append(doc_id)
+            community_categories[community][str(row.get("category", "document") or "document")] += 1
+            community_languages[community][str(row.get("language", "unknown") or "unknown")] += 1
+            community_kinds[community][str(row.get("kind", "document") or "document")] += 1
+            community_entities[community].update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()][:12])
+        for community, doc_ids in community_doc_ids.items():
+            doc_ids.sort(
+                key=lambda doc_id: (
+                    int(self.doc_meta.get(doc_id, {}).get("graph_degree", 0) or 0),
+                    int(self.doc_meta.get(doc_id, {}).get("chunk_count", 0) or 0),
+                    float(self.doc_meta.get(doc_id, {}).get("updated_at", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+        community_links: dict[str, dict[str, int]] = defaultdict(dict)
+        for doc_id, related_map in self.related_docs.items():
+            left = str(self.doc_meta.get(doc_id, {}).get("community", "") or "").strip()
+            if not left:
+                continue
+            for other_id, weight in related_map.items():
+                right = str(self.doc_meta.get(other_id, {}).get("community", "") or "").strip()
+                if (not right) or right == left:
+                    continue
+                community_links[left][right] = int(community_links[left].get(right, 0) or 0) + int(weight or 0)
+        community_token_rows: dict[str, Counter[str]] = {}
+        community_df: Counter[str] = Counter()
+        community_reports: dict[str, dict] = {}
+        for community, doc_ids in community_doc_ids.items():
+            top_docs = [self.doc_meta.get(doc_id, {}) for doc_id in doc_ids[:6]]
+            top_entities = [name for name, _ in community_entities[community].most_common(10)]
+            top_categories = [name for name, _ in community_categories[community].most_common(3)]
+            top_languages = [name for name, _ in community_languages[community].most_common(3)]
+            top_kinds = [name for name, _ in community_kinds[community].most_common(3)]
+            links = sorted((community_links.get(community, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+            representative_docs = [
+                {
+                    "id": str(row.get("id", "") or ""),
+                    "title": str(row.get("title", "") or ""),
+                    "summary": trim(str(row.get("summary", "") or ""), 260),
+                    "entities": list(row.get("entities", []) or [])[:8],
+                    "graph_degree": int(row.get("graph_degree", 0) or 0),
+                }
+                for row in top_docs
+                if isinstance(row, dict)
+            ]
+            report_lines = [
+                f"Community: {community}",
+                f"Documents: {len(doc_ids)}",
+                f"Categories: {', '.join(top_categories) if top_categories else 'document'}",
+                f"Languages: {', '.join(top_languages) if top_languages else 'unknown'}",
+                f"Kinds: {', '.join(top_kinds) if top_kinds else 'document'}",
+            ]
+            if top_entities:
+                report_lines.append("Top entities: " + ", ".join(top_entities))
+            if links:
+                report_lines.append(
+                    "Cross-community links: "
+                    + ", ".join(f"{name} ({int(weight or 0)})" for name, weight in links[:4])
+                )
+            for idx, row in enumerate(representative_docs[:4], 1):
+                report_lines.append(
+                    f"Representative document {idx}: {row.get('title','')} "
+                    f"[{row.get('id','')}] degree={row.get('graph_degree',0)}"
+                )
+                if str(row.get("summary", "")).strip():
+                    report_lines.append(trim(str(row.get("summary", "") or ""), 320))
+                doc_entities = [str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()]
+                if doc_entities:
+                    report_lines.append("Document entities: " + ", ".join(doc_entities[:8]))
+            report_text = trim("\n".join(report_lines), 6000)
+            counts = Counter(_rag_expand_tokens(_rag_tokenize(report_text)))
+            if counts:
+                community_df.update(counts.keys())
+            community_token_rows[community] = counts
+            community_reports[community] = {
+                "community": community,
+                "doc_ids": list(doc_ids),
+                "doc_count": len(doc_ids),
+                "top_entities": top_entities,
+                "top_categories": top_categories,
+                "top_languages": top_languages,
+                "top_kinds": top_kinds,
+                "representative_docs": representative_docs,
+                "links": [{"community": name, "weight": int(weight or 0)} for name, weight in links[:6]],
+                "report": report_text,
+            }
+        doc_total = max(1, len(self.doc_meta))
+        community_total = max(1, len(community_reports))
+        hard_tokens, penalties, meta = self._derive_dynamic_noise_controls(
+            doc_df,
+            doc_total,
+            community_df,
+            community_total,
+        )
+        self.token_doc_df = {token: int(freq or 0) for token, freq in doc_df.items()}
+        self.token_community_df = {token: int(freq or 0) for token, freq in community_df.items()}
+        self.dynamic_noise_hard_tokens = set(hard_tokens)
+        self.dynamic_noise_penalties = dict(penalties)
+        self.dynamic_noise_meta = {str(token): dict(info) for token, info in meta.items()}
+        total_chunks = max(1, len(self.chunk_meta))
+        self.idf = {
+            token: math.log((1.0 + total_chunks) / (1.0 + freq)) + 1.0
+            for token, freq in chunk_df.items()
+            if token not in hard_tokens
+        }
+        inverted: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for chunk_id, counts in token_rows.items():
+            weights: dict[str, float] = {}
+            sq = 0.0
+            for token, freq in counts.items():
+                if token in hard_tokens:
+                    continue
+                weight = (1.0 + math.log(max(1, int(freq)))) * self.idf.get(token, 1.0) * penalties.get(token, 1.0)
+                if weight <= 0.0:
+                    continue
+                weights[token] = weight
+                sq += weight * weight
+            norm = math.sqrt(sq) or 1.0
+            self.chunk_norms[chunk_id] = norm
+            for token, weight in weights.items():
+                inverted[token].append((chunk_id, weight))
+        self.inverted = dict(inverted)
+        self.community_idf = {
+            token: math.log((1.0 + community_total) / (1.0 + freq)) + 1.0
+            for token, freq in community_df.items()
+            if token not in hard_tokens
+        }
+        community_inverted: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for community, counts in community_token_rows.items():
+            sq = 0.0
+            weights: dict[str, float] = {}
+            for token, freq in counts.items():
+                if token in hard_tokens:
+                    continue
+                weight = (
+                    (1.0 + math.log(max(1, int(freq))))
+                    * self.community_idf.get(token, 1.0)
+                    * penalties.get(token, 1.0)
+                )
+                if weight <= 0.0:
+                    continue
+                weights[token] = weight
+                sq += weight * weight
+            norm = math.sqrt(sq) or 1.0
+            self.community_norms[community] = norm
+            for token, weight in weights.items():
+                community_inverted[token].append((community, weight))
+        self.community_doc_ids = {k: list(v) for k, v in community_doc_ids.items()}
+        self.community_links = {k: dict(v) for k, v in community_links.items()}
+        self.community_reports = community_reports
+        self.community_inverted = dict(community_inverted)
+
+    def _query_weights(self, query: str) -> tuple[dict[str, float], float, set[str], str]:
+        tokens = _rag_expand_tokens(_rag_tokenize(query))
+        counts = Counter(tokens)
+        weights: dict[str, float] = {}
+        sq = 0.0
+        for token, freq in counts.items():
+            factor = self._token_noise_factor(token)
+            if factor <= 0.0:
+                continue
+            weight = (1.0 + math.log(max(1, int(freq)))) * self.idf.get(token, 1.0) * factor
+            if weight <= 0.0:
+                continue
+            weights[token] = weight
+            sq += weight * weight
+        norm = math.sqrt(sq) or 1.0
+        entities = set(_rag_filter_entities(_rag_extract_entities(query), limit=16))
+        qcat = str(_rag_classify_document("query.txt", "text", query).get("category", "document"))
+        return weights, norm, entities, qcat
+
+    def _finalize_query_rows(
+        self,
+        query: str,
+        rows: list[dict],
+        qentities: set[str],
+        *,
+        top_k: int,
+        route: str,
+        route_meta: dict | None = None,
+    ) -> dict:
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = "|".join(
+                [
+                    str(row.get("citation", "") or ""),
+                    str(row.get("doc_id", "") or ""),
+                    str(row.get("chunk_id", "") or ""),
+                    str(row.get("community", "") or ""),
+                    str(row.get("route_evidence", "") or ""),
+                ]
+            ).strip("|")
+            if not key:
+                key = trim(json_dumps(row, sort_keys=True), 240)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(dict(row))
+        deduped.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+                float(x.get("graph_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        top_rows = deduped[: max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))]
+        community_counter: Counter[str] = Counter(str(x.get("community", "")) for x in top_rows if str(x.get("community", "")).strip())
+        community_cards = []
+        for community, freq in community_counter.most_common(5):
+            related = [x for x in top_rows if str(x.get("community", "")) == community]
+            entities: Counter[str] = Counter()
+            for row in related:
+                entities.update([str(x) for x in (row.get("entities", []) or []) if str(x).strip()])
+            community_cards.append(
+                {
+                    "community": community,
+                    "hits": int(freq),
+                    "top_entities": [name for name, _ in entities.most_common(6)],
+                    "sample_titles": [str(x.get("title", "")) for x in related[:3]],
+                }
+            )
+        summary_parts = []
+        for row in top_rows[:4]:
+            summary_parts.append(f"{row.get('citation')} {row.get('title','')}: {trim(row.get('text',''), 180)}")
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(summary_parts),
+            "community_cards": community_cards,
+            "query_entities": sorted(qentities),
+            "route": str(route or "fast"),
+            "route_meta": dict(route_meta or {}),
+        }
+
+    def _fast_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        allowed_communities: set[str] | None = None,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for chunk_id, cweight in self.inverted.get(token, []):
+                scores[chunk_id] += qweight * cweight
+        rows: list[dict] = []
+        for chunk_id, dot in scores.items():
+            chunk = self.chunk_meta.get(chunk_id, {})
+            doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
+            if not doc:
+                continue
+            if category and str(doc.get("category", "")) != str(category):
+                continue
+            if kind and str(doc.get("kind", "")) != str(kind):
+                continue
+            if allowed and str(doc.get("community", "") or "") not in allowed:
+                continue
+            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            chunk_entities = set(str(x) for x in (chunk.get("entities", []) or []))
+            doc_entities = set(str(x) for x in (doc.get("entities", []) or []))
+            ent_overlap = len(qentities.intersection(chunk_entities))
+            doc_ent_overlap = len(qentities.intersection(doc_entities))
+            degree = int(doc.get("graph_degree", 0) or 0)
+            graph_bonus = (0.18 * ent_overlap) + (0.10 * doc_ent_overlap) + min(0.16, math.log1p(degree) / 12.0)
+            if qcat and str(doc.get("category", "")) == qcat:
+                graph_bonus += 0.08
+            if str(doc.get("community", "")) in self.community_counts:
+                graph_bonus += min(0.08, math.log1p(self.community_counts.get(str(doc.get("community", "")), 0)) / 16.0)
+            final_score = lexical * 0.82 + graph_bonus
+            rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": str(doc.get("id", "")),
+                    "chunk_id": chunk_id,
+                    "title": str(doc.get("title", "")),
+                    "filename": str(doc.get("filename", "")),
+                    "kind": str(doc.get("kind", "")),
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "language": str(doc.get("language", "")),
+                    "anchor": str(chunk.get("anchor", "")),
+                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "entities": list(chunk.get("entities", []) or [])[:12],
+                    "citation": f"[{doc.get('id', '')}:{chunk_id}]",
+                    "route_evidence": "chunk",
+                }
+            )
+        if not rows:
+            for doc in sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True):
+                if category and str(doc.get("category", "")) != str(category):
+                    continue
+                if kind and str(doc.get("kind", "")) != str(kind):
+                    continue
+                if allowed and str(doc.get("community", "") or "") not in allowed:
+                    continue
+                hay = f"{doc.get('title', '')}\n{doc.get('summary', '')}".strip().lower()
+                ratio = difflib.SequenceMatcher(None, query.lower()[:240], hay[:480]).ratio()
+                if ratio < 0.16:
+                    continue
+                rows.append(
+                    {
+                        "score": round(ratio, 6),
+                        "lexical_score": round(ratio, 6),
+                        "graph_score": 0.0,
+                        "doc_id": str(doc.get("id", "")),
+                        "chunk_id": "",
+                        "title": str(doc.get("title", "")),
+                        "filename": str(doc.get("filename", "")),
+                        "kind": str(doc.get("kind", "")),
+                        "category": str(doc.get("category", "")),
+                        "community": str(doc.get("community", "")),
+                        "language": str(doc.get("language", "")),
+                        "anchor": "",
+                        "text": trim(str(doc.get("summary", "")), 1200),
+                        "entities": list(doc.get("entities", []) or [])[:12],
+                        "citation": f"[{doc.get('id', '')}]",
+                        "route_evidence": "document",
+                    }
+                )
+        return self._finalize_query_rows(
+            query,
+            rows,
+            qentities,
+            top_k=top_k,
+            route="fast",
+            route_meta={"mode": "fast", "allowed_communities": sorted(allowed)[:8]},
+        )
+
+    def _decide_query_route(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> tuple[str, dict]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        tokens = _rag_expand_tokens(_rag_tokenize(query))
+        low = query.lower()
+        global_terms = [
+            "overall", "overview", "landscape", "big picture", "global", "across", "system-wide",
+            "summarize all", "compare", "comparison", "tradeoff", "relationship", "relationships",
+            "multi-hop", "cross-community", "trend", "timeline", "survey", "synthesize",
+            "整体", "全局", "综述", "概览", "总览", "全貌", "脉络", "关系", "联系", "对比", "比较",
+            "趋势", "演化", "系统性", "跨领域", "跨社区", "多跳", "汇总", "归纳", "科研路线",
+        ]
+        local_terms = [
+            "what is", "who is", "when did", "where is", "which file", "which document", "exact",
+            "citation", "cite", "locate", "path", "filename", "line", "chunk",
+            "是什么", "哪篇", "哪个", "哪一个", "哪份", "具体", "精确", "引用", "路径", "文件", "文档",
+        ]
+        reasons: list[str] = []
+        global_score = 0
+        local_score = 0
+        if len(tokens) >= 18:
+            global_score += 1
+            reasons.append("long-query")
+        if len(tokens) >= 32:
+            global_score += 1
+        if len(qentities) >= 2:
+            global_score += 1
+            reasons.append("multi-entity")
+        if any(term in low for term in global_terms):
+            global_score += 2
+            reasons.append("global-intent")
+        if qcat == "research" and len(tokens) >= 14:
+            global_score += 1
+            reasons.append("research-query")
+        if int(top_k or 0) >= 10:
+            global_score += 1
+        if any(term in low for term in local_terms):
+            local_score += 2
+            reasons.append("local-intent")
+        if re.search(r"\.(pdf|docx?|pptx?|csv|xlsx?|txt|md|json|py)\b", low):
+            local_score += 2
+            reasons.append("file-target")
+        if len(tokens) <= 10:
+            local_score += 1
+        if len(qentities) <= 1:
+            local_score += 1
+        route = "fast"
+        if len(self.community_reports) <= 1:
+            route = "fast"
+            reasons.append("community-index-small")
+        elif global_score >= 5 and global_score >= local_score + 1:
+            route = "global"
+        elif global_score >= 3 and global_score > local_score:
+            route = "hybrid"
+        return route, {
+            "mode": "auto",
+            "global_score": int(global_score),
+            "local_score": int(local_score),
+            "query_category": qcat,
+            "query_entities": sorted(qentities),
+            "community_count": len(self.community_reports),
+            "reasons": reasons[:12],
+            "token_count": len(tokens),
+            "nonzero_terms": len(qweights),
+            "query_norm": round(float(qnorm or 0.0), 6),
+        }
+
+    def _rank_global_communities(
+        self,
+        query: str,
+        *,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> list[dict]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for community, cweight in self.community_inverted.get(token, []):
+                scores[community] += qweight * cweight
+        community_rows: list[dict] = []
+        for community, report in self.community_reports.items():
+            if category and str(category) not in [str(x) for x in (report.get("top_categories", []) or [])]:
+                continue
+            if kind and str(kind) not in [str(x) for x in (report.get("top_kinds", []) or [])]:
+                continue
+            dot = float(scores.get(community, 0.0) or 0.0)
+            lexical = dot / ((self.community_norms.get(community, 1.0) or 1.0) * qnorm)
+            report_entities = {str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()}
+            ent_overlap = len(qentities.intersection(report_entities))
+            cross_links = sum(int(x.get("weight", 0) or 0) for x in (report.get("links", []) or [])[:3])
+            graph_bonus = (0.22 * ent_overlap) + min(0.18, math.log1p(cross_links) / 9.5) + min(
+                0.12, math.log1p(int(report.get("doc_count", 0) or 0)) / 8.0
+            )
+            if qcat and str(qcat) in [str(x) for x in (report.get("top_categories", []) or [])]:
+                graph_bonus += 0.08
+            final_score = lexical * 0.72 + graph_bonus
+            if final_score <= 0.0:
+                ratio = difflib.SequenceMatcher(None, query.lower()[:280], str(report.get("report", "")).lower()[:1200]).ratio()
+                if ratio < 0.18:
+                    continue
+                lexical = ratio
+                final_score = ratio * 0.62 + graph_bonus
+            community_rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": "",
+                    "chunk_id": "",
+                    "title": f"Community Report · {community}",
+                    "filename": "",
+                    "kind": "community_report",
+                    "category": str((report.get("top_categories", []) or ["document"])[0]),
+                    "community": community,
+                    "language": str((report.get("top_languages", []) or ["unknown"])[0]),
+                    "anchor": "",
+                    "text": trim(str(report.get("report", "") or ""), 1800),
+                    "entities": list(report.get("top_entities", []) or [])[:12],
+                    "citation": f"[community:{community}]",
+                    "route_evidence": "community_report",
+                    "sort_bias": 0.18,
+                }
+            )
+        community_rows.sort(
+            key=lambda x: (float(x.get("score", 0.0) or 0.0), float(x.get("graph_score", 0.0) or 0.0)),
+            reverse=True,
+        )
+        return community_rows
+
+    def _build_global_bridge_rows(self, selected_communities: list[str]) -> list[dict]:
+        bridge_rows: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for left in selected_communities[:RAG_MAX_GLOBAL_COMMUNITIES]:
+            for right, weight in sorted((self.community_links.get(left, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True):
+                if right not in selected_communities or left == right:
+                    continue
+                pair = tuple(sorted((left, right)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                left_report = self.community_reports.get(left, {})
+                right_report = self.community_reports.get(right, {})
+                shared_entities = sorted(
+                    set(str(x) for x in (left_report.get("top_entities", []) or []) if str(x).strip()).intersection(
+                        str(x) for x in (right_report.get("top_entities", []) or []) if str(x).strip()
+                    )
+                )
+                bridge_rows.append(
+                    {
+                        "score": round(min(0.92, 0.26 + math.log1p(int(weight or 0)) / 5.2), 6),
+                        "lexical_score": 0.0,
+                        "graph_score": round(min(0.92, 0.26 + math.log1p(int(weight or 0)) / 5.2), 6),
+                        "doc_id": "",
+                        "chunk_id": "",
+                        "title": f"Community Bridge · {left} ↔ {right}",
+                        "filename": "",
+                        "kind": "community_bridge",
+                        "category": str((left_report.get('top_categories', []) or ['document'])[0]),
+                        "community": left,
+                        "language": str((left_report.get('top_languages', []) or ['unknown'])[0]),
+                        "anchor": "",
+                        "text": trim(
+                            f"Cross-community bridge between {left} and {right}. "
+                            f"Link strength={int(weight or 0)}. "
+                            + (f"Shared entities: {', '.join(shared_entities[:8])}." if shared_entities else ""),
+                            1500,
+                        ),
+                        "entities": shared_entities[:12],
+                        "citation": f"[community-link:{left}<->{right}]",
+                        "route_evidence": "community_bridge",
+                        "sort_bias": 0.14,
+                    }
+                )
+                if len(bridge_rows) >= 4:
+                    break
+            if len(bridge_rows) >= 4:
+                break
+        return bridge_rows
+
+    def _build_query_community_map(
+        self,
+        query: str,
+        community_row: dict,
+        *,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> tuple[dict, list[dict]]:
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        community = str(community_row.get("community", "") or "").strip()
+        report = self.community_reports.get(community, {})
+        support = self._fast_query(
+            query,
+            top_k=max(2, min(RAG_MAX_COMMUNITY_MAP_SUPPORT, RAG_MAX_QUERY_RESULTS)),
+            category=category,
+            kind=kind,
+            allowed_communities={community},
+            qbundle=(qweights, qnorm, qentities, qcat),
+        )
+        support_rows = list(support.get("results", []) or [])
+        support_entities: Counter[str] = Counter()
+        support_titles: list[str] = []
+        evidence_lines: list[str] = []
+        support_citations: list[str] = []
+        for row in support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT]:
+            title = str(row.get("title", "") or "").strip()
+            citation = str(row.get("citation", "") or "").strip()
+            if title:
+                support_titles.append(title)
+            if citation:
+                support_citations.append(citation)
+            support_entities.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+            snippet = trim(str(row.get("text", "") or ""), 220)
+            if citation or title or snippet:
+                evidence_lines.append(f"{citation} {title}: {snippet}".strip())
+        report_entities = [str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()]
+        overlap_entities = [ent for ent in report_entities if ent in qentities]
+        if not overlap_entities:
+            overlap_entities = [name for name, _ in support_entities.most_common(8) if name in qentities]
+        if not overlap_entities:
+            overlap_entities = [name for name, _ in support_entities.most_common(8)]
+        if not overlap_entities:
+            overlap_entities = report_entities[:8]
+        representative_docs = [
+            str(row.get("title", "") or "").strip()
+            for row in (report.get("representative_docs", []) or [])[:4]
+            if isinstance(row, dict) and str(row.get("title", "") or "").strip()
+        ]
+        links = [
+            f"{str(row.get('community', '') or '').strip()} ({int(row.get('weight', 0) or 0)})"
+            for row in (report.get("links", []) or [])[:4]
+            if isinstance(row, dict) and str(row.get("community", "") or "").strip()
+        ]
+        map_lines = [
+            f"Query-specific community map for {community}.",
+            f"Community coverage: {int(report.get('doc_count', 0) or 0)} documents.",
+        ]
+        if report.get("top_categories"):
+            map_lines.append("Top categories: " + ", ".join(str(x) for x in (report.get("top_categories", []) or [])[:3]))
+        if report.get("top_kinds"):
+            map_lines.append("Modalities: " + ", ".join(str(x) for x in (report.get("top_kinds", []) or [])[:3]))
+        if overlap_entities:
+            map_lines.append("Query-aligned entities: " + ", ".join(overlap_entities[:8]))
+        if support_titles:
+            map_lines.append("Most relevant local evidence: " + ", ".join(support_titles[:4]))
+        elif representative_docs:
+            map_lines.append("Representative documents: " + ", ".join(representative_docs[:4]))
+        if links:
+            map_lines.append("Cross-community adjacency: " + ", ".join(links[:4]))
+        if evidence_lines:
+            map_lines.append("Evidence focus:\n" + "\n".join(evidence_lines[:3]))
+        elif str(report.get("report", "")).strip():
+            map_lines.append("Fallback report context: " + trim(str(report.get("report", "") or ""), 480))
+        map_text = trim("\n".join(map_lines), 2600)
+        map_score = max(
+            float(community_row.get("score", 0.0) or 0.0),
+            0.34
+            + min(0.20, 0.05 * len(support_rows))
+            + min(0.14, 0.04 * len(overlap_entities))
+            + (0.05 if links else 0.0),
+        )
+        return (
+            {
+                "score": round(map_score, 6),
+                "lexical_score": round(float(community_row.get("lexical_score", 0.0) or 0.0), 6),
+                "graph_score": round(float(community_row.get("graph_score", 0.0) or 0.0) + min(0.16, 0.03 * len(support_rows)), 6),
+                "doc_id": "",
+                "chunk_id": "",
+                "title": f"Community Map · {community}",
+                "filename": "",
+                "kind": "community_map",
+                "category": str((report.get("top_categories", []) or [community_row.get("category", "document")])[0]),
+                "community": community,
+                "language": str((report.get("top_languages", []) or [community_row.get("language", "unknown")])[0]),
+                "anchor": "",
+                "text": map_text,
+                "entities": overlap_entities[:12],
+                "citation": f"[community-map:{community}]",
+                "route_evidence": "community_map",
+                "sort_bias": 0.28,
+                "evidence_citations": support_citations[:6],
+            },
+            support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT],
+        )
+
+    def _build_global_reduce_row(
+        self,
+        query: str,
+        map_rows: list[dict],
+        bridge_rows: list[dict],
+        support_rows: list[dict],
+        qentities: set[str],
+    ) -> dict | None:
+        if not map_rows:
+            return None
+
+        def _compact_text(value: str, limit: int = 220) -> str:
+            flat = " ".join(part.strip() for part in str(value or "").splitlines() if part.strip())
+            return trim(flat, limit)
+
+        selected_communities = [str(row.get("community", "") or "").strip() for row in map_rows if str(row.get("community", "") or "").strip()]
+        selected_communities = [x for x in selected_communities if x]
+        entity_counter: Counter[str] = Counter()
+        for row in map_rows:
+            entity_counter.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+        for row in support_rows[:8]:
+            entity_counter.update([str(x).strip() for x in (row.get("entities", []) or []) if str(x).strip()])
+        for ent in sorted(qentities):
+            if ent:
+                entity_counter[ent] += 2
+        bridge_summaries = []
+        for row in bridge_rows[:3]:
+            bridge_summaries.append(_compact_text(str(row.get("text", "") or ""), 180))
+        evidence_anchors = []
+        seen_anchors: set[str] = set()
+        for row in support_rows[:8]:
+            citation = str(row.get("citation", "") or "").strip()
+            title = str(row.get("title", "") or "").strip()
+            anchor = f"{citation} {title}".strip()
+            if not anchor or anchor in seen_anchors:
+                continue
+            seen_anchors.add(anchor)
+            evidence_anchors.append(anchor)
+        reduce_lines = [
+            f"Global map-reduce synthesis for query: {query}",
+            "Communities selected: " + ", ".join(selected_communities[:RAG_MAX_GLOBAL_COMMUNITIES]),
+            "Community reductions:",
+        ]
+        for row in map_rows[:RAG_MAX_GLOBAL_COMMUNITIES]:
+            reduce_lines.append(
+                f"- {str(row.get('community', '') or '').strip()}: {_compact_text(str(row.get('text', '') or ''), 240)}"
+            )
+        if bridge_summaries:
+            reduce_lines.append("Cross-community bridges: " + " | ".join(bridge_summaries))
+        if entity_counter:
+            reduce_lines.append(
+                "Shared concepts/entities: "
+                + ", ".join(name for name, _ in entity_counter.most_common(10) if name)
+            )
+        if evidence_anchors:
+            reduce_lines.append("Evidence anchors: " + "; ".join(evidence_anchors[:6]))
+        text = trim("\n".join(reduce_lines), 3200)
+        score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
+        return {
+            "score": round(score, 6),
+            "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
+            "graph_score": round(float(map_rows[0].get("graph_score", 0.0) or 0.0) + 0.12, 6),
+            "doc_id": "",
+            "chunk_id": "",
+            "title": "Global Synthesis",
+            "filename": "",
+            "kind": "global_synthesis",
+            "category": str(map_rows[0].get("category", "document") or "document"),
+            "community": selected_communities[0] if selected_communities else "",
+            "language": str(map_rows[0].get("language", "unknown") or "unknown"),
+            "anchor": "",
+            "text": text,
+            "entities": [name for name, _ in entity_counter.most_common(12) if name],
+            "citation": "[global-synthesis]",
+            "route_evidence": "community_reduce",
+            "sort_bias": 0.38,
+        }
+
+    def _global_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        route_meta: dict | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "global",
+                "route_meta": {"mode": "global"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        community_rows = self._rank_global_communities(
+            query,
+            category=category,
+            kind=kind,
+            qbundle=(qweights, qnorm, qentities, qcat),
+        )
+        select_limit = 1 if len(community_rows) <= 1 else max(2, min(RAG_MAX_GLOBAL_COMMUNITIES, int(top_k or 4)))
+        selected_rows = community_rows[:select_limit]
+        selected_communities = [str(row.get("community", "") or "").strip() for row in selected_rows if str(row.get("community", "") or "").strip()]
+        if not selected_communities:
+            fallback = self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+            meta = dict(route_meta or {})
+            meta.update(
+                {
+                    "mode": "global",
+                    "fallback_route": "fast",
+                    "selected_communities": [],
+                    "community_result_count": 0,
+                    "bridge_count": 0,
+                    "support_count": len(list(fallback.get("results", []) or [])),
+                    "map_count": 0,
+                }
+            )
+            out = self._finalize_query_rows(
+                query,
+                list(fallback.get("results", []) or []),
+                qentities,
+                top_k=top_k,
+                route="global",
+                route_meta=meta,
+            )
+            out["summary"] = str(fallback.get("summary", "") or out.get("summary", "") or "")
+            return out
+        map_rows: list[dict] = []
+        support_rows: list[dict] = []
+        for row in selected_rows:
+            map_row, map_support = self._build_query_community_map(
+                query,
+                row,
+                category=category,
+                kind=kind,
+                qbundle=(qweights, qnorm, qentities, qcat),
+            )
+            if map_row:
+                map_rows.append(map_row)
+            support_rows.extend(map_support[:2])
+        bridge_rows = self._build_global_bridge_rows(selected_communities)
+        reduce_row = self._build_global_reduce_row(query, map_rows, bridge_rows, support_rows, qentities)
+        rows: list[dict] = []
+        if reduce_row:
+            rows.append(reduce_row)
+        rows.extend(map_rows)
+        rows.extend(bridge_rows[:3])
+        rows.extend(support_rows)
+        if len(rows) < max(3, min(int(top_k or 4), 6)):
+            rows.extend(selected_rows[:2])
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": "global",
+                "selected_communities": selected_communities[:6],
+                "community_result_count": len(community_rows),
+                "bridge_count": len(bridge_rows),
+                "support_count": len(support_rows),
+                "map_count": len(map_rows),
+                "reduce_mode": "community_map_reduce",
+            }
+        )
+        out = self._finalize_query_rows(query, rows, qentities, top_k=top_k, route="global", route_meta=meta)
+        if reduce_row and str(reduce_row.get("text", "")).strip():
+            out["summary"] = str(reduce_row.get("text", "") or "")
+            out["global_synthesis"] = dict(reduce_row)
+        out["community_maps"] = [dict(row) for row in map_rows[:RAG_MAX_GLOBAL_COMMUNITIES]]
+        return out
+
+    def _hybrid_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        route_meta: dict | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "hybrid",
+                "route_meta": {"mode": "hybrid"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        global_out = self._global_query(query, top_k=max(4, min(top_k, 6)), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        fast_rows = list(fast.get("results", []) or [])
+        global_rows = list(global_out.get("results", []) or [])
+        merged: list[dict] = []
+        fi = 0
+        gi = 0
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        while len(merged) < limit and (gi < len(global_rows) or fi < len(fast_rows)):
+            if gi < len(global_rows):
+                merged.append(global_rows[gi])
+                gi += 1
+            for _ in range(2):
+                if len(merged) >= limit:
+                    break
+                if fi < len(fast_rows):
+                    merged.append(fast_rows[fi])
+                    fi += 1
+            if gi >= len(global_rows) and fi >= len(fast_rows):
+                break
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": "hybrid",
+                "fast_count": len(fast_rows),
+                "global_count": len(global_rows),
+                "selected_communities": list(global_out.get("route_meta", {}).get("selected_communities", []) or [])[:6],
+                "map_count": int(global_out.get("route_meta", {}).get("map_count", 0) or 0),
+                "reduce_mode": str(global_out.get("route_meta", {}).get("reduce_mode", "") or ""),
+            }
+        )
+        out = self._finalize_query_rows(query, merged, qentities, top_k=top_k, route="hybrid", route_meta=meta)
+        if str(global_out.get("summary", "") or "").strip():
+            out["summary"] = str(global_out.get("summary", "") or "")
+        if isinstance(global_out.get("global_synthesis"), dict):
+            out["global_synthesis"] = dict(global_out.get("global_synthesis", {}) or {})
+        if isinstance(global_out.get("community_maps"), list):
+            out["community_maps"] = [dict(x) for x in (global_out.get("community_maps", []) or []) if isinstance(x, dict)]
+        return out
+
+    def query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        route: str = "auto",
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qbundle = self._query_weights(query)
+        wanted = str(route or "auto").strip().lower()
+        if wanted not in {"auto", "fast", "global", "hybrid"}:
+            wanted = "auto"
+        decided = wanted
+        meta: dict = {"requested_route": wanted}
+        if wanted == "auto":
+            decided, route_meta = self._decide_query_route(query, top_k=top_k, qbundle=qbundle)
+            meta.update(route_meta)
+        else:
+            meta.update({"mode": wanted, "community_count": len(self.community_reports)})
+            if wanted == "global" and len(self.community_reports) <= 1:
+                decided = "hybrid" if len(self.community_reports) == 1 else "fast"
+                meta["fallback_route"] = decided
+        if decided == "global":
+            return self._global_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
+        if decided == "hybrid":
+            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
+        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle)
+
+    def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        entity_nodes: dict[str, str] = {}
+        community_nodes: dict[str, str] = {}
+        try:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES if max_nodes is None else max_nodes)
+        except Exception:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES or 0)
+        node_budget = None if max_nodes_int <= 0 else max(20, max_nodes_int)
+        for doc in docs:
+            if node_budget is not None and len(nodes) >= node_budget:
+                break
+            doc_id = str(doc.get("id", ""))
+            doc_node = f"doc:{doc_id}"
+            nodes.append(
+                {
+                    "id": doc_node,
+                    "label": str(doc.get("title", doc_id)),
+                    "type": "document",
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "kind": str(doc.get("kind", "")),
+                }
+            )
+            community = str(doc.get("community", "") or "")
+            if community and community not in community_nodes and (node_budget is None or len(nodes) < node_budget):
+                community_id = f"community:{len(community_nodes)+1}"
+                community_nodes[community] = community_id
+                nodes.append({"id": community_id, "label": community, "type": "community"})
+            community_id = community_nodes.get(community, "")
+            if community_id:
+                edges.append({"source": doc_node, "target": community_id, "type": "belongs_to"})
+            for ent in list(doc.get("entities", []) or [])[:6]:
+                key = str(ent).strip()
+                if not key:
+                    continue
+                ent_id = entity_nodes.get(key)
+                if not ent_id and (node_budget is None or len(nodes) < node_budget):
+                    ent_id = f"entity:{hashlib.sha1(key.encode('utf-8', errors='ignore')).hexdigest()[:10]}"
+                    entity_nodes[key] = ent_id
+                    nodes.append({"id": ent_id, "label": key, "type": "entity"})
+                if ent_id:
+                    edges.append({"source": doc_node, "target": ent_id, "type": "mentions"})
+            for other, weight in list((self.related_docs.get(doc_id, {}) or {}).items())[:4]:
+                if other == doc_id:
+                    continue
+                edges.append({"source": doc_node, "target": f"doc:{other}", "type": "related", "weight": int(weight or 0)})
+        node_ids = {str(row.get("id", "")) for row in nodes if str(row.get("id", "")).strip()}
+        edges = [
+            dict(row)
+            for row in edges
+            if str(row.get("source", "")).strip() in node_ids and str(row.get("target", "")).strip() in node_ids
+        ]
+        return {
+            "built_at": self.built_at,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "communities": dict(self.community_counts),
+        }
+
+
+class RAGLibraryStore:
+    def _init_storage_layout(self, root: Path):
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "library_state.json"
+        self.documents_path = self.root / "documents.json"
+        self.chunks_path = self.root / "chunks.json"
+        self.tasks_path = self.root / "tasks.json"
+        self.index_snapshot_path = self.root / "index_snapshot.json"
+        self.backup_root = self.root / "backup"
+        self.parsed_root = self.root / "parsed"
+        self.assets_root = self.root / "assets"
+        self.inbox_root = self.root / "inbox"
+        self.queue_root = self.root / "queue"
+        for path in (self.backup_root, self.parsed_root, self.assets_root, self.inbox_root, self.queue_root):
+            path.mkdir(parents=True, exist_ok=True)
+
+    def __init__(self, root: Path, include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT):
+        self._init_storage_layout(root)
+        self.lock = threading.RLock()
+        self.include_filename_entities = bool(include_filename_entities)
+        self.created_at = now_ts()
+        self.updated_at = now_ts()
+        self.content_updated_at = now_ts()
+        self.documents: dict[str, dict] = {}
+        self.chunks: dict[str, dict] = {}
+        self.tasks: list[dict] = []
+        self.index = TFGraphIDFIndex(include_filename_entities=self.include_filename_entities)
+        self._load()
+        if not self._restore_index_snapshot():
+            self.rebuild_index(persist_snapshot=True)
+
+    def _rel(self, path: Path) -> str:
+        target = path.resolve()
+        if target.is_relative_to(self.root):
+            return target.relative_to(self.root).as_posix()
+        return str(target)
+
+    def _load(self):
+        raw = _read_json_file(self.state_path, {})
+        if not isinstance(raw, dict):
+            raw = {}
+        use_shards = any(path.exists() for path in (self.documents_path, self.chunks_path, self.tasks_path)) or int(
+            raw.get("format_version", 0) or 0
+        ) >= 2
+        if use_shards:
+            docs_raw = _read_json_file(self.documents_path, {})
+            chunks_raw = _read_json_file(self.chunks_path, {})
+            tasks_raw = _read_json_file(self.tasks_path, [])
+        else:
+            docs_raw = raw.get("documents", {})
+            chunks_raw = raw.get("chunks", {})
+            tasks_raw = raw.get("tasks", [])
+        if isinstance(docs_raw, dict):
+            self.documents = {str(k): dict(v) for k, v in docs_raw.items() if isinstance(v, dict)}
+        if isinstance(chunks_raw, dict):
+            self.chunks = {str(k): dict(v) for k, v in chunks_raw.items() if isinstance(v, dict)}
+        if isinstance(tasks_raw, list):
+            self.tasks = [dict(x) for x in tasks_raw[-RAG_TASK_HISTORY_LIMIT:] if isinstance(x, dict)]
+        self.created_at = float(raw.get("created_at", self.created_at) or self.created_at)
+        self.updated_at = float(raw.get("updated_at", self.updated_at) or self.updated_at)
+        self.content_updated_at = float(
+            raw.get("content_updated_at", raw.get("updated_at", self.content_updated_at)) or self.content_updated_at
+        )
+
+    def _save_locked(
+        self,
+        *,
+        write_documents: bool = True,
+        write_chunks: bool = True,
+        write_tasks: bool = True,
+        write_manifest: bool = True,
+    ):
+        tasks_payload = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+        payload = {
+            "format_version": 2,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "content_updated_at": self.content_updated_at,
+            "documents_count": len(self.documents),
+            "chunks_count": len(self.chunks),
+            "tasks_count": len(tasks_payload),
+            "documents_file": self.documents_path.name,
+            "chunks_file": self.chunks_path.name,
+            "tasks_file": self.tasks_path.name,
+            "index_file": self.index_snapshot_path.name,
+        }
+        if write_documents:
+            _write_json_file(self.documents_path, self.documents)
+        if write_chunks:
+            _write_json_file(self.chunks_path, self.chunks)
+        if write_tasks:
+            _write_json_file(self.tasks_path, tasks_payload)
+        if write_manifest:
+            _write_json_file(self.state_path, payload)
+
+    def _index_snapshot_payload_locked(self) -> dict:
+        return {
+            "content_updated_at": float(self.content_updated_at or 0.0),
+            "documents_count": len(self.documents),
+            "chunks_count": len(self.chunks),
+            "include_filename_entities": bool(self.index.include_filename_entities),
+            "index": self.index.snapshot(),
+        }
+
+    def _persist_index_snapshot(self):
+        with self.lock:
+            payload = self._index_snapshot_payload_locked()
+        _write_json_file(self.index_snapshot_path, payload)
+
+    def _restore_index_snapshot(self) -> bool:
+        raw = _read_json_file(self.index_snapshot_path, {})
+        if not isinstance(raw, dict):
+            return False
+        try:
+            if int(raw.get("documents_count", -1) or -1) != len(self.documents):
+                return False
+            if int(raw.get("chunks_count", -1) or -1) != len(self.chunks):
+                return False
+            if bool(raw.get("include_filename_entities", RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT)) != bool(
+                self.index.include_filename_entities
+            ):
+                return False
+            snapshot_updated = float(raw.get("content_updated_at", 0.0) or 0.0)
+            if snapshot_updated and abs(snapshot_updated - float(self.content_updated_at or 0.0)) > 1e-6:
+                return False
+            return self.index.restore(raw.get("index", {}) if isinstance(raw.get("index", {}), dict) else {})
+        except Exception:
+            return False
+
+    def _find_doc_by_sha_locked(self, sha256: str) -> str:
+        target = str(sha256 or "").strip()
+        if not target:
+            return ""
+        for doc_id, row in self.documents.items():
+            if str(row.get("sha256", "") or "").strip() == target:
+                return doc_id
+        return ""
+
+    def register_task(self, task: dict) -> dict:
+        row = dict(task or {})
+        row["id"] = str(row.get("id") or make_id("ragtask"))
+        row["status"] = str(row.get("status", "queued") or "queued")
+        row["submitted_at"] = float(row.get("submitted_at", now_ts()) or now_ts())
+        with self.lock:
+            self.tasks.append(row)
+            self.tasks = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+            self.updated_at = now_ts()
+            self._save_locked(write_documents=False, write_chunks=False)
+        return row
+
+    def update_task(self, task_id: str, **fields):
+        with self.lock:
+            for idx in range(len(self.tasks) - 1, -1, -1):
+                row = self.tasks[idx]
+                if str(row.get("id", "")) != str(task_id):
+                    continue
+                patched = dict(row)
+                patched.update(fields)
+                patched["updated_at"] = now_ts()
+                self.tasks[idx] = patched
+                self.updated_at = now_ts()
+                self._save_locked(write_documents=False, write_chunks=False)
+                return
+
+    def list_tasks(self, limit: int = 60) -> list[dict]:
+        with self.lock:
+            rows = [dict(x) for x in self.tasks[-max(1, int(limit or 60)) :]]
+        rows.sort(key=lambda x: float(x.get("submitted_at", 0.0) or 0.0), reverse=True)
+        return rows
+
+    def get_task(self, task_id: str) -> dict | None:
+        target = str(task_id or "").strip()
+        if not target:
+            return None
+        with self.lock:
+            for row in reversed(self.tasks):
+                if str(row.get("id", "") or "").strip() == target:
+                    return dict(row)
+        return None
+
+    def incomplete_tasks(self) -> list[dict]:
+        rows: list[dict] = []
+        with self.lock:
+            for row in self.tasks:
+                status = str(row.get("status", "") or "").strip().lower()
+                if status in {"queued", "running"}:
+                    rows.append(dict(row))
+        rows.sort(key=lambda x: float(x.get("submitted_at", 0.0) or 0.0))
+        return rows
+
+    def rebuild_index(self, persist_snapshot: bool = True):
+        with self.lock:
+            docs = [dict(v) for v in self.documents.values()]
+            chunks = [dict(v) for v in self.chunks.values()]
+        self.index.build(docs, chunks)
+        if persist_snapshot:
+            try:
+                self._persist_index_snapshot()
+            except Exception:
+                pass
+
+    def flush_content_state(self):
+        with self.lock:
+            self.updated_at = now_ts()
+            self._save_locked(write_tasks=False)
+
+    def library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        with self.lock:
+            docs = sorted(
+                (dict(v) for v in self.documents.values()),
+                key=lambda x: float(x.get("updated_at", x.get("created_at", 0.0)) or 0.0),
+                reverse=True,
+            )
+            chunks_total = len(self.chunks)
+            task_total = len(self.tasks)
+        categories = Counter(str(x.get("category", "document") or "document") for x in docs)
+        communities = Counter(
+            {
+                str(name): int(count or 0)
+                for name, count in (self.index.community_counts or {}).items()
+                if str(name).strip()
+            }
+        )
+        try:
+            doc_limit = int(limit)
+        except Exception:
+            doc_limit = 240
+        try:
+            doc_offset = max(0, int(offset))
+        except Exception:
+            doc_offset = 0
+        if doc_limit < 0:
+            selected_docs = docs[doc_offset:]
+        elif doc_limit == 0:
+            selected_docs = []
+        else:
+            selected_docs = docs[doc_offset : doc_offset + doc_limit]
+        total_docs = len(docs)
+        returned_docs = len(selected_docs)
+        return {
+            "root": str(self.root),
+            "updated_at": self.updated_at,
+            "content_updated_at": self.content_updated_at,
+            "total_documents": total_docs,
+            "returned_documents": returned_docs,
+            "offset": doc_offset,
+            "limit": doc_limit,
+            "has_more": (doc_offset + returned_docs) < total_docs,
+            "stats": {
+                "documents": total_docs,
+                "chunks": chunks_total,
+                "tasks": task_total,
+                "categories": dict(categories),
+                "communities": dict(communities.most_common(12)),
+                "dynamic_noise_hard_tokens": len(self.index.dynamic_noise_hard_tokens),
+                "dynamic_noise_soft_tokens": len(self.index.dynamic_noise_penalties),
+            },
+            "documents": [
+                {
+                    "id": str(x.get("id", "")),
+                    "title": str(x.get("title", "")),
+                    "filename": str(x.get("filename", "")),
+                    "kind": str(x.get("kind", "")),
+                    "category": str(x.get("category", "")),
+                    "language": str(x.get("language", "")),
+                    "community": str(
+                        self.index.doc_meta.get(str(x.get("id", "")), {}).get("community", x.get("community", ""))
+                    ),
+                    "chunk_count": int(x.get("chunk_count", 0) or 0),
+                    "assets_count": len(x.get("assets", []) or []),
+                    "summary": trim(str(x.get("summary", "") or ""), 420),
+                    "backup_path": str(x.get("backup_path", "")),
+                    "parsed_text_path": str(x.get("parsed_text_path", "")),
+                    "source_rel_path": str(x.get("source_rel_path", "")),
+                    "sha256": str(x.get("sha256", "")),
+                    "session_id": str(x.get("session_id", "")),
+                    "source_mode": str(x.get("source_mode", "")),
+                    "updated_at": float(x.get("updated_at", 0.0) or 0.0),
+                }
+                for x in selected_docs
+            ],
+        }
+
+    def filesystem_payload(self, max_nodes: int = 320) -> dict:
+        node_count = 0
+        truncated = False
+
+        def walk(path: Path, depth: int = 0) -> dict:
+            nonlocal node_count, truncated
+            node_count += 1
+            if node_count >= max_nodes:
+                truncated = True
+            row = {
+                "name": path.name or str(path),
+                "path": self._rel(path),
+                "type": "dir" if path.is_dir() else "file",
+            }
+            if path.is_file():
+                try:
+                    row["size"] = int(path.stat().st_size)
+                except Exception:
+                    row["size"] = 0
+                return row
+            children: list[dict] = []
+            if not truncated and depth < 6:
+                try:
+                    items = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                except Exception:
+                    items = []
+                for child in items:
+                    if node_count >= max_nodes:
+                        truncated = True
+                        break
+                    children.append(walk(child, depth + 1))
+            row["children"] = children
+            return row
+
+        tree = walk(self.root)
+        return {
+            "root": str(self.root),
+            "generated_at": now_ts(),
+            "node_count": node_count,
+            "truncated": truncated,
+            "tree": tree,
+        }
+
+    def ingest_document(
+        self,
+        *,
+        doc_id: str,
+        source_path: Path | None,
+        original_name: str,
+        parse_result: dict,
+        raw_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        session_id: str = "",
+        user_id: str = "",
+        source_rel_path: str = "",
+        tags: list[str] | None = None,
+        multimodal: dict | None = None,
+        asset_sources: list[dict] | None = None,
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        source_fp = Path(source_path).resolve() if isinstance(source_path, Path) else None
+        rel_raw = str(source_rel_path or "").strip().replace("\\", "/").lstrip("/")
+        rel_path_clean = "/".join(part for part in PurePosixPath(rel_raw).parts if part not in {"", ".", ".."})
+        if raw_bytes is None and source_fp and source_fp.exists():
+            raw_bytes = source_fp.read_bytes()
+        sha256 = str(parse_result.get("sha256", "") or "").strip()
+        if not sha256:
+            if raw_bytes is not None:
+                sha256 = _sha256_bytes(raw_bytes)
+            elif source_fp and source_fp.exists():
+                sha256 = _sha256_file(source_fp)
+        with self.lock:
+            existing_doc_id = self._find_doc_by_sha_locked(sha256)
+            if existing_doc_id:
+                row = dict(self.documents.get(existing_doc_id, {}))
+                stamp = now_ts()
+                source_links = row.get("source_links", [])
+                if not isinstance(source_links, list):
+                    source_links = []
+                source_links.append(
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                )
+                row["source_links"] = source_links[-24:]
+                if rel_path_clean:
+                    row["source_rel_path"] = rel_path_clean
+                row["updated_at"] = stamp
+                row["duplicate_hits"] = int(row.get("duplicate_hits", 0) or 0) + 1
+                self.documents[existing_doc_id] = row
+                self.updated_at = stamp
+                if persist_now:
+                    self._save_locked(write_chunks=False, write_tasks=False)
+                return {
+                    "ok": True,
+                    "doc_id": existing_doc_id,
+                    "duplicate": True,
+                    "title": str(row.get("title", "")),
+                    "backup_path": str(row.get("backup_path", "")),
+                }
+        safe_name = _rag_safe_name(original_name or (source_fp.name if source_fp else "document.bin"))
+        backup_dir = self.backup_root / doc_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / safe_name
+        if raw_bytes is not None:
+            backup_path.write_bytes(raw_bytes)
+        elif source_fp and source_fp.exists():
+            shutil.copy2(source_fp, backup_path)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 160_000)
+        multimodal_row = dict(multimodal or {})
+        mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
+        mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
+        mm_entities = [str(x).strip() for x in (multimodal_row.get("entities", []) or []) if str(x).strip()]
+        if mm_summary:
+            semantic_text = (semantic_text + "\n\n[Multimodal Summary]\n" + mm_summary).strip() if semantic_text else mm_summary
+        if not semantic_text:
+            title_line = f"title: {safe_name}\n" if self.include_filename_entities else ""
+            semantic_text = (
+                title_line + f"kind: {parse_result.get('kind', 'document')}\n"
+                f"category: {parse_result.get('category', 'document')}\n"
+                f"mime: {parse_result.get('mime', '')}\n"
+            )
+        parsed_path = self.parsed_root / f"{doc_id}.md"
+        parsed_path.write_text(f"# {safe_name}\n\n{semantic_text}\n", encoding="utf-8")
+        asset_rows: list[dict] = []
+        asset_dir = self.assets_root / doc_id
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        if str(parse_result.get("kind", "")) in {"image", "audio", "video"}:
+            asset_rows.append(
+                {
+                    "type": str(parse_result.get("kind", "")),
+                    "path": self._rel(backup_path),
+                    "name": backup_path.name,
+                    "mime": str(parse_result.get("mime", "")),
+                    "size": int(parse_result.get("size", 0) or 0),
+                }
+            )
+        for idx, row in enumerate(asset_sources or [], 1):
+            src_raw = str(row.get("path", "") or "").strip()
+            if not src_raw:
+                continue
+            src = Path(src_raw)
+            if not src.exists() or not src.is_file():
+                continue
+            safe_asset = _rag_safe_name(str(row.get("name", "") or src.name), fallback=f"asset_{idx}")
+            dst = asset_dir / safe_asset
+            if src.resolve() != dst.resolve():
+                shutil.copy2(src, dst)
+            asset_rows.append(
+                {
+                    "type": str(row.get("type", "image") or "image"),
+                    "path": self._rel(dst),
+                    "name": dst.name,
+                    "mime": str(row.get("mime", guess_mime_from_name(dst.name, "application/octet-stream")) or ""),
+                    "size": int(dst.stat().st_size) if dst.exists() else 0,
+                    "page": int(row.get("page", 0) or 0),
+                }
+            )
+        tags_clean = [str(x).strip() for x in (tags or []) if str(x).strip()]
+        combined_entities = _rag_apply_filename_entity_policy(
+            _rag_extract_entities(semantic_text),
+            safe_name,
+            source_rel_path=rel_path_clean,
+            allow_filename_entities=self.include_filename_entities,
+            limit=32,
+        )
+        for ent in mm_entities:
+            if _rag_entity_allowed(ent) and ent not in combined_entities:
+                combined_entities.append(ent)
+        combined_entities = _rag_apply_filename_entity_policy(
+            combined_entities,
+            safe_name,
+            source_rel_path=rel_path_clean,
+            allow_filename_entities=self.include_filename_entities,
+            limit=32,
+        )
+        community = _rag_choose_community(
+            parse_result.get("category", "document"),
+            parse_result.get("language", "unknown"),
+            combined_entities,
+            "",
+        )
+        chunks = _rag_chunk_text(semantic_text)
+        chunk_ids: list[str] = []
+        with self.lock:
+            stamp = now_ts()
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                chunk_id = f"{doc_id}_c{chunk_idx:03d}"
+                chunk_text = str(chunk.get("text", "") or "")
+                row = {
+                    "id": chunk_id,
+                    "doc_id": doc_id,
+                    "seq": chunk_idx,
+                    "anchor": str(chunk.get("anchor", "") or ""),
+                    "text": chunk_text,
+                    "entities": _rag_apply_filename_entity_policy(
+                        _rag_extract_entities(chunk_text),
+                        safe_name,
+                        source_rel_path=rel_path_clean,
+                        allow_filename_entities=self.include_filename_entities,
+                        limit=24,
+                    ),
+                }
+                self.chunks[chunk_id] = row
+                chunk_ids.append(chunk_id)
+            doc_row = {
+                "id": doc_id,
+                "title": safe_name,
+                "filename": safe_name,
+                "kind": str(parse_result.get("kind", "document") or "document"),
+                "category": str(parse_result.get("category", "document") or "document"),
+                "labels": sorted({str(x) for x in list(parse_result.get("labels", []) or []) + tags_clean + mm_tags if str(x).strip()}),
+                "language": str(parse_result.get("language", "unknown") or "unknown"),
+                "mime": str(parse_result.get("mime", "") or ""),
+                "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
+                "sha256": sha256,
+                "source_mode": str(source_mode or "manual"),
+                "source_path": str(source_fp or ""),
+                "source_rel_path": rel_path_clean,
+                "backup_path": self._rel(backup_path),
+                "parsed_text_path": self._rel(parsed_path),
+                "summary": trim(mm_summary or str(parse_result.get("summary", "") or semantic_text), 1600),
+                "entities": combined_entities,
+                "community": community,
+                "chunk_count": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+                "assets": asset_rows,
+                "multimodal": multimodal_row,
+                "session_id": str(session_id or ""),
+                "user_id": str(user_id or ""),
+                "source_links": [
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                ],
+                "created_at": stamp,
+                "updated_at": stamp,
+                "import_mark": True,
+            }
+            self.documents[doc_id] = doc_row
+            self.updated_at = stamp
+            self.content_updated_at = stamp
+            if persist_now:
+                self._save_locked(write_tasks=False)
+        if rebuild_index_now:
+            self.rebuild_index()
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "duplicate": False,
+            "title": safe_name,
+            "backup_path": self._rel(backup_path),
+            "parsed_text_path": self._rel(parsed_path),
+            "chunk_count": len(chunk_ids),
+        }
+
+
+def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
+    try:
+        parser = RAGContentParser(include_filename_entities=include_filename_entities)
+        result = parser.parse_file(Path(source_path), mime=mime, text_override=text_override)
+        send_conn.send({"ok": True, "result": result})
+    except Exception as exc:
+        try:
+            send_conn.send({"ok": False, "error": trim(str(exc), 320)})
+        except Exception:
+            pass
+    finally:
+        try:
+            send_conn.close()
+        except Exception:
+            pass
+
+
+class RAGIngestionService:
+    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None):
+        self.store = store
+        self.parser = parser
+        self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_count = int(RAG_IMPORT_WORKER_COUNT)
+        self.parse_timeout_seconds = int(RAG_PARSE_TIMEOUT_SECONDS)
+        self.resume_report = {"resumed": 0, "failed": 0, "cleaned": 0}
+        self._flush_lock = threading.Lock()
+        self.threads = [
+            threading.Thread(target=self._worker_loop, name=f"rag-ingestion-{idx+1}", daemon=True)
+            for idx in range(self.worker_count)
+        ]
+        for thread in self.threads:
+            thread.start()
+        self._cleanup_finished_job_artifacts()
+        self._resume_incomplete_tasks()
+
+    def __getattr__(self, name: str):
+        # Belt-and-suspenders: if _flush_lock was never set (e.g. partial init,
+        # subclass skipped super().__init__), create it on first access so we
+        # never crash with AttributeError inside _flush_ingest_state.
+        if name == "_flush_lock":
+            lock = threading.Lock()
+            object.__setattr__(self, "_flush_lock", lock)
+            return lock
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def _task_spool_path(self, task_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "").strip()) or "task"
+        return self.store.queue_root / f"{safe}.json"
+
+    def _serialize_job_value(self, value):
+        if isinstance(value, SessionState):
+            return None
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (bytes, bytearray)):
+            return {"__bytes_b64__": base64.b64encode(bytes(value)).decode("ascii")}
+        if isinstance(value, dict):
+            out: dict[str, object] = {}
+            for key, item in value.items():
+                if str(key) == "session":
+                    continue
+                out[str(key)] = self._serialize_job_value(item)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [self._serialize_job_value(item) for item in value]
+        return value
+
+    def _deserialize_job_value(self, value):
+        if isinstance(value, dict):
+            if set(value.keys()) == {"__bytes_b64__"}:
+                try:
+                    return base64.b64decode(str(value.get("__bytes_b64__", "") or ""))
+                except Exception:
+                    return b""
+            return {str(key): self._deserialize_job_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._deserialize_job_value(item) for item in value]
+        return value
+
+    def _persist_job_payload(self, job: dict):
+        task_id = str(job.get("task_id", "") or "").strip()
+        if not task_id:
+            return
+        payload = {
+            "version": 1,
+            "task_id": task_id,
+            "saved_at": now_ts(),
+            "job": self._serialize_job_value(dict(job)),
+        }
+        spool_path = self._task_spool_path(task_id)
+        _write_json_file(spool_path, payload)
+        self.store.update_task(task_id, job_spool_path=self.store._rel(spool_path))
+
+    def _load_job_payload(self, task_id: str) -> dict | None:
+        spool_path = self._task_spool_path(task_id)
+        raw = _read_json_file(spool_path, {})
+        if not isinstance(raw, dict):
+            return None
+        payload = raw.get("job", {})
+        if not isinstance(payload, dict):
+            return None
+        job = self._deserialize_job_value(payload)
+        return dict(job) if isinstance(job, dict) else None
+
+    def _drop_job_payload(self, task_id: str):
+        try:
+            self._task_spool_path(task_id).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _cleanup_task_inbox(self, task_id: str):
+        prefix = str(task_id or "").strip()
+        if not prefix:
+            return
+        try:
+            targets = list(self.store.inbox_root.glob(f"{prefix}*"))
+        except Exception:
+            targets = []
+        for path in targets:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _cleanup_finished_job_artifacts(self):
+        cleaned = 0
+        with self.store.lock:
+            rows = [dict(x) for x in self.store.tasks]
+        live_ids = {
+            str(row.get("id", "") or "").strip()
+            for row in rows
+            if str(row.get("status", "") or "").strip().lower() in {"queued", "running"}
+        }
+        for row in rows:
+            task_id = str(row.get("id", "") or "").strip()
+            if not task_id or task_id in live_ids:
+                continue
+            self._cleanup_task_inbox(task_id)
+            self._drop_job_payload(task_id)
+            cleaned += 1
+        try:
+            for spool_path in self.store.queue_root.glob("*.json"):
+                if spool_path.stem not in live_ids:
+                    try:
+                        spool_path.unlink(missing_ok=True)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        self.resume_report["cleaned"] = int(cleaned)
+
+    def _resolve_job_session(self, session_id: str, user_id: str, current=None):
+        if isinstance(current, SessionState):
+            return current
+        if not callable(self.session_resolver):
+            return None
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        try:
+            return self.session_resolver(uid, str(session_id or "").strip())
+        except Exception:
+            return None
+
+    def _fallback_job_from_task(self, task: dict) -> dict | None:
+        row = dict(task or {})
+        task_id = str(row.get("id", "") or "").strip()
+        task_type = str(row.get("type", "") or "").strip()
+        session_id = str(row.get("session_id", "") or "").strip()
+        user_id = str(row.get("user_id", "") or "").strip()
+        source_path = str(row.get("source_path", "") or "").strip()
+        if task_type == "session_upload" and source_path:
+            return {
+                "type": "session_upload",
+                "task_id": task_id,
+                "source_path": source_path,
+                "parsed_path": str(row.get("parsed_path", "") or ""),
+                "filename": str(row.get("filename", row.get("label", Path(source_path).name)) or Path(source_path).name),
+                "mime": str(row.get("mime", "") or ""),
+                "session_id": session_id,
+                "user_id": user_id,
+                "source_mode": str(row.get("source_mode", "session_upload") or "session_upload"),
+            }
+        if task_type == "manual_import" and source_path:
+            return {
+                "type": "manual_import",
+                "task_id": task_id,
+                "path": source_path,
+                "recursive": bool(row.get("recursive", True)),
+                "title": str(row.get("label", "") or ""),
+                "filename": str(row.get("filename", "") or ""),
+                "mime": str(row.get("mime", "") or ""),
+                "session_id": session_id,
+                "user_id": user_id,
+                "source_mode": str(row.get("source_mode", "manual") or "manual"),
+                "tags": [str(x).strip() for x in (row.get("tags", []) or []) if str(x).strip()],
+                "strict_local_only": bool(row.get("strict_local_only", False)),
+            }
+        return None
+
+    def _resume_task_job(self, task: dict) -> bool:
+        row = dict(task or {})
+        task_id = str(row.get("id", "") or "").strip()
+        if not task_id:
+            return False
+        job = self._load_job_payload(task_id)
+        if not isinstance(job, dict):
+            job = self._fallback_job_from_task(row)
+        if not isinstance(job, dict):
+            self.store.update_task(
+                task_id,
+                status="failed",
+                finished_at=now_ts(),
+                error="pending import payload missing after restart; please submit the import again",
+            )
+            self._cleanup_task_inbox(task_id)
+            self._drop_job_payload(task_id)
+            self.resume_report["failed"] = int(self.resume_report.get("failed", 0) or 0) + 1
+            return False
+        session_id = str(job.get("session_id", row.get("session_id", "")) or "").strip()
+        user_id = str(job.get("user_id", row.get("user_id", "")) or "").strip()
+        session = self._resolve_job_session(session_id, user_id, job.get("session"))
+        if isinstance(session, SessionState):
+            job["session"] = session
+        else:
+            job.pop("session", None)
+        job["task_id"] = task_id
+        if not self._task_spool_path(task_id).exists():
+            self._persist_job_payload(job)
+        resume_count = int(row.get("resume_count", 0) or 0) + 1
+        self.store.update_task(
+            task_id,
+            status="queued",
+            started_at=0,
+            finished_at=0,
+            heartbeat_at=0,
+            error="",
+            resumed_at=now_ts(),
+            resume_count=resume_count,
+        )
+        self.queue.put(job)
+        self.resume_report["resumed"] = int(self.resume_report.get("resumed", 0) or 0) + 1
+        return True
+
+    def _resume_incomplete_tasks(self):
+        for row in self.store.incomplete_tasks():
+            try:
+                self._resume_task_job(row)
+            except Exception:
+                task_id = str(row.get("id", "") or "").strip()
+                if task_id:
+                    self.store.update_task(
+                        task_id,
+                        status="failed",
+                        finished_at=now_ts(),
+                        error="resume failed after restart",
+                    )
+                    self._cleanup_task_inbox(task_id)
+                    self._drop_job_payload(task_id)
+                    self.resume_report["failed"] = int(self.resume_report.get("failed", 0) or 0) + 1
+
+    def _queue_job(self, job: dict, *, persist: bool = True):
+        if persist:
+            self._persist_job_payload(job)
+        self.queue.put(job)
+
+    def shutdown(self, timeout: float = 2.0):
+        self.stop_event.set()
+        for _ in range(max(1, self.worker_count)):
+            try:
+                self.queue.put_nowait({"type": "__stop__"})
+            except Exception:
+                pass
+        per_thread_timeout = max(0.1, float(timeout or 0.1)) / max(1, len(self.threads))
+        for thread in self.threads:
+            try:
+                thread.join(timeout=per_thread_timeout)
+            except Exception:
+                pass
+
+    def enqueue_upload(self, session: SessionState, upload_meta: dict, workspace_target: Path, parsed_target: Path | None) -> dict:
+        task = self.store.register_task(
+            {
+                "type": "session_upload",
+                "label": str(upload_meta.get("filename", workspace_target.name)),
+                "source_path": str(workspace_target),
+                "filename": str(upload_meta.get("filename", workspace_target.name)),
+                "mime": str(upload_meta.get("mime", "") or ""),
+                "parsed_path": str(parsed_target) if parsed_target else "",
+                "session_id": str(getattr(session, "id", "") or ""),
+                "user_id": str(getattr(session, "owner_user_id", "") or ""),
+                "source_mode": "session_upload",
+            }
+        )
+        self._queue_job(
+            {
+                "type": "session_upload",
+                "task_id": str(task.get("id", "")),
+                "source_path": str(workspace_target),
+                "parsed_path": str(parsed_target) if parsed_target else "",
+                "filename": str(upload_meta.get("filename", workspace_target.name)),
+                "mime": str(upload_meta.get("mime", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+                "user_id": str(getattr(session, "owner_user_id", "") or ""),
+                "source_mode": "session_upload",
+            }
+        )
+        return {
+            "ok": True,
+            "queued": True,
+            "task_id": str(task.get("id", "")),
+            "library_root": str(self.store.root),
+        }
+
+    def enqueue_import(
+        self,
+        *,
+        path: str = "",
+        session: SessionState | None = None,
+        session_id: str = "",
+        user_id: str = "",
+        recursive: bool = True,
+        title: str = "",
+        text: str = "",
+        filename: str = "",
+        mime: str = "",
+        content_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        tags: list[str] | None = None,
+        items: list[dict] | None = None,
+        strict_local_only: bool = False,
+    ) -> dict:
+        normalized_items: list[dict] = []
+        for row in (items or []):
+            if not isinstance(row, dict):
+                continue
+            raw_bytes = row.get("content_bytes")
+            item_text = str(row.get("text", "") or "")
+            if not item_text.strip() and not isinstance(raw_bytes, (bytes, bytearray)):
+                continue
+            if len(normalized_items) >= RAG_MAX_IMPORT_BATCH_ITEMS:
+                raise ValueError(f"too many import items in one batch (max {RAG_MAX_IMPORT_BATCH_ITEMS})")
+            normalized_items.append(
+                {
+                    "filename": str(row.get("filename", "") or "").strip(),
+                    "mime": str(row.get("mime", "") or "").strip(),
+                    "text": item_text,
+                    "relative_path": str(row.get("relative_path", "") or "").strip().replace("\\", "/").lstrip("/"),
+                    "content_bytes": bytes(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray)) else None,
+                }
+            )
+        item_count = len(normalized_items)
+        label = (
+            title
+            or filename
+            or path
+            or (
+                normalized_items[0].get("relative_path")
+                or normalized_items[0].get("filename")
+                or "manual-import"
+                if item_count == 1
+                else ""
+            )
+            or (f"batch-import ({item_count} items)" if item_count > 1 else "manual-import")
+        )
+        task = self.store.register_task(
+            {
+                "type": "manual_import",
+                "label": trim(label, 120),
+                "source_path": str(path or ""),
+                "filename": str(filename or ""),
+                "mime": str(mime or ""),
+                "session_id": str(session_id or getattr(session, "id", "") or ""),
+                "user_id": str(user_id or getattr(session, "owner_user_id", "") or ""),
+                "item_count": item_count or 1,
+                "strict_local_only": bool(strict_local_only),
+                "recursive": bool(recursive),
+                "source_mode": str(source_mode or "manual"),
+                "tags": [str(x).strip() for x in (tags or []) if str(x).strip()],
+            }
+        )
+        self._queue_job(
+            {
+                "type": "manual_import",
+                "task_id": str(task.get("id", "")),
+                "session": session,
+                "session_id": str(session_id or getattr(session, "id", "") or ""),
+                "user_id": str(user_id or getattr(session, "owner_user_id", "") or ""),
+                "path": str(path or ""),
+                "recursive": bool(recursive),
+                "title": str(title or ""),
+                "text": str(text or ""),
+                "filename": str(filename or ""),
+                "mime": str(mime or ""),
+                "content_bytes": content_bytes,
+                "source_mode": str(source_mode or "manual"),
+                "tags": [str(x).strip() for x in (tags or []) if str(x).strip()],
+                "items": normalized_items,
+                "strict_local_only": bool(strict_local_only),
+            }
+        )
+        return {
+            "ok": True,
+            "queued": True,
+            "task_id": str(task.get("id", "")),
+            "library_root": str(self.store.root),
+            "item_count": item_count or 1,
+            "strict_local_only": bool(strict_local_only),
+        }
+
+    def _parse_file_safe(self, source_path: Path, *, mime: str = "", text_override: str = "") -> dict:
+        kind = self.parser.detect_kind(source_path, mime=mime)
+        if kind in {"text", "csv", "image", "audio", "video"}:
+            return self.parser.parse_file(source_path, mime=mime, text_override=text_override)
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_rag_parse_file_worker,
+            args=(
+                child_conn,
+                str(source_path),
+                str(mime or ""),
+                str(text_override or ""),
+                bool(getattr(self.parser, "include_filename_entities", False)),
+            ),
+        )
+        try:
+            proc.start()
+            try:
+                child_conn.close()
+            except Exception:
+                pass
+            if not parent_conn.poll(self.parse_timeout_seconds):
+                raise TimeoutError(f"parse timeout after {self.parse_timeout_seconds}s ({kind or 'document'})")
+            payload = parent_conn.recv()
+            if not isinstance(payload, dict):
+                raise RuntimeError("parser worker returned invalid payload")
+            if not bool(payload.get("ok", False)):
+                raise RuntimeError(str(payload.get("error", "parse failed") or "parse failed"))
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("parser worker returned invalid result")
+            return dict(result)
+        finally:
+            try:
+                parent_conn.close()
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=1.5)
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=0.5)
+            except Exception:
+                pass
+
+    def _session_capabilities(self, session: SessionState | None) -> dict[str, bool]:
+        if not isinstance(session, SessionState):
+            return default_multimodal_capabilities()
+        try:
+            return session._capabilities_from_profile()
+        except Exception:
+            return default_multimodal_capabilities()
+
+    def _multimodal_enrich(self, session: SessionState | None, title: str, parse_result: dict, media_rows: list[dict]) -> dict:
+        if not isinstance(session, SessionState):
+            return {"status": "skipped", "reason": "no_session"}
+        caps = self._session_capabilities(session)
+        selected: list[dict] = []
+        skipped: list[str] = []
+        kind = str(parse_result.get("kind", "") or "")
+        for row in media_rows:
+            media_type = str(row.get("type", "") or "").strip().lower()
+            cap_key = {
+                "image": "input_image",
+                "audio": "input_audio",
+                "video": "input_video",
+            }.get(media_type, "")
+            if not cap_key or not bool(caps.get(cap_key, False)):
+                skipped.append(f"{media_type}:capability_disabled")
+                continue
+            fp = Path(str(row.get("path", "") or ""))
+            if not fp.exists() or not fp.is_file():
+                skipped.append(f"{media_type}:missing")
+                continue
+            if fp.stat().st_size > RAG_MODEL_MEDIA_MAX_BYTES:
+                skipped.append(f"{media_type}:too_large")
+                continue
+            try:
+                selected.append(
+                    {
+                        "type": media_type,
+                        "name": str(row.get("name", fp.name) or fp.name),
+                        "mime": str(row.get("mime", guess_mime_from_name(fp.name, "application/octet-stream")) or ""),
+                        "data_b64": base64.b64encode(fp.read_bytes()).decode("ascii"),
+                    }
+                )
+            except Exception:
+                skipped.append(f"{media_type}:read_failed")
+                continue
+            if media_type in {"audio", "video"}:
+                break
+            if sum(1 for item in selected if str(item.get("type", "")) == "image") >= 3:
+                break
+        if not selected:
+            return {"status": "skipped", "reason": "no_compatible_media", "skipped": skipped}
+        context_text = trim(str(parse_result.get("text", "") or parse_result.get("summary", "") or ""), 1800)
+        title_line = f"Title: {title}\n" if bool(getattr(self.parser, "include_filename_entities", False)) else ""
+        prompt = (
+            "Analyze these uploaded knowledge-base assets and return strict JSON with keys "
+            "summary, tags, entities, category, confidence, findings. "
+            f"{title_line}Kind: {kind}\nExisting text context:\n{context_text}"
+        )
+        try:
+            rsp = session.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=700,
+                temperature=0.1,
+                think=False,
+                stream_thinking=False,
+                media_inputs=selected,
+            )
+            payload = parse_json_object(str(rsp.get("content", "") or ""), {})
+            summary = trim(str(payload.get("summary", "") or rsp.get("content", "") or ""), 2400)
+            tags = [str(x).strip() for x in (payload.get("tags", []) or []) if str(x).strip()]
+            entities = [str(x).strip() for x in (payload.get("entities", []) or []) if str(x).strip()]
+            if not entities:
+                entities = _rag_extract_entities(summary)
+            return {
+                "status": "completed",
+                "summary": summary,
+                "tags": tags[:16],
+                "entities": entities[:24],
+                "category": str(payload.get("category", parse_result.get("category", "")) or ""),
+                "confidence": str(payload.get("confidence", "medium") or "medium"),
+                "findings": payload.get("findings", []) if isinstance(payload.get("findings"), list) else [],
+                "used_media": [str(x.get("name", "")) for x in selected],
+                "skipped": skipped,
+            }
+        except Exception as exc:
+            return {"status": "failed", "error": trim(str(exc), 240), "skipped": skipped}
+
+    def _collect_supported_files(self, root: Path, recursive: bool) -> list[Path]:
+        files: list[Path] = []
+        iterator = root.rglob("*") if recursive else root.glob("*")
+        for path in iterator:
+            if len(files) >= RAG_MAX_IMPORT_FILES:
+                break
+            try:
+                if not path.is_file():
+                    continue
+            except Exception:
+                continue
+            if self.parser.supported_file(path):
+                files.append(path)
+        return files
+
+    def _ingest_one_file(
+        self,
+        *,
+        task_id: str,
+        source_path: Path,
+        session: SessionState | None,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        mime: str,
+        source_mode: str,
+        tags: list[str],
+        source_rel_path: str = "",
+        strict_local_only: bool = False,
+        content_bytes: bytes | None = None,
+        text_override: str = "",
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        parse_result = self._parse_file_safe(source_path, mime=mime, text_override=text_override)
+        doc_id = make_id("ragdoc")
+        media_rows: list[dict] = []
+        asset_sources: list[dict] = []
+        kind = str(parse_result.get("kind", "") or "")
+        if kind in {"image", "audio", "video"}:
+            media_rows.append(
+                {
+                    "type": kind,
+                    "path": str(source_path),
+                    "name": filename or source_path.name,
+                    "mime": parse_result.get("mime", mime),
+                }
+            )
+        elif kind == "pdf":
+            pdf_asset_dir = self.store.inbox_root / f"{task_id}_{source_path.stem}_pdf_assets"
+            pdf_assets = self.parser.extract_pdf_images(source_path, pdf_asset_dir, limit=RAG_PDF_IMAGE_LIMIT)
+            media_rows.extend(pdf_assets)
+            asset_sources.extend(pdf_assets)
+        multimodal = (
+            {"status": "skipped", "reason": "strict_local_only"}
+            if bool(strict_local_only)
+            else self._multimodal_enrich(session, filename or source_path.name, parse_result, media_rows)
+        )
+        return self.store.ingest_document(
+            doc_id=doc_id,
+            source_path=source_path,
+            original_name=filename or source_path.name,
+            parse_result=parse_result,
+            raw_bytes=content_bytes,
+            source_mode=source_mode,
+            session_id=session_id,
+            user_id=user_id,
+            source_rel_path=source_rel_path,
+            tags=tags,
+            multimodal=multimodal,
+            asset_sources=asset_sources,
+            persist_now=persist_now,
+            rebuild_index_now=rebuild_index_now,
+        )
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            if not isinstance(job, dict):
+                self.queue.task_done()
+                continue
+            if str(job.get("type", "")) == "__stop__":
+                self.queue.task_done()
+                break
+            task_id = str(job.get("task_id", "") or "")
+            self._cleanup_task_inbox(task_id)
+            self.store.update_task(task_id, status="running", started_at=now_ts())
+            try:
+                result_rows: list[dict] = []
+                item_errors: list[str] = []
+                pending_flushes = 0
+                pending_rebuild = False
+                last_progress_at = 0.0
+                session = job.get("session") if isinstance(job.get("session"), SessionState) else None
+                session_id = str(job.get("session_id", "") or getattr(session, "id", "") or "")
+                user_id = str(job.get("user_id", "") or getattr(session, "owner_user_id", "") or "")
+                session = self._resolve_job_session(session_id, user_id, session)
+                if isinstance(session, SessionState):
+                    session_id = str(session_id or getattr(session, "id", "") or "")
+                    user_id = str(user_id or getattr(session, "owner_user_id", "") or "")
+                source_mode = str(job.get("source_mode", "manual") or "manual")
+                tags = [str(x).strip() for x in (job.get("tags", []) or []) if str(x).strip()]
+                strict_local_only = bool(job.get("strict_local_only", False))
+                batch_items = [dict(x) for x in (job.get("items", []) or []) if isinstance(x, dict)][:RAG_MAX_IMPORT_BATCH_ITEMS]
+
+                def _update_progress(current: int, total: int, label: str):
+                    nonlocal last_progress_at
+                    now = now_ts()
+                    current_item = int(current or 0)
+                    total_items = int(total or 0)
+                    force = total_items <= 1 or current_item <= 1 or current_item >= total_items
+                    if not force and current_item % 8 != 0 and (now - last_progress_at) < 0.75:
+                        return
+                    last_progress_at = now
+                    self.store.update_task(
+                        task_id,
+                        heartbeat_at=now,
+                        current_item=current_item,
+                        total_items=total_items,
+                        progress_label=trim(str(label or ""), 220),
+                    )
+
+                def _flush_ingest_state():
+                    nonlocal pending_flushes, pending_rebuild
+                    if pending_flushes <= 0:
+                        return
+                    with self._flush_lock:
+                        self.store.flush_content_state()
+                        if pending_rebuild:
+                            self.store.rebuild_index()
+                    pending_flushes = 0
+                    pending_rebuild = False
+                    result_rows.clear()
+
+                def _capture_ingest(**kwargs):
+                    nonlocal pending_flushes, pending_rebuild
+                    try:
+                        row = self._ingest_one_file(
+                            persist_now=False,
+                            rebuild_index_now=False,
+                            **kwargs,
+                        )
+                        result_rows.append(row)
+                        pending_flushes += 1
+                        if bool(row.get("ok", False)) and not bool(row.get("duplicate", False)):
+                            pending_rebuild = True
+                        if pending_flushes >= 12:
+                            _flush_ingest_state()
+                    except Exception as exc:
+                        label = str(
+                            kwargs.get("source_rel_path", "")
+                            or kwargs.get("filename", "")
+                            or Path(str(kwargs.get("source_path", "") or "")).name
+                            or "item"
+                        )
+                        item_errors.append(f"{label}: {trim(str(exc), 220)}")
+
+                if str(job.get("type", "")) == "session_upload":
+                    src = Path(str(job.get("source_path", "") or "")).resolve()
+                    parsed_path = Path(str(job.get("parsed_path", "") or "")).resolve() if str(job.get("parsed_path", "") or "").strip() else None
+                    text_override = ""
+                    if parsed_path and parsed_path.exists():
+                        text_override = try_read_text(parsed_path, max_bytes=300_000) or ""
+                    _update_progress(1, 1, str(job.get("filename", src.name) or src.name))
+                    _capture_ingest(
+                        task_id=task_id,
+                        source_path=src,
+                        session=session,
+                        session_id=session_id,
+                        user_id=user_id,
+                        filename=str(job.get("filename", src.name) or src.name),
+                        mime=str(job.get("mime", "") or ""),
+                        source_mode=source_mode,
+                        tags=tags,
+                        strict_local_only=strict_local_only,
+                        text_override=text_override,
+                    )
+                elif batch_items:
+                    total_batch_items = len(batch_items)
+                    for idx, item in enumerate(batch_items, 1):
+                        rel_path = str(item.get("relative_path", "") or "").strip().replace("\\", "/").lstrip("/")
+                        base_name = rel_path.rsplit("/", 1)[-1] if rel_path else str(item.get("filename", "") or "").strip()
+                        filename = _rag_safe_name(base_name or f"uploaded_{idx}.bin", f"uploaded_{idx}.bin")
+                        item_text = str(item.get("text", "") or "")
+                        item_bytes = item.get("content_bytes") if isinstance(item.get("content_bytes"), (bytes, bytearray)) else None
+                        temp_path = self.store.inbox_root / f"{task_id}_{make_id('ragitem')}_{filename}"
+                        _update_progress(idx, total_batch_items, rel_path or filename)
+                        if item_text.strip():
+                            temp_path.write_text(item_text, encoding="utf-8")
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=temp_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=filename,
+                                mime=str(item.get("mime", "text/plain") or "text/plain"),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=rel_path or filename,
+                                strict_local_only=strict_local_only,
+                                text_override=item_text,
+                            )
+                        elif item_bytes is not None:
+                            temp_path.write_bytes(bytes(item_bytes))
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=temp_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=filename,
+                                mime=str(item.get("mime", "") or ""),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=rel_path or filename,
+                                strict_local_only=strict_local_only,
+                                content_bytes=bytes(item_bytes),
+                            )
+                else:
+                    text = str(job.get("text", "") or "")
+                    content_bytes = job.get("content_bytes") if isinstance(job.get("content_bytes"), (bytes, bytearray)) else None
+                    if text:
+                        filename = _rag_safe_name(str(job.get("filename", "") or job.get("title", "") or "manual_note.txt"), "manual_note.txt")
+                        temp_path = self.store.inbox_root / f"{task_id}_{filename}"
+                        temp_path.write_text(text, encoding="utf-8")
+                        _capture_ingest(
+                            task_id=task_id,
+                            source_path=temp_path,
+                            session=session,
+                            session_id=session_id,
+                            user_id=user_id,
+                            filename=filename,
+                            mime=str(job.get("mime", "text/plain") or "text/plain"),
+                            source_mode=source_mode,
+                            tags=tags,
+                            source_rel_path=filename,
+                            strict_local_only=strict_local_only,
+                            text_override=text,
+                        )
+                    elif content_bytes is not None:
+                        filename = _rag_safe_name(str(job.get("filename", "") or "uploaded.bin"), "uploaded.bin")
+                        temp_path = self.store.inbox_root / f"{task_id}_{filename}"
+                        temp_path.write_bytes(bytes(content_bytes))
+                        _capture_ingest(
+                            task_id=task_id,
+                            source_path=temp_path,
+                            session=session,
+                            session_id=session_id,
+                            user_id=user_id,
+                            filename=filename,
+                            mime=str(job.get("mime", "") or ""),
+                            source_mode=source_mode,
+                            tags=tags,
+                            source_rel_path=filename,
+                            strict_local_only=strict_local_only,
+                            content_bytes=bytes(content_bytes),
+                        )
+                    else:
+                        raw_path = str(job.get("path", "") or "").strip()
+                        if not raw_path:
+                            raise ValueError("import path required")
+                        source_path = Path(raw_path).expanduser().resolve()
+                        if source_path.is_dir():
+                            files = self._collect_supported_files(source_path, recursive=bool(job.get("recursive", True)))
+                            total_files = len(files)
+                            for idx, fp in enumerate(files, 1):
+                                try:
+                                    rel_path = fp.relative_to(source_path).as_posix()
+                                except Exception:
+                                    rel_path = fp.name
+                                _update_progress(idx, total_files, rel_path)
+                                _capture_ingest(
+                                    task_id=task_id,
+                                    source_path=fp,
+                                    session=session,
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                    filename=fp.name,
+                                    mime="",
+                                    source_mode=source_mode,
+                                    tags=tags,
+                                    source_rel_path=rel_path,
+                                    strict_local_only=strict_local_only,
+                                )
+                        else:
+                            _update_progress(1, 1, source_path.name)
+                            _capture_ingest(
+                                task_id=task_id,
+                                source_path=source_path,
+                                session=session,
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=source_path.name,
+                                mime=str(job.get("mime", "") or ""),
+                                source_mode=source_mode,
+                                tags=tags,
+                                source_rel_path=source_path.name,
+                                strict_local_only=strict_local_only,
+                            )
+                _flush_ingest_state()
+                ok_count = sum(1 for row in result_rows if bool(row.get("ok", False)))
+                duplicate_count = sum(1 for row in result_rows if bool(row.get("duplicate", False)))
+                failed_count = len(item_errors)
+                if failed_count and ok_count <= 0:
+                    raise ValueError("\n".join(item_errors[:12]))
+                self.store.update_task(
+                    task_id,
+                    status="completed_with_errors" if failed_count else "completed",
+                    finished_at=now_ts(),
+                    imported_count=ok_count,
+                    duplicate_count=duplicate_count,
+                    failed_count=failed_count,
+                    error="\n".join(item_errors[:12]),
+                    doc_ids=[str(x.get("doc_id", "")) for x in result_rows if str(x.get("doc_id", "")).strip()],
+                )
+            except Exception as exc:
+                self.store.update_task(
+                    task_id,
+                    status="failed",
+                    finished_at=now_ts(),
+                    error=trim(str(exc), 320),
+                )
+            finally:
+                self._cleanup_task_inbox(task_id)
+                current = self.store.get_task(task_id)
+                status = str((current or {}).get("status", "") or "").strip().lower()
+                if status and status not in {"queued", "running"}:
+                    self._drop_job_payload(task_id)
+                self.queue.task_done()
+
+
+class CodeGraphIndex(TFGraphIDFIndex):
+    def __init__(self):
+        super().__init__()
+        self.import_edges: dict[tuple[str, str], int] = {}
+        self.symbol_to_docs: dict[str, list[str]] = {}
+        self.path_to_doc: dict[str, str] = {}
+        self.module_to_docs: dict[str, list[str]] = {}
+
+    def snapshot(self) -> dict:
+        payload = super().snapshot()
+        payload["import_edges"] = [
+            {"left": str(left), "right": str(right), "weight": int(weight or 0)}
+            for (left, right), weight in self.import_edges.items()
+            if str(left).strip() and str(right).strip()
+        ]
+        payload["symbol_to_docs"] = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in self.symbol_to_docs.items()
+        }
+        payload["path_to_doc"] = {str(k): str(v) for k, v in self.path_to_doc.items() if str(k).strip() and str(v).strip()}
+        payload["module_to_docs"] = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in self.module_to_docs.items()
+        }
+        return payload
+
+    def restore(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        ok = super().restore(payload)
+        if not ok:
+            return False
+        import_edges: dict[tuple[str, str], int] = {}
+        for row in (payload.get("import_edges", []) or []):
+            if not isinstance(row, dict):
+                continue
+            left = str(row.get("left", "") or "").strip()
+            right = str(row.get("right", "") or "").strip()
+            if not left or not right:
+                continue
+            import_edges[(left, right)] = int(row.get("weight", 0) or 0)
+        self.import_edges = import_edges
+        self.symbol_to_docs = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in (payload.get("symbol_to_docs", {}) or {}).items()
+            if isinstance(v, list)
+        }
+        self.path_to_doc = {
+            str(k): str(v)
+            for k, v in (payload.get("path_to_doc", {}) or {}).items()
+            if str(k).strip() and str(v).strip()
+        }
+        self.module_to_docs = {
+            str(k): [str(x) for x in (v or []) if str(x).strip()]
+            for k, v in (payload.get("module_to_docs", {}) or {}).items()
+            if isinstance(v, list)
+        }
+        return True
+
+    def _import_aliases(self, value: object) -> set[str]:
+        raw = str(value or "").strip().strip("\"'`")
+        raw = raw.replace("\\", "/")
+        raw = re.sub(r"^\.+/", "", raw)
+        raw = raw.strip("./")
+        if not raw:
+            return set()
+        base = raw
+        no_ext = raw.rsplit(".", 1)[0] if "." in raw and "/" in raw else raw
+        aliases = {
+            base,
+            no_ext,
+            base.replace("/", "."),
+            no_ext.replace("/", "."),
+            base.replace(".", "/"),
+            no_ext.replace(".", "/"),
+            base.split("/")[-1],
+            no_ext.split("/")[-1],
+            base.split(".")[-1],
+            no_ext.split(".")[-1],
+        }
+        return {str(x).strip().lower() for x in aliases if str(x).strip()}
+
+    def _rebuild_code_community_links(self):
+        community_links: dict[str, dict[str, int]] = defaultdict(dict)
+        for doc_id, related_map in self.related_docs.items():
+            left = str(self.doc_meta.get(doc_id, {}).get("community", "") or "").strip()
+            if not left:
+                continue
+            for other_id, weight in related_map.items():
+                right = str(self.doc_meta.get(other_id, {}).get("community", "") or "").strip()
+                if (not right) or right == left:
+                    continue
+                community_links[left][right] = int(community_links[left].get(right, 0) or 0) + int(weight or 0)
+        self.community_links = {k: dict(v) for k, v in community_links.items()}
+        for community, report in list(self.community_reports.items()):
+            links = sorted((self.community_links.get(community, {}) or {}).items(), key=lambda kv: int(kv[1] or 0), reverse=True)
+            patched = dict(report)
+            patched["links"] = [{"community": name, "weight": int(weight or 0)} for name, weight in links[:6]]
+            self.community_reports[community] = patched
+
+    def build(self, documents: list[dict], chunks: list[dict]):
+        self.import_edges = {}
+        self.symbol_to_docs = {}
+        self.path_to_doc = {}
+        self.module_to_docs = {}
+        docs_by_id = {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in documents
+            if isinstance(row, dict) and str(row.get("id", "") or "").strip()
+        }
+        chunks_by_id = {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in chunks
+            if isinstance(row, dict) and str(row.get("id", "") or "").strip()
+        }
+        super().build(documents, chunks)
+        alias_map: dict[str, set[str]] = defaultdict(set)
+        symbol_map: dict[str, set[str]] = defaultdict(set)
+        for doc_id, row in self.doc_meta.items():
+            src = docs_by_id.get(doc_id, {})
+            rel_path = str(src.get("relative_path", src.get("source_rel_path", src.get("filename", ""))) or "").strip().replace("\\", "/")
+            module_name = str(src.get("module_name", "") or "").strip()
+            imports = [str(x).strip() for x in (src.get("imports", []) or []) if str(x).strip()]
+            exports = [str(x).strip() for x in (src.get("exports", []) or []) if str(x).strip()]
+            labels = [str(x).strip() for x in (src.get("labels", []) or []) if str(x).strip()]
+            symbols = [dict(x) for x in (src.get("symbols", []) or []) if isinstance(x, dict)]
+            row.update(
+                {
+                    "relative_path": rel_path,
+                    "module_name": module_name,
+                    "imports": imports[:64],
+                    "exports": exports[:64],
+                    "labels": labels[:24],
+                    "symbols": symbols[:200],
+                    "line_count": int(src.get("line_count", src.get("metadata", {}).get("line_count", 0)) or 0)
+                    if isinstance(src.get("metadata", {}), dict)
+                    else int(src.get("line_count", 0) or 0),
+                }
+            )
+            if rel_path:
+                self.path_to_doc[rel_path] = doc_id
+            for alias in self._import_aliases(rel_path):
+                alias_map[alias].add(doc_id)
+            for alias in self._import_aliases(module_name):
+                alias_map[alias].add(doc_id)
+            for alias in self._import_aliases(Path(rel_path).stem if rel_path else row.get("filename", "")):
+                alias_map[alias].add(doc_id)
+            if module_name:
+                self.module_to_docs.setdefault(module_name, []).append(doc_id)
+            for sym in symbols:
+                name = str(sym.get("name", "") or "").strip()
+                if not name:
+                    continue
+                symbol_map[name.lower()].add(doc_id)
+        for name, doc_ids in symbol_map.items():
+            self.symbol_to_docs[name] = sorted(doc_ids)
+        for chunk_id, row in self.chunk_meta.items():
+            src = chunks_by_id.get(chunk_id, {})
+            row.update(
+                {
+                    "line_start": int(src.get("line_start", 0) or 0),
+                    "line_end": int(src.get("line_end", 0) or 0),
+                    "symbol": str(src.get("symbol", "") or ""),
+                    "symbol_kind": str(src.get("symbol_kind", "") or ""),
+                    "relative_path": str(src.get("relative_path", "") or ""),
+                }
+            )
+        import_edges: dict[tuple[str, str], int] = defaultdict(int)
+        for doc_id, row in self.doc_meta.items():
+            for token in list(row.get("imports", []) or [])[:64]:
+                candidates: set[str] = set()
+                for alias in self._import_aliases(token):
+                    candidates.update(alias_map.get(alias, set()))
+                for target_id in list(candidates)[:6]:
+                    if target_id == doc_id:
+                        continue
+                    import_edges[(doc_id, target_id)] += 1
+                    self.related_docs.setdefault(doc_id, {})
+                    self.related_docs.setdefault(target_id, {})
+                    self.related_docs[doc_id][target_id] = int(self.related_docs[doc_id].get(target_id, 0) or 0) + 1
+                    self.related_docs[target_id][doc_id] = int(self.related_docs[target_id].get(doc_id, 0) or 0) + 1
+        self.import_edges = {tuple(k): int(v or 0) for k, v in import_edges.items()}
+        for doc_id, row in self.doc_meta.items():
+            row["graph_degree"] = (
+                len(self.doc_to_chunks.get(doc_id, []) or [])
+                + len(row.get("symbols", []) or [])
+                + len(self.related_docs.get(doc_id, {}) or {})
+            )
+        self._rebuild_code_community_links()
+
+    def _fast_query(
+        self,
+        query_text: str,
+        *,
+        top_k: int = RAG_MAX_QUERY_RESULTS,
+        category: str = "",
+        kind: str = "",
+        allowed_communities: set[str] | None = None,
+        qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+    ) -> dict:
+        query = str(query_text or "").strip()
+        if not query:
+            return {
+                "query": "",
+                "results": [],
+                "summary": "",
+                "community_cards": [],
+                "query_entities": [],
+                "route": "fast",
+                "route_meta": {"mode": "fast"},
+            }
+        qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
+        qsymbols = _code_query_terms(query)
+        query_low = query.lower()
+        allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
+        scores: dict[str, float] = defaultdict(float)
+        for token, qweight in qweights.items():
+            for chunk_id, cweight in self.inverted.get(token, []):
+                scores[chunk_id] += qweight * cweight
+        rows: list[dict] = []
+        for chunk_id, dot in scores.items():
+            chunk = self.chunk_meta.get(chunk_id, {})
+            doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
+            if not doc:
+                continue
+            if category and str(doc.get("category", "")) != str(category):
+                continue
+            if kind and str(doc.get("kind", "")) != str(kind):
+                continue
+            if allowed and str(doc.get("community", "") or "") not in allowed:
+                continue
+            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or "").strip()
+            chunk_entities = {str(x).strip().lower() for x in (chunk.get("entities", []) or []) if str(x).strip()}
+            doc_symbols = {
+                str((row or {}).get("name", "") or "").strip().lower()
+                for row in (doc.get("symbols", []) or [])
+                if isinstance(row, dict) and str((row or {}).get("name", "") or "").strip()
+            }
+            chunk_symbol = str(chunk.get("symbol", "") or "").strip().lower()
+            if chunk_symbol:
+                chunk_entities.add(chunk_symbol)
+            ent_overlap = len({str(x).lower() for x in qentities}.intersection(chunk_entities))
+            symbol_overlap = len(qsymbols.intersection(chunk_entities.union(doc_symbols)))
+            graph_bonus = (0.12 * ent_overlap) + (0.16 * symbol_overlap)
+            if rel_path:
+                rel_low = rel_path.lower()
+                base_low = Path(rel_path).name.lower()
+                module_low = str(doc.get("module_name", "") or "").strip().lower()
+                if rel_low and rel_low in query_low:
+                    graph_bonus += 0.28
+                elif base_low and base_low in query_low:
+                    graph_bonus += 0.20
+                elif module_low and module_low in query_low:
+                    graph_bonus += 0.14
+            graph_bonus += min(0.12, math.log1p(len(self.related_docs.get(str(doc.get("id", "")), {}) or {})) / 9.0)
+            final_score = lexical * 0.78 + graph_bonus
+            line_start = int(chunk.get("line_start", 0) or 0)
+            line_end = int(chunk.get("line_end", 0) or 0)
+            if rel_path and line_start > 0:
+                citation = f"[{rel_path}:{line_start}-{max(line_start, line_end)}]"
+            else:
+                citation = f"[{rel_path or doc.get('id', '')}]"
+            rows.append(
+                {
+                    "score": round(final_score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(graph_bonus, 6),
+                    "doc_id": str(doc.get("id", "")),
+                    "chunk_id": chunk_id,
+                    "title": rel_path or str(doc.get("title", "")),
+                    "filename": str(doc.get("filename", "")),
+                    "relative_path": rel_path,
+                    "kind": str(doc.get("kind", "")),
+                    "category": str(doc.get("category", "")),
+                    "community": str(doc.get("community", "")),
+                    "language": str(doc.get("language", "")),
+                    "anchor": str(chunk.get("anchor", "") or chunk.get("symbol", "") or ""),
+                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "entities": list(chunk.get("entities", []) or [])[:12],
+                    "symbol": str(chunk.get("symbol", "") or ""),
+                    "symbol_kind": str(chunk.get("symbol_kind", "") or ""),
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "citation": citation,
+                    "route_evidence": "chunk",
+                    "sort_bias": 0.18 if rel_path and rel_path.lower() in query_low else 0.0,
+                }
+            )
+        if not rows:
+            for doc in sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True):
+                if category and str(doc.get("category", "")) != str(category):
+                    continue
+                if kind and str(doc.get("kind", "")) != str(kind):
+                    continue
+                rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or "")
+                hay = "\n".join(
+                    [
+                        rel_path,
+                        str(doc.get("module_name", "") or ""),
+                        str(doc.get("summary", "") or ""),
+                        " ".join(
+                            str((row or {}).get("name", "") or "")
+                            for row in (doc.get("symbols", []) or [])[:16]
+                            if isinstance(row, dict)
+                        ),
+                    ]
+                ).lower()
+                ratio = difflib.SequenceMatcher(None, query_low[:280], hay[:1200]).ratio()
+                if rel_path and Path(rel_path).name.lower() in query_low:
+                    ratio += 0.16
+                if ratio < 0.16:
+                    continue
+                rows.append(
+                    {
+                        "score": round(ratio, 6),
+                        "lexical_score": round(ratio, 6),
+                        "graph_score": 0.0,
+                        "doc_id": str(doc.get("id", "")),
+                        "chunk_id": "",
+                        "title": rel_path or str(doc.get("title", "")),
+                        "filename": str(doc.get("filename", "")),
+                        "relative_path": rel_path,
+                        "kind": str(doc.get("kind", "")),
+                        "category": str(doc.get("category", "")),
+                        "community": str(doc.get("community", "")),
+                        "language": str(doc.get("language", "")),
+                        "anchor": "",
+                        "text": trim(str(doc.get("summary", "")), 1200),
+                        "entities": [
+                            str((row or {}).get("name", "") or "")
+                            for row in (doc.get("symbols", []) or [])[:8]
+                            if isinstance(row, dict)
+                        ],
+                        "citation": f"[{rel_path or doc.get('id', '')}]",
+                        "route_evidence": "document",
+                    }
+                )
+        return self._finalize_query_rows(
+            query,
+            rows,
+            qentities,
+            top_k=top_k,
+            route="fast",
+            route_meta={"mode": "fast", "allowed_communities": sorted(allowed)[:8]},
+        )
+
+    def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        community_nodes: dict[str, str] = {}
+        symbol_nodes: dict[str, str] = {}
+        try:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES if max_nodes is None else max_nodes)
+        except Exception:
+            max_nodes_int = int(RAG_GRAPH_MAX_NODES or 0)
+        node_budget = None if max_nodes_int <= 0 else max(20, max_nodes_int)
+        for doc in docs:
+            if node_budget is not None and len(nodes) >= node_budget:
+                break
+            doc_id = str(doc.get("id", ""))
+            rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or doc_id)
+            file_node = f"file:{doc_id}"
+            nodes.append(
+                {
+                    "id": file_node,
+                    "label": Path(rel_path).name or rel_path,
+                    "path": rel_path,
+                    "type": "file",
+                    "language": str(doc.get("language", "")),
+                    "community": str(doc.get("community", "")),
+                }
+            )
+            community = str(doc.get("community", "") or "")
+            if community and community not in community_nodes and (node_budget is None or len(nodes) < node_budget):
+                community_id = f"community:{len(community_nodes)+1}"
+                community_nodes[community] = community_id
+                nodes.append({"id": community_id, "label": community, "type": "community"})
+            if community in community_nodes:
+                edges.append({"source": file_node, "target": community_nodes[community], "type": "belongs_to"})
+            for sym in (doc.get("symbols", []) or [])[:4]:
+                if node_budget is not None and len(nodes) >= node_budget:
+                    break
+                if not isinstance(sym, dict):
+                    continue
+                name = str(sym.get("name", "") or "").strip()
+                if not name:
+                    continue
+                key = f"{rel_path}:{name}"
+                node_id = symbol_nodes.get(key)
+                if not node_id:
+                    node_id = f"symbol:{hashlib.sha1(key.encode('utf-8', errors='ignore')).hexdigest()[:10]}"
+                    symbol_nodes[key] = node_id
+                    nodes.append({"id": node_id, "label": name, "type": "symbol", "kind": str(sym.get("kind", "") or "")})
+                edges.append({"source": file_node, "target": node_id, "type": "defines"})
+        active_doc_rows = docs if node_budget is None else docs[: max(1, node_budget // 2)]
+        active_files = {str(row.get("id", "")) for row in active_doc_rows if str(row.get("id", "")).strip()}
+        import_edge_rows = self.import_edges.items() if node_budget is None else list(self.import_edges.items())[: max(12, node_budget)]
+        for (left, right), weight in import_edge_rows:
+            if left not in active_files or right not in active_files:
+                continue
+            edges.append({"source": f"file:{left}", "target": f"file:{right}", "type": "imports", "weight": int(weight or 0)})
+        node_ids = {str(row.get("id", "")) for row in nodes if str(row.get("id", "")).strip()}
+        edges = [dict(row) for row in edges if str(row.get("source", "")).strip() in node_ids and str(row.get("target", "")).strip() in node_ids]
+        return {
+            "built_at": self.built_at,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "communities": dict(self.community_counts),
+        }
+
+
+class CodeLibraryStore(RAGLibraryStore):
+    def __init__(self, root: Path):
+        self._init_storage_layout(root)
+        self.lock = threading.RLock()
+        self.created_at = now_ts()
+        self.updated_at = now_ts()
+        self.content_updated_at = now_ts()
+        self.documents: dict[str, dict] = {}
+        self.chunks: dict[str, dict] = {}
+        self.tasks: list[dict] = []
+        self.index = CodeGraphIndex()
+        self._load()
+        if not self._restore_index_snapshot():
+            self.rebuild_index(persist_snapshot=True)
+
+    def register_task(self, task: dict) -> dict:
+        row = dict(task or {})
+        row["id"] = str(row.get("id") or make_id("codetask"))
+        row["status"] = str(row.get("status", "queued") or "queued")
+        row["submitted_at"] = float(row.get("submitted_at", now_ts()) or now_ts())
+        with self.lock:
+            self.tasks.append(row)
+            self.tasks = self.tasks[-RAG_TASK_HISTORY_LIMIT:]
+            self.updated_at = now_ts()
+            self._save_locked(write_documents=False, write_chunks=False)
+        return row
+
+    def library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        payload = super().library_payload(limit=limit, offset=offset)
+        docs = list(self.documents.values())
+        languages = Counter(str(x.get("language", "unknown") or "unknown") for x in docs)
+        symbol_total = sum(len(x.get("symbols", []) or []) for x in docs if isinstance(x, dict))
+        import_total = sum(len(x.get("imports", []) or []) for x in docs if isinstance(x, dict))
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        stats.update(
+            {
+                "languages": dict(languages.most_common(12)),
+                "symbols": int(symbol_total),
+                "imports": int(import_total),
+            }
+        )
+        payload["stats"] = stats
+        return payload
+
+    def ingest_document(
+        self,
+        *,
+        doc_id: str,
+        source_path: Path | None,
+        original_name: str,
+        parse_result: dict,
+        raw_bytes: bytes | None = None,
+        source_mode: str = "manual",
+        session_id: str = "",
+        user_id: str = "",
+        source_rel_path: str = "",
+        tags: list[str] | None = None,
+        multimodal: dict | None = None,
+        asset_sources: list[dict] | None = None,
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        source_fp = Path(source_path).resolve() if isinstance(source_path, Path) else None
+        rel_path_clean = str(source_rel_path or "").strip().replace("\\", "/").lstrip("/")
+        if raw_bytes is None and source_fp and source_fp.exists():
+            raw_bytes = source_fp.read_bytes()
+        sha256 = str(parse_result.get("sha256", "") or "").strip()
+        if not sha256:
+            if raw_bytes is not None:
+                sha256 = _sha256_bytes(raw_bytes)
+            elif source_fp and source_fp.exists():
+                sha256 = _sha256_file(source_fp)
+        with self.lock:
+            existing_doc_id = self._find_doc_by_sha_locked(sha256)
+            if existing_doc_id:
+                row = dict(self.documents.get(existing_doc_id, {}))
+                stamp = now_ts()
+                source_links = row.get("source_links", [])
+                if not isinstance(source_links, list):
+                    source_links = []
+                source_links.append(
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                )
+                row["source_links"] = source_links[-24:]
+                if rel_path_clean:
+                    row["source_rel_path"] = rel_path_clean
+                    row["relative_path"] = rel_path_clean
+                row["updated_at"] = stamp
+                row["duplicate_hits"] = int(row.get("duplicate_hits", 0) or 0) + 1
+                self.documents[existing_doc_id] = row
+                self.updated_at = stamp
+                if persist_now:
+                    self._save_locked(write_chunks=False, write_tasks=False)
+                return {
+                    "ok": True,
+                    "doc_id": existing_doc_id,
+                    "duplicate": True,
+                    "title": str(row.get("title", "")),
+                    "backup_path": str(row.get("backup_path", "")),
+                }
+        safe_name = _rag_safe_name(original_name or (source_fp.name if source_fp else "source.txt"))
+        backup_dir = self.backup_root / doc_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_rel = rel_path_clean or safe_name
+        backup_path = backup_dir / backup_rel
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        if raw_bytes is not None:
+            backup_path.write_bytes(raw_bytes)
+        elif source_fp and source_fp.exists():
+            shutil.copy2(source_fp, backup_path)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 220_000)
+        parsed_path = self.parsed_root / f"{doc_id}.md"
+        summary = trim(str(parse_result.get("summary", "") or semantic_text), 2400)
+        parsed_path.write_text(
+            "\n".join(
+                part
+                for part in [
+                    f"# {rel_path_clean or safe_name}",
+                    "",
+                    f"language: {str(parse_result.get('language', 'unknown') or 'unknown')}",
+                    f"module: {_code_module_name(rel_path_clean or safe_name, str(parse_result.get('language', '') or ''))}",
+                    "",
+                    summary,
+                ]
+                if part is not None
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        symbols = [dict(x) for x in (parse_result.get("symbols", []) or []) if isinstance(x, dict)]
+        imports = [str(x).strip() for x in (parse_result.get("imports", []) or []) if str(x).strip()]
+        exports = [str(x).strip() for x in (parse_result.get("exports", []) or []) if str(x).strip()]
+        labels = sorted(
+            {
+                str(x).strip()
+                for x in list(parse_result.get("labels", []) or []) + list(tags or [])
+                if str(x).strip()
+            }
+        )
+        if _code_is_test_path(rel_path_clean):
+            labels = sorted(set(labels + ["test"]))
+        language = str(parse_result.get("language", "unknown") or "unknown")
+        module_name = _code_module_name(rel_path_clean or safe_name, language)
+        community = _code_choose_community(rel_path_clean or safe_name, language, labels)
+        entity_candidates = list(parse_result.get("entities", []) or [])
+        entity_candidates.extend(str(row.get("name", "") or "") for row in symbols[:24])
+        entity_candidates.extend(imports[:24])
+        combined_entities: list[str] = []
+        seen_entities: set[str] = set()
+        for token in entity_candidates:
+            clean = re.sub(r"\s+", "", str(token or "").strip())
+            if not clean or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:.#/-]{1,119}", clean):
+                continue
+            key = clean.lower()
+            if key in seen_entities:
+                continue
+            seen_entities.add(key)
+            combined_entities.append(clean)
+            if len(combined_entities) >= 48:
+                break
+        chunk_rows = [dict(x) for x in (parse_result.get("chunks", []) or []) if isinstance(x, dict)]
+        if not chunk_rows:
+            chunk_rows = _rag_chunk_text(semantic_text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
+        chunk_ids: list[str] = []
+        with self.lock:
+            stamp = now_ts()
+            for chunk_idx, chunk in enumerate(chunk_rows[:CODE_MAX_CHUNKS_PER_DOC], 1):
+                chunk_id = f"{doc_id}_c{chunk_idx:03d}"
+                chunk_text = str(chunk.get("text", "") or "")
+                symbol = str(chunk.get("symbol", "") or "").strip()
+                chunk_entities: list[str] = []
+                seen_chunk_entities: set[str] = set()
+                for token in [symbol] + re.findall(r"[A-Za-z_][A-Za-z0-9_:.#/-]{1,80}", chunk_text[:2400]):
+                    clean = str(token or "").strip()
+                    if not clean:
+                        continue
+                    key = clean.lower()
+                    if key in seen_chunk_entities:
+                        continue
+                    seen_chunk_entities.add(key)
+                    chunk_entities.append(clean)
+                    if len(chunk_entities) >= 18:
+                        break
+                row = {
+                    "id": chunk_id,
+                    "doc_id": doc_id,
+                    "seq": chunk_idx,
+                    "anchor": str(chunk.get("anchor", "") or symbol or f"chunk {chunk_idx}"),
+                    "text": chunk_text,
+                    "entities": chunk_entities,
+                    "line_start": int(chunk.get("line_start", 0) or 0),
+                    "line_end": int(chunk.get("line_end", 0) or 0),
+                    "symbol": symbol,
+                    "symbol_kind": str(chunk.get("symbol_kind", "") or ""),
+                    "relative_path": rel_path_clean,
+                }
+                self.chunks[chunk_id] = row
+                chunk_ids.append(chunk_id)
+            doc_row = {
+                "id": doc_id,
+                "title": rel_path_clean or safe_name,
+                "filename": safe_name,
+                "relative_path": rel_path_clean,
+                "module_name": module_name,
+                "kind": "source_code",
+                "category": "code",
+                "labels": labels,
+                "language": language,
+                "mime": str(parse_result.get("mime", guess_mime_from_name(safe_name, "text/plain")) or ""),
+                "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
+                "sha256": sha256,
+                "source_mode": str(source_mode or "manual"),
+                "source_path": str(source_fp or ""),
+                "source_rel_path": rel_path_clean,
+                "backup_path": self._rel(backup_path),
+                "parsed_text_path": self._rel(parsed_path),
+                "summary": summary,
+                "entities": combined_entities,
+                "community": community,
+                "chunk_count": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+                "symbols": symbols[:200],
+                "imports": imports[:64],
+                "exports": exports[:64],
+                "line_count": int(parse_result.get("metadata", {}).get("line_count", 0) or 0)
+                if isinstance(parse_result.get("metadata", {}), dict)
+                else 0,
+                "session_id": str(session_id or ""),
+                "user_id": str(user_id or ""),
+                "source_links": [
+                    {
+                        "source_path": str(source_fp or ""),
+                        "relative_path": rel_path_clean,
+                        "session_id": str(session_id or ""),
+                        "user_id": str(user_id or ""),
+                        "seen_at": stamp,
+                    }
+                ],
+                "created_at": stamp,
+                "updated_at": stamp,
+                "import_mark": True,
+            }
+            self.documents[doc_id] = doc_row
+            self.updated_at = stamp
+            self.content_updated_at = stamp
+            if persist_now:
+                self._save_locked(write_tasks=False)
+        if rebuild_index_now:
+            self.rebuild_index()
+        return {
+            "ok": True,
+            "doc_id": doc_id,
+            "duplicate": False,
+            "title": rel_path_clean or safe_name,
+            "backup_path": self._rel(backup_path),
+            "parsed_text_path": self._rel(parsed_path),
+            "chunk_count": len(chunk_ids),
+        }
+
+
+class CodeIngestionService(RAGIngestionService):
+    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None):
+        self.store = store
+        self.parser = parser
+        self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
+        self.parse_timeout_seconds = int(CODE_PARSE_TIMEOUT_SECONDS)
+        self.resume_report = {"resumed": 0, "failed": 0, "cleaned": 0}
+        self._flush_lock = threading.Lock()
+        self.threads = [
+            threading.Thread(target=self._worker_loop, name=f"code-ingestion-{idx+1}", daemon=True)
+            for idx in range(self.worker_count)
+        ]
+        for thread in self.threads:
+            thread.start()
+        self._cleanup_finished_job_artifacts()
+        self._resume_incomplete_tasks()
+
+    def _collect_supported_files(self, root: Path, recursive: bool) -> list[Path]:
+        files: list[Path] = []
+        if not root.exists():
+            return files
+        if not recursive:
+            for path in sorted(root.glob("*")):
+                try:
+                    if path.is_file() and self.parser.supported_file(path):
+                        files.append(path)
+                except Exception:
+                    continue
+                if len(files) >= RAG_MAX_IMPORT_FILES:
+                    break
+            return files
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [name for name in dirnames if name.lower() not in CODE_LIBRARY_IGNORED_DIRS and not name.startswith(".")]
+            current_path = Path(current_root)
+            for name in sorted(filenames):
+                fp = current_path / name
+                try:
+                    if fp.is_file() and self.parser.supported_file(fp):
+                        files.append(fp)
+                except Exception:
+                    continue
+                if len(files) >= RAG_MAX_IMPORT_FILES:
+                    return files
+        return files
+
+    def _ingest_one_file(
+        self,
+        *,
+        task_id: str,
+        source_path: Path,
+        session: SessionState | None,
+        session_id: str,
+        user_id: str,
+        filename: str,
+        mime: str,
+        source_mode: str,
+        tags: list[str],
+        source_rel_path: str = "",
+        strict_local_only: bool = False,
+        content_bytes: bytes | None = None,
+        text_override: str = "",
+        persist_now: bool = True,
+        rebuild_index_now: bool = True,
+    ) -> dict:
+        if not self.parser.supported_file(source_path):
+            raise ValueError(f"unsupported code file: {source_path.name}")
+        parse_result = self.parser.parse_file(source_path, mime=mime, text_override=text_override)
+        doc_id = make_id("codedoc")
+        return self.store.ingest_document(
+            doc_id=doc_id,
+            source_path=source_path,
+            original_name=filename or source_path.name,
+            parse_result=parse_result,
+            raw_bytes=content_bytes,
+            source_mode=source_mode,
+            session_id=session_id,
+            user_id=user_id,
+            source_rel_path=source_rel_path,
+            tags=tags,
+            persist_now=persist_now,
+            rebuild_index_now=rebuild_index_now,
+        )
+
+RAG_ADMIN_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clouds Coder RAG Admin</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/rag-admin.js"></script>
+</head>
+<body>
+  <main class="rag-shell">
+    <header class="rag-hero">
+      <div>
+        <p class="eyebrow">Clouds Coder</p>
+        <h1>TF-Graph_IDF RAG Admin</h1>
+        <p class="subtitle">Global knowledge library, graph view, batch import, backup, and retrieval control.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn" class="btn">Refresh</button>
+        <button id="rebuildBtn" class="btn btn-accent">Rebuild Index</button>
+      </div>
+    </header>
+
+    <section class="rag-grid stats-grid" id="statsGrid"></section>
+
+    <section class="rag-grid form-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Import</h2>
+          <span id="importStatus" class="status-chip">idle</span>
+        </div>
+        <div class="field">
+          <label for="sessionSelect">Session Context</label>
+          <select id="sessionSelect"></select>
+        </div>
+        <div class="field">
+          <label for="tagInput">Tags</label>
+          <input id="tagInput" type="text" placeholder="research, multimodal, finance">
+        </div>
+        <div class="field">
+          <label class="check"><input id="importLocalOnly" type="checkbox"> Import without LLM / Strict local-only import</label>
+          <p class="field-note">Forces import to use only local parsers, local backup, local chunking, and local indexing. Multimodal LLM enrichment is disabled.</p>
+        </div>
+        <div class="field">
+          <label for="pathInput">Path / Directory</label>
+          <div class="inline">
+            <input id="pathInput" type="text" placeholder="/absolute/path or relative/path">
+            <label class="check"><input id="recursiveInput" type="checkbox" checked> recursive</label>
+          </div>
+          <button id="importPathBtn" class="btn btn-wide">Import Path</button>
+        </div>
+        <div class="field">
+          <label for="fileInput">Upload Files</label>
+          <input id="fileInput" type="file" multiple>
+          <p class="field-note">Single upload entry supports multiple files in one batch.</p>
+          <button id="importFileBtn" class="btn btn-wide">Upload Files To Library</button>
+        </div>
+        <div class="field">
+          <label for="folderInput">Upload Folder</label>
+          <input id="folderInput" type="file" webkitdirectory directory multiple>
+          <p class="field-note">Recursively traverses nested subdirectories and preserves relative paths in metadata.</p>
+          <button id="importFolderBtn" class="btn btn-wide">Upload Folder To Library</button>
+        </div>
+        <div class="field">
+          <label for="manualTitle">Manual Text</label>
+          <input id="manualTitle" type="text" placeholder="knowledge-note.md">
+          <textarea id="manualText" rows="7" placeholder="Paste text / report / notes here"></textarea>
+          <button id="importTextBtn" class="btn btn-wide">Save Text Into RAG</button>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Query</h2>
+          <span id="queryStatus" class="status-chip">ready</span>
+        </div>
+        <div class="field">
+          <label for="queryInput">Query</label>
+          <textarea id="queryInput" rows="7" placeholder="Ask the multilingual RAG system"></textarea>
+        </div>
+        <div class="inline split">
+          <div class="field grow">
+            <label for="queryRouteInput">Route</label>
+            <select id="queryRouteInput">
+              <option value="auto" selected>Auto</option>
+              <option value="fast">Fast</option>
+              <option value="global">Global</option>
+              <option value="hybrid">Hybrid</option>
+            </select>
+          </div>
+          <div class="field grow">
+            <label for="topKInput">Top K</label>
+            <input id="topKInput" type="number" min="1" max="12" value="8">
+          </div>
+          <label class="check top-gap"><input id="querySynthesize" type="checkbox" checked> synthesize answer</label>
+        </div>
+        <button id="queryBtn" class="btn btn-accent btn-wide">Run Query</button>
+        <div id="querySummary" class="query-summary"></div>
+        <div id="queryResults" class="stack-list"></div>
+      </article>
+    </section>
+
+    <section class="rag-grid content-grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Documents</h2>
+          <span id="docCount" class="status-chip">0</span>
+        </div>
+        <div id="docList" class="stack-list"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Tasks</h2>
+          <span id="taskCount" class="status-chip">0</span>
+        </div>
+        <div id="taskList" class="stack-list"></div>
+      </article>
+    </section>
+
+    <section class="rag-grid graph-grid">
+      <article class="panel panel-graph">
+        <div class="panel-head">
+          <h2>Knowledge Graph</h2>
+          <span id="graphCount" class="status-chip">0/0</span>
+        </div>
+        <div class="graph-toolbar">
+          <div class="graph-modes" role="tablist" aria-label="Graph views">
+            <button id="graphModeStaticBtn" class="graph-mode is-active" type="button">Static 2D</button>
+            <button id="graphMode3dBtn" class="graph-mode" type="button">3D View</button>
+            <button id="graphModeJsonBtn" class="graph-mode" type="button">JSON</button>
+          </div>
+          <div class="graph-meta">
+            <span id="graphPerfTag" class="status-chip">render-on-demand</span>
+            <span id="graphRuntimeTag" class="status-chip">ready</span>
+          </div>
+        </div>
+        <div id="graphStage" class="graph-stage">
+          <canvas id="graphCanvas2d" class="graph-layer"></canvas>
+          <div id="graph3dHost" class="graph-layer hidden"></div>
+          <pre id="graphView" class="code-block graph-json hidden"></pre>
+          <div id="graphOverlay" class="graph-overlay">
+            Static 2D by default. 3D loads three.js from local js_lib only when requested.
+          </div>
+        </div>
+        <div id="graphLegend" class="graph-legend"></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>File System</h2>
+          <span class="status-chip">library</span>
+        </div>
+        <pre id="fsView" class="code-block"></pre>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+RAG_ADMIN_CSS = """
+:root{
+  --bg:#eef3ea;
+  --bg-strong:#dde8d4;
+  --panel:#fbfcf8;
+  --ink:#173122;
+  --muted:#607565;
+  --line:#c9d8c6;
+  --accent:#1f7a4d;
+  --accent-2:#8d4f22;
+  --danger:#b44434;
+  --radius:18px;
+  --shadow:0 22px 55px rgba(38,62,46,.10);
+  --mono:"SFMono-Regular","Menlo","Monaco","Consolas",monospace;
+  --sans:"Avenir Next","Helvetica Neue","PingFang SC","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:radial-gradient(circle at top left,#f8fbf3 0,#eef3ea 42%,#dde8d4 100%);color:var(--ink);font-family:var(--sans)}
+body{min-height:100vh}
+.rag-shell{max-width:1520px;margin:0 auto;padding:24px}
+.rag-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px;padding:24px;border:1px solid rgba(23,49,34,.08);border-radius:28px;background:linear-gradient(135deg,rgba(255,255,255,.92),rgba(236,244,229,.88));box-shadow:var(--shadow)}
+.eyebrow{margin:0 0 6px;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent)}
+.rag-hero h1{margin:0;font-size:34px;line-height:1.05}
+.subtitle{margin:10px 0 0;max-width:760px;color:var(--muted)}
+.hero-actions{display:flex;gap:10px;flex-wrap:wrap}
+.rag-grid{display:grid;gap:18px;margin-bottom:18px}
+.stats-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.form-grid{grid-template-columns:1.15fr 1fr}
+.content-grid,.graph-grid{grid-template-columns:1fr 1fr}
+.panel{background:rgba(251,252,248,.94);border:1px solid rgba(23,49,34,.08);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}
+.panel h2{margin:0;font-size:18px}
+.stat-card{padding:16px;border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.95),rgba(236,244,229,.88));border:1px solid rgba(23,49,34,.08)}
+.stat-label{font-size:12px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted)}
+.stat-value{margin-top:8px;font-size:28px;font-weight:700}
+.stat-meta{margin-top:8px;font-size:12px;color:var(--muted)}
+.field{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.field label{font-size:13px;color:var(--muted)}
+.field-note{margin:0;font-size:12px;line-height:1.5;color:var(--muted)}
+.inline{display:flex;gap:10px;align-items:center}
+.split{justify-content:space-between;align-items:flex-end}
+.grow{flex:1}
+.top-gap{margin-top:28px}
+input,select,textarea,button{font:inherit}
+input,select,textarea{width:100%;padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:#fff;color:var(--ink)}
+textarea{resize:vertical;min-height:120px}
+.check{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
+.check input{width:auto}
+.btn{border:0;border-radius:999px;padding:12px 18px;background:#dcead6;color:var(--ink);cursor:pointer;font-weight:700}
+.btn:hover{filter:brightness(.98)}
+.btn-accent{background:linear-gradient(135deg,var(--accent),#3aa56f);color:#fff}
+.btn-wide{width:100%}
+.status-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:var(--bg-strong);color:var(--muted);font-size:12px}
+.status-chip.bad{background:#f7d8d2;color:var(--danger)}
+.stack-list{display:grid;gap:10px;max-height:560px;overflow:auto}
+.item{padding:12px;border:1px solid rgba(23,49,34,.08);border-radius:14px;background:rgba(255,255,255,.82)}
+.item-title{font-weight:700}
+.item-sub{margin-top:6px;color:var(--muted);font-size:12px;line-height:1.5}
+.item-text{margin-top:8px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.55}
+.item-tags{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
+.tag{display:inline-flex;padding:4px 8px;border-radius:999px;background:var(--bg-strong);font-size:11px;color:var(--muted)}
+.query-summary{margin:12px 0;padding:12px 14px;border-left:4px solid var(--accent-2);background:rgba(141,79,34,.08);border-radius:12px;white-space:pre-wrap;min-height:44px}
+.code-block{margin:0;min-height:320px;max-height:620px;overflow:auto;padding:14px;border-radius:16px;background:#15231c;color:#dce9df;font:12px/1.55 var(--mono);white-space:pre-wrap;word-break:break-word}
+.hidden{display:none!important}
+.panel-graph{min-height:0}
+.graph-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.graph-modes{display:inline-flex;gap:8px;padding:6px;border-radius:999px;background:rgba(23,49,34,.06);border:1px solid rgba(23,49,34,.08)}
+.graph-mode{border:0;border-radius:999px;padding:10px 14px;background:transparent;color:var(--muted);cursor:pointer;font-weight:700}
+.graph-mode.is-active{background:#163b29;color:#eef7f0;box-shadow:0 10px 24px rgba(22,59,41,.22)}
+.graph-mode:disabled{opacity:.45;cursor:not-allowed}
+.graph-meta{display:flex;gap:8px;flex-wrap:wrap}
+.graph-stage{position:relative;min-height:520px;height:520px;border-radius:18px;border:1px solid rgba(23,49,34,.08);overflow:hidden;background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.92),rgba(230,239,225,.92) 45%,rgba(214,228,208,.96))}
+.graph-layer{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+#graphCanvas2d{display:block}
+#graph3dHost canvas{display:block;width:100%!important;height:100%!important}
+.graph-stage.is-3d #graph3dHost{cursor:grab}
+.graph-stage.is-3d #graph3dHost.dragging{cursor:grabbing}
+.graph-json{min-height:100%;max-height:none;border-radius:0;background:transparent;color:#173122;padding:18px;font-size:12px}
+.graph-overlay{position:absolute;left:14px;bottom:14px;max-width:min(420px,78%);padding:10px 12px;border-radius:14px;background:rgba(21,35,28,.82);color:#dce9df;font-size:12px;line-height:1.5;backdrop-filter:blur(8px)}
+.graph-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.legend-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.82);border:1px solid rgba(23,49,34,.08);font-size:12px;color:var(--muted)}
+.legend-swatch{width:12px;height:12px;border-radius:999px;display:inline-block;box-shadow:0 0 0 1px rgba(23,49,34,.12)}
+@media (max-width:1180px){
+  .form-grid,.content-grid,.graph-grid{grid-template-columns:1fr}
+  .rag-hero{flex-direction:column}
+}
+@media (max-width:720px){
+  .graph-stage{height:380px;min-height:380px}
+  .graph-toolbar{align-items:flex-start}
+}
+"""
+
+RAG_ADMIN_JS = """
+const S={config:null,library:null,tasks:null,graph:null,filesystem:null,query:null};
+const G={
+  mode:'static',
+  layout:null,
+  layouts:{},
+  hoverId:'',
+  screenNodes:[],
+  bound:false,
+  renderKey:'',
+  three:{
+    lib:null,
+    loading:null,
+    renderer:null,
+    scene:null,
+    camera:null,
+    root:null,
+    raycaster:null,
+    meshes:new Map(),
+    dragging:false,
+    lastX:0,
+    lastY:0,
+    azimuth:0.72,
+    elevation:0.56,
+    distance:360,
+    fitDistance:360,
+    minDistance:96,
+    maxDistance:4200,
+    pending:false,
+    graphKey:'',
+    activeHoverId:'',
+    resizeObserver:null,
+  },
+};
+const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
+const GRAPH_STATIC_NODE_LIMIT=300;
+const GRAPH_STATIC_HERO_COUNT=30;
+const E=id=>document.getElementById(id);
+async function api(path,init){
+  const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
+  const text=await res.text();
+  let data=text;
+  try{data=text?JSON.parse(text):{}}catch{}
+  if(!res.ok){
+    const msg=(data&&typeof data==='object'&&data.error)?String(data.error):String(text||`HTTP ${res.status}`);
+    throw new Error(msg);
+  }
+  return data;
+}
+function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
+function fmtTs(v){const n=Number(v||0);if(!n)return '-';const d=new Date(n*1000);return isNaN(d.getTime())?'-':d.toLocaleString()}
+function ab2b64(buf){let out='';const bytes=new Uint8Array(buf);const step=0x8000;for(let i=0;i<bytes.length;i+=step){out+=String.fromCharCode.apply(null,bytes.subarray(i,i+step))}return btoa(out)}
+function setChip(id,text,bad=false){const el=E(id);if(!el)return;el.textContent=String(text||'');el.classList.toggle('bad',!!bad)}
+function selectedSession(){return String(E('sessionSelect')?.value||'').trim()}
+function parseTags(){return String(E('tagInput')?.value||'').split(',').map(x=>x.trim()).filter(Boolean)}
+function strictLocalOnlyImport(){return Boolean(E('importLocalOnly')?.checked)}
+function selectedQueryRoute(){return String(E('queryRouteInput')?.value||'auto').trim().toLowerCase()||'auto'}
+function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
+async function submitImportItems(items,batchIndex,batchCount){
+  const batchItems=Array.isArray(items)?items.filter(Boolean):[];
+  if(!batchItems.length)return {task_ids:[],task_count:0,item_count:0};
+  setChip('importStatus',`queue ${batchIndex}/${batchCount} · ${batchItems.length} item(s)`);
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({items:batchItems,session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  const ids=Array.isArray(out.task_ids)?out.task_ids.filter(Boolean):[];
+  const taskIds=ids.length?ids.map(x=>String(x)):(out.task_id?[String(out.task_id)]:[]);
+  return {task_ids:taskIds,task_count:taskIds.length,item_count:Number(out.item_count||batchItems.length||0)};
+}
+async function uploadFileListInBatches(fileList,label='encoding',requireRelative=false){
+  const files=Array.from(fileList||[]).filter(Boolean);
+  if(!files.length)throw new Error('select files first');
+  if(requireRelative&&!files.some(file=>normalizeUploadPath(file.webkitRelativePath||'')))throw new Error('select a folder first');
+  const maxBatchItems=Math.max(1,Number(S.config?.limits?.max_import_batch_items||500));
+  const maxBatchBytes=Math.max(1024*1024,Number(S.config?.limits?.max_import_batch_bytes||50331648));
+  const softMaxFiles=Math.max(maxBatchItems,Number(S.config?.limits?.max_import_files||20000));
+  const batchCount=Math.max(1,Math.ceil(files.length/maxBatchItems));
+  if(files.length>softMaxFiles){
+    setChip('importStatus',`${label} ${files.length} file(s) · auto batching beyond ${softMaxFiles}`);
+  }
+  const taskIds=[];
+  let queuedTasks=0;
+  let itemCount=0;
+  let items=[];
+  let batchBytes=0;
+  let batchIndex=0;
+  const flush=async()=>{
+    if(!items.length)return;
+    batchIndex+=1;
+    const out=await submitImportItems(items,batchIndex,batchCount);
+    if(out.task_ids?.length)taskIds.push(...out.task_ids);
+    queuedTasks+=Number(out.task_count||0);
+    itemCount+=Number(out.item_count||items.length||0);
+    items=[];
+    batchBytes=0;
+  };
+  for(let i=0;i<files.length;i+=1){
+    const file=files[i];
+    setChip('importStatus',`${label} ${i+1}/${files.length}`);
+    const buf=await file.arrayBuffer();
+    const encoded=ab2b64(buf);
+    const row={filename:String(file.name||`upload_${i+1}`),mime:String(file.type||''),content_b64:encoded};
+    const rel=normalizeUploadPath(file.webkitRelativePath||'');
+    if(rel)row.relative_path=rel;
+    const nextBytes=Number(encoded.length||0);
+    if(items.length&&((items.length+1)>maxBatchItems||(batchBytes+nextBytes)>maxBatchBytes)){
+      await flush();
+    }
+    items.push(row);
+    batchBytes+=nextBytes;
+  }
+  await flush();
+  return {task_ids:taskIds,task_count:queuedTasks||taskIds.length,item_count:itemCount};
+}
+function renderStats(){
+  const stats=S.library?.stats||{};
+  const cards=[
+    ['Documents',stats.documents||0,`${Object.keys(stats.categories||{}).length} categories`],
+    ['Chunks',stats.chunks||0,'chunk-level retrieval'],
+    ['Tasks',S.tasks?.length||0,'async import queue'],
+    ['Communities',Object.keys(stats.communities||{}).length||0,'graph communities'],
+  ];
+  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('');
+}
+function renderSessions(){
+  const sel=E('sessionSelect'); if(!sel) return;
+  const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
+  const current=selectedSession()||String(S.config?.default_session_id||'');
+  sel.innerHTML=`<option value="">(none)</option>`+sessions.map(s=>`<option value="${esc(s.id)}" ${String(s.id)===current?'selected':''}>${esc(s.title||s.id)} · ${esc(s.id)}</option>`).join('');
+}
+function renderDocs(){
+  const docs=Array.isArray(S.library?.documents)?S.library.documents:[];
+  const totalDocs=Number(S.library?.total_documents ?? S.library?.stats?.documents ?? docs.length ?? 0);
+  const returnedDocs=Number(S.library?.returned_documents ?? docs.length ?? 0);
+  setChip('docCount',returnedDocs===totalDocs?String(totalDocs):`${returnedDocs}/${totalDocs}`);
+  E('docList').innerHTML=docs.map(doc=>{
+    const rel=String(doc.source_rel_path||'').trim();
+    const relLine=rel?`<br>source rel: ${esc(rel)}`:'';
+    return `<div class="item"><div class="item-title">${esc(doc.title||doc.filename||doc.id)}</div><div class="item-sub">${esc(doc.id)} · ${esc(doc.category)} · ${esc(doc.kind)} · ${esc(doc.language)} · chunks=${esc(doc.chunk_count||0)} · assets=${esc(doc.assets_count||0)}<br>${esc(doc.backup_path||'')}${relLine}<br>updated: ${esc(fmtTs(doc.updated_at))}</div><div class="item-text">${esc(doc.summary||'')}</div></div>`;
+  }).join('')||'<div class="item">No documents yet.</div>';
+}
+function renderTasks(){
+  const tasks=Array.isArray(S.tasks)?S.tasks:[];
+  setChip('taskCount',String(tasks.length));
+  E('taskList').innerHTML=tasks.map(task=>{
+    const counts=[
+      task.item_count?`items=${task.item_count}`:'',
+      task.imported_count!==undefined?`imported=${task.imported_count}`:'',
+      task.duplicate_count!==undefined?`duplicates=${task.duplicate_count}`:'',
+      task.failed_count!==undefined?`failed=${task.failed_count}`:'',
+      (task.current_item&&task.total_items)?`progress=${task.current_item}/${task.total_items}`:'',
+      task.strict_local_only?`strict-local-only`:'' ,
+    ].filter(Boolean).join(' · ');
+    const progressLabel=String(task.progress_label||'').trim();
+    const sub=`${esc(task.id)} · ${esc(task.status||'queued')} · submitted: ${esc(fmtTs(task.submitted_at))}${counts?`<br>${esc(counts)}`:''}${progressLabel?`<br>${esc(progressLabel)}`:''}`;
+    return `<div class="item"><div class="item-title">${esc(task.label||task.type||task.id)}</div><div class="item-sub">${sub}</div><div class="item-text">${esc(task.error||'')}${task.doc_ids?`\\n${esc((task.doc_ids||[]).join(', '))}`:''}</div></div>`;
+  }).join('')||'<div class="item">No tasks.</div>';
+}
+function clamp(v,min,max){return Math.max(min,Math.min(max,Number(v||0)))}
+function hashText(text){let h=2166136261>>>0;const s=String(text||'');for(let i=0;i<s.length;i+=1){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+function hslToHex(h,s,l){
+  const hh=((Number(h)||0)%360+360)%360/360;
+  const ss=clamp(s,0,100)/100;
+  const ll=clamp(l,0,100)/100;
+  let r=ll,g=ll,b=ll;
+  if(ss>0){
+    const q=ll<0.5?ll*(1+ss):ll+ss-ll*ss;
+    const p=2*ll-q;
+    const hue=t=>{
+      let x=t;
+      if(x<0)x+=1;
+      if(x>1)x-=1;
+      if(x<1/6)return p+(q-p)*6*x;
+      if(x<1/2)return q;
+      if(x<2/3)return p+(q-p)*(2/3-x)*6;
+      return p;
+    };
+    r=hue(hh+1/3);g=hue(hh);b=hue(hh-1/3);
+  }
+  return ((Math.round(r*255)&255)<<16)|((Math.round(g*255)&255)<<8)|(Math.round(b*255)&255)
+}
+function mixHex(a,b,t){
+  const aa=Number(a||0)&0xffffff;
+  const bb=Number(b||0)&0xffffff;
+  const tt=clamp(t,0,1);
+  const ar=(aa>>16)&255,ag=(aa>>8)&255,ab=aa&255;
+  const br=(bb>>16)&255,bg=(bb>>8)&255,bbv=bb&255;
+  return (((Math.round(ar+(br-ar)*tt)&255)<<16)|((Math.round(ag+(bg-ag)*tt)&255)<<8)|(Math.round(ab+(bbv-ab)*tt)&255))>>>0
+}
+function rgbaFromHex(hex,a=1){
+  const v=Number(hex||0)&0xffffff;
+  return `rgba(${(v>>16)&255},${(v>>8)&255},${v&255},${clamp(a,0,1)})`
+}
+function graphSignature(graph){
+  const nodes=Array.isArray(graph?.nodes)?graph.nodes:[];
+  const edges=Array.isArray(graph?.edges)?graph.edges:[];
+  return JSON.stringify({
+    built_at:Number(graph?.built_at||0),
+    node_count:Number(graph?.node_count||0),
+    edge_count:Number(graph?.edge_count||0),
+    nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
+    edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]),
+  })
+}
+function normalizeGraphType(v){
+  const t=String(v||'').trim().toLowerCase();
+  if(t==='community'||t==='document'||t==='entity')return t;
+  return 'document';
+}
+function communityHex(key){return hslToHex(hashText(key)%360,72,58)}
+function nodeRadius2D(type){if(type==='community')return 11.5;if(type==='entity')return 2.7;return 4.5}
+function nodeRadius3D(type){if(type==='community')return 8.4;if(type==='entity')return 1.9;return 3.4}
+function nodeCommunityKey(node){
+  const type=normalizeGraphType(node?.type);
+  if(type==='community')return String(node?.label||node?.community||node?.id||'community').trim()||'community';
+  return String(node?.community||node?.category||'unassigned').trim()||'unassigned';
+}
+function dominantCommunity(items){
+  const counts=new Map();
+  for(const item of items||[]){
+    const key=String(item?.communityKey||'').trim()||'unassigned';
+    counts.set(key,Number(counts.get(key)||0)+1);
+  }
+  let best='unassigned',score=-1;
+  for(const [key,val] of counts.entries()){
+    if(val>score){score=val;best=key}
+  }
+  return best;
+}
+function typePriority(type){
+  if(type==='community')return 0;
+  if(type==='document')return 1;
+  if(type==='entity')return 2;
+  return 3;
+}
+function signedHashUnit(key){
+  const bucket=hashText(String(key||''))%2001;
+  return bucket/1000-1;
+}
+function depthOrbit(angle,radius,key,boost=1){
+  const span=Math.max(18,Number(radius||0));
+  const wave=Math.sin(angle*1.41)*span*1.08+Math.cos(angle*0.73)*span*0.54;
+  const jitter=signedHashUnit(key)*Math.max(12,span*0.24);
+  return (wave+jitter)*Math.max(0.3,Number(boost||1));
+}
+function computeGraphBounds(items){
+  let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+  for(const item of items||[]){
+    minX=Math.min(minX,Number(item?.x||0));
+    minY=Math.min(minY,Number(item?.y||0));
+    minZ=Math.min(minZ,Number(item?.z||0));
+    maxX=Math.max(maxX,Number(item?.x||0));
+    maxY=Math.max(maxY,Number(item?.y||0));
+    maxZ=Math.max(maxZ,Number(item?.z||0));
+  }
+  if(!(items||[]).length){minX=minY=minZ=-1;maxX=maxY=maxZ=1}
+  const center={
+    x:(minX+maxX)/2,
+    y:(minY+maxY)/2,
+    z:(minZ+maxZ)/2,
+  };
+  const halfX=Math.max(1,(maxX-minX)/2);
+  const halfY=Math.max(1,(maxY-minY)/2);
+  const halfZ=Math.max(1,(maxZ-minZ)/2);
+  return {
+    bounds:{minX,maxX,minY,maxY,minZ,maxZ},
+    center,
+    spanX:maxX-minX,
+    spanY:maxY-minY,
+    spanZ:maxZ-minZ,
+    radius:Math.max(24,Math.sqrt(halfX*halfX+halfY*halfY+halfZ*halfZ)),
+  };
+}
+function buildGraphLayout(graph){
+  const rawNodes=Array.isArray(graph?.nodes)?graph.nodes:[];
+  const rawEdges=Array.isArray(graph?.edges)?graph.edges:[];
+  const nodeMap=new Map();
+  for(const raw of rawNodes){
+    const id=String(raw?.id||'').trim();
+    if(!id)continue;
+    nodeMap.set(id,{...raw,id,label:String(raw?.label||raw?.title||id),type:normalizeGraphType(raw?.type)});
+  }
+  const edges=[];
+  const mentionDocsByEntity=new Map();
+  for(const raw of rawEdges){
+    const source=String(raw?.source||'').trim();
+    const target=String(raw?.target||'').trim();
+    if(!source||!target||!nodeMap.has(source)||!nodeMap.has(target))continue;
+    const row={source,target,type:String(raw?.type||'related').trim().toLowerCase()||'related',weight:Number(raw?.weight||0)};
+    edges.push(row);
+    const s=nodeMap.get(source),t=nodeMap.get(target);
+    if(s?.type==='document'&&t?.type==='entity'){
+      if(!mentionDocsByEntity.has(target))mentionDocsByEntity.set(target,[]);
+      mentionDocsByEntity.get(target).push(source);
+    }else if(s?.type==='entity'&&t?.type==='document'){
+      if(!mentionDocsByEntity.has(source))mentionDocsByEntity.set(source,[]);
+      mentionDocsByEntity.get(source).push(target);
+    }
+  }
+  const nodes=[...nodeMap.values()];
+  const communities=nodes.filter(n=>n.type==='community').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const documents=nodes.filter(n=>n.type==='document').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const entities=nodes.filter(n=>n.type==='entity').sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+  const other=nodes.filter(n=>!['community','document','entity'].includes(String(n.type||'')));
+  const communityKeys=[...new Set([
+    ...communities.map(n=>nodeCommunityKey(n)),
+    ...documents.map(n=>nodeCommunityKey(n)),
+  ])].filter(Boolean);
+  if(!communityKeys.length&&nodes.length)communityKeys.push('unassigned');
+  communityKeys.sort((a,b)=>String(a).localeCompare(String(b)));
+  const centers=new Map();
+  communityKeys.forEach((key,idx)=>{
+    const angle=GOLDEN_ANGLE*idx;
+    const radius=(idx===0?0:88*Math.sqrt(idx+1))+48;
+    const depthRadius=96+radius*0.82;
+    centers.set(
+      key,
+      {
+        x:Math.cos(angle)*radius*1.55,
+        y:Math.sin(angle)*radius*1.2,
+        z:depthOrbit(angle,depthRadius,key,1.28),
+        key,
+      }
+    )
+  });
+  if(!centers.has('unassigned'))centers.set('unassigned',{x:0,y:0,z:0,key:'unassigned'});
+  const items=[];
+  const itemById=new Map();
+  function pushNode(node,x,y,z,communityKey,colorHex){
+    const type=normalizeGraphType(node?.type);
+    const item={
+      id:String(node.id),
+      node,
+      type,
+      label:String(node.label||node.id),
+      communityKey:String(communityKey||'unassigned'),
+      x:Number(x||0),
+      y:Number(y||0),
+      z:Number(z||0),
+      colorHex:Number(colorHex||0),
+      radius2d:nodeRadius2D(type),
+      radius3d:nodeRadius3D(type),
+    };
+    items.push(item);
+    itemById.set(item.id,item);
+    return item;
+  }
+  for(const node of communities){
+    const key=nodeCommunityKey(node);
+    const center=centers.get(key)||centers.get('unassigned');
+    pushNode(node,center.x,center.y,center.z,key,communityHex(key));
+  }
+  const docsByCommunity=new Map();
+  for(const node of documents){
+    const key=nodeCommunityKey(node);
+    if(!docsByCommunity.has(key))docsByCommunity.set(key,[]);
+    docsByCommunity.get(key).push(node);
+  }
+  for(const [key,list] of docsByCommunity.entries()){
+    const center=centers.get(key)||centers.get('unassigned');
+    list.sort((a,b)=>String(a.label).localeCompare(String(b.label)));
+    list.forEach((node,idx)=>{
+      const angle=GOLDEN_ANGLE*(idx+1)+(hashText(node.id)%37)*0.03;
+      const radius=26+9*Math.sqrt(idx+1);
+      const colorHex=mixHex(communityHex(key),0x13231d,0.18);
+      const depth=depthOrbit(angle,radius*1.9,node.id,1.18)+Math.cos(angle*0.92)*radius*0.38;
+      pushNode(
+        node,
+        center.x+Math.cos(angle)*radius*1.55,
+        center.y+Math.sin(angle)*radius*1.18,
+        center.z+depth,
+        key,
+        colorHex
+      )
+    })
+  }
+  entities.forEach((node,idx)=>{
+    const docIds=mentionDocsByEntity.get(String(node.id))||[];
+    const anchors=docIds.map(id=>itemById.get(String(id))).filter(Boolean);
+    const key=anchors.length?dominantCommunity(anchors):communityKeys[idx%Math.max(1,communityKeys.length)]||'unassigned';
+    let x=0,y=0,z=0;
+    if(anchors.length){
+      x=anchors.reduce((sum,row)=>sum+Number(row.x||0),0)/anchors.length;
+      y=anchors.reduce((sum,row)=>sum+Number(row.y||0),0)/anchors.length;
+      z=anchors.reduce((sum,row)=>sum+Number(row.z||0),0)/anchors.length;
+      const angle=GOLDEN_ANGLE*(idx+1)+(hashText(node.id)%41)*0.05;
+      const radius=18+6*Math.sqrt(anchors.length+1);
+      x+=Math.cos(angle)*radius*1.2;
+      y+=Math.sin(angle)*radius*0.96;
+      z+=depthOrbit(angle,radius*1.45,node.id,0.96);
+    }else{
+      const angle=GOLDEN_ANGLE*(idx+1);
+      const radius=170+7*Math.sqrt(idx+1);
+      x=Math.cos(angle)*radius;
+      y=Math.sin(angle)*radius*0.82;
+      z=depthOrbit(angle,radius*1.06,node.id,1.06);
+    }
+    pushNode(node,x,y,z,key,mixHex(communityHex(key),0xffffff,0.26))
+  });
+  other.forEach((node,idx)=>{
+    const angle=GOLDEN_ANGLE*(idx+1);
+    const radius=200+9*Math.sqrt(idx+1);
+    pushNode(
+      node,
+      Math.cos(angle)*radius,
+      Math.sin(angle)*radius,
+      depthOrbit(angle,radius*1.12,node.id,1.1),
+      'unassigned',
+      0x607565
+    )
+  });
+  const visibleEdges=edges.filter(edge=>itemById.has(edge.source)&&itemById.has(edge.target));
+  const nodeStats=new Map(items.map(item=>[String(item.id),{degree:0,score:0,weightedScore:0}]));
+  function bumpNodeScore(id,amount){
+    const row=nodeStats.get(String(id));
+    if(!row)return;
+    row.degree+=1;
+    row.weightedScore+=Number(amount||0);
+    row.score+=Number(amount||0);
+  }
+  for(const edge of visibleEdges){
+    const boost=edge.type==='related'
+      ? (1.2+Math.min(4.2,Math.log1p(Number(edge.weight||0))*1.25))
+      : (edge.type==='mentions'?1.05:0.82);
+    bumpNodeScore(edge.source,boost);
+    bumpNodeScore(edge.target,boost);
+  }
+  items.forEach(item=>{
+    const stat=nodeStats.get(String(item.id))||{degree:0,score:0,weightedScore:0};
+    const type=String(item.type||'document');
+    const communityKey=nodeCommunityKey(item.node||item);
+    const communityFreq=Number(graph?.communities?.[communityKey]||graph?.communities?.[String(item.label||'')]||0);
+    let base=0.6;
+    if(type==='community')base=3.2+communityFreq*0.95;
+    else if(type==='document')base=1.4+communityFreq*0.08;
+    else if(type==='entity')base=0.9;
+    item.degree=Number(stat.degree||0);
+    item.score=Number(stat.score||0)+base;
+  });
+  const layoutEdges=visibleEdges.map(edge=>{
+    const source=itemById.get(edge.source),target=itemById.get(edge.target);
+    let colorHex=0x173122;
+    let alpha=0.14;
+    let width=0.9;
+    if(edge.type==='mentions'){
+      colorHex=mixHex(Number(target?.colorHex||0x607565),0xffffff,0.18);
+      alpha=0.16;
+      width=0.85;
+    }else if(edge.type==='related'){
+      colorHex=mixHex(Number(source?.colorHex||0x607565),Number(target?.colorHex||0x607565),0.5);
+      alpha=0.26;
+      width=1.2+Math.min(1.2,Math.log1p(Number(edge.weight||0))/2.4);
+    }else if(edge.type==='belongs_to'){
+      colorHex=0x173122;
+      alpha=0.14;
+      width=1.05;
+    }
+    return {...edge,colorHex,alpha,width}
+  });
+  const geometry=computeGraphBounds(items);
+  return {
+    signature:graphSignature(graph),
+    items,
+    itemById,
+    edges:layoutEdges,
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts:{community:communities.length,document:documents.length,entity:entities.length},
+    communities:communityKeys,
+    totalNodeCount:items.length,
+    totalEdgeCount:layoutEdges.length,
+    visibleNodeCount:items.length,
+    visibleEdgeCount:layoutEdges.length,
+    heroCount:0,
+    sampled:false,
+  }
+}
+function buildStaticGraphLayout(fullLayout){
+  const base=fullLayout&&typeof fullLayout==='object'?fullLayout:null;
+  const totalNodes=Number(base?.items?.length||0);
+  if(!base||!totalNodes){
+    return {
+      signature:`${String(base?.signature||'empty')}::static`,
+      items:[],
+      itemById:new Map(),
+      edges:[],
+      bounds:{minX:-1,maxX:1,minY:-1,maxY:1,minZ:-1,maxZ:1},
+      center:{x:0,y:0,z:0},
+      spanX:2,
+      spanY:2,
+      spanZ:2,
+      radius:24,
+      counts:{community:0,document:0,entity:0},
+      communities:Array.isArray(base?.communities)?base.communities:[],
+      totalNodeCount:totalNodes,
+      totalEdgeCount:Number(base?.edges?.length||0),
+      visibleNodeCount:0,
+      visibleEdgeCount:0,
+      heroCount:0,
+      sampled:false,
+      labelIds:new Set(),
+    };
+  }
+  const limit=Math.max(1,Math.min(GRAPH_STATIC_NODE_LIMIT,totalNodes));
+  const ranked=[...(base.items||[])].sort((a,b)=>{
+    const scoreDiff=Number(b?.score||0)-Number(a?.score||0);
+    if(Math.abs(scoreDiff)>1e-9)return scoreDiff;
+    const degreeDiff=Number(b?.degree||0)-Number(a?.degree||0);
+    if(Math.abs(degreeDiff)>1e-9)return degreeDiff;
+    const typeDiff=typePriority(String(a?.type||''))-typePriority(String(b?.type||''));
+    if(typeDiff)return typeDiff;
+    return String(a?.label||a?.id||'').localeCompare(String(b?.label||b?.id||''));
+  });
+  const heroCount=Math.min(GRAPH_STATIC_HERO_COUNT,limit,ranked.length);
+  const heroIds=new Set(ranked.slice(0,heroCount).map(item=>String(item.id||'')));
+  const selectedIds=new Set();
+  const addSelected=item=>{
+    const id=String(item?.id||'').trim();
+    if(!id||selectedIds.has(id)||selectedIds.size>=limit)return;
+    selectedIds.add(id);
+  };
+  ranked.slice(0,heroCount).forEach(addSelected);
+  ranked.filter(item=>String(item?.type||'')==='community').slice(0,Math.min(24,limit)).forEach(addSelected);
+  ranked.forEach(addSelected);
+  const visibleRatio=Math.min(1,limit/Math.max(limit,totalNodes));
+  const spreadScale=1/Math.max(0.4,Math.sqrt(visibleRatio));
+  const densityScale=1/Math.max(1,spreadScale);
+  const selectedItems=(base.items||[]).filter(item=>selectedIds.has(String(item.id||'')));
+  const scoreMax=Math.max(1,...selectedItems.map(item=>Math.log1p(Math.max(0,Number(item?.score||0)))));
+  const labelIds=new Set();
+  const items=selectedItems.map(item=>{
+    const logScore=Math.log1p(Math.max(0,Number(item?.score||0)));
+    const scoreNorm=clamp(logScore/scoreMax,0,1);
+    const hero=heroIds.has(String(item.id||''));
+    let radiusScale=0.78+scoreNorm*1.34;
+    if(String(item.type||'')==='community')radiusScale*=1.18;
+    if(hero)radiusScale*=1.52;
+    radiusScale*=densityScale;
+    const minRadius=String(item.type||'')==='entity'?1.5:(String(item.type||'')==='community'?5.8:3.2);
+    const maxRadius=String(item.type||'')==='community'?26:18;
+    const next={
+      ...item,
+      x:Number(item.x||0)*spreadScale,
+      y:Number(item.y||0)*spreadScale,
+      z:Number(item.z||0)*Math.max(1,spreadScale*0.94),
+      radius2d:clamp(Number(item.radius2d||3)*radiusScale,minRadius,maxRadius),
+      hero,
+      scoreNorm,
+    };
+    if(hero||String(next.type||'')==='community')labelIds.add(String(next.id||''));
+    return next;
+  });
+  const itemById=new Map(items.map(item=>[String(item.id),item]));
+  const edges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const geometry=computeGraphBounds(items);
+  const counts={community:0,document:0,entity:0};
+  items.forEach(item=>{
+    const type=String(item?.type||'document');
+    if(type==='community'||type==='document'||type==='entity')counts[type]+=1;
+  });
+  return {
+    signature:`${String(base.signature||'graph')}::static::${limit}/${totalNodes}`,
+    items,
+    itemById,
+    edges,
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts,
+    communities:Array.isArray(base.communities)?base.communities:[],
+    totalNodeCount:totalNodes,
+    totalEdgeCount:Number(base.edges?.length||0),
+    visibleNodeCount:items.length,
+    visibleEdgeCount:edges.length,
+    heroCount,
+    sampled:items.length<totalNodes,
+    labelIds,
+  };
+}
+function getGraphLayout(force=false,view='auto'){
+  const target=(view==='3d'||view==='json'||view==='full')?'full':'static';
+  const sig=graphSignature(S.graph||{});
+  if(force||!G.layouts||G.layouts.signature!==sig){
+    G.layouts={signature:sig,full:null,static:null};
+    G.layout=null;
+    G.renderKey=sig;
+    G.screenNodes=[];
+    G.hoverId='';
+    G.three.graphKey='';
+  }
+  if(!G.layouts.full)G.layouts.full=buildGraphLayout(S.graph||{});
+  if(!G.layouts.static)G.layouts.static=buildStaticGraphLayout(G.layouts.full);
+  G.layout=G.layouts[target]||G.layouts.full;
+  return G.layout;
+}
+function setGraphRuntime(text,bad=false){
+  const raw=String(text||'');
+  const label=raw.length>36?`${raw.slice(0,33)}...`:raw;
+  setChip('graphRuntimeTag',label,bad);
+}
+function setGraphOverlay(){
+  const layout=getGraphLayout(false,G.mode==='3d'||G.mode==='json'?'full':'static');
+  const fullLayout=getGraphLayout(false,'full');
+  const active=layout.itemById.get(String(G.hoverId||''))||null;
+  let text='';
+  if(G.mode==='static'){
+    text='Static 2D: simplified top-frequency layout.';
+    if(layout.sampled)text+=` sample ${Number(layout.visibleNodeCount||0)}/${Number(layout.totalNodeCount||0)} nodes, top ${Number(layout.heroCount||0)} highlighted.`;
+  }else if(G.mode==='3d')text='3D View: local three.js, render-on-demand only, camera auto-fits graph span.';
+  else text='JSON: raw graph payload for audit and debugging.';
+  text+=` nodes=${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  if(active){
+    const node=active.node||{};
+    const extra=[active.type,active.label];
+    if(String(node.community||'').trim())extra.push(String(node.community));
+    if(String(node.category||'').trim())extra.push(`cat=${String(node.category)}`);
+    if(String(node.kind||'').trim())extra.push(`kind=${String(node.kind)}`);
+    text+=`\\n${extra.join(' • ')}`
+  }else if(G.mode==='3d'){
+    text+='\\nDrag to orbit. Wheel to zoom. Static frame does not keep rendering.'
+  }
+  const el=E('graphOverlay');
+  if(el)el.textContent=text;
+}
+function activateGraphModeButton(){
+  const pairs=[['graphModeStaticBtn','static'],['graphMode3dBtn','3d'],['graphModeJsonBtn','json']];
+  pairs.forEach(([id,mode])=>{
+    const el=E(id);
+    if(el)el.classList.toggle('is-active',G.mode===mode);
+  })
+}
+function applyGraphModeAvailability(){
+  const three=E('graphMode3dBtn');
+  const available=Boolean(S.config?.three?.available);
+  if(three){
+    three.disabled=!available;
+    three.title=available?'Load local three.js from js_lib':'three.js not available in local js_lib';
+  }
+  if(G.mode==='3d'&&!available)G.mode='static';
+}
+function renderGraphLegend(){
+  const layout=getGraphLayout(false,G.mode==='static'?'static':'full');
+  const fullLayout=getGraphLayout(false,'full');
+  const communities=Object.entries(S.graph?.communities||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
+  const chips=[
+    {label:G.mode==='static'&&layout.sampled?`Communities ${layout.counts.community}/${fullLayout.counts.community}`:`Communities ${fullLayout.counts.community}`,color:communityHex('community')},
+    {label:G.mode==='static'&&layout.sampled?`Documents ${layout.counts.document}/${fullLayout.counts.document}`:`Documents ${fullLayout.counts.document}`,color:mixHex(communityHex('document'),0x13231d,0.18)},
+    {label:G.mode==='static'&&layout.sampled?`Entities ${layout.counts.entity}/${fullLayout.counts.entity}`:`Entities ${fullLayout.counts.entity}`,color:mixHex(communityHex('entity'),0xffffff,0.26)},
+    ...communities.map(([name,count])=>({label:`${name} ${count}`,color:communityHex(name)})),
+  ];
+  const legend=E('graphLegend');
+  if(legend)legend.innerHTML=chips.map(row=>`<span class="legend-chip"><span class="legend-swatch" style="background:${rgbaFromHex(row.color,0.96)}"></span>${esc(row.label)}</span>`).join('');
+}
+function syncGraphStage(){
+  const stage=E('graphStage');
+  const canvas=E('graphCanvas2d');
+  const host=E('graph3dHost');
+  const view=E('graphView');
+  if(stage){
+    stage.classList.toggle('is-3d',G.mode==='3d');
+    stage.classList.toggle('is-json',G.mode==='json');
+  }
+  if(canvas)canvas.classList.toggle('hidden',G.mode!=='static');
+  if(host)host.classList.toggle('hidden',G.mode!=='3d');
+  if(view)view.classList.toggle('hidden',G.mode!=='json');
+  activateGraphModeButton();
+}
+function renderGraphJson(){
+  const view=E('graphView');
+  if(view)view.textContent=JSON.stringify(S.graph||{},null,2);
+  setChip('graphPerfTag','json-view');
+  setGraphRuntime('json ready');
+  setGraphOverlay();
+}
+function ensureCanvasMetrics(){
+  const canvas=E('graphCanvas2d');
+  const stage=E('graphStage');
+  if(!canvas||!stage)return null;
+  const rect=stage.getBoundingClientRect();
+  const width=Math.max(320,Math.round(rect.width||0));
+  const height=Math.max(240,Math.round(rect.height||0));
+  const dpr=Math.max(1,Math.min(window.devicePixelRatio||1,2));
+  const bw=Math.round(width*dpr);
+  const bh=Math.round(height*dpr);
+  if(canvas.width!==bw||canvas.height!==bh){
+    canvas.width=bw;canvas.height=bh;
+    canvas.style.width=`${width}px`;
+    canvas.style.height=`${height}px`;
+  }
+  return {canvas,ctx:canvas.getContext('2d'),width,height,dpr}
+}
+function projectGraphTo2D(layout,width,height){
+  const pad=48;
+  const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
+  const dy=Math.max(1,Number(layout.bounds.maxY||0)-Number(layout.bounds.minY||0));
+  const scale=Math.max(0.1,Math.min((width-pad*2)/dx,(height-pad*2)/dy));
+  const cx=(Number(layout.bounds.minX||0)+Number(layout.bounds.maxX||0))/2;
+  const cy=(Number(layout.bounds.minY||0)+Number(layout.bounds.maxY||0))/2;
+  return layout.items.map(item=>({
+    ...item,
+    sx:width/2+(Number(item.x||0)-cx)*scale,
+    sy:height/2+(Number(item.y||0)-cy)*scale,
+    sr:Number(item.radius2d||3),
+  }))
+}
+function drawGraph2D(reason='draw'){
+  const metrics=ensureCanvasMetrics();
+  if(!metrics||G.mode!=='static')return;
+  const {ctx,width,height,dpr}=metrics;
+  const layout=getGraphLayout(false,'static');
+  const nodes=projectGraphTo2D(layout,width,height);
+  G.screenNodes=nodes;
+  const byId=new Map(nodes.map(row=>[row.id,row]));
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,metrics.canvas.width,metrics.canvas.height);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.lineCap='round';
+  for(const edge of layout.edges){
+    const a=byId.get(edge.source),b=byId.get(edge.target);
+    if(!a||!b)continue;
+    const hot=String(G.hoverId||'')&&(G.hoverId===edge.source||G.hoverId===edge.target);
+    ctx.beginPath();
+    ctx.moveTo(a.sx,a.sy);
+    ctx.lineTo(b.sx,b.sy);
+    ctx.strokeStyle=rgbaFromHex(edge.colorHex,hot?Math.min(0.42,Number(edge.alpha||0.16)+0.14):Number(edge.alpha||0.16));
+    ctx.lineWidth=hot?Number(edge.width||1)+0.7:Number(edge.width||1);
+    ctx.stroke();
+  }
+  const order={entity:0,document:1,community:2};
+  nodes.sort((a,b)=>(Number(order[a.type]||0)-Number(order[b.type]||0))||(Number(a.sr||0)-Number(b.sr||0)));
+  for(const node of nodes){
+    const hot=String(G.hoverId||'')===String(node.id);
+    if(hot){
+      ctx.beginPath();
+      ctx.arc(node.sx,node.sy,node.sr+5,0,Math.PI*2);
+      ctx.fillStyle=rgbaFromHex(node.colorHex,0.14);
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(node.sx,node.sy,node.sr+(hot?1.5:0),0,Math.PI*2);
+    ctx.fillStyle=rgbaFromHex(node.colorHex,node.type==='entity'?0.82:0.94);
+    ctx.fill();
+    ctx.strokeStyle=hot?'rgba(21,35,28,0.92)':'rgba(255,255,255,0.74)';
+    ctx.lineWidth=hot?2.2:(node.type==='community'?1.4:0.75);
+    ctx.stroke();
+  }
+  ctx.font='12px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+  ctx.fillStyle='rgba(23,49,34,0.72)';
+  ctx.textBaseline='top';
+  const labelIds=layout.labelIds instanceof Set?layout.labelIds:new Set();
+  nodes
+    .filter(node=>labelIds.has(String(node.id||'')))
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+    .slice(0,Math.max(16,Number(layout.heroCount||0)))
+    .forEach(node=>ctx.fillText(node.label,node.sx+node.sr+6,node.sy-node.sr-6));
+  const active=byId.get(String(G.hoverId||''))||null;
+  if(active){
+    ctx.font='13px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+    ctx.fillStyle='rgba(21,35,28,0.96)';
+    ctx.fillText(active.label,active.sx+active.sr+8,active.sy+active.sr+4)
+  }
+  setChip('graphPerfTag','zero-idle');
+  setGraphRuntime(`2d ${reason}`);
+  setGraphOverlay();
+}
+function findGraphNodeAt(clientX,clientY){
+  const canvas=E('graphCanvas2d');
+  if(!canvas)return '';
+  const rect=canvas.getBoundingClientRect();
+  const x=clientX-rect.left;
+  const y=clientY-rect.top;
+  let best='',dist=Infinity;
+  for(const node of G.screenNodes){
+    const dx=x-Number(node.sx||0);
+    const dy=y-Number(node.sy||0);
+    const r=Number(node.sr||0)+6;
+    const d=dx*dx+dy*dy;
+    if(d<=r*r&&d<dist){dist=d;best=String(node.id||'')}
+  }
+  return best;
+}
+function clearGraphHover(){
+  if(!String(G.hoverId||''))return;
+  G.hoverId='';
+  if(G.mode==='static')drawGraph2D('hover');
+  else if(G.mode==='3d')applyThreeHover('');
+  else setGraphOverlay();
+}
+async function ensureThreeLib(){
+  const info=S.config?.three||{};
+  if(!info.available||!String(info.url||'').trim())throw new Error('local three.js unavailable');
+  if(G.three.lib)return G.three.lib;
+  if(G.three.loading)return G.three.loading;
+  setGraphRuntime('three loading');
+  G.three.loading=(async()=>{
+    if(info.module){
+      const mod=await import(String(info.url));
+      if(!mod||typeof mod!=='object'||!mod.Scene)throw new Error('three module load failed');
+      G.three.lib=mod;
+      return mod;
+    }
+    if(window.THREE&&window.THREE.Scene){G.three.lib=window.THREE;return window.THREE}
+    await new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      script.src=String(info.url);
+      script.async=true;
+      script.onload=()=>resolve(true);
+      script.onerror=()=>reject(new Error('three script load failed'));
+      document.head.appendChild(script);
+    });
+    if(!(window.THREE&&window.THREE.Scene))throw new Error('three init failed');
+    G.three.lib=window.THREE;
+    return window.THREE;
+  })().finally(()=>{G.three.loading=null});
+  return G.three.loading;
+}
+function disposeThreeObject(obj){
+  if(!obj)return;
+  if(typeof obj.traverse==='function'){
+    obj.traverse(node=>{
+      if(node.geometry&&typeof node.geometry.dispose==='function')node.geometry.dispose();
+      const material=node.material;
+      if(Array.isArray(material))material.forEach(m=>m&&typeof m.dispose==='function'&&m.dispose());
+      else if(material&&typeof material.dispose==='function')material.dispose();
+    })
+  }
+}
+function updateThreeCamera(){
+  if(!G.three.camera)return;
+  const layout=getGraphLayout(false,'full');
+  const cx=Number(layout.center?.x||0);
+  const cy=Number(layout.center?.y||0);
+  const cz=Number(layout.center?.z||0);
+  const planar=Math.cos(G.three.elevation);
+  G.three.camera.position.set(
+    cx+Math.cos(G.three.azimuth)*planar*G.three.distance,
+    cy+Math.sin(G.three.elevation)*G.three.distance,
+    cz+Math.sin(G.three.azimuth)*planar*G.three.distance,
+  );
+  G.three.camera.lookAt(cx,cy,cz);
+  G.three.camera.updateProjectionMatrix();
+}
+function computeThreeFitDistance(layout,aspect=1){
+  const radius=Math.max(24,Number(layout?.radius||24));
+  const spanZ=Math.max(1,Number(layout?.spanZ||0));
+  const fovDeg=Number(G.three.camera?.fov||42);
+  const vFov=Math.max(0.42,(fovDeg*Math.PI)/180);
+  const hFov=Math.max(0.42,2*Math.atan(Math.tan(vFov/2)*Math.max(0.75,Number(aspect||1))));
+  const fitVertical=radius/Math.sin(vFov/2);
+  const fitHorizontal=radius/Math.sin(hFov/2);
+  return Math.max(260,Math.max(fitVertical,fitHorizontal)*1.15+spanZ*0.58+36);
+}
+function fitThreeCameraToLayout(resetDistance=false){
+  if(!G.three.camera)return;
+  const host=E('graph3dHost');
+  const rect=host?host.getBoundingClientRect():{width:1,height:1};
+  const aspect=Math.max(0.75,Number(rect.width||1)/Math.max(1,Number(rect.height||1)));
+  const layout=getGraphLayout(false,'full');
+  const fitDistance=computeThreeFitDistance(layout,aspect);
+  const radius=Math.max(24,Number(layout.radius||24));
+  G.three.fitDistance=fitDistance;
+  G.three.minDistance=Math.max(92,fitDistance*0.16);
+  G.three.maxDistance=Math.max(3200,fitDistance*8.8);
+  if(resetDistance||!Number.isFinite(G.three.distance)||G.three.distance<G.three.minDistance||G.three.distance>G.three.maxDistance){
+    G.three.distance=fitDistance;
+  }else{
+    G.three.distance=clamp(G.three.distance,G.three.minDistance,G.three.maxDistance);
+  }
+  G.three.camera.near=Math.max(0.1,Math.min(16,radius/340));
+  G.three.camera.far=Math.max(12000,fitDistance+radius*24);
+  G.three.camera.updateProjectionMatrix();
+}
+function scheduleThreeRender(reason='render'){
+  if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
+  setChip('graphPerfTag','render-on-demand');
+  G.three.lastReason=String(reason||'render');
+  if(G.three.pending)return;
+  G.three.pending=true;
+  requestAnimationFrame(()=>{
+    G.three.pending=false;
+    if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
+    updateThreeCamera();
+    G.three.renderer.render(G.three.scene,G.three.camera);
+    setGraphRuntime(`3d ${G.three.lastReason}`);
+    setGraphOverlay();
+  })
+}
+function applyThreeHover(id){
+  const next=String(id||'').trim();
+  if(String(G.three.activeHoverId||'')===next)return;
+  const prevMesh=G.three.meshes.get(String(G.three.activeHoverId||''));
+  if(prevMesh){
+    prevMesh.scale.setScalar(Number(prevMesh.userData?.baseScale||1));
+    prevMesh.material.opacity=Number(prevMesh.userData?.baseOpacity||0.95);
+    prevMesh.material.color.setHex(Number(prevMesh.userData?.baseColor||0x607565));
+  }
+  G.hoverId=next;
+  G.three.activeHoverId=next;
+  const mesh=G.three.meshes.get(next);
+  if(mesh){
+    mesh.scale.setScalar(Number(mesh.userData?.baseScale||1)*1.28);
+    mesh.material.opacity=1;
+    mesh.material.color.setHex(mixHex(Number(mesh.userData?.baseColor||0x607565),0xffffff,0.18));
+  }
+  scheduleThreeRender('hover');
+}
+function pickThreeNode(ev){
+  if(!G.three.renderer||!G.three.camera||!G.three.raycaster||!G.three.meshes.size)return '';
+  const rect=G.three.renderer.domElement.getBoundingClientRect();
+  const x=((ev.clientX-rect.left)/Math.max(1,rect.width))*2-1;
+  const y=-(((ev.clientY-rect.top)/Math.max(1,rect.height))*2-1);
+  G.three.raycaster.setFromCamera({x,y},G.three.camera);
+  const hits=G.three.raycaster.intersectObjects([...G.three.meshes.values()],false);
+  return String(hits?.[0]?.object?.userData?.id||'').trim();
+}
+function resizeThreeRenderer(){
+  if(!G.three.renderer||!G.three.camera)return;
+  const host=E('graph3dHost');
+  if(!host)return;
+  const rect=host.getBoundingClientRect();
+  const width=Math.max(240,Math.round(rect.width||0));
+  const height=Math.max(220,Math.round(rect.height||0));
+  G.three.renderer.setPixelRatio(Math.max(1,Math.min(window.devicePixelRatio||1,1.5)));
+  G.three.renderer.setSize(width,height,false);
+  G.three.camera.aspect=width/Math.max(1,height);
+  fitThreeCameraToLayout(false);
+  scheduleThreeRender('resize');
+}
+function buildThreeSceneGraph(){
+  const THREE=G.three.lib;
+  if(!THREE||!G.three.root)return;
+  const layout=getGraphLayout(false,'full');
+  while(G.three.root.children.length){
+    const child=G.three.root.children.pop();
+    disposeThreeObject(child);
+  }
+  G.three.meshes=new Map();
+  const edgeBuckets={belongs_to:[],mentions:[],related:[]};
+  for(const edge of layout.edges){
+    const source=layout.itemById.get(edge.source),target=layout.itemById.get(edge.target);
+    if(!source||!target)continue;
+    const key=edge.type==='mentions'||edge.type==='belongs_to'||edge.type==='related'?edge.type:'related';
+    edgeBuckets[key].push({edge,source,target});
+  }
+  Object.entries(edgeBuckets).forEach(([kind,list])=>{
+    if(!list.length)return;
+    const pos=[];
+    const col=[];
+    list.forEach(({edge,source,target})=>{
+      const hex=Number(edge.colorHex||0x607565);
+      const r=((hex>>16)&255)/255,g=((hex>>8)&255)/255,b=(hex&255)/255;
+      pos.push(Number(source.x||0),Number(source.y||0),Number(source.z||0),Number(target.x||0),Number(target.y||0),Number(target.z||0));
+      col.push(r,g,b,r,g,b);
+    });
+    const geometry=new THREE.BufferGeometry();
+    geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+    geometry.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+    const opacity=kind==='related'?0.32:(kind==='mentions'?0.18:0.14);
+    const material=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity,depthWrite:false});
+    G.three.root.add(new THREE.LineSegments(geometry,material));
+  });
+  layout.items.forEach(item=>{
+    const opacity=item.type==='entity'?0.86:0.95;
+    const material=new THREE.MeshBasicMaterial({color:Number(item.colorHex||0x607565),transparent:true,opacity});
+    const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
+    mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
+    mesh.scale.setScalar(Number(item.radius3d||2));
+    mesh.userData={id:item.id,baseScale:Number(item.radius3d||2),baseColor:Number(item.colorHex||0x607565),baseOpacity:opacity};
+    G.three.root.add(mesh);
+    G.three.meshes.set(String(item.id),mesh);
+  });
+  fitThreeCameraToLayout(true);
+  G.three.graphKey=layout.signature;
+}
+async function ensureThreeRenderer(){
+  const THREE=await ensureThreeLib();
+  const host=E('graph3dHost');
+  if(!host)throw new Error('graph 3d host missing');
+  if(!G.three.renderer){
+    G.three.scene=new THREE.Scene();
+    G.three.camera=new THREE.PerspectiveCamera(42,1,0.1,5000);
+    G.three.root=new THREE.Group();
+    G.three.scene.add(G.three.root);
+    G.three.raycaster=new THREE.Raycaster();
+    G.three.renderer=new THREE.WebGLRenderer({alpha:true,antialias:true,powerPreference:'low-power'});
+    G.three.renderer.setClearColor(0x000000,0);
+    host.innerHTML='';
+    host.appendChild(G.three.renderer.domElement);
+  }
+  if(G.three.graphKey!==getGraphLayout(false,'full').signature)buildThreeSceneGraph();
+  resizeThreeRenderer();
+}
+function bindThreeEvents(){
+  if(G.three.resizeObserver)return;
+  const host=E('graph3dHost');
+  if(!host)return;
+  host.addEventListener('pointerdown',ev=>{
+    if(G.mode!=='3d')return;
+    G.three.dragging=true;
+    G.three.lastX=Number(ev.clientX||0);
+    G.three.lastY=Number(ev.clientY||0);
+    host.classList.add('dragging');
+    try{host.setPointerCapture(ev.pointerId)}catch{}
+  });
+  host.addEventListener('pointermove',ev=>{
+    if(G.mode!=='3d')return;
+    if(G.three.dragging){
+      const dx=Number(ev.clientX||0)-G.three.lastX;
+      const dy=Number(ev.clientY||0)-G.three.lastY;
+      G.three.lastX=Number(ev.clientX||0);
+      G.three.lastY=Number(ev.clientY||0);
+      G.three.azimuth+=dx*0.01;
+      G.three.elevation=clamp(G.three.elevation-dy*0.008,-1.2,1.2);
+      scheduleThreeRender('drag');
+      return;
+    }
+    const hit=pickThreeNode(ev);
+    if(String(hit||'')!==String(G.hoverId||''))applyThreeHover(hit);
+  });
+  const finishDrag=()=>{
+    if(!G.three.dragging)return;
+    G.three.dragging=false;
+    host.classList.remove('dragging');
+    scheduleThreeRender('idle');
+  };
+  host.addEventListener('pointerup',finishDrag);
+  host.addEventListener('pointercancel',finishDrag);
+  host.addEventListener('mouseleave',()=>{
+    if(!G.three.dragging&&String(G.hoverId||''))applyThreeHover('');
+  });
+  host.addEventListener('wheel',ev=>{
+    if(G.mode!=='3d')return;
+    ev.preventDefault();
+    const factor=ev.deltaY>0?1.08:0.92;
+    G.three.distance=clamp(G.three.distance*factor,Number(G.three.minDistance||92),Number(G.three.maxDistance||4200));
+    scheduleThreeRender('zoom');
+  },{passive:false});
+  if(typeof ResizeObserver==='function'){
+    G.three.resizeObserver=new ResizeObserver(()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+    });
+    G.three.resizeObserver.observe(E('graphStage'));
+  }else{
+    window.addEventListener('resize',()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+    });
+    G.three.resizeObserver={disconnect(){}};
+  }
+}
+async function renderGraph3D(reason='build'){
+  if(G.mode!=='3d')return;
+  await ensureThreeRenderer();
+  bindThreeEvents();
+  setChip('graphPerfTag','render-on-demand');
+  applyThreeHover(String(G.hoverId||''));
+  scheduleThreeRender(reason);
+}
+function setGraphMode(mode){
+  const target=(mode==='3d'||mode==='json')?mode:'static';
+  if(target==='3d'&&!Boolean(S.config?.three?.available)){
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime('three unavailable',true);
+    return;
+  }
+  G.mode=target;
+  syncGraphStage();
+  if(target==='json')renderGraphJson();
+  else if(target==='3d')renderGraph3D('mode-switch').catch(err=>{
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime(err.message,true);
+  });
+  else drawGraph2D('mode-switch');
+}
+function initGraphUi(){
+  if(G.bound)return;
+  G.bound=true;
+  const canvas=E('graphCanvas2d');
+  if(canvas){
+    canvas.addEventListener('mousemove',ev=>{
+      if(G.mode!=='static')return;
+      const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+      if(String(hit||'')!==String(G.hoverId||'')){G.hoverId=String(hit||'');drawGraph2D('hover')}
+    });
+    canvas.addEventListener('mouseleave',()=>{if(G.mode==='static')clearGraphHover()});
+  }
+  const staticBtn=E('graphModeStaticBtn');
+  const threeBtn=E('graphMode3dBtn');
+  const jsonBtn=E('graphModeJsonBtn');
+  if(staticBtn)staticBtn.onclick=()=>setGraphMode('static');
+  if(threeBtn)threeBtn.onclick=()=>setGraphMode('3d');
+  if(jsonBtn)jsonBtn.onclick=()=>setGraphMode('json');
+  window.addEventListener('resize',()=>{
+    clearTimeout(G.resizeTimer);
+    G.resizeTimer=setTimeout(()=>{
+      if(G.mode==='static')drawGraph2D('resize');
+      else if(G.mode==='3d')resizeThreeRenderer();
+      else setGraphOverlay();
+    },40);
+  });
+}
+function renderGraph(force=false){
+  const graph=S.graph||{};
+  setChip('graphCount',`${Number(graph.node_count||0)}/${Number(graph.edge_count||0)}`);
+  const view=E('graphView');
+  if(view)view.textContent=JSON.stringify(graph,null,2);
+  getGraphLayout(force,'full');
+  getGraphLayout(force,'static');
+  renderGraphLegend();
+  applyGraphModeAvailability();
+  syncGraphStage();
+  if(G.mode==='json')renderGraphJson();
+  else if(G.mode==='3d')renderGraph3D(force?'refresh':'data').catch(err=>{
+    G.mode='static';
+    syncGraphStage();
+    drawGraph2D('fallback');
+    setGraphRuntime(err.message,true);
+  });
+  else drawGraph2D(force?'refresh':'data');
+}
+function renderFilesystem(){
+  E('fsView').textContent=JSON.stringify(S.filesystem||{},null,2);
+}
+function renderQuery(){
+  const route=String(S.query?.route||'').trim();
+  const requested=String(S.query?.requested_route||'').trim();
+  const routeMeta=S.query?.route_meta||{};
+  const routeParts=[];
+  if(route)routeParts.push(`Route: ${route}${requested&&requested!==route?` (requested ${requested})`:''}`);
+  if(Array.isArray(routeMeta?.selected_communities)&&routeMeta.selected_communities.length)routeParts.push(`Communities: ${routeMeta.selected_communities.join(', ')}`);
+  if(routeMeta?.reduce_mode)routeParts.push(`Global path: ${routeMeta.reduce_mode}`);
+  if(Array.isArray(routeMeta?.reasons)&&routeMeta.reasons.length)routeParts.push(`Signals: ${routeMeta.reasons.join(', ')}`);
+  const summary=String(S.query?.answer||S.query?.summary||'').trim();
+  E('querySummary').textContent=(routeParts.length?(routeParts.join('\\n')+'\\n\\n'):'')+(summary||'No answer yet.');
+  const results=Array.isArray(S.query?.results)?S.query.results:[];
+  E('queryResults').innerHTML=results.map(row=>`<div class="item"><div class="item-title">${esc(row.title||row.doc_id)}</div><div class="item-sub">${esc(row.citation||'')} · score=${esc(row.score||0)} · lexical=${esc(row.lexical_score||0)} · graph=${esc(row.graph_score||0)} · ${esc(row.category||'')}</div><div class="item-text">${esc(row.text||'')}</div><div class="item-tags">${(row.entities||[]).map(tag=>`<span class="tag">${esc(tag)}</span>`).join('')}</div></div>`).join('')||'<div class="item">No query results.</div>';
+}
+async function refreshAll(){
+  const [config,library,tasks,graph,filesystem]=await Promise.all([
+    api('/api/rag/config'),
+    api('/api/rag/library?limit=-1'),
+    api('/api/rag/tasks'),
+    api('/api/rag/graph'),
+    api('/api/rag/filesystem'),
+  ]);
+  S.config=config; S.library=library; S.tasks=tasks.tasks||[]; S.graph=graph; S.filesystem=filesystem;
+  renderSessions(); renderStats(); renderDocs(); renderTasks(); renderGraph(); renderFilesystem();
+}
+async function runImportPath(){
+  setChip('importStatus','running');
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({path:String(E('pathInput')?.value||'').trim(),recursive:Boolean(E('recursiveInput')?.checked),session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  setChip('importStatus',`${out.task_id||'queued'} · ${Number(out.item_count||1)} item(s)`); await refreshAll();
+}
+async function runImportFile(){
+  const out=await uploadFileListInBatches(E('fileInput')?.files,'encoding');
+  setChip('importStatus',out.task_count>1?`queued ${out.task_count} batches · ${Number(out.item_count||0)} item(s)`:`${out.task_ids?.[0]||'queued'} · ${Number(out.item_count||0)} item(s)`); await refreshAll();
+}
+async function runImportFolder(){
+  const folderInput=E('folderInput');
+  const out=await uploadFileListInBatches(folderInput?.files,'folder',true);
+  if(folderInput)folderInput.value='';
+  setChip('importStatus',out.task_count>1?`queued ${out.task_count} batches · ${Number(out.item_count||0)} item(s)`:`${out.task_ids?.[0]||'queued'} · ${Number(out.item_count||0)} item(s)`); await refreshAll();
+}
+function folderUploadSupported(){
+  const input=E('folderInput');
+  if(!input)return false;
+  return input.hasAttribute('webkitdirectory') || input.hasAttribute('directory') || ('webkitdirectory' in input);
+}
+async function triggerFolderImportFlow(){
+  const input=E('folderInput');
+  if(!input) throw new Error('folder input missing');
+  const files=input.files;
+  if(files&&files.length){
+    return await runImportFolder();
+  }
+  if(!folderUploadSupported()) throw new Error('folder upload is not supported in this browser');
+  setChip('importStatus','choose folder');
+  input.click();
+}
+async function onFolderInputChange(){
+  const input=E('folderInput');
+  const count=Number(input?.files?.length||0);
+  if(!count)return;
+  setChip('importStatus',`folder selected · ${count} file(s)`);
+  await runImportFolder();
+}
+async function runImportText(){
+  const title=String(E('manualTitle')?.value||'').trim()||'manual_note.txt';
+  const text=String(E('manualText')?.value||'').trim();
+  if(!text) throw new Error('manual text required');
+  setChip('importStatus','saving');
+  const out=await api('/api/rag/import',{method:'POST',body:JSON.stringify({title,filename:title,text,session_id:selectedSession(),tags:parseTags(),strict_local_only:strictLocalOnlyImport(),import_without_llm:strictLocalOnlyImport()})});
+  setChip('importStatus',`${out.task_id||'queued'} · ${Number(out.item_count||1)} item(s)`); await refreshAll();
+}
+async function runQuery(){
+  setChip('queryStatus','running');
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||8),route:selectedQueryRoute(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked)})});
+  S.query=out; renderQuery(); setChip('queryStatus','done');
+}
+async function rebuildIndex(){
+  setChip('importStatus','rebuilding');
+  await api('/api/rag/rebuild',{method:'POST',body:JSON.stringify({})});
+  setChip('importStatus','rebuilt'); await refreshAll();
+}
+window.addEventListener('DOMContentLoaded',async()=>{
+  initGraphUi();
+  E('refreshBtn').onclick=()=>refreshAll().catch(err=>setChip('importStatus',err.message,true));
+  E('rebuildBtn').onclick=()=>rebuildIndex().catch(err=>setChip('importStatus',err.message,true));
+  E('importPathBtn').onclick=()=>runImportPath().catch(err=>setChip('importStatus',err.message,true));
+  E('importFileBtn').onclick=()=>runImportFile().catch(err=>setChip('importStatus',err.message,true));
+  E('importFolderBtn').onclick=()=>triggerFolderImportFlow().catch(err=>setChip('importStatus',err.message,true));
+  if(E('folderInput'))E('folderInput').onchange=()=>onFolderInputChange().catch(err=>setChip('importStatus',err.message,true));
+  E('importTextBtn').onclick=()=>runImportText().catch(err=>setChip('importStatus',err.message,true));
+  E('queryBtn').onclick=()=>runQuery().catch(err=>setChip('queryStatus',err.message,true));
+  try{await refreshAll()}catch(err){setChip('importStatus',err.message,true)}
+});
+"""
+
+CODE_ADMIN_INDEX_HTML = (
+    RAG_ADMIN_INDEX_HTML
+    .replace("Clouds Coder RAG Admin", "Clouds Coder Code Library Admin")
+    .replace("/assets/rag-admin.js", "/assets/code-admin.js")
+    .replace("TF-Graph_IDF RAG Admin", "Code Graph Library Admin")
+    .replace(
+        "Global knowledge library, graph view, batch import, backup, and retrieval control.",
+        "Independent code library, repository graph view, batch import, backup, and developer retrieval control.",
+    )
+)
+CODE_ADMIN_CSS = (
+    RAG_ADMIN_CSS
+    + """
+:root{
+  --bg:#fff7fb;
+  --bg-strong:#ffe8f2;
+  --panel:#fffafb;
+  --line:#f1cadc;
+  --ink:#4d2433;
+  --muted:#8f6274;
+  --accent:#d95c8a;
+  --accent-2:#f08db0;
+  --danger:#c94b73;
+  --shadow:0 18px 48px rgba(193,94,136,.14);
+}
+html,body{background:radial-gradient(circle at top left,#fff8fc 0,#ffeef5 42%,#f9d9e6 100%);color:var(--ink)}
+.rag-hero{border:1px solid rgba(120,42,72,.08);background:linear-gradient(135deg,rgba(255,255,255,.95),rgba(255,236,244,.9));box-shadow:var(--shadow)}
+.panel{background:rgba(255,250,252,.95);border:1px solid rgba(120,42,72,.08);box-shadow:var(--shadow)}
+.stat-card{background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(255,236,244,.88));border:1px solid rgba(120,42,72,.08)}
+.btn{background:#ffe3ef}
+.btn-accent{background:linear-gradient(135deg,var(--accent),#f08db0);color:#fff}
+.item{border:1px solid rgba(120,42,72,.08);background:rgba(255,255,255,.84)}
+.query-summary{border-left:4px solid var(--accent);background:rgba(217,92,138,.09)}
+.graph-modes{background:rgba(217,92,138,.08);border:1px solid rgba(120,42,72,.1)}
+.graph-mode.is-active{background:#9c2f5e;color:#fff4f8;box-shadow:0 10px 24px rgba(156,47,94,.24)}
+.graph-stage{border:1px solid rgba(120,42,72,.08);background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.94),rgba(255,233,242,.94) 44%,rgba(248,214,228,.98))}
+.graph-json{color:#4d2433}
+.graph-overlay{background:rgba(88,31,53,.84);color:#ffeaf1}
+.legend-chip{background:rgba(255,255,255,.84);border:1px solid rgba(120,42,72,.08)}
+"""
+)
+CODE_ADMIN_JS = (
+    RAG_ADMIN_JS
+    .replace("/api/rag/", "/api/code/")
+    .replace("No query results.", "No code library results.")
+)
+
 class AppContext:
+    def _discover_external_code_source_roots(self) -> list[str]:
+        home = Path.home()
+        candidate_seeds = [
+            self.workspace / "code_corpora",
+            self.workspace.parent / "code_corpora",
+            self.workspace.parent.parent / "code_corpora",
+            self.workspace.parent / "Skills_Master" / "code_corpora",
+            self.workspace.parent.parent / "Skills_Master" / "code_corpora",
+            REPO_ROOT / "code_corpora",
+            home / "Downloads" / "Skills_Master" / "code_corpora",
+            home / "Downloads" / "code_corpora",
+        ]
+        seen: set[str] = set()
+        roots: list[str] = []
+
+        def _append(path: Path):
+            try:
+                resolved = path.resolve()
+            except Exception:
+                return
+            raw = str(resolved)
+            if raw in seen or not resolved.exists() or not resolved.is_dir():
+                return
+            seen.add(raw)
+            roots.append(raw)
+
+        for seed in candidate_seeds:
+            try:
+                base = seed.resolve()
+            except Exception:
+                continue
+            if not base.exists() or not base.is_dir():
+                continue
+            if (base / "repos").exists() and (base / "repos").is_dir():
+                _append(base / "repos")
+                continue
+            try:
+                children = sorted((child for child in base.iterdir() if child.is_dir()), key=lambda p: p.name.lower())
+            except Exception:
+                children = []
+            for child in children:
+                if (child / "repos").exists() and (child / "repos").is_dir():
+                    _append(child / "repos")
+        return roots
+
     def _sync_global_ollama_defaults(self, active_profile: dict | None = None):
         picked: dict = {}
         if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
@@ -29924,6 +40383,7 @@ class AppContext:
         skills_root: Path,
         thinking: bool = False,
         default_language: str = DEFAULT_UI_LANGUAGE,
+        ui_style: str = DEFAULT_UI_STYLE,
         context_token_limit: int = TOKEN_THRESHOLD,
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
@@ -29938,8 +40398,10 @@ class AppContext:
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         max_user: int = 0,
         max_user_sessions: int = 0,
+        rag_include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
     ):
-        self.workspace = workspace
+        self.workspace = Path(workspace).resolve()
+        self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
         self.base_url = base_url
         self.model = model
         self.thinking = False
@@ -29958,6 +40420,7 @@ class AppContext:
                 "error": trim(str(exc), 220),
             }
         self.default_language = normalize_ui_language(default_language)
+        self.ui_style = normalize_ui_style(ui_style)
         self.context_token_limit = max(
             MIN_CONTEXT_TOKEN_LIMIT,
             min(TOKEN_THRESHOLD, int(context_token_limit or TOKEN_THRESHOLD)),
@@ -29985,7 +40448,7 @@ class AppContext:
         ensure_runtime_skills(self.skills_root)
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
-        self.default_llm_config = parse_json_object(try_read_text(LLM_CONFIG_PATH) or "{}", {})
+        self.default_llm_config = parse_json_object(try_read_text(self.workspace / "LLM.config.json") or "{}", {})
         self.global_profiles_payload = parse_llm_config_profiles(
             self.default_llm_config, self.base_url, self.model
         )
@@ -29999,7 +40462,7 @@ class AppContext:
         active = self.global_profiles.get(self.global_active_profile_id, {})
         self._sync_global_ollama_defaults(active if isinstance(active, dict) else {})
         self.thinking = False
-        self.codes_root = CODES_ROOT
+        self.codes_root = (self.workspace / "Codes").resolve()
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
         self._session_mgrs: dict[str, SessionManager] = {}
@@ -30016,6 +40479,19 @@ class AppContext:
         self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
         self.web_ui_assets_override: dict[str, str] = {}
         self.show_upload_list = False
+        self.rag_include_filename_entities = bool(rag_include_filename_entities)
+        self.rag_parser = RAGContentParser(include_filename_entities=self.rag_include_filename_entities)
+        self.rag_root = self.workspace / RAG_LIBRARY_DIRNAME
+        self.rag_store = RAGLibraryStore(
+            self.rag_root,
+            include_filename_entities=self.rag_include_filename_entities,
+        )
+        self.rag_service = RAGIngestionService(self.rag_store, self.rag_parser, session_resolver=self._resolve_session_for_user)
+        self.code_parser = CodeContentParser()
+        self.code_root = self.workspace / CODE_LIBRARY_DIRNAME
+        self.code_store = CodeLibraryStore(self.code_root)
+        self.code_service = CodeIngestionService(self.code_store, self.code_parser, session_resolver=self._resolve_session_for_user)
+        self.code_source_roots = self._discover_external_code_source_roots()
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -30123,6 +40599,7 @@ class AppContext:
             "config_path": str(self.web_ui_config_path or ""),
             "dir": str(self.web_ui_dir),
             "show_upload_list": bool(getattr(self, "show_upload_list", False)),
+            "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "validation": dict(self.web_ui_validation or {}),
         }
 
@@ -30220,6 +40697,838 @@ class AppContext:
 
     def web_ui_skills_js(self) -> str:
         return self._web_ui_asset("skills.js")
+
+    def web_ui_rag_admin_index_html(self) -> str:
+        return RAG_ADMIN_INDEX_HTML
+
+    def web_ui_rag_admin_style_css(self) -> str:
+        return RAG_ADMIN_CSS
+
+    def web_ui_rag_admin_js(self) -> str:
+        return RAG_ADMIN_JS
+
+    def web_ui_code_admin_index_html(self) -> str:
+        return CODE_ADMIN_INDEX_HTML
+
+    def web_ui_code_admin_style_css(self) -> str:
+        return CODE_ADMIN_CSS
+
+    def web_ui_code_admin_js(self) -> str:
+        return CODE_ADMIN_JS
+
+    def rag_js_lib_asset_path(self, filename: str) -> Path | None:
+        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
+
+    def rag_three_asset_info(self) -> dict:
+        picks = [
+            ("three.min.js", False),
+            ("three.module.js", True),
+        ]
+        for filename, is_module in picks:
+            fp = self.rag_js_lib_asset_path(filename)
+            if fp and fp.stat().st_size > 40:
+                return {
+                    "available": True,
+                    "filename": filename,
+                    "module": bool(is_module),
+                    "url": f"/assets/js_lib/{filename}",
+                    "size": int(fp.stat().st_size),
+                }
+        return {
+            "available": False,
+            "filename": "",
+            "module": False,
+            "url": "",
+            "size": 0,
+        }
+
+    def _latest_session_for_user(self, user_id: str) -> SessionState | None:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = list(mgr.sessions.values())
+        if not sessions:
+            return None
+        return max(sessions, key=lambda s: float(getattr(s, "updated_at", 0.0) or 0.0))
+
+    def _resolve_session_for_user(self, user_id: str, session_id: str = "") -> SessionState | None:
+        sid = str(session_id or "").strip()
+        mgr = self.manager_for_user(user_id)
+        if sid:
+            return mgr.get(sid)
+        return self._latest_session_for_user(user_id)
+
+    # --- File classification constants for auto-routing ---
+    _CODE_EXTS = frozenset({
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c", ".cpp",
+        ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".scala", ".lua",
+        ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".r", ".jl", ".m",
+        ".vue", ".svelte", ".zig", ".nim", ".dart", ".ex", ".exs", ".erl",
+        ".hs", ".ml", ".mli", ".clj", ".cljs", ".elm", ".sql",
+    })
+    _DOC_EXTS = frozenset({
+        ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".epub", ".odt",
+        ".rtf", ".tex", ".bib",
+    })
+    _DATA_EXTS = frozenset({".csv", ".xlsx", ".xls", ".tsv", ".parquet", ".jsonl"})
+    _TEXT_EXTS = frozenset({".md", ".txt", ".rst", ".org", ".adoc", ".wiki", ".log"})
+    _MEDIA_EXTS = frozenset({
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico",
+        ".mp3", ".wav", ".ogg", ".flac", ".mp4", ".avi", ".mov", ".webm",
+    })
+
+    def _classify_upload_target(self, filename: str, mime: str = "") -> str:
+        """Classify upload file into 'code', 'document', 'data', 'text', 'media', or 'other'."""
+        ext = Path(filename).suffix.lower()
+        if ext in self._CODE_EXTS:
+            return "code"
+        if ext in self._DOC_EXTS:
+            return "document"
+        if ext in self._DATA_EXTS:
+            return "data"
+        if ext in self._TEXT_EXTS:
+            return "text"
+        if ext in self._MEDIA_EXTS:
+            return "media"
+        mime_low = str(mime or "").lower()
+        if "text/" in mime_low or "application/json" in mime_low or "application/xml" in mime_low:
+            return "text"
+        if "image/" in mime_low or "audio/" in mime_low or "video/" in mime_low:
+            return "media"
+        return "other"
+
+    def _on_session_upload(self, session: SessionState, upload_meta: dict, workspace_target: Path, parsed_target: Path | None) -> dict:
+        filename = str(upload_meta.get("filename", workspace_target.name) or workspace_target.name)
+        mime = str(upload_meta.get("mime", "") or "")
+        classification = self._classify_upload_target(filename, mime)
+        result: dict = {"classification": classification}
+        # Route to appropriate library
+        if classification == "code":
+            # Code files → Code Library
+            try:
+                code_result = self.code_service.enqueue_upload(session, upload_meta, workspace_target, parsed_target)
+                result["code_library"] = code_result
+            except Exception as exc:
+                result["code_library"] = {"ok": False, "error": trim(str(exc), 260)}
+        elif classification in ("document", "text", "other"):
+            # Documents, text, unknown → RAG Knowledge Library
+            try:
+                rag_result = self.rag_service.enqueue_upload(session, upload_meta, workspace_target, parsed_target)
+                result.update(rag_result)
+            except Exception as exc:
+                result["ok"] = False
+                result["error"] = trim(str(exc), 260)
+        elif classification == "data":
+            # Data files → both RAG (for knowledge) + emit summary event
+            try:
+                rag_result = self.rag_service.enqueue_upload(session, upload_meta, workspace_target, parsed_target)
+                result.update(rag_result)
+            except Exception as exc:
+                result["ok"] = False
+                result["error"] = trim(str(exc), 260)
+        else:
+            # Media files → just store, no library ingestion
+            result["ok"] = True
+            result["note"] = "media file stored in workspace only"
+        # Emit classification event for frontend
+        session.events.publish({
+            "type": "upload_classified",
+            "filename": filename,
+            "classification": classification,
+            "library": "code" if classification == "code" else ("rag" if classification in ("document", "text", "data", "other") else "none"),
+        })
+        return result
+
+    def rag_config(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = sorted(
+                (
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                    }
+                    for s in mgr.sessions.values()
+                ),
+                key=lambda x: float(x.get("updated_at", 0.0) or 0.0),
+                reverse=True,
+            )
+        session = self._latest_session_for_user(user_id)
+        caps = default_multimodal_capabilities()
+        if isinstance(session, SessionState):
+            try:
+                caps = session._capabilities_from_profile()
+            except Exception:
+                caps = default_multimodal_capabilities()
+        return {
+            "workspace": str(self.workspace),
+            "rag_root": str(self.rag_root),
+            "sessions": sessions,
+            "default_session_id": str(getattr(session, "id", "") or ""),
+            "active_capabilities": caps,
+            "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "agent_port": int(getattr(self, "agent_port", 0) or 0),
+            "skills_port": int(getattr(self, "skills_port", 0) or 0),
+            "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
+            "three": self.rag_three_asset_info(),
+            "limits": {
+                "max_import_files": RAG_MAX_IMPORT_FILES,
+                "max_import_batch_items": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "max_import_batch_bytes": RAG_MAX_IMPORT_BATCH_BYTES,
+                "max_query_results": RAG_MAX_QUERY_RESULTS,
+                "max_global_communities": RAG_MAX_GLOBAL_COMMUNITIES,
+                "parse_timeout_seconds": RAG_PARSE_TIMEOUT_SECONDS,
+                "import_workers": RAG_IMPORT_WORKER_COUNT,
+            },
+            "features": {
+                "strict_local_import": True,
+                "filename_entities": bool(self.rag_include_filename_entities),
+            },
+        }
+
+    def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        return self.rag_store.library_payload(limit=limit, offset=offset)
+
+    def rag_tasks_payload(self, limit: int = 80) -> dict:
+        return {"tasks": self.rag_store.list_tasks(limit=limit)}
+
+    def rag_graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        return self.rag_store.index.graph_payload(max_nodes=max_nodes)
+
+    def rag_filesystem_payload(self, max_nodes: int = 320) -> dict:
+        return self.rag_store.filesystem_payload(max_nodes=max_nodes)
+
+    def _knowledge_library_status_for_session(self, session: SessionState | None = None) -> dict:
+        payload = self.rag_store.library_payload(limit=0)
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", payload.get("total_documents", 0)) or 0)
+        chunks = int(stats.get("chunks", 0) or 0)
+        tasks = int(stats.get("tasks", 0) or 0)
+        ready = bool(
+            docs > 0
+            or chunks > 0
+            or self.rag_store.state_path.exists()
+            or self.rag_store.index_snapshot_path.exists()
+        )
+        return {
+            "root": str(self.rag_root),
+            "ready": ready,
+            "documents": docs,
+            "chunks": chunks,
+            "tasks": tasks,
+            "stats": stats,
+            "session_id": str(getattr(session, "id", "") or ""),
+        }
+
+    def _code_library_status_for_session(self, session: SessionState | None = None) -> dict:
+        payload = self.code_store.library_payload(limit=0)
+        stats = payload.get("stats", {}) if isinstance(payload.get("stats", {}), dict) else {}
+        docs = int(stats.get("documents", payload.get("total_documents", 0)) or 0)
+        chunks = int(stats.get("chunks", 0) or 0)
+        tasks = int(stats.get("tasks", 0) or 0)
+        source_roots = [str(x).strip() for x in (self.code_source_roots or []) if str(x).strip()]
+        initialized = bool(self.code_store.state_path.exists() or self.code_store.index_snapshot_path.exists())
+        ready = bool(docs > 0 or chunks > 0)
+        return {
+            "root": str(self.code_root),
+            "ready": ready,
+            "initialized": initialized,
+            "documents": docs,
+            "chunks": chunks,
+            "tasks": tasks,
+            "stats": stats,
+            "source_roots": source_roots,
+            "source_root_count": len(source_roots),
+            "session_id": str(getattr(session, "id", "") or ""),
+        }
+
+    def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
+        if not isinstance(session, SessionState) or not rows:
+            return ""
+        evidence_rows = [
+            row
+            for row in rows
+            if str(row.get("route_evidence", "") or "") in {"chunk", "document"}
+        ]
+        if not evidence_rows:
+            evidence_rows = list(rows)
+        evidence = []
+        for idx, row in enumerate(evidence_rows[:5], 1):
+            evidence.append(
+                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')}\n"
+                f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
+            )
+        prompt = (
+            "Use the retrieved evidence to answer the query. "
+            "Cite with the provided citation strings exactly as given. "
+            "If evidence is insufficient, say so explicitly.\n\n"
+            f"Query:\n{query}\n\nEvidence:\n" + "\n\n".join(evidence)
+        )
+        try:
+            rsp = session.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=900,
+                temperature=0.1,
+                think=False,
+                stream_thinking=False,
+            )
+            return trim(str(rsp.get("content", "") or ""), 6000)
+        except Exception:
+            return ""
+
+    def rag_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        category = str(body.get("category", "") or "").strip()
+        kind = str(body.get("kind", "") or "").strip()
+        route = str(
+            body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
+            or "auto"
+        ).strip().lower()
+        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route)
+        synthesize = bool(body.get("synthesize", False))
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        if synthesize:
+            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
+            if answer:
+                result["answer"] = answer
+        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        return result
+
+    def rag_import_request(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        path_raw = str(body.get("path", "") or "").strip()
+        title = str(body.get("title", "") or "").strip()
+        text = str(body.get("text", "") or "")
+        filename = str(body.get("filename", "") or "").strip()
+        mime = str(body.get("mime", "") or "").strip()
+        tags = [str(x).strip() for x in (body.get("tags", []) or []) if str(x).strip()]
+        content_b64_present = "content_b64" in body
+        content_b64 = str(body.get("content_b64", "") or "").strip()
+        strict_local_only = bool(body.get("strict_local_only", body.get("import_without_llm", body.get("local_only", False))))
+        items_raw = body.get("items", [])
+        if isinstance(items_raw, list) and items_raw:
+            if len(items_raw) > RAG_MAX_IMPORT_FILES:
+                raise ValueError(f"too many import items (max {RAG_MAX_IMPORT_FILES})")
+            items: list[dict] = []
+            for idx, row in enumerate(items_raw, 1):
+                if not isinstance(row, dict):
+                    continue
+                item_text = str(row.get("text", "") or "")
+                item_b64_present = "content_b64" in row
+                item_b64 = str(row.get("content_b64", "") or "").strip()
+                rel_path = str(row.get("relative_path", row.get("webkit_relative_path", "")) or "").strip().replace("\\", "/").lstrip("/")
+                item_filename = str(row.get("filename", "") or row.get("title", "") or f"upload_{idx}.bin").strip()
+                if item_b64_present:
+                    try:
+                        raw = base64.b64decode(item_b64.encode("ascii"), validate=True)
+                    except Exception:
+                        raise ValueError(f"invalid base64 payload in item {idx}")
+                    items.append(
+                        {
+                            "filename": item_filename,
+                            "mime": str(row.get("mime", "") or "").strip(),
+                            "content_bytes": raw,
+                            "relative_path": rel_path,
+                        }
+                    )
+                elif item_text.strip():
+                    items.append(
+                        {
+                            "filename": item_filename or (rel_path.rsplit("/", 1)[-1] if rel_path else f"upload_{idx}.txt"),
+                            "mime": str(row.get("mime", "text/plain") or "text/plain").strip(),
+                            "text": item_text,
+                            "relative_path": rel_path,
+                        }
+                    )
+            if not items:
+                raise ValueError("items payload did not contain importable content")
+            source_mode = "admin_batch_upload" if len(items) > 1 else "admin_upload"
+            if len(items) <= RAG_MAX_IMPORT_BATCH_ITEMS:
+                return self.rag_service.enqueue_import(
+                    session=session,
+                    session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                    user_id=user_id,
+                    source_mode=source_mode,
+                    tags=tags,
+                    items=items,
+                    strict_local_only=strict_local_only,
+                )
+            task_rows: list[dict] = []
+            for start in range(0, len(items), RAG_MAX_IMPORT_BATCH_ITEMS):
+                chunk = items[start : start + RAG_MAX_IMPORT_BATCH_ITEMS]
+                task_rows.append(
+                    self.rag_service.enqueue_import(
+                        session=session,
+                        session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                        user_id=user_id,
+                        source_mode=source_mode,
+                        tags=tags,
+                        items=chunk,
+                        strict_local_only=strict_local_only,
+                    )
+                )
+            return {
+                "ok": True,
+                "queued": True,
+                "task_ids": [str(row.get("task_id", "")) for row in task_rows if str(row.get("task_id", "")).strip()],
+                "task_count": len(task_rows),
+                "item_count": len(items),
+                "batch_size": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "strict_local_only": bool(strict_local_only),
+                "library_root": str(self.rag_store.root),
+            }
+        if content_b64_present:
+            try:
+                raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+            except Exception:
+                raise ValueError("invalid base64 payload")
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                filename=filename or "uploaded.bin",
+                mime=mime,
+                content_bytes=raw,
+                source_mode="admin_upload",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        if text.strip():
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                title=title or filename or "manual_note.txt",
+                text=text,
+                filename=filename or title or "manual_note.txt",
+                mime=mime or "text/plain",
+                source_mode="manual_text",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        if path_raw:
+            p = Path(path_raw).expanduser()
+            if not p.is_absolute():
+                p = (self.workspace / p).resolve()
+            else:
+                p = p.resolve()
+            return self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                path=str(p),
+                recursive=bool(body.get("recursive", True)),
+                source_mode="manual_path",
+                tags=tags,
+                strict_local_only=strict_local_only,
+            )
+        raise ValueError("path, text, content_b64, or items required")
+
+    def rag_rebuild(self) -> dict:
+        self.rag_store.rebuild_index()
+        return {
+            "ok": True,
+            "built_at": self.rag_store.index.built_at,
+            "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+        }
+
+    def code_config(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        with mgr.lock:
+            sessions = sorted(
+                (
+                    {
+                        "id": s.id,
+                        "title": s.title,
+                        "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                    }
+                    for s in mgr.sessions.values()
+                ),
+                key=lambda x: float(x.get("updated_at", 0.0) or 0.0),
+                reverse=True,
+            )
+        session = self._latest_session_for_user(user_id)
+        return {
+            "workspace": str(self.workspace),
+            "repo_root": str(REPO_ROOT),
+            "code_root": str(self.code_root),
+            "code_source_roots": list(self.code_source_roots or []),
+            "status": self._code_library_status_for_session(session),
+            "sessions": sessions,
+            "default_session_id": str(getattr(session, "id", "") or ""),
+            "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+            "agent_port": int(getattr(self, "agent_port", 0) or 0),
+            "skills_port": int(getattr(self, "skills_port", 0) or 0),
+            "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
+            "code_admin_port": int(getattr(self, "code_admin_port", 0) or 0),
+            "three": self.rag_three_asset_info(),
+            "limits": {
+                "max_import_files": RAG_MAX_IMPORT_FILES,
+                "max_import_batch_items": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "max_import_batch_bytes": RAG_MAX_IMPORT_BATCH_BYTES,
+                "max_query_results": RAG_MAX_QUERY_RESULTS,
+                "max_global_communities": RAG_MAX_GLOBAL_COMMUNITIES,
+                "parse_timeout_seconds": CODE_PARSE_TIMEOUT_SECONDS,
+                "import_workers": CODE_IMPORT_WORKER_COUNT,
+            },
+            "features": {
+                "llm_enrichment": False,
+                "strict_local_import": True,
+                "repo_import": True,
+            },
+        }
+
+    def code_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
+        return self.code_store.library_payload(limit=limit, offset=offset)
+
+    def code_tasks_payload(self, limit: int = 80) -> dict:
+        return {"tasks": self.code_store.list_tasks(limit=limit)}
+
+    def code_graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        return self.code_store.index.graph_payload(max_nodes=max_nodes)
+
+    def code_filesystem_payload(self, max_nodes: int = 320) -> dict:
+        return self.code_store.filesystem_payload(max_nodes=max_nodes)
+
+    def code_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
+        language_filter = str(body.get("language", "") or "").strip().lower()
+        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route)
+        if language_filter:
+            filtered = [
+                dict(row)
+                for row in (result.get("results", []) or [])
+                if str(row.get("language", "") or "").strip().lower() == language_filter
+            ]
+            result = dict(result)
+            result["results"] = filtered[:top_k]
+        synthesize = bool(body.get("synthesize", False))
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        if synthesize:
+            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
+            if answer:
+                result["answer"] = answer
+        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        return result
+
+    def code_import_request(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        path_raw = str(body.get("path", "") or "").strip()
+        title = str(body.get("title", "") or "").strip()
+        text = str(body.get("text", "") or "")
+        filename = str(body.get("filename", "") or "").strip()
+        mime = str(body.get("mime", "") or "").strip()
+        tags = [str(x).strip() for x in (body.get("tags", []) or []) if str(x).strip()]
+        content_b64_present = "content_b64" in body
+        content_b64 = str(body.get("content_b64", "") or "").strip()
+        items_raw = body.get("items", [])
+        if isinstance(items_raw, list) and items_raw:
+            if len(items_raw) > RAG_MAX_IMPORT_FILES:
+                raise ValueError(f"too many import items (max {RAG_MAX_IMPORT_FILES})")
+            items: list[dict] = []
+            for idx, row in enumerate(items_raw, 1):
+                if not isinstance(row, dict):
+                    continue
+                item_text = str(row.get("text", "") or "")
+                item_b64_present = "content_b64" in row
+                item_b64 = str(row.get("content_b64", "") or "").strip()
+                rel_path = str(row.get("relative_path", row.get("webkit_relative_path", "")) or "").strip().replace("\\", "/").lstrip("/")
+                item_filename = str(row.get("filename", "") or row.get("title", "") or f"upload_{idx}.bin").strip()
+                if item_b64_present:
+                    try:
+                        raw = base64.b64decode(item_b64.encode("ascii"), validate=True)
+                    except Exception:
+                        raise ValueError(f"invalid base64 payload in item {idx}")
+                    items.append(
+                        {
+                            "filename": item_filename,
+                            "mime": str(row.get("mime", "") or "").strip(),
+                            "content_bytes": raw,
+                            "relative_path": rel_path,
+                        }
+                    )
+                elif item_text.strip():
+                    items.append(
+                        {
+                            "filename": item_filename or (rel_path.rsplit("/", 1)[-1] if rel_path else f"upload_{idx}.txt"),
+                            "mime": str(row.get("mime", "text/plain") or "text/plain").strip(),
+                            "text": item_text,
+                            "relative_path": rel_path,
+                        }
+                    )
+            if not items:
+                raise ValueError("items payload did not contain importable content")
+            source_mode = "code_admin_batch_upload" if len(items) > 1 else "code_admin_upload"
+            if len(items) <= RAG_MAX_IMPORT_BATCH_ITEMS:
+                return self.code_service.enqueue_import(
+                    session=session,
+                    session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                    user_id=user_id,
+                    source_mode=source_mode,
+                    tags=tags,
+                    items=items,
+                    strict_local_only=True,
+                )
+            task_rows: list[dict] = []
+            for start in range(0, len(items), RAG_MAX_IMPORT_BATCH_ITEMS):
+                chunk = items[start : start + RAG_MAX_IMPORT_BATCH_ITEMS]
+                task_rows.append(
+                    self.code_service.enqueue_import(
+                        session=session,
+                        session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                        user_id=user_id,
+                        source_mode=source_mode,
+                        tags=tags,
+                        items=chunk,
+                        strict_local_only=True,
+                    )
+                )
+            return {
+                "ok": True,
+                "queued": True,
+                "task_ids": [str(row.get("task_id", "")) for row in task_rows if str(row.get("task_id", "")).strip()],
+                "task_count": len(task_rows),
+                "item_count": len(items),
+                "batch_size": RAG_MAX_IMPORT_BATCH_ITEMS,
+                "library_root": str(self.code_store.root),
+            }
+        if content_b64_present:
+            try:
+                raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
+            except Exception:
+                raise ValueError("invalid base64 payload")
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                filename=filename or "uploaded.bin",
+                mime=mime,
+                content_bytes=raw,
+                source_mode="code_admin_upload",
+                tags=tags,
+                strict_local_only=True,
+            )
+        if text.strip():
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                title=title or filename or "manual_code.txt",
+                text=text,
+                filename=filename or title or "manual_code.txt",
+                mime=mime or "text/plain",
+                source_mode="manual_text",
+                tags=tags,
+                strict_local_only=True,
+            )
+        if path_raw:
+            p = Path(path_raw).expanduser()
+            if not p.is_absolute():
+                p = (self.workspace / p).resolve()
+            else:
+                p = p.resolve()
+            return self.code_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or body.get("session_id", "")),
+                user_id=user_id,
+                path=str(p),
+                recursive=bool(body.get("recursive", True)),
+                source_mode="manual_path",
+                tags=tags,
+                strict_local_only=True,
+            )
+        raise ValueError("path, text, content_b64, or items required")
+
+    def code_rebuild(self) -> dict:
+        self.code_store.rebuild_index()
+        return {
+            "ok": True,
+            "built_at": self.code_store.index.built_at,
+            "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+        }
+
+    def _looks_like_code_task(self, text: str) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        if re.search(r"`[^`\n]+\.(py|js|ts|tsx|jsx|java|go|rs|cpp|c|hpp|kt|swift|php|rb|sh|sql)`", raw):
+            return True
+        if re.search(r"\b[a-z0-9_./-]+\.(py|js|ts|tsx|jsx|java|go|rs|cpp|c|hpp|kt|swift|php|rb|sh|sql)\b", low):
+            return True
+        code_terms = [
+            "bug", "fix", "error", "traceback", "stack trace", "compile", "build", "test",
+            "refactor", "implement", "function", "class", "method", "module", "interface", "api",
+            "代码", "报错", "修复", "函数", "类", "方法", "模块", "接口", "重构", "编译", "构建", "测试",
+        ]
+        return any(term in low for term in code_terms)
+
+    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        if not rows:
+            return {}
+        lines = []
+        for idx, row in enumerate(rows[:limit], 1):
+            citation = str(row.get("citation", "") or "").strip()
+            title = str(row.get("title", "") or "").strip()
+            symbol = str(row.get("symbol", "") or "").strip()
+            anchor = str(row.get("anchor", "") or "").strip()
+            snippet = trim(str(row.get("text", "") or ""), 420)
+            header = f"{idx}. {citation} {title}".strip()
+            if symbol:
+                header += f" | symbol={symbol}"
+            elif anchor:
+                header += f" | anchor={anchor}"
+            lines.append(header)
+            if snippet:
+                lines.append(snippet)
+        return {
+            "code_text": "\n".join(lines),
+            "code_meta": {
+                "route": str(result.get("route", "") or ""),
+                "requested_route": str(result.get("requested_route", "") or ""),
+                "result_count": len(rows[:limit]),
+                "summary": trim(str(result.get("summary", "") or ""), 600),
+            },
+        }
+
+    def _prepare_runtime_references(self, session: SessionState, text: str) -> dict:
+        query = trim(str(text or "").strip(), 4000)
+        if not query or not self._looks_like_code_task(query):
+            return {}
+        if not self.code_store.documents:
+            return {}
+        try:
+            result = self.code_query(
+                str(getattr(session, "owner_user_id", "") or ""),
+                {
+                    "query": query,
+                    "top_k": 6,
+                    "route": "auto",
+                    "session_id": str(getattr(session, "id", "") or ""),
+                },
+            )
+        except Exception:
+            return {}
+        return self._format_code_reference_payload(result, limit=6)
+
+    def _query_code_library_tool(self, session: SessionState, args: dict) -> str:
+        status = self._code_library_status_for_session(session)
+        query = str((args or {}).get("query", "") or "").strip()
+        if not query:
+            lines = [
+                f"code_library_root={status.get('root', '')}",
+                (
+                    "ready="
+                    + ("yes" if bool(status.get("ready", False)) else "no")
+                    + f" initialized={'yes' if bool(status.get('initialized', False)) else 'no'}"
+                    + f" documents={int(status.get('documents', 0) or 0)}"
+                    + f" chunks={int(status.get('chunks', 0) or 0)}"
+                    + f" tasks={int(status.get('tasks', 0) or 0)}"
+                ),
+            ]
+            source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
+            if source_roots:
+                lines.append("source_roots=" + " | ".join(source_roots[:8]))
+            return "\n".join(lines)
+        result = self.code_query(
+            str(getattr(session, "owner_user_id", "") or ""),
+            {
+                "query": query,
+                "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
+                "route": str((args or {}).get("route", "auto") or "auto"),
+                "language": str((args or {}).get("language", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+            },
+        )
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        lines = [
+            f"code_library_root={status.get('root', '')}",
+            (
+                "ready="
+                + ("yes" if bool(status.get("ready", False)) else "no")
+                + f" initialized={'yes' if bool(status.get('initialized', False)) else 'no'}"
+                + f" documents={int(status.get('documents', 0) or 0)}"
+                + f" chunks={int(status.get('chunks', 0) or 0)}"
+                + f" tasks={int(status.get('tasks', 0) or 0)}"
+            ),
+        ]
+        source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
+        if source_roots:
+            lines.append("source_roots=" + " | ".join(source_roots[:8]))
+        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        if not rows:
+            lines.append("No code library results.")
+            return "\n".join(lines)
+        for row in rows[: min(8, len(rows))]:
+            lines.append(
+                f"{str(row.get('citation', '') or '').strip()} "
+                f"{str(row.get('title', '') or '').strip()} "
+                f"score={str(row.get('score', 0) or 0)}"
+            )
+            if str(row.get("symbol", "") or "").strip():
+                lines.append(f"symbol={str(row.get('symbol', '') or '').strip()}")
+            snippet = trim(str(row.get("text", "") or ""), 320)
+            if snippet:
+                lines.append(snippet)
+        return "\n".join(lines)
+
+    def _query_knowledge_library_tool(self, session: SessionState, args: dict) -> str:
+        status = self._knowledge_library_status_for_session(session)
+        query = str((args or {}).get("query", "") or "").strip()
+        lines = [
+            f"knowledge_library_root={status.get('root', '')}",
+            (
+                "ready="
+                + ("yes" if bool(status.get("ready", False)) else "no")
+                + f" documents={int(status.get('documents', 0) or 0)}"
+                + f" chunks={int(status.get('chunks', 0) or 0)}"
+                + f" tasks={int(status.get('tasks', 0) or 0)}"
+            ),
+        ]
+        if not query:
+            return "\n".join(lines)
+        result = self.rag_query(
+            str(getattr(session, "owner_user_id", "") or ""),
+            {
+                "query": query,
+                "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
+                "route": str((args or {}).get("route", "auto") or "auto"),
+                "category": str((args or {}).get("category", "") or ""),
+                "kind": str((args or {}).get("kind", "") or ""),
+                "session_id": str(getattr(session, "id", "") or ""),
+            },
+        )
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        if not rows:
+            lines.append("No knowledge library results.")
+            return "\n".join(lines)
+        for row in rows[: min(8, len(rows))]:
+            lines.append(
+                f"{str(row.get('citation', '') or '').strip()} "
+                f"{str(row.get('title', '') or '').strip()} "
+                f"score={str(row.get('score', 0) or 0)}"
+            )
+            snippet = trim(str(row.get("text", "") or ""), 320)
+            if snippet:
+                lines.append(snippet)
+        return "\n".join(lines)
+
+    def shutdown_services(self):
+        try:
+            self.rag_service.shutdown()
+        except Exception:
+            pass
+        try:
+            self.code_service.shutdown()
+        except Exception:
+            pass
 
     def user_root(self, user_id: str) -> Path:
         root = self.codes_root / user_id
@@ -30455,7 +41764,15 @@ class AppContext:
                 self.arbiter_temperature,
                 self.execution_mode,
                 self.max_output_tokens,
+                upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
+                reference_prepare_callback=self._prepare_runtime_references,
+                query_code_library_callback=self._query_code_library_tool,
+                query_knowledge_library_callback=self._query_knowledge_library_tool,
+                code_library_root=self.code_root,
+                code_library_status_callback=self._code_library_status_for_session,
+                knowledge_library_root=self.rag_root,
+                knowledge_library_status_callback=self._knowledge_library_status_for_session,
             )
             self._session_mgrs[user_id] = mgr
             return mgr
@@ -31494,12 +42811,19 @@ class Handler(BaseHTTPRequestHandler):
                     "model": model_cat.get("selected", mgr.model),
                     "thinking": model_cat.get("thinking", mgr.thinking),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "ui_style_label": UI_STYLE_LABELS.get(
+                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        "Neo",
+                    ),
                     "supported_languages": supported_ui_languages_payload(),
                     "repo_root": str(REPO_ROOT),
                     "skills_root": str(self.app.skills_root),
                     "llm_config_path": str(LLM_CONFIG_PATH),
                     "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
                     "skills_port": skills_port,
+                    "rag_admin_port": int(getattr(self.app, "rag_admin_port", 0) or 0),
+                    "code_admin_port": int(getattr(self.app, "code_admin_port", 0) or 0),
                     "skills_ui_enabled": skills_enabled,
                     "skills_ui_url": skills_url,
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
@@ -31797,8 +43121,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json()
             filename = str(payload.get("filename", "")).strip()
             mime = str(payload.get("mime", "")).strip()
+            content_b64_present = "content_b64" in payload
             content_b64 = str(payload.get("content_b64", "")).strip()
-            if not filename or not content_b64:
+            if not filename or not content_b64_present:
                 return self._send_json({"error": "filename and content_b64 required"}, status=400)
             try:
                 raw = base64.b64decode(content_b64.encode("ascii"), validate=True)
@@ -31947,11 +43272,27 @@ class Handler(BaseHTTPRequestHandler):
             raise
         sub = sess.events.subscribe()
         try:
+            # Check Last-Event-ID for reconnection gap detection
+            last_event_id_raw = str(self.headers.get("Last-Event-ID", "") or "").strip()
+            last_event_id = 0
+            if last_event_id_raw:
+                try:
+                    last_event_id = int(last_event_id_raw)
+                except (ValueError, TypeError):
+                    pass
+            current_seq = int(sess.event_seq or 0)
             hello = (
-                f"data: {json_dumps({'type': 'hello', 'session_id': sess.id, 'seq': int(sess.event_seq or 0)})}\n\n"
+                f"data: {json_dumps({'type': 'hello', 'session_id': sess.id, 'seq': current_seq})}\n\n"
             ).encode("utf-8")
             if not self._sse_write(hello):
                 return
+            # If client had a previous event ID and there's a gap, send resync
+            if last_event_id > 0 and current_seq > last_event_id + 1:
+                resync = (
+                    f"data: {json_dumps({'type': 'resync', 'reason': 'event_gap', 'last_client_seq': last_event_id, 'current_seq': current_seq})}\n\n"
+                ).encode("utf-8")
+                if not self._sse_write(resync):
+                    return
             while True:
                 try:
                     event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
@@ -32068,6 +43409,11 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "skills_port": int(getattr(self.app, "skills_port", 0) or 0),
                     "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "ui_style_label": UI_STYLE_LABELS.get(
+                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        "Neo",
+                    ),
                     "supported_languages": supported_ui_languages_payload(),
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
@@ -32141,10 +43487,11 @@ class SkillsHandler(BaseHTTPRequestHandler):
         if path == "/api/skillslab/upload":
             payload = self._read_json()
             filename = str(payload.get("filename", "")).strip()
+            content_b64_present = "content_b64" in payload
             content_b64 = str(payload.get("content_b64", "")).strip()
             mime = str(payload.get("mime", "")).strip()
             overwrite = bool(payload.get("overwrite", False))
-            if not filename or not content_b64:
+            if not filename or not content_b64_present:
                 return self._send_json({"error": "filename and content_b64 required"}, status=400)
             try:
                 raw = base64.b64decode(content_b64, validate=True)
@@ -32154,6 +43501,319 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "max upload size is 30MB"}, status=413)
             try:
                 out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+class RagAdminHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebRAG/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.handle"):
+                return
+            raise
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_json"):
+                return
+            raise
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_text"):
+                return
+            raise
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "rag-handler.send_inline_bytes"):
+                return
+            raise
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_rag_admin_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_rag_admin_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/rag-admin.js":
+            return self._send_text(self.app.web_ui_rag_admin_js(), "application/javascript; charset=utf-8")
+        if path.startswith("/assets/js_lib/"):
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
+        if path == "/api/rag/config":
+            return self._send_json(self.app.rag_config(self._user_id()))
+        if path == "/api/rag/library":
+            try:
+                limit = int((query.get("limit", ["-1"]) or ["-1"])[0] or -1)
+            except Exception:
+                limit = -1
+            try:
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+            except Exception:
+                offset = 0
+            return self._send_json(self.app.rag_library_payload(limit=limit, offset=offset))
+        if path == "/api/rag/tasks":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            return self._send_json(self.app.rag_tasks_payload(limit=limit))
+        if path == "/api/rag/graph":
+            try:
+                max_nodes = int((query.get("max_nodes", [str(RAG_GRAPH_MAX_NODES)]) or [str(RAG_GRAPH_MAX_NODES)])[0] or RAG_GRAPH_MAX_NODES)
+            except Exception:
+                max_nodes = RAG_GRAPH_MAX_NODES
+            return self._send_json(self.app.rag_graph_payload(max_nodes=max_nodes))
+        if path == "/api/rag/filesystem":
+            try:
+                max_nodes = int((query.get("max_nodes", ["320"]) or ["320"])[0] or 320)
+            except Exception:
+                max_nodes = 320
+            return self._send_json(self.app.rag_filesystem_payload(max_nodes=max_nodes))
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/rag/import":
+            try:
+                out = self.app.rag_import_request(self._user_id(), self._read_json())
+                return self._send_json(out, status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/query":
+            try:
+                out = self.app.rag_query(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/rebuild":
+            try:
+                out = self.app.rag_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": "not found"}, status=404)
+
+
+class CodeAdminHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebCode/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.handle"):
+                return
+            raise
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_json"):
+                return
+            raise
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_text"):
+                return
+            raise
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "code-handler.send_inline_bytes"):
+                return
+            raise
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_code_admin_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/style.css":
+            return self._send_text(self.app.web_ui_code_admin_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/code-admin.js":
+            return self._send_text(self.app.web_ui_code_admin_js(), "application/javascript; charset=utf-8")
+        if path.startswith("/assets/js_lib/"):
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "code-admin", "version": APP_VERSION})
+        if path == "/api/code/config":
+            return self._send_json(self.app.code_config(self._user_id()))
+        if path == "/api/code/library":
+            try:
+                limit = int((query.get("limit", ["-1"]) or ["-1"])[0] or -1)
+            except Exception:
+                limit = -1
+            try:
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+            except Exception:
+                offset = 0
+            return self._send_json(self.app.code_library_payload(limit=limit, offset=offset))
+        if path == "/api/code/tasks":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            return self._send_json(self.app.code_tasks_payload(limit=limit))
+        if path == "/api/code/graph":
+            try:
+                max_nodes = int((query.get("max_nodes", [str(RAG_GRAPH_MAX_NODES)]) or [str(RAG_GRAPH_MAX_NODES)])[0] or RAG_GRAPH_MAX_NODES)
+            except Exception:
+                max_nodes = RAG_GRAPH_MAX_NODES
+            return self._send_json(self.app.code_graph_payload(max_nodes=max_nodes))
+        if path == "/api/code/filesystem":
+            try:
+                max_nodes = int((query.get("max_nodes", ["320"]) or ["320"])[0] or 320)
+            except Exception:
+                max_nodes = 320
+            return self._send_json(self.app.code_filesystem_payload(max_nodes=max_nodes))
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/code/import":
+            try:
+                out = self.app.code_import_request(self._user_id(), self._read_json())
+                return self._send_json(out, status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/query":
+            try:
+                out = self.app.code_query(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/rebuild":
+            try:
+                out = self.app.code_rebuild()
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -32248,6 +43908,18 @@ def main():
         help="Skills Studio web port (default: agent port + 1)",
     )
     parser.add_argument(
+        "--rag_admin_port",
+        default=None,
+        type=int,
+        help=f"RAG admin web port (default: agent port + {RAG_ADMIN_PORT_OFFSET})",
+    )
+    parser.add_argument(
+        "--code_admin_port",
+        default=None,
+        type=int,
+        help=f"Code library admin web port (default: agent port + {CODE_ADMIN_PORT_OFFSET})",
+    )
+    parser.add_argument(
         "--skills_root",
         default="",
         help="Override skills root directory. Supports relative paths and both 'skills'/'Skills' naming.",
@@ -32258,6 +43930,20 @@ def main():
         dest="no_skills_ui",
         action="store_true",
         help="Disable Skills Studio web UI server startup",
+    )
+    parser.add_argument(
+        "--no_rag_admin",
+        "--no-rag-admin",
+        dest="no_rag_admin",
+        action="store_true",
+        help="Disable RAG admin web UI server startup",
+    )
+    parser.add_argument(
+        "--no_code_admin",
+        "--no-code-admin",
+        dest="no_code_admin",
+        action="store_true",
+        help="Disable Code Library admin web UI server startup",
     )
     parser.add_argument(
         "--web_ui_config",
@@ -32297,6 +43983,13 @@ def main():
         dest="language",
         default=DEFAULT_UI_LANGUAGE,
         help="Default UI/model language (zh-CN|zh-TW|ja|en)",
+    )
+    parser.add_argument(
+        "--UI_Style",
+        "--ui-style",
+        dest="ui_style",
+        default="",
+        help="Frontend chat UI style (Trad|Neo). Default Neo.",
     )
     parser.add_argument(
         "--config",
@@ -32378,6 +44071,13 @@ def main():
         type=int,
         help="Max concurrent running tasks per user (0 means unlimited). When --max_user>0 and this flag is omitted, defaults to 1.",
     )
+    parser.add_argument(
+        "--RAG_File_Name",
+        "--rag-file-name",
+        dest="rag_file_name",
+        default="",
+        help="Whether TF-Graph_IDF RAG treats file names as semantic entities (on|off). Default off.",
+    )
     parser.set_defaults(auto_model_switch=False, use_external_web_ui=None, arbiter_enabled=True)
     args = parser.parse_args()
     ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
@@ -32436,6 +44136,12 @@ def main():
     web_ui_show_upload_list = extract_show_upload_list_setting(web_ui_config)
     if web_ui_show_upload_list is not None:
         resolved_show_upload_list = bool(web_ui_show_upload_list)
+    raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
+    if not raw_ui_style:
+        raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
+    if not raw_ui_style:
+        raw_ui_style = str(extract_ui_style_setting(web_ui_config) or "").strip()
+    resolved_ui_style = normalize_ui_style(raw_ui_style or DEFAULT_UI_STYLE)
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
@@ -32617,6 +44323,23 @@ def main():
                 "[web-agent] max_user_sessions adjusted "
                 f"{requested_max_user_sessions}->{resolved_max_user_sessions} (minimum 0)"
             )
+    raw_rag_file_name = str(getattr(args, "rag_file_name", "") or "").strip()
+    if not raw_rag_file_name:
+        raw_rag_file_name = str(
+            external_config.get(
+                "RAG_File_Name",
+                external_config.get(
+                    "rag_file_name",
+                    web_ui_config.get("RAG_File_Name", web_ui_config.get("rag_file_name", "")),
+                ),
+            )
+            or ""
+        ).strip()
+    resolved_rag_include_filename_entities = _to_bool_like(
+        raw_rag_file_name,
+        default=RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
+    )
+    print(f"[web-agent] RAG_File_Name={'on' if resolved_rag_include_filename_entities else 'off'}")
     resolved_language = normalize_ui_language(getattr(args, "language", DEFAULT_UI_LANGUAGE))
     skills_root, skills_root_source = select_preferred_skills_root(
         WORKDIR,
@@ -32634,6 +44357,7 @@ def main():
         skills_root,
         resolved_thinking,
         resolved_language,
+        resolved_ui_style,
         resolved_ctx_limit,
         ctx_limit_locked,
         resolved_max_rounds,
@@ -32648,6 +44372,7 @@ def main():
         resolved_max_output_tokens,
         resolved_max_user,
         resolved_max_user_sessions,
+        resolved_rag_include_filename_entities,
     )
     config_apply_result: dict = {}
     if external_config:
@@ -32666,9 +44391,15 @@ def main():
         show_upload_list=resolved_show_upload_list,
     )
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
+    rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
+    code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
+    setattr(app, "rag_admin_port", int(rag_admin_port))
+    setattr(app, "rag_admin_enabled", False)
+    setattr(app, "code_admin_port", int(code_admin_port))
+    setattr(app, "code_admin_enabled", False)
     server = AgentHTTPServer((args.host, args.port), Handler, app)
     skills_server = None
     skills_thread = None
@@ -32692,9 +44423,68 @@ def main():
             print(f"[web-agent] skills studio failed to start on {args.host}:{skills_port}: {exc}")
     else:
         print("[web-agent] skills studio disabled: skills_port equals agent port")
+    rag_admin_server = None
+    rag_admin_thread = None
+    if args.no_rag_admin:
+        print("[web-agent] rag admin disabled by --no_rag_admin")
+    elif int(rag_admin_port) in {int(args.port), int(skills_port)}:
+        print("[web-agent] rag admin disabled: rag_admin_port conflicts with existing server port")
+    else:
+        try:
+            rag_admin_server = AgentHTTPServer((args.host, rag_admin_port), RagAdminHandler, app)
+
+            def _rag_admin_serve_loop():
+                try:
+                    rag_admin_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "rag-admin-server.serve_forever"):
+                        raise
+
+            rag_admin_thread = threading.Thread(target=_rag_admin_serve_loop, daemon=True)
+            rag_admin_thread.start()
+            setattr(app, "rag_admin_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] rag admin failed to start on {args.host}:{rag_admin_port}: {exc}")
+    code_admin_server = None
+    code_admin_thread = None
+    if args.no_code_admin:
+        print("[web-agent] code admin disabled by --no_code_admin")
+    elif int(code_admin_port) in {int(args.port), int(skills_port), int(rag_admin_port)}:
+        print("[web-agent] code admin disabled: code_admin_port conflicts with existing server port")
+    else:
+        try:
+            code_admin_server = AgentHTTPServer((args.host, code_admin_port), CodeAdminHandler, app)
+
+            def _code_admin_serve_loop():
+                try:
+                    code_admin_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "code-admin-server.serve_forever"):
+                        raise
+
+            code_admin_thread = threading.Thread(target=_code_admin_serve_loop, daemon=True)
+            code_admin_thread.start()
+            setattr(app, "code_admin_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] code admin failed to start on {args.host}:{code_admin_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
+    migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
+    if isinstance(migration, dict):
+        moved = [str(x) for x in (migration.get("moved", []) or []) if str(x).strip()]
+        errors = [str(x) for x in (migration.get("errors", []) or []) if str(x).strip()]
+        if moved:
+            print(
+                "[web-agent] workspace_migration moved="
+                + ",".join(moved)
+                + f" from {migration.get('legacy_root', '')}"
+            )
+        if errors:
+            print(
+                "[web-agent] workspace_migration errors="
+                + " | ".join(errors[:6])
+            )
     print(f"[web-agent] skills_root={skills_root} (source={skills_root_source})")
     print(f"[web-agent] web_ui_config={web_ui_config_path}")
     print(f"[web-agent] web_ui_dir={resolved_web_ui_dir}")
@@ -32747,6 +44537,7 @@ def main():
         if config_apply_result.get("persist_warning"):
             print(f"[web-agent] llm_config persist warning: {config_apply_result.get('persist_warning')}")
     print(f"[web-agent] language={resolved_language} ({UI_LANGUAGE_LABELS.get(resolved_language, resolved_language)})")
+    print(f"[web-agent] UI_Style={UI_STYLE_LABELS.get(resolved_ui_style, 'Neo')}")
     print(f"[web-agent] ctx_limit={resolved_ctx_limit}")
     print(f"[web-agent] ctx_limit_lock={'on' if ctx_limit_locked else 'off'}")
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
@@ -32781,6 +44572,14 @@ def main():
         "[web-agent] skills_ui="
         + ("enabled" if bool(getattr(app, "skills_ui_enabled", False)) else "disabled")
     )
+    print(
+        "[web-agent] rag_admin="
+        + ("enabled" if bool(getattr(app, "rag_admin_enabled", False)) else "disabled")
+    )
+    print(
+        "[web-agent] code_admin="
+        + ("enabled" if bool(getattr(app, "code_admin_enabled", False)) else "disabled")
+    )
     if str(args.host).strip() in {"0.0.0.0", "::"}:
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
@@ -32789,10 +44588,20 @@ def main():
         if skills_server:
             print(f"[skills-studio] open local: http://127.0.0.1:{skills_port}")
             print(f"[skills-studio] open lan:   http://{lan_ip}:{skills_port}")
+        if rag_admin_server:
+            print(f"[rag-admin] open local: http://127.0.0.1:{rag_admin_port}")
+            print(f"[rag-admin] open lan:   http://{lan_ip}:{rag_admin_port}")
+        if code_admin_server:
+            print(f"[code-admin] open local: http://127.0.0.1:{code_admin_port}")
+            print(f"[code-admin] open lan:   http://{lan_ip}:{code_admin_port}")
     else:
         print(f"[web-agent] open http://{args.host}:{args.port}")
         if skills_server:
             print(f"[skills-studio] open http://{args.host}:{skills_port}")
+        if rag_admin_server:
+            print(f"[rag-admin] open http://{args.host}:{rag_admin_port}")
+        if code_admin_server:
+            print(f"[code-admin] open http://{args.host}:{code_admin_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -32828,6 +44637,25 @@ def main():
                 skills_server.server_close()
             except Exception:
                 pass
+        if rag_admin_server:
+            try:
+                rag_admin_server.shutdown()
+            except Exception:
+                pass
+            try:
+                rag_admin_server.server_close()
+            except Exception:
+                pass
+        if code_admin_server:
+            try:
+                code_admin_server.shutdown()
+            except Exception:
+                pass
+            try:
+                code_admin_server.server_close()
+            except Exception:
+                pass
+        app.shutdown_services()
         server.server_close()
 
 if __name__ == "__main__":
