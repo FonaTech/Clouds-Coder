@@ -2,50 +2,16 @@
 # Re-run split_coder.py to regenerate.
 
 from __future__ import annotations
-import argparse
-import ast
 import base64
-from collections import Counter, defaultdict, deque
-import concurrent.futures
-import csv
-import difflib
-import errno
-import html
 import hashlib
-import hmac
 import io
-import importlib.util
 import json
-import math
-import multiprocessing
-import mimetypes
-import os
-import queue
 import re
-import selectors
-import signal
 import shutil
-import shlex
-import socket
-import subprocess
-import sys
-import threading
 import time
-import traceback
-import uuid
 import zipfile
-import zlib
-import xml.etree.ElementTree as ET
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import BUILTIN_CLAWHUB_SKILLS_VERSION, EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64, EMBEDDED_SKILLS_ARCHIVE_B64, EMBEDDED_SKILLS_ARCHIVE_FILES, EMBEDDED_SKILLS_ARCHIVE_SHA256, SKILLS_VIRTUAL_PREFIX, SKILL_BODY_COMPACT_THRESHOLD_CHARS, SKILL_BODY_PREVIEW_CHARS, SKILL_DEFAULT_ATTACHMENT_GLOBS, SKILL_INLINE_ATTACHMENT_MAX_CHARS, SKILL_INLINE_ATTACHMENT_MAX_FILES, SKILL_PROMPT_MAX_CHARS, SKILL_PROMPT_MAX_ITEMS, SKILL_PROTOCOL_CLAWHUB, SKILL_PROTOCOL_HTTP_JSON, SKILL_PROTOCOL_LOCAL, SKILL_PROTOCOL_SPECS, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RESOURCE_MANIFEST_MAX_ITEMS
@@ -2325,7 +2291,6 @@ class SkillStore:
                 if any(resolved.is_relative_to(root) for root in excluded):
                     continue
                 # Skip if already loaded (may overlap with rglob above)
-                rel = skill_file.relative_to(self.skills_root).as_posix()
                 candidate_key = f"local:{skill_file.parent.name}"
                 if candidate_key in self.skills:
                     continue

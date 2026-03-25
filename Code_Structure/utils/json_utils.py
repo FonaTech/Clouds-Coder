@@ -2,50 +2,12 @@
 # Re-run split_coder.py to regenerate.
 
 from __future__ import annotations
-import argparse
-import ast
-import base64
-from collections import Counter, defaultdict, deque
-import concurrent.futures
-import csv
-import difflib
-import errno
-import html
-import hashlib
-import hmac
-import io
-import importlib.util
 import json
-import math
-import multiprocessing
-import mimetypes
 import os
-import queue
 import re
-import selectors
-import signal
 import shutil
-import shlex
-import socket
-import subprocess
-import sys
-import threading
-import time
-import traceback
 import uuid
-import zipfile
-import zlib
-import xml.etree.ElementTree as ET
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
+from pathlib import Path
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from .text import trim

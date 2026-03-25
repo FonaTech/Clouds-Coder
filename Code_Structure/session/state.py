@@ -2,23 +2,15 @@
 # Re-run split_coder.py to regenerate.
 
 from __future__ import annotations
-import argparse
-import ast
 import base64
-from collections import Counter, defaultdict, deque
 import concurrent.futures
 import csv
 import difflib
-import errno
 import html
 import hashlib
-import hmac
 import io
 import importlib.util
 import json
-import math
-import multiprocessing
-import mimetypes
 import os
 import queue
 import re
@@ -26,26 +18,15 @@ import selectors
 import signal
 import shutil
 import shlex
-import socket
 import subprocess
-import sys
 import threading
 import time
 import traceback
 import uuid
 import zipfile
-import zlib
 import xml.etree.ElementTree as ET
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from pathlib import Path
 from urllib.request import Request, urlopen
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..agent.background import BackgroundManager
@@ -2277,7 +2258,7 @@ class SessionState:
                 "loaded": loaded_names,
                 "conflicts": conflict_details,
                 "summary": (
-                    f"Skill conflict detected: "
+                    "Skill conflict detected: "
                     + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
                     + ". Please choose which to keep."
                 ),
@@ -16797,7 +16778,7 @@ class SessionState:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Loaded Skills\n"
+                    "\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
                     "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
@@ -17251,7 +17232,7 @@ class SessionState:
                     skill_previews.append(f"- {skey}: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Available Skills\n"
+                    "\n## Available Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
                     "- Which tool to call (bash, read_file, write_file, etc.)\n"
@@ -17428,7 +17409,7 @@ class SessionState:
         recommended = str(proposal.get("recommended", "") or "").strip()
         rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
         prompt = (
-            f"The user was presented with these options:\n"
+            "The user was presented with these options:\n"
             + "\n".join(options_desc)
             + rec_hint
             + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"

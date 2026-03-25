@@ -2,50 +2,9 @@
 # Re-run split_coder.py to regenerate.
 
 from __future__ import annotations
-import argparse
-import ast
-import base64
-from collections import Counter, defaultdict, deque
-import concurrent.futures
-import csv
-import difflib
-import errno
-import html
-import hashlib
-import hmac
-import io
-import importlib.util
-import json
-import math
-import multiprocessing
-import mimetypes
-import os
-import queue
-import re
-import selectors
-import signal
 import shutil
-import shlex
-import socket
-import subprocess
-import sys
 import threading
-import time
-import traceback
-import uuid
-import zipfile
-import zlib
-import xml.etree.ElementTree as ET
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
+from pathlib import Path
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, EXECUTION_MODE_SYNC, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, TOKEN_THRESHOLD

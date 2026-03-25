@@ -6883,7 +6883,6 @@ class SkillStore:
                 if any(resolved.is_relative_to(root) for root in excluded):
                     continue
                 # Skip if already loaded (may overlap with rglob above)
-                rel = skill_file.relative_to(self.skills_root).as_posix()
                 candidate_key = f"local:{skill_file.parent.name}"
                 if candidate_key in self.skills:
                     continue
@@ -11440,7 +11439,7 @@ class SessionState:
                 "loaded": loaded_names,
                 "conflicts": conflict_details,
                 "summary": (
-                    f"Skill conflict detected: "
+                    "Skill conflict detected: "
                     + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
                     + ". Please choose which to keep."
                 ),
@@ -25960,7 +25959,7 @@ class SessionState:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Loaded Skills\n"
+                    "\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
                     "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
@@ -26414,7 +26413,7 @@ class SessionState:
                     skill_previews.append(f"- {skey}: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Available Skills\n"
+                    "\n## Available Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
                     "- Which tool to call (bash, read_file, write_file, etc.)\n"
@@ -26591,7 +26590,7 @@ class SessionState:
         recommended = str(proposal.get("recommended", "") or "").strip()
         rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
         prompt = (
-            f"The user was presented with these options:\n"
+            "The user was presented with these options:\n"
             + "\n".join(options_desc)
             + rec_hint
             + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"

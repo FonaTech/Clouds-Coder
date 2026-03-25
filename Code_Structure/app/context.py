@@ -2,50 +2,13 @@
 # Re-run split_coder.py to regenerate.
 
 from __future__ import annotations
-import argparse
-import ast
 import base64
-from collections import Counter, defaultdict, deque
-import concurrent.futures
-import csv
-import difflib
-import errno
-import html
-import hashlib
-import hmac
+from collections import deque
 import io
-import importlib.util
-import json
-import math
-import multiprocessing
-import mimetypes
-import os
-import queue
 import re
-import selectors
-import signal
-import shutil
-import shlex
-import socket
-import subprocess
-import sys
 import threading
-import time
-import traceback
-import uuid
 import zipfile
-import zlib
-import xml.etree.ElementTree as ET
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
-try:
-    import yaml as _yaml
-except Exception:
-    _yaml = None
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
