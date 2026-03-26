@@ -27,6 +27,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -103,7 +104,7 @@ CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
 RAG_CHUNK_CHARS = 1200
 RAG_CHUNK_OVERLAP = 180
-RAG_MAX_CHUNKS_PER_DOC = 200
+RAG_MAX_CHUNKS_PER_DOC = 500
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
@@ -152,7 +153,7 @@ MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 3
-HARD_BREAK_TOOL_ERROR_THRESHOLD = 3
+HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 3
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
@@ -974,9 +975,212 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
         ],
         "match_tokens": ["cdn.tailwindcss.com", "@tailwindcss/browser", "tailwindcss"],
     },
+    {
+        "id": "mathjax",
+        "filename": "tex-mml-chtml.js",
+        "relative_path": "mathjax/es5/tex-mml-chtml.js",
+        "package_urls": [
+            "https://registry.npmjs.org/mathjax/-/mathjax-3.2.2.tgz",
+        ],
+        "package_install_dir": "mathjax",
+        "package_required_paths": [
+            "package.json",
+            "es5/core.js",
+            "es5/loader.js",
+            "es5/startup.js",
+            "es5/tex-mml-chtml.js",
+        ],
+        "match_tokens": ["mathjax", "tex-mml-chtml.js", "/mathjax@"],
+    },
+    {
+        "id": "katex",
+        "filename": "katex.min.js",
+        "relative_path": "katex/dist/katex.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/katex/-/katex-0.16.11.tgz",
+        ],
+        "package_install_dir": "katex",
+        "package_required_paths": [
+            "package.json",
+            "dist/katex.min.js",
+            "dist/katex.min.css",
+            "dist/contrib/auto-render.min.js",
+        ],
+        "match_tokens": ["katex", "katex.min.js", "/katex@"],
+    },
+    {
+        "id": "katex_auto_render",
+        "filename": "auto-render.min.js",
+        "relative_path": "katex/dist/contrib/auto-render.min.js",
+        "match_tokens": ["auto-render.min.js", "katex/contrib/auto-render", "katex-auto-render"],
+    },
+    {
+        "id": "html2canvas",
+        "filename": "html2canvas.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+            "https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js",
+        ],
+        "match_tokens": ["html2canvas", "html2canvas.min.js"],
+    },
+    {
+        "id": "jspdf",
+        "filename": "jspdf.umd.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+            "https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js",
+        ],
+        "match_tokens": ["jspdf", "jspdf.umd.min.js"],
+    },
+    {
+        "id": "xlsx",
+        "filename": "xlsx.full.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+            "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+        ],
+        "match_tokens": ["xlsx", "xlsx.full.min.js", "sheetjs"],
+    },
+    {
+        "id": "jszip",
+        "filename": "jszip.min.js",
+        "relative_path": "node_modules/jszip/dist/jszip.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+        ],
+        "package_install_dir": "node_modules/jszip",
+        "package_required_paths": [
+            "package.json",
+            "dist/jszip.min.js",
+        ],
+        "package_postprocess": "jszip-main-to-dist",
+        "match_tokens": ["jszip", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "package_urls": [
+            "https://registry.npmjs.org/pptxgenjs/-/pptxgenjs-4.0.1.tgz",
+        ],
+        "package_install_dir": "pptxgenjs",
+        "package_required_paths": [
+            "package.json",
+            "dist/pptxgen.bundle.js",
+            "dist/pptxgen.cjs.js",
+            "dist/pptxgen.es.js",
+            "dist/pptxgen.min.js",
+        ],
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.cjs.js", "pptxgen.es.js", "pptxgen.min.js", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs_bundle",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.bundle"],
+    },
+    {
+        "id": "pptxgenjs_cjs",
+        "filename": "pptxgen.cjs.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.cjs.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.cjs.js", "pptxgen.cjs"],
+    },
+    {
+        "id": "pptxgenjs_es",
+        "filename": "pptxgen.es.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.es.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.es.js", "pptxgen.es"],
+    },
+    {
+        "id": "pptxgenjs_min",
+        "filename": "pptxgen.min.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.min.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.min.js", "pptxgen.min"],
+    },
 ]
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 OFFLINE_JS_LIB_README_FILE = "README.md"
+
+
+def _normalize_js_lib_asset_ref(value: str) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if not raw:
+        return ""
+    raw = raw.lstrip("/")
+    pure = PurePosixPath(raw)
+    parts: list[str] = []
+    for part in pure.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _resolve_js_lib_asset_path(js_root: Path, asset_ref: str) -> Path | None:
+    rel = _normalize_js_lib_asset_ref(asset_ref)
+    if not rel:
+        return None
+    exact = (js_root / rel).resolve()
+    try:
+        if exact.is_file() and exact.is_relative_to(js_root):
+            return exact
+    except Exception:
+        pass
+    basename = _safe_js_filename(Path(rel).name, "lib.js")
+    candidates: list[Path] = []
+    try:
+        for fp in js_root.rglob(basename):
+            try:
+                resolved = fp.resolve()
+            except Exception:
+                continue
+            if resolved.is_file():
+                try:
+                    if resolved.is_relative_to(js_root):
+                        candidates.append(resolved)
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (len(p.relative_to(js_root).parts), p.relative_to(js_root).as_posix()))
+    return candidates[0]
+
+
+def _discover_extra_js_lib_files(js_root: Path, known_relative_paths: set[str]) -> list[dict]:
+    rows: list[dict] = []
+    if not js_root.exists():
+        return rows
+    seen: set[str] = set()
+    for fp in sorted(js_root.rglob("*")):
+        if not fp.is_file() or fp.name in {".DS_Store", OFFLINE_JS_LIB_INDEX_FILE, OFFLINE_JS_LIB_README_FILE}:
+            continue
+        if fp.suffix.lower() not in {".js", ".mjs", ".cjs"}:
+            continue
+        rel = fp.relative_to(js_root).as_posix()
+        if rel in known_relative_paths or rel in seen:
+            continue
+        seen.add(rel)
+        stem = fp.stem.replace(".min", "").replace(".umd", "").replace(".bundle", "")
+        rows.append(
+            {
+                "id": f"local:{stem or fp.name}",
+                "filename": fp.name,
+                "relative_path": rel,
+                "available": True,
+                "size": int(fp.stat().st_size),
+                "sha256": _sha256_file(fp),
+                "source": "existing-local",
+                "error": "",
+                "match_tokens": [fp.name.lower(), stem.lower(), rel.lower()],
+                "urls": [],
+                "catalog": False,
+            }
+        )
+    return rows
 
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -1250,6 +1454,28 @@ def extract_ui_style_setting(raw: object) -> str | None:
         for key in keys:
             if key in section:
                 return normalize_ui_style(str(section.get(key) or ""))
+    return None
+
+
+def extract_js_lib_download_setting(raw: object) -> bool | None:
+    """Read download_js_lib flag from config dict.
+    Keys accepted: download_js_lib / js_lib_download / enable_js_lib_download
+    Sections searched: top-level, then 'startup' / 'offline' / 'web_ui'.
+    Returns True/False, or None if key absent (caller uses default=True).
+    """
+    if not isinstance(raw, dict):
+        return None
+    keys = ("download_js_lib", "js_lib_download", "enable_js_lib_download", "offline_js_download")
+    for key in keys:
+        if key in raw:
+            return _to_bool_like(raw.get(key), default=True)
+    for section_key in ("startup", "offline", "web_ui", "ui"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _to_bool_like(section.get(key), default=True)
     return None
 
 
@@ -1618,20 +1844,194 @@ def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
 def offline_js_lib_root(workdir: Path = WORKDIR) -> Path:
     return (workdir / "js_lib").resolve()
 
+def _offline_js_entry_relative_path(entry: dict[str, object], fallback_name: str) -> str:
+    rel = _normalize_js_lib_asset_ref(str(entry.get("relative_path", "") or ""))
+    if rel:
+        return rel
+    return _safe_js_filename(fallback_name, fallback_name)
+
+def _archive_member_relative_path(name: str) -> str:
+    raw = _normalize_js_lib_asset_ref(name)
+    if not raw:
+        return ""
+    parts = [part for part in PurePosixPath(raw).parts if part not in {"", "."}]
+    while parts and parts[0].lower() == "package":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return "/".join(parts)
+
+def _path_size_bytes(target: Path) -> int:
+    try:
+        if target.is_file():
+            return int(target.stat().st_size)
+        if not target.exists():
+            return 0
+        total = 0
+        for fp in target.rglob("*"):
+            try:
+                if fp.is_file():
+                    total += int(fp.stat().st_size)
+            except Exception:
+                continue
+        return total
+    except Exception:
+        return 0
+
+def _extract_archive_to_dir(raw: bytes, install_root: Path) -> list[str]:
+    install_root.mkdir(parents=True, exist_ok=True)
+    install_root_resolved = install_root.resolve()
+    written: list[str] = []
+
+    def _write_bytes(rel: str, data: bytes):
+        target = (install_root / rel).resolve()
+        if not target.is_relative_to(install_root_resolved):
+            raise ValueError(f"archive member escapes target dir: {rel}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        written.append(rel)
+
+    bio = io.BytesIO(raw)
+    try:
+        if zipfile.is_zipfile(bio):
+            bio.seek(0)
+            with zipfile.ZipFile(bio, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    rel = _archive_member_relative_path(info.filename)
+                    if not rel:
+                        continue
+                    _write_bytes(rel, zf.read(info))
+            return written
+    except Exception:
+        pass
+
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            rel = _archive_member_relative_path(member.name)
+            if not rel:
+                continue
+            extracted = tf.extractfile(member)
+            if extracted is None:
+                continue
+            _write_bytes(rel, extracted.read())
+    return written
+
+def _package_required_paths(entry: dict[str, object]) -> list[str]:
+    rows: list[str] = []
+    for item in entry.get("package_required_paths") or []:
+        rel = _normalize_js_lib_asset_ref(str(item or ""))
+        if rel:
+            rows.append(rel)
+    return rows
+
+def _package_install_ready(install_root: Path, required_paths: list[str]) -> bool:
+    if not install_root.exists():
+        return False
+    if required_paths:
+        return all((install_root / rel).is_file() for rel in required_paths)
+    try:
+        return any(fp.is_file() for fp in install_root.rglob("*"))
+    except Exception:
+        return False
+
+def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path):
+    action = str(entry.get("package_postprocess", "") or "").strip().lower()
+    if action != "jszip-main-to-dist":
+        return
+    pkg_json = (install_root / "package.json").resolve()
+    dist_fp = (install_root / "dist" / "jszip.min.js").resolve()
+    if not pkg_json.exists():
+        if not dist_fp.exists():
+            return
+        obj: dict[str, object] = {
+            "name": "jszip",
+            "version": "offline-local",
+            "main": "./dist/jszip.min.js",
+            "exports": {".": "./dist/jszip.min.js"},
+        }
+    else:
+        try:
+            raw = pkg_json.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                return
+            obj = loaded
+        except Exception:
+            return
+    changed = False
+    if obj.get("main") != "./dist/jszip.min.js":
+        obj["main"] = "./dist/jszip.min.js"
+        changed = True
+    exports = obj.get("exports")
+    desired_exports = {".": "./dist/jszip.min.js"}
+    if exports != desired_exports:
+        obj["exports"] = desired_exports
+        changed = True
+    if changed or (not pkg_json.exists()):
+        pkg_json.parent.mkdir(parents=True, exist_ok=True)
+        pkg_json.write_text(json_dumps(obj, indent=2), encoding="utf-8")
+
+def _ensure_offline_js_package(root: Path, entry: dict[str, object], force: bool = False) -> tuple[bool, str, str, str]:
+    package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
+    if not package_urls:
+        return True, "", "", ""
+    install_dir = _normalize_js_lib_asset_ref(str(entry.get("package_install_dir", "") or ""))
+    if not install_dir:
+        install_dir = _normalize_js_lib_asset_ref(str(entry.get("id", "") or "package"))
+    if not install_dir:
+        return False, "missing", "package install dir is empty", ""
+    install_root = (root / install_dir).resolve()
+    if not install_root.is_relative_to(root):
+        return False, "missing", f"package install dir escapes js_lib: {install_dir}", install_dir
+    required_paths = _package_required_paths(entry)
+    if not force and install_root.exists():
+        _postprocess_offline_js_package(entry, install_root)
+        if _package_install_ready(install_root, required_paths):
+            return True, "existing-package", "", install_dir
+        try:
+            if any(fp.is_file() for fp in install_root.rglob("*")):
+                return True, "existing-package", "", install_dir
+        except Exception:
+            pass
+    error = ""
+    source = "missing"
+    for url in package_urls:
+        try:
+            data, _ = _download_http_bytes(url, timeout=90.0)
+            if len(data) < 200:
+                error = f"archive too small from {url}"
+                continue
+            _extract_archive_to_dir(data, install_root)
+            _postprocess_offline_js_package(entry, install_root)
+            if _package_install_ready(install_root, required_paths):
+                return True, url, "", install_dir
+            error = f"package install incomplete from {url}"
+            source = url
+        except Exception as exc:
+            error = trim(str(exc), 220)
+            source = url
+    return False, source, error, install_dir
+
 def _render_offline_js_catalog_md() -> str:
     rows = [
         "# Offline JS Library Catalog",
         "",
         "Pre-fetched common JS libraries for offline HTML deliverables.",
+        "Additional local `.js/.mjs/.cjs` files placed anywhere under `js_lib/` are auto-indexed in `index.json` and can be served by relative path.",
         "",
-        "| id | filename | source urls |",
-        "|---|---|---|",
+        "| id | relative path | file urls | package urls |",
+        "|---|---|---|---|",
     ]
     for row in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(row.get("id", "") or "").strip()
-        filename = str(row.get("filename", "") or "").strip()
+        filename = _offline_js_entry_relative_path(row, str(row.get("filename", "") or lib_id or "lib.js"))
         urls = [str(x).strip() for x in (row.get("urls") or []) if str(x).strip()]
-        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} |")
+        package_urls = [str(x).strip() for x in (row.get("package_urls") or []) if str(x).strip()]
+        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} | {'<br>'.join(package_urls)} |")
     return "\n".join(rows) + "\n"
 
 def load_offline_js_lib_index(js_root: Path) -> dict:
@@ -1645,26 +2045,78 @@ def load_offline_js_lib_index(js_root: Path) -> dict:
     except Exception:
         return {}
 
-def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict:
+def ensure_offline_js_libs(
+    workdir: Path = WORKDIR,
+    force: bool = False,
+    verbose: bool = False,
+    no_connection_deadline: float = 60.0,
+) -> dict:
     root = offline_js_lib_root(workdir)
     root.mkdir(parents=True, exist_ok=True)
     fetched = 0
     available = 0
     missing = 0
+    _dl_start = time.time()
+    _deadline_hit = False
+    total_catalog = len(OFFLINE_JS_LIB_CATALOG)
+    if verbose:
+        print(f"[js_lib] Starting JS library download ({total_catalog} files)...", flush=True)
     rows: list[dict] = []
+    known_relative_paths: set[str] = set()
     for entry in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(entry.get("id", "") or "").strip() or "lib"
         filename = _safe_js_filename(str(entry.get("filename", "") or f"{lib_id}.js"), f"{lib_id}.js")
+        relative_path = _offline_js_entry_relative_path(entry, filename)
         urls = [str(x).strip() for x in (entry.get("urls") or []) if str(x).strip()]
+        package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
         match_tokens = [str(x).strip().lower() for x in (entry.get("match_tokens") or []) if str(x).strip()]
-        target = root / filename
+        target = (root / relative_path).resolve()
+        if not target.is_relative_to(root):
+            rows.append(
+                {
+                    "id": lib_id,
+                    "filename": filename,
+                    "available": False,
+                    "size": 0,
+                    "sha256": "",
+                    "source": "missing",
+                    "error": f"relative path escapes js_lib: {relative_path}",
+                    "match_tokens": match_tokens,
+                    "urls": urls,
+                    "package_urls": package_urls,
+                    "relative_path": relative_path,
+                    "package_install_dir": "",
+                    "package_required_paths": [],
+                    "package_available": not package_urls,
+                    "package_size": 0,
+                    "catalog": True,
+                }
+            )
+            missing += 1
+            continue
+        known_relative_paths.add(relative_path)
         source = "existing"
         error = ""
-        ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
-        if not ok:
+        effective_target = target
+        file_ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
+        if (not file_ok) and (not force):
+            resolved_existing = _resolve_js_lib_asset_path(root, relative_path)
+            if resolved_existing and resolved_existing.exists() and resolved_existing.is_file() and resolved_existing.stat().st_size > 40:
+                effective_target = resolved_existing
+                file_ok = True
+                source = "existing-local"
+        if not file_ok and urls:
+            if fetched == 0 and (time.time() - _dl_start) > no_connection_deadline:
+                _deadline_hit = True
+                if verbose:
+                    print(f"[js_lib] No connection after {no_connection_deadline:.0f}s — skipping remaining downloads.", flush=True)
+                break
+            if verbose:
+                print(f"[js_lib] Downloading {filename}...", flush=True)
             for url in urls:
                 try:
-                    data, _ = _download_http_bytes(url, timeout=35.0)
+                    _timeout = 12.0 if fetched == 0 else 35.0
+                    data, _ = _download_http_bytes(url, timeout=_timeout)
                     if len(data) < 40:
                         error = f"download too small from {url}"
                         continue
@@ -1672,39 +2124,67 @@ def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict
                     if "<html" in probe and "<script" not in probe and "tailwind" not in probe:
                         error = f"unexpected html payload from {url}"
                         continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
-                    ok = True
+                    effective_target = target
+                    file_ok = True
                     source = url
                     fetched += 1
                     break
                 except Exception as exc:
                     error = trim(str(exc), 220)
-            if not ok:
+            if not file_ok:
                 source = "missing"
+        package_ok, package_source, package_error, package_install_dir = _ensure_offline_js_package(root, entry, force=force)
+        if package_urls and package_source and package_source not in {"existing-package", "missing"}:
+            fetched += 1
+        if package_error:
+            error = package_error if not error else f"{error}; {package_error}"
+        ok = bool((file_ok or (not urls)) and package_ok and effective_target.exists() and effective_target.is_file() and effective_target.stat().st_size > 40)
         if ok:
             available += 1
         else:
             missing += 1
+            if package_urls and package_source == "missing" and not source.strip():
+                source = "missing"
+        package_root = (root / package_install_dir).resolve() if package_install_dir else None
         rows.append(
             {
                 "id": lib_id,
                 "filename": filename,
                 "available": ok,
-                "size": int(target.stat().st_size) if target.exists() else 0,
-                "sha256": _sha256_file(target) if target.exists() else "",
-                "source": source,
+                "size": int(effective_target.stat().st_size) if effective_target.exists() else 0,
+                "sha256": _sha256_file(effective_target) if effective_target.exists() else "",
+                "source": source if source != "existing" or file_ok else package_source or source,
                 "error": error,
                 "match_tokens": match_tokens,
                 "urls": urls,
+                "package_urls": package_urls,
+                "relative_path": relative_path,
+                "resolved_path": effective_target.relative_to(root).as_posix() if effective_target.exists() else "",
+                "package_install_dir": package_install_dir,
+                "package_required_paths": _package_required_paths(entry),
+                "package_available": package_ok,
+                "package_size": _path_size_bytes(package_root) if package_root else 0,
+                "package_source": package_source,
+                "catalog": True,
             }
         )
+    extra_rows = _discover_extra_js_lib_files(root, known_relative_paths)
+    rows.extend(extra_rows)
+    if verbose:
+        _status = "skipped (no connection)" if _deadline_hit else f"{fetched} downloaded"
+        print(f"[js_lib] Done: {available}/{len(rows)} available, {_status}.", flush=True)
     payload = {
         "generated_at": int(now_ts()),
         "js_lib_root": str(root),
-        "total": len(OFFLINE_JS_LIB_CATALOG),
+        "total": len(rows),
         "available": available,
         "missing": missing,
         "fetched": fetched,
+        "catalog_total": len(OFFLINE_JS_LIB_CATALOG),
+        "catalog_missing": missing,
+        "extra_local": len(extra_rows),
         "libs": rows,
     }
     (root / OFFLINE_JS_LIB_INDEX_FILE).write_text(json_dumps(payload, indent=2), encoding="utf-8")
@@ -3601,7 +4081,10 @@ class TodoManager:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         validated = []
-        in_progress_seen = False
+        # Plan-step items (bb:proj: key) and worker/non-plan items each get their
+        # own in_progress slot, so a plan step in_progress doesn't demote worker subtasks.
+        plan_in_progress_seen = False
+        worker_in_progress_seen = False
         status_alias = {
             "todo": "pending",
             "doing": "in_progress",
@@ -3639,11 +4122,18 @@ class TodoManager:
             if owner not in {"manager", "explorer", "developer", "reviewer"}:
                 owner = ""
             key = trim(str(raw.get("key", "") or "").strip(), 120)
+            is_plan_step = key.startswith("bb:proj:")
             if status == "in_progress":
-                if in_progress_seen:
-                    status = "pending"
+                if is_plan_step:
+                    if plan_in_progress_seen:
+                        status = "pending"
+                    else:
+                        plan_in_progress_seen = True
                 else:
-                    in_progress_seen = True
+                    if worker_in_progress_seen:
+                        status = "pending"
+                    else:
+                        worker_in_progress_seen = True
             if not active_form:
                 if status == "in_progress":
                     active_form = f"Working on: {content}"
@@ -6873,7 +7363,6 @@ class SkillStore:
                 if any(resolved.is_relative_to(root) for root in excluded):
                     continue
                 # Skip if already loaded (may overlap with rglob above)
-                rel = skill_file.relative_to(self.skills_root).as_posix()
                 candidate_key = f"local:{skill_file.parent.name}"
                 if candidate_key in self.skills:
                     continue
@@ -9034,7 +9523,12 @@ TOOLS = [
     ),
     tool_def(
         "query_knowledge_library",
-        "Read current global knowledge-library status or query the TF-Graph_IDF RAG library for grounded document references.",
+        (
+            "Query the RAG knowledge library for grounded document references and background knowledge. "
+            "Call this BEFORE answering questions that require domain expertise, factual grounding, "
+            "or synthesis from imported documents. "
+            "Pass an empty query to check library status only."
+        ),
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
@@ -9396,6 +9890,7 @@ class SessionState:
         self.stall_escalation_triggered = False
         self.stall_escalation_round = 0
         self._cached_llm_complexity = ""
+        self._cached_complexity_dimensions: dict = {}  # scope/steps/skill/output dimensions
         self._pending_media_inputs: list[dict] = []
         self.tool_retry_counts: dict[str, int] = {}
         self.last_auto_title_ts = 0.0
@@ -10770,6 +11265,32 @@ class SessionState:
         self.runtime_code_reference_meta = {}
         return removed_hints
 
+    def _reset_blackboard_plan_state_locked(self) -> None:
+        """Clear plan/todo/skills state from a completed run so the next run starts fresh.
+
+        Called from submit_user_message when a new user request arrives after a
+        previous run finished (running=False, not awaiting plan choice).
+        Prevents the manager from seeing status=COMPLETED + all todos done and
+        immediately routing to 'finish' again on the very first round.
+        """
+        bb = self._ensure_blackboard()
+        bb["project_todos"] = []
+        bb["plan_steps"] = []
+        bb["plan_step_cursor"] = 0
+        bb["plan_step_total"] = 0
+        bb["status"] = ""
+        bb["approval"] = ""
+        bb["plan_findings"] = ""
+        bb["plan_proposal"] = ""
+        bb["plan_risks"] = ""
+        bb["loaded_skills"] = {}
+        bb["loaded_skills_goal_sig"] = ""
+        self.blackboard = bb
+        try:
+            self.todo.items = []
+        except Exception:
+            pass
+
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
         payload = dict(data or {})
         if self._sanitize_agent_bubble_role(payload.get("agent_role", "")):
@@ -11123,7 +11644,10 @@ class SessionState:
         skill_desc = str(skill_row.get("description", "-")).strip()
         inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
-            f"A skill has been loaded. Follow its instructions precisely.\n"
+            f"A skill has been loaded. IMPORTANT: This skill's workflow, tools, and commands "
+            f"OVERRIDE the plan's implementation approach for any step where it applies. "
+            f"Read the full instructions below and follow them exactly — do NOT substitute a "
+            f"different tool, library, or language unless the skill explicitly allows it.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
@@ -11283,7 +11807,13 @@ class SessionState:
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 600)
         if not goal:
             return
-        prep = self._prepare_loaded_skills_for_goal(goal, trigger=trigger)
+        # Sig = user goal + current plan step text.
+        # Plan step text changes per node → triggers per-node skill reload (desired).
+        # direct_objective changes every manager round → excluded to prevent per-round reload.
+        _user_goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or goal), 600)
+        _plan_step = self._current_plan_step_text()
+        stable_sig = trim((_user_goal + "::step::" + _plan_step) if _plan_step else _user_goal, 600)
+        prep = self._prepare_loaded_skills_for_goal(stable_sig, trigger=trigger)
         already_loaded = prep.get("loaded", {})
         # Allow up to 4 concurrent non-conflicting skills for complex tasks
         if isinstance(already_loaded, dict) and len(already_loaded) >= 4 and not bool(prep.get("goal_changed", False)):
@@ -11423,7 +11953,7 @@ class SessionState:
                 "loaded": loaded_names,
                 "conflicts": conflict_details,
                 "summary": (
-                    f"Skill conflict detected: "
+                    "Skill conflict detected: "
                     + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
                     + ". Please choose which to keep."
                 ),
@@ -11578,14 +12108,28 @@ class SessionState:
             )
             return (
                 f"ACTIVE SKILLS: {names}. "
-                "Follow loaded skill instructions precisely. "
-                f"If you encounter a step requiring a workflow you don't know, call load_skill ({skill_count} available). "
+                "Follow the loaded skill instructions for the current step. "
+                f"When moving to a different step that needs a DIFFERENT skill, call load_skill to switch "
+                f"(or unload the current one first if it's no longer needed). "
+                f"{skill_count} skills available total. "
             )
         return (
             f"SKILL SYSTEM: {skill_count} skills available. "
-            "Use list_skills to discover, load_skill to activate. "
-            "If unsure how to produce professional output (docs, slides, analysis), check skills first. "
+            "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
+            "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
+            "call list_skills to discover options, then load_skill to activate the right one. "
+            "Load a skill AT THE MOMENT you begin the step that requires it. "
+            "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
+            "For simple tasks, direct questions, and multimodal analysis, do NOT load skills. "
         )
+
+    def _skills_awareness_block(self, for_role: str = "developer") -> str:
+        """Canonical skills-awareness block shared by single, sync, and plan-mode.
+        Returns: loaded-skills hint  +  newline  +  'Skills:\\n<catalog>'
+        Keeps all three modes in sync — change here propagates everywhere.
+        """
+        hint = self._loaded_skills_prompt_hint(for_role=for_role)
+        return f"{hint}\nSkills:\n{self.skills.descriptions()}\n"
 
     def _refresh_runtime_code_reference(self, text: str):
         cb = getattr(self, "reference_prepare_callback", None)
@@ -11647,10 +12191,40 @@ class SessionState:
             header += " [" + ", ".join(tags) + "]"
         return (
             f"{header}:\n"
-            "This is the global TF-Graph_IDF RAG knowledge library for imported documents and research material. "
-            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`. "
-            "Do not infer knowledge-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_knowledge_library` to check readiness or retrieve grounded references from the global library."
+            "Global TF-Graph_IDF RAG library for imported documents, PDFs, and research material. "
+            "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
+            "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
+            "to retrieve grounded references BEFORE generating your answer. "
+            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Do not infer readiness from session/files or uploads — query the library directly."
+        )
+
+    def _multimodal_capability_block(self) -> str:
+        """Return a brief system-prompt note about native multimodal capabilities.
+
+        Injected into system prompt so the model knows it can directly analyze
+        images/audio/video rather than falling back to text-only workarounds.
+        Returns empty string when the active model has no multimodal input caps.
+        """
+        try:
+            caps = self._capabilities_from_profile()
+        except Exception:
+            return ""
+        types = []
+        if caps.get("input_image"):
+            types.append("images")
+        if caps.get("input_audio"):
+            types.append("audio")
+        if caps.get("input_video"):
+            types.append("video")
+        if not types:
+            return ""
+        joined = "/".join(types)
+        return (
+            f"MULTIMODAL: This model supports native {joined} analysis. "
+            f"When {joined} are attached or loaded via read_file, analyze them DIRECTLY "
+            "using your built-in perception capabilities — do not describe them as "
+            "inaccessible or attempt text-only workarounds. "
         )
 
     def _code_library_prompt_block(self) -> str:
@@ -11731,8 +12305,10 @@ class SessionState:
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
             plan_steps_block = f"{plan_ctx}\n"
+        mm_block = self._multimodal_capability_block()
+        mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
-            f"You are a coding agent. Workspace: {self.files_root}. "
+            f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -11740,6 +12316,7 @@ class SessionState:
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task when done. "
             f"{skill_hint}"
+            f"{mm_hint}"
             f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
@@ -13201,6 +13778,86 @@ class SessionState:
         bb["checkpoints"] = cps[-CHECKPOINT_MAX_COUNT:]
         self.blackboard = bb
 
+    def _classify_message_priority(self, msg: dict, index: int, total: int) -> int:
+        """Return 0-10 priority score. Higher = more important to keep during compression."""
+        score = 0
+        role = str(msg.get("role", ""))
+        content = str(msg.get("content", "") or "")
+        content_low = content[:2000].lower()
+        # Factor 1: Recency (0-3 points) — newest messages most valuable
+        recency = index / max(1, total - 1) if total > 1 else 1.0
+        score += int(recency * 3)
+        # Factor 2: Role weight — system/user messages more important than tool output
+        role_weights = {"system": 3, "user": 2, "assistant": 2, "tool": 1}
+        score += role_weights.get(role, 1)
+        # Factor 3: Task progress markers (+2)
+        if any(kw in content_low for kw in ("todowrite", "plan_step", "finish_task", "finish_current_task", "approved-plan")):
+            score += 2
+        # Factor 4: Error/critical info (+2) — essential for debugging continuity
+        if "error:" in content_low or "traceback" in content_low or "exception" in content_low:
+            score += 2
+        # Factor 5: Goal/task context (+1)
+        goal = str(getattr(self, "runtime_reclassify_goal", "") or self._latest_user_goal_text() or "").lower()[:200]
+        if goal:
+            goal_words = [w for w in goal.split() if len(w) > 3]
+            matches = sum(1 for w in goal_words if w in content_low)
+            if matches >= 2:
+                score += 1
+        # Factor 6: Skill content (+1) — preserve loaded skill context
+        if "<loaded-skill" in content or "_skill_notify" in str(msg):
+            score += 1
+        # Factor 7: Compact-resume notes are always max priority
+        if "<compact-resume>" in content or "<STATE_HANDOFF>" in content:
+            score = 10
+        return min(10, score)
+
+    def _priority_compress_messages(self, messages: list[dict], target_tokens: int, tier: int) -> list[dict]:
+        """Priority-based message compression: high-priority messages kept intact,
+        mid-priority compressed to summaries, low-priority reduced to one-liners."""
+        total = len(messages)
+        scored: list[tuple[int, int, dict]] = []
+        for i, msg in enumerate(messages):
+            priority = self._classify_message_priority(msg, i, total)
+            scored.append((priority, i, msg))
+        # Sort by priority descending, then by index descending (recent first)
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # Build result respecting token budget
+        kept: list[tuple[int, dict]] = []
+        current_tokens = 0
+        for priority, idx, msg in scored:
+            content = str(msg.get("content", "") or "")
+            msg_tokens = max(1, len(content) // 4)
+            if priority >= 7:
+                # High priority: keep intact
+                kept.append((idx, dict(msg)))
+                current_tokens += msg_tokens
+            elif priority >= 4:
+                # Mid priority: compress content to 500 chars if over budget
+                compressed = dict(msg)
+                if current_tokens + msg_tokens > target_tokens and len(content) > 500:
+                    role = msg.get("role", "tool")
+                    compressed["content"] = trim(content, 500) + " [compressed]"
+                kept.append((idx, compressed))
+                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+            else:
+                # Low priority: one-liner summary if over budget
+                if current_tokens > target_tokens * 0.8:
+                    continue  # Drop entirely if way over budget
+                compressed = dict(msg)
+                role = msg.get("role", "tool")
+                if role == "tool" and len(content) > 120:
+                    # Extract tool name from nearby assistant message
+                    compressed["content"] = f"[tool output, {len(content)} chars]"
+                elif len(content) > 200:
+                    compressed["content"] = trim(content, 200) + " [truncated]"
+                kept.append((idx, compressed))
+                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+            if current_tokens > target_tokens:
+                break
+        # Re-sort by original index to maintain conversation order
+        kept.sort(key=lambda x: x[0])
+        return [msg for _, msg in kept]
+
     def _auto_compact(self, reason: str):
         context_before = self._context_budget_metrics()
         tier = self._context_compression_tier(context_before)
@@ -13259,14 +13916,16 @@ class SessionState:
             target_tokens = max(3000, min(12_000, int(self.context_token_upper_bound * 0.45)))
         else:
             target_tokens = max(4000, min(20_000, int(self.context_token_upper_bound * 0.55)))
+        # Priority-based compression: keep important messages, compress/drop low-value ones
+        if self._estimate_messages_tokens(tail) > target_tokens:
+            compact_note_msg = tail[-1]  # preserve the compact-resume note
+            tail_without_note = tail[:-1]
+            compressed_tail = self._priority_compress_messages(tail_without_note, target_tokens, tier)
+            compressed_tail.append(compact_note_msg)
+            tail = compressed_tail
+        # Final safety: if still over budget, trim from front
         while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
             tail.pop(0)
-        if self._estimate_messages_tokens(tail) > target_tokens:
-            for msg in tail:
-                if msg.get("role") == "tool":
-                    msg["content"] = trim(msg.get("content", ""), 1800 if tier < 2 else 600)
-            while len(tail) > 2 and self._estimate_messages_tokens(tail) > target_tokens:
-                tail.pop(0)
         self.messages = tail
         # Compact agent contexts in sync (critical fix for re-wall prevention)
         self._compact_agent_contexts(max(tier, 1))
@@ -13353,6 +14012,37 @@ class SessionState:
         if self.developer_edit_fail_streaks:
             stuck = ", ".join(f"{k}({v}x)" for k, v in self.developer_edit_fail_streaks.items())
             parts.append(f"EDIT_STALLS: {stuck}")
+        # 8. Plan step progress
+        plan_todos = bb.get("project_todos", [])
+        if isinstance(plan_todos, list) and plan_todos:
+            completed = sum(1 for t in plan_todos if isinstance(t, dict) and t.get("status") == "completed")
+            total_steps = len(plan_todos)
+            cursor = int(bb.get("plan_step_cursor", 0) or 0)
+            current_step = ""
+            for t in plan_todos:
+                if isinstance(t, dict) and t.get("status") == "in_progress":
+                    current_step = trim(str(t.get("content", "")), 200)
+                    break
+            parts.append(f"PLAN_PROGRESS: {completed}/{total_steps} completed, cursor={cursor}")
+            if current_step:
+                parts.append(f"CURRENT_STEP: {current_step}")
+        # 9. Loaded skills
+        loaded_skills = bb.get("loaded_skills", {})
+        if isinstance(loaded_skills, dict) and loaded_skills:
+            skill_names = [str(v.get("skill_name", k)) for k, v in list(loaded_skills.items())[:5] if isinstance(v, dict)]
+            parts.append(f"ACTIVE_SKILLS: {', '.join(skill_names)}")
+        # 10. Recent tool calls summary
+        recent_tools: list[str] = []
+        for msg in self.messages[-20:]:
+            tc = msg.get("tool_calls", [])
+            if isinstance(tc, list):
+                for call in tc:
+                    if isinstance(call, dict):
+                        fname = str(call.get("function", {}).get("name", "")).strip()
+                        if fname and fname not in recent_tools:
+                            recent_tools.append(fname)
+        if recent_tools:
+            parts.append(f"RECENT_TOOLS: {', '.join(recent_tools[-8:])}")
         parts.append("</STATE_HANDOFF>")
         return "\n".join(parts)
 
@@ -13833,8 +14523,20 @@ class SessionState:
         }
 
     def _safe_upload_name(self, filename: str) -> str:
+        # Use Path().name to strip any directory component first.
         raw = Path(str(filename or "upload.bin")).name
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+        # Only remove characters that are genuinely illegal or dangerous on
+        # filesystems (path separators, null byte, control chars, Windows
+        # reserved chars). Unicode letters/CJK/etc. are left untouched so
+        # filenames like "我的数据.xlsx" remain readable.
+        safe = re.sub(r'[/\\\x00-\x1f\x7f:*?"<>|]', "_", raw)
+        safe = safe.strip(". ")  # avoid hidden files (leading dot) and trailing issues
+        # Enforce a byte-length ceiling safe across all filesystems (255 bytes max).
+        # Trim the stem if needed while preserving the extension.
+        if len(safe.encode("utf-8", errors="replace")) > 240:
+            ext = Path(safe).suffix  # e.g. ".xlsx"
+            stem = safe[: max(1, 200 - len(ext))]
+            safe = stem + ext
         return safe or f"upload_{int(now_ts())}.bin"
 
     def _decode_text_bytes(self, data: bytes) -> str:
@@ -15198,8 +15900,8 @@ class SessionState:
         return any(x in t for x in markers)
 
     def _llm_classify_task_complexity(self, goal_text: str) -> str:
-        """LLM semantic pre-screening: classify task as simple/complex. 3s timeout."""
-        goal = trim(str(goal_text or ""), 300)
+        """LLM semantic pre-screening: classify task as simple/complex via 4-dimension analysis. 5s timeout."""
+        goal = trim(str(goal_text or ""), 400)
         if not goal or len(goal) < 6:
             return "simple"
         import threading
@@ -15208,18 +15910,29 @@ class SessionState:
             try:
                 rsp = self.ollama.chat(
                     [{"role": "user", "content": (
-                        f"/no_think\nClassify this task as SIMPLE or COMPLEX.\n"
-                        f"COMPLEX = needs multiple steps, file creation, code generation, document production, "
-                        f"multi-agent collaboration, design work, data processing, API development, testing.\n"
-                        f"SIMPLE = direct Q&A, lookup, single-line fix, short explanation.\n\n"
+                        f"/no_think\nRate this task on 4 dimensions (1=low 2=med 3=high), then classify.\n\n"
                         f"Task: {goal}\n\n"
-                        f"Reply with ONLY one word: SIMPLE or COMPLEX"
+                        f"SCOPE: how many files/components/systems are touched?\n"
+                        f"STEPS: how many distinct execution steps are needed?\n"
+                        f"SKILL: does it need specialized tools, skills, research, or APIs?\n"
+                        f"OUTPUT: what is expected (1=text answer, 2=single file, 3=system/multi-file)?\n\n"
+                        f"Output exactly one line:\n"
+                        f"SCOPE:N STEPS:N SKILL:N OUTPUT:N VERDICT:SIMPLE|COMPLEX\n"
+                        f"(COMPLEX if any dimension >= 2)"
                     )}],
-                    system="/no_think\nClassify tasks. Output one word only.",
-                    max_tokens=30,
+                    system="/no_think\nAnalyze task dimensions. One line output only.",
+                    max_tokens=40,
                     think=False,
                 )
                 answer = str(rsp.get("content", "") or "").strip().upper()
+                # Parse dimension scores
+                dims: dict = {}
+                for dim in ("SCOPE", "STEPS", "SKILL", "OUTPUT"):
+                    m = re.search(rf"{dim}:(\d)", answer)
+                    if m:
+                        dims[dim.lower()] = int(m.group(1))
+                if dims:
+                    self._cached_complexity_dimensions = dims
                 if "COMPLEX" in answer:
                     result_box[0] = "complex"
             except Exception:
@@ -18313,12 +19026,26 @@ class SessionState:
                     "content": trim(str(pt.get("content", "") or ""), 400),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
+                    "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
                     "created_at": float(pt.get("created_at", 0.0) or 0.0),
                     "completed_at": float(pt.get("completed_at", 0.0) or 0.0) if pt.get("completed_at") else None,
                     "completed_by": trim(str(pt.get("completed_by", "") or ""), 40),
                     "evidence": trim(str(pt.get("evidence", "") or ""), 200),
                 })
             board["project_todos"] = clean_todos
+        # Preserve plan step cursor/total (used by _advance_plan_step and UI progress)
+        raw_cursor = src.get("plan_step_cursor")
+        if raw_cursor is not None:
+            try:
+                board["plan_step_cursor"] = int(raw_cursor)
+            except Exception:
+                pass
+        raw_total = src.get("plan_step_total")
+        if raw_total is not None:
+            try:
+                board["plan_step_total"] = int(raw_total)
+            except Exception:
+                pass
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -19293,18 +20020,28 @@ class SessionState:
             "step completed", "step done", "step passed",
             "现在进入", "开始 step", "开始step",
             "阶段完成", "阶段通过", "phase complete",
+            # extended: manager says "now do step X.Y" implying prior step is done
+            "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "执行步骤 2",
+            "进入下一步", "next step", "proceed to step",
+            "步骤 1.1 已完成", "步骤 1.2 已完成",
         )
         # Also detect "Step N 通过" or "进入 Step N+1" patterns
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
         # "Step 2 已通过" / "Step 2 完成" / "进入 Step 3"
         next_step_pattern = re.search(
-            r'(?:进入|enter|move\s+to|start)\s*step\s*(\d+)',
+            r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
         )
         if next_step_pattern:
             mentioned_step = int(next_step_pattern.group(1))
             if mentioned_step > current_idx + 1:
+                return True
+        # Pattern: "继续步骤 1.2" / "完成步骤 1.1，开始 1.2"
+        step_ref = re.search(r'步骤\s*1\.(\d+)', text)
+        if step_ref:
+            ref_sub = int(step_ref.group(1))
+            if ref_sub > (current_idx + 1):
                 return True
         return any(pat in text for pat in step_done_patterns)
 
@@ -19341,11 +20078,26 @@ class SessionState:
             })
         self.blackboard = bb
         self._blackboard_touch()
+        # 步骤推进时清除 in_progress/pending 的 worker 子任务，防止跨步骤堆积
+        # 保留 completed 的 worker 项，让 UI 保持已完成记录可见
+        try:
+            _snap = self.todo.snapshot()
+            _worker_owners = {"developer", "explorer", "reviewer"}
+            _clean = [
+                r for r in _snap
+                if str(r.get("owner", "") or "").lower() not in _worker_owners
+                or str(r.get("status", "") or "").lower() == "completed"
+            ]
+            if len(_clean) < len(_snap):
+                with self.todo.lock:
+                    self.todo.items = _clean
+        except Exception:
+            pass
         # Immediately sync todos so UI reflects plan step advancement
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
         if next_step:
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-advanced")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
         return True
@@ -19408,6 +20160,27 @@ class SessionState:
         if should_advance:
             evidence = f"single-agent auto-advance: phase={phase}, wrote={wrote_files}, bash_ok={ran_bash_ok}"
             self._advance_plan_step(evidence=evidence, actor="single")
+            # 步骤推进后注入 hint，提示 LLM 为新步骤调用 TodoWrite 更新子任务
+            try:
+                _bb_after = self._ensure_blackboard()
+                _new_step = next(
+                    (t for t in _bb_after.get("project_todos", [])
+                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                    None,
+                )
+                if _new_step:
+                    _step_idx = int(_new_step.get("plan_step_index", 0) or 0) + 1
+                    _total = int(_bb_after.get("plan_step_total", 0) or 0)
+                    _step_text = trim(str(_new_step.get("content", "") or ""), 200)
+                    _step_label = f"Step {_step_idx}" + (f"/{_total}" if _total else "")
+                    _hint = (
+                        f"[plan-step-advance] Previous step completed. Now at {_step_label}: {_step_text}\n"
+                        "Call TodoWrite to set your task breakdown for this step "
+                        "(3-5 subtask items, one marked in_progress) before proceeding."
+                    )
+                    self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
+            except Exception:
+                pass
         else:
             self._sync_todos_from_blackboard(reason="single-agent-round")
 
@@ -19443,17 +20216,24 @@ class SessionState:
         self._update_project_todo_status(bb)
         system_rows = self._todo_project_rows_from_blackboard(bb)
         existing = self.todo.snapshot()
+        worker_rows: list[dict] = []
         non_system_rows: list[dict] = []
         for row in existing:
             if not isinstance(row, dict):
                 continue
             key = str(row.get("key", "") or "").strip()
             owner = str(row.get("owner", "") or "").strip().lower()
-            if key.startswith(("bb:owner:", "bb:node:", "bb:proj:")) or owner in {"manager", "explorer", "developer", "reviewer"}:
+            is_system_key = key.startswith(("bb:owner:", "bb:node:", "bb:proj:"))
+            # Preserve worker-owned items (from TodoWrite) separately
+            is_worker_item = owner in ("developer", "explorer", "reviewer") and not is_system_key
+            if is_worker_item:
+                worker_rows.append(dict(row))
+                continue
+            if is_system_key or owner == "manager":
                 continue
             non_system_rows.append(dict(row))
-        remaining_cap = max(0, 20 - len(system_rows))
-        merged = list(system_rows) + non_system_rows[:remaining_cap]
+        remaining_cap = max(0, 20 - len(system_rows) - len(worker_rows))
+        merged = list(system_rows) + worker_rows + non_system_rows[:remaining_cap]
         try:
             todo_out = self.todo.update(merged)
         except Exception:
@@ -19989,34 +20769,91 @@ class SessionState:
 
     def _manager_classification_system_prompt(self) -> str:
         base = (
-            "You are Manager. Classify the latest user request by semantic intent, not by keyword templates. "
-            "Decide whether this latest turn should inherit the previous blackboard/task state. "
+            "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
+            "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
-            "set it false for a new independent objective. "
-            "If this turn is only a continuation signal, preserve current task level/mode/participants/budget. "
-            "If this turn both continues previous work and adds new requirements, keep inherit_previous_state=true "
-            "but re-evaluate level/participants/budget according to the new requirements. "
-            "Select one level:\n"
-            "1=simple direct answer (single agent)\n"
-            "2=simple multi-turn answer (single agent, larger budget)\n"
-            "3=simple collaborative execution (sync mode, limited budget)\n"
-            "4=complex collaborative execution (sync mode, larger budget)\n"
-            "5=system-level collaborative execution (sync mode, unlimited tier budget; require confirmation before actions)\n"
-            "Also infer user scale preference: fast|balanced|thorough. "
-            "If user clearly indicates speed vs completeness preference, that preference has higher priority than your default strategy. "
-            "Budgets are internal efficiency controls to reduce overthinking and idle loops; "
-            "they must not be treated as a user-visible early-stop reason. "
+            "set it false for a new independent objective.\n\n"
+            "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
+            "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
+            "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
+            "Level 2 — Multi-turn answer / light task: longer explanation, code snippet review, minor single-file edit, "
+            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds.\n"
+            "Level 3 — Coordinated execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
+            "API integration, documentation generation, data processing script. Sync mode with 2 participants. Budget: 8-15 rounds.\n"
+            "Level 4 — Full-stack collaborative: system-level feature implementation, architecture change, "
+            "multi-component refactoring, research-and-implement workflow, PPT/report generation from raw materials, "
+            "crawler/agent/service development. Sync mode with 3 participants. Budget: 15-25 rounds.\n"
+            "Level 5 — System-critical / risky: production deployment, DB schema migration, mass file deletion, "
+            "external API write operations with side effects, irreversible system changes. "
+            "Requires explicit user confirmation before actions start. Unlimited budget.\n\n"
+            "BOUNDARY SIGNALS:\n"
+            "• Requests containing 'all', 'entire', 'full system', 'migrate', 'deploy' → lean level 4-5.\n"
+            "• Requests with clear output artifact (ppt, report, app, service, test suite) → at least level 3.\n"
+            "• Requests asking 'how' or 'what' with no action words → level 1-2.\n"
+            "• Requests with 'quick', 'simple', 'just', 'only' from user → can lower by 1 level.\n"
+            "• Requests with 'thorough', 'comprehensive', 'detailed', 'production-ready' → raise by 1 level.\n\n"
+            "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
+            "User-stated preference overrides your default strategy. "
+            "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
             "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
-            "and semantic_confidence(high|medium|low). "
-            "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly. "
+            "and semantic_confidence (high|medium|low). "
+            "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
             f"{model_language_instruction(self.ui_language)}"
         )
         if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
             base += (
-                " NOTE: User has configured Single-agent mode. "
+                "\nNOTE: User has configured Single-agent mode. "
                 "Favor level 1-2 for straightforward tasks; only assign level 3+ when genuine multi-step complexity demands it."
             )
         return base
+
+    def _skill_aware_reeval_task_level(
+        self,
+        goal_text: str,
+        low_conf_row: dict,
+        pinned_selection: str,
+    ) -> dict:
+        """Second-pass skill-aware re-evaluation when primary classifier has low confidence.
+        Loads skill names + dimension scores into a focused prompt to re-anchor the level.
+        Returns an updated row dict (may be same as low_conf_row if re-eval fails/times out)."""
+        try:
+            # Build skill context
+            available_names = sorted(self.skills.list_names())[:15]
+            loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
+            active_names = [str(k) for k in loaded_skills.keys()][:4]
+            dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
+            dim_str = " ".join(f"{k.upper()}={v}" for k, v in dims.items()) if dims else "unavailable"
+            skill_list = ", ".join(active_names) if active_names else ("none active; available: " + ", ".join(available_names[:10]))
+            prev_level = int(low_conf_row.get("level", 0) or 0)
+            reeval_prompt = (
+                f"/no_think\nRe-evaluate this task classification. Primary classifier was uncertain.\n\n"
+                f"Task: {trim(str(goal_text or ''), 600)}\n"
+                f"Pre-screen dimensions: {dim_str}\n"
+                f"Skills context: {skill_list}\n"
+                f"Previous tentative level: {prev_level}\n\n"
+                f"Level guide:\n"
+                f"1=Q&A only  2=light single-file task  3=multi-file/tool task  "
+                f"4=full feature/research+implement  5=risky/system-critical\n\n"
+                f"Output ONE integer (1-5) that best fits. No explanation."
+            )
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": reeval_prompt}],
+                system="/no_think\nOutput one integer 1-5.",
+                max_tokens=10,
+                think=False,
+            )
+            answer = str(rsp.get("content", "") or "").strip()
+            for ch in answer:
+                if ch.isdigit() and ch in "12345":
+                    new_level = int(ch)
+                    updated = dict(low_conf_row)
+                    updated["level"] = new_level
+                    updated["semantic_confidence"] = "medium"
+                    updated["source"] = "skill-reeval"
+                    return updated
+        except Exception:
+            pass
+        return dict(low_conf_row)
 
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
         row = dict(decision or {})
@@ -20298,6 +21135,38 @@ class SessionState:
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
+        # ── Build skills context ──
+        skills_ctx = ""
+        try:
+            loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
+            available_names = sorted(self.skills.list_names())[:20]
+            active_names = [str(k) for k in loaded_skills.keys()][:5]
+            if active_names:
+                skills_ctx += f"Currently loaded skills: {', '.join(active_names)}.\n"
+            if available_names:
+                skills_ctx += f"Available skills (first 20): {', '.join(available_names)}.\n"
+            if active_names or available_names:
+                skills_ctx += (
+                    "If the task clearly requires one of these skills (e.g. ppt skill for presentation, "
+                    "research skill for analysis), factor that into your level decision "
+                    "(skill-based tasks tend to be level 3-4).\n"
+                )
+        except Exception:
+            pass
+        # ── Build dimension hint from pre-screen ──
+        dims_ctx = ""
+        try:
+            dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
+            if dims:
+                dim_str = " ".join(f"{k.upper()}={v}" for k, v in dims.items())
+                max_dim = max(dims.values()) if dims else 0
+                dims_ctx = (
+                    f"Pre-screen dimension scores: {dim_str}. "
+                    f"Max dimension={max_dim} "
+                    f"({'high complexity signal' if max_dim >= 3 else 'moderate' if max_dim == 2 else 'simple'}).\n"
+                )
+        except Exception:
+            pass
         prompt = (
             "Classify this user request now and decide run topology/budget.\n\n"
             f"User request:\n{trim(str(goal_text or ''), 4000)}\n\n"
@@ -20308,7 +21177,9 @@ class SessionState:
             f"participants={','.join(self.runtime_participants or []) or '-'}, "
             f"assigned={self.runtime_assigned_expert or '-'}, "
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
-            f"Workspace root: {self.files_root}\n"
+            f"{dims_ctx}"
+            f"{skills_ctx}"
+            f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
@@ -20338,7 +21209,7 @@ class SessionState:
             [{"role": "user", "content": prompt, "ts": now_ts()}],
             tools=self._manager_task_classify_tools(),
             system=self._manager_classification_system_prompt(),
-            max_tokens=260,
+            max_tokens=320,
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -20364,8 +21235,10 @@ class SessionState:
                     default="medium",
                 )
                 if str(row.get("semantic_confidence", "medium")) == "low":
+                    # Skill-aware re-evaluation before falling back to keyword heuristic
+                    reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
                     fallback_row = self._fallback_task_level_decision(goal_text)
-                    merged = self._merge_task_decision_for_low_confidence(row, fallback_row)
+                    merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
                     return merged
                 row["source"] = "manager"
                 return row
@@ -20526,6 +21399,12 @@ class SessionState:
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
         lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        lines.append(
+            "STEP COMPLETION RULE: Set advance_plan_step=true when the worker has provided concrete evidence "
+            "that the current step is done — e.g., research_notes populated for a read/analyze step, "
+            "code_artifacts created for an implement step, or all worker TodoWrite subtasks marked completed. "
+            "Do NOT keep re-delegating the same step once this evidence exists. "
+        )
         lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
                      "Do NOT reinterpret or replace plan steps with your own objectives. ")
         # Add loaded skills enforcement
@@ -20604,11 +21483,62 @@ class SessionState:
             cur = pending[0]
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
+            step_content_low = str(cur.get("content", "") or "").lower()
+            # ── Build blackboard evidence for step completion detection ──
+            research_count = len(bb.get("research_notes", []) or [])
+            code_count = len(bb.get("code_artifacts", {}) or {})
+            exec_count = len(bb.get("execution_logs", []) or [])
+            # ── Worker todo snapshot: show manager what workers wrote ──
+            worker_hint = ""
+            try:
+                worker_todos = [
+                    r for r in self.todo.snapshot()
+                    if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
+                    and not str(r.get("key", "") or "").startswith("bb:")
+                ]
+                if worker_todos:
+                    completed_w = [r for r in worker_todos if str(r.get("status", "")).lower() == "completed"]
+                    pending_w = [r for r in worker_todos if str(r.get("status", "")).lower() not in ("completed",)]
+                    if not pending_w and completed_w:
+                        worker_hint = (
+                            f"Worker subtasks: all {len(completed_w)} completed "
+                            f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
+                            "→ Worker has finished. Set advance_plan_step=true NOW. "
+                        )
+                    elif completed_w or pending_w:
+                        worker_hint = (
+                            f"Worker subtasks: {len(completed_w)} done, {len(pending_w)} pending. "
+                            "→ Do NOT advance yet. "
+                        )
+            except Exception:
+                pass
+            # ── Blackboard-evidence-based completion hint ──
+            bb_evidence_hint = ""
+            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "提取", "read", "analyze", "extract", "research", "summarize", "总结"))
+            is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
+            is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
+            if is_research_step and research_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {research_count} research_note(s) — "
+                    "if these were written for this step, set advance_plan_step=true. "
+                )
+            elif is_implement_step and code_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {code_count} code_artifact(s) — "
+                    "if these were created for this step, set advance_plan_step=true. "
+                )
+            elif is_test_step and exec_count > 0 and not worker_hint:
+                bb_evidence_hint = (
+                    f"Blackboard has {exec_count} execution_log(s) — "
+                    "if these reflect this step's test run, set advance_plan_step=true. "
+                )
             return (
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
                 f"({len(completed)} completed, {len(pending)} remaining) "
                 f"DO NOT finish until all {total} steps are completed. "
                 f"Focus on THIS step. When done, set advance_plan_step=true. "
+                f"{worker_hint}"
+                f"{bb_evidence_hint}"
             )
         # 原有逻辑
         pending = [t for t in todos if t.get("status") != "completed"]
@@ -21210,7 +22140,7 @@ class SessionState:
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
-        if len(recent) >= 2 and recent[-1] == target and recent[-2] == target:
+        if len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
             board = bb_for_routes
             low_reason = str(row.get("reason", "") or "").strip().lower()
             if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
@@ -21246,12 +22176,12 @@ class SessionState:
                 else:
                     row["target"] = "developer"
                     row["instruction"] = (
-                        "Anti-stall: CHANGE YOUR APPROACH. "
-                        "If edit_file keeps failing, use write_file. "
-                        "If reading without editing, make a concrete change now. "
-                        "If done, call finish_task."
+                        "You have been working on this for multiple rounds without visible progress. Consider: "
+                        "1) Use ask_colleague to request help from another agent. "
+                        "2) Try a completely different tool or approach. "
+                        "3) If the subtask is complete, call finish_current_task with what you have so far."
                     )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-change"
+                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
             row["source"] = "anti-stall"
             return row
         if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
@@ -22040,6 +22970,9 @@ class SessionState:
                 evidence=trim(str(route.get("instruction", "") or ""), 200),
                 actor=str(route.get("target", "developer") or "developer"),
             )
+            # CRITICAL: re-anchor board to the updated blackboard so the
+            # self.blackboard = board at line ~22388 does NOT overwrite the advance.
+            board = self.blackboard
         self.manager_routes.append(route_row)
         self.manager_routes = self.manager_routes[-240:]
         # Failure ledger: persist route and record delegation
@@ -22290,6 +23223,14 @@ class SessionState:
                         f"Your work must directly execute THIS step. Do not skip or replace it.\n"
                     )
                     break
+        # developer 被调用时有活跃 plan step，要求在开始前调用 TodoWrite 刷新子任务
+        todo_update_note = ""
+        if role_key == "developer" and current_plan_step_note:
+            todo_update_note = (
+                "TODO UPDATE: Call TodoWrite at the start of your work to set your task breakdown "
+                "for this step (3-5 subtask items, one marked in_progress). "
+                "Mark each subtask completed as you finish it.\n"
+            )
         payload = (
             "<manager-delegate>\n"
             f"target={role_key}\n"
@@ -22303,6 +23244,7 @@ class SessionState:
             f"{role_capability_note}\n"
             f"{loaded_skills_note}"
             f"{current_plan_step_note}"
+            f"{todo_update_note}"
             f"{error_section}"
             "</manager-delegate>\n"
             "<blackboard-state>\n"
@@ -23022,19 +23964,28 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
-        skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
-            f"Workspace: {self.files_root}. Use relative paths. "
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            f"{skills_note}{code_note + ' ' if code_note else ''}"
+            f"{code_note + ' ' if code_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
+        mm_note = self._multimodal_capability_block()
+        if mm_note:
+            base = base + mm_note
+        base = base + skills_block
         if role_key == "explorer":
-            return base + "Role: analyze goals, inspect codebase, produce research notes. Prefer read/search. "
+            return base + (
+                "Role: analyze goals, inspect codebase, produce research notes. "
+                "For factual or background questions on any topic, FIRST call "
+                "query_knowledge_library(query='<topic>', top_k=8, route='hybrid') to retrieve relevant documents. "
+                "Prefer read/search tools. "
+            )
         if role_key == "reviewer":
             if bool(self.reviewer_debug_mode):
                 debug_ctx = trim(str(self.reviewer_debug_context or ""), 500)
@@ -23067,6 +24018,11 @@ class SessionState:
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
+            "SKILL PRIORITY (critical): When ACTIVE SKILLS are listed above, find the "
+            "<loaded-skill> messages in your context and READ them before starting any step. "
+            "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
+            "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
+            "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
             "TODO TRACKING (mandatory): "
             "After completing each logical step, call TodoWrite to update progress — "
             "mark completed items as 'completed' and set the next item to 'in_progress'. "
@@ -24020,7 +24976,8 @@ class SessionState:
                     isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
                     for it in new_items
                 ):
-                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: removed
+                    pass  # Skills are loaded on-demand by the model
             except Exception:
                 pass
             return result
@@ -24028,7 +24985,7 @@ class SessionState:
             result = self._todo_write_rescue(args)
             # Also recheck skills on rescue write (likely a recovery situation)
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="todo-rescue")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
             return result
@@ -24637,6 +25594,10 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
+                # Reset completed plan/todo/skills blackboard state so the manager
+                # does not see status=COMPLETED on the very first round and immediately finish.
+                if not _awaiting_plan_choice:
+                    self._reset_blackboard_plan_state_locked()
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
@@ -25521,7 +26482,7 @@ class SessionState:
 
         # Auto-discover and load relevant skills before research
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-mode-start")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
 
@@ -25590,7 +26551,7 @@ class SessionState:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Loaded Skills\n"
+                    "\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
                     "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
@@ -25604,33 +26565,38 @@ class SessionState:
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"2. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
-            f"3. If skills are loaded, analyze their <loaded-skill> content to identify concrete workflow steps, "
-            f"scripts, tools, and file paths each skill requires\n"
-            f"4. Identify key technical details, data points, and structure needed for the output\n"
-            f"5. Assess risks and note any ambiguities that need user input\n"
-            f"6. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"7. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
+            f"to this task and note their names and capabilities in your findings.\n"
+            f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
+            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
+            f"workflow steps, scripts, tools, and file paths\n"
+            f"5. Identify key technical details, data points, and structure needed for the output\n"
+            f"6. Assess risks and note any ambiguities that need user input\n"
+            f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"   - Relevant skills found (names, what they do, how to invoke them)\n"
             f"   - File inventory (uploaded files, their types, sizes, key content)\n"
-            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each loaded skill)\n"
+            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
             f"   - Content analysis (key themes, structure, data points extracted from inputs)\n\n"
-            f"Workspace: {self.files_root}\n"
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT)\n"
             f"{os_note}\n"
             f"{lang_note}"
         )
 
     def _seed_plan_mode_explorer_context(self, research_prompt: str):
         os_note = _detect_os_shell_instruction()
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        skills_block = self._skills_awareness_block(for_role="explorer")
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
                 "You are Explorer in plan-mode (read-only research). "
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
-                "and blackboard tools only. "
-                f"{skills_hint}"
+                "list_skills, load_skill, and blackboard tools only. "
+                f"{skills_block}"
+                "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
+                "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -25661,16 +26627,16 @@ class SessionState:
             self.current_phase = f"plan-mode:explorer:round-{round_idx}"
             self.current_tool_name = ""
             self.active_agent_role = "explorer"
-        # Build loaded-skills hint for system prompt
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        # Build skills awareness block (same as sync/single mode)
+        skills_block = self._skills_awareness_block(for_role="explorer")
         response = self._chat_with_same_model_retry(
             ctx,
             tools=filtered_tools,
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
-                f"Workspace: {self.files_root}. "
-                f"{skills_hint}"
+                f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+                f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -26044,7 +27010,7 @@ class SessionState:
                     skill_previews.append(f"- {skey}: {preview}")
             if skill_previews:
                 skills_section = (
-                    f"\n## Available Skills\n"
+                    "\n## Available Skills\n"
                     + "\n".join(skill_previews)
                     + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
                     "- Which tool to call (bash, read_file, write_file, etc.)\n"
@@ -26079,7 +27045,8 @@ class SessionState:
         synthesis_ctx = [
             {"role": "system", "content": (
                 "You are a technical architect synthesizing research into actionable plans. "
-                "When loaded skills are available, incorporate their capabilities and best practices into plan options."
+                "When skills are referenced in the findings, incorporate their actual workflow steps into plan options. "
+                f"{self._skills_awareness_block(for_role='developer')}"
             ), "ts": now_ts()},
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
@@ -26221,7 +27188,7 @@ class SessionState:
         recommended = str(proposal.get("recommended", "") or "").strip()
         rec_hint = f"\nRecommended option: {recommended}" if recommended else ""
         prompt = (
-            f"The user was presented with these options:\n"
+            "The user was presented with these options:\n"
             + "\n".join(options_desc)
             + rec_hint
             + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"
@@ -26307,16 +27274,22 @@ class SessionState:
                 bb["plan_step_total"] = len(plan_todos)
                 self.blackboard = bb
                 self._blackboard_touch()
-                # 同步到 UI todo
+                # 同步到 UI todo — 使用 bb:proj: 键，与 _todo_project_rows_from_blackboard 保持一致
+                # 避免后续 _sync_todos_from_blackboard 把这些 items 误认为 worker_rows 造成重复
                 try:
                     self.todo.update([
-                        {"content": t["content"], "status": t["status"], "owner": "developer"}
+                        {
+                            "key": f"bb:proj:{t['id']}",
+                            "content": t["content"],
+                            "status": t["status"],
+                            "activeForm": f"Working on: {t['content']}" if t["status"] == "in_progress" else f"Pending: {t['content']}",
+                        }
                         for t in plan_todos[:20]
                     ])
                 except Exception:
                     pass
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
         # Pre-load skills explicitly mentioned in plan steps
@@ -26380,13 +27353,13 @@ class SessionState:
                     )
                 },
             )
-            # ── Auto-discover and load relevant skills BEFORE classification ──
+            # ── Skills are loaded on-demand by the model via load_skill ──
             try:
                 self._emit(
                     "status",
-                    {"summary": "initial skill discovery started"},
+                    {"summary": "skills available on-demand"},
                 )
-                self._refresh_loaded_skills_for_execution_focus(trigger="pre-classify")
+                pass  # No automatic pre-classify skill discovery
             except Exception:
                 pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()
@@ -29519,7 +30492,7 @@ const CODE_LANG_BY_NAME={'dockerfile':'shell','makefile':'makefile','cmakelists.
 const CODE_LITERAL_WORDS=new Set(['true','false','null','undefined','none','nil']);
 const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case','break','continue','return','function','class','import','export','from','try','catch','finally','throw','new','const','let','var','public','private','protected','static','async','await']),python:new Set(['def','class','if','elif','else','for','while','try','except','finally','raise','return','yield','import','from','as','with','pass','break','continue','lambda','global','nonlocal','assert','del','in','is','not','and','or','async','await']),javascript:new Set(['function','class','if','else','for','while','do','switch','case','break','continue','return','try','catch','finally','throw','new','this','const','let','var','import','export','from','default','extends','super','async','await','typeof','instanceof','in','of']),typescript:new Set(['interface','type','enum','implements','readonly','namespace','declare','keyof','infer','satisfies','as','extends','public','private','protected','abstract','override','function','class','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','const','let','var','import','export','from','async','await']),java:new Set(['class','interface','enum','extends','implements','public','private','protected','static','final','abstract','volatile','synchronized','if','else','for','while','switch','case','break','continue','return','try','catch','finally','throw','new','package','import','instanceof','this','super','void']),c:new Set(['if','else','for','while','switch','case','break','continue','return','typedef','struct','union','enum','static','const','volatile','extern','inline','sizeof','#include','#define']),cpp:new Set(['if','else','for','while','switch','case','break','continue','return','class','struct','namespace','template','typename','public','private','protected','virtual','override','const','static','auto','constexpr','using','new','delete','this','throw','try','catch','#include','#define']),go:new Set(['package','import','func','type','struct','interface','map','chan','go','defer','select','if','else','for','switch','case','break','continue','return','fallthrough','range','const','var']),rust:new Set(['fn','let','mut','impl','trait','struct','enum','match','if','else','for','while','loop','break','continue','return','pub','use','mod','crate','self','super','where','async','await','move']),ruby:new Set(['def','class','module','if','elsif','else','unless','case','when','for','while','until','begin','rescue','ensure','return','yield','super','self','require','include','extend','end']),php:new Set(['function','class','interface','trait','public','private','protected','static','if','elseif','else','for','foreach','while','switch','case','break','continue','return','try','catch','finally','throw','namespace','use','new']),swift:new Set(['func','class','struct','enum','protocol','extension','if','else','guard','for','while','switch','case','break','continue','return','defer','do','catch','throw','try','import','let','var']),kotlin:new Set(['fun','class','interface','object','data','sealed','enum','if','else','when','for','while','do','break','continue','return','try','catch','throw','import','package','val','var','companion']),scala:new Set(['def','class','trait','object','case','if','else','for','while','match','break','continue','return','try','catch','throw','import','package','val','var','extends','with']),shell:new Set(['if','then','else','fi','for','do','done','while','case','esac','function','return','break','continue','export','local','readonly','in']),sql:new Set(['select','from','where','group','by','order','insert','into','values','update','set','delete','join','left','right','inner','outer','on','create','alter','drop','table','view','index','and','or','not','as','limit']),json:new Set([]),yaml:new Set([]),toml:new Set([]),ini:new Set([]),xml:new Set([]),csharp:new Set(['namespace','class','interface','struct','enum','public','private','protected','internal','static','readonly','const','if','else','for','foreach','while','switch','case','break','continue','return','using','new','this','base','async','await']),objectivec:new Set(['@interface','@implementation','@property','@synthesize','@end','if','else','for','while','switch','case','break','continue','return','#import']),r:new Set(['if','else','for','while','repeat','break','next','function','return','library']),perl:new Set(['if','elsif','else','for','foreach','while','last','next','sub','my','our','use','package','return']),lua:new Set(['if','then','else','elseif','end','for','while','repeat','until','break','function','local','return']),dart:new Set(['class','enum','extension','if','else','for','while','switch','case','break','continue','return','import','library','part','new','const','final','var','async','await']),groovy:new Set(['class','interface','trait','if','else','for','while','switch','case','break','continue','return','def','import','package','new']),makefile:new Set(['include','ifeq','ifneq','ifdef','ifndef','else','endif']),cmake:new Set(['if','else','elseif','endif','foreach','endforeach','while','endwhile','function','endfunction','macro','endmacro','set','add_executable','add_library']),fortran:new Set(['program','module','subroutine','function','end','use','implicit','none','integer','real','character','logical','complex','dimension','allocatable','intent','in','out','inout','do','if','then','else','elseif','endif','call','return','write','read','format','type','class','interface','contains','allocate','deallocate']),haskell:new Set(['module','where','import','qualified','as','hiding','data','type','newtype','class','instance','deriving','if','then','else','case','of','let','in','do','return','where','infixl','infixr','infix','forall','default']),erlang:new Set(['module','export','import','if','case','of','end','receive','after','when','fun','try','catch','throw','begin','andalso','orelse','not','band','bor','bxor','bnot','bsl','bsr']),elixir:new Set(['def','defp','defmodule','defmacro','defstruct','defprotocol','defimpl','if','else','unless','case','cond','do','end','fn','when','with','for','raise','rescue','import','use','alias','require']),ocaml:new Set(['let','in','if','then','else','match','with','fun','function','type','module','struct','sig','end','open','val','rec','and','or','not','begin','do','done','for','while','to','downto','mutable','ref']),vhdl:new Set(['library','use','entity','architecture','is','of','begin','end','signal','variable','constant','port','in','out','inout','process','if','then','else','elsif','case','when','for','generate','component','generic','map']),verilog:new Set(['module','endmodule','input','output','inout','wire','reg','assign','always','begin','end','if','else','case','endcase','for','while','parameter','localparam','initial','posedge','negedge','task','function']),asm:new Set([]),protobuf:new Set(['syntax','package','import','option','message','enum','service','rpc','returns','repeated','optional','required','map','oneof','reserved','extend']),hcl:new Set(['resource','data','variable','output','locals','module','provider','terraform','backend','required_providers','for_each','count','depends_on','lifecycle','dynamic','content','block']),zig:new Set(['const','var','fn','pub','return','if','else','for','while','break','continue','switch','struct','enum','union','error','defer','errdefer','try','catch','import','comptime','inline','test','unreachable']),nim:new Set(['proc','func','method','type','var','let','const','if','elif','else','case','of','for','while','break','continue','return','import','include','from','object','ref','ptr','template','macro','iterator','yield','discard']),julia:new Set(['function','end','if','elseif','else','for','while','break','continue','return','module','using','import','export','struct','mutable','abstract','type','const','let','do','begin','try','catch','finally','throw','macro','quote']),crystal:new Set(['def','class','module','struct','enum','if','elsif','else','unless','case','when','while','until','for','do','end','return','yield','begin','rescue','ensure','require','include','extend','abstract','private','protected']),dlang:new Set(['module','import','class','struct','enum','interface','if','else','for','foreach','while','do','switch','case','default','break','continue','return','void','auto','const','immutable','static','public','private','protected','override','template','mixin','alias']),clojure:new Set(['def','defn','defmacro','fn','let','if','cond','case','do','loop','recur','for','doseq','when','when-not','ns','require','use','import','try','catch','throw','finally']),lisp:new Set(['defun','defmacro','defvar','defparameter','defconstant','let','let*','if','cond','case','when','unless','lambda','progn','loop','do','dolist','dotimes','setq','setf','funcall','apply','require','provide']),racket:new Set(['define','lambda','let','let*','letrec','if','cond','case','when','unless','begin','do','for','for/list','for/hash','match','struct','class','require','provide','module','import','export']),pascal:new Set(['program','unit','uses','interface','implementation','begin','end','var','const','type','procedure','function','if','then','else','for','to','downto','while','repeat','until','case','of','with','record','class','array','set','nil']),wgsl:new Set(['fn','var','let','const','struct','if','else','for','while','loop','break','continue','return','switch','case','default','override','enable','type','alias','discard','continuing','fallthrough']),glsl:new Set(['void','float','int','bool','vec2','vec3','vec4','mat2','mat3','mat4','sampler2D','uniform','varying','attribute','in','out','inout','if','else','for','while','do','break','continue','return','struct','const','precision','highp','mediump','lowp']),hlsl:new Set(['float','float2','float3','float4','int','bool','void','struct','cbuffer','Texture2D','SamplerState','if','else','for','while','do','break','continue','return','in','out','inout','uniform','static','const','register','semantic']),prisma:new Set(['model','enum','datasource','generator','type','relation','default','unique','id','map','index','ignore','updatedAt']),graphql:new Set(['type','query','mutation','subscription','input','enum','interface','union','scalar','schema','fragment','on','directive','extend','implements'])};
 S.staticMode=STATIC_UI;
-async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl)}catch(err){showError(err.message||String(err))}}
+async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
 const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
 function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}}
@@ -30206,16 +31179,32 @@ function _mathRunTypeset(root,key=''){
   if(!root)return;
   const k=String(key||'').trim();
   if(k&&root.getAttribute('data-math-key')===k)return;
+  const mathJaxCandidates=[
+    '/assets/js_lib/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/tex-mml-chtml.js',
+    '/assets/js_lib/es5/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/es5/tex-mml-chtml.js',
+    'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'
+  ];
+  const loadMathJax=(idx=0)=>{
+    const src=String(mathJaxCandidates[idx]||'').trim();
+    if(!src)return;
+    const s=document.createElement('script');
+    s.src=src;
+    s.async=true;
+    s.dataset.mathjaxCandidate=String(idx);
+    s.onerror=()=>{
+      if(idx+1<mathJaxCandidates.length)loadMathJax(idx+1);
+    };
+    document.head.appendChild(s);
+  };
   const run=(retry)=>{
     const mj=window.MathJax;
     if(!mj||typeof mj.typesetPromise!=='function'){
       // Lazy-load MathJax on first actual math demand
       if(!window._mjaxLoading){
         window._mjaxLoading=true;
-        const s=document.createElement('script');
-        s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
-        s.async=true;
-        document.head.appendChild(s);
+        loadMathJax(0);
       }
       if(retry<20)setTimeout(()=>run(retry+1),200);
       return;
@@ -33974,7 +34963,7 @@ class RAGContentParser:
 
             text = extract_text(str(pdf_path))
             if text and text.strip():
-                return trim(text.strip(), 150_000)
+                return trim(text.strip(), 800_000)
         except ImportError:
             pass
         except Exception:
@@ -33989,7 +34978,7 @@ class RAGContentParser:
                     timeout=60,
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return trim(r.stdout.strip(), 150_000)
+                    return trim(r.stdout.strip(), 800_000)
             except Exception:
                 pass
         try:
@@ -36150,7 +37139,7 @@ class RAGLibraryStore:
             backup_path.write_bytes(raw_bytes)
         elif source_fp and source_fp.exists():
             shutil.copy2(source_fp, backup_path)
-        semantic_text = trim(str(parse_result.get("text", "") or ""), 160_000)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 800_000)
         multimodal_row = dict(multimodal or {})
         mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
         mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
@@ -36339,6 +37328,16 @@ class RAGIngestionService:
             thread.start()
         self._cleanup_finished_job_artifacts()
         self._resume_incomplete_tasks()
+
+    def __getattr__(self, name: str):
+        # Belt-and-suspenders: if _flush_lock was never set (e.g. partial init,
+        # subclass skipped super().__init__), create it on first access so we
+        # never crash with AttributeError inside _flush_ingest_state.
+        if name == "_flush_lock":
+            lock = threading.Lock()
+            object.__setattr__(self, "_flush_lock", lock)
+            return lock
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def _task_spool_path(self, task_id: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "").strip()) or "task"
@@ -37871,6 +38870,7 @@ class CodeIngestionService(RAGIngestionService):
         self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
         self.parse_timeout_seconds = int(CODE_PARSE_TIMEOUT_SECONDS)
         self.resume_report = {"resumed": 0, "failed": 0, "cleaned": 0}
+        self._flush_lock = threading.Lock()
         self.threads = [
             threading.Thread(target=self._worker_loop, name=f"code-ingestion-{idx+1}", daemon=True)
             for idx in range(self.worker_count)
@@ -39569,17 +40569,9 @@ class AppContext:
         self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
-            self.offline_js_summary = ensure_offline_js_libs(self.workspace, force=False)
-        except Exception as exc:
-            self.offline_js_summary = {
-                "generated_at": int(now_ts()),
-                "js_lib_root": str(self.js_lib_root),
-                "total": len(OFFLINE_JS_LIB_CATALOG),
-                "available": 0,
-                "missing": len(OFFLINE_JS_LIB_CATALOG),
-                "fetched": 0,
-                "error": trim(str(exc), 220),
-            }
+            self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
+        except Exception:
+            self.offline_js_summary = {}
         self.default_language = normalize_ui_language(default_language)
         self.ui_style = normalize_ui_style(ui_style)
         self.context_token_limit = max(
@@ -39878,16 +40870,7 @@ class AppContext:
         return CODE_ADMIN_JS
 
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
-        safe = _safe_js_filename(str(filename or "").strip(), "lib.js")
-        fp = (self.js_lib_root / safe).resolve()
-        try:
-            if not fp.is_relative_to(self.js_lib_root):
-                return None
-        except Exception:
-            return None
-        if not fp.exists() or (not fp.is_file()):
-            return None
-        return fp
+        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
 
     def rag_three_asset_info(self) -> dict:
         picks = [
@@ -40685,7 +41668,7 @@ class AppContext:
                 f"{str(row.get('title', '') or '').strip()} "
                 f"score={str(row.get('score', 0) or 0)}"
             )
-            snippet = trim(str(row.get("text", "") or ""), 320)
+            snippet = trim(str(row.get("text", "") or ""), 800)
             if snippet:
                 lines.append(snippet)
         return "\n".join(lines)
@@ -42764,8 +43747,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/rag-admin.js":
             return self._send_text(self.app.web_ui_rag_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -42773,7 +43756,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
@@ -42921,8 +43904,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/code-admin.js":
             return self._send_text(self.app.web_ui_code_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -42930,7 +43913,7 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
@@ -43552,6 +44535,17 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    # JS lib download (default on; set download_js_lib: false in --config to disable)
+    _js_dl_enabled = extract_js_lib_download_setting(external_config)
+    if _js_dl_enabled is None:
+        _js_dl_enabled = True
+    if _js_dl_enabled:
+        try:
+            app.offline_js_summary = ensure_offline_js_libs(
+                app.workspace, force=False, verbose=True, no_connection_deadline=60.0
+            )
+        except Exception as _js_exc:
+            print(f"[js_lib] download error: {_js_exc}")
     web_ui_state = app.configure_web_ui(
         config_path=str(web_ui_config_path),
         ui_dir=resolved_web_ui_dir,
