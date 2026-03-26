@@ -10370,35 +10370,36 @@ class SessionState:
         if not current:
             return False
         text = (str(instruction or "") + " " + str(reason or "")).lower()
-        # Patterns that indicate step completion
+        # Patterns that indicate step completion — only BACKWARD-looking signals
+        # (agent/manager explicitly says a step is done, NOT forward-looking dispatch instructions)
         step_done_patterns = (
             "审查通过", "通过审查", "已通过", "已完成", "完成了",
-            "进入 step", "进入step", "enter step", "move to step",
             "step completed", "step done", "step passed",
-            "现在进入", "开始 step", "开始step",
             "阶段完成", "阶段通过", "phase complete",
-            # extended: manager says "now do step X.Y" implying prior step is done
-            "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "执行步骤 2",
-            "进入下一步", "next step", "proceed to step",
-            "步骤 1.1 已完成", "步骤 1.2 已完成",
+            "步骤 1.1 已完成", "步骤 1.2 已完成", "步骤 1.3 已完成",
+            "步骤 1.4 已完成", "步骤 1.5 已完成",
         )
-        # Also detect "Step N 通过" or "进入 Step N+1" patterns
+        # NOTE: intentionally excluded forward-looking dispatch patterns:
+        #   "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "进入下一步", "next step",
+        #   "proceed to step", "进入 step", "开始 step" — these are manager dispatch
+        #   instructions, NOT evidence that the current step was completed.
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
-        # "Step 2 已通过" / "Step 2 完成" / "进入 Step 3"
+        # Only advance when an agent explicitly says "进入 Step N" where N > current+1
+        # (skipping ahead), NOT when manager dispatches the very next step.
         next_step_pattern = re.search(
             r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
         )
         if next_step_pattern:
             mentioned_step = int(next_step_pattern.group(1))
-            if mentioned_step > current_idx + 1:
+            if mentioned_step > current_idx + 2:  # must skip at least 2 ahead to be meaningful
                 return True
-        # Pattern: "继续步骤 1.2" / "完成步骤 1.1，开始 1.2"
-        step_ref = re.search(r'步骤\s*1\.(\d+)', text)
+        # "完成步骤 1.1，开始 1.2" — only if explicitly marking current step done
+        step_ref = re.search(r'(?:完成|finished|done)\s*步骤\s*1\.(\d+)', text)
         if step_ref:
             ref_sub = int(step_ref.group(1))
-            if ref_sub > (current_idx + 1):
+            if ref_sub == current_idx + 1:  # explicitly says current step (1-based) is done
                 return True
         return any(pat in text for pat in step_done_patterns)
 
