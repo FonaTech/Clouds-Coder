@@ -989,8 +989,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/rag-admin.js":
             return self._send_text(self.app.web_ui_rag_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -998,7 +998,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
@@ -1145,8 +1145,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/code-admin.js":
             return self._send_text(self.app.web_ui_code_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -1154,7 +1154,7 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":

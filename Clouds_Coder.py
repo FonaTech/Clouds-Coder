@@ -27,6 +27,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -103,7 +104,7 @@ CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
 RAG_CHUNK_CHARS = 1200
 RAG_CHUNK_OVERLAP = 180
-RAG_MAX_CHUNKS_PER_DOC = 200
+RAG_MAX_CHUNKS_PER_DOC = 500
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
@@ -152,7 +153,7 @@ MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 3
-HARD_BREAK_TOOL_ERROR_THRESHOLD = 3
+HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 3
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
@@ -974,9 +975,212 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
         ],
         "match_tokens": ["cdn.tailwindcss.com", "@tailwindcss/browser", "tailwindcss"],
     },
+    {
+        "id": "mathjax",
+        "filename": "tex-mml-chtml.js",
+        "relative_path": "mathjax/es5/tex-mml-chtml.js",
+        "package_urls": [
+            "https://registry.npmjs.org/mathjax/-/mathjax-3.2.2.tgz",
+        ],
+        "package_install_dir": "mathjax",
+        "package_required_paths": [
+            "package.json",
+            "es5/core.js",
+            "es5/loader.js",
+            "es5/startup.js",
+            "es5/tex-mml-chtml.js",
+        ],
+        "match_tokens": ["mathjax", "tex-mml-chtml.js", "/mathjax@"],
+    },
+    {
+        "id": "katex",
+        "filename": "katex.min.js",
+        "relative_path": "katex/dist/katex.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/katex/-/katex-0.16.11.tgz",
+        ],
+        "package_install_dir": "katex",
+        "package_required_paths": [
+            "package.json",
+            "dist/katex.min.js",
+            "dist/katex.min.css",
+            "dist/contrib/auto-render.min.js",
+        ],
+        "match_tokens": ["katex", "katex.min.js", "/katex@"],
+    },
+    {
+        "id": "katex_auto_render",
+        "filename": "auto-render.min.js",
+        "relative_path": "katex/dist/contrib/auto-render.min.js",
+        "match_tokens": ["auto-render.min.js", "katex/contrib/auto-render", "katex-auto-render"],
+    },
+    {
+        "id": "html2canvas",
+        "filename": "html2canvas.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+            "https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js",
+        ],
+        "match_tokens": ["html2canvas", "html2canvas.min.js"],
+    },
+    {
+        "id": "jspdf",
+        "filename": "jspdf.umd.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+            "https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js",
+        ],
+        "match_tokens": ["jspdf", "jspdf.umd.min.js"],
+    },
+    {
+        "id": "xlsx",
+        "filename": "xlsx.full.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+            "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+        ],
+        "match_tokens": ["xlsx", "xlsx.full.min.js", "sheetjs"],
+    },
+    {
+        "id": "jszip",
+        "filename": "jszip.min.js",
+        "relative_path": "node_modules/jszip/dist/jszip.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+        ],
+        "package_install_dir": "node_modules/jszip",
+        "package_required_paths": [
+            "package.json",
+            "dist/jszip.min.js",
+        ],
+        "package_postprocess": "jszip-main-to-dist",
+        "match_tokens": ["jszip", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "package_urls": [
+            "https://registry.npmjs.org/pptxgenjs/-/pptxgenjs-4.0.1.tgz",
+        ],
+        "package_install_dir": "pptxgenjs",
+        "package_required_paths": [
+            "package.json",
+            "dist/pptxgen.bundle.js",
+            "dist/pptxgen.cjs.js",
+            "dist/pptxgen.es.js",
+            "dist/pptxgen.min.js",
+        ],
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.cjs.js", "pptxgen.es.js", "pptxgen.min.js", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs_bundle",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.bundle"],
+    },
+    {
+        "id": "pptxgenjs_cjs",
+        "filename": "pptxgen.cjs.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.cjs.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.cjs.js", "pptxgen.cjs"],
+    },
+    {
+        "id": "pptxgenjs_es",
+        "filename": "pptxgen.es.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.es.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.es.js", "pptxgen.es"],
+    },
+    {
+        "id": "pptxgenjs_min",
+        "filename": "pptxgen.min.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.min.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.min.js", "pptxgen.min"],
+    },
 ]
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 OFFLINE_JS_LIB_README_FILE = "README.md"
+
+
+def _normalize_js_lib_asset_ref(value: str) -> str:
+    raw = str(value or "").replace("\\", "/").strip()
+    if not raw:
+        return ""
+    raw = raw.lstrip("/")
+    pure = PurePosixPath(raw)
+    parts: list[str] = []
+    for part in pure.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            return ""
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _resolve_js_lib_asset_path(js_root: Path, asset_ref: str) -> Path | None:
+    rel = _normalize_js_lib_asset_ref(asset_ref)
+    if not rel:
+        return None
+    exact = (js_root / rel).resolve()
+    try:
+        if exact.is_file() and exact.is_relative_to(js_root):
+            return exact
+    except Exception:
+        pass
+    basename = _safe_js_filename(Path(rel).name, "lib.js")
+    candidates: list[Path] = []
+    try:
+        for fp in js_root.rglob(basename):
+            try:
+                resolved = fp.resolve()
+            except Exception:
+                continue
+            if resolved.is_file():
+                try:
+                    if resolved.is_relative_to(js_root):
+                        candidates.append(resolved)
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (len(p.relative_to(js_root).parts), p.relative_to(js_root).as_posix()))
+    return candidates[0]
+
+
+def _discover_extra_js_lib_files(js_root: Path, known_relative_paths: set[str]) -> list[dict]:
+    rows: list[dict] = []
+    if not js_root.exists():
+        return rows
+    seen: set[str] = set()
+    for fp in sorted(js_root.rglob("*")):
+        if not fp.is_file() or fp.name in {".DS_Store", OFFLINE_JS_LIB_INDEX_FILE, OFFLINE_JS_LIB_README_FILE}:
+            continue
+        if fp.suffix.lower() not in {".js", ".mjs", ".cjs"}:
+            continue
+        rel = fp.relative_to(js_root).as_posix()
+        if rel in known_relative_paths or rel in seen:
+            continue
+        seen.add(rel)
+        stem = fp.stem.replace(".min", "").replace(".umd", "").replace(".bundle", "")
+        rows.append(
+            {
+                "id": f"local:{stem or fp.name}",
+                "filename": fp.name,
+                "relative_path": rel,
+                "available": True,
+                "size": int(fp.stat().st_size),
+                "sha256": _sha256_file(fp),
+                "source": "existing-local",
+                "error": "",
+                "match_tokens": [fp.name.lower(), stem.lower(), rel.lower()],
+                "urls": [],
+                "catalog": False,
+            }
+        )
+    return rows
 
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -1250,6 +1454,28 @@ def extract_ui_style_setting(raw: object) -> str | None:
         for key in keys:
             if key in section:
                 return normalize_ui_style(str(section.get(key) or ""))
+    return None
+
+
+def extract_js_lib_download_setting(raw: object) -> bool | None:
+    """Read download_js_lib flag from config dict.
+    Keys accepted: download_js_lib / js_lib_download / enable_js_lib_download
+    Sections searched: top-level, then 'startup' / 'offline' / 'web_ui'.
+    Returns True/False, or None if key absent (caller uses default=True).
+    """
+    if not isinstance(raw, dict):
+        return None
+    keys = ("download_js_lib", "js_lib_download", "enable_js_lib_download", "offline_js_download")
+    for key in keys:
+        if key in raw:
+            return _to_bool_like(raw.get(key), default=True)
+    for section_key in ("startup", "offline", "web_ui", "ui"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _to_bool_like(section.get(key), default=True)
     return None
 
 
@@ -1618,20 +1844,194 @@ def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
 def offline_js_lib_root(workdir: Path = WORKDIR) -> Path:
     return (workdir / "js_lib").resolve()
 
+def _offline_js_entry_relative_path(entry: dict[str, object], fallback_name: str) -> str:
+    rel = _normalize_js_lib_asset_ref(str(entry.get("relative_path", "") or ""))
+    if rel:
+        return rel
+    return _safe_js_filename(fallback_name, fallback_name)
+
+def _archive_member_relative_path(name: str) -> str:
+    raw = _normalize_js_lib_asset_ref(name)
+    if not raw:
+        return ""
+    parts = [part for part in PurePosixPath(raw).parts if part not in {"", "."}]
+    while parts and parts[0].lower() == "package":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return "/".join(parts)
+
+def _path_size_bytes(target: Path) -> int:
+    try:
+        if target.is_file():
+            return int(target.stat().st_size)
+        if not target.exists():
+            return 0
+        total = 0
+        for fp in target.rglob("*"):
+            try:
+                if fp.is_file():
+                    total += int(fp.stat().st_size)
+            except Exception:
+                continue
+        return total
+    except Exception:
+        return 0
+
+def _extract_archive_to_dir(raw: bytes, install_root: Path) -> list[str]:
+    install_root.mkdir(parents=True, exist_ok=True)
+    install_root_resolved = install_root.resolve()
+    written: list[str] = []
+
+    def _write_bytes(rel: str, data: bytes):
+        target = (install_root / rel).resolve()
+        if not target.is_relative_to(install_root_resolved):
+            raise ValueError(f"archive member escapes target dir: {rel}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        written.append(rel)
+
+    bio = io.BytesIO(raw)
+    try:
+        if zipfile.is_zipfile(bio):
+            bio.seek(0)
+            with zipfile.ZipFile(bio, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    rel = _archive_member_relative_path(info.filename)
+                    if not rel:
+                        continue
+                    _write_bytes(rel, zf.read(info))
+            return written
+    except Exception:
+        pass
+
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            rel = _archive_member_relative_path(member.name)
+            if not rel:
+                continue
+            extracted = tf.extractfile(member)
+            if extracted is None:
+                continue
+            _write_bytes(rel, extracted.read())
+    return written
+
+def _package_required_paths(entry: dict[str, object]) -> list[str]:
+    rows: list[str] = []
+    for item in entry.get("package_required_paths") or []:
+        rel = _normalize_js_lib_asset_ref(str(item or ""))
+        if rel:
+            rows.append(rel)
+    return rows
+
+def _package_install_ready(install_root: Path, required_paths: list[str]) -> bool:
+    if not install_root.exists():
+        return False
+    if required_paths:
+        return all((install_root / rel).is_file() for rel in required_paths)
+    try:
+        return any(fp.is_file() for fp in install_root.rglob("*"))
+    except Exception:
+        return False
+
+def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path):
+    action = str(entry.get("package_postprocess", "") or "").strip().lower()
+    if action != "jszip-main-to-dist":
+        return
+    pkg_json = (install_root / "package.json").resolve()
+    dist_fp = (install_root / "dist" / "jszip.min.js").resolve()
+    if not pkg_json.exists():
+        if not dist_fp.exists():
+            return
+        obj: dict[str, object] = {
+            "name": "jszip",
+            "version": "offline-local",
+            "main": "./dist/jszip.min.js",
+            "exports": {".": "./dist/jszip.min.js"},
+        }
+    else:
+        try:
+            raw = pkg_json.read_text(encoding="utf-8")
+            loaded = json.loads(raw)
+            if not isinstance(loaded, dict):
+                return
+            obj = loaded
+        except Exception:
+            return
+    changed = False
+    if obj.get("main") != "./dist/jszip.min.js":
+        obj["main"] = "./dist/jszip.min.js"
+        changed = True
+    exports = obj.get("exports")
+    desired_exports = {".": "./dist/jszip.min.js"}
+    if exports != desired_exports:
+        obj["exports"] = desired_exports
+        changed = True
+    if changed or (not pkg_json.exists()):
+        pkg_json.parent.mkdir(parents=True, exist_ok=True)
+        pkg_json.write_text(json_dumps(obj, indent=2), encoding="utf-8")
+
+def _ensure_offline_js_package(root: Path, entry: dict[str, object], force: bool = False) -> tuple[bool, str, str, str]:
+    package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
+    if not package_urls:
+        return True, "", "", ""
+    install_dir = _normalize_js_lib_asset_ref(str(entry.get("package_install_dir", "") or ""))
+    if not install_dir:
+        install_dir = _normalize_js_lib_asset_ref(str(entry.get("id", "") or "package"))
+    if not install_dir:
+        return False, "missing", "package install dir is empty", ""
+    install_root = (root / install_dir).resolve()
+    if not install_root.is_relative_to(root):
+        return False, "missing", f"package install dir escapes js_lib: {install_dir}", install_dir
+    required_paths = _package_required_paths(entry)
+    if not force and install_root.exists():
+        _postprocess_offline_js_package(entry, install_root)
+        if _package_install_ready(install_root, required_paths):
+            return True, "existing-package", "", install_dir
+        try:
+            if any(fp.is_file() for fp in install_root.rglob("*")):
+                return True, "existing-package", "", install_dir
+        except Exception:
+            pass
+    error = ""
+    source = "missing"
+    for url in package_urls:
+        try:
+            data, _ = _download_http_bytes(url, timeout=90.0)
+            if len(data) < 200:
+                error = f"archive too small from {url}"
+                continue
+            _extract_archive_to_dir(data, install_root)
+            _postprocess_offline_js_package(entry, install_root)
+            if _package_install_ready(install_root, required_paths):
+                return True, url, "", install_dir
+            error = f"package install incomplete from {url}"
+            source = url
+        except Exception as exc:
+            error = trim(str(exc), 220)
+            source = url
+    return False, source, error, install_dir
+
 def _render_offline_js_catalog_md() -> str:
     rows = [
         "# Offline JS Library Catalog",
         "",
         "Pre-fetched common JS libraries for offline HTML deliverables.",
+        "Additional local `.js/.mjs/.cjs` files placed anywhere under `js_lib/` are auto-indexed in `index.json` and can be served by relative path.",
         "",
-        "| id | filename | source urls |",
-        "|---|---|---|",
+        "| id | relative path | file urls | package urls |",
+        "|---|---|---|---|",
     ]
     for row in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(row.get("id", "") or "").strip()
-        filename = str(row.get("filename", "") or "").strip()
+        filename = _offline_js_entry_relative_path(row, str(row.get("filename", "") or lib_id or "lib.js"))
         urls = [str(x).strip() for x in (row.get("urls") or []) if str(x).strip()]
-        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} |")
+        package_urls = [str(x).strip() for x in (row.get("package_urls") or []) if str(x).strip()]
+        rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} | {'<br>'.join(package_urls)} |")
     return "\n".join(rows) + "\n"
 
 def load_offline_js_lib_index(js_root: Path) -> dict:
@@ -1645,26 +2045,78 @@ def load_offline_js_lib_index(js_root: Path) -> dict:
     except Exception:
         return {}
 
-def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict:
+def ensure_offline_js_libs(
+    workdir: Path = WORKDIR,
+    force: bool = False,
+    verbose: bool = False,
+    no_connection_deadline: float = 60.0,
+) -> dict:
     root = offline_js_lib_root(workdir)
     root.mkdir(parents=True, exist_ok=True)
     fetched = 0
     available = 0
     missing = 0
+    _dl_start = time.time()
+    _deadline_hit = False
+    total_catalog = len(OFFLINE_JS_LIB_CATALOG)
+    if verbose:
+        print(f"[js_lib] Starting JS library download ({total_catalog} files)...", flush=True)
     rows: list[dict] = []
+    known_relative_paths: set[str] = set()
     for entry in OFFLINE_JS_LIB_CATALOG:
         lib_id = str(entry.get("id", "") or "").strip() or "lib"
         filename = _safe_js_filename(str(entry.get("filename", "") or f"{lib_id}.js"), f"{lib_id}.js")
+        relative_path = _offline_js_entry_relative_path(entry, filename)
         urls = [str(x).strip() for x in (entry.get("urls") or []) if str(x).strip()]
+        package_urls = [str(x).strip() for x in (entry.get("package_urls") or []) if str(x).strip()]
         match_tokens = [str(x).strip().lower() for x in (entry.get("match_tokens") or []) if str(x).strip()]
-        target = root / filename
+        target = (root / relative_path).resolve()
+        if not target.is_relative_to(root):
+            rows.append(
+                {
+                    "id": lib_id,
+                    "filename": filename,
+                    "available": False,
+                    "size": 0,
+                    "sha256": "",
+                    "source": "missing",
+                    "error": f"relative path escapes js_lib: {relative_path}",
+                    "match_tokens": match_tokens,
+                    "urls": urls,
+                    "package_urls": package_urls,
+                    "relative_path": relative_path,
+                    "package_install_dir": "",
+                    "package_required_paths": [],
+                    "package_available": not package_urls,
+                    "package_size": 0,
+                    "catalog": True,
+                }
+            )
+            missing += 1
+            continue
+        known_relative_paths.add(relative_path)
         source = "existing"
         error = ""
-        ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
-        if not ok:
+        effective_target = target
+        file_ok = bool(target.exists() and target.is_file() and target.stat().st_size > 40 and (not force))
+        if (not file_ok) and (not force):
+            resolved_existing = _resolve_js_lib_asset_path(root, relative_path)
+            if resolved_existing and resolved_existing.exists() and resolved_existing.is_file() and resolved_existing.stat().st_size > 40:
+                effective_target = resolved_existing
+                file_ok = True
+                source = "existing-local"
+        if not file_ok and urls:
+            if fetched == 0 and (time.time() - _dl_start) > no_connection_deadline:
+                _deadline_hit = True
+                if verbose:
+                    print(f"[js_lib] No connection after {no_connection_deadline:.0f}s — skipping remaining downloads.", flush=True)
+                break
+            if verbose:
+                print(f"[js_lib] Downloading {filename}...", flush=True)
             for url in urls:
                 try:
-                    data, _ = _download_http_bytes(url, timeout=35.0)
+                    _timeout = 12.0 if fetched == 0 else 35.0
+                    data, _ = _download_http_bytes(url, timeout=_timeout)
                     if len(data) < 40:
                         error = f"download too small from {url}"
                         continue
@@ -1672,39 +2124,67 @@ def ensure_offline_js_libs(workdir: Path = WORKDIR, force: bool = False) -> dict
                     if "<html" in probe and "<script" not in probe and "tailwind" not in probe:
                         error = f"unexpected html payload from {url}"
                         continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
-                    ok = True
+                    effective_target = target
+                    file_ok = True
                     source = url
                     fetched += 1
                     break
                 except Exception as exc:
                     error = trim(str(exc), 220)
-            if not ok:
+            if not file_ok:
                 source = "missing"
+        package_ok, package_source, package_error, package_install_dir = _ensure_offline_js_package(root, entry, force=force)
+        if package_urls and package_source and package_source not in {"existing-package", "missing"}:
+            fetched += 1
+        if package_error:
+            error = package_error if not error else f"{error}; {package_error}"
+        ok = bool((file_ok or (not urls)) and package_ok and effective_target.exists() and effective_target.is_file() and effective_target.stat().st_size > 40)
         if ok:
             available += 1
         else:
             missing += 1
+            if package_urls and package_source == "missing" and not source.strip():
+                source = "missing"
+        package_root = (root / package_install_dir).resolve() if package_install_dir else None
         rows.append(
             {
                 "id": lib_id,
                 "filename": filename,
                 "available": ok,
-                "size": int(target.stat().st_size) if target.exists() else 0,
-                "sha256": _sha256_file(target) if target.exists() else "",
-                "source": source,
+                "size": int(effective_target.stat().st_size) if effective_target.exists() else 0,
+                "sha256": _sha256_file(effective_target) if effective_target.exists() else "",
+                "source": source if source != "existing" or file_ok else package_source or source,
                 "error": error,
                 "match_tokens": match_tokens,
                 "urls": urls,
+                "package_urls": package_urls,
+                "relative_path": relative_path,
+                "resolved_path": effective_target.relative_to(root).as_posix() if effective_target.exists() else "",
+                "package_install_dir": package_install_dir,
+                "package_required_paths": _package_required_paths(entry),
+                "package_available": package_ok,
+                "package_size": _path_size_bytes(package_root) if package_root else 0,
+                "package_source": package_source,
+                "catalog": True,
             }
         )
+    extra_rows = _discover_extra_js_lib_files(root, known_relative_paths)
+    rows.extend(extra_rows)
+    if verbose:
+        _status = "skipped (no connection)" if _deadline_hit else f"{fetched} downloaded"
+        print(f"[js_lib] Done: {available}/{len(rows)} available, {_status}.", flush=True)
     payload = {
         "generated_at": int(now_ts()),
         "js_lib_root": str(root),
-        "total": len(OFFLINE_JS_LIB_CATALOG),
+        "total": len(rows),
         "available": available,
         "missing": missing,
         "fetched": fetched,
+        "catalog_total": len(OFFLINE_JS_LIB_CATALOG),
+        "catalog_missing": missing,
+        "extra_local": len(extra_rows),
         "libs": rows,
     }
     (root / OFFLINE_JS_LIB_INDEX_FILE).write_text(json_dumps(payload, indent=2), encoding="utf-8")
@@ -9043,7 +9523,12 @@ TOOLS = [
     ),
     tool_def(
         "query_knowledge_library",
-        "Read current global knowledge-library status or query the TF-Graph_IDF RAG library for grounded document references.",
+        (
+            "Query the RAG knowledge library for grounded document references and background knowledge. "
+            "Call this BEFORE answering questions that require domain expertise, factual grounding, "
+            "or synthesis from imported documents. "
+            "Pass an empty query to check library status only."
+        ),
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
@@ -10780,6 +11265,32 @@ class SessionState:
         self.runtime_code_reference_meta = {}
         return removed_hints
 
+    def _reset_blackboard_plan_state_locked(self) -> None:
+        """Clear plan/todo/skills state from a completed run so the next run starts fresh.
+
+        Called from submit_user_message when a new user request arrives after a
+        previous run finished (running=False, not awaiting plan choice).
+        Prevents the manager from seeing status=COMPLETED + all todos done and
+        immediately routing to 'finish' again on the very first round.
+        """
+        bb = self._ensure_blackboard()
+        bb["project_todos"] = []
+        bb["plan_steps"] = []
+        bb["plan_step_cursor"] = 0
+        bb["plan_step_total"] = 0
+        bb["status"] = ""
+        bb["approval"] = ""
+        bb["plan_findings"] = ""
+        bb["plan_proposal"] = ""
+        bb["plan_risks"] = ""
+        bb["loaded_skills"] = {}
+        bb["loaded_skills_goal_sig"] = ""
+        self.blackboard = bb
+        try:
+            self.todo.items = []
+        except Exception:
+            pass
+
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
         payload = dict(data or {})
         if self._sanitize_agent_bubble_role(payload.get("agent_role", "")):
@@ -11133,7 +11644,10 @@ class SessionState:
         skill_desc = str(skill_row.get("description", "-")).strip()
         inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
-            f"A skill has been loaded. Follow its instructions precisely.\n"
+            f"A skill has been loaded. IMPORTANT: This skill's workflow, tools, and commands "
+            f"OVERRIDE the plan's implementation approach for any step where it applies. "
+            f"Read the full instructions below and follow them exactly — do NOT substitute a "
+            f"different tool, library, or language unless the skill explicitly allows it.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
@@ -11594,14 +12108,28 @@ class SessionState:
             )
             return (
                 f"ACTIVE SKILLS: {names}. "
-                "Follow loaded skill instructions precisely. "
-                f"If you encounter a step requiring a workflow you don't know, call load_skill ({skill_count} available). "
+                "Follow the loaded skill instructions for the current step. "
+                f"When moving to a different step that needs a DIFFERENT skill, call load_skill to switch "
+                f"(or unload the current one first if it's no longer needed). "
+                f"{skill_count} skills available total. "
             )
         return (
             f"SKILL SYSTEM: {skill_count} skills available. "
-            "Use list_skills to discover, load_skill to activate. "
-            "If unsure how to produce professional output (docs, slides, analysis), check skills first. "
+            "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
+            "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
+            "call list_skills to discover options, then load_skill to activate the right one. "
+            "Load a skill AT THE MOMENT you begin the step that requires it. "
+            "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
+            "For simple tasks, direct questions, and multimodal analysis, do NOT load skills. "
         )
+
+    def _skills_awareness_block(self, for_role: str = "developer") -> str:
+        """Canonical skills-awareness block shared by single, sync, and plan-mode.
+        Returns: loaded-skills hint  +  newline  +  'Skills:\\n<catalog>'
+        Keeps all three modes in sync — change here propagates everywhere.
+        """
+        hint = self._loaded_skills_prompt_hint(for_role=for_role)
+        return f"{hint}\nSkills:\n{self.skills.descriptions()}\n"
 
     def _refresh_runtime_code_reference(self, text: str):
         cb = getattr(self, "reference_prepare_callback", None)
@@ -11663,10 +12191,40 @@ class SessionState:
             header += " [" + ", ".join(tags) + "]"
         return (
             f"{header}:\n"
-            "This is the global TF-Graph_IDF RAG knowledge library for imported documents and research material. "
-            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`. "
-            "Do not infer knowledge-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_knowledge_library` to check readiness or retrieve grounded references from the global library."
+            "Global TF-Graph_IDF RAG library for imported documents, PDFs, and research material. "
+            "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
+            "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
+            "to retrieve grounded references BEFORE generating your answer. "
+            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Do not infer readiness from session/files or uploads — query the library directly."
+        )
+
+    def _multimodal_capability_block(self) -> str:
+        """Return a brief system-prompt note about native multimodal capabilities.
+
+        Injected into system prompt so the model knows it can directly analyze
+        images/audio/video rather than falling back to text-only workarounds.
+        Returns empty string when the active model has no multimodal input caps.
+        """
+        try:
+            caps = self._capabilities_from_profile()
+        except Exception:
+            return ""
+        types = []
+        if caps.get("input_image"):
+            types.append("images")
+        if caps.get("input_audio"):
+            types.append("audio")
+        if caps.get("input_video"):
+            types.append("video")
+        if not types:
+            return ""
+        joined = "/".join(types)
+        return (
+            f"MULTIMODAL: This model supports native {joined} analysis. "
+            f"When {joined} are attached or loaded via read_file, analyze them DIRECTLY "
+            "using your built-in perception capabilities — do not describe them as "
+            "inaccessible or attempt text-only workarounds. "
         )
 
     def _code_library_prompt_block(self) -> str:
@@ -11747,8 +12305,10 @@ class SessionState:
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
             plan_steps_block = f"{plan_ctx}\n"
+        mm_block = self._multimodal_capability_block()
+        mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
-            f"You are a coding agent. Workspace: {self.files_root}. "
+            f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -11756,6 +12316,7 @@ class SessionState:
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task when done. "
             f"{skill_hint}"
+            f"{mm_hint}"
             f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
@@ -13962,8 +14523,20 @@ class SessionState:
         }
 
     def _safe_upload_name(self, filename: str) -> str:
+        # Use Path().name to strip any directory component first.
         raw = Path(str(filename or "upload.bin")).name
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+        # Only remove characters that are genuinely illegal or dangerous on
+        # filesystems (path separators, null byte, control chars, Windows
+        # reserved chars). Unicode letters/CJK/etc. are left untouched so
+        # filenames like "我的数据.xlsx" remain readable.
+        safe = re.sub(r'[/\\\x00-\x1f\x7f:*?"<>|]', "_", raw)
+        safe = safe.strip(". ")  # avoid hidden files (leading dot) and trailing issues
+        # Enforce a byte-length ceiling safe across all filesystems (255 bytes max).
+        # Trim the stem if needed while preserving the extension.
+        if len(safe.encode("utf-8", errors="replace")) > 240:
+            ext = Path(safe).suffix  # e.g. ".xlsx"
+            stem = safe[: max(1, 200 - len(ext))]
+            safe = stem + ext
         return safe or f"upload_{int(now_ts())}.bin"
 
     def _decode_text_bytes(self, data: bytes) -> str:
@@ -16430,10 +17003,31 @@ class SessionState:
     def _run_bash(self, command: str) -> str:
         return self._run_shell_meta(command, self.files_root, 120)["output"]
 
+    def _fuzzy_resolve_path(self, fp: Path) -> Path:
+        """If fp doesn't exist, try stripping spaces from the filename to find a close match.
+        Handles the common model error of hallucinating spaces in Chinese/mixed filenames.
+        Returns the resolved Path if found, otherwise the original fp unchanged."""
+        if fp.exists():
+            return fp
+        stripped = fp.name.replace(" ", "")
+        if stripped != fp.name:
+            candidate = fp.parent / stripped
+            if candidate.exists():
+                return candidate
+        try:
+            query = fp.name.replace(" ", "").lower()
+            for sibling in fp.parent.iterdir():
+                if sibling.name.replace(" ", "").lower() == query:
+                    return sibling
+        except Exception:
+            pass
+        return fp
+
     def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -16680,7 +17274,8 @@ class SessionState:
     def _run_write(self, path: str, content: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Wrote {len(content)} bytes to {rel}"
@@ -16690,7 +17285,8 @@ class SessionState:
     def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
                 diag = self._edit_mismatch_diagnostic(content, old_text)
@@ -19524,7 +20120,7 @@ class SessionState:
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
         if next_step:
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-advanced")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
         return True
@@ -20606,7 +21202,7 @@ class SessionState:
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
             f"{dims_ctx}"
             f"{skills_ctx}"
-            f"Workspace root: {self.files_root}\n"
+            f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
@@ -23391,19 +23987,28 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
-        skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
-            f"Workspace: {self.files_root}. Use relative paths. "
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            f"{skills_note}{code_note + ' ' if code_note else ''}"
+            f"{code_note + ' ' if code_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
+        mm_note = self._multimodal_capability_block()
+        if mm_note:
+            base = base + mm_note
+        base = base + skills_block
         if role_key == "explorer":
-            return base + "Role: analyze goals, inspect codebase, produce research notes. Prefer read/search. "
+            return base + (
+                "Role: analyze goals, inspect codebase, produce research notes. "
+                "For factual or background questions on any topic, FIRST call "
+                "query_knowledge_library(query='<topic>', top_k=8, route='hybrid') to retrieve relevant documents. "
+                "Prefer read/search tools. "
+            )
         if role_key == "reviewer":
             if bool(self.reviewer_debug_mode):
                 debug_ctx = trim(str(self.reviewer_debug_context or ""), 500)
@@ -23436,6 +24041,11 @@ class SessionState:
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
+            "SKILL PRIORITY (critical): When ACTIVE SKILLS are listed above, find the "
+            "<loaded-skill> messages in your context and READ them before starting any step. "
+            "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
+            "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
+            "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
             "TODO TRACKING (mandatory): "
             "After completing each logical step, call TodoWrite to update progress — "
             "mark completed items as 'completed' and set the next item to 'in_progress'. "
@@ -24389,7 +24999,8 @@ class SessionState:
                     isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
                     for it in new_items
                 ):
-                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: removed
+                    pass  # Skills are loaded on-demand by the model
             except Exception:
                 pass
             return result
@@ -24397,7 +25008,7 @@ class SessionState:
             result = self._todo_write_rescue(args)
             # Also recheck skills on rescue write (likely a recovery situation)
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="todo-rescue")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
             return result
@@ -25006,6 +25617,10 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
+                # Reset completed plan/todo/skills blackboard state so the manager
+                # does not see status=COMPLETED on the very first round and immediately finish.
+                if not _awaiting_plan_choice:
+                    self._reset_blackboard_plan_state_locked()
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
@@ -25890,7 +26505,7 @@ class SessionState:
 
         # Auto-discover and load relevant skills before research
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-mode-start")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
 
@@ -25973,33 +26588,38 @@ class SessionState:
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"2. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
-            f"3. If skills are loaded, analyze their <loaded-skill> content to identify concrete workflow steps, "
-            f"scripts, tools, and file paths each skill requires\n"
-            f"4. Identify key technical details, data points, and structure needed for the output\n"
-            f"5. Assess risks and note any ambiguities that need user input\n"
-            f"6. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"7. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
+            f"to this task and note their names and capabilities in your findings.\n"
+            f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
+            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
+            f"workflow steps, scripts, tools, and file paths\n"
+            f"5. Identify key technical details, data points, and structure needed for the output\n"
+            f"6. Assess risks and note any ambiguities that need user input\n"
+            f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"   - Relevant skills found (names, what they do, how to invoke them)\n"
             f"   - File inventory (uploaded files, their types, sizes, key content)\n"
-            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each loaded skill)\n"
+            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
             f"   - Content analysis (key themes, structure, data points extracted from inputs)\n\n"
-            f"Workspace: {self.files_root}\n"
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT)\n"
             f"{os_note}\n"
             f"{lang_note}"
         )
 
     def _seed_plan_mode_explorer_context(self, research_prompt: str):
         os_note = _detect_os_shell_instruction()
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        skills_block = self._skills_awareness_block(for_role="explorer")
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
                 "You are Explorer in plan-mode (read-only research). "
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
-                "and blackboard tools only. "
-                f"{skills_hint}"
+                "list_skills, load_skill, and blackboard tools only. "
+                f"{skills_block}"
+                "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
+                "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -26030,16 +26650,16 @@ class SessionState:
             self.current_phase = f"plan-mode:explorer:round-{round_idx}"
             self.current_tool_name = ""
             self.active_agent_role = "explorer"
-        # Build loaded-skills hint for system prompt
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        # Build skills awareness block (same as sync/single mode)
+        skills_block = self._skills_awareness_block(for_role="explorer")
         response = self._chat_with_same_model_retry(
             ctx,
             tools=filtered_tools,
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
-                f"Workspace: {self.files_root}. "
-                f"{skills_hint}"
+                f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+                f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -26448,7 +27068,8 @@ class SessionState:
         synthesis_ctx = [
             {"role": "system", "content": (
                 "You are a technical architect synthesizing research into actionable plans. "
-                "When loaded skills are available, incorporate their capabilities and best practices into plan options."
+                "When skills are referenced in the findings, incorporate their actual workflow steps into plan options. "
+                f"{self._skills_awareness_block(for_role='developer')}"
             ), "ts": now_ts()},
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
@@ -26691,7 +27312,7 @@ class SessionState:
                 except Exception:
                     pass
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
         # Pre-load skills explicitly mentioned in plan steps
@@ -26755,13 +27376,13 @@ class SessionState:
                     )
                 },
             )
-            # ── Auto-discover and load relevant skills BEFORE classification ──
+            # ── Skills are loaded on-demand by the model via load_skill ──
             try:
                 self._emit(
                     "status",
-                    {"summary": "initial skill discovery started"},
+                    {"summary": "skills available on-demand"},
                 )
-                self._refresh_loaded_skills_for_execution_focus(trigger="pre-classify")
+                pass  # No automatic pre-classify skill discovery
             except Exception:
                 pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()
@@ -30581,16 +31202,32 @@ function _mathRunTypeset(root,key=''){
   if(!root)return;
   const k=String(key||'').trim();
   if(k&&root.getAttribute('data-math-key')===k)return;
+  const mathJaxCandidates=[
+    '/assets/js_lib/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/tex-mml-chtml.js',
+    '/assets/js_lib/es5/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/es5/tex-mml-chtml.js',
+    'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'
+  ];
+  const loadMathJax=(idx=0)=>{
+    const src=String(mathJaxCandidates[idx]||'').trim();
+    if(!src)return;
+    const s=document.createElement('script');
+    s.src=src;
+    s.async=true;
+    s.dataset.mathjaxCandidate=String(idx);
+    s.onerror=()=>{
+      if(idx+1<mathJaxCandidates.length)loadMathJax(idx+1);
+    };
+    document.head.appendChild(s);
+  };
   const run=(retry)=>{
     const mj=window.MathJax;
     if(!mj||typeof mj.typesetPromise!=='function'){
       // Lazy-load MathJax on first actual math demand
       if(!window._mjaxLoading){
         window._mjaxLoading=true;
-        const s=document.createElement('script');
-        s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
-        s.async=true;
-        document.head.appendChild(s);
+        loadMathJax(0);
       }
       if(retry<20)setTimeout(()=>run(retry+1),200);
       return;
@@ -34349,7 +34986,7 @@ class RAGContentParser:
 
             text = extract_text(str(pdf_path))
             if text and text.strip():
-                return trim(text.strip(), 150_000)
+                return trim(text.strip(), 800_000)
         except ImportError:
             pass
         except Exception:
@@ -34364,7 +35001,7 @@ class RAGContentParser:
                     timeout=60,
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return trim(r.stdout.strip(), 150_000)
+                    return trim(r.stdout.strip(), 800_000)
             except Exception:
                 pass
         try:
@@ -36525,7 +37162,7 @@ class RAGLibraryStore:
             backup_path.write_bytes(raw_bytes)
         elif source_fp and source_fp.exists():
             shutil.copy2(source_fp, backup_path)
-        semantic_text = trim(str(parse_result.get("text", "") or ""), 160_000)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 800_000)
         multimodal_row = dict(multimodal or {})
         mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
         mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
@@ -39955,17 +40592,9 @@ class AppContext:
         self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
-            self.offline_js_summary = ensure_offline_js_libs(self.workspace, force=False)
-        except Exception as exc:
-            self.offline_js_summary = {
-                "generated_at": int(now_ts()),
-                "js_lib_root": str(self.js_lib_root),
-                "total": len(OFFLINE_JS_LIB_CATALOG),
-                "available": 0,
-                "missing": len(OFFLINE_JS_LIB_CATALOG),
-                "fetched": 0,
-                "error": trim(str(exc), 220),
-            }
+            self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
+        except Exception:
+            self.offline_js_summary = {}
         self.default_language = normalize_ui_language(default_language)
         self.ui_style = normalize_ui_style(ui_style)
         self.context_token_limit = max(
@@ -40264,16 +40893,7 @@ class AppContext:
         return CODE_ADMIN_JS
 
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
-        safe = _safe_js_filename(str(filename or "").strip(), "lib.js")
-        fp = (self.js_lib_root / safe).resolve()
-        try:
-            if not fp.is_relative_to(self.js_lib_root):
-                return None
-        except Exception:
-            return None
-        if not fp.exists() or (not fp.is_file()):
-            return None
-        return fp
+        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
 
     def rag_three_asset_info(self) -> dict:
         picks = [
@@ -41071,7 +41691,7 @@ class AppContext:
                 f"{str(row.get('title', '') or '').strip()} "
                 f"score={str(row.get('score', 0) or 0)}"
             )
-            snippet = trim(str(row.get("text", "") or ""), 320)
+            snippet = trim(str(row.get("text", "") or ""), 800)
             if snippet:
                 lines.append(snippet)
         return "\n".join(lines)
@@ -43150,8 +43770,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/rag-admin.js":
             return self._send_text(self.app.web_ui_rag_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -43159,7 +43779,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
@@ -43307,8 +43927,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         if path == "/assets/code-admin.js":
             return self._send_text(self.app.web_ui_code_admin_js(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
-            filename = path.rsplit("/", 1)[-1]
-            fp = self.app.rag_js_lib_asset_path(filename)
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             try:
@@ -43316,7 +43936,7 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() == ".js":
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
@@ -43938,6 +44558,17 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    # JS lib download (default on; set download_js_lib: false in --config to disable)
+    _js_dl_enabled = extract_js_lib_download_setting(external_config)
+    if _js_dl_enabled is None:
+        _js_dl_enabled = True
+    if _js_dl_enabled:
+        try:
+            app.offline_js_summary = ensure_offline_js_libs(
+                app.workspace, force=False, verbose=True, no_connection_deadline=60.0
+            )
+        except Exception as _js_exc:
+            print(f"[js_lib] download error: {_js_exc}")
     web_ui_state = app.configure_web_ui(
         config_path=str(web_ui_config_path),
         ui_dir=resolved_web_ui_dir,

@@ -415,7 +415,7 @@ class RAGLibraryStore:
             backup_path.write_bytes(raw_bytes)
         elif source_fp and source_fp.exists():
             shutil.copy2(source_fp, backup_path)
-        semantic_text = trim(str(parse_result.get("text", "") or ""), 160_000)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), 800_000)
         multimodal_row = dict(multimodal or {})
         mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
         mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]

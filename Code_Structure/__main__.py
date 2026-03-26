@@ -7,6 +7,7 @@ import sys
 import threading
 
 # ── cross-module imports ─────────────────────────────────────────────────
+from ._unclassified import extract_js_lib_download_setting
 from .app.context import AppContext
 from .config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_PORT_OFFSET, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_PORT_OFFSET, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, TOKEN_THRESHOLD, UI_LANGUAGE_LABELS, UI_STYLE_LABELS
 from .config.paths import LLM_CONFIG_PATH, REPO_ROOT, WORKDIR
@@ -14,6 +15,7 @@ from .config.settings import _to_bool_like, extract_show_upload_list_setting, ex
 from .llm.utils import list_ollama_models
 from .server.handlers import AgentHTTPServer, CodeAdminHandler, Handler, RagAdminHandler, SkillsHandler
 from .skills.store import ensure_embedded_skills_at_root, ensure_runtime_skills
+from .utils.files import ensure_offline_js_libs
 from .utils.misc import BENIGN_SOCKET_DEBUG_LOG_ENABLED, detect_local_lan_ip, normalize_timeout_seconds, swallow_benign_socket_error
 from .utils.text import trim
 
@@ -580,6 +582,17 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    # JS lib download (default on; set download_js_lib: false in --config to disable)
+    _js_dl_enabled = extract_js_lib_download_setting(external_config)
+    if _js_dl_enabled is None:
+        _js_dl_enabled = True
+    if _js_dl_enabled:
+        try:
+            app.offline_js_summary = ensure_offline_js_libs(
+                app.workspace, force=False, verbose=True, no_connection_deadline=60.0
+            )
+        except Exception as _js_exc:
+            print(f"[js_lib] download error: {_js_exc}")
     web_ui_state = app.configure_web_ui(
         config_path=str(web_ui_config_path),
         ui_dir=resolved_web_ui_dir,

@@ -41,7 +41,7 @@ RAG_CHUNK_CHARS = 1200
 
 RAG_CHUNK_OVERLAP = 180
 
-RAG_MAX_CHUNKS_PER_DOC = 200
+RAG_MAX_CHUNKS_PER_DOC = 500
 
 CODE_CHUNK_CHARS = 1800
 
@@ -127,7 +127,7 @@ REPEATED_TOOL_LOOP_THRESHOLD = 2
 
 BASH_READ_LOOP_THRESHOLD = 3
 
-HARD_BREAK_TOOL_ERROR_THRESHOLD = 3
+HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 
@@ -1087,6 +1087,128 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
             "https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4",
         ],
         "match_tokens": ["cdn.tailwindcss.com", "@tailwindcss/browser", "tailwindcss"],
+    },
+    {
+        "id": "mathjax",
+        "filename": "tex-mml-chtml.js",
+        "relative_path": "mathjax/es5/tex-mml-chtml.js",
+        "package_urls": [
+            "https://registry.npmjs.org/mathjax/-/mathjax-3.2.2.tgz",
+        ],
+        "package_install_dir": "mathjax",
+        "package_required_paths": [
+            "package.json",
+            "es5/core.js",
+            "es5/loader.js",
+            "es5/startup.js",
+            "es5/tex-mml-chtml.js",
+        ],
+        "match_tokens": ["mathjax", "tex-mml-chtml.js", "/mathjax@"],
+    },
+    {
+        "id": "katex",
+        "filename": "katex.min.js",
+        "relative_path": "katex/dist/katex.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/katex/-/katex-0.16.11.tgz",
+        ],
+        "package_install_dir": "katex",
+        "package_required_paths": [
+            "package.json",
+            "dist/katex.min.js",
+            "dist/katex.min.css",
+            "dist/contrib/auto-render.min.js",
+        ],
+        "match_tokens": ["katex", "katex.min.js", "/katex@"],
+    },
+    {
+        "id": "katex_auto_render",
+        "filename": "auto-render.min.js",
+        "relative_path": "katex/dist/contrib/auto-render.min.js",
+        "match_tokens": ["auto-render.min.js", "katex/contrib/auto-render", "katex-auto-render"],
+    },
+    {
+        "id": "html2canvas",
+        "filename": "html2canvas.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js",
+            "https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js",
+        ],
+        "match_tokens": ["html2canvas", "html2canvas.min.js"],
+    },
+    {
+        "id": "jspdf",
+        "filename": "jspdf.umd.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+            "https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js",
+        ],
+        "match_tokens": ["jspdf", "jspdf.umd.min.js"],
+    },
+    {
+        "id": "xlsx",
+        "filename": "xlsx.full.min.js",
+        "urls": [
+            "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+            "https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js",
+        ],
+        "match_tokens": ["xlsx", "xlsx.full.min.js", "sheetjs"],
+    },
+    {
+        "id": "jszip",
+        "filename": "jszip.min.js",
+        "relative_path": "node_modules/jszip/dist/jszip.min.js",
+        "package_urls": [
+            "https://registry.npmjs.org/jszip/-/jszip-3.10.1.tgz",
+        ],
+        "package_install_dir": "node_modules/jszip",
+        "package_required_paths": [
+            "package.json",
+            "dist/jszip.min.js",
+        ],
+        "package_postprocess": "jszip-main-to-dist",
+        "match_tokens": ["jszip", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "package_urls": [
+            "https://registry.npmjs.org/pptxgenjs/-/pptxgenjs-4.0.1.tgz",
+        ],
+        "package_install_dir": "pptxgenjs",
+        "package_required_paths": [
+            "package.json",
+            "dist/pptxgen.bundle.js",
+            "dist/pptxgen.cjs.js",
+            "dist/pptxgen.es.js",
+            "dist/pptxgen.min.js",
+        ],
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.cjs.js", "pptxgen.es.js", "pptxgen.min.js", "jszip.min.js"],
+    },
+    {
+        "id": "pptxgenjs_bundle",
+        "filename": "pptxgen.bundle.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.bundle.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.bundle.js", "pptxgen.bundle"],
+    },
+    {
+        "id": "pptxgenjs_cjs",
+        "filename": "pptxgen.cjs.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.cjs.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.cjs.js", "pptxgen.cjs"],
+    },
+    {
+        "id": "pptxgenjs_es",
+        "filename": "pptxgen.es.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.es.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.es.js", "pptxgen.es"],
+    },
+    {
+        "id": "pptxgenjs_min",
+        "filename": "pptxgen.min.js",
+        "relative_path": "pptxgenjs/dist/pptxgen.min.js",
+        "match_tokens": ["pptxgenjs", "pptxgen.min.js", "pptxgen.min"],
     },
 ]
 
@@ -3245,16 +3367,32 @@ function _mathRunTypeset(root,key=''){
   if(!root)return;
   const k=String(key||'').trim();
   if(k&&root.getAttribute('data-math-key')===k)return;
+  const mathJaxCandidates=[
+    '/assets/js_lib/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/tex-mml-chtml.js',
+    '/assets/js_lib/es5/tex-mml-chtml.js',
+    '/assets/js_lib/mathjax/es5/tex-mml-chtml.js',
+    'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js'
+  ];
+  const loadMathJax=(idx=0)=>{
+    const src=String(mathJaxCandidates[idx]||'').trim();
+    if(!src)return;
+    const s=document.createElement('script');
+    s.src=src;
+    s.async=true;
+    s.dataset.mathjaxCandidate=String(idx);
+    s.onerror=()=>{
+      if(idx+1<mathJaxCandidates.length)loadMathJax(idx+1);
+    };
+    document.head.appendChild(s);
+  };
   const run=(retry)=>{
     const mj=window.MathJax;
     if(!mj||typeof mj.typesetPromise!=='function'){
       // Lazy-load MathJax on first actual math demand
       if(!window._mjaxLoading){
         window._mjaxLoading=true;
-        const s=document.createElement('script');
-        s.src='https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js';
-        s.async=true;
-        document.head.appendChild(s);
+        loadMathJax(0);
       }
       if(retry<20)setTimeout(()=>run(retry+1),200);
       return;

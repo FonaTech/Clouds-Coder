@@ -1599,6 +1599,32 @@ class SessionState:
         self.runtime_code_reference_meta = {}
         return removed_hints
 
+    def _reset_blackboard_plan_state_locked(self) -> None:
+        """Clear plan/todo/skills state from a completed run so the next run starts fresh.
+
+        Called from submit_user_message when a new user request arrives after a
+        previous run finished (running=False, not awaiting plan choice).
+        Prevents the manager from seeing status=COMPLETED + all todos done and
+        immediately routing to 'finish' again on the very first round.
+        """
+        bb = self._ensure_blackboard()
+        bb["project_todos"] = []
+        bb["plan_steps"] = []
+        bb["plan_step_cursor"] = 0
+        bb["plan_step_total"] = 0
+        bb["status"] = ""
+        bb["approval"] = ""
+        bb["plan_findings"] = ""
+        bb["plan_proposal"] = ""
+        bb["plan_risks"] = ""
+        bb["loaded_skills"] = {}
+        bb["loaded_skills_goal_sig"] = ""
+        self.blackboard = bb
+        try:
+            self.todo.items = []
+        except Exception:
+            pass
+
     def _event_payload_with_agent_role(self, kind: str, data: dict | None) -> dict:
         payload = dict(data or {})
         if self._sanitize_agent_bubble_role(payload.get("agent_role", "")):
@@ -1952,7 +1978,10 @@ class SessionState:
         skill_desc = str(skill_row.get("description", "-")).strip()
         inject_msg = (
             f"<loaded-skill name=\"{skill_key}\">\n"
-            f"A skill has been loaded. Follow its instructions precisely.\n"
+            f"A skill has been loaded. IMPORTANT: This skill's workflow, tools, and commands "
+            f"OVERRIDE the plan's implementation approach for any step where it applies. "
+            f"Read the full instructions below and follow them exactly — do NOT substitute a "
+            f"different tool, library, or language unless the skill explicitly allows it.\n"
             f"{trim(skill_text, 12000)}\n"
             f"</loaded-skill>"
         )
@@ -2413,14 +2442,28 @@ class SessionState:
             )
             return (
                 f"ACTIVE SKILLS: {names}. "
-                "Follow loaded skill instructions precisely. "
-                f"If you encounter a step requiring a workflow you don't know, call load_skill ({skill_count} available). "
+                "Follow the loaded skill instructions for the current step. "
+                f"When moving to a different step that needs a DIFFERENT skill, call load_skill to switch "
+                f"(or unload the current one first if it's no longer needed). "
+                f"{skill_count} skills available total. "
             )
         return (
             f"SKILL SYSTEM: {skill_count} skills available. "
-            "Use list_skills to discover, load_skill to activate. "
-            "If unsure how to produce professional output (docs, slides, analysis), check skills first. "
+            "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
+            "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
+            "call list_skills to discover options, then load_skill to activate the right one. "
+            "Load a skill AT THE MOMENT you begin the step that requires it. "
+            "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
+            "For simple tasks, direct questions, and multimodal analysis, do NOT load skills. "
         )
+
+    def _skills_awareness_block(self, for_role: str = "developer") -> str:
+        """Canonical skills-awareness block shared by single, sync, and plan-mode.
+        Returns: loaded-skills hint  +  newline  +  'Skills:\\n<catalog>'
+        Keeps all three modes in sync — change here propagates everywhere.
+        """
+        hint = self._loaded_skills_prompt_hint(for_role=for_role)
+        return f"{hint}\nSkills:\n{self.skills.descriptions()}\n"
 
     def _refresh_runtime_code_reference(self, text: str):
         cb = getattr(self, "reference_prepare_callback", None)
@@ -2482,10 +2525,40 @@ class SessionState:
             header += " [" + ", ".join(tags) + "]"
         return (
             f"{header}:\n"
-            "This is the global TF-Graph_IDF RAG knowledge library for imported documents and research material. "
-            "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`. "
-            "Do not infer knowledge-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_knowledge_library` to check readiness or retrieve grounded references from the global library."
+            "Global TF-Graph_IDF RAG library for imported documents, PDFs, and research material. "
+            "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
+            "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
+            "to retrieve grounded references BEFORE generating your answer. "
+            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Do not infer readiness from session/files or uploads — query the library directly."
+        )
+
+    def _multimodal_capability_block(self) -> str:
+        """Return a brief system-prompt note about native multimodal capabilities.
+
+        Injected into system prompt so the model knows it can directly analyze
+        images/audio/video rather than falling back to text-only workarounds.
+        Returns empty string when the active model has no multimodal input caps.
+        """
+        try:
+            caps = self._capabilities_from_profile()
+        except Exception:
+            return ""
+        types = []
+        if caps.get("input_image"):
+            types.append("images")
+        if caps.get("input_audio"):
+            types.append("audio")
+        if caps.get("input_video"):
+            types.append("video")
+        if not types:
+            return ""
+        joined = "/".join(types)
+        return (
+            f"MULTIMODAL: This model supports native {joined} analysis. "
+            f"When {joined} are attached or loaded via read_file, analyze them DIRECTLY "
+            "using your built-in perception capabilities — do not describe them as "
+            "inaccessible or attempt text-only workarounds. "
         )
 
     def _code_library_prompt_block(self) -> str:
@@ -2566,8 +2639,10 @@ class SessionState:
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
             plan_steps_block = f"{plan_ctx}\n"
+        mm_block = self._multimodal_capability_block()
+        mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
-            f"You are a coding agent. Workspace: {self.files_root}. "
+            f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -2575,6 +2650,7 @@ class SessionState:
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task when done. "
             f"{skill_hint}"
+            f"{mm_hint}"
             f"{plan_steps_block}"
             f"{html_block}"
             f"{research_block}"
@@ -4781,8 +4857,20 @@ class SessionState:
         }
 
     def _safe_upload_name(self, filename: str) -> str:
+        # Use Path().name to strip any directory component first.
         raw = Path(str(filename or "upload.bin")).name
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+        # Only remove characters that are genuinely illegal or dangerous on
+        # filesystems (path separators, null byte, control chars, Windows
+        # reserved chars). Unicode letters/CJK/etc. are left untouched so
+        # filenames like "我的数据.xlsx" remain readable.
+        safe = re.sub(r'[/\\\x00-\x1f\x7f:*?"<>|]', "_", raw)
+        safe = safe.strip(". ")  # avoid hidden files (leading dot) and trailing issues
+        # Enforce a byte-length ceiling safe across all filesystems (255 bytes max).
+        # Trim the stem if needed while preserving the extension.
+        if len(safe.encode("utf-8", errors="replace")) > 240:
+            ext = Path(safe).suffix  # e.g. ".xlsx"
+            stem = safe[: max(1, 200 - len(ext))]
+            safe = stem + ext
         return safe or f"upload_{int(now_ts())}.bin"
 
     def _decode_text_bytes(self, data: bytes) -> str:
@@ -7249,10 +7337,31 @@ class SessionState:
     def _run_bash(self, command: str) -> str:
         return self._run_shell_meta(command, self.files_root, 120)["output"]
 
+    def _fuzzy_resolve_path(self, fp: Path) -> Path:
+        """If fp doesn't exist, try stripping spaces from the filename to find a close match.
+        Handles the common model error of hallucinating spaces in Chinese/mixed filenames.
+        Returns the resolved Path if found, otherwise the original fp unchanged."""
+        if fp.exists():
+            return fp
+        stripped = fp.name.replace(" ", "")
+        if stripped != fp.name:
+            candidate = fp.parent / stripped
+            if candidate.exists():
+                return candidate
+        try:
+            query = fp.name.replace(" ", "").lower()
+            for sibling in fp.parent.iterdir():
+                if sibling.name.replace(" ", "").lower() == query:
+                    return sibling
+        except Exception:
+            pass
+        return fp
+
     def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -7499,7 +7608,8 @@ class SessionState:
     def _run_write(self, path: str, content: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Wrote {len(content)} bytes to {rel}"
@@ -7509,7 +7619,8 @@ class SessionState:
     def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
                 diag = self._edit_mismatch_diagnostic(content, old_text)
@@ -10343,7 +10454,7 @@ class SessionState:
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
         if next_step:
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-advanced")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
         return True
@@ -11425,7 +11536,7 @@ class SessionState:
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
             f"{dims_ctx}"
             f"{skills_ctx}"
-            f"Workspace root: {self.files_root}\n"
+            f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
@@ -14210,19 +14321,28 @@ class SessionState:
 
     def _agent_role_system_prompt(self, role: str) -> str:
         role_key = self._sanitize_agent_role(role) or "developer"
-        skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
+        skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
-            f"Workspace: {self.files_root}. Use relative paths. "
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
-            f"{skills_note}{code_note + ' ' if code_note else ''}"
+            f"{code_note + ' ' if code_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
+        mm_note = self._multimodal_capability_block()
+        if mm_note:
+            base = base + mm_note
+        base = base + skills_block
         if role_key == "explorer":
-            return base + "Role: analyze goals, inspect codebase, produce research notes. Prefer read/search. "
+            return base + (
+                "Role: analyze goals, inspect codebase, produce research notes. "
+                "For factual or background questions on any topic, FIRST call "
+                "query_knowledge_library(query='<topic>', top_k=8, route='hybrid') to retrieve relevant documents. "
+                "Prefer read/search tools. "
+            )
         if role_key == "reviewer":
             if bool(self.reviewer_debug_mode):
                 debug_ctx = trim(str(self.reviewer_debug_context or ""), 500)
@@ -14255,6 +14375,11 @@ class SessionState:
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
+            "SKILL PRIORITY (critical): When ACTIVE SKILLS are listed above, find the "
+            "<loaded-skill> messages in your context and READ them before starting any step. "
+            "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
+            "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
+            "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
             "TODO TRACKING (mandatory): "
             "After completing each logical step, call TodoWrite to update progress — "
             "mark completed items as 'completed' and set the next item to 'in_progress'. "
@@ -15208,7 +15333,8 @@ class SessionState:
                     isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
                     for it in new_items
                 ):
-                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: removed
+                    pass  # Skills are loaded on-demand by the model
             except Exception:
                 pass
             return result
@@ -15216,7 +15342,7 @@ class SessionState:
             result = self._todo_write_rescue(args)
             # Also recheck skills on rescue write (likely a recovery situation)
             try:
-                self._refresh_loaded_skills_for_execution_focus(trigger="todo-rescue")
+                pass  # Skills are loaded on-demand by the model via load_skill
             except Exception:
                 pass
             return result
@@ -15825,6 +15951,10 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
+                # Reset completed plan/todo/skills blackboard state so the manager
+                # does not see status=COMPLETED on the very first round and immediately finish.
+                if not _awaiting_plan_choice:
+                    self._reset_blackboard_plan_state_locked()
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
@@ -16709,7 +16839,7 @@ class SessionState:
 
         # Auto-discover and load relevant skills before research
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-mode-start")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
 
@@ -16792,33 +16922,38 @@ class SessionState:
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"2. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
-            f"3. If skills are loaded, analyze their <loaded-skill> content to identify concrete workflow steps, "
-            f"scripts, tools, and file paths each skill requires\n"
-            f"4. Identify key technical details, data points, and structure needed for the output\n"
-            f"5. Assess risks and note any ambiguities that need user input\n"
-            f"6. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"7. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
+            f"to this task and note their names and capabilities in your findings.\n"
+            f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
+            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
+            f"workflow steps, scripts, tools, and file paths\n"
+            f"5. Identify key technical details, data points, and structure needed for the output\n"
+            f"6. Assess risks and note any ambiguities that need user input\n"
+            f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
+            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"   - Relevant skills found (names, what they do, how to invoke them)\n"
             f"   - File inventory (uploaded files, their types, sizes, key content)\n"
-            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each loaded skill)\n"
+            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
             f"   - Content analysis (key themes, structure, data points extracted from inputs)\n\n"
-            f"Workspace: {self.files_root}\n"
+            f"Workspace: \"{self.files_root}\" ($SESSION_ROOT)\n"
             f"{os_note}\n"
             f"{lang_note}"
         )
 
     def _seed_plan_mode_explorer_context(self, research_prompt: str):
         os_note = _detect_os_shell_instruction()
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        skills_block = self._skills_awareness_block(for_role="explorer")
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
                 "You are Explorer in plan-mode (read-only research). "
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
-                "and blackboard tools only. "
-                f"{skills_hint}"
+                "list_skills, load_skill, and blackboard tools only. "
+                f"{skills_block}"
+                "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
+                "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -16849,16 +16984,16 @@ class SessionState:
             self.current_phase = f"plan-mode:explorer:round-{round_idx}"
             self.current_tool_name = ""
             self.active_agent_role = "explorer"
-        # Build loaded-skills hint for system prompt
-        skills_hint = self._loaded_skills_prompt_hint(for_role="explorer")
+        # Build skills awareness block (same as sync/single mode)
+        skills_block = self._skills_awareness_block(for_role="explorer")
         response = self._chat_with_same_model_retry(
             ctx,
             tools=filtered_tools,
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
-                f"Workspace: {self.files_root}. "
-                f"{skills_hint}"
+                f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+                f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -17267,7 +17402,8 @@ class SessionState:
         synthesis_ctx = [
             {"role": "system", "content": (
                 "You are a technical architect synthesizing research into actionable plans. "
-                "When loaded skills are available, incorporate their capabilities and best practices into plan options."
+                "When skills are referenced in the findings, incorporate their actual workflow steps into plan options. "
+                f"{self._skills_awareness_block(for_role='developer')}"
             ), "ts": now_ts()},
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
@@ -17510,7 +17646,7 @@ class SessionState:
                 except Exception:
                     pass
         try:
-            self._refresh_loaded_skills_for_execution_focus(trigger="plan-approved")
+            pass  # Skills are loaded on-demand by the model via load_skill
         except Exception:
             pass
         # Pre-load skills explicitly mentioned in plan steps
@@ -17574,13 +17710,13 @@ class SessionState:
                     )
                 },
             )
-            # ── Auto-discover and load relevant skills BEFORE classification ──
+            # ── Skills are loaded on-demand by the model via load_skill ──
             try:
                 self._emit(
                     "status",
-                    {"summary": "initial skill discovery started"},
+                    {"summary": "skills available on-demand"},
                 )
-                self._refresh_loaded_skills_for_execution_focus(trigger="pre-classify")
+                pass  # No automatic pre-classify skill discovery
             except Exception:
                 pass
             initial_policy_media_inputs = self._recent_multimodal_inputs()

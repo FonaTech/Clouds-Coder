@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
+from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
 from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, _migrate_legacy_runtime_roots
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_capability_overrides, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path
 from ..llm.client import OllamaClient
@@ -23,7 +23,7 @@ from ..session.manager import SessionManager
 from ..session.state import SessionState
 from ..skills.store import SkillStore, _sanitize_skill_slug, analyze_skill_building_knowledge, ensure_runtime_skills
 from ..utils.crypto import CryptoBox
-from ..utils.files import _safe_js_filename, ensure_offline_js_libs, offline_js_lib_root, safe_path, try_read_text
+from ..utils.files import _resolve_js_lib_asset_path, ensure_offline_js_libs, load_offline_js_lib_index, offline_js_lib_root, safe_path, try_read_text
 from ..utils.json_utils import TOOLS, extract_json_object_from_text, json_dumps, parse_json_object
 from ..utils.misc import DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, normalize_timeout_seconds, now_ts, sanitize_profile_id
 from ..utils.text import parse_front_matter, trim
@@ -125,17 +125,9 @@ class AppContext:
         self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
-            self.offline_js_summary = ensure_offline_js_libs(self.workspace, force=False)
-        except Exception as exc:
-            self.offline_js_summary = {
-                "generated_at": int(now_ts()),
-                "js_lib_root": str(self.js_lib_root),
-                "total": len(OFFLINE_JS_LIB_CATALOG),
-                "available": 0,
-                "missing": len(OFFLINE_JS_LIB_CATALOG),
-                "fetched": 0,
-                "error": trim(str(exc), 220),
-            }
+            self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
+        except Exception:
+            self.offline_js_summary = {}
         self.default_language = normalize_ui_language(default_language)
         self.ui_style = normalize_ui_style(ui_style)
         self.context_token_limit = max(
@@ -434,16 +426,7 @@ class AppContext:
         return CODE_ADMIN_JS
 
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
-        safe = _safe_js_filename(str(filename or "").strip(), "lib.js")
-        fp = (self.js_lib_root / safe).resolve()
-        try:
-            if not fp.is_relative_to(self.js_lib_root):
-                return None
-        except Exception:
-            return None
-        if not fp.exists() or (not fp.is_file()):
-            return None
-        return fp
+        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
 
     def rag_three_asset_info(self) -> dict:
         picks = [
@@ -1241,7 +1224,7 @@ class AppContext:
                 f"{str(row.get('title', '') or '').strip()} "
                 f"score={str(row.get('score', 0) or 0)}"
             )
-            snippet = trim(str(row.get("text", "") or ""), 320)
+            snippet = trim(str(row.get("text", "") or ""), 800)
             if snippet:
                 lines.append(snippet)
         return "\n".join(lines)

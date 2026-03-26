@@ -1126,7 +1126,7 @@ class RAGContentParser:
 
             text = extract_text(str(pdf_path))
             if text and text.strip():
-                return trim(text.strip(), 150_000)
+                return trim(text.strip(), 800_000)
         except ImportError:
             pass
         except Exception:
@@ -1141,7 +1141,7 @@ class RAGContentParser:
                     timeout=60,
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return trim(r.stdout.strip(), 150_000)
+                    return trim(r.stdout.strip(), 800_000)
             except Exception:
                 pass
         try:

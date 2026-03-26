@@ -291,7 +291,12 @@ TOOLS = [
     ),
     tool_def(
         "query_knowledge_library",
-        "Read current global knowledge-library status or query the TF-Graph_IDF RAG library for grounded document references.",
+        (
+            "Query the RAG knowledge library for grounded document references and background knowledge. "
+            "Call this BEFORE answering questions that require domain expertise, factual grounding, "
+            "or synthesis from imported documents. "
+            "Pass an empty query to check library status only."
+        ),
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
