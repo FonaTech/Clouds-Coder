@@ -17003,10 +17003,31 @@ class SessionState:
     def _run_bash(self, command: str) -> str:
         return self._run_shell_meta(command, self.files_root, 120)["output"]
 
+    def _fuzzy_resolve_path(self, fp: Path) -> Path:
+        """If fp doesn't exist, try stripping spaces from the filename to find a close match.
+        Handles the common model error of hallucinating spaces in Chinese/mixed filenames.
+        Returns the resolved Path if found, otherwise the original fp unchanged."""
+        if fp.exists():
+            return fp
+        stripped = fp.name.replace(" ", "")
+        if stripped != fp.name:
+            candidate = fp.parent / stripped
+            if candidate.exists():
+                return candidate
+        try:
+            query = fp.name.replace(" ", "").lower()
+            for sibling in fp.parent.iterdir():
+                if sibling.name.replace(" ", "").lower() == query:
+                    return sibling
+        except Exception:
+            pass
+        return fp
+
     def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -17253,7 +17274,8 @@ class SessionState:
     def _run_write(self, path: str, content: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Wrote {len(content)} bytes to {rel}"
@@ -17263,7 +17285,8 @@ class SessionState:
     def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
-            fp = self._session_path(rel)
+            fp = self._fuzzy_resolve_path(self._session_path(rel))
+            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
                 diag = self._edit_mismatch_diagnostic(content, old_text)
