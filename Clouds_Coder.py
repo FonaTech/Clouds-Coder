@@ -1309,6 +1309,7 @@ def _detect_os_shell_instruction() -> str:
             "Package manager is 'brew'. "
             "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
+            "Virtual alias '/js_lib/...' maps to the offline JS libraries root ($JS_LIB_ROOT) and is also supported in file tools. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
             "IMPORTANT: The workspace path contains spaces. Always use relative paths "
             "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
@@ -12309,6 +12310,10 @@ class SessionState:
         mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+            f"Offline JS libraries root: $JS_LIB_ROOT. "
+            f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
+            f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS require) or pptxgen.bundle.js (browser). "
+            f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -14101,6 +14106,11 @@ class SessionState:
         if low.startswith("/workspace/"):
             rel = raw[len("/workspace/") :].lstrip("/")
             return rel or "."
+        if low in {"/js_lib", "/js_lib/"}:
+            return ".__js_lib__"
+        if low.startswith("/js_lib/"):
+            rel = raw[len("/js_lib/") :].lstrip("/")
+            return f".__js_lib__/{rel}" if rel else ".__js_lib__"
         if low in {SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}:
             return ".__skills__"
         if low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/"):
@@ -14124,9 +14134,10 @@ class SessionState:
             return ""
         low = txt.lower()
         if (
-            low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}
+            low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/", "/js_lib", "/js_lib/"}
             or low.startswith("/workspace/")
             or low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/")
+            or low.startswith("/js_lib/")
         ):
             return ""
         return (
@@ -14139,6 +14150,9 @@ class SessionState:
         if normalized == ".__skills__" or normalized.startswith(".__skills__/"):
             rel = normalized[len(".__skills__") :].lstrip("/")
             return safe_path(rel or ".", self.skills.skills_root)
+        if normalized == ".__js_lib__" or normalized.startswith(".__js_lib__/"):
+            rel = normalized[len(".__js_lib__") :].lstrip("/")
+            return safe_path(rel or ".", self.js_lib_root)
         return safe_path(normalized, self.files_root)
 
     def _session_rel(self, path: Path) -> str:
@@ -14146,6 +14160,13 @@ class SessionState:
         root = self.files_root.resolve()
         if target.is_relative_to(root):
             return target.relative_to(root).as_posix()
+        try:
+            js_lib_root = self.js_lib_root.resolve()
+            if target.is_relative_to(js_lib_root):
+                rel = target.relative_to(js_lib_root).as_posix()
+                return f"/js_lib/{rel}".replace("//", "/")
+        except Exception:
+            pass
         try:
             skills_root = self.skills.skills_root.resolve()
             if target.is_relative_to(skills_root):
@@ -16537,15 +16558,22 @@ class SessionState:
             skills_root = str(self.skills.skills_root.resolve())
         except Exception:
             skills_root = str(self.skills.skills_root)
+        try:
+            js_lib_root = str(self.js_lib_root.resolve())
+        except Exception:
+            js_lib_root = str(self.js_lib_root)
         mappings = [
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
+            ("/js_lib", js_lib_root),
         ]
         # Auto-quote raw absolute paths that contain spaces (prevents word-splitting)
         if " " in workspace_root and workspace_root not in ("/workspace",):
             mappings.append((workspace_root, workspace_root))
         if " " in skills_root and skills_root != SKILLS_VIRTUAL_PREFIX:
             mappings.append((skills_root, skills_root))
+        if " " in js_lib_root and js_lib_root != "/js_lib":
+            mappings.append((js_lib_root, js_lib_root))
         out: list[str] = []
         mode = "plain"
         i = 0
@@ -16886,6 +16914,7 @@ class SessionState:
             proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
             proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
             proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
+            proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
@@ -22981,14 +23010,13 @@ class SessionState:
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
         }
-        # advance_plan_step: 当前 plan step 完成，推进到下一步
-        should_advance = _to_bool_like(route.get("advance_plan_step", False), default=False)
-        # Auto-detect step advancement from instruction semantics
-        if not should_advance:
-            should_advance = self._instruction_implies_step_advance(
-                str(route.get("instruction", "") or ""),
-                str(route.get("reason", "") or ""),
-            )
+        # advance_plan_step: only trust semantics from what the agent actually wrote,
+        # NOT from the manager's own route JSON — the manager often sets this flag
+        # simultaneously with dispatching the work, advancing the step before it runs.
+        should_advance = self._instruction_implies_step_advance(
+            str(route.get("instruction", "") or ""),
+            str(route.get("reason", "") or ""),
+        )
         if should_advance:
             self._advance_plan_step(
                 evidence=trim(str(route.get("instruction", "") or ""), 200),
@@ -23993,6 +24021,10 @@ class SessionState:
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
+            f"Offline JS libraries root: $JS_LIB_ROOT. "
+            f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
+            f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS) or pptxgen.bundle.js (browser). "
+            f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{code_note + ' ' if code_note else ''}"
@@ -25460,8 +25492,6 @@ class SessionState:
                     "</live-user-adjustment>"
                 )
                 self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
-                # Merge user feedback with plan direction
-                self._merge_user_feedback_with_plan(content)
                 self.runtime_reclassify_goal = trim(content, 4000)
                 # Only trigger reclassification in auto mode (no user override)
                 if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
@@ -25475,6 +25505,7 @@ class SessionState:
                         "weight": weight,
                         "priority": priority,
                         "applied": applied,
+                        "content": content,
                     }
                 )
                 row["applied_count"] = applied
@@ -25487,6 +25518,8 @@ class SessionState:
                 self.updated_at = now_ts()
                 self._persist()
         for item in injected:
+            # Merge user feedback with plan direction (outside lock — may do LLM call)
+            self._merge_user_feedback_with_plan(item["content"])
             self._emit(
                 "status",
                 {
@@ -25498,6 +25531,49 @@ class SessionState:
                 },
             )
         return len(injected)
+
+    def _user_feedback_conflict_score(self, user_text: str, step_desc: str = "") -> float:
+        """Score 0.0–1.0 via LLM semantic analysis: how strongly user feedback conflicts with current plan.
+        Falls back to 0.5 on error."""
+        if not str(user_text or "").strip():
+            return 0.0
+        try:
+            ctx = [
+                {"role": "system", "content": (
+                    "You are a semantic conflict analyzer. "
+                    "Given a user's mid-execution feedback and the current task step, "
+                    "output ONLY a JSON object: {\"score\": <float 0.0-1.0>, \"reason\": \"<brief>\"}. "
+                    "score=0.0 means fully aligned (minor tweak/clarification). "
+                    "score=1.0 means direct contradiction/override (user wants opposite direction). "
+                    "No other text."
+                ), "ts": now_ts()},
+                {"role": "user", "content": (
+                    f"Current step: {trim(step_desc, 300) or 'unknown'}\n"
+                    f"User feedback: {trim(user_text, 500)}\n"
+                    "Output JSON only."
+                ), "ts": now_ts()},
+            ]
+            resp = self._chat_with_same_model_retry(
+                ctx,
+                tools=None,
+                system=None,
+                max_tokens=80,
+                think=False,
+                stream_thinking=False,
+                context_label="feedback-conflict-score",
+                retries=1,
+            )
+            text = str(resp.get("content", "") or "").strip()
+            # Extract JSON from response
+            import re as _re
+            m = _re.search(r'\{[^}]+\}', text)
+            if m:
+                parsed = parse_json_object(m.group(0), {})
+                score = float(parsed.get("score", 0.5) or 0.5)
+                return max(0.0, min(1.0, score))
+        except Exception:
+            pass
+        return 0.5
 
     def _merge_user_feedback_with_plan(self, user_text: str):
         """When user provides feedback during execution, inject plan-aware merge note into manager context."""
@@ -25512,22 +25588,41 @@ class SessionState:
                 break
         step_desc = trim(str(current_step.get("content", "") if current_step else "none"), 200)
         is_plan_executing = plan.get("phase") == "executing"
+        conflict_score = self._user_feedback_conflict_score(user_text, step_desc)
+        if conflict_score >= 0.8:
+            conflict_level = "HIGH"
+            directive = (
+                "USER OVERRIDE: This feedback DIRECTLY CONFLICTS with the current plan step. "
+                "You MUST prioritize the user's instruction over the original plan. "
+                "Adjust the current step's approach immediately to comply with user's requirement. "
+                "Do NOT continue the original approach."
+            )
+        elif conflict_score >= 0.5:
+            conflict_level = "MEDIUM"
+            directive = (
+                "This feedback modifies the current approach. "
+                "Re-evaluate the current step and adjust delegation to incorporate user's requirement. "
+                "User's direction takes precedence over plan details."
+            )
+        else:
+            conflict_level = "LOW"
+            directive = (
+                "Minor feedback — integrate with current work direction. "
+                "Adjust approach if needed but maintain progress."
+            )
         if is_plan_executing:
             merge_note = (
-                f"<user-feedback-merge>\n"
+                f"<user-feedback-merge conflict=\"{conflict_level}\" score=\"{conflict_score:.2f}\">\n"
                 f"User provided new input during plan execution: {trim(user_text, 500)}\n"
                 f"Current plan step: {step_desc}\n"
-                f"Re-evaluate: Does this feedback change the current step's approach? "
-                f"If yes, adjust delegation accordingly. If it's a new requirement, "
-                f"integrate it into the current or next step. Do NOT restart from scratch.\n"
+                f"{directive}\n"
                 f"</user-feedback-merge>"
             )
         else:
             merge_note = (
-                f"<user-feedback-merge>\n"
+                f"<user-feedback-merge conflict=\"{conflict_level}\" score=\"{conflict_score:.2f}\">\n"
                 f"User provided new input: {trim(user_text, 500)}\n"
-                f"Integrate this feedback with current work direction. "
-                f"Adjust approach if needed but maintain progress.\n"
+                f"{directive}\n"
                 f"</user-feedback-merge>"
             )
         if self._is_multi_agent_mode():
@@ -25536,6 +25631,13 @@ class SessionState:
                 "content": merge_note,
                 "ts": now_ts(),
                 "agent_role": "manager",
+            })
+        else:
+            # single mode: inject directly into message history so the model sees it
+            self.messages.append({
+                "role": "user",
+                "content": merge_note,
+                "ts": now_ts(),
             })
 
     def _is_restart_scenario(self) -> bool:
@@ -26141,6 +26243,7 @@ class SessionState:
             if self.stall_escalation_triggered:
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
+            self._inject_pending_user_inputs()
             self._apply_auto_compact_if_needed("auto:multi-sync")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -26516,6 +26619,7 @@ class SessionState:
         for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
             if self.cancel_requested:
                 return
+            self._inject_pending_user_inputs()
             step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
             if step.get("status") in ("no-tools", "skip", "interrupted"):
                 break
@@ -40590,7 +40694,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
-        self.js_lib_root = offline_js_lib_root(self.workspace)
+        self.js_lib_root = offline_js_lib_root(SCRIPT_DIR)
         self.offline_js_summary: dict = {}
         try:
             self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)

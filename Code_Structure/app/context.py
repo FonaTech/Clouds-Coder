@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
-from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, _migrate_legacy_runtime_roots
+from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, SCRIPT_DIR, _migrate_legacy_runtime_roots
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_capability_overrides, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path
 from ..llm.client import OllamaClient
 from ..llm.utils import extract_base_url
@@ -122,7 +122,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
-        self.js_lib_root = offline_js_lib_root(self.workspace)
+        self.js_lib_root = offline_js_lib_root(SCRIPT_DIR)
         self.offline_js_summary: dict = {}
         try:
             self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)

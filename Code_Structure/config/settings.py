@@ -138,6 +138,7 @@ def _detect_os_shell_instruction() -> str:
             "Package manager is 'brew'. "
             "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
+            "Virtual alias '/js_lib/...' maps to the offline JS libraries root ($JS_LIB_ROOT) and is also supported in file tools. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
             "IMPORTANT: The workspace path contains spaces. Always use relative paths "
             "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
