@@ -455,7 +455,7 @@ PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
 TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
 TASK_PHASE_ROUTING = {
     "research": "explorer",
-    "design": "explorer",
+    "design": "developer",
     "implement": "developer",
     "test": "developer",
     "review": "reviewer",
@@ -1309,6 +1309,7 @@ def _detect_os_shell_instruction() -> str:
             "Package manager is 'brew'. "
             "Environment variables WORKSPACE_ROOT, SESSION_ROOT, and SKILLS_ROOT are available. "
             "Virtual aliases '/workspace/...' and '/skills/...' are supported in shell commands and rewritten to real paths before execution. "
+            "Virtual alias '/js_lib/...' maps to the offline JS libraries root ($JS_LIB_ROOT) and is also supported in file tools. "
             "Do NOT assume Linux-specific paths like /proc or /etc/os-release exist. "
             "IMPORTANT: The workspace path contains spaces. Always use relative paths "
             "(e.g., 'ls uploaded/' not 'ls /full/absolute/path/uploaded/'). "
@@ -12309,6 +12310,10 @@ class SessionState:
         mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+            f"Offline JS libraries root: $JS_LIB_ROOT. "
+            f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
+            f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS require) or pptxgen.bundle.js (browser). "
+            f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -12890,16 +12895,13 @@ class SessionState:
         meta = {"filtered": False, "reason": "", "original_chars": len(raw)}
         if not clean:
             return raw, meta
-        if (
-            not tool_calls
-            and len(clean) >= int(RAW_TOOLCALL_TEXT_FILTER_THRESHOLD)
-            and self._looks_like_raw_toolcall_blob(clean)
-        ):
+        # Filter raw <tool_call> XML regardless of size — any size is invalid display content
+        if not tool_calls and self._looks_like_raw_toolcall_blob(clean):
             note = (
-                "[toolcall payload omitted: detected oversized inline <toolcall> text, "
-                "likely truncated. Please regenerate a compact structured tool call.]"
+                "[toolcall payload omitted: detected inline <toolcall> text. "
+                "Please regenerate a compact structured tool call.]"
             )
-            meta.update({"filtered": True, "reason": "oversized_raw_toolcall"})
+            meta.update({"filtered": True, "reason": "raw_toolcall"})
             return note, meta
         if len(raw) > int(ASSISTANT_TEXT_PERSIST_MAX_CHARS):
             clipped = trim(raw, int(ASSISTANT_TEXT_PERSIST_MAX_CHARS))
@@ -14101,6 +14103,11 @@ class SessionState:
         if low.startswith("/workspace/"):
             rel = raw[len("/workspace/") :].lstrip("/")
             return rel or "."
+        if low in {"/js_lib", "/js_lib/"}:
+            return ".__js_lib__"
+        if low.startswith("/js_lib/"):
+            rel = raw[len("/js_lib/") :].lstrip("/")
+            return f".__js_lib__/{rel}" if rel else ".__js_lib__"
         if low in {SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}:
             return ".__skills__"
         if low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/"):
@@ -14124,9 +14131,10 @@ class SessionState:
             return ""
         low = txt.lower()
         if (
-            low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}
+            low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/", "/js_lib", "/js_lib/"}
             or low.startswith("/workspace/")
             or low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/")
+            or low.startswith("/js_lib/")
         ):
             return ""
         return (
@@ -14139,6 +14147,9 @@ class SessionState:
         if normalized == ".__skills__" or normalized.startswith(".__skills__/"):
             rel = normalized[len(".__skills__") :].lstrip("/")
             return safe_path(rel or ".", self.skills.skills_root)
+        if normalized == ".__js_lib__" or normalized.startswith(".__js_lib__/"):
+            rel = normalized[len(".__js_lib__") :].lstrip("/")
+            return safe_path(rel or ".", self.js_lib_root)
         return safe_path(normalized, self.files_root)
 
     def _session_rel(self, path: Path) -> str:
@@ -14146,6 +14157,13 @@ class SessionState:
         root = self.files_root.resolve()
         if target.is_relative_to(root):
             return target.relative_to(root).as_posix()
+        try:
+            js_lib_root = self.js_lib_root.resolve()
+            if target.is_relative_to(js_lib_root):
+                rel = target.relative_to(js_lib_root).as_posix()
+                return f"/js_lib/{rel}".replace("//", "/")
+        except Exception:
+            pass
         try:
             skills_root = self.skills.skills_root.resolve()
             if target.is_relative_to(skills_root):
@@ -16537,15 +16555,22 @@ class SessionState:
             skills_root = str(self.skills.skills_root.resolve())
         except Exception:
             skills_root = str(self.skills.skills_root)
+        try:
+            js_lib_root = str(self.js_lib_root.resolve())
+        except Exception:
+            js_lib_root = str(self.js_lib_root)
         mappings = [
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
+            ("/js_lib", js_lib_root),
         ]
         # Auto-quote raw absolute paths that contain spaces (prevents word-splitting)
         if " " in workspace_root and workspace_root not in ("/workspace",):
             mappings.append((workspace_root, workspace_root))
         if " " in skills_root and skills_root != SKILLS_VIRTUAL_PREFIX:
             mappings.append((skills_root, skills_root))
+        if " " in js_lib_root and js_lib_root != "/js_lib":
+            mappings.append((js_lib_root, js_lib_root))
         out: list[str] = []
         mode = "plain"
         i = 0
@@ -16886,6 +16911,7 @@ class SessionState:
             proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
             proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
             proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
+            proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
@@ -20036,35 +20062,36 @@ class SessionState:
         if not current:
             return False
         text = (str(instruction or "") + " " + str(reason or "")).lower()
-        # Patterns that indicate step completion
+        # Patterns that indicate step completion — only BACKWARD-looking signals
+        # (agent/manager explicitly says a step is done, NOT forward-looking dispatch instructions)
         step_done_patterns = (
             "审查通过", "通过审查", "已通过", "已完成", "完成了",
-            "进入 step", "进入step", "enter step", "move to step",
             "step completed", "step done", "step passed",
-            "现在进入", "开始 step", "开始step",
             "阶段完成", "阶段通过", "phase complete",
-            # extended: manager says "now do step X.Y" implying prior step is done
-            "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "执行步骤 2",
-            "进入下一步", "next step", "proceed to step",
-            "步骤 1.1 已完成", "步骤 1.2 已完成",
+            "步骤 1.1 已完成", "步骤 1.2 已完成", "步骤 1.3 已完成",
+            "步骤 1.4 已完成", "步骤 1.5 已完成",
         )
-        # Also detect "Step N 通过" or "进入 Step N+1" patterns
+        # NOTE: intentionally excluded forward-looking dispatch patterns:
+        #   "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "进入下一步", "next step",
+        #   "proceed to step", "进入 step", "开始 step" — these are manager dispatch
+        #   instructions, NOT evidence that the current step was completed.
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
-        # "Step 2 已通过" / "Step 2 完成" / "进入 Step 3"
+        # Only advance when an agent explicitly says "进入 Step N" where N > current+1
+        # (skipping ahead), NOT when manager dispatches the very next step.
         next_step_pattern = re.search(
             r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
         )
         if next_step_pattern:
             mentioned_step = int(next_step_pattern.group(1))
-            if mentioned_step > current_idx + 1:
+            if mentioned_step > current_idx + 2:  # must skip at least 2 ahead to be meaningful
                 return True
-        # Pattern: "继续步骤 1.2" / "完成步骤 1.1，开始 1.2"
-        step_ref = re.search(r'步骤\s*1\.(\d+)', text)
+        # "完成步骤 1.1，开始 1.2" — only if explicitly marking current step done
+        step_ref = re.search(r'(?:完成|finished|done)\s*步骤\s*1\.(\d+)', text)
         if step_ref:
             ref_sub = int(step_ref.group(1))
-            if ref_sub > (current_idx + 1):
+            if ref_sub == current_idx + 1:  # explicitly says current step (1-based) is done
                 return True
         return any(pat in text for pat in step_done_patterns)
 
@@ -21455,12 +21482,15 @@ class SessionState:
     def _plan_step_phase_hint(self, step_content: str) -> str:
         """Infer the task phase from a plan step's content."""
         c = str(step_content or "").lower()
+        # implement keywords take priority — if step produces output, it's implement not design/research
+        if any(kw in c for kw in ("实现", "编写", "创建", "开发", "绘制", "生成", "写入",
+                                   "implement", "write", "create", "build", "develop", "code",
+                                   "generate", "draw", "scaffold", "mkdir", "\.f90", "\.py", "\.cpp", "\.md")):
+            return "implement"
         if any(kw in c for kw in ("研究", "分析", "调研", "探索", "research", "analyze", "investigate", "explore", "inspect")):
             return "research"
         if any(kw in c for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
             return "design"
-        if any(kw in c for kw in ("实现", "编写", "创建", "开发", "implement", "write", "create", "build", "develop", "code")):
-            return "implement"
         if any(kw in c for kw in ("测试", "验证", "检查", "test", "verify", "check", "validate", "compile")):
             return "test"
         if any(kw in c for kw in ("审查", "评审", "review", "audit", "inspect code")):
@@ -21523,11 +21553,24 @@ class SessionState:
                     completed_w = [r for r in worker_todos if str(r.get("status", "")).lower() == "completed"]
                     pending_w = [r for r in worker_todos if str(r.get("status", "")).lower() not in ("completed",)]
                     if not pending_w and completed_w:
-                        worker_hint = (
-                            f"Worker subtasks: all {len(completed_w)} completed "
-                            f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
-                            "→ Worker has finished. Set advance_plan_step=true NOW. "
-                        )
+                        # Verify actual work evidence before suggesting advance
+                        bb_now = self._ensure_blackboard()
+                        has_artifacts = bool(bb_now.get("code_artifacts"))
+                        has_research = bool(bb_now.get("research_notes"))
+                        has_shell_output = bool(bb_now.get("execution_logs"))
+                        has_evidence = has_artifacts or has_research or has_shell_output
+                        if has_evidence:
+                            worker_hint = (
+                                f"Worker subtasks: all {len(completed_w)} completed "
+                                f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
+                                "Blackboard has concrete outputs. \u2192 Set advance_plan_step=true NOW. "
+                            )
+                        else:
+                            worker_hint = (
+                                f"Worker subtasks: all {len(completed_w)} marked completed "
+                                "but blackboard has NO concrete outputs (no code_artifacts, research_notes, or execution_logs). "
+                                "\u2192 Do NOT advance. Re-delegate to verify actual work was done. "
+                            )
                     elif completed_w or pending_w:
                         worker_hint = (
                             f"Worker subtasks: {len(completed_w)} done, {len(pending_w)} pending. "
@@ -22980,14 +23023,13 @@ class SessionState:
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
         }
-        # advance_plan_step: 当前 plan step 完成，推进到下一步
-        should_advance = _to_bool_like(route.get("advance_plan_step", False), default=False)
-        # Auto-detect step advancement from instruction semantics
-        if not should_advance:
-            should_advance = self._instruction_implies_step_advance(
-                str(route.get("instruction", "") or ""),
-                str(route.get("reason", "") or ""),
-            )
+        # advance_plan_step: only trust semantics from what the agent actually wrote,
+        # NOT from the manager's own route JSON — the manager often sets this flag
+        # simultaneously with dispatching the work, advancing the step before it runs.
+        should_advance = self._instruction_implies_step_advance(
+            str(route.get("instruction", "") or ""),
+            str(route.get("reason", "") or ""),
+        )
         if should_advance:
             self._advance_plan_step(
                 evidence=trim(str(route.get("instruction", "") or ""), 200),
@@ -23992,6 +24034,10 @@ class SessionState:
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
+            f"Offline JS libraries root: $JS_LIB_ROOT. "
+            f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
+            f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS) or pptxgen.bundle.js (browser). "
+            f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{code_note + ' ' if code_note else ''}"
@@ -25459,8 +25505,6 @@ class SessionState:
                     "</live-user-adjustment>"
                 )
                 self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
-                # Merge user feedback with plan direction
-                self._merge_user_feedback_with_plan(content)
                 self.runtime_reclassify_goal = trim(content, 4000)
                 # Only trigger reclassification in auto mode (no user override)
                 if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
@@ -25474,6 +25518,7 @@ class SessionState:
                         "weight": weight,
                         "priority": priority,
                         "applied": applied,
+                        "content": content,
                     }
                 )
                 row["applied_count"] = applied
@@ -25486,6 +25531,8 @@ class SessionState:
                 self.updated_at = now_ts()
                 self._persist()
         for item in injected:
+            # Merge user feedback with plan direction (outside lock — may do LLM call)
+            self._merge_user_feedback_with_plan(item["content"])
             self._emit(
                 "status",
                 {
@@ -25497,6 +25544,49 @@ class SessionState:
                 },
             )
         return len(injected)
+
+    def _user_feedback_conflict_score(self, user_text: str, step_desc: str = "") -> float:
+        """Score 0.0–1.0 via LLM semantic analysis: how strongly user feedback conflicts with current plan.
+        Falls back to 0.5 on error."""
+        if not str(user_text or "").strip():
+            return 0.0
+        try:
+            ctx = [
+                {"role": "system", "content": (
+                    "You are a semantic conflict analyzer. "
+                    "Given a user's mid-execution feedback and the current task step, "
+                    "output ONLY a JSON object: {\"score\": <float 0.0-1.0>, \"reason\": \"<brief>\"}. "
+                    "score=0.0 means fully aligned (minor tweak/clarification). "
+                    "score=1.0 means direct contradiction/override (user wants opposite direction). "
+                    "No other text."
+                ), "ts": now_ts()},
+                {"role": "user", "content": (
+                    f"Current step: {trim(step_desc, 300) or 'unknown'}\n"
+                    f"User feedback: {trim(user_text, 500)}\n"
+                    "Output JSON only."
+                ), "ts": now_ts()},
+            ]
+            resp = self._chat_with_same_model_retry(
+                ctx,
+                tools=None,
+                system=None,
+                max_tokens=80,
+                think=False,
+                stream_thinking=False,
+                context_label="feedback-conflict-score",
+                retries=1,
+            )
+            text = str(resp.get("content", "") or "").strip()
+            # Extract JSON from response
+            import re as _re
+            m = _re.search(r'\{[^}]+\}', text)
+            if m:
+                parsed = parse_json_object(m.group(0), {})
+                score = float(parsed.get("score", 0.5) or 0.5)
+                return max(0.0, min(1.0, score))
+        except Exception:
+            pass
+        return 0.5
 
     def _merge_user_feedback_with_plan(self, user_text: str):
         """When user provides feedback during execution, inject plan-aware merge note into manager context."""
@@ -25511,22 +25601,41 @@ class SessionState:
                 break
         step_desc = trim(str(current_step.get("content", "") if current_step else "none"), 200)
         is_plan_executing = plan.get("phase") == "executing"
+        conflict_score = self._user_feedback_conflict_score(user_text, step_desc)
+        if conflict_score >= 0.8:
+            conflict_level = "HIGH"
+            directive = (
+                "USER OVERRIDE: This feedback DIRECTLY CONFLICTS with the current plan step. "
+                "You MUST prioritize the user's instruction over the original plan. "
+                "Adjust the current step's approach immediately to comply with user's requirement. "
+                "Do NOT continue the original approach."
+            )
+        elif conflict_score >= 0.5:
+            conflict_level = "MEDIUM"
+            directive = (
+                "This feedback modifies the current approach. "
+                "Re-evaluate the current step and adjust delegation to incorporate user's requirement. "
+                "User's direction takes precedence over plan details."
+            )
+        else:
+            conflict_level = "LOW"
+            directive = (
+                "Minor feedback — integrate with current work direction. "
+                "Adjust approach if needed but maintain progress."
+            )
         if is_plan_executing:
             merge_note = (
-                f"<user-feedback-merge>\n"
+                f"<user-feedback-merge conflict=\"{conflict_level}\" score=\"{conflict_score:.2f}\">\n"
                 f"User provided new input during plan execution: {trim(user_text, 500)}\n"
                 f"Current plan step: {step_desc}\n"
-                f"Re-evaluate: Does this feedback change the current step's approach? "
-                f"If yes, adjust delegation accordingly. If it's a new requirement, "
-                f"integrate it into the current or next step. Do NOT restart from scratch.\n"
+                f"{directive}\n"
                 f"</user-feedback-merge>"
             )
         else:
             merge_note = (
-                f"<user-feedback-merge>\n"
+                f"<user-feedback-merge conflict=\"{conflict_level}\" score=\"{conflict_score:.2f}\">\n"
                 f"User provided new input: {trim(user_text, 500)}\n"
-                f"Integrate this feedback with current work direction. "
-                f"Adjust approach if needed but maintain progress.\n"
+                f"{directive}\n"
                 f"</user-feedback-merge>"
             )
         if self._is_multi_agent_mode():
@@ -25535,6 +25644,13 @@ class SessionState:
                 "content": merge_note,
                 "ts": now_ts(),
                 "agent_role": "manager",
+            })
+        else:
+            # single mode: inject directly into message history so the model sees it
+            self.messages.append({
+                "role": "user",
+                "content": merge_note,
+                "ts": now_ts(),
             })
 
     def _is_restart_scenario(self) -> bool:
@@ -26140,6 +26256,7 @@ class SessionState:
             if self.stall_escalation_triggered:
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
+            self._inject_pending_user_inputs()
             self._apply_auto_compact_if_needed("auto:multi-sync")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -26515,6 +26632,7 @@ class SessionState:
         for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
             if self.cancel_requested:
                 return
+            self._inject_pending_user_inputs()
             step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
             if step.get("status") in ("no-tools", "skip", "interrupted"):
                 break
@@ -30402,6 +30520,9 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff}
 .todo-item.st-pending,.task-item.st-pending{border-left-color:#7b8798}
 .todo-item.st-in_progress,.task-item.st-in_progress{border-left-color:#1f6feb;background:#eef5ff}
+.todo-group-label{font-size:.72rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:6px 0 2px 2px}
+.todo-subtask{margin-left:16px;border-left-width:3px;border-radius:8px;padding:6px 10px;font-size:.9em}
+.todo-subtask::before{content:"↳ ";color:var(--muted);font-size:.85em}
 .todo-item.st-completed,.task-item.st-completed{border-left-color:#13b8a6;background:#edfcf7}
 .todo-item.st-blocked,.task-item.st-blocked{border-left-color:#b96b00;background:#fff6ea}
 .todo-item.st-deleted,.task-item.st-deleted{border-left-color:#a0a6b0;background:#f7f8fa}
@@ -30560,7 +30681,8 @@ const I18N={
     llm_fill_config:'Fill LLM Config',llm_provider:'Provider',llm_confirm:'Confirm',llm_import_config:'Import config',
     llm_thinking_stream:'Thinking Stream',llm_enabled:'Enabled',llm_disabled:'Disabled',
     llm_model:'Model',llm_scan:'Scan',llm_scan_hint:'Click Scan to detect models from Ollama',llm_scan_first:'Scan models first',
-    llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed'
+    llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed',
+    todo_plan_steps:'Plan Steps',todo_subtasks:'Subtasks'
   },
   'zh-CN':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驱动的会话式集成编程 Agent 平台',powered_by:'Powered By Fona',
@@ -30595,7 +30717,8 @@ const I18N={
     llm_fill_config:'填写 LLM 配置',llm_provider:'供应商',llm_confirm:'确认',llm_import_config:'导入配置',
     llm_thinking_stream:'思维流',llm_enabled:'启用',llm_disabled:'禁用',
     llm_model:'模型',llm_scan:'扫描',llm_scan_hint:'点击扫描检测 Ollama 可用模型',llm_scan_first:'请先扫描模型',
-    llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败'
+    llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败',
+    todo_plan_steps:'计划步骤',todo_subtasks:'子任务'
   },
   'zh-TW':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驅動的會話式整合程式 Agent 平台',powered_by:'Powered By Fona',
@@ -30630,7 +30753,8 @@ const I18N={
     llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
     llm_thinking_stream:'思維流',llm_enabled:'啟用',llm_disabled:'停用',
     llm_model:'模型',llm_scan:'掃描',llm_scan_hint:'點擊掃描偵測 Ollama 可用模型',llm_scan_first:'請先掃描模型',
-    llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗'
+    llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗',
+    todo_plan_steps:'計劃步驟',todo_subtasks:'子任務'
   },
   'ja':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 駆動の対話型コーディング Agent プラットフォーム',powered_by:'Powered By Fona',
@@ -30665,7 +30789,8 @@ const I18N={
     llm_fill_config:'LLM設定入力',llm_provider:'プロバイダー',llm_confirm:'確認',llm_import_config:'設定をインポート',
     llm_thinking_stream:'シンキングストリーム',llm_enabled:'有効',llm_disabled:'無効',
     llm_model:'モデル',llm_scan:'スキャン',llm_scan_hint:'スキャンをクリックしてOllamaモデルを検出',llm_scan_first:'先にモデルをスキャン',
-    llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗'
+    llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗',
+    todo_plan_steps:'計画ステップ',todo_subtasks:'サブタスク'
   }
 };
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
@@ -32976,7 +33101,41 @@ function statusClass(status){return `st-${normalizeStatus(status)}`}
 function statusLabel(status){const s=normalizeStatus(status);if(s==='in_progress')return t('status_in_progress');if(s==='completed')return t('status_completed');if(s==='blocked')return t('status_blocked');if(s==='deleted')return t('status_deleted');return t('status_pending')}
 function cleanWorkText(text,status=''){let s=String(text??'').replace(/\\s+/g,' ').trim();if(!s)return '';s=s.replace(/^\\[[ x>\\-]\\]\\s*/i,'');s=s.replace(/^(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*[·:\\-\\]]\\s*/i,'');if(status){const st=String(status).replace('_','[_\\\\-\\\\s]?');s=s.replace(new RegExp(`\\\\s*[—-]\\\\s*${st}\\\\s*$`,'i'),'')}s=s.replace(/\\s*[—-]\\s*(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*$/i,'');return s.trim()||String(text??'').trim()}
 function formatTs(ts){const v=Number(ts||0);if(!v)return '';try{return new Date(v*1000).toLocaleString()}catch(_){return ''}}
-function renderTodoBoard(items){const todos=Array.isArray(items)?items:[];if(!todos.length)return `<div class=\"mono\">${esc(t('no_todos'))}</div>`;const done=todos.filter(t=>normalizeStatus(t?.status)==='completed').length;const open=todos.length-done;const cards=todos.map((t,idx)=>{const status=normalizeStatus(t?.status);const content=cleanWorkText(t?.content,status)||'(empty todo)';const active=String(t?.activeForm||'').trim();const meta=status==='in_progress'&&active?`<div class=\"todo-meta\">${esc(cleanWorkText(active,status))}</div>`:'';return `<div class=\"todo-item ${statusClass(status)}\"><div class=\"todo-head\"><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span><span class=\"mono todo-index\">#${idx+1}</span></div><div class=\"todo-content\">${esc(content)}</div>${meta}</div>`}).join('');return `<div class=\"board-summary\"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div><div class=\"todo-list\">${cards}</div>`}
+function renderTodoBoard(items){
+  const todos=Array.isArray(items)?items:[];
+  if(!todos.length)return `<div class="mono">${esc(t('no_todos'))}</div>`;
+  const done=todos.filter(x=>normalizeStatus(x?.status)==='completed').length;
+  const open=todos.length-done;
+  function todoCard(item,idx,extraClass=''){
+    const status=normalizeStatus(item?.status);
+    const content=cleanWorkText(item?.content,status)||'(empty todo)';
+    const active=String(item?.activeForm||'').trim();
+    const meta=status==='in_progress'&&active?`<div class="todo-meta">${esc(cleanWorkText(active,status))}</div>`:'';
+    return `<div class="todo-item ${statusClass(status)}${extraClass?(' '+extraClass):''}"><div class="todo-head"><span class="status-badge ${statusClass(status)}">${esc(statusLabel(status))}</span><span class="mono todo-index">#${idx+1}</span></div><div class="todo-content">${esc(content)}</div>${meta}</div>`;
+  }
+  // Split into plan steps (bb:proj:) and worker subtasks
+  const planSteps=todos.filter(x=>String(x?.key||'').startsWith('bb:proj:'));
+  const workerTodos=todos.filter(x=>!String(x?.key||'').startsWith('bb:proj:'));
+  let html='';
+  if(planSteps.length&&workerTodos.length){
+    // Find active plan step index for subtask attachment
+    const activeStepIdx=planSteps.findIndex(x=>normalizeStatus(x?.status)==='in_progress');
+    html+=`<div class="todo-group-label">${esc(t('todo_plan_steps'))}</div><div class="todo-list">`;
+    planSteps.forEach((step,i)=>{
+      html+=todoCard(step,i);
+      // Attach worker subtasks under the active plan step
+      if(i===activeStepIdx&&workerTodos.length){
+        html+=`<div class="todo-group-label" style="margin-left:16px">${esc(t('todo_subtasks'))}</div>`;
+        workerTodos.forEach((sub,j)=>{html+=todoCard(sub,j,'todo-subtask');});
+      }
+    });
+    html+=`</div>`;
+  } else {
+    // No grouping needed — flat list
+    html+=`<div class="todo-list">${todos.map((x,i)=>todoCard(x,i)).join('')}</div>`;
+  }
+  return `<div class="board-summary"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div>${html}`;
+}
 function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
 function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;return st}
 function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}
@@ -40589,7 +40748,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
-        self.js_lib_root = offline_js_lib_root(self.workspace)
+        self.js_lib_root = offline_js_lib_root(SCRIPT_DIR)
         self.offline_js_summary: dict = {}
         try:
             self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
