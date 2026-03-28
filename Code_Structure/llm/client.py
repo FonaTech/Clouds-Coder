@@ -761,6 +761,116 @@ class OllamaClient:
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []) if isinstance(msg, dict) else [])
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
+    # ── Anthropic Messages API ─────────────────────────────────────
+
+    def _chat_anthropic(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+    ) -> dict:
+        endpoint = (self.endpoint or "").strip()
+        if not endpoint:
+            base = (self.base_url or "").strip().rstrip("/")
+            endpoint = f"{base}/v1/messages" if base else "https://api.anthropic.com/v1/messages"
+        # Separate system messages (Anthropic uses a dedicated 'system' parameter)
+        system_parts: list[str] = []
+        messages: list[dict] = []
+        for m in req_messages:
+            role = str(m.get("role", "") or "").strip()
+            content = m.get("content", "") or ""
+            if role == "system":
+                system_parts.append(str(content))
+            else:
+                # Convert OpenAI-style image_url parts to Anthropic image format
+                if isinstance(content, list):
+                    converted: list[dict] = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "image_url":
+                            url_data = part.get("image_url", {})
+                            url_str = str(url_data.get("url", "") if isinstance(url_data, dict) else url_data or "")
+                            dm = re.match(r"^data:([^;]+);base64,(.+)$", url_str, re.DOTALL)
+                            if dm:
+                                converted.append({
+                                    "type": "image",
+                                    "source": {"type": "base64", "media_type": dm.group(1), "data": dm.group(2)},
+                                })
+                            else:
+                                converted.append({"type": "image", "source": {"type": "url", "url": url_str}})
+                        else:
+                            converted.append(part)
+                    content = converted
+                messages.append({"role": role, "content": content})
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        if tools:
+            payload["tools"] = self._convert_tools_to_anthropic(tools)
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        raw = self._post_json_url(endpoint, payload, headers=headers)
+        content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def _extract_anthropic_message(self, raw: dict) -> tuple[str, list[dict], str]:
+        """Parse Anthropic Messages API response into (content, tool_calls, thinking)."""
+        content_blocks = raw.get("content", [])
+        if not isinstance(content_blocks, list):
+            # Fallback: try OpenAI format
+            if isinstance(raw.get("choices"), list):
+                return self._extract_openai_message(raw)
+            return str(content_blocks or ""), [], ""
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: list[dict] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip()
+            if btype == "text":
+                text_parts.append(str(block.get("text", "") or ""))
+            elif btype == "thinking":
+                thinking_parts.append(str(block.get("thinking", "") or ""))
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": str(block.get("id") or make_id("tool")),
+                    "type": "function",
+                    "function": {
+                        "name": str(block.get("name", "") or ""),
+                        "arguments": json_dumps(block.get("input", {})),
+                    },
+                })
+        return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
+
+    def _convert_tools_to_anthropic(self, openai_tools: list[dict]) -> list[dict]:
+        """Convert OpenAI-format tool definitions to Anthropic format."""
+        out: list[dict] = []
+        for t in openai_tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function", {})
+            if not isinstance(fn, dict):
+                continue
+            out.append({
+                "name": str(fn.get("name", "") or ""),
+                "description": str(fn.get("description", "") or ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        return out
+
     def _chat_ollama_stream_native(
         self,
         req_messages: list[dict],
@@ -884,6 +994,10 @@ class OllamaClient:
                 req_messages = sys_msgs + non_sys_msgs
         if provider in {"openai_compat", "openai", "siliconflow"}:
             return self._chat_openai_compat(
+                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+            )
+        if provider == "anthropic":
+            return self._chat_anthropic(
                 req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
             )
         if provider == "custom_http":

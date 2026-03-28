@@ -539,6 +539,11 @@ class SessionManager:
             return bool(endpoint or complete_chat_endpoint(base))
         if provider == "custom_http":
             return bool(str(profile.get("endpoint", "") or "").strip())
+        if provider == "anthropic":
+            api_key = str(profile.get("api_key", "") or "").strip()
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(api_key and (endpoint or base))
         return False
 
     def _option_is_runnable(self, option: dict) -> bool:

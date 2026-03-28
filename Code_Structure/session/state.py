@@ -778,6 +778,11 @@ class SessionState:
         if provider == "custom_http":
             endpoint = str(profile.get("endpoint", "") or "").strip()
             return bool(endpoint)
+        if provider == "anthropic":
+            api_key = str(profile.get("api_key", "") or "").strip()
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(api_key and (endpoint or base))
         return False
 
     def _option_is_runnable(self, option: dict) -> bool:
@@ -4499,7 +4504,7 @@ class SessionState:
         normalized = self._normalize_tool_path_text(path_text)
         if normalized == ".__skills__" or normalized.startswith(".__skills__/"):
             rel = normalized[len(".__skills__") :].lstrip("/")
-            return safe_path(rel or ".", self.skills.skills_root)
+            return self.skills.resolve_virtual_skill_path(rel or ".")
         if normalized == ".__js_lib__" or normalized.startswith(".__js_lib__/"):
             rel = normalized[len(".__js_lib__") :].lstrip("/")
             return safe_path(rel or ".", self.js_lib_root)
@@ -4518,10 +4523,9 @@ class SessionState:
         except Exception:
             pass
         try:
-            skills_root = self.skills.skills_root.resolve()
-            if target.is_relative_to(skills_root):
-                rel = target.relative_to(skills_root).as_posix()
-                return f"{SKILLS_VIRTUAL_PREFIX}/{rel}".replace("//", "/")
+            virtual_skill_path = self.skills.public_virtual_skill_path_for_abs(target)
+            if virtual_skill_path:
+                return virtual_skill_path
         except Exception:
             pass
         return str(target)
@@ -6912,7 +6916,7 @@ class SessionState:
             js_lib_root = str(self.js_lib_root.resolve())
         except Exception:
             js_lib_root = str(self.js_lib_root)
-        mappings = [
+        mappings = self.skills.shell_virtual_mappings() + [
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
             ("/js_lib", js_lib_root),
@@ -9426,6 +9430,7 @@ class SessionState:
                 clean_todos.append({
                     "id": trim(str(pt.get("id", "") or ""), 20),
                     "content": trim(str(pt.get("content", "") or ""), 400),
+                    "full_content": trim(str(pt.get("full_content", "") or ""), 1500),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
                     "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
@@ -10520,9 +10525,30 @@ class SessionState:
             pass
         # Immediately sync todos so UI reflects plan step advancement
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
+        # Inject hint for the next step (works in both single and multi-agent mode)
         if next_step:
             try:
-                pass  # Skills are loaded on-demand by the model via load_skill
+                _ns_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
+                _ns_total = int(bb.get("plan_step_total", 0) or 0)
+                _ns_text = trim(str(next_step.get("content", "") or ""), 200)
+                _ns_id = str(next_step.get("id", "") or "")
+                _ns_label = f"Step {_ns_idx}" + (f"/{_ns_total}" if _ns_total else "")
+                _hint = (
+                    f"[plan-step-advance] Previous step completed. Now at {_ns_label}: {_ns_text}\n"
+                    f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
+                    f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
+                    f"Each subtask MUST include parent_step_id='{_ns_id}'. "
+                    f"Create 3-5 items, one marked in_progress, others pending.\n"
+                    f"Do NOT create subtasks for other plan steps."
+                )
+                self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
+                # Also inject into active agent context for multi-agent mode
+                if self._is_multi_agent_mode():
+                    active_role = str(bb.get("active_agent", "") or actor)
+                    if active_role:
+                        self._append_agent_context_message(active_role, {
+                            "role": "system", "content": _hint, "ts": now_ts(), "agent_role": active_role,
+                        }, mirror_to_global=False)
             except Exception:
                 pass
         return True
@@ -10543,11 +10569,30 @@ class SessionState:
         worker_produced_output = self._worker_step_has_evidence(worker_step)
         # 3. All subtasks for this step are completed
         subtasks_all_done = self._step_subtasks_all_completed(current)
-        # Advance only when evidence confirms step completion:
+        # 4. File-evidence fallback: when worker doesn't call TodoWrite, use phase heuristics
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        results = worker_step.get("tool_results", []) or []
+        wrote_files_count = sum(
+            1 for r in results
+            if isinstance(r, dict) and r.get("ok", False)
+            and str(r.get("name", "")) in ("write_file", "edit_file")
+        )
+        ran_bash_ok = any(
+            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            for r in results
+        )
+        file_evidence_strong = (
+            phase in ("implement", "design") and wrote_files_count >= 2
+        ) or (
+            phase in ("test", "review") and ran_bash_ok
+        )
+        # Advance when:
         # - Manager requested AND worker produced output, OR
-        # - All subtasks completed AND worker produced output
+        # - All subtasks completed AND worker produced output, OR
+        # - Strong file evidence (fallback when worker forgets TodoWrite)
         has_strong_evidence = worker_produced_output and (
-            manager_requested or subtasks_all_done
+            manager_requested or subtasks_all_done or file_evidence_strong
         )
         if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
@@ -10569,7 +10614,8 @@ class SessionState:
         )
 
     def _step_subtasks_all_completed(self, plan_step: dict) -> bool:
-        """Check if all worker subtasks linked to this plan step are completed."""
+        """Check if all worker subtasks linked to this plan step are completed.
+        Filters out cross-step subtasks (e.g., 2.1 under step 1) to prevent blocking."""
         step_id = str(plan_step.get("id", "") or "")
         if not step_id:
             return False
@@ -10582,6 +10628,23 @@ class SessionState:
         ]
         if not worker_items:
             return False
+        # Extract major step number from plan step content (e.g., "1. Project init" → "1")
+        import re
+        step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        _m = re.match(r"^(\d+)\.", step_content.strip())
+        active_major = _m.group(1) if _m else ""
+        # Filter out cross-step subtasks (N.M where N != active major)
+        if active_major:
+            _cross_re = re.compile(r"^(\d+)\.\d+\s")
+            relevant = []
+            for r in worker_items:
+                rc = str(r.get("content", "") or "").strip()
+                cm = _cross_re.match(rc)
+                if cm and cm.group(1) != active_major:
+                    continue  # Skip cross-step items — don't let them block advancement
+                relevant.append(r)
+            if relevant:
+                worker_items = relevant
         return all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
 
     def _collect_step_evidence(self, plan_step: dict, worker_step: dict) -> str:
@@ -10621,9 +10684,7 @@ class SessionState:
             self._sync_todos_from_blackboard(reason="single-agent-round")
             return
         # Heuristic: check if tool results indicate step completion
-        # - write_file/edit_file calls suggest implementation progress
-        # - successful bash calls suggest testing/verification
-        step_content = str(current.get("content", "") or "").lower()
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
         wrote_files = any(
             str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
@@ -10633,19 +10694,27 @@ class SessionState:
             str(r.get("name", "")) == "bash" and r.get("ok", False)
             for r in tool_results
         )
-        # Auto-advance conditions based on phase:
+        called_todo_write = any(
+            str(r.get("name", "")) == "TodoWrite"
+            for r in tool_results
+        )
+        # Auto-advance conditions:
         should_advance = False
-        if phase in ("research", "design") and wrote_files:
-            # Research/design phase completed when files are produced
+        # Priority 1: Check if worker subtasks are all completed (most reliable signal)
+        subtasks_done = self._step_subtasks_all_completed(current)
+        if subtasks_done and (wrote_files or ran_bash_ok):
             should_advance = True
-        elif phase == "implement" and wrote_files and ran_bash_ok:
-            # Implementation completed when files written and bash succeeds
-            should_advance = True
-        elif phase in ("test", "review") and ran_bash_ok and not any(
-            not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
-        ):
-            # Test/review completed when all bash calls succeed
-            should_advance = True
+        # Priority 2: Phase-based heuristics (relaxed — wrote_files OR bash, not both)
+        if not should_advance:
+            if phase in ("research", "design") and wrote_files:
+                should_advance = True
+            elif phase == "implement" and wrote_files:
+                # Relaxed: implement step done when files are written (don't require bash)
+                should_advance = True
+            elif phase in ("test", "review") and ran_bash_ok and not any(
+                not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
+            ):
+                should_advance = True
         # Also check if the agent explicitly mentioned step completion
         if not should_advance:
             # Check last assistant message for step completion signals
@@ -10673,12 +10742,15 @@ class SessionState:
                     _step_idx = int(_new_step.get("plan_step_index", 0) or 0) + 1
                     _total = int(_bb_after.get("plan_step_total", 0) or 0)
                     _step_text = trim(str(_new_step.get("content", "") or ""), 200)
+                    _step_id = str(_new_step.get("id", "") or "")
                     _step_label = f"Step {_step_idx}" + (f"/{_total}" if _total else "")
                     _hint = (
                         f"[plan-step-advance] Previous step completed. Now at {_step_label}: {_step_text}\n"
                         f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
-                        "Call TodoWrite to set your task breakdown for this step "
-                        "(3-5 subtask items, one marked in_progress) before proceeding."
+                        f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
+                        f"Each subtask MUST include parent_step_id='{_step_id}'. "
+                        f"Create 3-5 items, one marked in_progress, others pending.\n"
+                        f"Do NOT create subtasks for other plan steps."
                     )
                     self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
             except Exception:
@@ -10739,6 +10811,58 @@ class SessionState:
         active_system = [r for r in system_rows if r.get("status") != "completed"]
         completed_system = [r for r in system_rows if r.get("status") == "completed"]
         trimmed_system = active_system + completed_system[-3:]
+        # ── Subtask conflict guard ──
+        # Remove worker subtasks whose content duplicates a plan step to prevent
+        # the UI from showing the same task twice (once as plan step, once as subtask).
+        if trimmed_system:
+            import re as _re_dedup
+            plan_content_set = set()
+            for sr in trimmed_system:
+                pc = str(sr.get("content", "") or "").strip().lower()
+                if pc:
+                    plan_content_set.add(pc)
+                    # Also add first line only (sub-step headers match full step content)
+                    first_line = pc.split("\n")[0].strip()
+                    if first_line:
+                        plan_content_set.add(first_line)
+            # Build stripped-prefix set for fuzzy matching ("步骤 1：XXX" → "XXX")
+            _num_prefix_re = _re_dedup.compile(r"^(?:步骤\s*\d+[：:]\s*|\d+\.\s*|step\s*\d+[：:]\s*)", _re_dedup.IGNORECASE)
+            plan_stripped_set = set()
+            for sr in trimmed_system:
+                pc = str(sr.get("content", "") or "").strip().lower()
+                stripped = _num_prefix_re.sub("", pc).strip()
+                if stripped and len(stripped) > 4:
+                    plan_stripped_set.add(stripped)
+            # Find current active step major number for cross-step detection
+            _active_major = ""
+            for sr in trimmed_system:
+                if sr.get("status") == "in_progress":
+                    mc = str(sr.get("content", "") or "")
+                    _am = _re_dedup.match(r"^(\d+)\.", mc)
+                    if _am:
+                        _active_major = _am.group(1)
+                    break
+            _cross_step_re = _re_dedup.compile(r"^(\d+)\.\d+\s")
+            deduped_worker = []
+            for wr in worker_rows:
+                wc = str(wr.get("content", "") or "").strip().lower()
+                if not wc:
+                    deduped_worker.append(wr)
+                    continue
+                # Layer 1: Exact match
+                if wc in plan_content_set:
+                    continue
+                # Layer 2: Stripped prefix match
+                wc_stripped = _num_prefix_re.sub("", wc).strip()
+                if wc_stripped and wc_stripped in plan_stripped_set:
+                    continue
+                # Layer 3: Cross-step detection — reject N.M subtasks where N != active major
+                if _active_major:
+                    cm = _cross_step_re.match(wc)
+                    if cm and cm.group(1) != _active_major:
+                        continue
+                deduped_worker.append(wr)
+            worker_rows = deduped_worker
         remaining_cap = max(0, 40 - len(trimmed_system) - len(worker_rows))
         merged = list(trimmed_system) + worker_rows + non_system_rows[:remaining_cap]
         try:
@@ -11534,6 +11658,13 @@ class SessionState:
         _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
         if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
             level = int(self.user_task_level_override)
+        # Floor protection: if plan was approved, do not allow downgrade below floor
+        _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
+        if _level_floor > 0 and int(level) < _level_floor:
+            level = _level_floor
+        _complexity_floor = str(getattr(self, 'runtime_complexity_floor', '') or '').strip()
+        if _complexity_floor == "complex" and complexity == "simple":
+            complexity = "complex"
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
         self.runtime_execution_mode = mode
@@ -11903,7 +12034,7 @@ class SessionState:
             idx = int(t.get("plan_step_index", 0) or 0) + 1
             status = t.get("status", "pending")
             mark = "✅" if status == "completed" else "👉" if status == "in_progress" else "⬜"
-            phase_hint = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+            phase_hint = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
         lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
@@ -11966,7 +12097,7 @@ class SessionState:
         bb = self._ensure_blackboard()
         for t in bb.get("project_todos", []):
             if t.get("category") == "plan_step" and t.get("status") == "in_progress":
-                phase = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+                phase = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
                 if phase:
                     return phase
         # Fallback: infer from blackboard state
@@ -13741,7 +13872,7 @@ class SessionState:
         if isinstance(plan_todos, list):
             for pt in plan_todos:
                 if isinstance(pt, dict) and pt.get("category") == "plan_step" and pt.get("status") == "in_progress":
-                    step_text = trim(str(pt.get("content", "") or ""), 300)
+                    step_text = trim(str(pt.get("full_content", "") or pt.get("content", "") or ""), 600)
                     step_idx = int(pt.get("plan_step_index", 0) or 0) + 1
                     current_plan_step_note = (
                         f"CURRENT PLAN STEP (#{step_idx}): {step_text}\n"
@@ -13759,10 +13890,14 @@ class SessionState:
                         _active_step_id = str(_pt.get("id", "") or "")
                         break
             todo_update_note = (
-                f"TODO UPDATE: At the START of your work, call TodoWrite to set subtasks for this step.\n"
-                f"Each subtask MUST include parent_step_id='{_active_step_id}' to link it to this plan step.\n"
-                f"Format: 3-5 items, one marked in_progress, others pending.\n"
-                f"Mark each subtask completed as you finish it. When ALL subtasks are done, the step auto-advances.\n"
+                f"TODO UPDATE: Call TodoWrite at the START to set subtasks for THIS step ONLY.\n"
+                f"Each subtask MUST include parent_step_id='{_active_step_id}'.\n"
+                f"CRITICAL SCOPE RULE:\n"
+                f"- Create 3-5 subtasks that break down ONLY the current step's work.\n"
+                f"- Do NOT create subtasks for other plan steps (do NOT list step 2, 3, 4 etc.).\n"
+                f"- Do NOT duplicate the plan step titles as subtasks.\n"
+                f"- Each subtask should be a concrete action within THIS step.\n"
+                f"Mark each subtask completed as you finish it. When ALL are done, the step auto-advances.\n"
             )
         # Build step_files context note for cross-agent file visibility
         step_files_note = ""
@@ -17201,8 +17336,15 @@ class SessionState:
             self.runtime_plan_approved = True
             return
 
-        # Phase 3: Emit 方案到前端
+        # Synthesis Step 1: 立即写 plan.md（与 synthesis 思维连续，避免信息丢失）
         self.runtime_plan_proposal = proposal
+        try:
+            self._write_plan_file(self._format_plan_file_preselection(proposal))
+        except Exception:
+            pass
+        self._emit("status", {"summary": "plan-mode: plan.md written"})
+
+        # Synthesis Step 2: 更新 blackboard + 生成精简 bubble
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
             bb["plan"] = {"phase": "awaiting_choice", "findings": []}
@@ -17210,13 +17352,7 @@ class SessionState:
         bb["plan"]["proposal"] = proposal
         self.blackboard = bb
 
-        # Write full plan to file for model consumption
-        try:
-            self._write_plan_file(self._format_plan_file_preselection(proposal))
-        except Exception:
-            pass
-
-        # Condensed bubble for UI (under PLAN_BUBBLE_MAX_CHARS)
+        # Phase 3: Emit bubble 到前端（纯输出，不做额外思考）
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -17739,7 +17875,38 @@ class SessionState:
             f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
             f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
             f"- Each step should be completable in 1-3 tool calls\n"
-            f"- Group related substeps under numbered headings (e.g., '2.1 Read report 1', '2.2 Read report 2')\n"
+            f"\nSTEP STRUCTURE — MAJOR STEPS WITH SUB-STEPS:\n"
+            f"Organize steps into MAJOR numbered groups. Each major step has:\n"
+            f"  1) A summary title line: \"N. Summary Title\" (e.g., \"1. Project Initialization\")\n"
+            f"  2) Sub-steps: \"N.1 Sub-step title\\nConcrete details\\nN.2 Next sub-step\\nDetails\"\n"
+            f"\nThe steps array should contain one string per MAJOR step. "
+            f"Each string starts with the summary title, followed by sub-steps.\n"
+            f"\nExample steps array with 3 major steps:\n"
+            f"[\n"
+            f"  \"1. Project Initialization and Build\\n"
+            f"1.1 Initialize project structure\\n"
+            f"Create directories: src/python/, src/fortran/, tests/, docs/\\n"
+            f"1.2 Configure build system\\n"
+            f"Create CMakeLists.txt with Fortran compiler config\\n"
+            f"Run: cmake -B build -S . && cmake --build build\",\n"
+            f"  \"2. Core Module Implementation\\n"
+            f"2.1 Implement data model\\n"
+            f"Create src/models/data.py with schema definitions\\n"
+            f"2.2 Implement business logic\\n"
+            f"Create src/services/processor.py\",\n"
+            f"  \"3. Testing and Documentation\\n"
+            f"3.1 Unit tests\\n"
+            f"Create tests/test_models.py\\n"
+            f"Run: pytest tests/\\n"
+            f"3.2 Write documentation\\n"
+            f"Create docs/README.md\"\n"
+            f"]\n"
+            f"\nRules:\n"
+            f"- Each major step = one array element with summary title + 2-5 sub-steps\n"
+            f"- Summary title captures the THEME of that group (not just repeat the first sub-step)\n"
+            f"- Sub-steps include specific file paths, commands, or expected outputs\n"
+            f"- Aim for 5-8 major steps for complex tasks, 3-5 for simpler ones\n"
+            f"\n"
             f"Make options meaningfully different (e.g. different approaches, scope levels, or trade-offs).\n"
             "\nVERIFICATION & TESTING:\n"
             "Judge from the task content and research findings whether the task involves writing, "
@@ -17921,8 +18088,22 @@ class SessionState:
             steps = opt.get("steps", [])
             if isinstance(steps, list) and steps:
                 lines.append("\n### Steps")
+                import re as _re_plan
+                _mid_re = _re_plan.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
                 for i, s in enumerate(steps):
-                    lines.append(f"{i + 1}. {s}")
+                    step_str = str(s or "").strip()
+                    # Normalize: split mid-string N.N sub-step numbers onto own lines
+                    step_str = _mid_re.sub(r"\n\1", step_str)
+                    if "\n" in step_str:
+                        # Multi-line step: first line as header, rest as nested list
+                        step_lines = step_str.split("\n")
+                        lines.append(f"{i + 1}. {step_lines[0]}")
+                        for sub in step_lines[1:]:
+                            stripped = sub.strip()
+                            if stripped:
+                                lines.append(f"   - {stripped}")
+                    else:
+                        lines.append(f"{i + 1}. {step_str}")
             pros = str(opt.get("pros", "") or "").strip()
             if pros:
                 lines.append(f"\n**Pros:** {pros}")
@@ -17962,14 +18143,22 @@ class SessionState:
         if summary:
             lines.append(f"## Summary\n{summary}\n")
         lines.append("## Steps\n")
+        import re as _re_exec
+        _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
         for t in plan_todos:
             idx = int(t.get("plan_step_index", 0) or 0) + 1
-            text = str(t.get("content", "") or "").strip()
+            full = str(t.get("full_content", "") or t.get("content", "")).strip()
+            # Normalize: split concatenated N.N sub-steps onto own lines
+            full = _mid_re_exec.sub(r"\n\1", full)
+            header = full.split("\n")[0] if "\n" in full else full
+            sub_lines = [ln for ln in full.split("\n")[1:] if ln.strip()] if "\n" in full else []
             status = str(t.get("status", "pending") or "pending")
             if status == "completed":
                 actor = str(t.get("completed_by", "") or "")
                 evidence = str(t.get("evidence", "") or "")
-                lines.append(f"- [x] Step {idx}: {text}")
+                lines.append(f"- [x] Step {idx}: {header}")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
                 meta_parts = []
                 if actor:
                     meta_parts.append(f"Completed by: {actor}")
@@ -17978,9 +18167,13 @@ class SessionState:
                 if meta_parts:
                     lines.append(f"  > {' | '.join(meta_parts)}")
             elif status == "in_progress":
-                lines.append(f"- [>] Step {idx}: {text}  <-- CURRENT")
+                lines.append(f"- [>] Step {idx}: {header}  <-- CURRENT")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
             else:
-                lines.append(f"- [ ] Step {idx}: {text}")
+                lines.append(f"- [ ] Step {idx}: {header}")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
         return "\n".join(lines) + "\n"
 
     def _update_plan_file_step_status(self) -> bool:
@@ -18033,13 +18226,120 @@ class SessionState:
 
     def _plan_file_read_instruction(self) -> str:
         """Short instruction for models: read the plan file instead of embedding full plan text."""
+        # Find active step id for parent_step_id linkage
+        bb = self._ensure_blackboard()
+        active_step_id = ""
+        active_step_idx = 0
+        for t in bb.get("project_todos", []):
+            if isinstance(t, dict) and t.get("category") == "plan_step" and t.get("status") == "in_progress":
+                active_step_id = str(t.get("id", "") or "")
+                active_step_idx = int(t.get("plan_step_index", 0) or 0) + 1
+                break
+        todo_note = ""
+        if active_step_id:
+            todo_note = (
+                f"\nTODO UPDATE: Call TodoWrite at the START to set subtasks for the current step (Step {active_step_idx}) ONLY.\n"
+                f"Each subtask MUST include parent_step_id='{active_step_id}'.\n"
+                f"Create 3-5 subtasks that break down ONLY the current step's work.\n"
+                f"Do NOT create subtasks for other plan steps. Mark each subtask completed as you finish it.\n"
+            )
         return (
             f"[plan-file] The approved execution plan is at `{PLAN_FILE_RELATIVE_PATH}`.\n"
             f"Use: read_file {PLAN_FILE_RELATIVE_PATH} to review full steps and live status.\n"
             "The plan file is the authoritative source for step ordering and completion status.\n"
             "Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing.\n"
             "If a step references a skill or workflow, call load_skill to load it before proceeding."
+            f"{todo_note}"
         )
+
+    @staticmethod
+    def _group_plan_steps(raw_steps: list) -> list[str]:
+        """Group flat step array by major step number (first digit of N.N).
+
+        All 1.x sub-steps merge into one logical step, all 2.x into another, etc.
+        If a step has the format "N. Summary title" (single digit, no sub-number),
+        it becomes the group header. Otherwise a header is synthesized from the
+        first sub-step.
+
+        Handles LLM output where sub-steps may be separate array elements OR
+        concatenated in one string with spaces/newlines.
+
+        Returns a list where each element is one major step (multi-line string):
+          "1. Summary Title\\n1.1 Sub-step A\\nDetail...\\n1.2 Sub-step B\\n..."
+        """
+        import re
+        if not raw_steps or not isinstance(raw_steps, list):
+            return list(raw_steps or [])
+        # Patterns
+        sub_step_re = re.compile(r"^(\d+)\.(\d+)\s")   # "N.M ..."
+        major_step_re = re.compile(r"^(\d+)\.\s")       # "N. ..." (summary line)
+        mid_numbered_re = re.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
+        # Phase 0: Normalize — split mid-string N.N onto own lines
+        normalized: list[str] = []
+        for s in raw_steps:
+            text = str(s or "").strip()
+            if not text:
+                continue
+            fixed = mid_numbered_re.sub(r"\n\1", text)
+            for line in fixed.split("\n"):
+                stripped = line.strip()
+                if stripped:
+                    normalized.append(stripped)
+        if not normalized:
+            return [str(s) for s in raw_steps if str(s or "").strip()]
+        # Phase 1: Check if any N.N sub-step headers exist
+        has_sub_steps = any(sub_step_re.match(ln) for ln in normalized)
+        if not has_sub_steps:
+            return normalized
+        # Phase 2: Group by major number (first digit of N.N)
+        from collections import OrderedDict
+        major_groups: OrderedDict[str, list[str]] = OrderedDict()
+        major_headers: dict[str, str] = {}  # major_num → "N. Summary" if provided
+        orphan_lines: list[str] = []
+        current_major: str = ""
+        for line in normalized:
+            m_sub = sub_step_re.match(line)
+            m_major = major_step_re.match(line)
+            if m_sub:
+                major_num = m_sub.group(1)
+                current_major = major_num
+                if major_num not in major_groups:
+                    major_groups[major_num] = []
+                major_groups[major_num].append(line)
+            elif m_major:
+                # "N. Summary title" line → store as header for this major group
+                major_num = m_major.group(1)
+                current_major = major_num
+                major_headers[major_num] = line
+                if major_num not in major_groups:
+                    major_groups[major_num] = []
+            else:
+                # Detail line → attach to current major group
+                if current_major and current_major in major_groups:
+                    major_groups[current_major].append(line)
+                else:
+                    orphan_lines.append(line)
+        # Phase 3: Build output — each major group becomes one step
+        result: list[str] = []
+        if orphan_lines:
+            result.append("\n".join(orphan_lines))
+        for major_num, lines in major_groups.items():
+            if not lines:
+                continue
+            header = major_headers.get(major_num, "")
+            if not header:
+                # Synthesize header from first sub-step: "N. <first sub-step title>"
+                first_sub = lines[0]
+                m = sub_step_re.match(first_sub)
+                if m:
+                    # Extract title part after "N.M "
+                    title_part = first_sub[m.end():].split("\n")[0].strip()
+                    # Remove detail after title (heuristic: title is before first Chinese/action verb)
+                    header = f"{major_num}. {title_part}" if title_part else f"{major_num}. Step {major_num}"
+                else:
+                    header = f"{major_num}. Step {major_num}"
+            result.append(header + "\n" + "\n".join(lines))
+        return result
 
     # ── (legacy) _format_plan_proposal_markdown ──────────────────────
 
@@ -18192,16 +18492,20 @@ class SessionState:
         self.runtime_complexity_floor = str(self.runtime_task_complexity or "complex")
         self.runtime_task_level_floor = int(self.runtime_task_level or 4)
         # Auto-create todos from plan steps → write into bb["project_todos"]
-        steps = chosen.get("steps", [])
+        steps = self._group_plan_steps(chosen.get("steps", []))
         if steps and isinstance(steps, list):
             plan_todos = []
             for i, step in enumerate(steps):
-                step_text = trim(str(step or "").strip(), 600)
+                step_text = trim(str(step or "").strip(), 1500)
                 if not step_text:
                     continue
+                # Extract header (first line) for todo display; keep full text for plan.md rendering
+                step_lines = step_text.split("\n")
+                step_header = step_lines[0].strip()
                 plan_todos.append({
                     "id": f"pt:{i:03d}",
-                    "content": step_text,
+                    "content": step_header,
+                    "full_content": step_text,
                     "status": "in_progress" if i == 0 else "pending",
                     "category": "plan_step",
                     "plan_step_index": i,

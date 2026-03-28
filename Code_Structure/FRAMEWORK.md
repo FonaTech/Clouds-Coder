@@ -5,7 +5,7 @@
 - Source file: `/Users/macbookair/Downloads/Split Coder/Clouds_Coder.py`
 - Output directory: `/Users/macbookair/Downloads/Split Coder/Code_Structure`
 - Generated modules: 29
-- Top-level symbols: 475
+- Top-level symbols: 478
 - Entry point present: yes
 - Unclassified symbols: 0
 
@@ -66,7 +66,7 @@ Code_Structure/
 | `agent/todo.py` | 1 | `utils/text.py` |
 | `agent/worktree.py` | 1 | `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
 | `app/context.py` | 1 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `session/manager.py`, `session/state.py`, `skills/store.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
-| `config/constants.py` | 269 | `utils/json_utils.py`, `utils/misc.py` |
+| `config/constants.py` | 270 | `utils/json_utils.py`, `utils/misc.py` |
 | `config/paths.py` | 8 | `utils/text.py` |
 | `config/settings.py` | 24 | `config/constants.py`, `config/paths.py`, `llm/utils.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
 | `llm/client.py` | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
@@ -78,7 +78,7 @@ Code_Structure/
 | `server/handlers.py` | 5 | `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/utils.py`, `session/manager.py`, `session/state.py`, `skills/store.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py` |
 | `session/manager.py` | 1 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `session/state.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` |
 | `session/state.py` | 1 | `agent/background.py`, `agent/bus.py`, `agent/events.py`, `agent/tasks.py`, `agent/todo.py`, `agent/worktree.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/parsers.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` |
-| `skills/store.py` | 21 | `config/constants.py`, `config/paths.py`, `llm/utils.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
+| `skills/store.py` | 23 | `config/constants.py`, `config/paths.py`, `llm/utils.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` |
 | `utils/compress.py` | 2 | — |
 | `utils/crypto.py` | 1 | `utils/json_utils.py` |
 | `utils/errors.py` | 2 | — |
@@ -95,61 +95,61 @@ Code_Structure/
 - Routed symbols: 2
 - Cross-module imports: `app/context.py`: `AppContext`; `config/constants.py`: `AGENT_MAX_OUTPUT_TOKENS`, `ARBITER_DEFAULT_MAX_TOKENS`, `ARBITER_DEFAULT_TEMPERATURE`, `ARBITER_DEFAULT_TIMEOUT_SECONDS`, `CODE_ADMIN_PORT_OFFSET`, `DEFAULT_OLLAMA_BASE_URL`, `DEFAULT_OLLAMA_MODEL`, `DEFAULT_UI_LANGUAGE`, `DEFAULT_UI_STYLE`, `DEFAULT_WEB_UI_CONFIG`, `DEFAULT_WEB_UI_DIR`, `EXECUTION_MODE_SYNC`, `LIVE_INPUT_DELAY_NORMAL_ROUNDS`, `LIVE_INPUT_DELAY_TOOL_ROUNDS`, `LIVE_INPUT_DELAY_WRITE_ROUNDS`, `LIVE_INPUT_MAX_INJECTIONS`, `LIVE_INPUT_REINJECT_INTERVAL`, `LIVE_INPUT_WEIGHT_BASE_DELAYED`, `LIVE_INPUT_WEIGHT_BASE_NORMAL`, `LIVE_INPUT_WEIGHT_STEP_DELAYED`, `LIVE_INPUT_WEIGHT_STEP_NORMAL`, `MAX_AGENT_ROUNDS`, `MAX_AGENT_ROUNDS_CAP`, `MAX_RUN_SECONDS`, `MAX_RUN_TIMEOUT_SECONDS`, `MIN_AGENT_ROUNDS`, `MIN_CONTEXT_TOKEN_LIMIT`, `MIN_RUN_TIMEOUT_SECONDS`, `OFFLINE_JS_LIB_CATALOG`, `RAG_ADMIN_PORT_OFFSET`, `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`, `TOKEN_THRESHOLD`, `UI_LANGUAGE_LABELS`, `UI_STYLE_LABELS`; `config/paths.py`: `LLM_CONFIG_PATH`, `REPO_ROOT`, `WORKDIR`; `config/settings.py`: `_to_bool_like`, `extract_js_lib_download_setting`, `extract_show_upload_list_setting`, `extract_ui_style_setting`, `load_llm_config_from_source`, `load_web_ui_config_file`, `normalize_execution_mode`, `normalize_ui_language`, `normalize_ui_style`, `parse_llm_config_profiles`, `resolve_optional_file_path`, `resolve_web_ui_dir_path`, `select_preferred_skills_root`; `llm/utils.py`: `list_ollama_models`; `server/handlers.py`: `AgentHTTPServer`, `CodeAdminHandler`, `Handler`, `RagAdminHandler`, `SkillsHandler`; `skills/store.py`: `ensure_embedded_skills_at_root`, `ensure_runtime_skills`; `utils/files.py`: `ensure_offline_js_libs`; `utils/misc.py`: `BENIGN_SOCKET_DEBUG_LOG_ENABLED`, `detect_local_lan_ip`, `normalize_timeout_seconds`, `swallow_benign_socket_error`; `utils/text.py`: `trim`
 - Symbols:
-  - `main` (function, lines 44678-45526)
-  - `_main_guard_45528` (main_guard, lines 45528-45529)
+  - `main` (function, lines 46423-47273)
+  - `_main_guard_47275` (main_guard, lines 47275-47276)
 
 ### `agent/background.py`
 
 - Routed symbols: 1
 - Cross-module imports: `utils/misc.py`: `make_id`, `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `BackgroundManager` (class, lines 8183-8263)
+  - `BackgroundManager` (class, lines 9479-9559)
 
 ### `agent/bus.py`
 
 - Routed symbols: 1
 - Cross-module imports: `config/constants.py`: `VALID_MSG_TYPES`; `utils/crypto.py`: `CryptoBox`; `utils/misc.py`: `now_ts`
 - Symbols:
-  - `MessageBus` (class, lines 8265-8319)
+  - `MessageBus` (class, lines 9561-9615)
 
 ### `agent/events.py`
 
 - Routed symbols: 1
 - Cross-module imports: none
 - Symbols:
-  - `EventHub` (class, lines 4031-4076)
+  - `EventHub` (class, lines 4206-4251)
 
 ### `agent/tasks.py`
 
 - Routed symbols: 1
 - Cross-module imports: `utils/crypto.py`: `CryptoBox`; `utils/json_utils.py`: `json_dumps`; `utils/misc.py`: `now_ts`
 - Symbols:
-  - `TaskManager` (class, lines 8055-8181)
+  - `TaskManager` (class, lines 9351-9477)
 
 ### `agent/todo.py`
 
 - Routed symbols: 1
 - Cross-module imports: `utils/text.py`: `normalize_work_text`, `trim`
 - Symbols:
-  - `TodoManager` (class, lines 4078-4260)
+  - `TodoManager` (class, lines 4253-4435)
 
 ### `agent/worktree.py`
 
 - Routed symbols: 1
 - Cross-module imports: `agent/tasks.py`: `TaskManager`; `config/constants.py`: `DANGEROUS_PATTERNS`; `utils/crypto.py`: `CryptoBox`; `utils/json_utils.py`: `json_dumps`; `utils/misc.py`: `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `WorktreeManager` (class, lines 8321-8532)
+  - `WorktreeManager` (class, lines 9617-9828)
 
 ### `app/context.py`
 
 - Routed symbols: 1
 - Cross-module imports: `config/constants.py`: `AGENT_MAX_OUTPUT_TOKENS`, `APP_CSS`, `APP_JS`, `APP_TS`, `ARBITER_DEFAULT_MAX_TOKENS`, `ARBITER_DEFAULT_TEMPERATURE`, `ARBITER_DEFAULT_TIMEOUT_SECONDS`, `CODE_ADMIN_CSS`, `CODE_ADMIN_INDEX_HTML`, `CODE_ADMIN_JS`, `CODE_IMPORT_WORKER_COUNT`, `CODE_LIBRARY_DIRNAME`, `CODE_PARSE_TIMEOUT_SECONDS`, `DEFAULT_REQUEST_TIMEOUT`, `DEFAULT_UI_LANGUAGE`, `DEFAULT_UI_STYLE`, `DEFAULT_WEB_UI_DIR`, `EXECUTION_MODE_SYNC`, `INDEX_HTML`, `MAX_AGENT_ROUNDS`, `MAX_AGENT_ROUNDS_CAP`, `MAX_RUN_SECONDS`, `MAX_RUN_TIMEOUT_SECONDS`, `MIN_AGENT_ROUNDS`, `MIN_CONTEXT_TOKEN_LIMIT`, `MIN_RUN_TIMEOUT_SECONDS`, `RAG_ADMIN_CSS`, `RAG_ADMIN_INDEX_HTML`, `RAG_ADMIN_JS`, `RAG_GRAPH_MAX_NODES`, `RAG_IMPORT_WORKER_COUNT`, `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`, `RAG_LIBRARY_DIRNAME`, `RAG_MAX_GLOBAL_COMMUNITIES`, `RAG_MAX_IMPORT_BATCH_BYTES`, `RAG_MAX_IMPORT_BATCH_ITEMS`, `RAG_MAX_IMPORT_FILES`, `RAG_MAX_QUERY_RESULTS`, `RAG_PARSE_TIMEOUT_SECONDS`, `RAG_QUERY_CONTEXT_CHARS`, `SKILLS_APP_JS`, `SKILLS_EXTRA_CSS`, `SKILLS_INDEX_HTML`, `SKILL_REFRESH_MIN_INTERVAL_SECONDS`, `TOKEN_THRESHOLD`, `WEB_UI_OPTIONAL_FILES`, `WEB_UI_REQUIRED_FILES`; `config/paths.py`: `LLM_CONFIG_PATH`, `REPO_ROOT`, `SCRIPT_DIR`, `_migrate_legacy_runtime_roots`; `config/settings.py`: `default_multimodal_capabilities`, `infer_model_multimodal_capabilities`, `merge_multimodal_capabilities`, `model_language_instruction`, `normalize_execution_mode`, `normalize_ui_language`, `normalize_ui_style`, `parse_capability_overrides`, `parse_llm_config_profiles`, `resolve_optional_file_path`, `resolve_web_ui_dir_path`; `llm/client.py`: `OllamaClient`; `llm/utils.py`: `extract_base_url`; `rag/ingestion.py`: `CodeIngestionService`, `RAGIngestionService`; `rag/parsers.py`: `CodeContentParser`, `RAGContentParser`; `rag/store.py`: `CodeLibraryStore`, `RAGLibraryStore`; `session/manager.py`: `SessionManager`; `session/state.py`: `SessionState`; `skills/store.py`: `SkillStore`, `_sanitize_skill_slug`, `analyze_skill_building_knowledge`, `ensure_runtime_skills`; `utils/crypto.py`: `CryptoBox`; `utils/files.py`: `_resolve_js_lib_asset_path`, `ensure_offline_js_libs`, `load_offline_js_lib_index`, `offline_js_lib_root`, `safe_path`, `try_read_text`; `utils/json_utils.py`: `TOOLS`, `extract_json_object_from_text`, `json_dumps`, `parse_json_object`; `utils/misc.py`: `DEFAULT_TIMEOUT_SECONDS`, `MAX_TIMEOUT_SECONDS`, `MIN_TIMEOUT_SECONDS`, `normalize_timeout_seconds`, `now_ts`, `sanitize_profile_id`; `utils/text.py`: `parse_front_matter`, `trim`
 - Symbols:
-  - `AppContext` (class, lines 41178-43487)
+  - `AppContext` (class, lines 42904-45213)
 
 ### `config/constants.py`
 
-- Routed symbols: 269
+- Routed symbols: 270
 - Cross-module imports: `utils/json_utils.py`: `TOOL_SPEC_BY_NAME`; `utils/misc.py`: `DEFAULT_TIMEOUT_SECONDS`
 - Symbols:
   - `APP_VERSION` (constant, lines 48-48)
@@ -318,109 +318,110 @@ Code_Structure/
   - `SKILL_BODY_COMPACT_THRESHOLD_CHARS` (constant, lines 448-448)
   - `SKILL_BODY_PREVIEW_CHARS` (constant, lines 449-449)
   - `SKILLS_VIRTUAL_PREFIX` (constant, lines 450-450)
-  - `PLAN_MODE_ENABLED_LEVELS` (constant, lines 451-451)
-  - `PLAN_MODE_FORCED_LEVELS` (constant, lines 452-452)
-  - `PLAN_MODE_USER_CHOICES` (constant, lines 453-453)
-  - `TASK_PHASES` (constant, lines 455-455)
-  - `TASK_PHASE_ROUTING` (constant, lines 456-463)
-  - `COMPLEXITY_KEYWORDS` (constant, lines 465-470)
-  - `PLAN_MODE_EXPLORER_MAX_ROUNDS` (constant, lines 471-471)
-  - `REVIEWER_DEBUG_MODE_MAX_ROUNDS` (constant, lines 473-473)
-  - `REVIEWER_DEBUG_TOOL_ALLOWLIST` (constant, lines 474-478)
-  - `EXPLORER_STALL_THRESHOLD` (constant, lines 479-479)
-  - `DEVELOPER_EDIT_STALL_THRESHOLD` (constant, lines 480-480)
-  - `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS` (constant, lines 481-481)
-  - `PLAN_MODE_MAX_OPTIONS` (constant, lines 482-482)
-  - `PLAN_FILE_RELATIVE_PATH` (constant, lines 483-483)
-  - `PLAN_BUBBLE_MAX_CHARS` (constant, lines 484-484)
-  - `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST` (constant, lines 485-489)
-  - `FAILURE_LEDGER_MAX_FIXES` (constant, lines 490-490)
-  - `FAILURE_LEDGER_MAX_COMPILE_ERRORS` (constant, lines 491-491)
-  - `FAILURE_LEDGER_MAX_DELEGATIONS` (constant, lines 492-492)
-  - `FAILURE_LEDGER_MAX_STALLS` (constant, lines 493-493)
-  - `FAILURE_LEDGER_MAX_TOOL_FPS` (constant, lines 494-494)
-  - `FAILURE_LEDGER_MAX_ERRORS` (constant, lines 495-495)
-  - `ERROR_CATEGORY_DEFS` (constant, lines 498-535)
-  - `CHECKPOINT_MAX_COUNT` (constant, lines 536-536)
-  - `CHECKPOINT_INTERVAL_ROUNDS` (constant, lines 537-537)
-  - `PERSISTED_ROUTES_MAX` (constant, lines 538-538)
-  - `HTML_FRONTEND_REQUEST_KEYWORDS` (constant, lines 539-578)
-  - `DEEP_RESEARCH_REQUEST_KEYWORDS` (constant, lines 579-601)
-  - `DEEP_RESEARCH_RETRIEVAL_KEYWORDS` (constant, lines 602-621)
-  - `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS` (constant, lines 622-639)
-  - `DANGEROUS_PATTERNS` (constant, lines 641-641)
-  - `VALID_MSG_TYPES` (constant, lines 642-648)
-  - `SUPPORTED_UI_LANGUAGES` (constant, lines 650-655)
-  - `UI_LANGUAGE_LABELS` (constant, lines 656-656)
-  - `DEFAULT_UI_LANGUAGE` (constant, lines 657-657)
-  - `UI_STYLE_CHOICES` (constant, lines 658-658)
-  - `UI_STYLE_LABELS` (constant, lines 659-659)
-  - `DEFAULT_UI_STYLE` (constant, lines 660-660)
-  - `DEFAULT_WEB_UI_DIR` (constant, lines 661-661)
-  - `DEFAULT_WEB_UI_CONFIG` (constant, lines 662-662)
-  - `WEB_UI_REQUIRED_FILES` (constant, lines 663-670)
-  - `WEB_UI_OPTIONAL_FILES` (constant, lines 671-671)
-  - `IMAGE_EXTS` (constant, lines 673-686)
-  - `IMAGE_FORMATS_NEED_CONVERSION` (constant, lines 687-687)
-  - `IMAGE_SAFE_FORMATS` (constant, lines 688-688)
-  - `AUDIO_EXTS` (constant, lines 689-699)
-  - `VIDEO_EXTS` (constant, lines 700-710)
-  - `CODE_PREVIEW_STAGE_MAX_BYTES` (constant, lines 711-711)
-  - `CODE_PREVIEW_STAGE_MAX_ROWS` (constant, lines 712-712)
-  - `CODE_PREVIEW_STAGE_MAX_PER_FILE` (constant, lines 713-713)
-  - `CODE_PREVIEW_STAGE_MAX_TOTAL` (constant, lines 714-714)
-  - `RENDER_FRAME_MAX_B64_CHARS` (constant, lines 715-715)
-  - `RENDER_FRAME_MAX_POINTS` (constant, lines 716-716)
-  - `RENDER_FRAME_MAX_LINES` (constant, lines 717-717)
-  - `RENDER_FRAME_MAX_LINE_POINTS` (constant, lines 718-718)
-  - `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS` (constant, lines 719-719)
-  - `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD` (constant, lines 720-720)
-  - `ASSISTANT_TEXT_PERSIST_MAX_CHARS` (constant, lines 721-721)
-  - `ASSISTANT_MESSAGE_EVENT_MAX_CHARS` (constant, lines 722-722)
-  - `CODE_PREVIEW_EXTS` (constant, lines 723-812)
-  - `CODE_PREVIEW_FILENAMES` (constant, lines 813-824)
-  - `MEDIA_CAPABILITY_KEYS` (constant, lines 825-832)
-  - `SAMPLE_IMAGE_PNG_B64` (constant, lines 833-836)
-  - `SAMPLE_AUDIO_WAV_B64` (constant, lines 837-839)
-  - `SAMPLE_VIDEO_MP4_B64` (constant, lines 840-842)
-  - `OFFLINE_JS_LIB_CATALOG` (constant, lines 844-1102)
-  - `OFFLINE_JS_LIB_INDEX_FILE` (constant, lines 1103-1103)
-  - `OFFLINE_JS_LIB_README_FILE` (constant, lines 1104-1104)
-  - `EMBEDDED_SKILLS_ARCHIVE_B64` (constant, lines 4262-4781)
-  - `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant, lines 4782-4782)
-  - `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant, lines 4783-4806)
-  - `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant, lines 6452-6452)
-  - `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant, lines 6454-6698)
-  - `SKILL_PROTOCOL_LOCAL` (constant, lines 6752-6752)
-  - `SKILL_PROTOCOL_CLAWHUB` (constant, lines 6753-6753)
-  - `SKILL_PROTOCOL_HTTP_JSON` (constant, lines 6754-6754)
-  - `SKILL_PROTOCOL_SPECS` (constant, lines 6756-6787)
-  - `AGENT_TOOL_ALLOWLIST` (constant, lines 9715-9758)
-  - `INDEX_HTML` (constant, lines 30559-30740)
-  - `APP_CSS` (constant, lines 30742-31103)
-  - `APP_JS` (constant, lines 31105-33965)
-  - `APP_TS` (constant, lines 33967-33994)
-  - `SKILLS_INDEX_HTML` (constant, lines 33996-34150)
-  - `SKILLS_EXTRA_CSS` (constant, lines 34152-34247)
-  - `SKILLS_APP_JS` (constant, lines 34249-34341)
-  - `RAG_TERM_GROUPS` (constant, lines 34343-34353)
-  - `RAG_RESEARCH_HINTS` (constant, lines 34354-34375)
-  - `RAG_CODE_HINTS` (constant, lines 34376-34386)
-  - `RAG_SHORT_TOKEN_ALLOWLIST` (constant, lines 34387-34402)
-  - `RAG_EN_STOPWORDS` (constant, lines 34403-34475)
-  - `RAG_ZH_STOPWORDS` (constant, lines 34476-34512)
-  - `RAG_GENERIC_ENTITY_TERMS_EN` (constant, lines 34513-34591)
-  - `RAG_GENERIC_ENTITY_TERMS_ZH` (constant, lines 34592-34634)
-  - `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant, lines 34635-34653)
-  - `CODE_LIBRARY_IGNORED_DIRS` (constant, lines 34976-34981)
-  - `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant, lines 34982-35038)
-  - `CODE_LIBRARY_SPECIAL_FILENAMES` (constant, lines 35039-35045)
-  - `RAG_ADMIN_INDEX_HTML` (constant, lines 39652-39809)
-  - `RAG_ADMIN_CSS` (constant, lines 39811-39901)
-  - `RAG_ADMIN_JS` (constant, lines 39903-41129)
-  - `CODE_ADMIN_INDEX_HTML` (constant, lines 41131-41140)
-  - `CODE_ADMIN_CSS` (constant, lines 41141-41171)
-  - `CODE_ADMIN_JS` (constant, lines 41172-41176)
+  - `SKILLS_EXTERNAL_MOUNT` (constant, lines 451-451)
+  - `PLAN_MODE_ENABLED_LEVELS` (constant, lines 452-452)
+  - `PLAN_MODE_FORCED_LEVELS` (constant, lines 453-453)
+  - `PLAN_MODE_USER_CHOICES` (constant, lines 454-454)
+  - `TASK_PHASES` (constant, lines 456-456)
+  - `TASK_PHASE_ROUTING` (constant, lines 457-464)
+  - `COMPLEXITY_KEYWORDS` (constant, lines 466-471)
+  - `PLAN_MODE_EXPLORER_MAX_ROUNDS` (constant, lines 472-472)
+  - `REVIEWER_DEBUG_MODE_MAX_ROUNDS` (constant, lines 474-474)
+  - `REVIEWER_DEBUG_TOOL_ALLOWLIST` (constant, lines 475-479)
+  - `EXPLORER_STALL_THRESHOLD` (constant, lines 480-480)
+  - `DEVELOPER_EDIT_STALL_THRESHOLD` (constant, lines 481-481)
+  - `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS` (constant, lines 482-482)
+  - `PLAN_MODE_MAX_OPTIONS` (constant, lines 483-483)
+  - `PLAN_FILE_RELATIVE_PATH` (constant, lines 484-484)
+  - `PLAN_BUBBLE_MAX_CHARS` (constant, lines 485-485)
+  - `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST` (constant, lines 486-490)
+  - `FAILURE_LEDGER_MAX_FIXES` (constant, lines 491-491)
+  - `FAILURE_LEDGER_MAX_COMPILE_ERRORS` (constant, lines 492-492)
+  - `FAILURE_LEDGER_MAX_DELEGATIONS` (constant, lines 493-493)
+  - `FAILURE_LEDGER_MAX_STALLS` (constant, lines 494-494)
+  - `FAILURE_LEDGER_MAX_TOOL_FPS` (constant, lines 495-495)
+  - `FAILURE_LEDGER_MAX_ERRORS` (constant, lines 496-496)
+  - `ERROR_CATEGORY_DEFS` (constant, lines 499-536)
+  - `CHECKPOINT_MAX_COUNT` (constant, lines 537-537)
+  - `CHECKPOINT_INTERVAL_ROUNDS` (constant, lines 538-538)
+  - `PERSISTED_ROUTES_MAX` (constant, lines 539-539)
+  - `HTML_FRONTEND_REQUEST_KEYWORDS` (constant, lines 540-579)
+  - `DEEP_RESEARCH_REQUEST_KEYWORDS` (constant, lines 580-602)
+  - `DEEP_RESEARCH_RETRIEVAL_KEYWORDS` (constant, lines 603-622)
+  - `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS` (constant, lines 623-640)
+  - `DANGEROUS_PATTERNS` (constant, lines 642-642)
+  - `VALID_MSG_TYPES` (constant, lines 643-649)
+  - `SUPPORTED_UI_LANGUAGES` (constant, lines 651-656)
+  - `UI_LANGUAGE_LABELS` (constant, lines 657-657)
+  - `DEFAULT_UI_LANGUAGE` (constant, lines 658-658)
+  - `UI_STYLE_CHOICES` (constant, lines 659-659)
+  - `UI_STYLE_LABELS` (constant, lines 660-660)
+  - `DEFAULT_UI_STYLE` (constant, lines 661-661)
+  - `DEFAULT_WEB_UI_DIR` (constant, lines 662-662)
+  - `DEFAULT_WEB_UI_CONFIG` (constant, lines 663-663)
+  - `WEB_UI_REQUIRED_FILES` (constant, lines 664-671)
+  - `WEB_UI_OPTIONAL_FILES` (constant, lines 672-672)
+  - `IMAGE_EXTS` (constant, lines 674-687)
+  - `IMAGE_FORMATS_NEED_CONVERSION` (constant, lines 688-688)
+  - `IMAGE_SAFE_FORMATS` (constant, lines 689-689)
+  - `AUDIO_EXTS` (constant, lines 690-700)
+  - `VIDEO_EXTS` (constant, lines 701-711)
+  - `CODE_PREVIEW_STAGE_MAX_BYTES` (constant, lines 712-712)
+  - `CODE_PREVIEW_STAGE_MAX_ROWS` (constant, lines 713-713)
+  - `CODE_PREVIEW_STAGE_MAX_PER_FILE` (constant, lines 714-714)
+  - `CODE_PREVIEW_STAGE_MAX_TOTAL` (constant, lines 715-715)
+  - `RENDER_FRAME_MAX_B64_CHARS` (constant, lines 716-716)
+  - `RENDER_FRAME_MAX_POINTS` (constant, lines 717-717)
+  - `RENDER_FRAME_MAX_LINES` (constant, lines 718-718)
+  - `RENDER_FRAME_MAX_LINE_POINTS` (constant, lines 719-719)
+  - `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS` (constant, lines 720-720)
+  - `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD` (constant, lines 721-721)
+  - `ASSISTANT_TEXT_PERSIST_MAX_CHARS` (constant, lines 722-722)
+  - `ASSISTANT_MESSAGE_EVENT_MAX_CHARS` (constant, lines 723-723)
+  - `CODE_PREVIEW_EXTS` (constant, lines 724-813)
+  - `CODE_PREVIEW_FILENAMES` (constant, lines 814-825)
+  - `MEDIA_CAPABILITY_KEYS` (constant, lines 826-833)
+  - `SAMPLE_IMAGE_PNG_B64` (constant, lines 834-837)
+  - `SAMPLE_AUDIO_WAV_B64` (constant, lines 838-840)
+  - `SAMPLE_VIDEO_MP4_B64` (constant, lines 841-843)
+  - `OFFLINE_JS_LIB_CATALOG` (constant, lines 845-1103)
+  - `OFFLINE_JS_LIB_INDEX_FILE` (constant, lines 1104-1104)
+  - `OFFLINE_JS_LIB_README_FILE` (constant, lines 1105-1105)
+  - `EMBEDDED_SKILLS_ARCHIVE_B64` (constant, lines 4437-4956)
+  - `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant, lines 4957-4957)
+  - `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant, lines 4958-4981)
+  - `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant, lines 7625-7625)
+  - `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant, lines 7627-7871)
+  - `SKILL_PROTOCOL_LOCAL` (constant, lines 7927-7927)
+  - `SKILL_PROTOCOL_CLAWHUB` (constant, lines 7928-7928)
+  - `SKILL_PROTOCOL_HTTP_JSON` (constant, lines 7929-7929)
+  - `SKILL_PROTOCOL_SPECS` (constant, lines 7931-7962)
+  - `AGENT_TOOL_ALLOWLIST` (constant, lines 11125-11168)
+  - `INDEX_HTML` (constant, lines 32278-32465)
+  - `APP_CSS` (constant, lines 32467-32828)
+  - `APP_JS` (constant, lines 32830-35691)
+  - `APP_TS` (constant, lines 35693-35720)
+  - `SKILLS_INDEX_HTML` (constant, lines 35722-35876)
+  - `SKILLS_EXTRA_CSS` (constant, lines 35878-35973)
+  - `SKILLS_APP_JS` (constant, lines 35975-36067)
+  - `RAG_TERM_GROUPS` (constant, lines 36069-36079)
+  - `RAG_RESEARCH_HINTS` (constant, lines 36080-36101)
+  - `RAG_CODE_HINTS` (constant, lines 36102-36112)
+  - `RAG_SHORT_TOKEN_ALLOWLIST` (constant, lines 36113-36128)
+  - `RAG_EN_STOPWORDS` (constant, lines 36129-36201)
+  - `RAG_ZH_STOPWORDS` (constant, lines 36202-36238)
+  - `RAG_GENERIC_ENTITY_TERMS_EN` (constant, lines 36239-36317)
+  - `RAG_GENERIC_ENTITY_TERMS_ZH` (constant, lines 36318-36360)
+  - `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant, lines 36361-36379)
+  - `CODE_LIBRARY_IGNORED_DIRS` (constant, lines 36702-36707)
+  - `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant, lines 36708-36764)
+  - `CODE_LIBRARY_SPECIAL_FILENAMES` (constant, lines 36765-36771)
+  - `RAG_ADMIN_INDEX_HTML` (constant, lines 41378-41535)
+  - `RAG_ADMIN_CSS` (constant, lines 41537-41627)
+  - `RAG_ADMIN_JS` (constant, lines 41629-42855)
+  - `CODE_ADMIN_INDEX_HTML` (constant, lines 42857-42866)
+  - `CODE_ADMIN_CSS` (constant, lines 42867-42897)
+  - `CODE_ADMIN_JS` (constant, lines 42898-42902)
 
 ### `config/paths.py`
 
@@ -433,233 +434,235 @@ Code_Structure/
   - `WORKDIR` (constant, lines 89-89)
   - `CODES_ROOT` (constant, lines 90-90)
   - `LLM_CONFIG_PATH` (constant, lines 91-91)
-  - `detect_repo_root` (function, lines 1786-1800)
-  - `REPO_ROOT` (constant, lines 1802-1802)
+  - `detect_repo_root` (function, lines 1794-1808)
+  - `REPO_ROOT` (constant, lines 1810-1810)
 
 ### `config/settings.py`
 
 - Routed symbols: 24
 - Cross-module imports: `config/constants.py`: `AUTO_SKILLS_ROOT_CANDIDATES`, `DEFAULT_REQUEST_TIMEOUT`, `DEFAULT_UI_LANGUAGE`, `DEFAULT_UI_STYLE`, `DEFAULT_WEB_UI_CONFIG`, `DEFAULT_WEB_UI_DIR`, `EXECUTION_MODE_CHOICES`, `EXECUTION_MODE_SEQUENTIAL`, `EXECUTION_MODE_SINGLE`, `EXECUTION_MODE_SYNC`, `MEDIA_CAPABILITY_KEYS`, `SUPPORTED_UI_LANGUAGES`, `UI_LANGUAGE_LABELS`, `UI_STYLE_CHOICES`; `config/paths.py`: `WORKDIR`; `llm/utils.py`: `_is_http_url`, `_resolve_local_path`, `complete_chat_endpoint`, `extract_base_url`; `skills/store.py`: `ensure_embedded_skills`; `utils/json_utils.py`: `parse_json_object`; `utils/misc.py`: `MAX_TIMEOUT_SECONDS`, `MIN_TIMEOUT_SECONDS`, `normalize_timeout_seconds`; `utils/text.py`: `trim`
 - Symbols:
-  - `normalize_ui_language` (function, lines 1188-1210)
-  - `normalize_ui_style` (function, lines 1213-1230)
-  - `supported_ui_languages_payload` (function, lines 1233-1234)
-  - `normalize_execution_mode` (function, lines 1237-1256)
-  - `model_language_instruction` (function, lines 1259-1287)
-  - `_detect_os_shell_instruction` (function, lines 1290-1329)
-  - `resolve_web_ui_dir_path` (function, lines 1331-1338)
-  - `resolve_optional_file_path` (function, lines 1341-1348)
-  - `resolve_skills_root_path` (function, lines 1351-1358)
-  - `_count_skill_markdown_files` (function, lines 1361-1372)
-  - `select_preferred_skills_root` (function, lines 1375-1409)
-  - `load_web_ui_config_file` (function, lines 1412-1426)
-  - `extract_show_upload_list_setting` (function, lines 1429-1443)
-  - `extract_ui_style_setting` (function, lines 1446-1460)
-  - `extract_js_lib_download_setting` (function, lines 1463-1482)
-  - `default_multimodal_capabilities` (function, lines 1485-1493)
-  - `_to_bool_like` (function, lines 1496-1506)
-  - `infer_model_multimodal_capabilities` (function, lines 1509-1546)
-  - `parse_capability_overrides` (function, lines 1549-1586)
-  - `merge_multimodal_capabilities` (function, lines 1589-1596)
-  - `parse_media_endpoints` (function, lines 1599-1613)
-  - `load_llm_config_from_source` (function, lines 2908-2942)
-  - `parse_llm_config_profiles` (function, lines 2944-3153)
-  - `looks_like_llm_config` (function, lines 3155-3201)
+  - `normalize_ui_language` (function, lines 1189-1211)
+  - `normalize_ui_style` (function, lines 1214-1231)
+  - `supported_ui_languages_payload` (function, lines 1234-1235)
+  - `normalize_execution_mode` (function, lines 1238-1257)
+  - `model_language_instruction` (function, lines 1260-1288)
+  - `_detect_os_shell_instruction` (function, lines 1291-1330)
+  - `resolve_web_ui_dir_path` (function, lines 1332-1339)
+  - `resolve_optional_file_path` (function, lines 1342-1349)
+  - `resolve_skills_root_path` (function, lines 1352-1359)
+  - `_count_skill_markdown_files` (function, lines 1362-1373)
+  - `select_preferred_skills_root` (function, lines 1376-1410)
+  - `load_web_ui_config_file` (function, lines 1413-1427)
+  - `extract_show_upload_list_setting` (function, lines 1430-1444)
+  - `extract_ui_style_setting` (function, lines 1447-1461)
+  - `extract_js_lib_download_setting` (function, lines 1464-1483)
+  - `default_multimodal_capabilities` (function, lines 1486-1494)
+  - `_to_bool_like` (function, lines 1497-1507)
+  - `infer_model_multimodal_capabilities` (function, lines 1510-1554)
+  - `parse_capability_overrides` (function, lines 1557-1594)
+  - `merge_multimodal_capabilities` (function, lines 1597-1604)
+  - `parse_media_endpoints` (function, lines 1607-1621)
+  - `load_llm_config_from_source` (function, lines 2916-2950)
+  - `parse_llm_config_profiles` (function, lines 2952-3306)
+  - `looks_like_llm_config` (function, lines 3308-3376)
 
 ### `llm/client.py`
 
 - Routed symbols: 2
 - Cross-module imports: `config/constants.py`: `DEFAULT_REQUEST_TIMEOUT`, `OLLAMA_THINKING_TOOL_BUFFER`, `SAMPLE_AUDIO_WAV_B64`, `SAMPLE_IMAGE_PNG_B64`, `SAMPLE_VIDEO_MP4_B64`; `config/settings.py`: `default_multimodal_capabilities`, `infer_model_multimodal_capabilities`, `merge_multimodal_capabilities`, `parse_capability_overrides`, `parse_media_endpoints`; `llm/utils.py`: `complete_chat_endpoint`, `split_thinking_content`; `utils/json_utils.py`: `canonicalize_tool_name`, `json_dumps`, `parse_json_object`, `parse_tool_arguments`, `parse_tool_arguments_with_error`; `utils/misc.py`: `MAX_TIMEOUT_SECONDS`, `MIN_TIMEOUT_SECONDS`, `make_id`, `normalize_timeout_seconds`, `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `OllamaError` (class, lines 8534-8537)
-  - `OllamaClient` (class, lines 8539-9477)
+  - `OllamaError` (class, lines 9830-9833)
+  - `OllamaClient` (class, lines 9835-10887)
 
 ### `llm/utils.py`
 
 - Routed symbols: 19
 - Cross-module imports: `utils/json_utils.py`: `json_dumps`, `parse_json_object`; `utils/text.py`: `trim`
 - Symbols:
-  - `probe_ollama_environment` (function, lines 2569-2582)
-  - `list_ollama_models` (function, lines 2584-2586)
-  - `_OLLAMA_TAG_CACHE_LOCK` (assignment, lines 2588-2588)
-  - `_OLLAMA_TAG_CACHE` (assignment, lines 2589-2589)
-  - `list_ollama_models_cached` (function, lines 2599-2636)
-  - `resolve_ollama_model` (function, lines 2638-2648)
-  - `infer_thinking_model` (function, lines 2650-2652)
-  - `split_thinking_content` (function, lines 2654-2695)
-  - `strip_thinking_content` (function, lines 2697-2698)
-  - `check_ollama_model_ready` (function, lines 2700-2724)
-  - `list_loaded_ollama_models` (function, lines 2726-2739)
-  - `wake_ollama_model` (function, lines 2741-2771)
-  - `try_pull_ollama_model` (function, lines 2773-2791)
-  - `ordered_model_candidates` (function, lines 2793-2811)
-  - `pick_working_ollama_model` (function, lines 2813-2829)
-  - `extract_base_url` (function, lines 2862-2870)
-  - `complete_chat_endpoint` (function, lines 2872-2881)
-  - `_is_http_url` (function, lines 2883-2888)
-  - `_resolve_local_path` (function, lines 2890-2906)
+  - `probe_ollama_environment` (function, lines 2577-2590)
+  - `list_ollama_models` (function, lines 2592-2594)
+  - `_OLLAMA_TAG_CACHE_LOCK` (assignment, lines 2596-2596)
+  - `_OLLAMA_TAG_CACHE` (assignment, lines 2597-2597)
+  - `list_ollama_models_cached` (function, lines 2607-2644)
+  - `resolve_ollama_model` (function, lines 2646-2656)
+  - `infer_thinking_model` (function, lines 2658-2660)
+  - `split_thinking_content` (function, lines 2662-2703)
+  - `strip_thinking_content` (function, lines 2705-2706)
+  - `check_ollama_model_ready` (function, lines 2708-2732)
+  - `list_loaded_ollama_models` (function, lines 2734-2747)
+  - `wake_ollama_model` (function, lines 2749-2779)
+  - `try_pull_ollama_model` (function, lines 2781-2799)
+  - `ordered_model_candidates` (function, lines 2801-2819)
+  - `pick_working_ollama_model` (function, lines 2821-2837)
+  - `extract_base_url` (function, lines 2870-2878)
+  - `complete_chat_endpoint` (function, lines 2880-2889)
+  - `_is_http_url` (function, lines 2891-2896)
+  - `_resolve_local_path` (function, lines 2898-2914)
 
 ### `rag/index.py`
 
 - Routed symbols: 5
 - Cross-module imports: `config/constants.py`: `RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO`, `RAG_DYNAMIC_NOISE_HARD_DOC_RATIO`, `RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ`, `RAG_DYNAMIC_NOISE_MIN_DOC_FREQ`, `RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO`, `RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO`, `RAG_EN_STOPWORDS`, `RAG_GRAPH_MAX_NODES`, `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`, `RAG_MAX_COMMUNITY_MAP_SUPPORT`, `RAG_MAX_GLOBAL_COMMUNITIES`, `RAG_MAX_QUERY_RESULTS`; `rag/parsers.py`: `_code_is_test_path`, `_rag_apply_filename_entity_policy`, `_rag_choose_community`, `_rag_classify_document`, `_rag_expand_tokens`, `_rag_extract_entities`, `_rag_filter_entities`, `_rag_tokenize`; `utils/json_utils.py`: `json_dumps`; `utils/misc.py`: `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `_code_module_name` (function, lines 35072-35086)
-  - `_code_choose_community` (function, lines 35089-35096)
-  - `_code_query_terms` (function, lines 35099-35111)
-  - `TFGraphIDFIndex` (class, lines 36087-37445)
-  - `CodeGraphIndex` (class, lines 38885-39297)
+  - `_code_module_name` (function, lines 36798-36812)
+  - `_code_choose_community` (function, lines 36815-36822)
+  - `_code_query_terms` (function, lines 36825-36837)
+  - `TFGraphIDFIndex` (class, lines 37813-39171)
+  - `CodeGraphIndex` (class, lines 40611-41023)
 
 ### `rag/ingestion.py`
 
 - Routed symbols: 3
 - Cross-module imports: `config/constants.py`: `CODE_IMPORT_WORKER_COUNT`, `CODE_LIBRARY_IGNORED_DIRS`, `CODE_PARSE_TIMEOUT_SECONDS`, `RAG_IMPORT_WORKER_COUNT`, `RAG_MAX_IMPORT_BATCH_ITEMS`, `RAG_MAX_IMPORT_FILES`, `RAG_MODEL_MEDIA_MAX_BYTES`, `RAG_PARSE_TIMEOUT_SECONDS`, `RAG_PDF_IMAGE_LIMIT`; `config/settings.py`: `default_multimodal_capabilities`; `rag/parsers.py`: `CodeContentParser`, `RAGContentParser`, `_rag_extract_entities`, `_rag_safe_name`; `rag/store.py`: `CodeLibraryStore`, `RAGLibraryStore`; `session/state.py`: `SessionState`; `utils/files.py`: `try_read_text`; `utils/json_utils.py`: `_read_json_file`, `_write_json_file`, `parse_json_object`; `utils/media.py`: `guess_mime_from_name`; `utils/misc.py`: `make_id`, `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `_rag_parse_file_worker` (function, lines 37998-38012)
-  - `RAGIngestionService` (class, lines 38015-38882)
-  - `CodeIngestionService` (class, lines 39566-39650)
+  - `_rag_parse_file_worker` (function, lines 39724-39738)
+  - `RAGIngestionService` (class, lines 39741-40608)
+  - `CodeIngestionService` (class, lines 41292-41376)
 
 ### `rag/parsers.py`
 
 - Routed symbols: 22
 - Cross-module imports: `config/constants.py`: `AUDIO_EXTS`, `CODE_CHUNK_CHARS`, `CODE_CHUNK_OVERLAP`, `CODE_LIBRARY_LANGUAGE_BY_EXT`, `CODE_LIBRARY_SPECIAL_FILENAMES`, `CODE_MAX_CHUNKS_PER_DOC`, `CODE_PREVIEW_EXTS`, `CODE_PREVIEW_FILENAMES`, `CODE_PREVIEW_STAGE_MAX_ROWS`, `IMAGE_EXTS`, `RAG_CHUNK_CHARS`, `RAG_CHUNK_OVERLAP`, `RAG_CODE_HINTS`, `RAG_EN_STOPWORDS`, `RAG_GENERIC_ENTITY_TERMS_EN`, `RAG_GENERIC_ENTITY_TERMS_ZH`, `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`, `RAG_MAX_CHUNKS_PER_DOC`, `RAG_PDF_IMAGE_LIMIT`, `RAG_RESEARCH_HINTS`, `RAG_SHORT_TOKEN_ALLOWLIST`, `RAG_STRUCTURAL_ENTITY_PATTERNS`, `RAG_TERM_GROUPS`, `RAG_ZH_STOPWORDS`, `VIDEO_EXTS`; `utils/files.py`: `_sha256_bytes`, `_sha256_file`; `utils/json_utils.py`: `parse_json_object`; `utils/media.py`: `guess_mime_from_name`; `utils/text.py`: `_compress_rows_keep_hotspot`, `_skip_row`, `trim`
 - Symbols:
-  - `normalize_rel_preview_path` (function, lines 3807-3818)
-  - `is_code_preview_candidate` (function, lines 3821-3829)
-  - `preview_kind_for_path` (function, lines 3832-3842)
-  - `build_code_preview_rows` (function, lines 3845-4029)
-  - `_rag_safe_name` (function, lines 34656-34659)
-  - `_rag_detect_language` (function, lines 34662-34676)
-  - `_rag_cjk_ngrams` (function, lines 34679-34691)
-  - `_rag_is_noise_token` (function, lines 34694-34713)
-  - `_rag_entity_allowed` (function, lines 34716-34728)
-  - `_rag_filter_entities` (function, lines 34731-34745)
-  - `_rag_filename_entity_aliases` (function, lines 34748-34781)
-  - `_rag_apply_filename_entity_policy` (function, lines 34784-34814)
-  - `_rag_choose_community` (function, lines 34817-34834)
-  - `_rag_tokenize` (function, lines 34837-34867)
-  - `_rag_expand_tokens` (function, lines 34870-34884)
-  - `_rag_extract_entities` (function, lines 34887-34903)
-  - `_rag_classify_document` (function, lines 34906-34940)
-  - `_rag_chunk_text` (function, lines 34943-34973)
-  - `_code_language_from_name` (function, lines 35048-35064)
-  - `_code_is_test_path` (function, lines 35067-35069)
-  - `CodeContentParser` (class, lines 35114-35574)
-  - `RAGContentParser` (class, lines 35577-36084)
+  - `normalize_rel_preview_path` (function, lines 3982-3993)
+  - `is_code_preview_candidate` (function, lines 3996-4004)
+  - `preview_kind_for_path` (function, lines 4007-4017)
+  - `build_code_preview_rows` (function, lines 4020-4204)
+  - `_rag_safe_name` (function, lines 36382-36385)
+  - `_rag_detect_language` (function, lines 36388-36402)
+  - `_rag_cjk_ngrams` (function, lines 36405-36417)
+  - `_rag_is_noise_token` (function, lines 36420-36439)
+  - `_rag_entity_allowed` (function, lines 36442-36454)
+  - `_rag_filter_entities` (function, lines 36457-36471)
+  - `_rag_filename_entity_aliases` (function, lines 36474-36507)
+  - `_rag_apply_filename_entity_policy` (function, lines 36510-36540)
+  - `_rag_choose_community` (function, lines 36543-36560)
+  - `_rag_tokenize` (function, lines 36563-36593)
+  - `_rag_expand_tokens` (function, lines 36596-36610)
+  - `_rag_extract_entities` (function, lines 36613-36629)
+  - `_rag_classify_document` (function, lines 36632-36666)
+  - `_rag_chunk_text` (function, lines 36669-36699)
+  - `_code_language_from_name` (function, lines 36774-36790)
+  - `_code_is_test_path` (function, lines 36793-36795)
+  - `CodeContentParser` (class, lines 36840-37300)
+  - `RAGContentParser` (class, lines 37303-37810)
 
 ### `rag/store.py`
 
 - Routed symbols: 2
 - Cross-module imports: `config/constants.py`: `CODE_CHUNK_CHARS`, `CODE_CHUNK_OVERLAP`, `CODE_MAX_CHUNKS_PER_DOC`, `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`, `RAG_TASK_HISTORY_LIMIT`; `rag/index.py`: `CodeGraphIndex`, `TFGraphIDFIndex`, `_code_choose_community`, `_code_module_name`; `rag/parsers.py`: `_code_is_test_path`, `_rag_apply_filename_entity_policy`, `_rag_choose_community`, `_rag_chunk_text`, `_rag_entity_allowed`, `_rag_extract_entities`, `_rag_safe_name`; `utils/files.py`: `_sha256_bytes`, `_sha256_file`; `utils/json_utils.py`: `_read_json_file`, `_write_json_file`; `utils/media.py`: `guess_mime_from_name`; `utils/misc.py`: `make_id`, `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `RAGLibraryStore` (class, lines 37448-37995)
-  - `CodeLibraryStore` (class, lines 39300-39563)
+  - `RAGLibraryStore` (class, lines 39174-39721)
+  - `CodeLibraryStore` (class, lines 41026-41289)
 
 ### `server/handlers.py`
 
 - Routed symbols: 5
 - Cross-module imports: `app/context.py`: `AppContext`; `config/constants.py`: `APP_VERSION`, `DEFAULT_REQUEST_TIMEOUT`, `DEFAULT_UI_LANGUAGE`, `DEFAULT_UI_STYLE`, `EXECUTION_MODE_CHOICES`, `EXECUTION_MODE_SYNC`, `MIN_RUN_TIMEOUT_SECONDS`, `PLAN_MODE_USER_CHOICES`, `RAG_GRAPH_MAX_NODES`, `SSE_HEARTBEAT_SECONDS`, `TASK_LEVEL_CHOICES`, `TASK_LEVEL_POLICIES`, `UI_STYLE_LABELS`; `config/paths.py`: `LLM_CONFIG_PATH`, `REPO_ROOT`, `WORKDIR`; `config/settings.py`: `_to_bool_like`, `looks_like_llm_config`, `normalize_execution_mode`, `normalize_ui_language`, `normalize_ui_style`, `resolve_web_ui_dir_path`, `supported_ui_languages_payload`; `llm/utils.py`: `list_ollama_models`; `session/manager.py`: `SessionManager`; `session/state.py`: `SessionState`; `skills/store.py`: `analyze_skill_building_knowledge`; `utils/files.py`: `safe_path`, `try_read_text`; `utils/json_utils.py`: `json_dumps`, `parse_json_object`; `utils/media.py`: `guess_mime_from_name`; `utils/misc.py`: `now_ts`, `swallow_benign_socket_error`, `user_id_from_ip`
 - Symbols:
-  - `AgentHTTPServer` (class, lines 43489-43517)
-  - `Handler` (class, lines 43519-44168)
-  - `SkillsHandler` (class, lines 44170-44363)
-  - `RagAdminHandler` (class, lines 44365-44519)
-  - `CodeAdminHandler` (class, lines 44522-44676)
+  - `AgentHTTPServer` (class, lines 45215-45243)
+  - `Handler` (class, lines 45245-45913)
+  - `SkillsHandler` (class, lines 45915-46108)
+  - `RagAdminHandler` (class, lines 46110-46264)
+  - `CodeAdminHandler` (class, lines 46267-46421)
 
 ### `session/manager.py`
 
 - Routed symbols: 1
 - Cross-module imports: `config/constants.py`: `AGENT_MAX_OUTPUT_TOKENS`, `ARBITER_DEFAULT_MAX_TOKENS`, `ARBITER_DEFAULT_TEMPERATURE`, `ARBITER_DEFAULT_TIMEOUT_SECONDS`, `DEFAULT_REQUEST_TIMEOUT`, `DEFAULT_UI_LANGUAGE`, `EXECUTION_MODE_SYNC`, `MAX_AGENT_ROUNDS`, `MAX_AGENT_ROUNDS_CAP`, `MAX_RUN_SECONDS`, `MAX_RUN_TIMEOUT_SECONDS`, `MIN_AGENT_ROUNDS`, `MIN_CONTEXT_TOKEN_LIMIT`, `MIN_RUN_TIMEOUT_SECONDS`, `TOKEN_THRESHOLD`; `config/paths.py`: `LLM_CONFIG_PATH`; `config/settings.py`: `infer_model_multimodal_capabilities`, `merge_multimodal_capabilities`, `normalize_execution_mode`, `normalize_ui_language`, `parse_capability_overrides`, `parse_llm_config_profiles`; `llm/client.py`: `OllamaClient`; `llm/utils.py`: `complete_chat_endpoint`, `extract_base_url`, `list_ollama_models_cached`, `probe_ollama_environment`; `session/state.py`: `SessionState`; `utils/crypto.py`: `CryptoBox`; `utils/files.py`: `try_read_text`; `utils/json_utils.py`: `parse_json_object`; `utils/misc.py`: `make_id`, `normalize_timeout_seconds`, `now_ts`, `sanitize_profile_id`
 - Symbols:
-  - `SessionManager` (class, lines 29710-30557)
+  - `SessionManager` (class, lines 31424-32276)
 
 ### `session/state.py`
 
 - Routed symbols: 1
 - Cross-module imports: `agent/background.py`: `BackgroundManager`; `agent/bus.py`: `MessageBus`; `agent/events.py`: `EventHub`; `agent/tasks.py`: `TaskManager`; `agent/todo.py`: `TodoManager`; `agent/worktree.py`: `WorktreeManager`; `config/constants.py`: `AGENT_BUBBLE_ROLES`, `AGENT_CTX_LIMIT_TIER0`, `AGENT_CTX_LIMIT_TIER1`, `AGENT_CTX_LIMIT_TIER2`, `AGENT_CTX_LIMIT_TIER3`, `AGENT_MAX_OUTPUT_TOKENS`, `AGENT_MSG_LIMIT_TIER0`, `AGENT_MSG_LIMIT_TIER1`, `AGENT_MSG_LIMIT_TIER2`, `AGENT_MSG_LIMIT_TIER3`, `AGENT_ROLES`, `AGENT_ROLE_LABELS`, `AGENT_TOOL_ALLOWLIST`, `ARBITER_DEFAULT_MAX_TOKENS`, `ARBITER_DEFAULT_TEMPERATURE`, `ARBITER_DEFAULT_TIMEOUT_SECONDS`, `ARBITER_TRIGGER_MIN_CONTENT_CHARS`, `ARBITER_VALID_PLANNING_STREAK_LIMIT`, `ASSISTANT_MESSAGE_EVENT_MAX_CHARS`, `ASSISTANT_TEXT_PERSIST_MAX_CHARS`, `AUDIO_EXTS`, `AUTO_CONTINUE_BUDGET_DEFAULT`, `BASH_READ_LOOP_THRESHOLD`, `BLACKBOARD_MAX_LOG_ENTRIES`, `BLACKBOARD_MAX_TEXT`, `BLACKBOARD_STATUSES`, `CHECKPOINT_INTERVAL_ROUNDS`, `CHECKPOINT_MAX_COUNT`, `CODE_PREVIEW_STAGE_MAX_BYTES`, `CODE_PREVIEW_STAGE_MAX_PER_FILE`, `CODE_PREVIEW_STAGE_MAX_ROWS`, `CODE_PREVIEW_STAGE_MAX_TOTAL`, `COMPACT_TIER1_ABS`, `COMPACT_TIER1_PCT`, `COMPACT_TIER2_ABS`, `COMPACT_TIER2_PCT`, `COMPACT_TIER3_PCT`, `COMPLEXITY_KEYWORDS`, `DANGEROUS_PATTERNS`, `DEEP_RESEARCH_REQUEST_KEYWORDS`, `DEEP_RESEARCH_RETRIEVAL_KEYWORDS`, `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS`, `DEFAULT_REQUEST_TIMEOUT`, `DEFAULT_UI_LANGUAGE`, `DEVELOPER_EDIT_STALL_THRESHOLD`, `EMPTY_ACTION_MIN_CONTENT_CHARS`, `EMPTY_ACTION_WAKEUP_RETRY_LIMIT`, `ERROR_CATEGORY_DEFS`, `EXECUTION_MODE_CHOICES`, `EXECUTION_MODE_SEQUENTIAL`, `EXECUTION_MODE_SINGLE`, `EXECUTION_MODE_SYNC`, `EXPLORER_STALL_THRESHOLD`, `FAILURE_LEDGER_MAX_COMPILE_ERRORS`, `FAILURE_LEDGER_MAX_DELEGATIONS`, `FAILURE_LEDGER_MAX_ERRORS`, `FAILURE_LEDGER_MAX_FIXES`, `FAILURE_LEDGER_MAX_STALLS`, `FAILURE_LEDGER_MAX_TOOL_FPS`, `FILE_BUFFER_CONTENT_THRESHOLD`, `FILE_BUFFER_MAX_FILES`, `FINAL_SUMMARY_MIN_CHARS`, `FINAL_SUMMARY_STRICT_MIN_CHARS`, `FUSED_FAULT_BREAK_THRESHOLD`, `HARD_BREAK_RECOVERY_ROUND_THRESHOLD`, `HARD_BREAK_TOOL_ERROR_THRESHOLD`, `HTML_FRONTEND_REQUEST_KEYWORDS`, `IMAGE_EXTS`, `IMAGE_FORMATS_NEED_CONVERSION`, `LIVE_INPUT_DELAY_NORMAL_ROUNDS`, `LIVE_INPUT_DELAY_TOOL_ROUNDS`, `LIVE_INPUT_DELAY_WRITE_ROUNDS`, `LIVE_INPUT_MAX_INJECTIONS`, `LIVE_INPUT_REINJECT_INTERVAL`, `LIVE_INPUT_WEIGHT_BASE_DELAYED`, `LIVE_INPUT_WEIGHT_BASE_NORMAL`, `LIVE_INPUT_WEIGHT_STEP_DELAYED`, `LIVE_INPUT_WEIGHT_STEP_NORMAL`, `LONG_OUTPUT_LISTING_OFFLOAD_CHARS`, `LONG_OUTPUT_MODEL_PAGE_CHARS`, `LONG_OUTPUT_READ_PAGE_LINES`, `LONG_OUTPUT_READ_PAGE_MAX_CHARS`, `LONG_OUTPUT_TEMP_MAX_FILES`, `LONG_OUTPUT_UI_PAGE_CHARS`, `LONG_OUTPUT_UI_PREVIEW_MAX_PAGES`, `MANAGER_CTX_LIMIT_TIER0`, `MANAGER_CTX_LIMIT_TIER1`, `MANAGER_CTX_LIMIT_TIER2`, `MANAGER_CTX_LIMIT_TIER3`, `MANAGER_ROUTE_TARGETS`, `MAX_AGENT_ROUNDS`, `MAX_AGENT_ROUNDS_CAP`, `MAX_CONTEXT_ARCHIVE_SEGMENTS`, `MAX_RUN_SECONDS`, `MAX_RUN_TIMEOUT_SECONDS`, `MIN_AGENT_ROUNDS`, `MIN_CONTEXT_TOKEN_LIMIT`, `MIN_RUN_TIMEOUT_SECONDS`, `MODEL_CALL_PROGRESS_DELAY`, `MODEL_CALL_PROGRESS_INTERVAL`, `MODEL_OUTPUT_RETRY_TIMES`, `PERSISTED_ROUTES_MAX`, `PLAN_BUBBLE_MAX_CHARS`, `PLAN_FILE_RELATIVE_PATH`, `PLAN_MODE_ENABLED_LEVELS`, `PLAN_MODE_EXPLORER_MAX_ROUNDS`, `PLAN_MODE_FORCED_LEVELS`, `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS`, `PLAN_MODE_MAX_OPTIONS`, `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST`, `PLAN_MODE_USER_CHOICES`, `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS`, `RENDER_FRAME_MAX_B64_CHARS`, `RENDER_FRAME_MAX_LINES`, `RENDER_FRAME_MAX_LINE_POINTS`, `RENDER_FRAME_MAX_POINTS`, `REPEATED_TOOL_LOOP_THRESHOLD`, `RETRY_RUNTIME_HINT_PREFIXES`, `REVIEWER_DEBUG_MODE_MAX_ROUNDS`, `RUNTIME_CONTROL_HINT_PREFIXES`, `SEMANTIC_CONFIDENCE_CHOICES`, `SKILLS_VIRTUAL_PREFIX`, `SKILL_REFRESH_MIN_INTERVAL_SECONDS`, `SKILL_RUNTIME_CACHE_MAX_BYTES`, `SKILL_RUNTIME_CACHE_MAX_ENTRIES`, `STALL_ESCALATION_CONTEXT_MAX_CHARS`, `STALL_ESCALATION_MIN_LEVEL`, `STALL_PLAN_SYNTHESIS_MAX_TOKENS`, `STALL_SEVERITY_DECAY_ON_SUCCESS`, `STALL_SEVERITY_ESCALATION_THRESHOLD`, `STALL_SEVERITY_WEIGHT_BASH_READ_LOOP`, `STALL_SEVERITY_WEIGHT_FAULT`, `STALL_SEVERITY_WEIGHT_RECOVERY_RETRY`, `STALL_SEVERITY_WEIGHT_REPEATED_TOOL`, `STALL_SEVERITY_WEIGHT_WATCHDOG`, `TASK_COMPLEXITY_LEVELS`, `TASK_LEVEL_CHOICES`, `TASK_LEVEL_POLICIES`, `TASK_PHASE_ROUTING`, `TASK_PROFILE_TYPES`, `TASK_SCALE_PREFERENCES`, `THINKING_BUDGET_FORCE_RATIO`, `TOKEN_THRESHOLD`, `TRUNCATION_CONTINUATION_ECHO_CHARS`, `TRUNCATION_CONTINUATION_MAX_PASSES`, `TRUNCATION_CONTINUATION_MAX_TOKENS`, `TRUNCATION_CONTINUATION_TAIL_CHARS`, `TRUNCATION_LIVE_BUFFER_MAX_CHARS`, `TRUNCATION_OVERLAP_SCAN_CHARS`, `TRUNCATION_PAIR_SCAN_CHARS`, `VIDEO_EXTS`, `WATCHDOG_CONTEXT_NEAR_RATIO`, `WATCHDOG_CONTEXT_STALL_THRESHOLD`, `WATCHDOG_INTENT_NO_TOOL_THRESHOLD`, `WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE`, `WATCHDOG_MAX_DECOMPOSE_STEPS`, `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD`, `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE`, `WATCHDOG_REPEAT_SIMILARITY_THRESHOLD`, `WATCHDOG_STATE_STALL_THRESHOLD`, `WATCHDOG_STEP_MAX_ATTEMPTS`, `_DEFAULT_TOOL_TIMEOUT`, `_TOOL_TIMEOUT_MAP`; `config/paths.py`: `WORKDIR`; `config/settings.py`: `_detect_os_shell_instruction`, `_to_bool_like`, `default_multimodal_capabilities`, `infer_model_multimodal_capabilities`, `looks_like_llm_config`, `merge_multimodal_capabilities`, `model_language_instruction`, `normalize_execution_mode`, `normalize_ui_language`, `parse_capability_overrides`, `parse_llm_config_profiles`; `llm/client.py`: `OllamaClient`, `OllamaError`; `llm/utils.py`: `complete_chat_endpoint`, `list_loaded_ollama_models`, `list_ollama_models`, `list_ollama_models_cached`, `probe_ollama_environment`, `resolve_ollama_model`, `split_thinking_content`, `strip_thinking_content`, `wake_ollama_model`; `rag/parsers.py`: `build_code_preview_rows`, `is_code_preview_candidate`, `normalize_rel_preview_path`, `preview_kind_for_path`; `skills/store.py`: `SkillStore`, `ensure_runtime_skills`; `utils/compress.py`: `compress_text_blob`, `decompress_text_blob`; `utils/crypto.py`: `CryptoBox`; `utils/errors.py`: `CircuitBreakerTriggered`, `EmptyActionError`; `utils/files.py`: `_normalize_external_js_url`, `_safe_js_filename`, `cache_external_js_url`, `ensure_offline_js_libs`, `is_external_js_src`, `load_offline_js_lib_index`, `match_offline_js_catalog_by_url`, `offline_js_lib_root`, `safe_path`, `try_read_text`; `utils/json_utils.py`: `TOOLS`, `TOOL_REQUIRED_ARGS`, `canonicalize_tool_name`, `extract_json_object_from_text`, `json_dumps`, `parse_json_object`, `repair_truncated_json_object`, `tool_def`; `utils/media.py`: `_convert_image_to_safe_format`, `guess_ext_from_mime`, `guess_mime_from_name`; `utils/misc.py`: `MAX_TIMEOUT_SECONDS`, `MIN_TIMEOUT_SECONDS`, `is_benign_socket_error`, `make_id`, `normalize_timeout_seconds`, `now_ts`, `sanitize_profile_id`; `utils/text.py`: `MAX_TOOL_OUTPUT`, `_fmt_export_ts`, `_html_esc`, `_text_to_minimal_pdf`, `filter_runtime_noise_lines`, `make_numbered_diff`, `make_unified_diff`, `normalize_work_text`, `parse_front_matter`, `render_numbered_diff_text`, `trim`
 - Symbols:
-  - `SessionState` (class, lines 9760-29708)
+  - `SessionState` (class, lines 11170-31422)
 
 ### `skills/store.py`
 
-- Routed symbols: 21
-- Cross-module imports: `config/constants.py`: `BUILTIN_CLAWHUB_SKILLS_VERSION`, `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`, `EMBEDDED_SKILLS_ARCHIVE_B64`, `EMBEDDED_SKILLS_ARCHIVE_FILES`, `EMBEDDED_SKILLS_ARCHIVE_SHA256`, `SKILLS_VIRTUAL_PREFIX`, `SKILL_BODY_COMPACT_THRESHOLD_CHARS`, `SKILL_BODY_PREVIEW_CHARS`, `SKILL_DEFAULT_ATTACHMENT_GLOBS`, `SKILL_INLINE_ATTACHMENT_MAX_CHARS`, `SKILL_INLINE_ATTACHMENT_MAX_FILES`, `SKILL_PROMPT_MAX_CHARS`, `SKILL_PROMPT_MAX_ITEMS`, `SKILL_PROTOCOL_CLAWHUB`, `SKILL_PROTOCOL_HTTP_JSON`, `SKILL_PROTOCOL_LOCAL`, `SKILL_PROTOCOL_SPECS`, `SKILL_REFRESH_MIN_INTERVAL_SECONDS`, `SKILL_RESOURCE_MANIFEST_MAX_ITEMS`; `config/paths.py`: `WORKDIR`; `llm/utils.py`: `_is_http_url`; `utils/files.py`: `_render_offline_js_catalog_md`, `try_read_text`; `utils/json_utils.py`: `json_dumps`, `parse_json_object`; `utils/misc.py`: `_meta_string_list`, `_module_exists`, `now_ts`; `utils/text.py`: `parse_front_matter`, `trim`
+- Routed symbols: 23
+- Cross-module imports: `config/constants.py`: `BUILTIN_CLAWHUB_SKILLS_VERSION`, `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`, `EMBEDDED_SKILLS_ARCHIVE_B64`, `EMBEDDED_SKILLS_ARCHIVE_FILES`, `EMBEDDED_SKILLS_ARCHIVE_SHA256`, `SKILLS_EXTERNAL_MOUNT`, `SKILLS_VIRTUAL_PREFIX`, `SKILL_BODY_COMPACT_THRESHOLD_CHARS`, `SKILL_BODY_PREVIEW_CHARS`, `SKILL_DEFAULT_ATTACHMENT_GLOBS`, `SKILL_INLINE_ATTACHMENT_MAX_CHARS`, `SKILL_INLINE_ATTACHMENT_MAX_FILES`, `SKILL_PROMPT_MAX_CHARS`, `SKILL_PROMPT_MAX_ITEMS`, `SKILL_PROTOCOL_CLAWHUB`, `SKILL_PROTOCOL_HTTP_JSON`, `SKILL_PROTOCOL_LOCAL`, `SKILL_PROTOCOL_SPECS`, `SKILL_REFRESH_MIN_INTERVAL_SECONDS`, `SKILL_RESOURCE_MANIFEST_MAX_ITEMS`; `config/paths.py`: `WORKDIR`; `llm/utils.py`: `_is_http_url`; `utils/files.py`: `_render_offline_js_catalog_md`, `safe_path`, `try_read_text`; `utils/json_utils.py`: `json_dumps`, `parse_json_object`; `utils/misc.py`: `_meta_string_list`, `_module_exists`, `now_ts`; `utils/text.py`: `parse_front_matter`, `trim`
 - Symbols:
-  - `ensure_embedded_skills_at_root` (function, lines 4809-4861)
-  - `ensure_embedded_skills` (function, lines 4864-4865)
-  - `detect_upload_parser_capabilities` (function, lines 4873-4888)
-  - `_render_cap_markdown` (function, lines 4890-4904)
-  - `_write_text_if_changed` (function, lines 4906-4911)
-  - `ensure_generated_document_skills` (function, lines 4913-5001)
-  - `ensure_generated_image_coding_feedback_skill` (function, lines 5003-5102)
-  - `_skill_knowledge_files` (function, lines 5104-5123)
-  - `analyze_skill_building_knowledge` (function, lines 5125-5179)
-  - `_sanitize_skill_slug` (function, lines 5181-5183)
-  - `_build_skills_gen_skill_content` (function, lines 5185-5216)
-  - `ensure_generated_skills_gen_skill` (function, lines 5218-5222)
-  - `ensure_generated_execution_recovery_skill` (function, lines 5224-5302)
-  - `ensure_generated_html_frontend_report_skills` (function, lines 5304-5509)
-  - `ensure_generated_deep_research_skills` (function, lines 5511-5779)
-  - `ensure_generated_research_scientific_skills` (function, lines 5781-6417)
-  - `ensure_generated_runtime_skills_manifest` (function, lines 6419-6450)
-  - `ensure_embedded_clawhub_skills` (function, lines 6701-6738)
-  - `ensure_runtime_skills` (function, lines 6740-6750)
-  - `_BUILTIN_SKILLS` (assignment, lines 6792-6878)
-  - `SkillStore` (class, lines 6880-8053)
+  - `ensure_embedded_skills_at_root` (function, lines 4984-5036)
+  - `ensure_embedded_skills` (function, lines 5039-5040)
+  - `detect_upload_parser_capabilities` (function, lines 5048-5063)
+  - `_render_cap_markdown` (function, lines 5065-5079)
+  - `_write_text_if_changed` (function, lines 5081-5086)
+  - `ensure_generated_document_skills` (function, lines 5088-5176)
+  - `ensure_generated_image_coding_feedback_skill` (function, lines 5178-5277)
+  - `_skill_knowledge_files` (function, lines 5279-5298)
+  - `analyze_skill_building_knowledge` (function, lines 5300-5354)
+  - `_sanitize_skill_slug` (function, lines 5356-5358)
+  - `_build_skills_gen_skill_content` (function, lines 5360-5391)
+  - `ensure_generated_skills_gen_skill` (function, lines 5393-5397)
+  - `ensure_generated_execution_recovery_skill` (function, lines 5399-5477)
+  - `ensure_generated_html_frontend_report_skills` (function, lines 5479-5684)
+  - `ensure_generated_deep_research_skills` (function, lines 5686-5954)
+  - `ensure_generated_research_scientific_skills` (function, lines 5956-6592)
+  - `ensure_generated_rag_mastery_skills` (function, lines 6598-6894)
+  - `ensure_generated_multimodal_comprehension_skills` (function, lines 6900-7589)
+  - `ensure_generated_runtime_skills_manifest` (function, lines 7592-7623)
+  - `ensure_embedded_clawhub_skills` (function, lines 7874-7911)
+  - `ensure_runtime_skills` (function, lines 7913-7925)
+  - `_BUILTIN_SKILLS` (assignment, lines 7967-8053)
+  - `SkillStore` (class, lines 8055-9349)
 
 ### `utils/compress.py`
 
 - Routed symbols: 2
 - Cross-module imports: none
 - Symbols:
-  - `compress_text_blob` (function, lines 2427-2432)
-  - `decompress_text_blob` (function, lines 2434-2442)
+  - `compress_text_blob` (function, lines 2435-2440)
+  - `decompress_text_blob` (function, lines 2442-2450)
 
 ### `utils/crypto.py`
 
 - Routed symbols: 1
 - Cross-module imports: `utils/json_utils.py`: `json_dumps`
 - Symbols:
-  - `CryptoBox` (class, lines 3211-3328)
+  - `CryptoBox` (class, lines 3386-3503)
 
 ### `utils/errors.py`
 
 - Routed symbols: 2
 - Cross-module imports: none
 - Symbols:
-  - `EmptyActionError` (class, lines 2592-2593)
-  - `CircuitBreakerTriggered` (class, lines 2596-2597)
+  - `EmptyActionError` (class, lines 2600-2601)
+  - `CircuitBreakerTriggered` (class, lines 2604-2605)
 
 ### `utils/files.py`
 
 - Routed symbols: 25
 - Cross-module imports: `config/constants.py`: `OFFLINE_JS_LIB_CATALOG`, `OFFLINE_JS_LIB_INDEX_FILE`, `OFFLINE_JS_LIB_README_FILE`; `config/paths.py`: `WORKDIR`; `utils/json_utils.py`: `json_dumps`; `utils/misc.py`: `now_ts`; `utils/text.py`: `trim`
 - Symbols:
-  - `_normalize_js_lib_asset_ref` (function, lines 1107-1120)
-  - `_resolve_js_lib_asset_path` (function, lines 1123-1152)
-  - `_discover_extra_js_lib_files` (function, lines 1155-1185)
-  - `safe_path` (function, lines 1804-1813)
-  - `_safe_js_filename` (function, lines 1815-1822)
-  - `_sha256_bytes` (function, lines 1824-1825)
-  - `_sha256_file` (function, lines 1827-1835)
-  - `_download_http_bytes` (function, lines 1837-1845)
-  - `offline_js_lib_root` (function, lines 1847-1848)
-  - `_offline_js_entry_relative_path` (function, lines 1850-1854)
-  - `_archive_member_relative_path` (function, lines 1856-1865)
-  - `_path_size_bytes` (function, lines 1867-1882)
-  - `_extract_archive_to_dir` (function, lines 1884-1924)
-  - `_package_required_paths` (function, lines 1926-1932)
-  - `_package_install_ready` (function, lines 1934-1942)
-  - `_postprocess_offline_js_package` (function, lines 1944-1979)
-  - `_ensure_offline_js_package` (function, lines 1981-2020)
-  - `_render_offline_js_catalog_md` (function, lines 2022-2038)
-  - `load_offline_js_lib_index` (function, lines 2040-2049)
-  - `ensure_offline_js_libs` (function, lines 2051-2195)
-  - `_normalize_external_js_url` (function, lines 2197-2201)
-  - `is_external_js_src` (function, lines 2203-2205)
-  - `match_offline_js_catalog_by_url` (function, lines 2207-2223)
-  - `cache_external_js_url` (function, lines 2225-2257)
-  - `try_read_text` (function, lines 3533-3541)
+  - `_normalize_js_lib_asset_ref` (function, lines 1108-1121)
+  - `_resolve_js_lib_asset_path` (function, lines 1124-1153)
+  - `_discover_extra_js_lib_files` (function, lines 1156-1186)
+  - `safe_path` (function, lines 1812-1821)
+  - `_safe_js_filename` (function, lines 1823-1830)
+  - `_sha256_bytes` (function, lines 1832-1833)
+  - `_sha256_file` (function, lines 1835-1843)
+  - `_download_http_bytes` (function, lines 1845-1853)
+  - `offline_js_lib_root` (function, lines 1855-1856)
+  - `_offline_js_entry_relative_path` (function, lines 1858-1862)
+  - `_archive_member_relative_path` (function, lines 1864-1873)
+  - `_path_size_bytes` (function, lines 1875-1890)
+  - `_extract_archive_to_dir` (function, lines 1892-1932)
+  - `_package_required_paths` (function, lines 1934-1940)
+  - `_package_install_ready` (function, lines 1942-1950)
+  - `_postprocess_offline_js_package` (function, lines 1952-1987)
+  - `_ensure_offline_js_package` (function, lines 1989-2028)
+  - `_render_offline_js_catalog_md` (function, lines 2030-2046)
+  - `load_offline_js_lib_index` (function, lines 2048-2057)
+  - `ensure_offline_js_libs` (function, lines 2059-2203)
+  - `_normalize_external_js_url` (function, lines 2205-2209)
+  - `is_external_js_src` (function, lines 2211-2213)
+  - `match_offline_js_catalog_by_url` (function, lines 2215-2231)
+  - `cache_external_js_url` (function, lines 2233-2265)
+  - `try_read_text` (function, lines 3708-3716)
 
 ### `utils/json_utils.py`
 
@@ -667,30 +670,30 @@ Code_Structure/
 - Cross-module imports: `utils/text.py`: `trim`
 - Symbols:
   - `JSON_FSYNC_ENABLED` (constant, lines 100-100)
-  - `json_dumps` (function, lines 1776-1777)
-  - `parse_tool_arguments` (function, lines 2471-2480)
-  - `repair_truncated_json_object` (function, lines 2482-2535)
-  - `parse_tool_arguments_with_error` (function, lines 2537-2567)
-  - `parse_json_object` (function, lines 2831-2836)
-  - `extract_json_object_from_text` (function, lines 2838-2860)
-  - `_json_default_copy` (function, lines 3543-3548)
-  - `_read_json_file` (function, lines 3550-3570)
-  - `_write_json_file` (function, lines 3572-3599)
-  - `tool_def` (function, lines 9479-9491)
-  - `TOOLS` (constant, lines 9493-9669)
-  - `TOOL_REQUIRED_ARGS` (constant, lines 9671-9671)
-  - `TOOL_SPEC_BY_NAME` (constant, lines 9672-9672)
-  - `TOOL_NAME_FUZZY_MAP` (constant, lines 9684-9684)
-  - `canonicalize_tool_name` (function, lines 9702-9713)
+  - `json_dumps` (function, lines 1784-1785)
+  - `parse_tool_arguments` (function, lines 2479-2488)
+  - `repair_truncated_json_object` (function, lines 2490-2543)
+  - `parse_tool_arguments_with_error` (function, lines 2545-2575)
+  - `parse_json_object` (function, lines 2839-2844)
+  - `extract_json_object_from_text` (function, lines 2846-2868)
+  - `_json_default_copy` (function, lines 3718-3723)
+  - `_read_json_file` (function, lines 3725-3745)
+  - `_write_json_file` (function, lines 3747-3774)
+  - `tool_def` (function, lines 10889-10901)
+  - `TOOLS` (constant, lines 10903-11079)
+  - `TOOL_REQUIRED_ARGS` (constant, lines 11081-11081)
+  - `TOOL_SPEC_BY_NAME` (constant, lines 11082-11082)
+  - `TOOL_NAME_FUZZY_MAP` (constant, lines 11094-11094)
+  - `canonicalize_tool_name` (function, lines 11112-11123)
 
 ### `utils/media.py`
 
 - Routed symbols: 3
 - Cross-module imports: none
 - Symbols:
-  - `guess_mime_from_name` (function, lines 1616-1618)
-  - `_convert_image_to_safe_format` (function, lines 1621-1638)
-  - `guess_ext_from_mime` (function, lines 1641-1647)
+  - `guess_mime_from_name` (function, lines 1624-1626)
+  - `_convert_image_to_safe_format` (function, lines 1629-1646)
+  - `guess_ext_from_mime` (function, lines 1649-1655)
 
 ### `utils/misc.py`
 
@@ -702,20 +705,20 @@ Code_Structure/
   - `DEFAULT_TIMEOUT_SECONDS` (constant, lines 174-180)
   - `BENIGN_SOCKET_DEBUG_LOG_ENABLED` (constant, lines 270-276)
   - `BENIGN_SOCKET_LOG_INTERVAL_SECONDS` (constant, lines 277-277)
-  - `now_ts` (function, lines 1649-1650)
-  - `_benign_socket_log_lock` (assignment, lines 1653-1653)
-  - `_benign_socket_log_state` (assignment, lines 1654-1654)
-  - `is_benign_socket_error` (function, lines 1672-1690)
-  - `_socket_error_code` (function, lines 1693-1702)
-  - `_log_benign_socket_error_limited` (function, lines 1705-1739)
-  - `swallow_benign_socket_error` (function, lines 1742-1746)
-  - `normalize_timeout_seconds` (function, lines 1749-1762)
-  - `detect_local_lan_ip` (function, lines 1764-1774)
-  - `make_id` (function, lines 1779-1780)
-  - `sanitize_profile_id` (function, lines 1782-1784)
-  - `user_id_from_ip` (function, lines 3203-3209)
-  - `_meta_string_list` (function, lines 3520-3531)
-  - `_module_exists` (function, lines 4867-4871)
+  - `now_ts` (function, lines 1657-1658)
+  - `_benign_socket_log_lock` (assignment, lines 1661-1661)
+  - `_benign_socket_log_state` (assignment, lines 1662-1662)
+  - `is_benign_socket_error` (function, lines 1680-1698)
+  - `_socket_error_code` (function, lines 1701-1710)
+  - `_log_benign_socket_error_limited` (function, lines 1713-1747)
+  - `swallow_benign_socket_error` (function, lines 1750-1754)
+  - `normalize_timeout_seconds` (function, lines 1757-1770)
+  - `detect_local_lan_ip` (function, lines 1772-1782)
+  - `make_id` (function, lines 1787-1788)
+  - `sanitize_profile_id` (function, lines 1790-1792)
+  - `user_id_from_ip` (function, lines 3378-3384)
+  - `_meta_string_list` (function, lines 3695-3706)
+  - `_module_exists` (function, lines 5042-5046)
 
 ### `utils/text.py`
 
@@ -724,17 +727,17 @@ Code_Structure/
 - Symbols:
   - `MAX_TOOL_OUTPUT` (constant, lines 92-92)
   - `SOCKET_NOISE_LINE_PATTERNS` (constant, lines 264-269)
-  - `filter_runtime_noise_lines` (function, lines 1657-1669)
-  - `trim` (function, lines 2259-2261)
-  - `_fmt_export_ts` (function, lines 2264-2272)
-  - `_html_esc` (function, lines 2275-2276)
-  - `_text_to_minimal_pdf` (function, lines 2279-2425)
-  - `normalize_work_text` (function, lines 2444-2469)
-  - `parse_front_matter` (function, lines 3330-3517)
-  - `make_unified_diff` (function, lines 3601-3618)
-  - `_skip_row` (function, lines 3620-3624)
-  - `_row_is_hot` (function, lines 3627-3628)
-  - `_hotspot_index` (function, lines 3631-3652)
-  - `_compress_rows_keep_hotspot` (function, lines 3655-3702)
-  - `make_numbered_diff` (function, lines 3705-3790)
-  - `render_numbered_diff_text` (function, lines 3792-3804)
+  - `filter_runtime_noise_lines` (function, lines 1665-1677)
+  - `trim` (function, lines 2267-2269)
+  - `_fmt_export_ts` (function, lines 2272-2280)
+  - `_html_esc` (function, lines 2283-2284)
+  - `_text_to_minimal_pdf` (function, lines 2287-2433)
+  - `normalize_work_text` (function, lines 2452-2477)
+  - `parse_front_matter` (function, lines 3505-3692)
+  - `make_unified_diff` (function, lines 3776-3793)
+  - `_skip_row` (function, lines 3795-3799)
+  - `_row_is_hot` (function, lines 3802-3803)
+  - `_hotspot_index` (function, lines 3806-3827)
+  - `_compress_rows_keep_hotspot` (function, lines 3830-3877)
+  - `make_numbered_diff` (function, lines 3880-3965)
+  - `render_numbered_diff_text` (function, lines 3967-3979)

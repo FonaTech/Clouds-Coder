@@ -255,6 +255,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
             except Exception as exc:
                 return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
+        if path == "/api/openai_compat/models":
+            base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
+            api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
+            if not base_url:
+                return self._send_json({"ok": False, "models": [], "error": "base_url required"})
+            try:
+                import urllib.request
+                models_url = base_url.rstrip("/") + "/models"
+                req = urllib.request.Request(models_url, method="GET")
+                req.add_header("Accept", "application/json")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                data = raw.get("data", [])
+                model_ids = [str(m.get("id", "")) for m in data if isinstance(m, dict) and m.get("id")]
+                return self._send_json({"ok": True, "models": model_ids, "base_url": base_url})
+            except Exception as exc:
+                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": base_url})
         if path == "/api/skills":
             return self._send_json(self.app.skills_catalog())
         if path == "/api/skills/providers":

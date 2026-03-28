@@ -448,6 +448,7 @@ SKILL_RESOURCE_MANIFEST_MAX_ITEMS = 120
 SKILL_BODY_COMPACT_THRESHOLD_CHARS = 12_000
 SKILL_BODY_PREVIEW_CHARS = 4_000
 SKILLS_VIRTUAL_PREFIX = "/skills"
+SKILLS_EXTERNAL_MOUNT = "__external__"
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
 PLAN_MODE_FORCED_LEVELS = {4, 5}
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
@@ -478,7 +479,7 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
 }
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
-PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 4096
+PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 6144
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
 PLAN_BUBBLE_MAX_CHARS = 3800  # margin under ASSISTANT_MESSAGE_EVENT_MAX_CHARS (4000)
@@ -1529,6 +1530,9 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
                 "qwen-vl",
                 "gemini",
                 "claude-3",
+                "claude-sonnet-4",
+                "claude-opus",
+                "glm-4v",
                 "omni",
             )
         ):
@@ -1543,6 +1547,10 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
             caps["output_audio"] = True
         if any(x in m for x in ("video", "sora", "kling", "wan")):
             caps["output_video"] = True
+    if p == "anthropic":
+        # All current Claude models support image input
+        if any(x in m for x in ("claude-3", "claude-sonnet-4", "claude-opus", "claude-haiku")):
+            caps["input_image"] = True
     return caps
 
 
@@ -3104,6 +3112,136 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("siliconflow"),
         )
 
+    # ── vLLM (local) ────────────────────────────────────────���─────
+    vllm_url = str(config.get("vllm_url", "")).strip()
+    vllm_model = str(config.get("vllm_model", "")).strip()
+    vllm_key = str(config.get("vllm_key", "")).strip()
+    if vllm_url or vllm_model:
+        _vllm_default = "http://localhost:8000/v1"
+        add_profile(
+            profiles,
+            profile_id="vllm",
+            provider="openai_compat",
+            label="vLLM",
+            model=vllm_model or "auto",
+            base_url=extract_base_url(vllm_url or _vllm_default),
+            endpoint=complete_chat_endpoint(vllm_url or _vllm_default),
+            api_key=vllm_key,
+            thinking_stream=bool(config.get("vllm_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("vllm", "openai_compat", vllm_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("vllm"),
+        )
+
+    # ── LM Studio (local) ─────────────────────────────────────────
+    lms_url = str(config.get("lmstudio_url", "")).strip()
+    lms_model = str(config.get("lmstudio_model", "")).strip()
+    if lms_url or lms_model:
+        _lms_default = "http://localhost:1234/v1"
+        add_profile(
+            profiles,
+            profile_id="lmstudio",
+            provider="openai_compat",
+            label="LM Studio",
+            model=lms_model or "auto",
+            base_url=extract_base_url(lms_url or _lms_default),
+            endpoint=complete_chat_endpoint(lms_url or _lms_default),
+            thinking_stream=bool(config.get("lmstudio_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("lmstudio", "openai_compat", lms_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("lmstudio"),
+        )
+
+    # ── Anthropic ──────────────────────────────────────────────────
+    anth_url = str(config.get("anthropic_url", "")).strip()
+    anth_model = str(config.get("anthropic_model", "")).strip()
+    anth_key = str(config.get("anthropic_key", "")).strip()
+    if anth_url or anth_model or anth_key:
+        _anth_base = anth_url or "https://api.anthropic.com"
+        add_profile(
+            profiles,
+            profile_id="anthropic",
+            provider="anthropic",
+            label="Anthropic",
+            model=anth_model or "claude-sonnet-4-20250514",
+            base_url=extract_base_url(_anth_base),
+            endpoint=_anth_base.rstrip("/") + "/v1/messages",
+            api_key=anth_key,
+            thinking_stream=bool(config.get("anthropic_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("anthropic", "anthropic", anth_model or "claude-sonnet-4-20250514"),
+            media_endpoints=build_profile_media_endpoints("anthropic"),
+        )
+
+    # ── GLM (智谱) ─────────────────────────────────────────────────
+    glm_url = str(config.get("glm_url", "")).strip()
+    glm_model = str(config.get("glm_model", "")).strip()
+    glm_key = str(config.get("glm_key", "")).strip()
+    if glm_url or glm_model or glm_key:
+        _glm_default = "https://open.bigmodel.cn/api/paas/v4"
+        add_profile(
+            profiles,
+            profile_id="glm",
+            provider="openai_compat",
+            label="GLM",
+            model=glm_model or "glm-4-flash",
+            base_url=extract_base_url(glm_url or _glm_default),
+            endpoint=complete_chat_endpoint(glm_url or _glm_default),
+            api_key=glm_key,
+            thinking_stream=bool(config.get("glm_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("glm", "openai_compat", glm_model or "glm-4-flash"),
+            media_endpoints=build_profile_media_endpoints("glm"),
+        )
+
+    # ── KIMI (Moonshot / 月之暗面) ─────────────────────────────────
+    kimi_url = str(config.get("kimi_url", "")).strip()
+    kimi_model = str(config.get("kimi_model", "")).strip()
+    kimi_key = str(config.get("kimi_key", "")).strip()
+    if kimi_url or kimi_model or kimi_key:
+        _kimi_default = "https://api.moonshot.cn/v1"
+        add_profile(
+            profiles,
+            profile_id="kimi",
+            provider="openai_compat",
+            label="KIMI (Moonshot)",
+            model=kimi_model or "moonshot-v1-8k",
+            base_url=extract_base_url(kimi_url or _kimi_default),
+            endpoint=complete_chat_endpoint(kimi_url or _kimi_default),
+            api_key=kimi_key,
+            thinking_stream=bool(config.get("kimi_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("kimi", "openai_compat", kimi_model or "moonshot-v1-8k"),
+            media_endpoints=build_profile_media_endpoints("kimi"),
+        )
+
+    # ── OpenRouter ─────────────────────────────────────────────────
+    or_url = str(config.get("openrouter_url", "")).strip()
+    or_model = str(config.get("openrouter_model", "")).strip()
+    or_key = str(config.get("openrouter_key", "")).strip()
+    if or_url or or_model or or_key:
+        _or_default = "https://openrouter.ai/api/v1"
+        add_profile(
+            profiles,
+            profile_id="openrouter",
+            provider="openai_compat",
+            label="OpenRouter",
+            model=or_model or "meta-llama/llama-3.1-8b-instruct",
+            base_url=extract_base_url(or_url or _or_default),
+            endpoint=complete_chat_endpoint(or_url or _or_default),
+            api_key=or_key,
+            thinking_stream=bool(config.get("openrouter_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("openrouter", "openai_compat", or_model or "meta-llama/llama-3.1-8b-instruct"),
+            media_endpoints=build_profile_media_endpoints("openrouter"),
+        )
+
     custom_url = str(config.get("custom_url", "")).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
@@ -3147,9 +3285,24 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         "ollama": "ollama",
         "openai": "openai",
         "siliconflow": "siliconflow",
+        "vllm": "vllm",
+        "lmstudio": "lmstudio",
+        "anthropic": "anthropic",
+        "glm": "glm",
+        "kimi": "kimi",
+        "openrouter": "openrouter",
         "custom": "custom",
     }
-    default_profile_id = active_map.get(provider, profiles[0]["id"])
+    profile_ids = {p["id"] for p in profiles}
+    default_profile_id = active_map.get(provider, "")
+    if not default_profile_id or default_profile_id not in profile_ids:
+        # Fallback: first non-ollama profile that was explicitly configured
+        for p in profiles:
+            if p["id"] != "ollama" and p.get("source") != "default":
+                default_profile_id = p["id"]
+                break
+        if not default_profile_id or default_profile_id not in profile_ids:
+            default_profile_id = profiles[0]["id"]
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
 def looks_like_llm_config(config: dict) -> bool:
@@ -3166,6 +3319,22 @@ def looks_like_llm_config(config: dict) -> bool:
         "siliconflow_url",
         "siliconflow_model",
         "siliconflow_key",
+        "vllm_url",
+        "vllm_model",
+        "lmstudio_url",
+        "lmstudio_model",
+        "anthropic_url",
+        "anthropic_model",
+        "anthropic_key",
+        "glm_url",
+        "glm_model",
+        "glm_key",
+        "kimi_url",
+        "kimi_model",
+        "kimi_key",
+        "openrouter_url",
+        "openrouter_model",
+        "openrouter_key",
         "custom_url",
         "custom_model",
         "custom_key",
@@ -3178,6 +3347,12 @@ def looks_like_llm_config(config: dict) -> bool:
         "ollama_capabilities",
         "openai_capabilities",
         "siliconflow_capabilities",
+        "anthropic_capabilities",
+        "glm_capabilities",
+        "kimi_capabilities",
+        "openrouter_capabilities",
+        "vllm_capabilities",
+        "lmstudio_capabilities",
         "custom_capabilities",
         "ollama_media_endpoints",
         "openai_media_endpoints",
@@ -6416,6 +6591,1004 @@ if __name__ == "__main__":
         ),
     )
 
+# ---------------------------------------------------------------------------
+# Generated Skills: RAG Retrieval Mastery
+# ---------------------------------------------------------------------------
+
+def ensure_generated_rag_mastery_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+
+    # ── Skill A: rag-retrieval-mastery ────────────────────────────────
+
+    rag_mastery_skill = """---
+name: rag-retrieval-mastery
+aliases:
+  - rag-mastery
+  - rag-guide
+  - retrieval-mastery
+triggers:
+  - RAG query
+  - knowledge library
+  - retrieval strategy
+  - query formulation
+  - cross-library search
+  - empty retrieval results
+  - RAG检索
+  - 知识库查询
+  - 检索策略
+  - 查询优化
+clouds_coder:
+  preferred_tools:
+    - query_knowledge_library
+    - query_code_library
+    - read_file
+description: >
+  Comprehensive guide for effective RAG retrieval across knowledge and code libraries.
+  Covers query formulation, route selection, iterative refinement, cross-library strategy,
+  result interpretation, and citation best practices.
+  TRIGGER when: user asks about RAG usage, retrieval quality is poor, empty results from library queries,
+  or task requires grounded knowledge retrieval before answering.
+  DO NOT TRIGGER for: general research workflows (use research-orchestrator-pro), scientific reasoning.
+---
+
+# RAG Retrieval Mastery
+
+Master guide for effective use of `query_knowledge_library` and `query_code_library`.
+
+## When to Use
+- Before answering questions that may have grounded references in the library
+- When retrieval results are empty or irrelevant
+- When combining knowledge from code and document libraries
+- When you need to formulate complex multi-step queries
+
+## 1. Query Formulation Strategies
+
+### Entity-Focused Query
+Extract the **core entity/concept** from the user's question:
+- Bad: "What does the system do when a user logs in?"
+- Good: `query_knowledge_library(query="user login authentication flow", top_k=8)`
+
+### Concept Decomposition
+Break complex questions into 2-3 sub-queries:
+1. `query_knowledge_library(query="transformer attention mechanism", top_k=5)`
+2. `query_knowledge_library(query="self-attention vs cross-attention", top_k=5)`
+
+### Specificity Ladder
+Start specific, broaden if empty:
+1. `query="BERT fine-tuning learning rate schedule"` (narrow)
+2. `query="BERT fine-tuning hyperparameters"` (medium)
+3. `query="transformer model fine-tuning"` (broad)
+
+### Synonym Expansion
+If first query returns few results, try synonyms:
+- "machine learning" → "ML", "deep learning", "neural network"
+- "API endpoint" → "REST route", "HTTP handler", "web service"
+
+### Multilingual Bridging (CN/EN)
+Query in **both languages** if the library may contain mixed content:
+1. `query="注意力机制 attention mechanism"` (combined)
+2. Or run two queries: one Chinese, one English, merge results
+
+### Negation-Aware Query
+To find counter-evidence or alternatives:
+- `query="limitations of batch normalization alternatives"` (includes both positive and negative)
+
+## 2. Route Selection Decision Table
+
+| Route | When to Use | Example |
+|-------|-------------|---------|
+| `fast` | Exact terms, IDs, specific names, short lookup | `query="ResNet-50 accuracy ImageNet", route="fast"` |
+| `global` | Broad themes, overview, synthesis across topics | `query="deep learning trends 2024", route="global"` |
+| `hybrid` | Best default — combines keyword + semantic | `query="transformer optimization techniques", route="hybrid"` |
+| `auto` | Unsure — let system decide | `query="attention", route="auto"` |
+
+**Default recommendation: always start with `route="hybrid"`** unless you have a specific reason for another route.
+
+## 3. Iterative Refinement Protocol
+
+When results are empty or irrelevant, follow this escalation:
+
+```
+Step 1: Try synonyms/alternative terms (same route)
+  → Still empty?
+Step 2: Switch route (fast→hybrid, or hybrid→global)
+  → Still empty?
+Step 3: Broaden query (remove modifiers, use parent concept)
+  → Still empty?
+Step 4: Check library status (is it initialized? has documents?)
+  → query_knowledge_library(query="*", top_k=1) to test readiness
+```
+
+**Never give up after one empty query.** Always try at least 2-3 variations before concluding the library has no relevant content.
+
+## 4. Cross-Library Strategy
+
+### When to use Knowledge Library
+- Research papers, reports, uploaded documents
+- Domain knowledge, definitions, benchmarks
+- Historical data, reference material
+
+### When to use Code Library
+- Function implementations, API signatures
+- Code patterns, architectural decisions
+- Error handling patterns, test examples
+
+### Combined workflow
+1. Knowledge first: `query_knowledge_library(query="OAuth 2.0 PKCE flow", route="hybrid")`
+2. Code second: `query_code_library(query="oauth pkce implementation", route="fast")`
+3. Merge: Use knowledge context to understand the code, use code to ground the theory
+
+## 5. Result Interpretation
+
+### Score Thresholds
+- score > 0.7: Strong match — high confidence
+- score 0.4-0.7: Moderate match — review carefully
+- score < 0.4: Weak match — may be tangential
+
+### Community Cards
+When results include `community_cards`:
+- Multiple communities = topic spans multiple areas → consider refining query
+- Single community = focused topic → results are likely relevant
+
+### Empty Results Debugging
+1. Check `ready` field in library status
+2. Try `query="*", top_k=1` to verify library has content
+3. Check if documents were imported (documents > 0)
+4. Try simpler single-word queries to find what terms the library contains
+
+## 6. Citation Best Practices
+- Always include the `citation` field from results in your response
+- Format: [Source: citation_string] after the referenced claim
+- For multiple sources supporting one claim, list all citations
+- If `title` differs from `citation`, prefer `citation` for attribution
+
+## 7. Common Pitfalls
+- **Overly broad queries**: "tell me everything" → returns noise. Be specific.
+- **Wrong route**: Using `fast` for conceptual questions → misses semantic matches.
+- **Single attempt**: One query with no refinement → likely misses relevant content.
+- **Ignoring low-score results**: Sometimes the 8th result has the answer. Scan all returned results.
+- **Not using top_k**: Default may be too low. Use `top_k=10` for exploration, `top_k=5` for focused.
+"""
+
+    # ── Skill B: code-library-navigator ───────────────────────────────
+
+    code_nav_skill = """---
+name: code-library-navigator
+aliases:
+  - code-navigator
+  - code-rag
+  - code-search
+triggers:
+  - code library
+  - code search
+  - function lookup
+  - symbol search
+  - API reference
+  - code review with library
+  - 代码库查询
+  - 代码搜索
+  - 函数查找
+  - 符号搜索
+clouds_coder:
+  preferred_tools:
+    - query_code_library
+    - read_file
+    - bash
+description: >
+  Specialized guide for code library retrieval. Code-specific query patterns,
+  language filtering, symbol-aware search, and integration with read_file for full context.
+  TRIGGER when: looking up code implementations, function signatures, API patterns, code review.
+  DO NOT TRIGGER for: knowledge/document retrieval (use rag-retrieval-mastery),
+  general research (use research-orchestrator-pro).
+---
+
+# Code Library Navigator
+
+Specialized guide for effective code library retrieval via `query_code_library`.
+
+## When to Use
+- Looking up function implementations or API signatures
+- Finding code patterns or architectural references
+- Code review with library-backed evidence
+- Understanding unfamiliar codebases via indexed symbols
+
+## 1. Code-Specific Query Patterns
+
+### Function/Method Lookup
+```
+query_code_library(query="def authenticate_user", route="fast")
+query_code_library(query="handleSubmit onClick", route="fast", language="javascript")
+```
+
+### Class/Module Discovery
+```
+query_code_library(query="class UserRepository database", route="hybrid")
+query_code_library(query="module authentication middleware", route="hybrid")
+```
+
+### API Pattern Search
+```
+query_code_library(query="REST endpoint /api/users POST", route="fast")
+query_code_library(query="GraphQL resolver mutation", route="hybrid")
+```
+
+### Error Handling Patterns
+```
+query_code_library(query="try catch database connection retry", route="hybrid")
+query_code_library(query="error boundary fallback component", route="fast", language="typescript")
+```
+
+### Algorithm/Logic Search
+```
+query_code_library(query="binary search sorted array", route="hybrid")
+query_code_library(query="LRU cache eviction policy", route="hybrid")
+```
+
+## 2. Language Filtering
+
+Use the `language` parameter to narrow results:
+```
+query_code_library(query="sort implementation", language="python")
+query_code_library(query="async await pattern", language="javascript")
+query_code_library(query="error handling", language="go")
+```
+
+For multi-language projects, run **two queries** — one filtered, one unfiltered — and compare.
+
+## 3. From Snippet to Full Context
+
+Code library returns **snippets** (320 chars max). To get full context:
+
+1. **Query**: `result = query_code_library(query="parse config file", top_k=5)`
+2. **Extract path**: Read `citation` field → contains file path
+3. **Read full file**: `read_file` on the extracted path
+4. **Analyze**: Now you have the full function/class context
+
+This is the core workflow: **search → locate → read → understand**.
+
+## 4. Symbol-Aware Search
+
+Results may include a `symbol` field (function/class name):
+- Use symbol for precise follow-up: `query_code_library(query="symbol:UserService.create")`
+- Symbol results have higher precision than text-only matches
+
+## 5. Code Review Workflow
+
+1. **Find reference implementations**:
+   `query_code_library(query="similar function pattern", top_k=8)`
+2. **Compare patterns**: Check if the code under review follows library conventions
+3. **Report deviations**: Note differences in error handling, naming, structure
+4. **Verify edge cases**: Query for test files: `query_code_library(query="test_authenticate", route="fast")`
+
+## 6. Integration with Knowledge Library
+
+When a code question needs **domain context**:
+1. First: `query_knowledge_library(query="OAuth 2.0 PKCE specification")` — understand the concept
+2. Then: `query_code_library(query="pkce code_verifier code_challenge")` — find the implementation
+3. Combine: Verify implementation matches specification
+
+## Quick Reference
+
+```
+query_code_library(
+    query="search text",        # Required: the search query
+    top_k=8,                    # Optional: results count (1-12, default 8)
+    route="hybrid",             # Optional: fast|global|hybrid|auto
+    language="python",          # Optional: filter by programming language
+)
+```
+"""
+
+    _write_text_if_changed(generated_root / "rag-retrieval-mastery" / "SKILL.md", rag_mastery_skill)
+    _write_text_if_changed(generated_root / "code-library-navigator" / "SKILL.md", code_nav_skill)
+    _write_text_if_changed(
+        generated_root / "rag-mastery-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": ["rag-retrieval-mastery", "code-library-navigator"],
+                "focus": ["rag_query_mastery", "code_library_navigation"],
+            },
+            indent=2,
+        ),
+    )
+
+# ---------------------------------------------------------------------------
+# Generated Skills: Multimodal Reading Comprehension
+# ---------------------------------------------------------------------------
+
+def ensure_generated_multimodal_comprehension_skills(skills_root: Path):
+    generated_root = skills_root / "generated"
+
+    # ── Skill C: pdf-reading-comprehension ────────────────────────────
+
+    pdf_skill = """---
+name: pdf-reading-comprehension
+aliases:
+  - pdf-reader
+  - pdf-comprehension
+  - read-pdf
+triggers:
+  - read PDF
+  - PDF analysis
+  - PDF summary
+  - PDF comparison
+  - extract from PDF
+  - PDF table
+  - PDF figure
+  - 阅读PDF
+  - PDF分析
+  - PDF摘要
+  - PDF对比
+  - PDF提取
+clouds_coder:
+  preferred_tools:
+    - read_file
+    - bash
+    - query_knowledge_library
+description: >
+  General-purpose PDF reading comprehension skill. Text extraction via .parsed.md,
+  figure analysis via read_file on extracted images, structure extraction, multi-PDF comparison,
+  and summary generation at three depth levels.
+  TRIGGER when: user uploads PDF and asks for reading/analysis/summary/comparison/extraction.
+  DO NOT TRIGGER for: research literature review (use pdf-vision-literature-integrator),
+  PDF creation/generation (use kimi-pdf or pdf skill).
+---
+
+# PDF Reading Comprehension
+
+General-purpose skill for reading and understanding PDF documents.
+
+## When to Use
+- User uploads a PDF and asks to read, summarize, analyze, or compare it
+- Need to extract tables, figures, or specific sections from PDFs
+- Multi-PDF comparison or cross-reference tasks
+
+## When NOT to Use
+- Academic literature review with evidence synthesis → use `pdf-vision-literature-integrator`
+- Creating/generating PDF files → use `kimi-pdf` or `pdf` output skill
+
+## Step 1: Text Extraction
+
+**Always try `.parsed.md` first** — the backend auto-generates it on upload:
+```
+read_file uploaded/<filename>.parsed.md
+```
+
+If `.parsed.md` is unavailable or incomplete:
+```bash
+# pdftotext (preserves layout)
+bash: pdftotext -layout "uploaded/<filename>.pdf" -
+
+# pdfminer (Python, more robust)
+bash: python3 -c "from pdfminer.high_level import extract_text; print(extract_text('uploaded/<filename>.pdf'))"
+```
+
+**Scanned PDF detection**: If extracted text is empty, garbled, or very short relative to page count,
+the PDF is likely scanned → use OCR fallback (Step 5).
+
+## Step 2: Structure Recognition
+
+After reading text, identify the document structure:
+1. **Headings/Sections**: Look for numbered sections, bold text, ALL CAPS patterns
+2. **Table of Contents**: Often in first 2 pages — use as navigation map
+3. **Tables**: Look for tab-separated or pipe-separated data in parsed text
+4. **Figure references**: "Figure 1", "Fig. 2", "Table 3" — note their locations
+5. **Page numbers**: Track content locations for citations
+
+## Step 3: Visual Elements (Figures/Charts/Diagrams)
+
+Check if images were extracted alongside the upload:
+```bash
+bash: ls uploaded/<filename_stem>*images* 2>/dev/null || ls uploaded/*images*/ 2>/dev/null
+```
+
+If image directory exists:
+1. `read_file` on each image file — runtime injects as native vision input
+2. Correlate each image with nearby text/captions in the parsed content
+3. Describe what the figure shows and how it relates to the text
+
+If no images extracted but the PDF contains figures:
+```bash
+# Probe PyMuPDF availability
+bash: python3 -c "import fitz; print('PyMuPDF available')" 2>&1
+# If available, extract figures
+bash: python3 -c "
+import fitz
+doc = fitz.open('uploaded/<filename>.pdf')
+for i, page in enumerate(doc):
+    for j, img in enumerate(page.get_images(full=True)):
+        xref = img[0]
+        pix = fitz.Pixmap(doc, xref)
+        if pix.n >= 5: pix = fitz.Pixmap(fitz.csRGB, pix)
+        pix.save(f'uploaded/fig_p{i+1}_{j+1}.png')
+        print(f'Saved: uploaded/fig_p{i+1}_{j+1}.png')
+"
+```
+
+## Step 4: Multi-PDF Comparison
+
+When comparing multiple PDFs:
+1. Read each PDF's `.parsed.md`
+2. Build a comparison matrix:
+
+| Aspect | Document A | Document B | Notes |
+|--------|-----------|-----------|-------|
+| Topic | ... | ... | Agreement/Difference |
+| Method | ... | ... | ... |
+| Findings | ... | ... | ... |
+
+3. Synthesize: What do the documents agree on? Where do they differ? Why?
+
+## Step 5: Summary Generation
+
+Three depth levels:
+
+### Executive Summary (3-5 bullets)
+- Core conclusion
+- Key data point
+- Main recommendation
+- Critical limitation
+
+### Standard Summary (section-by-section)
+For each major section: 2-3 sentences covering the key points.
+Always cite section/page numbers.
+
+### Deep Summary (claim-evidence-source)
+| Claim | Evidence | Source (page/section) | Confidence |
+|-------|----------|----------------------|------------|
+
+## Step 6: Fallback for Scanned PDFs
+
+If text extraction returns empty/garbled content:
+```bash
+# OCR with tesseract
+bash: tesseract "uploaded/<filename>.pdf" stdout pdf 2>/dev/null || echo "tesseract not available"
+
+# ocrmypdf (adds OCR layer to PDF, then re-extract)
+bash: ocrmypdf "uploaded/<filename>.pdf" "/tmp/ocr_output.pdf" && pdftotext "/tmp/ocr_output.pdf" -
+```
+
+## Notes
+- Always cite page numbers or section references in your analysis
+- For very large PDFs (100+ pages), focus on the sections relevant to the user's question
+- When RAG library has the PDF imported, also try: `query_knowledge_library(query="<topic>", route="hybrid")`
+"""
+
+    # ── Skill D: audio-comprehension ──────────────────────────────────
+
+    audio_skill = """---
+name: audio-comprehension
+aliases:
+  - audio-reader
+  - audio-analysis
+  - listen-audio
+  - transcription
+triggers:
+  - audio analysis
+  - listen to audio
+  - transcribe
+  - meeting notes
+  - lecture notes
+  - podcast summary
+  - speech analysis
+  - 音频分析
+  - 听音频
+  - 转录
+  - 会议纪要
+  - 讲座笔记
+  - 语音识别
+clouds_coder:
+  preferred_tools:
+    - read_file
+    - bash
+description: >
+  Audio comprehension workflow: native analysis via read_file when model supports audio input,
+  with whisper/ffmpeg fallback. Covers speech, music, sound analysis, meeting/lecture notes.
+  TRIGGER when: user uploads audio and asks for analysis/transcription/notes/summary.
+  DO NOT TRIGGER for: audio generation or text-to-speech tasks.
+---
+
+# Audio Comprehension
+
+Workflow for analyzing and understanding audio files.
+
+## Supported Formats
+mp3, wav, m4a, aac, flac, ogg, oga, opus, webm
+
+## Primary: Native Audio Analysis
+
+Use `read_file` on the audio file — the runtime automatically injects it as native audio input
+if the model supports it:
+```
+read_file uploaded/<filename>.mp3
+```
+
+The model can then directly analyze:
+- Speech content (what is being said)
+- Speaker tone, emotion, emphasis
+- Music elements (if applicable)
+- Background sounds and environment
+
+**After loading**, describe what you hear and answer the user's question based on the audio content.
+
+## Fallback: Transcription Tools
+
+If the model reports native audio input is unavailable, use external transcription:
+
+### Whisper (recommended)
+```bash
+# Quick transcription
+bash: whisper "uploaded/<filename>.mp3" --model base --output_format txt --output_dir /tmp/
+
+# Higher quality (slower)
+bash: whisper "uploaded/<filename>.mp3" --model small --output_format txt --output_dir /tmp/
+
+# Read transcript
+read_file /tmp/<filename>.txt
+```
+
+### Python whisper library
+```bash
+bash: python3 -c "
+import whisper
+model = whisper.load_model('base')
+result = model.transcribe('uploaded/<filename>.mp3')
+print(result['text'])
+"
+```
+
+### Format conversion (if needed)
+```bash
+# Convert to wav for better compatibility
+bash: ffmpeg -i "uploaded/<filename>.m4a" -ar 16000 -ac 1 /tmp/converted.wav
+```
+
+## Meeting Notes Workflow
+
+1. Load audio via `read_file` (or transcribe via fallback)
+2. Identify key elements:
+   - Participants (if identifiable)
+   - Topics discussed (segment by theme)
+   - Decisions made
+   - Action items assigned
+3. Output structured meeting notes:
+
+```markdown
+# Meeting Notes — [Date/Topic]
+
+## Participants
+- Speaker A, Speaker B, ...
+
+## Discussion Topics
+### Topic 1: [name]
+- Key points discussed
+- Decisions: ...
+
+### Topic 2: [name]
+- ...
+
+## Action Items
+- [ ] [Person]: [Action] — by [deadline]
+
+## Follow-up
+- Next meeting: ...
+```
+
+## Lecture / Podcast Summary
+
+1. Load or transcribe the audio
+2. Identify the structure:
+   - Introduction / topic statement
+   - Main arguments / sections
+   - Examples and evidence
+   - Conclusion / takeaways
+3. Output:
+   - **Key Topics** (bulleted list)
+   - **Section-by-section summary** (2-3 sentences each)
+   - **Notable quotes** (verbatim if possible)
+   - **Study questions** (for lectures)
+
+## Quality Notes
+- File size limit: <20 MB for native audio input
+- Long audio (>15 min): Consider chunking via ffmpeg:
+  `bash: ffmpeg -i input.mp3 -ss 0 -t 300 chunk1.mp3` (first 5 min)
+- Noisy audio: Transcription quality degrades — note uncertainty in output
+- Multiple speakers: Native models may distinguish speakers; whisper may not
+"""
+
+    # ── Skill E: video-comprehension ──────────────────────────────────
+
+    video_skill = """---
+name: video-comprehension
+aliases:
+  - video-reader
+  - video-analysis
+  - watch-video
+triggers:
+  - video analysis
+  - watch video
+  - video summary
+  - video transcript
+  - screen recording
+  - 视频分析
+  - 看视频
+  - 视频摘要
+  - 视频转录
+  - 录屏分析
+clouds_coder:
+  preferred_tools:
+    - read_file
+    - bash
+description: >
+  Video comprehension workflow: native analysis via read_file when model supports video input,
+  with frame extraction fallback via ffmpeg. Covers temporal analysis, video summarization,
+  screen recording interpretation, and tutorial extraction.
+  TRIGGER when: user uploads video and asks for analysis/summary/transcription.
+  DO NOT TRIGGER for: video generation tasks.
+---
+
+# Video Comprehension
+
+Workflow for analyzing and understanding video files.
+
+## Supported Formats
+mp4, mov, avi, mkv, webm, m4v, mpeg, mpg, 3gp
+
+## Primary: Native Video Analysis
+
+Use `read_file` on the video file — the runtime injects it as native video input if the model supports it:
+```
+read_file uploaded/<filename>.mp4
+```
+
+The model can then directly analyze:
+- Visual content (scenes, objects, people, text overlays)
+- Audio track (speech, music, sound effects)
+- Temporal flow (what happens when)
+- UI elements (for screen recordings)
+
+## Fallback: Frame Extraction + Audio Separation
+
+If native video input is unavailable:
+
+### Extract Key Frames
+```bash
+# One frame every 5 seconds
+bash: mkdir -p /tmp/frames && ffmpeg -i "uploaded/<filename>.mp4" -vf "fps=1/5" -q:v 2 /tmp/frames/frame_%04d.jpg 2>&1 | tail -3
+
+# List extracted frames
+bash: ls /tmp/frames/
+```
+
+Then analyze each frame via `read_file`:
+```
+read_file /tmp/frames/frame_0001.jpg
+read_file /tmp/frames/frame_0002.jpg
+...
+```
+
+### Extract Audio Track
+```bash
+bash: ffmpeg -i "uploaded/<filename>.mp4" -vn -acodec pcm_s16le /tmp/audio_track.wav 2>&1 | tail -3
+```
+Then apply the `audio-comprehension` workflow on the extracted audio.
+
+### Combine Visual + Audio Analysis
+Merge the visual scene descriptions with audio transcription to build a complete understanding.
+
+## Screen Recording Analysis
+
+For screen recordings / UI walkthroughs:
+1. Extract frames at higher frequency (every 2 seconds):
+   `bash: ffmpeg -i input.mp4 -vf "fps=1/2" frames/frame_%04d.jpg`
+2. Analyze each frame for:
+   - Application/webpage being shown
+   - UI state changes between frames
+   - Text content on screen
+   - Error messages or notifications
+3. Reconstruct the workflow step by step
+4. Output as a tutorial or issue report
+
+## Video Summarization
+
+1. Load video natively or extract frames
+2. Build scene list:
+   | Timestamp | Scene Description | Key Content |
+   |-----------|------------------|-------------|
+   | 0:00-0:30 | Intro | Title, speaker |
+   | 0:30-2:00 | Topic 1 | Main argument |
+   | ... | ... | ... |
+3. Generate structured summary:
+   - **Overview** (1-2 sentences)
+   - **Timeline** (scene-by-scene)
+   - **Key moments** (with timestamps)
+   - **Conclusions**
+
+## Quality Notes
+- File size limit: <20 MB for native video input
+- Long videos: Sample frames strategically rather than extracting all
+  - First frame, last frame, and N evenly-spaced frames in between
+- Resolution affects analysis quality — high-res frames give better results
+- For tutorials: higher frame rate (1 fps) captures more UI state changes
+"""
+
+    # ── Skill F: data-analysis-deep-dive ──────────────────────────────
+
+    data_skill = """---
+name: data-analysis-deep-dive
+aliases:
+  - data-deep-dive
+  - deep-data-analysis
+  - advanced-tabular
+  - data-science
+triggers:
+  - data analysis
+  - statistical analysis
+  - data profiling
+  - data visualization
+  - dataset comparison
+  - data quality
+  - correlation analysis
+  - 数据分析
+  - 统计分析
+  - 数据质量
+  - 数据可视化
+  - 数据对比
+  - 相关性分析
+clouds_coder:
+  preferred_tools:
+    - bash
+    - read_file
+    - write_file
+    - query_knowledge_library
+description: >
+  Enhanced data analysis skill for CSV/XLSX files. Statistical analysis via Python,
+  data profiling, visualization generation, quality assessment, cross-dataset comparison,
+  and RAG-backed contextual analysis.
+  TRIGGER when: user needs statistical analysis, data profiling, visualization, or dataset comparison.
+  DO NOT TRIGGER for: simple file reading (use upload-tabular-parser),
+  research workflows (use research-orchestrator-pro).
+---
+
+# Data Analysis Deep Dive
+
+Advanced data analysis workflow beyond basic file parsing.
+
+## When to Use
+- Statistical analysis, hypothesis testing
+- Data profiling and quality assessment
+- Visualization / chart generation
+- Cross-dataset comparison
+- RAG-backed contextual analysis
+
+## When NOT to Use
+- Just reading a CSV/XLSX file → use `upload-tabular-parser`
+- Full research workflow → use `research-orchestrator-pro` Phase 2
+
+## Step 1: Data Ingestion
+
+Read the `.parsed.md` for a quick preview, then load properly via Python:
+```bash
+bash: python3 -c "
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+print('Shape:', df.shape)
+print('Columns:', list(df.columns))
+print('Types:', df.dtypes.to_dict())
+print('Head:')
+print(df.head())
+"
+```
+
+For XLSX:
+```bash
+bash: python3 -c "
+import pandas as pd
+xls = pd.ExcelFile('uploaded/<filename>.xlsx')
+print('Sheets:', xls.sheet_names)
+df = pd.read_excel(xls, sheet_name=0)
+print('Shape:', df.shape)
+print('Head:')
+print(df.head())
+"
+```
+
+Handle encoding/delimiter issues:
+```bash
+# Auto-detect encoding
+bash: python3 -c "
+import chardet
+with open('uploaded/<filename>.csv', 'rb') as f:
+    result = chardet.detect(f.read(10000))
+    print(result)
+"
+```
+
+## Step 2: Data Profiling
+
+Quick automated profile:
+```bash
+bash: python3 -c "
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+print('=== Shape ===')
+print(df.shape)
+print('=== Missing Values ===')
+print(df.isnull().sum())
+print('=== Unique Counts ===')
+print(df.nunique())
+print('=== Descriptive Stats ===')
+print(df.describe(include='all').to_string())
+"
+```
+
+Key metrics to report:
+- Row count, column count
+- Missing values per column (count and percentage)
+- Unique values per column
+- Min/max/mean/std for numeric columns
+- Top-N value counts for categorical columns
+
+## Step 3: Statistical Analysis
+
+Choose the right analysis based on the question:
+
+### Descriptive Statistics
+```python
+df.describe(), df.corr(), df.groupby('category').mean()
+```
+
+### Correlation Analysis
+```bash
+bash: python3 -c "
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+corr = df.select_dtypes(include='number').corr()
+print(corr.to_string())
+# Highlight strong correlations
+for col1 in corr.columns:
+    for col2 in corr.columns:
+        if col1 < col2 and abs(corr.loc[col1, col2]) > 0.7:
+            print(f'Strong: {col1} <-> {col2}: {corr.loc[col1, col2]:.3f}')
+"
+```
+
+### Hypothesis Testing
+```bash
+bash: python3 -c "
+from scipy import stats
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+# Example: t-test between two groups
+group_a = df[df['group'] == 'A']['value']
+group_b = df[df['group'] == 'B']['value']
+t_stat, p_value = stats.ttest_ind(group_a, group_b)
+print(f't-stat: {t_stat:.4f}, p-value: {p_value:.4f}')
+print('Significant' if p_value < 0.05 else 'Not significant')
+"
+```
+
+## Step 4: Visualization
+
+Generate charts and save to workspace:
+
+### Bar Chart (comparison)
+```bash
+bash: python3 -c "
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+df.groupby('category')['value'].mean().plot(kind='bar', title='Average Value by Category')
+plt.ylabel('Value')
+plt.tight_layout()
+plt.savefig('chart_comparison.png', dpi=150)
+print('Saved: chart_comparison.png')
+"
+```
+
+### Line Chart (trend)
+```bash
+bash: python3 -c "
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt; import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+plt.figure(figsize=(10,5))
+plt.plot(df['date'], df['value'])
+plt.title('Value Trend'); plt.xlabel('Date'); plt.ylabel('Value')
+plt.xticks(rotation=45); plt.tight_layout()
+plt.savefig('chart_trend.png', dpi=150); print('Saved: chart_trend.png')
+"
+```
+
+### Chart Selection Guide
+| Intent | Chart Type | matplotlib call |
+|--------|-----------|-----------------|
+| Comparison | Bar | `.plot(kind='bar')` |
+| Trend over time | Line | `plt.plot()` |
+| Distribution | Histogram | `.plot(kind='hist')` |
+| Correlation | Scatter | `plt.scatter()` |
+| Composition | Pie | `.plot(kind='pie')` |
+| Distribution shape | Box plot | `.plot(kind='box')` |
+
+Always include: title, axis labels, legend (if multiple series), tight_layout.
+
+## Step 5: Data Quality Assessment
+
+```bash
+bash: python3 -c "
+import pandas as pd
+df = pd.read_csv('uploaded/<filename>.csv')
+print('=== Missing Data ===')
+missing = df.isnull().sum()
+missing_pct = (missing / len(df) * 100).round(2)
+print(pd.DataFrame({'count': missing, 'percent': missing_pct})[missing > 0].to_string())
+
+print('\\n=== Duplicates ===')
+print(f'Duplicate rows: {df.duplicated().sum()} / {len(df)}')
+
+print('\\n=== Outliers (IQR method) ===')
+for col in df.select_dtypes(include='number').columns:
+    Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+    IQR = Q3 - Q1
+    outliers = ((df[col] < Q1 - 1.5*IQR) | (df[col] > Q3 + 1.5*IQR)).sum()
+    if outliers > 0:
+        print(f'  {col}: {outliers} outliers')
+"
+```
+
+## Step 6: Cross-Dataset Comparison
+
+When comparing two datasets:
+1. Load both: `df_a = pd.read_csv('a.csv')`, `df_b = pd.read_csv('b.csv')`
+2. Compare schemas: column names, types, missing patterns
+3. Compare distributions: mean, std, min, max for shared columns
+4. Identify drift: significant differences in distributions
+5. Output comparison matrix
+
+## RAG Context Integration
+
+Use `query_knowledge_library` to ground your analysis in domain knowledge:
+```
+query_knowledge_library(query="normal range for <metric>", route="hybrid")
+query_knowledge_library(query="<domain> benchmark data", route="hybrid")
+```
+
+This helps you:
+- Know what ranges are "normal" for the domain
+- Compare against published benchmarks
+- Understand what statistical tests are appropriate
+"""
+
+    _write_text_if_changed(generated_root / "pdf-reading-comprehension" / "SKILL.md", pdf_skill)
+    _write_text_if_changed(generated_root / "audio-comprehension" / "SKILL.md", audio_skill)
+    _write_text_if_changed(generated_root / "video-comprehension" / "SKILL.md", video_skill)
+    _write_text_if_changed(generated_root / "data-analysis-deep-dive" / "SKILL.md", data_skill)
+    _write_text_if_changed(
+        generated_root / "multimodal-comprehension-capabilities.json",
+        json_dumps(
+            {
+                "generated_at": int(now_ts()),
+                "skills": [
+                    "pdf-reading-comprehension",
+                    "audio-comprehension",
+                    "video-comprehension",
+                    "data-analysis-deep-dive",
+                ],
+                "focus": [
+                    "pdf_comprehension",
+                    "audio_comprehension",
+                    "video_comprehension",
+                    "advanced_data_analysis",
+                ],
+            },
+            indent=2,
+        ),
+    )
+
+
 def ensure_generated_runtime_skills_manifest(skills_root: Path):
     generated_root = skills_root / "generated"
     tracked = [
@@ -6746,6 +7919,8 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_html_frontend_report_skills(skills_root)
     ensure_generated_deep_research_skills(skills_root)
     ensure_generated_research_scientific_skills(skills_root)
+    ensure_generated_rag_mastery_skills(skills_root)
+    ensure_generated_multimodal_comprehension_skills(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -7153,6 +8328,117 @@ class SkillStore:
             total_chars += len(text)
         return chosen
 
+    def _provider_root_path(self, provider_id: str) -> Path | None:
+        row = self.providers.get(str(provider_id or "").strip(), {})
+        raw = str(row.get("root", "") or "").strip() if isinstance(row, dict) else ""
+        if not raw:
+            return None
+        try:
+            return Path(raw).resolve()
+        except Exception:
+            return None
+
+    def _provider_virtual_prefix(self, provider_id: str) -> str:
+        pid = self._sanitize_provider_id(provider_id, "provider")
+        return f"{SKILLS_VIRTUAL_PREFIX}/{SKILLS_EXTERNAL_MOUNT}/{pid}"
+
+    def _public_provider_path(self, provider_id: str, raw_locator: str | Path) -> str:
+        raw = str(raw_locator or "").strip()
+        if not raw:
+            return ""
+        if raw == "(builtin)" or _is_http_url(raw):
+            return raw
+        base, sep, frag = raw.partition("#")
+        if _is_http_url(base):
+            return raw
+        try:
+            candidate = Path(base)
+        except Exception:
+            return self._public_skill_locator(raw)
+        try:
+            resolved = candidate.resolve() if candidate.is_absolute() else (self.skills_root / candidate).resolve()
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            try:
+                rel = resolved.relative_to(self.skills_root.resolve()).as_posix()
+                public = SKILLS_VIRTUAL_PREFIX if rel in {"", "."} else f"{SKILLS_VIRTUAL_PREFIX}/{rel}"
+                public = public.replace("//", "/")
+                return public + (f"#{frag}" if sep else "")
+            except Exception:
+                pass
+            root = self._provider_root_path(provider_id)
+            if root is not None:
+                try:
+                    rel = resolved.relative_to(root).as_posix()
+                    prefix = self._provider_virtual_prefix(provider_id)
+                    public = prefix if rel in {"", "."} else f"{prefix}/{rel}"
+                    public = public.replace("//", "/")
+                    return public + (f"#{frag}" if sep else "")
+                except Exception:
+                    pass
+        return self._public_skill_locator(raw)
+
+    def resolve_virtual_skill_path(self, rel_path: str) -> Path:
+        rel = str(PurePosixPath(str(rel_path or "").replace("\\", "/"))).strip().lstrip("/")
+        parts = PurePosixPath(rel).parts
+        if len(parts) >= 2 and parts[0] == SKILLS_EXTERNAL_MOUNT:
+            provider_id = str(parts[1]).strip()
+            root = self._provider_root_path(provider_id)
+            if root is None:
+                raise ValueError(f"unknown external skill provider: {provider_id}")
+            tail = PurePosixPath(*parts[2:]).as_posix() if len(parts) > 2 else "."
+            return safe_path(tail or ".", root)
+        return safe_path(rel or ".", self.skills_root)
+
+    def public_virtual_skill_path_for_abs(self, path: Path) -> str:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            return ""
+        try:
+            rel = resolved.relative_to(self.skills_root.resolve()).as_posix()
+            public = SKILLS_VIRTUAL_PREFIX if rel in {"", "."} else f"{SKILLS_VIRTUAL_PREFIX}/{rel}"
+            return public.replace("//", "/")
+        except Exception:
+            pass
+        for provider_id in sorted(self.providers.keys()):
+            root = self._provider_root_path(provider_id)
+            if root is None:
+                continue
+            try:
+                if root == self.skills_root.resolve() or root.is_relative_to(self.skills_root.resolve()):
+                    continue
+            except Exception:
+                pass
+            try:
+                rel = resolved.relative_to(root).as_posix()
+            except Exception:
+                continue
+            prefix = self._provider_virtual_prefix(provider_id)
+            public = prefix if rel in {"", "."} else f"{prefix}/{rel}"
+            return public.replace("//", "/")
+        return ""
+
+    def shell_virtual_mappings(self) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        try:
+            skills_root = self.skills_root.resolve()
+        except Exception:
+            skills_root = self.skills_root
+        for provider_id in sorted(self.providers.keys()):
+            root = self._provider_root_path(provider_id)
+            if root is None:
+                continue
+            try:
+                if root == skills_root or root.is_relative_to(skills_root):
+                    continue
+            except Exception:
+                pass
+            rows.append((self._provider_virtual_prefix(provider_id), str(root)))
+        rows.sort(key=lambda x: len(x[0]), reverse=True)
+        return rows
+
     def _public_skill_locator(self, raw_locator: str) -> str:
         raw = str(raw_locator or "").strip()
         if not raw:
@@ -7214,12 +8500,15 @@ class SkillStore:
     def _public_attachment_locator(self, item: dict) -> tuple[str, str]:
         source = str(item.get("virtual_path", "") or "").strip()
         if not source:
-            source = self._public_skill_locator(str(item.get("abs_path", "") or ""))
+            source = self._public_provider_locator(
+                str(item.get("abs_path", "") or ""),
+                str(item.get("provider_id", "") or ""),
+            )
         virtual_path = source if source.startswith(f"{SKILLS_VIRTUAL_PREFIX}/") else ""
         return source, virtual_path
 
-    def _public_provider_locator(self, raw_locator: str) -> str:
-        public = self._public_skill_locator(raw_locator)
+    def _public_provider_locator(self, raw_locator: str, provider_id: str = "") -> str:
+        public = self._public_provider_path(provider_id, raw_locator)
         if public == "(external-local-path)":
             return ""
         return public
@@ -7255,6 +8544,7 @@ class SkillStore:
         self,
         skill_dir: Path,
         *,
+        provider_id: str = "",
         skip_name: str = "SKILL.md",
         globs: list[str] | None = None,
         base_dir: Path | None = None,
@@ -7299,7 +8589,9 @@ class SkillStore:
                 {
                     "path": rel,
                     "abs_path": str(fp.resolve()),
-                    "virtual_path": f"{SKILLS_VIRTUAL_PREFIX}/{skill_rel}".replace("//", "/"),
+                    "virtual_path": self._public_provider_path(provider_id, fp.resolve())
+                    or f"{SKILLS_VIRTUAL_PREFIX}/{skill_rel}".replace("//", "/"),
+                    "provider_id": provider_id,
                     "content": text or "",
                     "text_available": text is not None,
                     "size": size,
@@ -7338,7 +8630,7 @@ class SkillStore:
             "protocol_version": protocol_version,
             "meta": dict(meta or {}),
             "body": (body or "").strip(),
-            "skill_path": self._public_skill_locator(skill_path),
+            "skill_path": self._public_provider_path(provider_id, skill_path),
             "skill_abs_path": self._absolute_skill_locator(skill_path),
             "attachments": attachments,
         }
@@ -7361,6 +8653,7 @@ class SkillStore:
         desc = str(meta.get("description", "-"))
         attachments = self._collect_attachments(
             skill_dir,
+            provider_id=provider_id,
             skip_name=skill_file.name,
             globs=self._skill_attachment_globs(meta),
             entrypoints=self._skill_entrypoints(meta),
@@ -7871,8 +9164,9 @@ class SkillStore:
         out = []
         for provider in sorted(self.providers.values(), key=lambda x: x["provider_id"]):
             row = dict(provider)
-            row["root"] = self._public_provider_locator(str(row.get("root", "") or ""))
-            row["config_path"] = self._public_provider_locator(str(row.get("config_path", "") or ""))
+            provider_id = str(row.get("provider_id", "") or "")
+            row["root"] = self._public_provider_locator(str(row.get("root", "") or ""), provider_id)
+            row["config_path"] = self._public_provider_locator(str(row.get("config_path", "") or ""), provider_id)
             out.append(row)
         return out
 
@@ -8006,8 +9300,10 @@ class SkillStore:
                     if not skill_abs_path:
                         raise ValueError("skill has no local absolute path")
                     base = Path(skill_abs_path).resolve().parent
-                    vp_rel = (base / rel).resolve().relative_to(self.skills_root.resolve()).as_posix()
-                    virtual_path = f"{SKILLS_VIRTUAL_PREFIX}/{vp_rel}".replace("//", "/")
+                    virtual_path = self._public_provider_path(
+                        str(skill.get("provider_id", "") or ""),
+                        (base / rel).resolve(),
+                    )
                 except Exception:
                     virtual_path = str(row.get("virtual_path", "") or "")
                 lines.append(
@@ -9276,6 +10572,116 @@ class OllamaClient:
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []) if isinstance(msg, dict) else [])
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
+    # ── Anthropic Messages API ─────────────────────────────────────
+
+    def _chat_anthropic(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+    ) -> dict:
+        endpoint = (self.endpoint or "").strip()
+        if not endpoint:
+            base = (self.base_url or "").strip().rstrip("/")
+            endpoint = f"{base}/v1/messages" if base else "https://api.anthropic.com/v1/messages"
+        # Separate system messages (Anthropic uses a dedicated 'system' parameter)
+        system_parts: list[str] = []
+        messages: list[dict] = []
+        for m in req_messages:
+            role = str(m.get("role", "") or "").strip()
+            content = m.get("content", "") or ""
+            if role == "system":
+                system_parts.append(str(content))
+            else:
+                # Convert OpenAI-style image_url parts to Anthropic image format
+                if isinstance(content, list):
+                    converted: list[dict] = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "image_url":
+                            url_data = part.get("image_url", {})
+                            url_str = str(url_data.get("url", "") if isinstance(url_data, dict) else url_data or "")
+                            dm = re.match(r"^data:([^;]+);base64,(.+)$", url_str, re.DOTALL)
+                            if dm:
+                                converted.append({
+                                    "type": "image",
+                                    "source": {"type": "base64", "media_type": dm.group(1), "data": dm.group(2)},
+                                })
+                            else:
+                                converted.append({"type": "image", "source": {"type": "url", "url": url_str}})
+                        else:
+                            converted.append(part)
+                    content = converted
+                messages.append({"role": role, "content": content})
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        if tools:
+            payload["tools"] = self._convert_tools_to_anthropic(tools)
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        raw = self._post_json_url(endpoint, payload, headers=headers)
+        content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def _extract_anthropic_message(self, raw: dict) -> tuple[str, list[dict], str]:
+        """Parse Anthropic Messages API response into (content, tool_calls, thinking)."""
+        content_blocks = raw.get("content", [])
+        if not isinstance(content_blocks, list):
+            # Fallback: try OpenAI format
+            if isinstance(raw.get("choices"), list):
+                return self._extract_openai_message(raw)
+            return str(content_blocks or ""), [], ""
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: list[dict] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip()
+            if btype == "text":
+                text_parts.append(str(block.get("text", "") or ""))
+            elif btype == "thinking":
+                thinking_parts.append(str(block.get("thinking", "") or ""))
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": str(block.get("id") or make_id("tool")),
+                    "type": "function",
+                    "function": {
+                        "name": str(block.get("name", "") or ""),
+                        "arguments": json_dumps(block.get("input", {})),
+                    },
+                })
+        return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
+
+    def _convert_tools_to_anthropic(self, openai_tools: list[dict]) -> list[dict]:
+        """Convert OpenAI-format tool definitions to Anthropic format."""
+        out: list[dict] = []
+        for t in openai_tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function", {})
+            if not isinstance(fn, dict):
+                continue
+            out.append({
+                "name": str(fn.get("name", "") or ""),
+                "description": str(fn.get("description", "") or ""),
+                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            })
+        return out
+
     def _chat_ollama_stream_native(
         self,
         req_messages: list[dict],
@@ -9399,6 +10805,10 @@ class OllamaClient:
                 req_messages = sys_msgs + non_sys_msgs
         if provider in {"openai_compat", "openai", "siliconflow"}:
             return self._chat_openai_compat(
+                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+            )
+        if provider == "anthropic":
+            return self._chat_anthropic(
                 req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
             )
         if provider == "custom_http":
@@ -10484,6 +11894,11 @@ class SessionState:
         if provider == "custom_http":
             endpoint = str(profile.get("endpoint", "") or "").strip()
             return bool(endpoint)
+        if provider == "anthropic":
+            api_key = str(profile.get("api_key", "") or "").strip()
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(api_key and (endpoint or base))
         return False
 
     def _option_is_runnable(self, option: dict) -> bool:
@@ -14205,7 +15620,7 @@ class SessionState:
         normalized = self._normalize_tool_path_text(path_text)
         if normalized == ".__skills__" or normalized.startswith(".__skills__/"):
             rel = normalized[len(".__skills__") :].lstrip("/")
-            return safe_path(rel or ".", self.skills.skills_root)
+            return self.skills.resolve_virtual_skill_path(rel or ".")
         if normalized == ".__js_lib__" or normalized.startswith(".__js_lib__/"):
             rel = normalized[len(".__js_lib__") :].lstrip("/")
             return safe_path(rel or ".", self.js_lib_root)
@@ -14224,10 +15639,9 @@ class SessionState:
         except Exception:
             pass
         try:
-            skills_root = self.skills.skills_root.resolve()
-            if target.is_relative_to(skills_root):
-                rel = target.relative_to(skills_root).as_posix()
-                return f"{SKILLS_VIRTUAL_PREFIX}/{rel}".replace("//", "/")
+            virtual_skill_path = self.skills.public_virtual_skill_path_for_abs(target)
+            if virtual_skill_path:
+                return virtual_skill_path
         except Exception:
             pass
         return str(target)
@@ -16618,7 +18032,7 @@ class SessionState:
             js_lib_root = str(self.js_lib_root.resolve())
         except Exception:
             js_lib_root = str(self.js_lib_root)
-        mappings = [
+        mappings = self.skills.shell_virtual_mappings() + [
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
             ("/js_lib", js_lib_root),
@@ -19132,6 +20546,7 @@ class SessionState:
                 clean_todos.append({
                     "id": trim(str(pt.get("id", "") or ""), 20),
                     "content": trim(str(pt.get("content", "") or ""), 400),
+                    "full_content": trim(str(pt.get("full_content", "") or ""), 1500),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
                     "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
@@ -20226,9 +21641,30 @@ class SessionState:
             pass
         # Immediately sync todos so UI reflects plan step advancement
         self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
+        # Inject hint for the next step (works in both single and multi-agent mode)
         if next_step:
             try:
-                pass  # Skills are loaded on-demand by the model via load_skill
+                _ns_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
+                _ns_total = int(bb.get("plan_step_total", 0) or 0)
+                _ns_text = trim(str(next_step.get("content", "") or ""), 200)
+                _ns_id = str(next_step.get("id", "") or "")
+                _ns_label = f"Step {_ns_idx}" + (f"/{_ns_total}" if _ns_total else "")
+                _hint = (
+                    f"[plan-step-advance] Previous step completed. Now at {_ns_label}: {_ns_text}\n"
+                    f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
+                    f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
+                    f"Each subtask MUST include parent_step_id='{_ns_id}'. "
+                    f"Create 3-5 items, one marked in_progress, others pending.\n"
+                    f"Do NOT create subtasks for other plan steps."
+                )
+                self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
+                # Also inject into active agent context for multi-agent mode
+                if self._is_multi_agent_mode():
+                    active_role = str(bb.get("active_agent", "") or actor)
+                    if active_role:
+                        self._append_agent_context_message(active_role, {
+                            "role": "system", "content": _hint, "ts": now_ts(), "agent_role": active_role,
+                        }, mirror_to_global=False)
             except Exception:
                 pass
         return True
@@ -20249,11 +21685,30 @@ class SessionState:
         worker_produced_output = self._worker_step_has_evidence(worker_step)
         # 3. All subtasks for this step are completed
         subtasks_all_done = self._step_subtasks_all_completed(current)
-        # Advance only when evidence confirms step completion:
+        # 4. File-evidence fallback: when worker doesn't call TodoWrite, use phase heuristics
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        results = worker_step.get("tool_results", []) or []
+        wrote_files_count = sum(
+            1 for r in results
+            if isinstance(r, dict) and r.get("ok", False)
+            and str(r.get("name", "")) in ("write_file", "edit_file")
+        )
+        ran_bash_ok = any(
+            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            for r in results
+        )
+        file_evidence_strong = (
+            phase in ("implement", "design") and wrote_files_count >= 2
+        ) or (
+            phase in ("test", "review") and ran_bash_ok
+        )
+        # Advance when:
         # - Manager requested AND worker produced output, OR
-        # - All subtasks completed AND worker produced output
+        # - All subtasks completed AND worker produced output, OR
+        # - Strong file evidence (fallback when worker forgets TodoWrite)
         has_strong_evidence = worker_produced_output and (
-            manager_requested or subtasks_all_done
+            manager_requested or subtasks_all_done or file_evidence_strong
         )
         if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
@@ -20275,7 +21730,8 @@ class SessionState:
         )
 
     def _step_subtasks_all_completed(self, plan_step: dict) -> bool:
-        """Check if all worker subtasks linked to this plan step are completed."""
+        """Check if all worker subtasks linked to this plan step are completed.
+        Filters out cross-step subtasks (e.g., 2.1 under step 1) to prevent blocking."""
         step_id = str(plan_step.get("id", "") or "")
         if not step_id:
             return False
@@ -20288,6 +21744,23 @@ class SessionState:
         ]
         if not worker_items:
             return False
+        # Extract major step number from plan step content (e.g., "1. Project init" → "1")
+        import re
+        step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        _m = re.match(r"^(\d+)\.", step_content.strip())
+        active_major = _m.group(1) if _m else ""
+        # Filter out cross-step subtasks (N.M where N != active major)
+        if active_major:
+            _cross_re = re.compile(r"^(\d+)\.\d+\s")
+            relevant = []
+            for r in worker_items:
+                rc = str(r.get("content", "") or "").strip()
+                cm = _cross_re.match(rc)
+                if cm and cm.group(1) != active_major:
+                    continue  # Skip cross-step items — don't let them block advancement
+                relevant.append(r)
+            if relevant:
+                worker_items = relevant
         return all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
 
     def _collect_step_evidence(self, plan_step: dict, worker_step: dict) -> str:
@@ -20327,9 +21800,7 @@ class SessionState:
             self._sync_todos_from_blackboard(reason="single-agent-round")
             return
         # Heuristic: check if tool results indicate step completion
-        # - write_file/edit_file calls suggest implementation progress
-        # - successful bash calls suggest testing/verification
-        step_content = str(current.get("content", "") or "").lower()
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
         wrote_files = any(
             str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
@@ -20339,19 +21810,27 @@ class SessionState:
             str(r.get("name", "")) == "bash" and r.get("ok", False)
             for r in tool_results
         )
-        # Auto-advance conditions based on phase:
+        called_todo_write = any(
+            str(r.get("name", "")) == "TodoWrite"
+            for r in tool_results
+        )
+        # Auto-advance conditions:
         should_advance = False
-        if phase in ("research", "design") and wrote_files:
-            # Research/design phase completed when files are produced
+        # Priority 1: Check if worker subtasks are all completed (most reliable signal)
+        subtasks_done = self._step_subtasks_all_completed(current)
+        if subtasks_done and (wrote_files or ran_bash_ok):
             should_advance = True
-        elif phase == "implement" and wrote_files and ran_bash_ok:
-            # Implementation completed when files written and bash succeeds
-            should_advance = True
-        elif phase in ("test", "review") and ran_bash_ok and not any(
-            not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
-        ):
-            # Test/review completed when all bash calls succeed
-            should_advance = True
+        # Priority 2: Phase-based heuristics (relaxed — wrote_files OR bash, not both)
+        if not should_advance:
+            if phase in ("research", "design") and wrote_files:
+                should_advance = True
+            elif phase == "implement" and wrote_files:
+                # Relaxed: implement step done when files are written (don't require bash)
+                should_advance = True
+            elif phase in ("test", "review") and ran_bash_ok and not any(
+                not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
+            ):
+                should_advance = True
         # Also check if the agent explicitly mentioned step completion
         if not should_advance:
             # Check last assistant message for step completion signals
@@ -20379,12 +21858,15 @@ class SessionState:
                     _step_idx = int(_new_step.get("plan_step_index", 0) or 0) + 1
                     _total = int(_bb_after.get("plan_step_total", 0) or 0)
                     _step_text = trim(str(_new_step.get("content", "") or ""), 200)
+                    _step_id = str(_new_step.get("id", "") or "")
                     _step_label = f"Step {_step_idx}" + (f"/{_total}" if _total else "")
                     _hint = (
                         f"[plan-step-advance] Previous step completed. Now at {_step_label}: {_step_text}\n"
                         f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
-                        "Call TodoWrite to set your task breakdown for this step "
-                        "(3-5 subtask items, one marked in_progress) before proceeding."
+                        f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
+                        f"Each subtask MUST include parent_step_id='{_step_id}'. "
+                        f"Create 3-5 items, one marked in_progress, others pending.\n"
+                        f"Do NOT create subtasks for other plan steps."
                     )
                     self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
             except Exception:
@@ -20445,6 +21927,58 @@ class SessionState:
         active_system = [r for r in system_rows if r.get("status") != "completed"]
         completed_system = [r for r in system_rows if r.get("status") == "completed"]
         trimmed_system = active_system + completed_system[-3:]
+        # ── Subtask conflict guard ──
+        # Remove worker subtasks whose content duplicates a plan step to prevent
+        # the UI from showing the same task twice (once as plan step, once as subtask).
+        if trimmed_system:
+            import re as _re_dedup
+            plan_content_set = set()
+            for sr in trimmed_system:
+                pc = str(sr.get("content", "") or "").strip().lower()
+                if pc:
+                    plan_content_set.add(pc)
+                    # Also add first line only (sub-step headers match full step content)
+                    first_line = pc.split("\n")[0].strip()
+                    if first_line:
+                        plan_content_set.add(first_line)
+            # Build stripped-prefix set for fuzzy matching ("步骤 1：XXX" → "XXX")
+            _num_prefix_re = _re_dedup.compile(r"^(?:步骤\s*\d+[：:]\s*|\d+\.\s*|step\s*\d+[：:]\s*)", _re_dedup.IGNORECASE)
+            plan_stripped_set = set()
+            for sr in trimmed_system:
+                pc = str(sr.get("content", "") or "").strip().lower()
+                stripped = _num_prefix_re.sub("", pc).strip()
+                if stripped and len(stripped) > 4:
+                    plan_stripped_set.add(stripped)
+            # Find current active step major number for cross-step detection
+            _active_major = ""
+            for sr in trimmed_system:
+                if sr.get("status") == "in_progress":
+                    mc = str(sr.get("content", "") or "")
+                    _am = _re_dedup.match(r"^(\d+)\.", mc)
+                    if _am:
+                        _active_major = _am.group(1)
+                    break
+            _cross_step_re = _re_dedup.compile(r"^(\d+)\.\d+\s")
+            deduped_worker = []
+            for wr in worker_rows:
+                wc = str(wr.get("content", "") or "").strip().lower()
+                if not wc:
+                    deduped_worker.append(wr)
+                    continue
+                # Layer 1: Exact match
+                if wc in plan_content_set:
+                    continue
+                # Layer 2: Stripped prefix match
+                wc_stripped = _num_prefix_re.sub("", wc).strip()
+                if wc_stripped and wc_stripped in plan_stripped_set:
+                    continue
+                # Layer 3: Cross-step detection — reject N.M subtasks where N != active major
+                if _active_major:
+                    cm = _cross_step_re.match(wc)
+                    if cm and cm.group(1) != _active_major:
+                        continue
+                deduped_worker.append(wr)
+            worker_rows = deduped_worker
         remaining_cap = max(0, 40 - len(trimmed_system) - len(worker_rows))
         merged = list(trimmed_system) + worker_rows + non_system_rows[:remaining_cap]
         try:
@@ -21240,6 +22774,13 @@ class SessionState:
         _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
         if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
             level = int(self.user_task_level_override)
+        # Floor protection: if plan was approved, do not allow downgrade below floor
+        _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
+        if _level_floor > 0 and int(level) < _level_floor:
+            level = _level_floor
+        _complexity_floor = str(getattr(self, 'runtime_complexity_floor', '') or '').strip()
+        if _complexity_floor == "complex" and complexity == "simple":
+            complexity = "complex"
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
         self.runtime_execution_mode = mode
@@ -21609,7 +23150,7 @@ class SessionState:
             idx = int(t.get("plan_step_index", 0) or 0) + 1
             status = t.get("status", "pending")
             mark = "✅" if status == "completed" else "👉" if status == "in_progress" else "⬜"
-            phase_hint = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+            phase_hint = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
         lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
@@ -21672,7 +23213,7 @@ class SessionState:
         bb = self._ensure_blackboard()
         for t in bb.get("project_todos", []):
             if t.get("category") == "plan_step" and t.get("status") == "in_progress":
-                phase = self._plan_step_phase_hint(str(t.get("content", "") or ""))
+                phase = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
                 if phase:
                     return phase
         # Fallback: infer from blackboard state
@@ -23447,7 +24988,7 @@ class SessionState:
         if isinstance(plan_todos, list):
             for pt in plan_todos:
                 if isinstance(pt, dict) and pt.get("category") == "plan_step" and pt.get("status") == "in_progress":
-                    step_text = trim(str(pt.get("content", "") or ""), 300)
+                    step_text = trim(str(pt.get("full_content", "") or pt.get("content", "") or ""), 600)
                     step_idx = int(pt.get("plan_step_index", 0) or 0) + 1
                     current_plan_step_note = (
                         f"CURRENT PLAN STEP (#{step_idx}): {step_text}\n"
@@ -23465,10 +25006,14 @@ class SessionState:
                         _active_step_id = str(_pt.get("id", "") or "")
                         break
             todo_update_note = (
-                f"TODO UPDATE: At the START of your work, call TodoWrite to set subtasks for this step.\n"
-                f"Each subtask MUST include parent_step_id='{_active_step_id}' to link it to this plan step.\n"
-                f"Format: 3-5 items, one marked in_progress, others pending.\n"
-                f"Mark each subtask completed as you finish it. When ALL subtasks are done, the step auto-advances.\n"
+                f"TODO UPDATE: Call TodoWrite at the START to set subtasks for THIS step ONLY.\n"
+                f"Each subtask MUST include parent_step_id='{_active_step_id}'.\n"
+                f"CRITICAL SCOPE RULE:\n"
+                f"- Create 3-5 subtasks that break down ONLY the current step's work.\n"
+                f"- Do NOT create subtasks for other plan steps (do NOT list step 2, 3, 4 etc.).\n"
+                f"- Do NOT duplicate the plan step titles as subtasks.\n"
+                f"- Each subtask should be a concrete action within THIS step.\n"
+                f"Mark each subtask completed as you finish it. When ALL are done, the step auto-advances.\n"
             )
         # Build step_files context note for cross-agent file visibility
         step_files_note = ""
@@ -26907,8 +28452,15 @@ class SessionState:
             self.runtime_plan_approved = True
             return
 
-        # Phase 3: Emit 方案到前端
+        # Synthesis Step 1: 立即写 plan.md（与 synthesis 思维连续，避免信息丢失）
         self.runtime_plan_proposal = proposal
+        try:
+            self._write_plan_file(self._format_plan_file_preselection(proposal))
+        except Exception:
+            pass
+        self._emit("status", {"summary": "plan-mode: plan.md written"})
+
+        # Synthesis Step 2: 更新 blackboard + 生成精简 bubble
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
             bb["plan"] = {"phase": "awaiting_choice", "findings": []}
@@ -26916,13 +28468,7 @@ class SessionState:
         bb["plan"]["proposal"] = proposal
         self.blackboard = bb
 
-        # Write full plan to file for model consumption
-        try:
-            self._write_plan_file(self._format_plan_file_preselection(proposal))
-        except Exception:
-            pass
-
-        # Condensed bubble for UI (under PLAN_BUBBLE_MAX_CHARS)
+        # Phase 3: Emit bubble 到前端（纯输出，不做额外思考）
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -27445,7 +28991,38 @@ class SessionState:
             f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
             f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
             f"- Each step should be completable in 1-3 tool calls\n"
-            f"- Group related substeps under numbered headings (e.g., '2.1 Read report 1', '2.2 Read report 2')\n"
+            f"\nSTEP STRUCTURE — MAJOR STEPS WITH SUB-STEPS:\n"
+            f"Organize steps into MAJOR numbered groups. Each major step has:\n"
+            f"  1) A summary title line: \"N. Summary Title\" (e.g., \"1. Project Initialization\")\n"
+            f"  2) Sub-steps: \"N.1 Sub-step title\\nConcrete details\\nN.2 Next sub-step\\nDetails\"\n"
+            f"\nThe steps array should contain one string per MAJOR step. "
+            f"Each string starts with the summary title, followed by sub-steps.\n"
+            f"\nExample steps array with 3 major steps:\n"
+            f"[\n"
+            f"  \"1. Project Initialization and Build\\n"
+            f"1.1 Initialize project structure\\n"
+            f"Create directories: src/python/, src/fortran/, tests/, docs/\\n"
+            f"1.2 Configure build system\\n"
+            f"Create CMakeLists.txt with Fortran compiler config\\n"
+            f"Run: cmake -B build -S . && cmake --build build\",\n"
+            f"  \"2. Core Module Implementation\\n"
+            f"2.1 Implement data model\\n"
+            f"Create src/models/data.py with schema definitions\\n"
+            f"2.2 Implement business logic\\n"
+            f"Create src/services/processor.py\",\n"
+            f"  \"3. Testing and Documentation\\n"
+            f"3.1 Unit tests\\n"
+            f"Create tests/test_models.py\\n"
+            f"Run: pytest tests/\\n"
+            f"3.2 Write documentation\\n"
+            f"Create docs/README.md\"\n"
+            f"]\n"
+            f"\nRules:\n"
+            f"- Each major step = one array element with summary title + 2-5 sub-steps\n"
+            f"- Summary title captures the THEME of that group (not just repeat the first sub-step)\n"
+            f"- Sub-steps include specific file paths, commands, or expected outputs\n"
+            f"- Aim for 5-8 major steps for complex tasks, 3-5 for simpler ones\n"
+            f"\n"
             f"Make options meaningfully different (e.g. different approaches, scope levels, or trade-offs).\n"
             "\nVERIFICATION & TESTING:\n"
             "Judge from the task content and research findings whether the task involves writing, "
@@ -27627,8 +29204,22 @@ class SessionState:
             steps = opt.get("steps", [])
             if isinstance(steps, list) and steps:
                 lines.append("\n### Steps")
+                import re as _re_plan
+                _mid_re = _re_plan.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
                 for i, s in enumerate(steps):
-                    lines.append(f"{i + 1}. {s}")
+                    step_str = str(s or "").strip()
+                    # Normalize: split mid-string N.N sub-step numbers onto own lines
+                    step_str = _mid_re.sub(r"\n\1", step_str)
+                    if "\n" in step_str:
+                        # Multi-line step: first line as header, rest as nested list
+                        step_lines = step_str.split("\n")
+                        lines.append(f"{i + 1}. {step_lines[0]}")
+                        for sub in step_lines[1:]:
+                            stripped = sub.strip()
+                            if stripped:
+                                lines.append(f"   - {stripped}")
+                    else:
+                        lines.append(f"{i + 1}. {step_str}")
             pros = str(opt.get("pros", "") or "").strip()
             if pros:
                 lines.append(f"\n**Pros:** {pros}")
@@ -27668,14 +29259,22 @@ class SessionState:
         if summary:
             lines.append(f"## Summary\n{summary}\n")
         lines.append("## Steps\n")
+        import re as _re_exec
+        _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
         for t in plan_todos:
             idx = int(t.get("plan_step_index", 0) or 0) + 1
-            text = str(t.get("content", "") or "").strip()
+            full = str(t.get("full_content", "") or t.get("content", "")).strip()
+            # Normalize: split concatenated N.N sub-steps onto own lines
+            full = _mid_re_exec.sub(r"\n\1", full)
+            header = full.split("\n")[0] if "\n" in full else full
+            sub_lines = [ln for ln in full.split("\n")[1:] if ln.strip()] if "\n" in full else []
             status = str(t.get("status", "pending") or "pending")
             if status == "completed":
                 actor = str(t.get("completed_by", "") or "")
                 evidence = str(t.get("evidence", "") or "")
-                lines.append(f"- [x] Step {idx}: {text}")
+                lines.append(f"- [x] Step {idx}: {header}")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
                 meta_parts = []
                 if actor:
                     meta_parts.append(f"Completed by: {actor}")
@@ -27684,9 +29283,13 @@ class SessionState:
                 if meta_parts:
                     lines.append(f"  > {' | '.join(meta_parts)}")
             elif status == "in_progress":
-                lines.append(f"- [>] Step {idx}: {text}  <-- CURRENT")
+                lines.append(f"- [>] Step {idx}: {header}  <-- CURRENT")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
             else:
-                lines.append(f"- [ ] Step {idx}: {text}")
+                lines.append(f"- [ ] Step {idx}: {header}")
+                for sub in sub_lines:
+                    lines.append(f"  - {sub.strip()}")
         return "\n".join(lines) + "\n"
 
     def _update_plan_file_step_status(self) -> bool:
@@ -27739,13 +29342,120 @@ class SessionState:
 
     def _plan_file_read_instruction(self) -> str:
         """Short instruction for models: read the plan file instead of embedding full plan text."""
+        # Find active step id for parent_step_id linkage
+        bb = self._ensure_blackboard()
+        active_step_id = ""
+        active_step_idx = 0
+        for t in bb.get("project_todos", []):
+            if isinstance(t, dict) and t.get("category") == "plan_step" and t.get("status") == "in_progress":
+                active_step_id = str(t.get("id", "") or "")
+                active_step_idx = int(t.get("plan_step_index", 0) or 0) + 1
+                break
+        todo_note = ""
+        if active_step_id:
+            todo_note = (
+                f"\nTODO UPDATE: Call TodoWrite at the START to set subtasks for the current step (Step {active_step_idx}) ONLY.\n"
+                f"Each subtask MUST include parent_step_id='{active_step_id}'.\n"
+                f"Create 3-5 subtasks that break down ONLY the current step's work.\n"
+                f"Do NOT create subtasks for other plan steps. Mark each subtask completed as you finish it.\n"
+            )
         return (
             f"[plan-file] The approved execution plan is at `{PLAN_FILE_RELATIVE_PATH}`.\n"
             f"Use: read_file {PLAN_FILE_RELATIVE_PATH} to review full steps and live status.\n"
             "The plan file is the authoritative source for step ordering and completion status.\n"
             "Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing.\n"
             "If a step references a skill or workflow, call load_skill to load it before proceeding."
+            f"{todo_note}"
         )
+
+    @staticmethod
+    def _group_plan_steps(raw_steps: list) -> list[str]:
+        """Group flat step array by major step number (first digit of N.N).
+
+        All 1.x sub-steps merge into one logical step, all 2.x into another, etc.
+        If a step has the format "N. Summary title" (single digit, no sub-number),
+        it becomes the group header. Otherwise a header is synthesized from the
+        first sub-step.
+
+        Handles LLM output where sub-steps may be separate array elements OR
+        concatenated in one string with spaces/newlines.
+
+        Returns a list where each element is one major step (multi-line string):
+          "1. Summary Title\\n1.1 Sub-step A\\nDetail...\\n1.2 Sub-step B\\n..."
+        """
+        import re
+        if not raw_steps or not isinstance(raw_steps, list):
+            return list(raw_steps or [])
+        # Patterns
+        sub_step_re = re.compile(r"^(\d+)\.(\d+)\s")   # "N.M ..."
+        major_step_re = re.compile(r"^(\d+)\.\s")       # "N. ..." (summary line)
+        mid_numbered_re = re.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
+        # Phase 0: Normalize — split mid-string N.N onto own lines
+        normalized: list[str] = []
+        for s in raw_steps:
+            text = str(s or "").strip()
+            if not text:
+                continue
+            fixed = mid_numbered_re.sub(r"\n\1", text)
+            for line in fixed.split("\n"):
+                stripped = line.strip()
+                if stripped:
+                    normalized.append(stripped)
+        if not normalized:
+            return [str(s) for s in raw_steps if str(s or "").strip()]
+        # Phase 1: Check if any N.N sub-step headers exist
+        has_sub_steps = any(sub_step_re.match(ln) for ln in normalized)
+        if not has_sub_steps:
+            return normalized
+        # Phase 2: Group by major number (first digit of N.N)
+        from collections import OrderedDict
+        major_groups: OrderedDict[str, list[str]] = OrderedDict()
+        major_headers: dict[str, str] = {}  # major_num → "N. Summary" if provided
+        orphan_lines: list[str] = []
+        current_major: str = ""
+        for line in normalized:
+            m_sub = sub_step_re.match(line)
+            m_major = major_step_re.match(line)
+            if m_sub:
+                major_num = m_sub.group(1)
+                current_major = major_num
+                if major_num not in major_groups:
+                    major_groups[major_num] = []
+                major_groups[major_num].append(line)
+            elif m_major:
+                # "N. Summary title" line → store as header for this major group
+                major_num = m_major.group(1)
+                current_major = major_num
+                major_headers[major_num] = line
+                if major_num not in major_groups:
+                    major_groups[major_num] = []
+            else:
+                # Detail line → attach to current major group
+                if current_major and current_major in major_groups:
+                    major_groups[current_major].append(line)
+                else:
+                    orphan_lines.append(line)
+        # Phase 3: Build output — each major group becomes one step
+        result: list[str] = []
+        if orphan_lines:
+            result.append("\n".join(orphan_lines))
+        for major_num, lines in major_groups.items():
+            if not lines:
+                continue
+            header = major_headers.get(major_num, "")
+            if not header:
+                # Synthesize header from first sub-step: "N. <first sub-step title>"
+                first_sub = lines[0]
+                m = sub_step_re.match(first_sub)
+                if m:
+                    # Extract title part after "N.M "
+                    title_part = first_sub[m.end():].split("\n")[0].strip()
+                    # Remove detail after title (heuristic: title is before first Chinese/action verb)
+                    header = f"{major_num}. {title_part}" if title_part else f"{major_num}. Step {major_num}"
+                else:
+                    header = f"{major_num}. Step {major_num}"
+            result.append(header + "\n" + "\n".join(lines))
+        return result
 
     # ── (legacy) _format_plan_proposal_markdown ──────────────────────
 
@@ -27898,16 +29608,20 @@ class SessionState:
         self.runtime_complexity_floor = str(self.runtime_task_complexity or "complex")
         self.runtime_task_level_floor = int(self.runtime_task_level or 4)
         # Auto-create todos from plan steps → write into bb["project_todos"]
-        steps = chosen.get("steps", [])
+        steps = self._group_plan_steps(chosen.get("steps", []))
         if steps and isinstance(steps, list):
             plan_todos = []
             for i, step in enumerate(steps):
-                step_text = trim(str(step or "").strip(), 600)
+                step_text = trim(str(step or "").strip(), 1500)
                 if not step_text:
                     continue
+                # Extract header (first line) for todo display; keep full text for plan.md rendering
+                step_lines = step_text.split("\n")
+                step_header = step_lines[0].strip()
                 plan_todos.append({
                     "id": f"pt:{i:03d}",
-                    "content": step_text,
+                    "content": step_header,
+                    "full_content": step_text,
                     "status": "in_progress" if i == 0 else "pending",
                     "category": "plan_step",
                     "plan_step_index": i,
@@ -30228,6 +31942,11 @@ class SessionManager:
             return bool(endpoint or complete_chat_endpoint(base))
         if provider == "custom_http":
             return bool(str(profile.get("endpoint", "") or "").strip())
+        if provider == "anthropic":
+            api_key = str(profile.get("api_key", "") or "").strip()
+            endpoint = str(profile.get("endpoint", "") or "").strip()
+            base = str(profile.get("base_url", "") or "").strip()
+            return bool(api_key and (endpoint or base))
         return False
 
     def _option_is_runnable(self, option: dict) -> bool:
@@ -30604,16 +32323,22 @@ window.MathJax={
           <label id="llmProviderLabel">Provider</label>
           <select id="llmProvider">
             <option value="ollama">Ollama</option>
+            <option value="vllm">vLLM (Local)</option>
+            <option value="lmstudio">LM Studio (Local)</option>
             <option value="openai_compat">OpenAI Compatible</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="glm">GLM</option>
+            <option value="kimi">KIMI (Moonshot)</option>
+            <option value="openrouter">OpenRouter</option>
             <option value="siliconflow">SiliconFlow</option>
             <option value="custom_http">Custom HTTP</option>
           </select>
         </div>
         <div id="llmFieldsContainer"></div>
       </div>
-      <div class="llm-modal-footer">
+      <div class="llm-modal-footer" style="flex-direction:column;gap:8px">
+        <label for="configInput" id="llmConfigImport" class="llm-modal-btn-secondary" style="cursor:pointer;margin:0;text-align:center">Import config</label>
         <button id="llmConfigConfirm" type="button" class="llm-modal-btn-primary">Confirm</button>
-        <label for="configInput" id="llmConfigImport" class="llm-modal-btn-secondary" style="cursor:pointer;margin:0">Import config</label>
       </div>
     </div>
   </div>
@@ -31146,9 +32871,10 @@ const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case',
 S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
-const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const _localScanProviders=['ollama','vllm','lmstudio'];if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else if(provider==='vllm'||provider==='lmstudio'){const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}const urlKey=provider==='vllm'?'vllm_url':'lmstudio_url';const modelKey=provider==='vllm'?'vllm_model':'lmstudio_model';html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(provider==='vllm'||provider==='lmstudio'){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+async function scanOpenAICompatModels(provider){const urlKey=provider==='vllm'?'vllm_url':'lmstudio_url';const modelKey=provider==='vllm'?'vllm_model':'lmstudio_model';const urlEl=E('llmF_'+urlKey);const modelEl=E('llmF_'+modelKey);const hint=E('localScanHint');const defaults={vllm:'http://localhost:8000/v1',lmstudio:'http://localhost:1234/v1'};const baseUrl=(urlEl?.value||'').trim()||defaults[provider]||'';const apiKey=(E('llmF_'+provider+'_key')?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(modelEl){modelEl.value=data.models[0]}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))+': '+data.models.slice(0,3).join(', ')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el)config[f.key]=el.value.trim()}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
@@ -43716,6 +45442,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
             except Exception as exc:
                 return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
+        if path == "/api/openai_compat/models":
+            base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
+            api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
+            if not base_url:
+                return self._send_json({"ok": False, "models": [], "error": "base_url required"})
+            try:
+                import urllib.request
+                models_url = base_url.rstrip("/") + "/models"
+                req = urllib.request.Request(models_url, method="GET")
+                req.add_header("Accept", "application/json")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                data = raw.get("data", [])
+                model_ids = [str(m.get("id", "")) for m in data if isinstance(m, dict) and m.get("id")]
+                return self._send_json({"ok": True, "models": model_ids, "base_url": base_url})
+            except Exception as exc:
+                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": base_url})
         if path == "/api/skills":
             return self._send_json(self.app.skills_catalog())
         if path == "/api/skills/providers":
@@ -45001,8 +46746,10 @@ def main():
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
+        print(f"[web-agent] ollama: found {len(startup_tags)} model(s) at {bootstrap_base_url} — using '{resolved_model}'")
     else:
         resolved_model = bootstrap_model
+        print(f"[web-agent] ollama: not available at {bootstrap_base_url} — using fallback '{resolved_model}'")
     resolved_thinking = False
     requested_ctx_limit = int(args.ctx_limit or TOKEN_THRESHOLD)
     resolved_ctx_limit = max(

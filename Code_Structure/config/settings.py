@@ -345,6 +345,9 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
                 "qwen-vl",
                 "gemini",
                 "claude-3",
+                "claude-sonnet-4",
+                "claude-opus",
+                "glm-4v",
                 "omni",
             )
         ):
@@ -359,6 +362,10 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
             caps["output_audio"] = True
         if any(x in m for x in ("video", "sora", "kling", "wan")):
             caps["output_video"] = True
+    if p == "anthropic":
+        # All current Claude models support image input
+        if any(x in m for x in ("claude-3", "claude-sonnet-4", "claude-opus", "claude-haiku")):
+            caps["input_image"] = True
     return caps
 
 def parse_capability_overrides(raw: object) -> dict[str, bool]:
@@ -624,6 +631,136 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("siliconflow"),
         )
 
+    # ── vLLM (local) ────────────────────────────────────────���─────
+    vllm_url = str(config.get("vllm_url", "")).strip()
+    vllm_model = str(config.get("vllm_model", "")).strip()
+    vllm_key = str(config.get("vllm_key", "")).strip()
+    if vllm_url or vllm_model:
+        _vllm_default = "http://localhost:8000/v1"
+        add_profile(
+            profiles,
+            profile_id="vllm",
+            provider="openai_compat",
+            label="vLLM",
+            model=vllm_model or "auto",
+            base_url=extract_base_url(vllm_url or _vllm_default),
+            endpoint=complete_chat_endpoint(vllm_url or _vllm_default),
+            api_key=vllm_key,
+            thinking_stream=bool(config.get("vllm_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("vllm", "openai_compat", vllm_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("vllm"),
+        )
+
+    # ── LM Studio (local) ─────────────────────────────────────────
+    lms_url = str(config.get("lmstudio_url", "")).strip()
+    lms_model = str(config.get("lmstudio_model", "")).strip()
+    if lms_url or lms_model:
+        _lms_default = "http://localhost:1234/v1"
+        add_profile(
+            profiles,
+            profile_id="lmstudio",
+            provider="openai_compat",
+            label="LM Studio",
+            model=lms_model or "auto",
+            base_url=extract_base_url(lms_url or _lms_default),
+            endpoint=complete_chat_endpoint(lms_url or _lms_default),
+            thinking_stream=bool(config.get("lmstudio_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("lmstudio", "openai_compat", lms_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("lmstudio"),
+        )
+
+    # ── Anthropic ──────────────────────────────────────────────────
+    anth_url = str(config.get("anthropic_url", "")).strip()
+    anth_model = str(config.get("anthropic_model", "")).strip()
+    anth_key = str(config.get("anthropic_key", "")).strip()
+    if anth_url or anth_model or anth_key:
+        _anth_base = anth_url or "https://api.anthropic.com"
+        add_profile(
+            profiles,
+            profile_id="anthropic",
+            provider="anthropic",
+            label="Anthropic",
+            model=anth_model or "claude-sonnet-4-20250514",
+            base_url=extract_base_url(_anth_base),
+            endpoint=_anth_base.rstrip("/") + "/v1/messages",
+            api_key=anth_key,
+            thinking_stream=bool(config.get("anthropic_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("anthropic", "anthropic", anth_model or "claude-sonnet-4-20250514"),
+            media_endpoints=build_profile_media_endpoints("anthropic"),
+        )
+
+    # ── GLM (智谱) ─────────────────────────────────────────────────
+    glm_url = str(config.get("glm_url", "")).strip()
+    glm_model = str(config.get("glm_model", "")).strip()
+    glm_key = str(config.get("glm_key", "")).strip()
+    if glm_url or glm_model or glm_key:
+        _glm_default = "https://open.bigmodel.cn/api/paas/v4"
+        add_profile(
+            profiles,
+            profile_id="glm",
+            provider="openai_compat",
+            label="GLM",
+            model=glm_model or "glm-4-flash",
+            base_url=extract_base_url(glm_url or _glm_default),
+            endpoint=complete_chat_endpoint(glm_url or _glm_default),
+            api_key=glm_key,
+            thinking_stream=bool(config.get("glm_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("glm", "openai_compat", glm_model or "glm-4-flash"),
+            media_endpoints=build_profile_media_endpoints("glm"),
+        )
+
+    # ── KIMI (Moonshot / 月之暗面) ─────────────────────────────────
+    kimi_url = str(config.get("kimi_url", "")).strip()
+    kimi_model = str(config.get("kimi_model", "")).strip()
+    kimi_key = str(config.get("kimi_key", "")).strip()
+    if kimi_url or kimi_model or kimi_key:
+        _kimi_default = "https://api.moonshot.cn/v1"
+        add_profile(
+            profiles,
+            profile_id="kimi",
+            provider="openai_compat",
+            label="KIMI (Moonshot)",
+            model=kimi_model or "moonshot-v1-8k",
+            base_url=extract_base_url(kimi_url or _kimi_default),
+            endpoint=complete_chat_endpoint(kimi_url or _kimi_default),
+            api_key=kimi_key,
+            thinking_stream=bool(config.get("kimi_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("kimi", "openai_compat", kimi_model or "moonshot-v1-8k"),
+            media_endpoints=build_profile_media_endpoints("kimi"),
+        )
+
+    # ── OpenRouter ─────────────────────────────────────────────────
+    or_url = str(config.get("openrouter_url", "")).strip()
+    or_model = str(config.get("openrouter_model", "")).strip()
+    or_key = str(config.get("openrouter_key", "")).strip()
+    if or_url or or_model or or_key:
+        _or_default = "https://openrouter.ai/api/v1"
+        add_profile(
+            profiles,
+            profile_id="openrouter",
+            provider="openai_compat",
+            label="OpenRouter",
+            model=or_model or "meta-llama/llama-3.1-8b-instruct",
+            base_url=extract_base_url(or_url or _or_default),
+            endpoint=complete_chat_endpoint(or_url or _or_default),
+            api_key=or_key,
+            thinking_stream=bool(config.get("openrouter_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("openrouter", "openai_compat", or_model or "meta-llama/llama-3.1-8b-instruct"),
+            media_endpoints=build_profile_media_endpoints("openrouter"),
+        )
+
     custom_url = str(config.get("custom_url", "")).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
@@ -667,9 +804,24 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         "ollama": "ollama",
         "openai": "openai",
         "siliconflow": "siliconflow",
+        "vllm": "vllm",
+        "lmstudio": "lmstudio",
+        "anthropic": "anthropic",
+        "glm": "glm",
+        "kimi": "kimi",
+        "openrouter": "openrouter",
         "custom": "custom",
     }
-    default_profile_id = active_map.get(provider, profiles[0]["id"])
+    profile_ids = {p["id"] for p in profiles}
+    default_profile_id = active_map.get(provider, "")
+    if not default_profile_id or default_profile_id not in profile_ids:
+        # Fallback: first non-ollama profile that was explicitly configured
+        for p in profiles:
+            if p["id"] != "ollama" and p.get("source") != "default":
+                default_profile_id = p["id"]
+                break
+        if not default_profile_id or default_profile_id not in profile_ids:
+            default_profile_id = profiles[0]["id"]
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
 def looks_like_llm_config(config: dict) -> bool:
@@ -686,6 +838,22 @@ def looks_like_llm_config(config: dict) -> bool:
         "siliconflow_url",
         "siliconflow_model",
         "siliconflow_key",
+        "vllm_url",
+        "vllm_model",
+        "lmstudio_url",
+        "lmstudio_model",
+        "anthropic_url",
+        "anthropic_model",
+        "anthropic_key",
+        "glm_url",
+        "glm_model",
+        "glm_key",
+        "kimi_url",
+        "kimi_model",
+        "kimi_key",
+        "openrouter_url",
+        "openrouter_model",
+        "openrouter_key",
         "custom_url",
         "custom_model",
         "custom_key",
@@ -698,6 +866,12 @@ def looks_like_llm_config(config: dict) -> bool:
         "ollama_capabilities",
         "openai_capabilities",
         "siliconflow_capabilities",
+        "anthropic_capabilities",
+        "glm_capabilities",
+        "kimi_capabilities",
+        "openrouter_capabilities",
+        "vllm_capabilities",
+        "lmstudio_capabilities",
         "custom_capabilities",
         "ollama_media_endpoints",
         "openai_media_endpoints",

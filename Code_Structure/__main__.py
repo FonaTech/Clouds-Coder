@@ -344,8 +344,10 @@ def main():
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
+        print(f"[web-agent] ollama: found {len(startup_tags)} model(s) at {bootstrap_base_url} — using '{resolved_model}'")
     else:
         resolved_model = bootstrap_model
+        print(f"[web-agent] ollama: not available at {bootstrap_base_url} — using fallback '{resolved_model}'")
     resolved_thinking = False
     requested_ctx_limit = int(args.ctx_limit or TOKEN_THRESHOLD)
     resolved_ctx_limit = max(
