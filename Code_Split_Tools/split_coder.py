@@ -568,6 +568,7 @@ class ModuleRouter:
 
     def __init__(self, layout: Dict[str, List[str]]) -> None:
         self.layout = layout
+        self._fallback_classifier = AutoLayoutGenerator()
         # Pre-compile: list of (module_path, list_of_matchers)
         self._rules: List[Tuple[str, List[Tuple[str, object]]]] = []
         for mod_path, patterns in layout.items():
@@ -598,6 +599,10 @@ class ModuleRouter:
             for kind, matcher in matchers:
                 if kind == "regex" and matcher.search(name):
                     return mod_path
+
+        fallback_module = self._fallback_classifier._classify(node)
+        if fallback_module != "_unclassified.py":
+            return fallback_module
 
         return "_unclassified.py"
 
@@ -1569,6 +1574,13 @@ class AutoLayoutGenerator:
         ("ensure_generated_",      "skills/store.py"),
     ]
 
+    FUNCTION_REGEX_RULES: List[Tuple[str, str]] = [
+        (r"^extract_.*_setting$", "config/settings.py"),
+        (r"^(?:load|parse)_.*config(?:_from_.*)?$", "config/settings.py"),
+        (r"^resolve_.*(?:path|dir|root)$", "config/paths.py"),
+        (r"^(?:load|ensure|match|cache|offline|download|extract|resolve)_.*(?:js_lib|offline_js|external_js).*$", "utils/files.py"),
+    ]
+
     def generate(self, nodes: List[NodeInfo]) -> Dict[str, List[str]]:
         """Generate a layout config from node analysis."""
         layout: Dict[str, List[str]] = defaultdict(list)
@@ -1612,6 +1624,9 @@ class AutoLayoutGenerator:
 
         # Check function prefixes
         if node.kind in ("function", "assignment"):
+            for pattern, module in self.FUNCTION_REGEX_RULES:
+                if re.match(pattern, name):
+                    return module
             for prefix, module in self.FUNCTION_PREFIXES:
                 if name.startswith(prefix) or name == prefix.rstrip("_"):
                     return module
