@@ -517,7 +517,7 @@ TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
 
 TASK_PHASE_ROUTING = {
     "research": "explorer",
-    "design": "explorer",
+    "design": "developer",
     "implement": "developer",
     "test": "developer",
     "review": "reviewer",
@@ -548,6 +548,10 @@ DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same fil
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 4096
 
 PLAN_MODE_MAX_OPTIONS = 3
+
+PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
+
+PLAN_BUBBLE_MAX_CHARS = 3800  # margin under ASSISTANT_MESSAGE_EVENT_MAX_CHARS (4000)
 
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
@@ -1757,6 +1761,7 @@ EMBEDDED_SKILLS_ARCHIVE_FILES = [
     "skills/generated/upload-office-parser/SKILL.md",
     "skills/generated/upload-parsers-capabilities.json",
     "skills/generated/upload-tabular-parser/SKILL.md",
+    "skills/generated/upload-image-parser/SKILL.md",
     "skills/mcp-builder/SKILL.md",
     "skills/pdf/SKILL.md",
     "skills/skills_Gen/SKILL.md",
@@ -2567,6 +2572,9 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff}
 .todo-item.st-pending,.task-item.st-pending{border-left-color:#7b8798}
 .todo-item.st-in_progress,.task-item.st-in_progress{border-left-color:#1f6feb;background:#eef5ff}
+.todo-group-label{font-size:.72rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:6px 0 2px 2px}
+.todo-subtask{margin-left:16px;border-left-width:3px;border-radius:8px;padding:6px 10px;font-size:.9em}
+.todo-subtask::before{content:"↳ ";color:var(--muted);font-size:.85em}
 .todo-item.st-completed,.task-item.st-completed{border-left-color:#13b8a6;background:#edfcf7}
 .todo-item.st-blocked,.task-item.st-blocked{border-left-color:#b96b00;background:#fff6ea}
 .todo-item.st-deleted,.task-item.st-deleted{border-left-color:#a0a6b0;background:#f7f8fa}
@@ -2725,7 +2733,8 @@ const I18N={
     llm_fill_config:'Fill LLM Config',llm_provider:'Provider',llm_confirm:'Confirm',llm_import_config:'Import config',
     llm_thinking_stream:'Thinking Stream',llm_enabled:'Enabled',llm_disabled:'Disabled',
     llm_model:'Model',llm_scan:'Scan',llm_scan_hint:'Click Scan to detect models from Ollama',llm_scan_first:'Scan models first',
-    llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed'
+    llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed',
+    todo_plan_steps:'Plan Steps',todo_subtasks:'Subtasks'
   },
   'zh-CN':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驱动的会话式集成编程 Agent 平台',powered_by:'Powered By Fona',
@@ -2760,7 +2769,8 @@ const I18N={
     llm_fill_config:'填写 LLM 配置',llm_provider:'供应商',llm_confirm:'确认',llm_import_config:'导入配置',
     llm_thinking_stream:'思维流',llm_enabled:'启用',llm_disabled:'禁用',
     llm_model:'模型',llm_scan:'扫描',llm_scan_hint:'点击扫描检测 Ollama 可用模型',llm_scan_first:'请先扫描模型',
-    llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败'
+    llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败',
+    todo_plan_steps:'计划步骤',todo_subtasks:'子任务'
   },
   'zh-TW':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 驅動的會話式整合程式 Agent 平台',powered_by:'Powered By Fona',
@@ -2795,7 +2805,8 @@ const I18N={
     llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
     llm_thinking_stream:'思維流',llm_enabled:'啟用',llm_disabled:'停用',
     llm_model:'模型',llm_scan:'掃描',llm_scan_hint:'點擊掃描偵測 Ollama 可用模型',llm_scan_first:'請先掃描模型',
-    llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗'
+    llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗',
+    todo_plan_steps:'計劃步驟',todo_subtasks:'子任務'
   },
   'ja':{
     app_title:'Clouds Coder',app_subtitle:'WebUI 駆動の対話型コーディング Agent プラットフォーム',powered_by:'Powered By Fona',
@@ -2830,7 +2841,8 @@ const I18N={
     llm_fill_config:'LLM設定入力',llm_provider:'プロバイダー',llm_confirm:'確認',llm_import_config:'設定をインポート',
     llm_thinking_stream:'シンキングストリーム',llm_enabled:'有効',llm_disabled:'無効',
     llm_model:'モデル',llm_scan:'スキャン',llm_scan_hint:'スキャンをクリックしてOllamaモデルを検出',llm_scan_first:'先にモデルをスキャン',
-    llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗'
+    llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗',
+    todo_plan_steps:'計画ステップ',todo_subtasks:'サブタスク'
   }
 };
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
@@ -5141,7 +5153,54 @@ function statusClass(status){return `st-${normalizeStatus(status)}`}
 function statusLabel(status){const s=normalizeStatus(status);if(s==='in_progress')return t('status_in_progress');if(s==='completed')return t('status_completed');if(s==='blocked')return t('status_blocked');if(s==='deleted')return t('status_deleted');return t('status_pending')}
 function cleanWorkText(text,status=''){let s=String(text??'').replace(/\\s+/g,' ').trim();if(!s)return '';s=s.replace(/^\\[[ x>\\-]\\]\\s*/i,'');s=s.replace(/^(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*[·:\\-\\]]\\s*/i,'');if(status){const st=String(status).replace('_','[_\\\\-\\\\s]?');s=s.replace(new RegExp(`\\\\s*[—-]\\\\s*${st}\\\\s*$`,'i'),'')}s=s.replace(/\\s*[—-]\\s*(pending|in[_\\-\\s]?progress|completed|done|blocked)\\s*$/i,'');return s.trim()||String(text??'').trim()}
 function formatTs(ts){const v=Number(ts||0);if(!v)return '';try{return new Date(v*1000).toLocaleString()}catch(_){return ''}}
-function renderTodoBoard(items){const todos=Array.isArray(items)?items:[];if(!todos.length)return `<div class=\"mono\">${esc(t('no_todos'))}</div>`;const done=todos.filter(t=>normalizeStatus(t?.status)==='completed').length;const open=todos.length-done;const cards=todos.map((t,idx)=>{const status=normalizeStatus(t?.status);const content=cleanWorkText(t?.content,status)||'(empty todo)';const active=String(t?.activeForm||'').trim();const meta=status==='in_progress'&&active?`<div class=\"todo-meta\">${esc(cleanWorkText(active,status))}</div>`:'';return `<div class=\"todo-item ${statusClass(status)}\"><div class=\"todo-head\"><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span><span class=\"mono todo-index\">#${idx+1}</span></div><div class=\"todo-content\">${esc(content)}</div>${meta}</div>`}).join('');return `<div class=\"board-summary\"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div><div class=\"todo-list\">${cards}</div>`}
+function renderTodoBoard(items){
+  const todos=Array.isArray(items)?items:[];
+  if(!todos.length)return `<div class="mono">${esc(t('no_todos'))}</div>`;
+  const done=todos.filter(x=>normalizeStatus(x?.status)==='completed').length;
+  const open=todos.length-done;
+  function todoCard(item,idx,extraClass=''){
+    const status=normalizeStatus(item?.status);
+    const content=cleanWorkText(item?.content,status)||'(empty todo)';
+    const active=String(item?.activeForm||'').trim();
+    const meta=status==='in_progress'&&active?`<div class="todo-meta">${esc(cleanWorkText(active,status))}</div>`:'';
+    return `<div class="todo-item ${statusClass(status)}${extraClass?(' '+extraClass):''}"><div class="todo-head"><span class="status-badge ${statusClass(status)}">${esc(statusLabel(status))}</span><span class="mono todo-index">#${idx+1}</span></div><div class="todo-content">${esc(content)}</div>${meta}</div>`;
+  }
+  // Split into plan steps (bb:proj:) and worker subtasks
+  const planSteps=todos.filter(x=>String(x?.key||'').startsWith('bb:proj:'));
+  const workerTodos=todos.filter(x=>!String(x?.key||'').startsWith('bb:proj:'));
+  let html='';
+  if(planSteps.length&&workerTodos.length){
+    // Build parent_step_id index: map step key suffix to its subtasks
+    const stepIdFromKey=(key)=>{const k=String(key||'');return k.startsWith('bb:proj:')?k.slice(8):''};
+    const subtasksByStep={};
+    const unlinked=[];
+    workerTodos.forEach(sub=>{
+      const pid=String(sub?.parent_step_id||'').trim();
+      if(pid){(subtasksByStep[pid]=subtasksByStep[pid]||[]).push(sub)}
+      else{unlinked.push(sub)}
+    });
+    // Find active plan step for unlinked subtasks fallback
+    const activeStepIdx=planSteps.findIndex(x=>normalizeStatus(x?.status)==='in_progress');
+    html+=`<div class="todo-group-label">${esc(t('todo_plan_steps'))}</div><div class="todo-list">`;
+    planSteps.forEach((step,i)=>{
+      html+=todoCard(step,i);
+      const sid=stepIdFromKey(step?.key);
+      // Show subtasks linked to this step via parent_step_id
+      const linked=sid?subtasksByStep[sid]||[]:[];
+      // Also attach unlinked subtasks under the active plan step (backward compat)
+      const subs=i===activeStepIdx?linked.concat(unlinked):linked;
+      if(subs.length){
+        html+=`<div class="todo-group-label" style="margin-left:16px">${esc(t('todo_subtasks'))}</div>`;
+        subs.forEach((sub,j)=>{html+=todoCard(sub,j,'todo-subtask')});
+      }
+    });
+    html+=`</div>`;
+  } else {
+    // No grouping needed — flat list
+    html+=`<div class="todo-list">${todos.map((x,i)=>todoCard(x,i)).join('')}</div>`;
+  }
+  return `<div class="board-summary"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div>${html}`;
+}
 function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
 function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;return st}
 function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}

@@ -81,9 +81,13 @@ class TodoManager:
                 row["owner"] = owner
             if key:
                 row["key"] = key
+            # Preserve parent_step_id for subtask-to-plan-step linkage
+            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
+            if parent_step_id:
+                row["parent_step_id"] = parent_step_id
             validated.append(row)
-        if len(validated) > 20:
-            raise ValueError("max 20 todos")
+        if len(validated) > 40:
+            raise ValueError("max 40 todos")
         if validated and not any(x["status"] == "in_progress" for x in validated):
             for row in validated:
                 if row["status"] == "pending":

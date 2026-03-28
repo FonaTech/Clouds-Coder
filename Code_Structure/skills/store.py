@@ -167,6 +167,36 @@ Use this skill when the user uploads Word/PowerPoint documents and needs content
 - The backend automatically parses `.doc`, `.docx`, `.ppt`, `.pptx`.
 - If parser dependencies are unavailable, fallback extractor is used (may lose formatting).
 """
+    image_skill = """---
+name: upload-image-parser
+description: Analyze uploaded image files (PNG/JPG/JPEG/WEBP/GIF/BMP) using model native vision capabilities as the primary method; no OCR tools needed for supported formats.
+---
+
+# Upload Image Parser
+
+Use this skill when the user uploads image files and needs content description, analysis, extraction, or comparison.
+
+## Primary Approach: Model Vision (Multimodal)
+1. Use `read_file` on the uploaded image path — the runtime automatically injects it as a native vision input to the model.
+2. Analyze or describe the image directly with vision capabilities; no external tools required.
+3. Uploaded image paths are under `files/uploaded/` in the session workspace. Check `Uploaded files context` in the system prompt for exact paths.
+
+## Format Notes
+- Native formats (sent directly, no conversion): `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`
+- Auto-converted formats (runtime handles via Pillow): `.bmp`, `.tiff`, `.tif`, `.heic`, `.heif`, `.avif`
+  - If conversion fails, the runtime returns an error message; use bash fallback below.
+- `.svg` files: runtime returns the SVG markup as text — parse the XML/SVG source directly, do not treat as a raster image.
+
+## Fallback (only if runtime reports vision input unavailable)
+If the model cannot process the image natively (runtime message will say so):
+- OCR text extraction: `bash` → `tesseract <path> stdout`
+- Metadata / dimensions: `bash` → `identify <path>` (ImageMagick)
+- Pixel-level analysis: `bash` → `python3 -c "from PIL import Image; img=Image.open('<path>'); print(img.size, img.mode)"`
+
+## Notes
+- Never attempt text extraction (OCR) on images when vision input is available — use the model's native understanding instead.
+- For multi-image comparison tasks, load each image via `read_file` sequentially; the runtime accumulates them as pending media inputs for the next model call.
+"""
     cap_json = json_dumps(
         {
             "generated_at": int(now_ts()),
@@ -176,6 +206,7 @@ Use this skill when the user uploads Word/PowerPoint documents and needs content
     )
     _write_text_if_changed(generated_root / "upload-tabular-parser" / "SKILL.md", tabular_skill)
     _write_text_if_changed(generated_root / "upload-office-parser" / "SKILL.md", office_skill)
+    _write_text_if_changed(generated_root / "upload-image-parser" / "SKILL.md", image_skill)
     _write_text_if_changed(generated_root / "upload-parsers-capabilities.json", cap_json)
 
 def ensure_generated_image_coding_feedback_skill(skills_root: Path):
@@ -198,12 +229,12 @@ Use this skill when the task depends on image understanding in a coding workflow
 - Generated image(s): current output from app, script, or model generation pipeline.
 - Code scope: file paths, rendering command, and runtime constraints.
 
-## Capability Gate
-1. Check active model/image pipeline capability first.
-2. If image input is supported, use direct vision reasoning for detailed comparison.
-3. If image input is unavailable, use fallback checks:
+## Image Analysis: Vision First
+1. Load all reference and generated images via `read_file` — the runtime injects them as native vision inputs automatically.
+2. Analyze images directly with model vision capabilities; do not use OCR or pixel heuristics when vision input is available.
+3. Fallback (only if the runtime explicitly reports vision input unavailable):
    - deterministic metadata checks (size/aspect/background),
-   - text checks (OCR if available),
+   - text checks via OCR tools (e.g., `tesseract`),
    - simple pixel-region checks from locally rendered output.
 4. Always report confidence level (`high|medium|low`) based on signal quality.
 
@@ -1601,6 +1632,7 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "skills_Gen/knowledge_snapshot.json",
         "generated/upload-tabular-parser/SKILL.md",
         "generated/upload-office-parser/SKILL.md",
+        "generated/upload-image-parser/SKILL.md",
         "generated/image-coding-feedback-loop/SKILL.md",
         "generated/execution-degradation-recovery/SKILL.md",
         "generated/deep-research-orchestrator/SKILL.md",
