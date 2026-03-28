@@ -10694,10 +10694,6 @@ class SessionState:
             str(r.get("name", "")) == "bash" and r.get("ok", False)
             for r in tool_results
         )
-        called_todo_write = any(
-            str(r.get("name", "")) == "TodoWrite"
-            for r in tool_results
-        )
         # Auto-advance conditions:
         should_advance = False
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
