@@ -1384,12 +1384,6 @@ BACKEND_I18N["en"].update(
         "plan_proposal_cons": "**Cons:** {text}",
         "plan_proposal_risk": "**Risk:** {text}",
         "plan_proposal_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
-        "plan_bubble_questions_title": "\n**Clarification questions** (plan assumes defaults below):",
-        "plan_bubble_question_item": "- {q} *(default: {default})*",
-        "plan_file_questions_title": "\n## ❓ Clarification Questions\n> Generated with these default assumptions. You may override them when selecting a plan option.",
-        "plan_file_question_item": "- **{q}** — default: *{default}*",
-        "plan_bubble_modify_hint": '> To modify: reply "Option {id}, but <your change>"',
-        "plan_revision_confirm_hint": "✏️ Plan {id} has been revised. Reply '**{id}**' or 'confirm' to proceed.",
         "status_project_todos_synced": "project todos synced ({reason})",
     }
 )
@@ -1484,13 +1478,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_proposal_pros": "**优势：** {text}",
         "plan_proposal_cons": "**劣势：** {text}",
         "plan_proposal_risk": "**风险：** {text}",
-        "plan_proposal_reply": "请回复选择（如”方案A””A””选1”），或输入修改意见。",
-        "plan_bubble_questions_title": "\n**待用户确认的问题**（方案按以下默认值生成）：",
-        "plan_bubble_question_item": "- {q} *（默认：{default}）*",
-        "plan_file_questions_title": "\n## ❓ 待用户确认的问题\n> 方案按以下默认假设生成。选择方案时可同时回答这些问题。",
-        "plan_file_question_item": "- **{q}** — 默认值：*{default}*",
-        "plan_bubble_modify_hint": '> 修改方案：回复”方案{id}，但 <修改内容>”',
-        "plan_revision_confirm_hint": '✏️ 方案 {id} 已根据你的修改意见更新。回复”**{id}**”或”确认”开始执行。',
+        "plan_proposal_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
         "status_project_todos_synced": "项目待办已同步（{reason}）",
     }
 )
@@ -1684,6 +1672,14 @@ BACKEND_I18N["ja"].update(
         "status_project_todos_synced": "プロジェクト Todo を同期しました（{reason}）",
     }
 )
+
+TABULAR_PREVIEW_EXTS = {".csv", ".tsv"}
+
+EXCEL_PREVIEW_EXTS = {".xlsx", ".xls", ".xlsm"}
+
+PRESENTATION_PREVIEW_EXTS = {".pptx", ".ppt", ".pptm"}
+
+DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
 
 EMBEDDED_SKILLS_ARCHIVE_B64 = """UEsDBBQAAAAIAAoDYlxfdPK4gQgAAGkSAAAdAAAAc2tpbGxzL2FnZW50LWJ1aWxkZXIvU0tJTEwubWSVWO9v3LgR/a6/YuAAvdjd1fWSS1H4QwPHTq9G7LMR
 +5D2U82VuCvGFKkTqV1vsejf3jdD/bLTO6D+4l2KMxrOvHnzuMvlMnOq1qekNtrF5aozttRtVupQtKaJxrtTOmREFzqYjSPlSpI9dHaZTAKtfYv1PZW+Vsbl
@@ -2782,7 +2778,7 @@ body[data-ui-style="trad"] button,body[data-ui-style="trad"] a{border-radius:10p
 .stat .k{font-size:.78rem;color:var(--muted)}
 .stat .v{font-size:1.25rem;font-weight:700}
 main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
-.panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;height:100%}
+.panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;min-width:0;height:100%}
 body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
@@ -2807,6 +2803,13 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .preview-body{flex:1;min-height:0;overflow:auto;background:#fff}
 .preview-frame{width:100%;height:100%;border:0;background:#fff}
 .preview-md{padding:14px}
+.preview-media-wrap{height:100%;display:flex;align-items:center;justify-content:center;padding:14px;background:
+linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
+.preview-media-img{display:block;max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;border-radius:12px;box-shadow:0 10px 28px rgba(15,23,42,.10);background:#fff}
+.preview-player-wrap{height:100%;display:flex;align-items:center;justify-content:center;padding:18px;background:
+linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
+.preview-player-video{display:block;max-width:100%;max-height:100%;width:100%;height:auto;border-radius:12px;background:#000;box-shadow:0 10px 28px rgba(15,23,42,.16)}
+.preview-player-audio{width:min(720px,100%);background:#fff;border:1px solid #d7e2f0;border-radius:999px;padding:8px 10px;box-shadow:0 10px 24px rgba(15,23,42,.08)}
 .preview-code-scroll{height:100%;overflow:auto;background:#fbfdff;overscroll-behavior:contain;scrollbar-gutter:stable both-edges}
 .preview-code-shell{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;line-height:1.5;background:#fbfdff;color:#1f2b3d;min-width:100%;width:max-content}
 .code-row{display:grid;grid-template-columns:82px max-content;align-items:stretch;min-width:100%;border-bottom:1px solid #e7eef8}
@@ -3005,23 +3008,32 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .ctx-live.danger{border-color:#f1c5c5;background:#fff4f4}
 .error-box{margin-top:8px;padding:8px 10px;border:1px solid #f2b4b4;background:#fff1f1;color:#8f1d1d;border-radius:8px}
 .hidden{display:none}
-#runtimeScroll{flex:1;min-height:0;overflow:auto;padding-right:2px}
-#status{font-size:.9rem;color:var(--muted);margin-bottom:8px;line-height:1.35}
+#runtimeScroll{flex:1;min-height:0;min-width:0;overflow:auto;padding-right:2px}
+#status{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;min-width:0;line-height:1.35}
+.runtime-pill{display:inline-flex;align-items:flex-start;gap:6px;min-width:0;max-width:100%;padding:6px 10px;border:1px solid #dde6f2;border-radius:999px;background:linear-gradient(180deg,#fff,#f7fbff);font-size:.78rem;color:#32465f}
+.runtime-pill-wide{width:100%;border-radius:14px}
+.runtime-pill.state-running{background:linear-gradient(180deg,#f2fff9,#e7fbf1);border-color:#bfe7cf}
+.runtime-pill.state-idle{background:linear-gradient(180deg,#ffffff,#f5f7fb);border-color:#dde6f2}
+.runtime-pill-label{flex:0 0 auto;font-weight:700;color:#667b94;white-space:nowrap}
+.runtime-pill-value{min-width:0;color:#17283d;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.runtime-pill-value.mono{font-size:.76rem}
 .render-bridge{margin:0 0 10px;border:1px solid #d9e4f1;border-radius:10px;background:#fbfdff;overflow:hidden}
 .render-meta{padding:6px 8px;border-bottom:1px solid #e6edf7;color:#51627a;font-size:.76rem;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .render-canvas{display:block;width:100%;height:220px;background:#ffffff}
 .compact-toast{position:fixed;top:16px;right:16px;z-index:9999;max-width:320px;background:#0f1b2d;color:#fff;border-radius:12px;padding:10px 12px;box-shadow:0 10px 26px rgba(15,27,45,.28);opacity:0;transform:translateY(-8px);pointer-events:none;transition:opacity .2s ease,transform .2s ease}
 .compact-toast.show{opacity:1;transform:translateY(0)}
-#todos,#tasks,#activity,#commands,#diffs,#catalog,#fileExplorer{overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fff}
+#todos,#tasks,#activity,#commands,#diffs,#catalog,#fileExplorer{overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fff;min-width:0}
 #todos,#tasks{height:220px;max-height:240px}
 #activity,#commands,#diffs,#catalog{height:160px;max-height:160px}
 #fileExplorer{height:250px;max-height:280px;background:linear-gradient(180deg,#f7fbff 0%,#ffffff 100%);padding:8px}
 h3{font-size:.96rem;margin:10px 0 6px}
-.runtime-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.runtime-section-head h3{margin:10px 0 6px}
-.runtime-mini-btn{padding:6px 10px;border-radius:10px;font-size:.76rem;line-height:1.2;white-space:nowrap}
-.file-explorer-wrap{display:flex;flex-direction:column;gap:8px}
-.file-explorer-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#607089;font-size:.75rem}
+.runtime-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;min-width:0}
+.runtime-section-head h3{margin:10px 0 6px;min-width:0}
+.runtime-mini-btn{padding:6px 10px;border-radius:10px;font-size:.76rem;line-height:1.2;white-space:nowrap;max-width:100%}
+.file-explorer-wrap{display:flex;flex-direction:column;gap:8px;min-width:0}
+.file-explorer-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;flex-wrap:wrap;min-width:0;color:#607089;font-size:.75rem}
+.file-explorer-root{flex:1 1 220px;min-width:0;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.file-explorer-summary{flex:0 1 160px;min-width:0;text-align:right;overflow-wrap:anywhere;word-break:break-word}
 .file-explorer-tree{display:flex;flex-direction:column;gap:4px}
 .fe-row{display:flex;align-items:center;gap:8px;min-height:32px;padding:6px 8px;border:1px solid #e2eaf5;border-radius:10px;background:#fff;box-shadow:0 1px 0 rgba(16,24,40,.02);margin-left:calc(var(--depth,0)*14px)}
 .fe-row.dir{background:#f5f9ff}
@@ -3034,13 +3046,14 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .fe-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.83rem;color:#1f2f45}
 .fe-meta{font-size:.72rem;color:#6f7f97;white-space:nowrap}
 .fe-kind{display:inline-flex;align-items:center;padding:1px 6px;border-radius:999px;border:1px solid #d8e3f4;background:#f5f8fd;font-size:.68rem;font-weight:700;letter-spacing:.01em;color:#455b7a}
-.fe-empty{padding:10px;color:#6c7b90}
+.fe-empty{padding:10px;color:#6c7b90;overflow-wrap:anywhere;word-break:break-word}
 .fe-trunc{margin-top:4px;font-size:.72rem;color:#8b5e1a;background:#fff4db;border:1px solid #f0d49c;border-radius:8px;padding:5px 8px}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.84rem}
 .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#f1f6ff;border:1px solid #d6e4ff;font-size:.75rem;margin-right:6px}
-.board-summary{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:.8rem;margin-bottom:8px}
-.todo-list,.task-list{display:flex;flex-direction:column;gap:8px}
-.todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff}
+.board-summary{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;min-width:0;color:var(--muted);font-size:.8rem;margin-bottom:8px}
+.board-summary span{min-width:0;overflow-wrap:anywhere;word-break:break-word}
+.todo-list,.task-list{display:flex;flex-direction:column;gap:8px;min-width:0}
+.todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff;min-width:0}
 .todo-item.st-pending,.task-item.st-pending{border-left-color:#7b8798}
 .todo-item.st-in_progress,.task-item.st-in_progress{border-left-color:#1f6feb;background:#eef5ff}
 .todo-group-label{font-size:.72rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:6px 0 2px 2px}
@@ -3049,28 +3062,28 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .todo-item.st-completed,.task-item.st-completed{border-left-color:#13b8a6;background:#edfcf7}
 .todo-item.st-blocked,.task-item.st-blocked{border-left-color:#b96b00;background:#fff6ea}
 .todo-item.st-deleted,.task-item.st-deleted{border-left-color:#a0a6b0;background:#f7f8fa}
-.todo-head,.task-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px}
+.todo-head,.task-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;margin-bottom:4px}
 .status-badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #d6deea;background:#f1f5fa;color:#334155;font-size:.72rem;font-weight:700;letter-spacing:.02em}
 .status-badge.st-in_progress{background:#e9f1ff;border-color:#bfd4ff;color:#0f4ca8}
 .status-badge.st-completed{background:#e4faf1;border-color:#b9efd9;color:#0f7d57}
 .status-badge.st-blocked{background:#fff1df;border-color:#ffd8a8;color:#935300}
 .status-badge.st-deleted{background:#f0f2f5;border-color:#d4dae2;color:#5e6775}
-.todo-content,.task-subject{font-size:.88rem;line-height:1.35}
-.todo-meta,.task-meta{margin-top:4px;font-size:.76rem;color:var(--muted);line-height:1.35}
+.todo-content,.task-subject{font-size:.88rem;line-height:1.35;overflow-wrap:anywhere;word-break:break-word}
+.todo-meta,.task-meta{margin-top:4px;font-size:.76rem;color:var(--muted);line-height:1.35;overflow-wrap:anywhere;word-break:break-word}
 .todo-index,.task-id{color:#475467}
-.cmd-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#f9fbff}
-.cmd-main{font-weight:600}
-.cmd-sub{color:var(--muted);font-size:.82rem}
+.cmd-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#f9fbff;min-width:0}
+.cmd-main{font-weight:600;overflow-wrap:anywhere;word-break:break-word}
+.cmd-sub{color:var(--muted);font-size:.82rem;overflow-wrap:anywhere;word-break:break-word}
 .cmd-flags{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .cmd-flag{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #d4deec;background:#eef4fb;color:#37506c;font-size:.72rem;font-weight:600}
 .cmd-flag.warn{background:#fff3e4;border-color:#ffd3a1;color:#8a4b08}
 .cmd-flag.info{background:#e8f2ff;border-color:#bfd4ff;color:#0f4ca8}
 .cmd-output{margin-top:6px;max-height:220px;overflow:auto;background:#fff;border:1px solid #e7edf5;border-radius:6px;padding:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre-wrap;word-break:break-word}
-.cmd-pager{display:flex;align-items:center;gap:8px;margin-top:6px}
+.cmd-pager{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;margin-top:6px}
 .cmd-pager button{border:1px solid #d7e2f0;background:#fff;border-radius:6px;padding:2px 8px;font-size:.75rem;cursor:pointer}
 .cmd-pager button:disabled{opacity:.45;cursor:default}
-.diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff}
-.diff-head{font-weight:600;margin-bottom:4px}
+.diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff;min-width:0}
+.diff-head{font-weight:600;margin-bottom:4px;overflow-wrap:anywhere;word-break:break-word}
 .diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
 .diff-line-add{background:#eaffea;color:#0f6a1b}
 .diff-line-del{background:#ffeaea;color:#8a1d1d}
@@ -3332,7 +3345,7 @@ Object.assign(I18N['en'],{
   event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
-  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',
+  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -3352,7 +3365,7 @@ Object.assign(I18N['zh-CN'],{
   event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
-  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',
+  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -3374,7 +3387,7 @@ Object.assign(I18N['zh-TW'],{
   event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
-  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',
+  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -3395,7 +3408,7 @@ Object.assign(I18N['ja'],{
   event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
-  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',
+  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -4325,12 +4338,13 @@ function _mdWorkerQueue(text,key){
 }
 function renderMarkdownCached(text,key){const src=String(text||'');const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const jobId=_mdWorkerQueue(src,k);if(jobId>0){return `<div class=\"md-async-slot\" data-md-job=\"${jobId}\">${esc(src).replace(/\\n/g,'<br>')}</div>`}const html=renderMarkdown(src);if(k){_mdCacheSet(k,html)}return html}
 function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
-function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
-function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='code')return '{}';return '📄'}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='image')return '🖼️';if(kind==='video')return '🎞️';if(kind==='audio')return '🔊';if(kind==='pdf')return '📕';if(kind==='csv')return '📊';if(kind==='excel')return '📗';if(kind==='document')return '📘';if(kind==='presentation')return '📽️';if(kind==='code')return '{}';return '📄'}
 function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
 function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
 function encodePreviewPath(path){return normalizePreviewPath(path).split('/').filter(Boolean).map(x=>encodeURIComponent(x)).join('/')}
 function previewFileUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-file/${rel}${ts}`}
+function previewHtmlUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-html/${rel}${ts}`}
 function previewCodeStagesUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code-stages/${rel}${ts}`}
 function previewCodeUrl(sessionId,path,stage='latest',forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const st=encodeURIComponent(String(stage||'latest'));const ts=forceReload?`&ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code/${rel}?stage=${st}${ts}`}
 function _previewLatestCodeStageHint(path){const rel=normalizePreviewPath(path);const ops=Array.isArray(S.snap?.operations)?S.snap.operations:[];for(let i=ops.length-1;i>=0;i--){const op=ops[i]||{};if(String(op.type||'')!=='file_patch')continue;const d=op.data||{};const p=normalizePreviewPath(d.session_rel_path||d.path||'');if(p!==rel)continue;const sid=String(d?.code_stage?.id||'').trim();if(sid)return sid}return ''}
@@ -4894,6 +4908,26 @@ function renderActivePreview(forceReload=false){
   const url=previewFileUrl(S.activeId,tab.path,forceReload);
   if(tab.kind==='html'){
     body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
+    return;
+  }
+  if(tab.kind==='image'){
+    body.innerHTML=`<div class=\"preview-media-wrap\"><img class=\"preview-media-img\" src=\"${esc(url)}\" alt=\"${esc(tab.title||tab.path)}\" loading=\"lazy\"></div>`;
+    return;
+  }
+  if(tab.kind==='video'){
+    body.innerHTML=`<div class=\"preview-player-wrap\"><video class=\"preview-player-video\" src=\"${esc(url)}\" controls playsinline preload=\"metadata\"></video></div>`;
+    return;
+  }
+  if(tab.kind==='audio'){
+    body.innerHTML=`<div class=\"preview-player-wrap\"><audio class=\"preview-player-audio\" src=\"${esc(url)}\" controls preload=\"metadata\"></audio></div>`;
+    return;
+  }
+  if(tab.kind==='pdf'){
+    body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
+    return;
+  }
+  if(tab.kind==='csv'||tab.kind==='excel'||tab.kind==='document'||tab.kind==='presentation'){
+    body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(previewHtmlUrl(S.activeId,tab.path,forceReload))}\" loading=\"lazy\"></iframe>`;
     return;
   }
   body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
@@ -5765,49 +5799,18 @@ function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.active
 function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}
 function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)return '-';if(n<1024)return `${n}B`;if(n<1024*1024)return `${(n/1024).toFixed(1)}KB`;if(n<1024*1024*1024)return `${(n/(1024*1024)).toFixed(1)}MB`;return `${(n/(1024*1024*1024)).toFixed(1)}GB`}
 function _feTs(ts){const n=Number(ts||0);if(!Number.isFinite(n)||n<=0)return'';try{return new Date(n*1000).toLocaleString()}catch(_){return''}}
-function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==='html')return'HTML';if(k==='markdown')return'MD';if(k==='code')return'CODE';return''}
-function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='code')return'⌘';return'📄'}
-function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(t('fe_items',{n:kids.length}))}</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
-function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=[t('fe_nodes',{n:Number(st.nodeCount||0)}),st.inflight?t('fe_loading'):''].filter(Boolean).join(' · ');const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">${esc(t('fe_tree_truncated',{n:Number(st.maxNodes||0)}))}</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
+function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==='html')return'HTML';if(k==='markdown')return'MD';if(k==='image')return'IMG';if(k==='video')return'VIDEO';if(k==='audio')return'AUDIO';if(k==='pdf')return'PDF';if(k==='csv')return'CSV';if(k==='excel')return'XLS';if(k==='document')return'DOC';if(k==='presentation')return'PPT';if(k==='code')return'CODE';return''}
+function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='image')return'🖼️';if(k==='video')return'🎞️';if(k==='audio')return'🔊';if(k==='pdf')return'📕';if(k==='csv')return'📊';if(k==='excel')return'📗';if(k==='document')return'📘';if(k==='presentation')return'📽️';if(k==='code')return'⌘';return'📄'}
+function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(t('fe_items',{n:kids.length}))}</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=!!kind;const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
+function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=[t('fe_nodes',{n:Number(st.nodeCount||0)}),st.inflight?t('fe_loading'):''].filter(Boolean).join(' · ');const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">${esc(t('fe_tree_truncated',{n:Number(st.maxNodes||0)}))}</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono file-explorer-root\">${esc(rootText||'/workspace')}</span><span class=\"file-explorer-summary\">${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
 function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>{const status=String(u.parse_status||'').trim();const statusTxt=status?` · parse=${status}`:'';const err=String(u.parse_error||'').trim();return `<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}${esc(statusTxt)}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div>${err?`<div class="upload-entry-path">${esc(err)}</div>`:''}</div>`}).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
 function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
 function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';E('status').textContent=[
-`${t('rt_session')}=${S.snap?.id||'-'}`,
-`${t('rt_model')}=${S.snap?.model||'-'}`,
-`${t('rt_thinking')}=${boolWord(S.snap?.thinking)}`,
-`${t('rt_thinking_stream')}=${boolWord(S.snap?.thinking_stream)}`,
-`${t('rt_mode')}=${S.snap?.execution_mode||S.config?.execution_mode||'sync'}`,
-`${t('rt_active_agent')}=${activeRoleLabel}`,
-`${t('rt_blackboard')}=${S.snap?.blackboard?.status||'-'}`,
-`${t('rt_task')}=${S.snap?.blackboard?.task_profile?.task_type||'-'}`,
-`${t('rt_complexity')}=${S.snap?.blackboard?.task_profile?.complexity||'-'}`,
-`${t('rt_judgement')}=${S.snap?.blackboard?.manager_judgement?.progress||'-'}`,
-`${t('rt_budget')}=${S.snap?.blackboard?.task_profile?.round_budget??'-'}`,
-`${t('rt_remaining')}=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'}`,
-`${t('rt_blackboard_cycles')}=${S.snap?.blackboard?.manager_cycles??'-'}`,
-`${t('rt_round_limit')}=${S.snap?.max_agent_rounds||'-'}`,
-`${t('rt_round')}=${S.snap?.agent_round_index??'-'}`,
-`${t('rt_phase')}=${S.snap?.agent_phase||t('idle')}`,
-`${t('rt_queued_inputs')}=${S.snap?.queued_user_inputs_count??0}`,
-`${t('rt_run_timeout')}=${S.snap?.max_run_seconds??'-'}s`,
-`${t('rt_ctx_used')}=${S.snap?.context_tokens_estimate??'-'}`,
-`${t('rt_ctx_limit')}=${S.snap?.context_token_upper_bound||'-'}`,
-`${t('rt_ctx_mode')}=${t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')}`,
-`${t('rt_ctx_left')}=${formatContextLeft(S.snap)}`,
-`${t('rt_truncation')}=${S.snap?.truncation_count||0}`,
-`${t('rt_trunc_retry')}=${S.snap?.live_truncation_attempts||0}`,
-`${t('rt_trunc_tokens')}=${S.snap?.live_truncation_tokens||0}`,
-`${t('rt_archive')}=${S.snap?.compact_segments_count||0}`,
-`${t('rt_last_compact')}=${S.snap?.last_compact_reason||'-'}`,
-`${t('rt_ollama')}=${S.snap?.ollama_base_url||'-'}`,
-`${t('rt_files')}=${S.snap?.session_files_root||'-'}`,
-`${t('rt_ui_mode')}=${uiState}`,
-S.snap?.running?t('running'):t('idle')
-].join(' | ');
+function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)

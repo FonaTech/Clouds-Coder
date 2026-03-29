@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import AUDIO_EXTS, CODE_CHUNK_CHARS, CODE_CHUNK_OVERLAP, CODE_LIBRARY_LANGUAGE_BY_EXT, CODE_LIBRARY_SPECIAL_FILENAMES, CODE_MAX_CHUNKS_PER_DOC, CODE_PREVIEW_EXTS, CODE_PREVIEW_FILENAMES, CODE_PREVIEW_STAGE_MAX_ROWS, IMAGE_EXTS, RAG_CHUNK_CHARS, RAG_CHUNK_OVERLAP, RAG_CODE_HINTS, RAG_EN_STOPWORDS, RAG_GENERIC_ENTITY_TERMS_EN, RAG_GENERIC_ENTITY_TERMS_ZH, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_MAX_CHUNKS_PER_DOC, RAG_PDF_IMAGE_LIMIT, RAG_RESEARCH_HINTS, RAG_SHORT_TOKEN_ALLOWLIST, RAG_STRUCTURAL_ENTITY_PATTERNS, RAG_TERM_GROUPS, RAG_ZH_STOPWORDS, VIDEO_EXTS
+from ..config.constants import AUDIO_EXTS, CODE_CHUNK_CHARS, CODE_CHUNK_OVERLAP, CODE_LIBRARY_LANGUAGE_BY_EXT, CODE_LIBRARY_SPECIAL_FILENAMES, CODE_MAX_CHUNKS_PER_DOC, CODE_PREVIEW_EXTS, CODE_PREVIEW_FILENAMES, CODE_PREVIEW_STAGE_MAX_ROWS, DOCUMENT_PREVIEW_EXTS, EXCEL_PREVIEW_EXTS, IMAGE_EXTS, PRESENTATION_PREVIEW_EXTS, RAG_CHUNK_CHARS, RAG_CHUNK_OVERLAP, RAG_CODE_HINTS, RAG_EN_STOPWORDS, RAG_GENERIC_ENTITY_TERMS_EN, RAG_GENERIC_ENTITY_TERMS_ZH, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_MAX_CHUNKS_PER_DOC, RAG_PDF_IMAGE_LIMIT, RAG_RESEARCH_HINTS, RAG_SHORT_TOKEN_ALLOWLIST, RAG_STRUCTURAL_ENTITY_PATTERNS, RAG_TERM_GROUPS, RAG_ZH_STOPWORDS, TABULAR_PREVIEW_EXTS, VIDEO_EXTS
 from ..utils.files import _sha256_bytes, _sha256_file
 from ..utils.json_utils import parse_json_object
 from ..utils.media import guess_mime_from_name
@@ -54,6 +54,23 @@ def preview_kind_for_path(path_text: str) -> str:
         return "html"
     if rel.endswith((".md", ".markdown")):
         return "markdown"
+    ext = PurePosixPath(rel).suffix.lower()
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    if ext == ".pdf":
+        return "pdf"
+    if ext in TABULAR_PREVIEW_EXTS:
+        return "csv"
+    if ext in EXCEL_PREVIEW_EXTS:
+        return "excel"
+    if ext in PRESENTATION_PREVIEW_EXTS:
+        return "presentation"
+    if ext in DOCUMENT_PREVIEW_EXTS:
+        return "document"
     if is_code_preview_candidate(rel):
         return "code"
     return ""

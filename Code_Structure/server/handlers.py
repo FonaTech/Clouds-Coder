@@ -335,6 +335,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(payload)
+        m = re.match(r"^/api/sessions/([^/]+)/preview-html/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                html_text = sess.preview_html_payload(rel)
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
         m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
