@@ -418,10 +418,10 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
     },
     3: {
         "name": "light_collaboration",
-        "execution_mode": EXECUTION_MODE_SYNC,
-        "participants": ["explorer", "developer"],
+        "execution_mode": EXECUTION_MODE_SINGLE,
+        "participants": ["developer"],
         "assigned_expert": "developer",
-        "round_budget": 10,
+        "round_budget": 16,
         "requires_user_confirmation": False,
         "complexity": "simple",
     },
@@ -511,7 +511,7 @@ SKILLS_EXTERNAL_MOUNT = "__external__"
 
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
 
-PLAN_MODE_FORCED_LEVELS = {4, 5}
+PLAN_MODE_FORCED_LEVELS = {3, 4, 5}
 
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
 
@@ -1221,6 +1221,457 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 
 OFFLINE_JS_LIB_README_FILE = "README.md"
+
+BACKEND_I18N = {
+    "en": {
+        "role_explorer": "Explorer",
+        "role_developer": "Developer",
+        "role_reviewer": "Reviewer",
+        "role_manager": "Manager",
+        "role_planner": "Planner",
+        "role_agent": "Agent",
+        "todo_no_changes": "No todo changes.",
+        "todo_no_todos": "No todos.",
+        "todo_working": "Working on: {content}",
+        "todo_completed": "Completed: {content}",
+        "todo_pending": "Pending: {content}",
+        "todo_working_owner": "Working on ({owner}): {content}",
+        "todo_completed_owner": "Completed ({owner}): {content}",
+        "todo_pending_owner": "Pending ({owner}): {content}",
+        "todo_footer": "({done}/{total} completed)",
+    },
+    "zh-CN": {
+        "role_explorer": "探索者",
+        "role_developer": "开发者",
+        "role_reviewer": "审查者",
+        "role_manager": "管理者",
+        "role_planner": "规划者",
+        "role_agent": "Agent",
+        "todo_no_changes": "待办无变化。",
+        "todo_no_todos": "暂无待办。",
+        "todo_working": "进行中：{content}",
+        "todo_completed": "已完成：{content}",
+        "todo_pending": "待处理：{content}",
+        "todo_working_owner": "进行中（{owner}）：{content}",
+        "todo_completed_owner": "已完成（{owner}）：{content}",
+        "todo_pending_owner": "待处理（{owner}）：{content}",
+        "todo_footer": "（已完成 {done}/{total}）",
+    },
+    "zh-TW": {
+        "role_explorer": "探索者",
+        "role_developer": "開發者",
+        "role_reviewer": "審查者",
+        "role_manager": "管理者",
+        "role_planner": "規劃者",
+        "role_agent": "Agent",
+        "todo_no_changes": "待辦沒有變化。",
+        "todo_no_todos": "尚無待辦。",
+        "todo_working": "進行中：{content}",
+        "todo_completed": "已完成：{content}",
+        "todo_pending": "待處理：{content}",
+        "todo_working_owner": "進行中（{owner}）：{content}",
+        "todo_completed_owner": "已完成（{owner}）：{content}",
+        "todo_pending_owner": "待處理（{owner}）：{content}",
+        "todo_footer": "（已完成 {done}/{total}）",
+    },
+    "ja": {
+        "role_explorer": "探索担当",
+        "role_developer": "開発担当",
+        "role_reviewer": "レビュー担当",
+        "role_manager": "マネージャー",
+        "role_planner": "プランナー",
+        "role_agent": "Agent",
+        "todo_no_changes": "Todo に変更はありません。",
+        "todo_no_todos": "Todo はありません。",
+        "todo_working": "進行中: {content}",
+        "todo_completed": "完了: {content}",
+        "todo_pending": "未着手: {content}",
+        "todo_working_owner": "進行中 ({owner}): {content}",
+        "todo_completed_owner": "完了 ({owner}): {content}",
+        "todo_pending_owner": "未着手 ({owner}): {content}",
+        "todo_footer": "({done}/{total} 完了)",
+    },
+}
+
+BACKEND_I18N["en"].update(
+    {
+        "todo_node_suffix": " | node: {topic}",
+        "node_desc_manager_active": "Plan route and coordinate current node handoff ({target} active)",
+        "node_desc_manager": "Plan route and coordinate current node handoff",
+        "node_desc_explorer_active": "Gather constraints and evidence for current node",
+        "node_desc_explorer": "Provide research support and risk notes for current node",
+        "node_desc_developer_active": "Implement concrete outputs and file or tool changes for current node",
+        "node_desc_developer": "Prepare and deliver implementation updates for current node",
+        "node_desc_reviewer_active": "Validate current node and provide pass or fix judgement",
+        "node_desc_reviewer": "Review outputs and keep the quality gate updated for current node",
+        "node_desc_generic": "Handle current node work",
+        "project_answer_objective": "Answer: {objective}",
+        "project_answer_default": "Answer the user's question",
+        "project_analyze_requirements": "Analyze requirements and project structure",
+        "project_implement_objective": "Implement: {objective}",
+        "project_implement_default": "Implement the coding task",
+        "project_compile_check": "Compile / syntax check",
+        "project_min_test": "Minimal functional test",
+        "project_research_objective": "Research: {objective}",
+        "project_research_default": "Run the research task",
+        "project_research_summary": "Organize research findings",
+        "project_execute_objective": "Execute: {objective}",
+        "project_execute_default": "Execute the task",
+        "evidence_structure_analyzed": "structure analyzed",
+        "evidence_files_produced": "{count} file(s) produced",
+        "evidence_compile_passed": "compile check passed",
+        "evidence_test_passed": "tests passed",
+        "evidence_review_passed": "review passed",
+        "step_completed_evidence": "step completed",
+        "plan_step_summary": "📋 Plan step {step}/{total}: {content}",
+        "plan_step_label": "Step {step}/{total}",
+        "plan_step_hint": "[plan-step-advance] Previous step completed. Now at {step_label}: {step_text}\nRead updated plan: read_file {plan_path}\nCall TodoWrite to set subtasks for THIS step ONLY.\nEach subtask MUST include parent_step_id='{parent_step_id}'. Create 3-5 items, one marked in_progress, others pending.\nDo NOT create subtasks for other plan steps.",
+        "stall_execution_blocked_title": "## Execution Blocked\n",
+        "stall_stop_reason": "**Stop reason:** {reason}",
+        "stall_error_details": "**Error details:** {detail}",
+        "stall_recent_error": "**Recent error:**",
+        "stall_repeated_tools": "**Repeated tool calls:** {tools}",
+        "stall_suggested_actions": "**Suggested actions:**",
+        "stall_action_1": "1. Check whether the environment satisfies the task requirements (files exist, dependencies installed)",
+        "stall_action_2": "2. Manually run the failed command and confirm the error output",
+        "stall_action_3": "3. Provide more specific guidance or revise the task description, then retry",
+        "stall_continue_prompt": "Please provide further instructions and I will continue from the new information.",
+        "stall_analysis_title": "### Stall Analysis\n",
+        "stall_goal": "**Goal:** {goal}",
+        "stall_severity": "**Severity score:** {score}",
+        "stall_events": "**Stall event sequence:**",
+        "stall_event_line": "- [{source}] +{points} -> total {cumulative}",
+        "stall_error_context": "**Error context:**",
+        "stall_repeated_tools_label": "**Repeated tools:** {tools}",
+        "stall_last_fault_reason": "**Last fault reason:** {reason}",
+        "stall_open_todos": "**Open todos:**",
+        "plan_file_proposals_title": "# Execution Plan Proposals\n",
+        "plan_file_background": "## Background\n{context}\n",
+        "plan_file_option": "## Option {id}: {title}",
+        "plan_file_recommended": " [RECOMMENDED]",
+        "plan_file_steps": "### Steps",
+        "plan_file_pros": "**Pros:** {text}",
+        "plan_file_cons": "**Cons:** {text}",
+        "plan_file_risk": "**Risk:** {text}",
+        "plan_file_awaiting_choice": "> Awaiting user choice.",
+        "active_plan_title": "# Active Plan: {title}\n",
+        "active_plan_status": "> Status: EXECUTING | Step {current}/{total}",
+        "active_plan_chosen": "> Chosen: Option {choice}",
+        "active_plan_updated": "> Updated: {updated}\n",
+        "active_plan_summary": "## Summary\n{summary}\n",
+        "active_plan_steps": "## Steps\n",
+        "active_plan_step_done": "- [x] Step {idx}: {header}",
+        "active_plan_step_current": "- [>] Step {idx}: {header}  <-- CURRENT",
+        "active_plan_step_pending": "- [ ] Step {idx}: {header}",
+        "active_plan_completed_by": "Completed by: {actor}",
+        "active_plan_evidence": "Evidence: {evidence}",
+        "plan_bubble_title": "## 📋 Execution Plans\n",
+        "plan_bubble_background": "**Background:** {context}\n",
+        "plan_bubble_option": "### Option {id}: {title}",
+        "plan_bubble_recommended": " ⭐ Recommended",
+        "plan_bubble_steps": "Steps: {count}",
+        "plan_bubble_risk": "Risk: {risk}",
+        "plan_bubble_full_ref": "Full plan: `{path}`",
+        "plan_bubble_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
+        "plan_read_instruction": "[plan-file] The approved execution plan is at `{path}`.\nUse: read_file {path} to review full steps and live status.\nThe plan file is the authoritative source for step ordering and completion status.\nExecute steps IN ORDER. Do NOT skip ahead. Mark the current step done before advancing.\nIf a step references a skill or workflow, call load_skill before proceeding.",
+        "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-5 subtasks for THIS step ONLY — do NOT list subtasks for other plan steps. As you complete each subtask, update it to status=completed. When ALL subtasks are done, call finish_current_task to signal step completion.\n",
+        "plan_proposal_title": "## 📋 Execution Plans\n",
+        "plan_proposal_background": "### Background Analysis\n{context}\n",
+        "plan_proposal_option": "### Option {id}: {title}",
+        "plan_proposal_recommended": " ⭐ Recommended",
+        "plan_proposal_steps": "**Steps:**",
+        "plan_proposal_pros": "**Pros:** {text}",
+        "plan_proposal_cons": "**Cons:** {text}",
+        "plan_proposal_risk": "**Risk:** {text}",
+        "plan_proposal_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
+        "status_project_todos_synced": "project todos synced ({reason})",
+    }
+)
+
+BACKEND_I18N["zh-CN"].update(
+    {
+        "todo_node_suffix": " | 当前节点：{topic}",
+        "node_desc_manager_active": "规划路由并协调当前节点交接（{target} 正在处理）",
+        "node_desc_manager": "规划路由并协调当前节点交接",
+        "node_desc_explorer_active": "为当前节点收集约束与证据",
+        "node_desc_explorer": "为当前节点提供调研支持与风险备注",
+        "node_desc_developer_active": "为当前节点实施具体产出以及文件/工具改动",
+        "node_desc_developer": "为当前节点准备并交付实现更新",
+        "node_desc_reviewer_active": "校验当前节点并给出通过/修复判断",
+        "node_desc_reviewer": "审查当前节点产出并维护质量闸门",
+        "node_desc_generic": "处理当前节点工作",
+        "project_answer_objective": "回答：{objective}",
+        "project_answer_default": "回答用户问题",
+        "project_analyze_requirements": "分析需求和项目结构",
+        "project_implement_objective": "实现：{objective}",
+        "project_implement_default": "实现编码任务",
+        "project_compile_check": "编译 / 语法检查",
+        "project_min_test": "最小功能测试",
+        "project_research_objective": "调研：{objective}",
+        "project_research_default": "执行调研任务",
+        "project_research_summary": "整理调研结果",
+        "project_execute_objective": "执行：{objective}",
+        "project_execute_default": "执行任务",
+        "evidence_structure_analyzed": "结构已分析",
+        "evidence_files_produced": "已产出 {count} 个文件",
+        "evidence_compile_passed": "编译通过",
+        "evidence_test_passed": "测试通过",
+        "evidence_review_passed": "审查通过",
+        "step_completed_evidence": "步骤已完成",
+        "plan_step_summary": "📋 计划步骤 {step}/{total}：{content}",
+        "plan_step_label": "步骤 {step}/{total}",
+        "plan_step_hint": "[plan-step-advance] 上一步已完成。当前来到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n现在调用 TodoWrite，只为当前步骤拆分子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。创建 3-5 项，其中 1 项为 in_progress，其余为 pending。\n不要为其他计划步骤创建子任务。",
+        "stall_execution_blocked_title": "## 执行遇阻\n",
+        "stall_stop_reason": "**停止原因：** {reason}",
+        "stall_error_details": "**错误详情：** {detail}",
+        "stall_recent_error": "**最近错误：**",
+        "stall_repeated_tools": "**重复工具调用：** {tools}",
+        "stall_suggested_actions": "**建议操作：**",
+        "stall_action_1": "1. 检查环境是否满足任务要求（文件是否存在、依赖是否安装）",
+        "stall_action_2": "2. 手动执行失败的命令，确认错误输出",
+        "stall_action_3": "3. 提供更具体的指导或调整任务描述后重试",
+        "stall_continue_prompt": "请提供进一步指示，我会基于新的信息继续执行。",
+        "stall_analysis_title": "### 卡死分析\n",
+        "stall_goal": "**目标：** {goal}",
+        "stall_severity": "**严重度分数：** {score}",
+        "stall_events": "**卡死事件序列：**",
+        "stall_event_line": "- [{source}] +{points} -> 累计 {cumulative}",
+        "stall_error_context": "**错误上下文：**",
+        "stall_repeated_tools_label": "**重复工具：** {tools}",
+        "stall_last_fault_reason": "**最后故障原因：** {reason}",
+        "stall_open_todos": "**未完成任务：**",
+        "plan_file_proposals_title": "# 执行方案提案\n",
+        "plan_file_background": "## 背景\n{context}\n",
+        "plan_file_option": "## 方案 {id}：{title}",
+        "plan_file_recommended": " [推荐]",
+        "plan_file_steps": "### 步骤",
+        "plan_file_pros": "**优势：** {text}",
+        "plan_file_cons": "**劣势：** {text}",
+        "plan_file_risk": "**风险：** {text}",
+        "plan_file_awaiting_choice": "> 等待用户选择。",
+        "active_plan_title": "# 当前执行方案：{title}\n",
+        "active_plan_status": "> 状态：执行中 | 步骤 {current}/{total}",
+        "active_plan_chosen": "> 已选择：方案 {choice}",
+        "active_plan_updated": "> 更新时间：{updated}\n",
+        "active_plan_summary": "## 摘要\n{summary}\n",
+        "active_plan_steps": "## 步骤\n",
+        "active_plan_step_done": "- [x] 步骤 {idx}：{header}",
+        "active_plan_step_current": "- [>] 步骤 {idx}：{header}  <-- 当前",
+        "active_plan_step_pending": "- [ ] 步骤 {idx}：{header}",
+        "active_plan_completed_by": "执行者：{actor}",
+        "active_plan_evidence": "证据：{evidence}",
+        "plan_bubble_title": "## 📋 执行方案\n",
+        "plan_bubble_background": "**背景：** {context}\n",
+        "plan_bubble_option": "### 方案 {id}：{title}",
+        "plan_bubble_recommended": " ⭐推荐",
+        "plan_bubble_steps": "步骤数：{count}",
+        "plan_bubble_risk": "风险：{risk}",
+        "plan_bubble_full_ref": "完整方案详见：`{path}`",
+        "plan_bubble_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
+        "plan_read_instruction": "[plan-file] 已批准的执行计划位于 `{path}`。\n使用：read_file {path} 查看完整步骤与实时状态。\n计划文件是步骤顺序与完成状态的唯一权威来源。\n请按顺序执行步骤，不要跳步。完成当前步骤后再推进下一步。\n如果某一步引用了 skill 或 workflow，继续前先调用 load_skill。",
+        "plan_read_todo_note": "\nTODO 更新：一开始就调用 TodoWrite，只为当前步骤（{step_label}）设置子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。\n创建 3-5 个只属于当前步骤的子任务，并在完成后及时标记完成。\n不要为其他计划步骤创建子任务。\n",
+        "plan_proposal_title": "## 📋 执行方案\n",
+        "plan_proposal_background": "### 背景分析\n{context}\n",
+        "plan_proposal_option": "### 方案 {id}：{title}",
+        "plan_proposal_recommended": " ⭐推荐",
+        "plan_proposal_steps": "**步骤：**",
+        "plan_proposal_pros": "**优势：** {text}",
+        "plan_proposal_cons": "**劣势：** {text}",
+        "plan_proposal_risk": "**风险：** {text}",
+        "plan_proposal_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
+        "status_project_todos_synced": "项目待办已同步（{reason}）",
+    }
+)
+
+BACKEND_I18N["zh-TW"].update(
+    {
+        "todo_node_suffix": " | 目前節點：{topic}",
+        "node_desc_manager_active": "規劃路由並協調目前節點交接（{target} 正在處理）",
+        "node_desc_manager": "規劃路由並協調目前節點交接",
+        "node_desc_explorer_active": "為目前節點蒐集限制與證據",
+        "node_desc_explorer": "為目前節點提供研究支援與風險備註",
+        "node_desc_developer_active": "為目前節點落實具體產出以及檔案/工具變更",
+        "node_desc_developer": "為目前節點準備並交付實作更新",
+        "node_desc_reviewer_active": "驗證目前節點並給出通過/修復判斷",
+        "node_desc_reviewer": "審查目前節點產出並維護品質閘門",
+        "node_desc_generic": "處理目前節點工作",
+        "project_answer_objective": "回答：{objective}",
+        "project_answer_default": "回答使用者問題",
+        "project_analyze_requirements": "分析需求與專案結構",
+        "project_implement_objective": "實作：{objective}",
+        "project_implement_default": "實作程式任務",
+        "project_compile_check": "編譯 / 語法檢查",
+        "project_min_test": "最小功能測試",
+        "project_research_objective": "調研：{objective}",
+        "project_research_default": "執行調研任務",
+        "project_research_summary": "整理調研結果",
+        "project_execute_objective": "執行：{objective}",
+        "project_execute_default": "執行任務",
+        "evidence_structure_analyzed": "結構已分析",
+        "evidence_files_produced": "已產出 {count} 個檔案",
+        "evidence_compile_passed": "編譯通過",
+        "evidence_test_passed": "測試通過",
+        "evidence_review_passed": "審查通過",
+        "step_completed_evidence": "步驟已完成",
+        "plan_step_summary": "📋 計畫步驟 {step}/{total}：{content}",
+        "plan_step_label": "步驟 {step}/{total}",
+        "plan_step_hint": "[plan-step-advance] 上一步已完成。現在來到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n現在呼叫 TodoWrite，只為目前步驟拆分子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。建立 3-5 項，其中 1 項為 in_progress，其餘為 pending。\n不要為其他計畫步驟建立子任務。",
+        "stall_execution_blocked_title": "## 執行受阻\n",
+        "stall_stop_reason": "**停止原因：** {reason}",
+        "stall_error_details": "**錯誤詳情：** {detail}",
+        "stall_recent_error": "**最近錯誤：**",
+        "stall_repeated_tools": "**重複工具呼叫：** {tools}",
+        "stall_suggested_actions": "**建議操作：**",
+        "stall_action_1": "1. 檢查環境是否符合任務要求（檔案是否存在、依賴是否安裝）",
+        "stall_action_2": "2. 手動執行失敗命令，確認錯誤輸出",
+        "stall_action_3": "3. 提供更具體的指示或調整任務描述後再重試",
+        "stall_continue_prompt": "請提供進一步指示，我會依照新的資訊繼續執行。",
+        "stall_analysis_title": "### 卡住分析\n",
+        "stall_goal": "**目標：** {goal}",
+        "stall_severity": "**嚴重度分數：** {score}",
+        "stall_events": "**卡住事件序列：**",
+        "stall_event_line": "- [{source}] +{points} -> 累計 {cumulative}",
+        "stall_error_context": "**錯誤上下文：**",
+        "stall_repeated_tools_label": "**重複工具：** {tools}",
+        "stall_last_fault_reason": "**最後故障原因：** {reason}",
+        "stall_open_todos": "**未完成任務：**",
+        "plan_file_proposals_title": "# 執行方案提案\n",
+        "plan_file_background": "## 背景\n{context}\n",
+        "plan_file_option": "## 方案 {id}：{title}",
+        "plan_file_recommended": " [推薦]",
+        "plan_file_steps": "### 步驟",
+        "plan_file_pros": "**優勢：** {text}",
+        "plan_file_cons": "**劣勢：** {text}",
+        "plan_file_risk": "**風險：** {text}",
+        "plan_file_awaiting_choice": "> 等待使用者選擇。",
+        "active_plan_title": "# 目前執行方案：{title}\n",
+        "active_plan_status": "> 狀態：執行中 | 步驟 {current}/{total}",
+        "active_plan_chosen": "> 已選擇：方案 {choice}",
+        "active_plan_updated": "> 更新時間：{updated}\n",
+        "active_plan_summary": "## 摘要\n{summary}\n",
+        "active_plan_steps": "## 步驟\n",
+        "active_plan_step_done": "- [x] 步驟 {idx}：{header}",
+        "active_plan_step_current": "- [>] 步驟 {idx}：{header}  <-- 目前",
+        "active_plan_step_pending": "- [ ] 步驟 {idx}：{header}",
+        "active_plan_completed_by": "執行者：{actor}",
+        "active_plan_evidence": "證據：{evidence}",
+        "plan_bubble_title": "## 📋 執行方案\n",
+        "plan_bubble_background": "**背景：** {context}\n",
+        "plan_bubble_option": "### 方案 {id}：{title}",
+        "plan_bubble_recommended": " ⭐推薦",
+        "plan_bubble_steps": "步驟數：{count}",
+        "plan_bubble_risk": "風險：{risk}",
+        "plan_bubble_full_ref": "完整方案詳見：`{path}`",
+        "plan_bubble_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
+        "plan_read_instruction": "[plan-file] 已核准的執行計畫位於 `{path}`。\n使用：read_file {path} 查看完整步驟與即時狀態。\n計畫檔是步驟順序與完成狀態的唯一權威來源。\n請依序執行步驟，不要跳步。完成目前步驟後再推進下一步。\n如果某一步引用了 skill 或 workflow，繼續前先呼叫 load_skill。",
+        "plan_read_todo_note": "\nTODO 更新：一開始就呼叫 TodoWrite，只為目前步驟（{step_label}）設定子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。\n建立 3-5 個只屬於目前步驟的子任務，並在完成後即時標記完成。\n不要為其他計畫步驟建立子任務。\n",
+        "plan_proposal_title": "## 📋 執行方案\n",
+        "plan_proposal_background": "### 背景分析\n{context}\n",
+        "plan_proposal_option": "### 方案 {id}：{title}",
+        "plan_proposal_recommended": " ⭐推薦",
+        "plan_proposal_steps": "**步驟：**",
+        "plan_proposal_pros": "**優勢：** {text}",
+        "plan_proposal_cons": "**劣勢：** {text}",
+        "plan_proposal_risk": "**風險：** {text}",
+        "plan_proposal_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
+        "status_project_todos_synced": "專案待辦已同步（{reason}）",
+    }
+)
+
+BACKEND_I18N["ja"].update(
+    {
+        "todo_node_suffix": " | 現在のノード: {topic}",
+        "node_desc_manager_active": "現在のノードの引き継ぎを計画し調整する ({target} が担当中)",
+        "node_desc_manager": "現在のノードの引き継ぎを計画し調整する",
+        "node_desc_explorer_active": "現在のノードに必要な制約と証拠を集める",
+        "node_desc_explorer": "現在のノードに調査支援とリスクメモを提供する",
+        "node_desc_developer_active": "現在のノードで具体的な成果物とファイル/ツール変更を実装する",
+        "node_desc_developer": "現在のノード向けの実装更新を準備して反映する",
+        "node_desc_reviewer_active": "現在のノードを検証し、通過か修正かを判断する",
+        "node_desc_reviewer": "出力をレビューし、現在のノードの品質ゲートを維持する",
+        "node_desc_generic": "現在のノード作業を処理する",
+        "project_answer_objective": "回答: {objective}",
+        "project_answer_default": "ユーザーの質問に回答する",
+        "project_analyze_requirements": "要件とプロジェクト構造を分析する",
+        "project_implement_objective": "実装: {objective}",
+        "project_implement_default": "コーディング作業を実装する",
+        "project_compile_check": "コンパイル / 構文チェック",
+        "project_min_test": "最小機能テスト",
+        "project_research_objective": "調査: {objective}",
+        "project_research_default": "調査タスクを実行する",
+        "project_research_summary": "調査結果を整理する",
+        "project_execute_objective": "実行: {objective}",
+        "project_execute_default": "タスクを実行する",
+        "evidence_structure_analyzed": "構造分析済み",
+        "evidence_files_produced": "{count} 個のファイルを生成済み",
+        "evidence_compile_passed": "コンパイル確認済み",
+        "evidence_test_passed": "テスト通過",
+        "evidence_review_passed": "レビュー通過",
+        "step_completed_evidence": "ステップ完了",
+        "plan_step_summary": "📋 計画ステップ {step}/{total}: {content}",
+        "plan_step_label": "ステップ {step}/{total}",
+        "plan_step_hint": "[plan-step-advance] 前のステップが完了しました。現在は{step_label}: {step_text}\n更新済みプランを読む: read_file {plan_path}\n今すぐ TodoWrite を呼び出し、現在のステップだけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。3-5 件作成し、1 件を in_progress、残りを pending にしてください。\n他の計画ステップのサブタスクは作成しないでください。",
+        "stall_execution_blocked_title": "## 実行が停止しました\n",
+        "stall_stop_reason": "**停止理由:** {reason}",
+        "stall_error_details": "**エラー詳細:** {detail}",
+        "stall_recent_error": "**直近のエラー:**",
+        "stall_repeated_tools": "**重複したツール呼び出し:** {tools}",
+        "stall_suggested_actions": "**推奨アクション:**",
+        "stall_action_1": "1. 環境がタスク要件を満たしているか確認する（ファイルの存在、依存関係の導入など）",
+        "stall_action_2": "2. 失敗したコマンドを手動で実行し、エラー出力を確認する",
+        "stall_action_3": "3. より具体的な指示を与えるか、タスク記述を調整してから再試行する",
+        "stall_continue_prompt": "追加の指示をいただければ、新しい情報に基づいて続行します。",
+        "stall_analysis_title": "### 停滞分析\n",
+        "stall_goal": "**目標:** {goal}",
+        "stall_severity": "**重大度スコア:** {score}",
+        "stall_events": "**停滞イベント列:**",
+        "stall_event_line": "- [{source}] +{points} -> 累計 {cumulative}",
+        "stall_error_context": "**エラー文脈:**",
+        "stall_repeated_tools_label": "**重複ツール:** {tools}",
+        "stall_last_fault_reason": "**直近の故障理由:** {reason}",
+        "stall_open_todos": "**未完了 Todo:**",
+        "plan_file_proposals_title": "# 実行プラン候補\n",
+        "plan_file_background": "## 背景\n{context}\n",
+        "plan_file_option": "## 案 {id}: {title}",
+        "plan_file_recommended": " [推奨]",
+        "plan_file_steps": "### 手順",
+        "plan_file_pros": "**利点:** {text}",
+        "plan_file_cons": "**欠点:** {text}",
+        "plan_file_risk": "**リスク:** {text}",
+        "plan_file_awaiting_choice": "> ユーザー選択待ち。",
+        "active_plan_title": "# 現在の実行プラン: {title}\n",
+        "active_plan_status": "> 状態: 実行中 | ステップ {current}/{total}",
+        "active_plan_chosen": "> 選択済み: 案 {choice}",
+        "active_plan_updated": "> 更新時刻: {updated}\n",
+        "active_plan_summary": "## 要約\n{summary}\n",
+        "active_plan_steps": "## 手順\n",
+        "active_plan_step_done": "- [x] ステップ {idx}: {header}",
+        "active_plan_step_current": "- [>] ステップ {idx}: {header}  <-- 現在",
+        "active_plan_step_pending": "- [ ] ステップ {idx}: {header}",
+        "active_plan_completed_by": "完了者: {actor}",
+        "active_plan_evidence": "証拠: {evidence}",
+        "plan_bubble_title": "## 📋 実行プラン\n",
+        "plan_bubble_background": "**背景:** {context}\n",
+        "plan_bubble_option": "### 案 {id}: {title}",
+        "plan_bubble_recommended": " ⭐推奨",
+        "plan_bubble_steps": "手順数: {count}",
+        "plan_bubble_risk": "リスク: {risk}",
+        "plan_bubble_full_ref": "完全なプラン: `{path}`",
+        "plan_bubble_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
+        "plan_read_instruction": "[plan-file] 承認済みの実行計画は `{path}` にあります。\nread_file {path} を使って完全な手順と進行状況を確認してください。\n計画ファイルは手順順序と完了状態の唯一の正式ソースです。\n必ず順番に実行し、飛ばさないでください。現在のステップを完了してから次へ進んでください。\nステップが skill や workflow を参照している場合は、続行前に load_skill を呼び出してください。",
+        "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite を呼び出し、現在のステップ（{step_label}）だけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。\n現在のステップだけを分解した 3-5 件のサブタスクを作り、完了ごとに完了状態へ更新してください。\n他の計画ステップのサブタスクは作成しないでください。\n",
+        "plan_proposal_title": "## 📋 実行プラン\n",
+        "plan_proposal_background": "### 背景分析\n{context}\n",
+        "plan_proposal_option": "### 案 {id}: {title}",
+        "plan_proposal_recommended": " ⭐推奨",
+        "plan_proposal_steps": "**手順:**",
+        "plan_proposal_pros": "**利点:** {text}",
+        "plan_proposal_cons": "**欠点:** {text}",
+        "plan_proposal_risk": "**リスク:** {text}",
+        "plan_proposal_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
+        "status_project_todos_synced": "プロジェクト Todo を同期しました（{reason}）",
+    }
+)
 
 EMBEDDED_SKILLS_ARCHIVE_B64 = """UEsDBBQAAAAIAAoDYlxfdPK4gQgAAGkSAAAdAAAAc2tpbGxzL2FnZW50LWJ1aWxkZXIvU0tJTEwubWSVWO9v3LgR/a6/YuAAvdjd1fWSS1H4QwPHTq9G7LMR
 +5D2U82VuCvGFKkTqV1vsejf3jdD/bLTO6D+4l2KMxrOvHnzuMvlMnOq1qekNtrF5aozttRtVupQtKaJxrtTOmREFzqYjSPlSpI9dHaZTAKtfYv1PZW+Vsbl
@@ -2789,7 +3240,7 @@ const I18N={
     btn_send:'送出',btn_interrupt:'中斷',btn_compact:'壓縮',btn_refresh:'重新整理',btn_export_session:'匯出會話',
     btn_clear_stale_todos:'清除陳舊待辦',
     prompt_placeholder:'描述你的任務，或將檔案拖入此處...',
-    upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV��或點擊此處選擇檔案',
+    upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案',
     upload_file_hint:'支援拖入檔案：程式碼 / Markdown / PDF / Excel / Word / PPT / CSV',
     upload_pick_file:'選擇檔案',
     upload_drop_release:'釋放以上傳檔案',
@@ -2808,7 +3259,7 @@ const I18N={
     copy_code:'複製程式碼',copy_done:'已複製',
     btn_tools:'工具 ▾',btn_compact_action:'壓縮',btn_refresh_action:'重新整理',
     btn_level:'等級',level_auto:'自動',level_1_simple:'L1 簡單',level_2_multi:'L2 多輪',
-    level_3_collab:'L3 協���',level_4_complex:'L4 複雜',level_5_system:'L5 系統',
+    level_3_collab:'L3 協作',level_4_complex:'L4 複雜',level_5_system:'L5 系統',
 
 
     llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
@@ -2854,6 +3305,88 @@ const I18N={
     todo_plan_steps:'計画ステップ',todo_subtasks:'サブタスク'
   }
 };
+Object.assign(I18N['en'],{
+  sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
+  role_explorer:'Explorer',role_developer:'Developer',role_reviewer:'Reviewer',role_manager:'Manager',role_planner:'Planner',role_agent:'Agent',
+  callout_warning:'Warning',callout_notice:'Notice',callout_instruction:'Instruction',callout_tip:'Tip',callout_reminder:'Reminder',
+  event_manager_delegate_title:'Manager Delegate',event_objective:'Objective',event_instruction:'Instruction',event_intent:'intent',
+  event_tool_calls_title:'Tool Calls',event_tool_calls_note:'Model scheduled these tools for the current turn.',event_tool_calls_empty:'No structured tool metadata was attached to this turn.',
+  event_skill_loaded_title:'Skill Loaded',event_skill_loaded_note:'Skill context was auto-loaded into the current run.',event_skill_loaded_empty:'No public description was attached to this skill notification.',event_skill_label:'skill',
+  event_loaded:'loaded',event_preview_truncated:'preview truncated',
+  event_file_patch_title:'File Patch',event_session:'session',
+  event_upload_title:'Upload',event_upload_path:'path',event_upload_filename:'filename',event_preview_unavailable:'Preview unavailable for this upload.',event_upload_parsing:'Parsing uploaded file in background. The bubble will refresh when parsing completes.',event_upload_failed:'Upload parsing failed',
+  event_command_title:'Command',event_command_label:'command',event_cwd:'cwd',event_changed:'changed',event_command_empty:'No command output captured.',event_ui_truncated:'UI truncated',event_model_truncated:'Model truncated',event_temp_read_file:'Temp read_file',event_buffered:'Buffered',
+  event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
+  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
+  state_on:'on',state_off:'off',
+  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',
+  fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
+  cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
+});
+Object.assign(I18N['zh-CN'],{
+  sec_todos:'待办',sec_tasks:'任务',sec_activity:'活动',sec_commands:'命令',sec_diffs:'文件差异',sec_catalog:'目录',
+  no_todos:'暂无待办',no_tasks:'暂无任务',no_catalog:'暂无目录',
+  role_explorer:'探索者',role_developer:'开发者',role_reviewer:'审查者',role_manager:'管理者',role_planner:'规划者',role_agent:'Agent',
+  callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建议',callout_reminder:'提醒',
+  event_manager_delegate_title:'管理者委派',event_objective:'目标',event_instruction:'指令',event_intent:'意图',
+  event_tool_calls_title:'工具调用',event_tool_calls_note:'模型已为当前轮安排以下工具调用。',event_tool_calls_empty:'当前轮没有附带结构化工具元数据。',
+  event_skill_loaded_title:'Skill 已加载',event_skill_loaded_note:'Skill 上下文已自动加载到当前运行。',event_skill_loaded_empty:'该 skill 通知没有附带公开描述。',event_skill_label:'skill',
+  event_loaded:'已加载',event_preview_truncated:'预览被截断',
+  event_file_patch_title:'文件补丁',event_session:'会话',
+  event_upload_title:'上传',event_upload_path:'路径',event_upload_filename:'文件名',event_preview_unavailable:'该上传暂不支持预览。',event_upload_parsing:'正在后台解析上传文件。解析完成后气泡会自动刷新。',event_upload_failed:'上传解析失败',
+  event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目录',event_changed:'变更',event_command_empty:'未捕获到命令输出。',event_ui_truncated:'UI 截断',event_model_truncated:'模型截断',event_temp_read_file:'临时 read_file',event_buffered:'已缓冲',
+  event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
+  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
+  state_on:'开',state_off:'关',
+  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',
+  fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
+  cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
+});
+Object.assign(I18N['zh-TW'],{
+  upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案',
+  sec_todos:'待辦',sec_tasks:'任務',sec_activity:'活動',sec_commands:'命令',sec_diffs:'檔案差異',sec_catalog:'目錄',
+  no_todos:'尚無待辦',no_tasks:'尚無任務',no_catalog:'尚無目錄',
+  level_3_collab:'L3 協作',
+  role_explorer:'探索者',role_developer:'開發者',role_reviewer:'審查者',role_manager:'管理者',role_planner:'規劃者',role_agent:'Agent',
+  callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建議',callout_reminder:'提醒',
+  event_manager_delegate_title:'管理者委派',event_objective:'目標',event_instruction:'指令',event_intent:'意圖',
+  event_tool_calls_title:'工具呼叫',event_tool_calls_note:'模型已為目前輪安排以下工具呼叫。',event_tool_calls_empty:'目前輪沒有附帶結構化工具中繼資料。',
+  event_skill_loaded_title:'Skill 已載入',event_skill_loaded_note:'Skill 上下文已自動載入到目前執行。',event_skill_loaded_empty:'此 skill 通知沒有附帶公開描述。',event_skill_label:'skill',
+  event_loaded:'已載入',event_preview_truncated:'預覽已截斷',
+  event_file_patch_title:'檔案補丁',event_session:'會話',
+  event_upload_title:'上傳',event_upload_path:'路徑',event_upload_filename:'檔名',event_preview_unavailable:'此上傳暫時無法預覽。',event_upload_parsing:'正在背景解析上傳檔案。解析完成後氣泡會自動更新。',event_upload_failed:'上傳解析失敗',
+  event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目錄',event_changed:'變更',event_command_empty:'未擷取到命令輸出。',event_ui_truncated:'UI 截斷',event_model_truncated:'模型截斷',event_temp_read_file:'暫存 read_file',event_buffered:'已緩衝',
+  event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
+  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
+  state_on:'開',state_off:'關',
+  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',
+  fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
+  cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
+});
+Object.assign(I18N['ja'],{
+  sec_todos:'Todo',sec_tasks:'タスク',sec_activity:'アクティビティ',sec_commands:'コマンド',sec_diffs:'ファイル差分',sec_catalog:'カタログ',
+  thinking:'思考',thinking_stream:'思考（ストリーム）',copy_code:'コードをコピー',copy_done:'コピーしました',
+  no_todos:'Todo はありません',no_tasks:'タスクはありません',no_catalog:'カタログなし',
+  role_explorer:'探索担当',role_developer:'開発担当',role_reviewer:'レビュー担当',role_manager:'マネージャー',role_planner:'プランナー',role_agent:'Agent',
+  callout_warning:'警告',callout_notice:'通知',callout_instruction:'指示',callout_tip:'ヒント',callout_reminder:'リマインダー',
+  event_manager_delegate_title:'マネージャー委任',event_objective:'目的',event_instruction:'指示',event_intent:'意図',
+  event_tool_calls_title:'ツール呼び出し',event_tool_calls_note:'モデルはこのターンで次のツール呼び出しを予定しました。',event_tool_calls_empty:'このターンには構造化されたツールメタデータがありません。',
+  event_skill_loaded_title:'Skill 読み込み完了',event_skill_loaded_note:'Skill コンテキストが現在の実行に自動読み込みされました。',event_skill_loaded_empty:'この skill 通知には公開説明が付いていません。',event_skill_label:'skill',
+  event_loaded:'読み込み済み',event_preview_truncated:'プレビュー切り詰め',
+  event_file_patch_title:'ファイルパッチ',event_session:'セッション',
+  event_upload_title:'アップロード',event_upload_path:'パス',event_upload_filename:'ファイル名',event_preview_unavailable:'このアップロードではプレビューを利用できません。',event_upload_parsing:'アップロードファイルをバックグラウンドで解析中です。完了するとバブルが更新されます。',event_upload_failed:'アップロード解析失敗',
+  event_command_title:'コマンド',event_command_label:'コマンド',event_cwd:'作業ディレクトリ',event_changed:'変更',event_command_empty:'コマンド出力は取得されませんでした。',event_ui_truncated:'UI 切り詰め',event_model_truncated:'モデル切り詰め',event_temp_read_file:'一時 read_file',event_buffered:'バッファ済み',
+  event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
+  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
+  state_on:'オン',state_off:'オフ',
+  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',
+  fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
+  cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
+});
 function currentLang(){const fromSnap=String(S.snap?.ui_language||'').trim();if(fromSnap&&I18N[fromSnap])return fromSnap;const fromCfg=String(S.config?.language||'').trim();if(fromCfg&&I18N[fromCfg])return fromCfg;return 'zh-CN'}
 function normalizeUiStyle(raw){const key=String(raw||'').trim().toLowerCase().replace(/-/g,'_');if(['trad','traditional','classic','legacy','old'].includes(key))return'trad';return'neo'}
 function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');if(document.body)document.body.setAttribute('data-ui-style',style);document.documentElement.setAttribute('data-ui-style',style)}
@@ -2862,7 +3395,7 @@ function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
 function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
-async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderSkillsEntryLink()}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();renderChat('language');renderSkillsEntryLink()}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const timeoutMs=Math.max(1000,Math.min(180000,Number(o.timeoutMs||45000)||45000));delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
 function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
@@ -2917,7 +3450,7 @@ function setPanelHtml(id,html){
 }
 function formatContextLeft(snap){const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct))return '-';return `${left} (${pct.toFixed(1)}%)`}
 function scheduleCompactRefreshBurst(count=COMPACT_AUTO_REFRESH_COUNT){if(!S.activeId)return;const n=Math.max(1,Math.min(10,Number(count)||COMPACT_AUTO_REFRESH_COUNT));const delay=Math.max(90,Math.min(1400,90+((n-1)*COMPACT_AUTO_REFRESH_INTERVAL_MS)));scheduleSnapshot({forceFull:false,delayMs:delay,allowWhenFrozen:true})}
-function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct)){textEl.textContent='ctx_left=-';fill.style.width='0%';box.classList.remove('warn','danger');return}const safePct=Math.max(0,Math.min(100,pct));textEl.textContent=`ctx_left=${left} (${safePct.toFixed(1)}%)`;fill.style.width=`${safePct}%`;box.classList.toggle('warn',safePct<=35&&safePct>15);box.classList.toggle('danger',safePct<=15)}
+function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct)){textEl.textContent=`${t('rt_ctx_left')}=-`;fill.style.width='0%';box.classList.remove('warn','danger');return}const safePct=Math.max(0,Math.min(100,pct));textEl.textContent=`${t('rt_ctx_left')}=${left} (${safePct.toFixed(1)}%)`;fill.style.width=`${safePct}%`;box.classList.toggle('warn',safePct<=35&&safePct>15);box.classList.toggle('danger',safePct<=15)}
 function showCompactToast(text){let el=document.querySelector('.compact-toast');if(!el){el=document.createElement('div');el.className='compact-toast';document.body.appendChild(el)}el.textContent=text;el.classList.add('show');if(el._t)clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),2800)}
 function parseCompactReason(data){const direct=String(data?.reason||'').trim();if(direct)return direct;const s=String(data?.summary||'');const m=s.match(/context compacted \\(([^)]*)\\)/);return m?String(m[1]||'').trim():''}
 function isRenderRuntimeEventType(evtType){return RENDER_EVT_TYPES.has(String(evtType||''))}
@@ -3470,11 +4003,11 @@ function renderInlineMarkdown(raw){
 }
 function _mdCalloutLabel(tag){
   const low=String(tag||'').toLowerCase();
-  if(low==='warning')return 'Warning';
-  if(low==='notice')return 'Notice';
-  if(low==='instruction')return 'Instruction';
-  if(low==='tip')return 'Tip';
-  return 'Reminder';
+  if(low==='warning')return t('callout_warning');
+  if(low==='notice')return t('callout_notice');
+  if(low==='instruction')return t('callout_instruction');
+  if(low==='tip')return t('callout_tip');
+  return t('callout_reminder');
 }
 function _mdExtractCallouts(src,inlineRenderer){
   const blocks=[];
@@ -3589,6 +4122,13 @@ function _mdWorkerEnsure(){
   if(S.mdWorker)return S.mdWorker;
   if(typeof Worker!=='function'||typeof Blob!=='function'||typeof URL==='undefined'||typeof URL.createObjectURL!=='function')return null;
   const workerSrc=String.raw`
+const CALLOUT_LABELS=${JSON.stringify({
+  warning:t('callout_warning'),
+  notice:t('callout_notice'),
+  instruction:t('callout_instruction'),
+  tip:t('callout_tip'),
+  reminder:t('callout_reminder'),
+})};
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>(c==='&'?'&amp;':(c==='<'?'&lt;':(c==='>'?'&gt;':'&quot;'))));
 function inline(raw){
   let s=esc(String(raw||''));
@@ -3614,11 +4154,8 @@ function isTableSeparator(line){
 }
 function calloutLabel(tag){
   const low=String(tag||'').toLowerCase();
-  if(low==='warning')return 'Warning';
-  if(low==='notice')return 'Notice';
-  if(low==='instruction')return 'Instruction';
-  if(low==='tip')return 'Tip';
-  return 'Reminder';
+  if(Object.prototype.hasOwnProperty.call(CALLOUT_LABELS,low))return CALLOUT_LABELS[low];
+  return CALLOUT_LABELS.reminder||'Reminder';
 }
 function extractCallouts(src){
   const blocks=[];
@@ -4496,7 +5033,7 @@ function _chatVirtReleaseNode(node){
 }
 function _chatVirtReleaseRendered(root){if(!root)return;for(const node of root.querySelectorAll('.msg[data-vk]')){_chatVirtReleaseNode(node)}}
 function _chatVirtAgentRoleKey(raw){const role=String(raw||'').trim().toLowerCase();return(role==='explorer'||role==='developer'||role==='reviewer'||role==='manager'||role==='planner')?role:''}
-function _chatVirtAgentRoleLabel(role){if(role==='explorer')return'Explorer';if(role==='developer')return'Developer';if(role==='reviewer')return'Reviewer';if(role==='manager')return'Manager';if(role==='planner')return'Planner';return''}
+function _chatVirtAgentRoleLabel(role){if(role==='explorer')return t('role_explorer');if(role==='developer')return t('role_developer');if(role==='reviewer')return t('role_reviewer');if(role==='manager')return t('role_manager');if(role==='planner')return t('role_planner');return t('role_agent')}
 function _stripLeadingAgentTitle(raw,agentRole){
   let txt=String(raw||'').replace(/^\\uFEFF/,'').trimStart();
   const role=_chatVirtAgentRoleKey(agentRole);
@@ -4537,21 +5074,21 @@ function _stripObjectiveInstructionForWorker(raw){
   return txt;
 }
 const RUNTIME_HINT_RENDER_META={
-  'auto-continue':{label:'Auto Continue',tone:'instruction'},
-  'arbiter-continue':{label:'Arbiter Continue',tone:'instruction'},
-  'continuation-briefing':{label:'Continuation Briefing',tone:'instruction'},
-  'reminder':{label:'Reminder',tone:'reminder'},
-  'todo-rescue':{label:'Todo Rescue',tone:'warning'},
-  'tool-retry':{label:'Tool Retry',tone:'warning'},
-  'segmented-retry':{label:'Segmented Retry',tone:'warning'},
-  'forced-converge':{label:'Forced Converge',tone:'warning'},
-  'no-tool-recovery':{label:'No-Tool Recovery',tone:'warning'},
-  'auto-context-recall':{label:'Context Recall',tone:'notice'},
-  'failure-recovery':{label:'Failure Recovery',tone:'warning'},
-  'truncate-rescue':{label:'Truncation Rescue',tone:'warning'},
-  'thinking-empty-recovery':{label:'Thinking Recovery',tone:'warning'},
-  'fault-prefill':{label:'Fault Prefill',tone:'warning'},
-  'edit-recovery':{label:'Edit Recovery',tone:'warning'},
+  'auto-continue':{labelKey:'event_auto_continue',tone:'instruction'},
+  'arbiter-continue':{labelKey:'event_arbiter_continue',tone:'instruction'},
+  'continuation-briefing':{labelKey:'event_continuation_briefing',tone:'instruction'},
+  'reminder':{labelKey:'event_reminder',tone:'reminder'},
+  'todo-rescue':{labelKey:'event_todo_rescue',tone:'warning'},
+  'tool-retry':{labelKey:'event_tool_retry',tone:'warning'},
+  'segmented-retry':{labelKey:'event_segmented_retry',tone:'warning'},
+  'forced-converge':{labelKey:'event_forced_converge',tone:'warning'},
+  'no-tool-recovery':{labelKey:'event_no_tool_recovery',tone:'warning'},
+  'auto-context-recall':{labelKey:'event_context_recall',tone:'notice'},
+  'failure-recovery':{labelKey:'event_failure_recovery',tone:'warning'},
+  'truncate-rescue':{labelKey:'event_truncate_rescue',tone:'warning'},
+  'thinking-empty-recovery':{labelKey:'event_thinking_recovery',tone:'warning'},
+  'fault-prefill':{labelKey:'event_fault_prefill',tone:'warning'},
+  'edit-recovery':{labelKey:'event_edit_recovery',tone:'warning'},
 };
 function _chatVirtParseRuntimeHint(raw){
   const txt=String(raw||'').trim();
@@ -4560,7 +5097,8 @@ function _chatVirtParseRuntimeHint(raw){
   if(!m)return null;
   const name=String(m[1]||'').trim().toLowerCase();
   if(!Object.prototype.hasOwnProperty.call(RUNTIME_HINT_RENDER_META,name))return null;
-  return {name,body:String(m[2]||'').trim(),meta:RUNTIME_HINT_RENDER_META[name]||{label:'Runtime Hint',tone:'notice'}};
+  const meta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
+  return {name,body:String(m[2]||'').trim(),meta:{label:t(String(meta.labelKey||'event_reminder')),tone:String(meta.tone||'notice')}};
 }
 function _chatVirtBuildMessageNode(m){
   let kind='assistant_text';
@@ -4594,7 +5132,7 @@ function _chatVirtBuildMessageNode(m){
   if(m.type==='manager_delegate'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const targetRole=_chatVirtAgentRoleKey(info.target);
-    const targetLabel=String(info.target_label||_chatVirtAgentRoleLabel(targetRole)||info.target||'Agent');
+    const targetLabel=String(info.target_label||_chatVirtAgentRoleLabel(targetRole)||info.target||t('role_agent'));
     const level=Math.floor(Number(info.task_level||0));
     const mode=String(info.execution_mode||'').trim();
     const taskType=String(info.task_type||'').trim();
@@ -4615,24 +5153,24 @@ function _chatVirtBuildMessageNode(m){
     pills.push(`budget=${budgetNum<=0?'unlimited':budgetNum}`);
     if(Number.isFinite(remainNum))pills.push(`remaining=${remainNum<0?'unlimited':remainNum}`);
     const pillsHtml=pills.map(x=>`<span class=\"manager-delegate-pill\">${esc(String(x))}</span>`).join('');
-    const routeHtml=`<div class=\"manager-delegate-route\"><span class=\"agent-bus-pill manager\">Manager</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${targetRole?(' '+targetRole):''}\">${esc(targetLabel)}</span></div>`;
-    const objectiveHtml=(objective&&instruction&&objective.toLowerCase()===instruction.toLowerCase())?'':(objective?`<div class=\"manager-delegate-line\"><span>Objective</span><div>${esc(objective)}</div></div>`:'');
-    const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>Instruction</span><div>${esc(instruction)}</div></div>`:'';
-    d.innerHTML=`${roleBadge}<div class=\"manager-delegate-card\"><div class=\"manager-delegate-head\">Manager Delegate</div>${routeHtml}<div class=\"manager-delegate-pills\">${pillsHtml}</div>${objectiveHtml}${instructionHtml}</div>`;
+    const routeHtml=`<div class=\"manager-delegate-route\"><span class=\"agent-bus-pill manager\">${esc(t('role_manager'))}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${targetRole?(' '+targetRole):''}\">${esc(targetLabel)}</span></div>`;
+    const objectiveHtml=(objective&&instruction&&objective.toLowerCase()===instruction.toLowerCase())?'':(objective?`<div class=\"manager-delegate-line\"><span>${esc(t('event_objective'))}</span><div>${esc(objective)}</div></div>`:'');
+    const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>${esc(t('event_instruction'))}</span><div>${esc(instruction)}</div></div>`:'';
+    d.innerHTML=`${roleBadge}<div class=\"manager-delegate-card\"><div class=\"manager-delegate-head\">${esc(t('event_manager_delegate_title'))}</div>${routeHtml}<div class=\"manager-delegate-pills\">${pillsHtml}</div>${objectiveHtml}${instructionHtml}</div>`;
     return d;
   }
   if(m.type==='agent_bus'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const fromRole=_chatVirtAgentRoleKey(info.from)||agentRole;
     const toRole=_chatVirtAgentRoleKey(info.to);
-    const fromLabel=fromRole?_chatVirtAgentRoleLabel(fromRole):String(info.from||'Agent');
-    const toLabel=toRole?_chatVirtAgentRoleLabel(toRole):String(info.to||'Agent');
+    const fromLabel=fromRole?_chatVirtAgentRoleLabel(fromRole):String(info.from||t('role_agent'));
+    const toLabel=toRole?_chatVirtAgentRoleLabel(toRole):String(info.to||t('role_agent'));
     const intent=String(info.intent||'message').trim()||'message';
     const payloadRaw=String(info.payload||'').trim()||String(m.text||'').trim();
     const payload=_stripObjectiveInstructionForWorker(payloadRaw)||payloadRaw;
     const fromCls=fromRole?` ${fromRole}`:'';
     const toCls=toRole?` ${toRole}`:'';
-    d.innerHTML=`${roleBadge}<div class=\"agent-bus-card\"><div class=\"agent-bus-route\"><span class=\"agent-bus-pill${fromCls}\">${esc(fromLabel)}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${toCls}\">${esc(toLabel)}</span></div><div class=\"agent-bus-intent\">intent: ${esc(intent)}</div><div class=\"agent-bus-payload\">${esc(payload)}</div></div>`;
+    d.innerHTML=`${roleBadge}<div class=\"agent-bus-card\"><div class=\"agent-bus-route\"><span class=\"agent-bus-pill${fromCls}\">${esc(fromLabel)}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${toCls}\">${esc(toLabel)}</span></div><div class=\"agent-bus-intent\">${esc(t('event_intent'))}: ${esc(intent)}</div><div class=\"agent-bus-payload\">${esc(payload)}</div></div>`;
     return d;
   }
   if(m.type==='tool_calls'){
@@ -4642,27 +5180,27 @@ function _chatVirtBuildMessageNode(m){
       const txt=String(m.text||'').trim().replace(/^\\[tool calls\\]\\s*/i,'');
       tools=txt?txt.split(',').map(x=>String(x||'').trim()).filter(Boolean):[];
     }
-    const pills=[_chatVirtEventPillHtml(`${tools.length||0} tool${tools.length===1?'':'s'}`,'neutral')];
+    const pills=[_chatVirtEventPillHtml(String(tools.length||0),'neutral')];
     const bodyHtml=tools.length
-      ? `<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model scheduled these tools for the current turn.</div><div class=\"msg-event-tool-grid\">${tools.slice(0,24).map(name=>_chatVirtEventPillHtml(String(name||'?'),'info')).join('')}</div></div>`
-      : `<div class=\"msg-event-body\"><div class=\"msg-event-note\">No structured tool metadata was attached to this turn.</div></div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Tool Calls',tools.length?`Auto-triggered chain for this turn`:'Tool dispatch metadata',pills,[],bodyHtml,'msg-event-card-tools')}`;
+      ? `<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_tool_calls_note'))}</div><div class=\"msg-event-tool-grid\">${tools.slice(0,24).map(name=>_chatVirtEventPillHtml(String(name||'?'),'info')).join('')}</div></div>`
+      : `<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_tool_calls_empty'))}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_tool_calls_title'),tools.length?`${tools.length}`:'',pills,[],bodyHtml,'msg-event-card-tools')}`;
     return d;
   }
   if(kind==='skill_loaded'){
     const parsed=_chatVirtParseSkillLoaded(String(m.text||''))||{name:'skill',desc:String(m.text||''),truncated:false};
     const pills=[
-      _chatVirtEventPillHtml('loaded','ok'),
-      parsed.truncated?_chatVirtEventPillHtml('preview truncated','warn'):'',
+      _chatVirtEventPillHtml(t('event_loaded'),'ok'),
+      parsed.truncated?_chatVirtEventPillHtml(t('event_preview_truncated'),'warn'):'',
     ];
     const grid=[
-      _chatVirtEventCellHtml('skill',String(parsed.name||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_skill_label'),String(parsed.name||''),{mono:true}),
     ];
     const descHtml=String(parsed.desc||'').trim()
       ? `<div class="msg-md">${renderMarkdownCached(String(parsed.desc||''),`${String(m._vk||'')}:skill`)}</div>`
-      : `<div class="msg-event-note">No public description was attached to this skill notification.</div>`;
-    const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">Skill context was auto-loaded into the current run.</div>${descHtml}</div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Skill Loaded',String(parsed.name||'').trim()||'skill context',pills,grid,bodyHtml,'msg-event-card-skill')}`;
+      : `<div class="msg-event-note">${esc(t('event_skill_loaded_empty'))}</div>`;
+    const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">${esc(t('event_skill_loaded_note'))}</div>${descHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_skill_loaded_title'),String(parsed.name||'').trim()||'skill context',pills,grid,bodyHtml,'msg-event-card-skill')}`;
     d.setAttribute('data-math-request',`${String(m._vk||'')}:skill`);
     return d;
   }
@@ -4674,10 +5212,10 @@ function _chatVirtBuildMessageNode(m){
     const pills=[_chatVirtEventPillHtml(`+${p.added??0}`,'ok'),_chatVirtEventPillHtml(`-${p.deleted??0}`,'warn')];
     const grid=[
       _chatVirtEventCellHtml(t('rel_path'),String(loc||''),{mono:true}),
-      _chatVirtEventCellHtml('session',String(root||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_session'),String(root||''),{mono:true}),
     ];
     const bodyHtml=`<div class=\"msg-event-body\">${preview}<div class=\"msg-diff-shell\">${diffHtml(p.diff_numbered||p.diff||'')}</div></div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('File Patch',String(loc||'').trim()||'workspace update',pills,grid,bodyHtml,'msg-event-card-diff')}`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_file_patch_title'),String(loc||'').trim()||'workspace update',pills,grid,bodyHtml,'msg-event-card-diff')}`;
     return d;
   }
   if(m.type==='upload'&&m.data){
@@ -4692,19 +5230,19 @@ function _chatVirtBuildMessageNode(m){
       parseStatus?_chatVirtEventPillHtml(`parse ${parseStatus}`,parseStatus==='done'?'ok':(parseStatus==='failed'?'error':'warn')):'',
     ];
     const grid=[
-      _chatVirtEventCellHtml('path',String(upath||''),{mono:true}),
-      _chatVirtEventCellHtml('filename',String(u.filename||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_upload_path'),String(upath||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_upload_filename'),String(u.filename||''),{mono:true}),
     ];
-    let previewHtml=`<div class=\"msg-event-note\">Preview unavailable for this upload.</div>`;
+    let previewHtml=`<div class=\"msg-event-note\">${esc(t('event_preview_unavailable'))}</div>`;
     if(parseStatus==='pending'){
-      previewHtml=`<div class=\"msg-event-note\">Parsing uploaded file in background. The bubble will refresh when parsing completes.</div>`;
+      previewHtml=`<div class=\"msg-event-note\">${esc(t('event_upload_parsing'))}</div>`;
     }else if(parseStatus==='failed'){
-      previewHtml=`<div class=\"msg-event-note\">Upload parsing failed${parseError?`: ${esc(parseError)}`:''}</div>`;
+      previewHtml=`<div class=\"msg-event-note\">${esc(t('event_upload_failed'))}${parseError?`: ${esc(parseError)}`:''}</div>`;
     }else if(String(u.preview||'').trim()){
       previewHtml=`<pre class=\"msg-code-shell\">${esc(u.preview||'')}</pre>`;
     }
     const bodyHtml=`<div class=\"msg-event-body\">${preview}${previewHtml}</div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Upload',String(u.filename||'').trim()||'session upload',pills,grid,bodyHtml,'msg-event-card-upload')}`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_upload_title'),String(u.filename||'').trim()||'session upload',pills,grid,bodyHtml,'msg-event-card-upload')}`;
     return d;
   }
   if(m.type==='command'&&m.data){
@@ -4719,19 +5257,19 @@ function _chatVirtBuildMessageNode(m){
       _chatVirtEventPillHtml(`exit ${exitTxt}`,exitTone),
       durationTxt?_chatVirtEventPillHtml(durationTxt,'neutral','mono'):'',
       pageCount>1?_chatVirtEventPillHtml(`page ${pageIndex||1}/${pageCount}`,'info','mono'):'',
-      x.ui_truncated?_chatVirtEventPillHtml('UI truncated','warn'):'',
-      x.model_truncated?_chatVirtEventPillHtml('Model truncated','warn'):'',
-      x.temp_output_path?_chatVirtEventPillHtml('Temp read_file','info'):'',
-      x.buffer_ref?_chatVirtEventPillHtml('Buffered','neutral'):'',
+      x.ui_truncated?_chatVirtEventPillHtml(t('event_ui_truncated'),'warn'):'',
+      x.model_truncated?_chatVirtEventPillHtml(t('event_model_truncated'),'warn'):'',
+      x.temp_output_path?_chatVirtEventPillHtml(t('event_temp_read_file'),'info'):'',
+      x.buffer_ref?_chatVirtEventPillHtml(t('event_buffered'),'neutral'):'',
     ];
     const grid=[
-      _chatVirtEventCellHtml('command',`$ ${String(x.command||'')}`,{mono:true}),
-      _chatVirtEventCellHtml('cwd',String(x.cwd||''),{mono:true}),
-      changedFiles?_chatVirtEventCellHtml('changed',changedFiles,{mono:true}):'',
+      _chatVirtEventCellHtml(t('event_command_label'),`$ ${String(x.command||'')}`,{mono:true}),
+      _chatVirtEventCellHtml(t('event_cwd'),String(x.cwd||''),{mono:true}),
+      changedFiles?_chatVirtEventCellHtml(t('event_changed'),changedFiles,{mono:true}):'',
     ];
     const outputTxt=String(x.output||'');
-    const bodyHtml=`<div class=\"msg-event-body\">${outputTxt?`<pre class=\"msg-code-shell\">${esc(outputTxt)}</pre>`:'<div class=\"msg-event-note\">No command output captured.</div>'}</div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Command',String(x.name||'command'),pills,grid,bodyHtml,'msg-event-card-command')}`;
+    const bodyHtml=`<div class=\"msg-event-body\">${outputTxt?`<pre class=\"msg-code-shell\">${esc(outputTxt)}</pre>`:`<div class=\"msg-event-note\">${esc(t('event_command_empty'))}</div>`}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_command_title'),String(x.name||'command'),pills,grid,bodyHtml,'msg-event-card-command')}`;
     return d;
   }
   if(m.type==='live_thinking'){
@@ -4749,7 +5287,7 @@ function _chatVirtBuildMessageNode(m){
     const toolTxt=String(m.tool||'').trim();
     const extra=[];if(kindTxt)extra.push('kind='+kindTxt);if(toolTxt)extra.push('tool='+toolTxt);
     const extraTxt=extra.length?(' · '+extra.map(x=>esc(x)).join(' · ')):'';
-    const label=lang.startsWith('zh')?'截断恢复':(lang.startsWith('ja')?'切り詰め復旧':'Truncation Recovery');
+    const label=t('event_truncation_recovery');
     const stateTxt=lang.startsWith('zh')?(active?'进行中':'已完成'):(lang.startsWith('ja')?(active?'進行中':'完了'):(active?'active':'done'));
     const key=`${m._vk}:live-trunc`;
     const pills=[
@@ -4759,8 +5297,8 @@ function _chatVirtBuildMessageNode(m){
       kindTxt?_chatVirtEventPillHtml(`kind ${kindTxt}`,'neutral'):'',
       toolTxt?_chatVirtEventPillHtml(`tool ${toolTxt}`,'info'):'',
     ];
-    const noteHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">Model output hit a truncation boundary and entered recovery mode.${extraTxt?` ${extraTxt}`:''}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(label,'Structured truncation recovery state',pills,[],noteHtml,'msg-event-card-truncation')}`;
+    const noteHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_truncation_note'))}${extraTxt?` ${extraTxt}`:''}</div><div class=\"msg-md\">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(label,t('event_truncation_state'),pills,[],noteHtml,'msg-event-card-truncation')}`;
     d.setAttribute('data-math-request',key);
     return d;
   }
@@ -4778,8 +5316,8 @@ function _chatVirtBuildMessageNode(m){
       _chatVirtEventPillHtml(t('running'),'live'),
       _chatVirtEventPillHtml(_chatVirtLiveRunText(label,elapsedNow),'neutral','mono'),
     ];
-    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">The active agent is in a model call. This timer updates live while generation is in progress.</div></div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml('Agent Turn Model Call',label,pills,[],bodyHtml,'msg-event-card-live')}`;
+    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_live_model_call_note'))}</div></div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
     return d;
@@ -5217,15 +5755,47 @@ function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)ret
 function _feTs(ts){const n=Number(ts||0);if(!Number.isFinite(n)||n<=0)return'';try{return new Date(n*1000).toLocaleString()}catch(_){return''}}
 function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==='html')return'HTML';if(k==='markdown')return'MD';if(k==='code')return'CODE';return''}
 function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(kind||'').trim().toLowerCase();if(k==='html')return'🌐';if(k==='markdown')return'📝';if(k==='code')return'⌘';return'📄'}
-function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(kids.length)} item(s)</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
-function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=`nodes=${Number(st.nodeCount||0)}${st.inflight?' · loading...':''}`;const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">tree truncated at ${esc(Number(st.maxNodes||0))} nodes</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
+function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(t('fe_items',{n:kids.length}))}</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=kind==='html'||kind==='markdown'||kind==='code';const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
+function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const st=ensureFileExplorerState(sid);if(!st){host.innerHTML=`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=[t('fe_nodes',{n:Number(st.nodeCount||0)}),st.inflight?t('fe_loading'):''].filter(Boolean).join(' · ');const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">${esc(t('fe_tree_truncated',{n:Number(st.maxNodes||0)}))}</div>`:'';host.innerHTML=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono\">${esc(rootText||'/workspace')}</span><span>${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
 function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){host.innerHTML='';return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();host.innerHTML=uploads.map(u=>{const status=String(u.parse_status||'').trim();const statusTxt=status?` · parse=${status}`:'';const err=String(u.parse_error||'').trim();return `<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}${esc(statusTxt)}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div>${err?`<div class="upload-entry-path">${esc(err)}</div>`:''}</div>`}).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`}
 async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){const host=E('fileExplorer');if(host)host.innerHTML=`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`}}finally{st.inflight=false;if(btn)btn.disabled=false}}
 function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
 function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';E('status').textContent=`session=${S.snap?.id||'-'} | model=${S.snap?.model||'-'} | thinking=${S.snap?.thinking?'on':'off'} | thinking_stream=${S.snap?.thinking_stream?'on':'off'} | mode=${S.snap?.execution_mode||S.config?.execution_mode||'sync'} | active_agent=${S.snap?.agent_active_role||'-'} | bb=${S.snap?.blackboard?.status||'-'} | task=${S.snap?.blackboard?.task_profile?.task_type||'-'} | complexity=${S.snap?.blackboard?.task_profile?.complexity||'-'} | judgement=${S.snap?.blackboard?.manager_judgement?.progress||'-'} | budget=${S.snap?.blackboard?.task_profile?.round_budget??'-'} | remaining=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'} | bb_cycles=${S.snap?.blackboard?.manager_cycles??'-'} | round_limit=${S.snap?.max_agent_rounds||'-'} | round=${S.snap?.agent_round_index??'-'} | phase=${S.snap?.agent_phase||'idle'} | queued_inputs=${S.snap?.queued_user_inputs_count??0} | run_timeout=${S.snap?.max_run_seconds??'-'}s | ctx_used=${S.snap?.context_tokens_estimate??'-'} | ctx_limit=${S.snap?.context_token_upper_bound||'-'} | ctx_mode=${S.snap?.context_token_limit_locked?'manual-lock':'adaptive'} | ctx_left=${formatContextLeft(S.snap)} | truncation=${S.snap?.truncation_count||0} | trunc_retry=${S.snap?.live_truncation_attempts||0} | trunc_tokens~=${S.snap?.live_truncation_tokens||0} | archive=${S.snap?.compact_segments_count||0} | last_compact=${S.snap?.last_compact_reason||'-'} | ollama=${S.snap?.ollama_base_url||'-'} | files=${S.snap?.session_files_root||'-'} | ui_mode=${uiState} | ${S.snap?.running?'running':'idle'}`;
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';E('status').textContent=[
+`${t('rt_session')}=${S.snap?.id||'-'}`,
+`${t('rt_model')}=${S.snap?.model||'-'}`,
+`${t('rt_thinking')}=${boolWord(S.snap?.thinking)}`,
+`${t('rt_thinking_stream')}=${boolWord(S.snap?.thinking_stream)}`,
+`${t('rt_mode')}=${S.snap?.execution_mode||S.config?.execution_mode||'sync'}`,
+`${t('rt_active_agent')}=${activeRoleLabel}`,
+`${t('rt_blackboard')}=${S.snap?.blackboard?.status||'-'}`,
+`${t('rt_task')}=${S.snap?.blackboard?.task_profile?.task_type||'-'}`,
+`${t('rt_complexity')}=${S.snap?.blackboard?.task_profile?.complexity||'-'}`,
+`${t('rt_judgement')}=${S.snap?.blackboard?.manager_judgement?.progress||'-'}`,
+`${t('rt_budget')}=${S.snap?.blackboard?.task_profile?.round_budget??'-'}`,
+`${t('rt_remaining')}=${S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'}`,
+`${t('rt_blackboard_cycles')}=${S.snap?.blackboard?.manager_cycles??'-'}`,
+`${t('rt_round_limit')}=${S.snap?.max_agent_rounds||'-'}`,
+`${t('rt_round')}=${S.snap?.agent_round_index??'-'}`,
+`${t('rt_phase')}=${S.snap?.agent_phase||t('idle')}`,
+`${t('rt_queued_inputs')}=${S.snap?.queued_user_inputs_count??0}`,
+`${t('rt_run_timeout')}=${S.snap?.max_run_seconds??'-'}s`,
+`${t('rt_ctx_used')}=${S.snap?.context_tokens_estimate??'-'}`,
+`${t('rt_ctx_limit')}=${S.snap?.context_token_upper_bound||'-'}`,
+`${t('rt_ctx_mode')}=${t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')}`,
+`${t('rt_ctx_left')}=${formatContextLeft(S.snap)}`,
+`${t('rt_truncation')}=${S.snap?.truncation_count||0}`,
+`${t('rt_trunc_retry')}=${S.snap?.live_truncation_attempts||0}`,
+`${t('rt_trunc_tokens')}=${S.snap?.live_truncation_tokens||0}`,
+`${t('rt_archive')}=${S.snap?.compact_segments_count||0}`,
+`${t('rt_last_compact')}=${S.snap?.last_compact_reason||'-'}`,
+`${t('rt_ollama')}=${S.snap?.ollama_base_url||'-'}`,
+`${t('rt_files')}=${S.snap?.session_files_root||'-'}`,
+`${t('rt_ui_mode')}=${uiState}`,
+S.snap?.running?t('running'):t('idle')
+].join(' | ');
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -5235,7 +5805,7 @@ setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]));
 setPanelHtml('activity',(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)).map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`);
 const ops=S.snap?.operations||[];
 const cmds=ops.filter(x=>x.type==='command').slice(-30).reverse();
-setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">UI preview truncated</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">Model context truncated</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">Temp read_file ready</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">Buffered copy</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>Prev</button><span class=\"cmd-sub\">preview ${esc(page)}/${esc(total)}${totalAll>total?` of ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>Next</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">read_file path: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">buffer_ref: ${esc(d.buffer_ref)} · chars=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">full_output: ${esc(d.output_full_chars)} chars · ${esc(d.output_full_lines||0)} lines · strategy=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||'command')} · exit=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
+setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">${esc(t('cmd_ui_preview_truncated'))}</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">${esc(t('cmd_model_context_truncated'))}</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">${esc(t('cmd_temp_read_file_ready'))}</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">${esc(t('cmd_buffered_copy'))}</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>${esc(t('cmd_prev'))}</button><span class=\"cmd-sub\">${esc(t('cmd_preview'))} ${esc(page)}/${esc(total)}${totalAll>total?` · ${esc(t('cmd_of'))} ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>${esc(t('cmd_next'))}</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">${esc(t('cmd_read_file_path'))}: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">${esc(t('cmd_buffer_ref'))}: ${esc(d.buffer_ref)} · ${esc(t('cmd_chars'))}=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">${esc(t('cmd_full_output'))}: ${esc(d.output_full_chars)} ${esc(t('cmd_chars'))} · ${esc(d.output_full_lines||0)} ${esc(t('cmd_lines'))} · ${esc(t('cmd_strategy'))}=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||t('cmd_default_name'))} · ${esc(t('cmd_exit'))}=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);
 const cmdHost=E('commands');if(cmdHost){for(const btn of cmdHost.querySelectorAll('[data-cmd-page]')){btn.onclick=(ev)=>{ev.preventDefault();const key=String(btn.getAttribute('data-cmd-key')||'').trim();const step=Number(btn.getAttribute('data-cmd-page')||0);const total=Math.max(1,Number(btn.getAttribute('data-cmd-total')||1));if(!key||!step)return;if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const cur=Number(S.commandPageState[key]||1);S.commandPageState[key]=Math.max(1,Math.min(total,cur+step));renderBoards()}}}
 const diffs=ops.filter(x=>x.type==='file_patch').slice(-20).reverse();
 setPanelHtml('diffs',diffs.map(e=>`<div class=\"diff-item\"><div class=\"diff-head\">${esc(e.data.path)} (+${esc(e.data.added)} / -${esc(e.data.deleted)})</div><div class=\"cmd-sub\">${esc(e.data.session_rel_path||e.data.path||'')}<br>${esc(e.data.session_root||'')}</div><div class=\"diff-body\">${diffHtml(e.data.diff_numbered||e.data.diff)}</div></div>`).join('')||`<div class=\"mono\">${esc(t('no_diffs'))}</div>`);
@@ -5566,88 +6136,88 @@ SKILLS_INDEX_HTML = """<!doctype html>
   <div class="actions">
     <select id="skillsLangSelect"></select>
     <select id="modelSelect"></select>
-    <button id="applyModelBtn" class="subtle">Apply Model</button>
-    <button id="refreshBtn" class="subtle">Refresh</button>
-    <a id="agentLink" href="#">Open Agent UI</a>
+    <button id="applyModelBtn" class="subtle">应用模型</button>
+    <button id="refreshBtn" class="subtle">刷新</button>
+    <a id="agentLink" href="#">打开 Agent UI</a>
   </div>
 </header>
 <div class="status-cards" id="topStats"></div>
 <main class="skills-main">
   <aside class="panel skills-panel-left">
-    <div class="panel-title">Rules & Knowledge</div>
+    <div class="panel-title">规则与知识</div>
     <div class="row">
-      <button id="analyzeBtn">Analyze agents/docs</button>
-      <button id="scanBtn" class="subtle">Scan Skills</button>
+      <button id="analyzeBtn">分析 agents/docs</button>
+      <button id="scanBtn" class="subtle">扫描 Skills</button>
     </div>
     <div id="rulesSummary" class="mono block-scroll compact-block"></div>
-    <h3>Rules</h3>
+    <h3>规则</h3>
     <div id="rulesList" class="block-scroll grow-block"></div>
-    <h3>Sources</h3>
+    <h3>来源</h3>
     <div id="sourceList" class="block-scroll grow-block"></div>
   </aside>
   <section class="panel skills-panel-center">
-    <div class="panel-title">Flow Builder</div>
+    <div class="panel-title">流程构建器</div>
     <div class="row compact flow-tabs">
-      <button id="flowTabNodeBtn" class="subtle active">Node</button>
-      <button id="flowTabLinkBtn" class="subtle">Manual Link</button>
+      <button id="flowTabNodeBtn" class="subtle active">节点</button>
+      <button id="flowTabLinkBtn" class="subtle">手动连线</button>
     </div>
     <div id="flowPanelNode" class="flow-panel active">
       <div class="row compact">
-        <input id="nodeTitle" placeholder="Node title">
+        <input id="nodeTitle" placeholder="节点标题">
         <select id="nodeType">
-          <option value="goal">goal</option>
-          <option value="input">input</option>
-          <option value="process">process</option>
-          <option value="check">check</option>
-          <option value="output">output</option>
+          <option value="goal">目标</option>
+          <option value="input">输入</option>
+          <option value="process">流程</option>
+          <option value="check">检查</option>
+          <option value="output">输出</option>
         </select>
-        <button id="addNodeBtn">Add Node</button>
+        <button id="addNodeBtn">添加节点</button>
       </div>
-      <textarea id="nodeContent" class="node-content" placeholder="Node content..."></textarea>
+      <textarea id="nodeContent" class="node-content" placeholder="节点内容..."></textarea>
     </div>
     <div id="flowPanelLink" class="flow-panel">
       <div class="row compact">
         <select id="edgeFrom"></select>
         <select id="edgeFromSide">
-          <option value="">from:auto</option>
-          <option value="top">from:top</option>
-          <option value="right">from:right</option>
-          <option value="bottom">from:bottom</option>
-          <option value="left">from:left</option>
+          <option value="">起点:自动</option>
+          <option value="top">起点:上</option>
+          <option value="right">起点:右</option>
+          <option value="bottom">起点:下</option>
+          <option value="left">起点:左</option>
         </select>
         <select id="edgeTo"></select>
         <select id="edgeToSide">
-          <option value="">to:auto</option>
-          <option value="top">to:top</option>
-          <option value="right">to:right</option>
-          <option value="bottom">to:bottom</option>
-          <option value="left">to:left</option>
+          <option value="">终点:自动</option>
+          <option value="top">终点:上</option>
+          <option value="right">终点:右</option>
+          <option value="bottom">终点:下</option>
+          <option value="left">终点:左</option>
         </select>
-        <input id="edgeLabel" placeholder="edge label">
-        <button id="addEdgeBtn" class="subtle">Connect</button>
-        <button id="removeNodeBtn" class="subtle danger">Delete Node</button>
+        <input id="edgeLabel" placeholder="连线标签">
+        <button id="addEdgeBtn" class="subtle">连接</button>
+        <button id="removeNodeBtn" class="subtle danger">删除节点</button>
       </div>
       <div class="row compact edge-meta-row">
         <label class="inline-check">
           <input id="edgeBidirectional" type="checkbox">
-          Bidirectional
+          双向
         </label>
-        <input id="edgeReturnN" type="number" min="1" step="1" value="1" placeholder="return n">
-        <span class="mono edge-tip">Drag ports + hold Shift => bidirectional (n)</span>
+        <input id="edgeReturnN" type="number" min="1" step="1" value="1" placeholder="返回 n">
+        <span class="mono edge-tip">拖拽端口并按住 Shift => 双向链路 (n)</span>
       </div>
     </div>
     <div class="flow-stage">
       <div id="flowZoomPill" class="flow-zoom-pill">
-        <button id="flowZoomOutBtn" class="subtle" title="Zoom out">-</button>
+        <button id="flowZoomOutBtn" class="subtle" title="缩小">-</button>
         <span id="flowZoomText" class="mono">100%</span>
-        <button id="flowZoomInBtn" class="subtle" title="Zoom in">+</button>
+        <button id="flowZoomInBtn" class="subtle" title="放大">+</button>
       </div>
       <div id="flowWrap" class="flow-wrap">
         <svg id="flowSvg"></svg>
         <div id="flowCanvas"></div>
       </div>
       <div id="flowHelpOverlay" class="flow-wrap-help">
-        <div class="t">Canvas Tips</div>
+        <div class="t">画布提示</div>
         <div>1. 拖拽节点移动位置</div>
         <div>2. 从节点四边圆点拖拽连线</div>
         <div>3. 按住 Shift 拖拽 => 双向链路</div>
@@ -5656,41 +6226,41 @@ SKILLS_INDEX_HTML = """<!doctype html>
       </div>
     </div>
     <div class="row">
-      <button id="resetFlowBtn" class="subtle">Reset Flow</button>
-      <button id="exportFlowBtn" class="subtle">Export Flow JSON</button>
-      <button id="importFlowBtn" class="subtle">Import Flow JSON</button>
+      <button id="resetFlowBtn" class="subtle">重置流程</button>
+      <button id="exportFlowBtn" class="subtle">导出 Flow JSON</button>
+      <button id="importFlowBtn" class="subtle">导入 Flow JSON</button>
     </div>
     <textarea id="flowJson" class="mono flow-json" placeholder="Flow JSON..."></textarea>
   </section>
   <aside class="panel skills-panel-right">
-    <div class="panel-title">Skill Draft & Publish</div>
-    <input id="skillName" placeholder="skill name (e.g. web-api-review)">
-    <input id="skillPath" placeholder="skill path (e.g. generated/web-api-review)">
-    <input id="skillDesc" placeholder="short description">
-    <textarea id="requirements" class="req-box" placeholder="extra requirements..."></textarea>
+    <div class="panel-title">技能草稿与发布</div>
+    <input id="skillName" placeholder="技能名称（例如 web-api-review）">
+    <input id="skillPath" placeholder="技能路径（例如 generated/web-api-review）">
+    <input id="skillDesc" placeholder="简短描述">
+    <textarea id="requirements" class="req-box" placeholder="额外要求..."></textarea>
     <div class="row">
-      <button id="generateBtn">Generate + Inject</button>
-      <button id="saveBtn" class="subtle">Save Current Markdown</button>
+      <button id="generateBtn">生成并注入</button>
+      <button id="saveBtn" class="subtle">保存当前 Markdown</button>
     </div>
-    <textarea id="skillMarkdown" class="mono skill-md" placeholder="Generated SKILL.md content..."></textarea>
+    <textarea id="skillMarkdown" class="mono skill-md" placeholder="生成的 SKILL.md 内容..."></textarea>
     <div class="skills-catalog">
       <div class="row compact">
-        <h3>Skills Explorer</h3>
+        <h3>技能浏览器</h3>
         <span id="skillsStats" class="mono"></span>
       </div>
       <div class="row compact explorer-actions">
-        <button id="previewToFlowBtn" class="subtle">Load To Flow Builder</button>
+        <button id="previewToFlowBtn" class="subtle">载入到流程构建器</button>
       </div>
       <div id="skillsUploadDrop" class="upload-drop skills-upload-drop">拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮</div>
       <div class="row compact upload-actions">
-        <button id="skillsUploadFileBtn" class="subtle">Upload Files</button>
-        <button id="skillsUploadFolderBtn" class="subtle">Upload Folder</button>
+        <button id="skillsUploadFileBtn" class="subtle">上传文件</button>
+        <button id="skillsUploadFolderBtn" class="subtle">上传文件夹</button>
       </div>
       <input id="skillsUploadInput" type="file" multiple accept=".zip,.md,.markdown,.txt">
       <input id="skillsUploadDirInput" type="file" multiple webkitdirectory directory>
       <div id="skillsUploadList" class="mono upload-list"></div>
       <div id="skillsTree" class="block-scroll tree-scroll"></div>
-      <h3>Selected Skill</h3>
+      <h3>已选 Skill</h3>
       <div id="skillPreview" class="mono block-scroll preview-scroll"></div>
     </div>
     <div id="errorBox" class="error-box hidden"></div>
@@ -5805,22 +6375,70 @@ const I18N={'en':{title:'Fona Skills Studio',subtitle:'Visual Skills authoring p
 'zh-CN':{title:'Fona Skills Studio',subtitle:'基于现有 WebUI 风格的图形化 Skills 制作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'应用模型',refresh:'刷新',open_agent:'打开 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'扫描 Skills',rules:'规则',sources:'来源',flow_builder:'流程构建器',tab_node:'节点',tab_manual_link:'手动连线',add_node:'添加节点',connect:'连接',delete_node:'删除节点',bidirectional:'双向',drag_tip:'拖拽端口并按 Shift => 双向链路 (n)',canvas_tips:'画布提示',tip1:'1. 拖拽节点移动位置',tip2:'2. 从节点四边端口拖拽连线',tip3:'3. 按住 Shift 拖拽 => 双向链路',tip4:'4. 双击连线附近 => 删除连线',tip5:'5. 使用 +/- 按钮缩放',reset_flow:'重置流程',export_flow:'导出 Flow JSON',import_flow:'导入 Flow JSON',draft_publish:'技能草稿与发布',generate_inject:'生成并注入',save_markdown:'保存当前 Markdown',skills_explorer:'技能浏览器',load_to_flow:'载入到流程构建器',upload_drop:'拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮',upload_files:'上传文件',upload_folder:'上传文件夹',selected_skill:'已选 Skill',stat_rules:'规则',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程节点',no_rules:'暂无规则',no_sources:'暂无来源',no_skill_selected:'未选择 Skill',no_uploads:'暂无上传',select_skill_first:'请先选择一个 skill',no_model_selected:'未选择模型',invalid_flow_json:'无效的 flow json',summary:'摘要',generated_at:'生成时间',skills_unit:'个 skills',upload_parse_failed:'上传解析失败',folder:'目录',empty:'(空)'},
 'zh-TW':{title:'Fona Skills Studio',subtitle:'基於現有 WebUI 風格的圖形化 Skills 製作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'套用模型',refresh:'重新整理',open_agent:'開啟 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'掃描 Skills',rules:'規則',sources:'來源',flow_builder:'流程建構器',tab_node:'節點',tab_manual_link:'手動連線',add_node:'新增節點',connect:'連線',delete_node:'刪除節點',bidirectional:'雙向',drag_tip:'拖曳端口並按 Shift => 雙向鏈路 (n)',canvas_tips:'畫布提示',tip1:'1. 拖曳節點移動位置',tip2:'2. 從節點四邊端口拖曳連線',tip3:'3. 按住 Shift 拖曳 => 雙向鏈路',tip4:'4. 雙擊連線附近 => 刪除連線',tip5:'5. 使用 +/- 按鈕縮放',reset_flow:'重設流程',export_flow:'匯出 Flow JSON',import_flow:'匯入 Flow JSON',draft_publish:'技能草稿與發布',generate_inject:'生成並注入',save_markdown:'儲存目前 Markdown',skills_explorer:'技能瀏覽器',load_to_flow:'載入至流程建構器',upload_drop:'拖曳上傳 skills（SKILL.md / .zip），或使用下方上傳按鈕',upload_files:'上傳檔案',upload_folder:'上傳資料夾',selected_skill:'已選 Skill',stat_rules:'規則',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程節點',no_rules:'尚無規則',no_sources:'尚無來源',no_skill_selected:'未選擇 Skill',no_uploads:'尚無上傳',select_skill_first:'請先選擇一個 skill',no_model_selected:'尚未選擇模型',invalid_flow_json:'無效的 flow json',summary:'摘要',generated_at:'產生時間',skills_unit:'個 skills',upload_parse_failed:'上傳解析失敗',folder:'資料夾',empty:'(空)'},
 'ja':{title:'Fona Skills Studio',subtitle:'既存 WebUI スタイルのビジュアル Skills 制作プラットフォーム',flow_line:'Flowchart → LLM 解析 → SKILL.md を ./skills へ注入',apply_model:'モデル適用',refresh:'更新',open_agent:'Agent UI を開く',rules_knowledge:'Rules & Knowledge',analyze:'agents/docs を解析',scan:'Skills をスキャン',rules:'ルール',sources:'ソース',flow_builder:'フロービルダー',tab_node:'ノード',tab_manual_link:'手動リンク',add_node:'ノード追加',connect:'接続',delete_node:'ノード削除',bidirectional:'双方向',drag_tip:'ポートをドラッグ + Shift で双方向リンク (n)',canvas_tips:'Canvas Tips',tip1:'1. ノードをドラッグして移動',tip2:'2. ノード端子からドラッグして接続',tip3:'3. Shift を押しながらドラッグで双方向',tip4:'4. エッジ付近をダブルクリックで削除',tip5:'5. +/- ボタンでズーム',reset_flow:'Flow をリセット',export_flow:'Flow JSON をエクスポート',import_flow:'Flow JSON をインポート',draft_publish:'Skill 下書きと公開',generate_inject:'生成して注入',save_markdown:'現在の Markdown を保存',skills_explorer:'Skills Explorer',load_to_flow:'Flow Builder に読み込む',upload_drop:'skills（SKILL.md / .zip）をドラッグ＆ドロップ、または下のアップロードを使用',upload_files:'ファイルをアップロード',upload_folder:'フォルダをアップロード',selected_skill:'選択中 Skill',stat_rules:'ルール',stat_skills:'Skills',stat_model:'モデル',stat_nodes:'Flow ノード',no_rules:'ルールなし',no_sources:'ソースなし',no_skill_selected:'Skill が選択されていません',no_uploads:'アップロードなし',select_skill_first:'先に skill を選択してください',no_model_selected:'モデルが未選択です',invalid_flow_json:'無効な flow json',summary:'summary',generated_at:'generated_at',skills_unit:'skills',upload_parse_failed:'upload parse failed',folder:'folder',empty:'(empty)'}};
+Object.assign(I18N['en'],{
+  summary:'Summary',generated_at:'Generated At',skills_unit:'skills',upload_parse_failed:'Upload parse failed',select_skill_first:'Select a skill first',no_model_selected:'No model selected',invalid_flow_json:'Invalid flow JSON',folder:'folder',empty:'(empty)',file_too_large:'File too large',
+  placeholder_node_title:'Node title',placeholder_node_content:'Node content...',placeholder_edge_label:'edge label',placeholder_return_n:'return n',placeholder_flow_json:'Flow JSON...',placeholder_skill_name:'skill name (e.g. web-api-review)',placeholder_skill_path:'skill path (e.g. generated/web-api-review)',placeholder_skill_desc:'short description',placeholder_requirements:'extra requirements...',placeholder_skill_markdown:'Generated SKILL.md content...',
+  node_type_goal:'Goal',node_type_input:'Input',node_type_process:'Process',node_type_check:'Check',node_type_output:'Output',
+  edge_from_auto:'from:auto',edge_from_top:'from:top',edge_from_right:'from:right',edge_from_bottom:'from:bottom',edge_from_left:'from:left',edge_to_auto:'to:auto',edge_to_top:'to:top',edge_to_right:'to:right',edge_to_bottom:'to:bottom',edge_to_left:'to:left',
+  zoom_out:'Zoom out',zoom_in:'Zoom in',source_bytes:'bytes',
+  meta_name:'name',meta_path:'path',meta_provider:'provider',meta_protocol:'protocol',meta_description:'description',
+  no_preview:'(no preview)',upload_imported:'imported',upload_skipped:'skipped',upload_errors:'errors',imported_skill:'Imported Skill',
+  flow_goal_title:'Goal',flow_inputs_title:'Inputs',flow_process_title:'Process',flow_checks_title:'Checks',flow_output_title:'Output',
+  flow_goal_desc:'Define target skill behavior.',flow_inputs_desc:'List user intent, constraints, and context.',flow_process_desc:'Translate into deterministic workflow.',flow_checks_desc:'Validate quality and failure handling.',flow_output_desc:'Emit SKILL.md and inject to ./skills.',
+  parse_goal_fallback:'Define target behavior.',parse_input_fallback:'Collect user intent, constraints, and required files.',parse_process_fallback:'Execute deterministic workflow with clear tool usage and outputs.',parse_checks_fallback:'Validate outputs, handle failure paths, and enforce quality gates.',parse_output_fallback:'Produce final answer and artifacts with traceable evidence.'
+});
+Object.assign(I18N['zh-CN'],{
+  rules_knowledge:'规则与知识',canvas_tips:'画布提示',skills_explorer:'技能浏览器',summary:'摘要',generated_at:'生成时间',skills_unit:'项技能',upload_parse_failed:'上传解析失败',select_skill_first:'请先选择一个 Skill',no_model_selected:'未选择模型',invalid_flow_json:'无效的 Flow JSON',folder:'目录',empty:'(空)',file_too_large:'文件过大',
+  placeholder_node_title:'节点标题',placeholder_node_content:'节点内容...',placeholder_edge_label:'连线标签',placeholder_return_n:'返回 n',placeholder_flow_json:'Flow JSON...',placeholder_skill_name:'技能名称（例如 web-api-review）',placeholder_skill_path:'技能路径（例如 generated/web-api-review）',placeholder_skill_desc:'简短描述',placeholder_requirements:'额外要求...',placeholder_skill_markdown:'生成的 SKILL.md 内容...',
+  node_type_goal:'目标',node_type_input:'输入',node_type_process:'流程',node_type_check:'检查',node_type_output:'输出',
+  edge_from_auto:'起点:自动',edge_from_top:'起点:上',edge_from_right:'起点:右',edge_from_bottom:'起点:下',edge_from_left:'起点:左',edge_to_auto:'终点:自动',edge_to_top:'终点:上',edge_to_right:'终点:右',edge_to_bottom:'终点:下',edge_to_left:'终点:左',
+  zoom_out:'缩小',zoom_in:'放大',source_bytes:'字节',
+  meta_name:'名称',meta_path:'路径',meta_provider:'提供方',meta_protocol:'协议',meta_description:'描述',
+  no_preview:'（无预览）',upload_imported:'导入',upload_skipped:'跳过',upload_errors:'错误',imported_skill:'导入的 Skill',
+  flow_goal_title:'目标',flow_inputs_title:'输入',flow_process_title:'流程',flow_checks_title:'检查',flow_output_title:'输出',
+  flow_goal_desc:'定义目标 Skill 的行为。',flow_inputs_desc:'列出用户意图、约束和上下文。',flow_process_desc:'转换为确定性工作流。',flow_checks_desc:'校验质量与失败处理。',flow_output_desc:'生成 SKILL.md 并注入到 ./skills。',
+  parse_goal_fallback:'定义目标行为。',parse_input_fallback:'收集用户意图、约束和所需文件。',parse_process_fallback:'执行具备清晰工具调用与输出的确定性工作流。',parse_checks_fallback:'校验输出、处理失败路径并落实质量门禁。',parse_output_fallback:'产出最终答复和可追溯工件。'
+});
+Object.assign(I18N['zh-TW'],{
+  rules_knowledge:'規則與知識',canvas_tips:'畫布提示',skills_explorer:'技能瀏覽器',summary:'摘要',generated_at:'產生時間',skills_unit:'項技能',upload_parse_failed:'上傳解析失敗',select_skill_first:'請先選擇一個 Skill',no_model_selected:'尚未選擇模型',invalid_flow_json:'無效的 Flow JSON',folder:'資料夾',empty:'(空)',file_too_large:'檔案過大',
+  placeholder_node_title:'節點標題',placeholder_node_content:'節點內容...',placeholder_edge_label:'連線標籤',placeholder_return_n:'返回 n',placeholder_flow_json:'Flow JSON...',placeholder_skill_name:'技能名稱（例如 web-api-review）',placeholder_skill_path:'技能路徑（例如 generated/web-api-review）',placeholder_skill_desc:'簡短描述',placeholder_requirements:'額外要求...',placeholder_skill_markdown:'生成的 SKILL.md 內容...',
+  node_type_goal:'目標',node_type_input:'輸入',node_type_process:'流程',node_type_check:'檢查',node_type_output:'輸出',
+  edge_from_auto:'起點:自動',edge_from_top:'起點:上',edge_from_right:'起點:右',edge_from_bottom:'起點:下',edge_from_left:'起點:左',edge_to_auto:'終點:自動',edge_to_top:'終點:上',edge_to_right:'終點:右',edge_to_bottom:'終點:下',edge_to_left:'終點:左',
+  zoom_out:'縮小',zoom_in:'放大',source_bytes:'位元組',
+  meta_name:'名稱',meta_path:'路徑',meta_provider:'提供方',meta_protocol:'協定',meta_description:'描述',
+  no_preview:'（無預覽）',upload_imported:'匯入',upload_skipped:'略過',upload_errors:'錯誤',imported_skill:'匯入的 Skill',
+  flow_goal_title:'目標',flow_inputs_title:'輸入',flow_process_title:'流程',flow_checks_title:'檢查',flow_output_title:'輸出',
+  flow_goal_desc:'定義目標 Skill 的行為。',flow_inputs_desc:'列出使用者意圖、約束與上下文。',flow_process_desc:'轉換為確定性工作流程。',flow_checks_desc:'檢查品質與失敗處理。',flow_output_desc:'產出 SKILL.md 並注入到 ./skills。',
+  parse_goal_fallback:'定義目標行為。',parse_input_fallback:'蒐集使用者意圖、約束與所需檔案。',parse_process_fallback:'執行具有清楚工具呼叫與輸出的確定性流程。',parse_checks_fallback:'檢查輸出、處理失敗路徑並落實品質門檻。',parse_output_fallback:'產出最終回覆與可追溯工件。'
+});
+Object.assign(I18N['ja'],{
+  rules_knowledge:'ルールと知識',canvas_tips:'キャンバスのヒント',skills_explorer:'スキルエクスプローラー',summary:'概要',generated_at:'生成時刻',skills_unit:'件のスキル',upload_parse_failed:'アップロード解析失敗',select_skill_first:'先に Skill を選択してください',no_model_selected:'モデルが未選択です',invalid_flow_json:'無効な Flow JSON',folder:'フォルダ',empty:'(空)',file_too_large:'ファイルが大きすぎます',
+  placeholder_node_title:'ノードタイトル',placeholder_node_content:'ノード内容...',placeholder_edge_label:'エッジラベル',placeholder_return_n:'戻り n',placeholder_flow_json:'Flow JSON...',placeholder_skill_name:'スキル名（例: web-api-review）',placeholder_skill_path:'スキルパス（例: generated/web-api-review）',placeholder_skill_desc:'短い説明',placeholder_requirements:'追加要件...',placeholder_skill_markdown:'生成された SKILL.md 内容...',
+  node_type_goal:'目標',node_type_input:'入力',node_type_process:'処理',node_type_check:'検証',node_type_output:'出力',
+  edge_from_auto:'始点:自動',edge_from_top:'始点:上',edge_from_right:'始点:右',edge_from_bottom:'始点:下',edge_from_left:'始点:左',edge_to_auto:'終点:自動',edge_to_top:'終点:上',edge_to_right:'終点:右',edge_to_bottom:'終点:下',edge_to_left:'終点:左',
+  zoom_out:'縮小',zoom_in:'拡大',source_bytes:'バイト',
+  meta_name:'名前',meta_path:'パス',meta_provider:'プロバイダー',meta_protocol:'プロトコル',meta_description:'説明',
+  no_preview:'（プレビューなし）',upload_imported:'取込',upload_skipped:'スキップ',upload_errors:'エラー',imported_skill:'インポート済み Skill',
+  flow_goal_title:'目標',flow_inputs_title:'入力',flow_process_title:'処理',flow_checks_title:'検証',flow_output_title:'出力',
+  flow_goal_desc:'対象 Skill の振る舞いを定義します。',flow_inputs_desc:'ユーザー意図、制約、文脈を整理します。',flow_process_desc:'確定的なワークフローへ変換します。',flow_checks_desc:'品質と失敗時処理を検証します。',flow_output_desc:'SKILL.md を生成し ./skills へ注入します。',
+  parse_goal_fallback:'目標の振る舞いを定義します。',parse_input_fallback:'ユーザー意図、制約、必要ファイルを収集します。',parse_process_fallback:'明確なツール利用と出力を伴う確定的ワークフローを実行します。',parse_checks_fallback:'出力を検証し、失敗経路を処理し、品質ゲートを適用します。',parse_output_fallback:'最終回答と追跡可能な成果物を生成します。'
+});
 function currentLang(){const c=String(S.config?.language||'').trim();if(c&&I18N[c])return c;return 'zh-CN'}
-function t(key){const lang=currentLang();const pack=I18N[lang]||I18N['en'];return String((pack&&pack[key])??(I18N['en']&&I18N['en'][key])??key)}
+function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];let txt=String((pack&&pack[key])??(I18N['en']&&I18N['en'][key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
 function renderLanguageControls(){const sel=E('skillsLangSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(S.config?.language)sel.value=S.config.language}
 async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/skillslab/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;applySkillsI18n();renderLanguageControls();setStats();renderRules();renderSkills()}
-function applySkillsI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('subtitle');if(hp&&hp[1])hp[1].textContent=t('flow_line');setText('applyModelBtn','apply_model');setText('refreshBtn','refresh');setText('agentLink','open_agent');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('rules_knowledge');if(panels&&panels[1])panels[1].textContent=t('flow_builder');if(panels&&panels[2])panels[2].textContent=t('draft_publish');setText('analyzeBtn','analyze');setText('scanBtn','scan');setText('flowTabNodeBtn','tab_node');setText('flowTabLinkBtn','tab_manual_link');setText('addNodeBtn','add_node');setText('addEdgeBtn','connect');setText('removeNodeBtn','delete_node');setText('resetFlowBtn','reset_flow');setText('exportFlowBtn','export_flow');setText('importFlowBtn','import_flow');setText('generateBtn','generate_inject');setText('saveBtn','save_markdown');setText('previewToFlowBtn','load_to_flow');setText('skillsUploadFileBtn','upload_files');setText('skillsUploadFolderBtn','upload_folder');const ud=E('skillsUploadDrop');if(ud)ud.textContent=t('upload_drop');const edgeTip=document.querySelector('.edge-tip');if(edgeTip)edgeTip.textContent=t('drag_tip');setPlaceholder('nodeTitle','tab_node');setPlaceholder('nodeContent','flow_builder');setPlaceholder('edgeLabel','connect');setPlaceholder('flowJson','export_flow');setPlaceholder('skillName','skills_explorer');setPlaceholder('skillPath','skills_explorer');setPlaceholder('skillDesc','draft_publish');setPlaceholder('requirements','rules_knowledge');setPlaceholder('skillMarkdown','draft_publish');const hs=document.querySelectorAll('.skills-panel-left h3, .skills-panel-right h3');if(hs&&hs[0])hs[0].textContent=t('rules');if(hs&&hs[1])hs[1].textContent=t('sources');if(hs&&hs[2])hs[2].textContent=t('skills_explorer');if(hs&&hs[3])hs[3].textContent=t('selected_skill');const tip=document.querySelector('#flowHelpOverlay .t');if(tip)tip.textContent=t('canvas_tips');const tipRows=document.querySelectorAll('#flowHelpOverlay div');if(tipRows&&tipRows[1])tipRows[1].textContent=t('tip1');if(tipRows&&tipRows[2])tipRows[2].textContent=t('tip2');if(tipRows&&tipRows[3])tipRows[3].textContent=t('tip3');if(tipRows&&tipRows[4])tipRows[4].textContent=t('tip4');if(tipRows&&tipRows[5])tipRows[5].textContent=t('tip5');const inlineCheck=document.querySelector('.inline-check');if(inlineCheck){const txt=inlineCheck.childNodes[inlineCheck.childNodes.length-1];if(txt&&txt.nodeType===Node.TEXT_NODE)txt.textContent=' '+t('bidirectional')}}
+function applySkillsI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('subtitle');if(hp&&hp[1])hp[1].textContent=t('flow_line');setText('applyModelBtn','apply_model');setText('refreshBtn','refresh');setText('agentLink','open_agent');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('rules_knowledge');if(panels&&panels[1])panels[1].textContent=t('flow_builder');if(panels&&panels[2])panels[2].textContent=t('draft_publish');setText('analyzeBtn','analyze');setText('scanBtn','scan');setText('flowTabNodeBtn','tab_node');setText('flowTabLinkBtn','tab_manual_link');setText('addNodeBtn','add_node');setText('addEdgeBtn','connect');setText('removeNodeBtn','delete_node');setText('resetFlowBtn','reset_flow');setText('exportFlowBtn','export_flow');setText('importFlowBtn','import_flow');setText('generateBtn','generate_inject');setText('saveBtn','save_markdown');setText('previewToFlowBtn','load_to_flow');setText('skillsUploadFileBtn','upload_files');setText('skillsUploadFolderBtn','upload_folder');const ud=E('skillsUploadDrop');if(ud)ud.textContent=t('upload_drop');const edgeTip=document.querySelector('.edge-tip');if(edgeTip)edgeTip.textContent=t('drag_tip');setPlaceholder('nodeTitle','placeholder_node_title');setPlaceholder('nodeContent','placeholder_node_content');setPlaceholder('edgeLabel','placeholder_edge_label');setPlaceholder('edgeReturnN','placeholder_return_n');setPlaceholder('flowJson','placeholder_flow_json');setPlaceholder('skillName','placeholder_skill_name');setPlaceholder('skillPath','placeholder_skill_path');setPlaceholder('skillDesc','placeholder_skill_desc');setPlaceholder('requirements','placeholder_requirements');setPlaceholder('skillMarkdown','placeholder_skill_markdown');const hs=document.querySelectorAll('.skills-panel-left h3, .skills-panel-right h3');if(hs&&hs[0])hs[0].textContent=t('rules');if(hs&&hs[1])hs[1].textContent=t('sources');if(hs&&hs[2])hs[2].textContent=t('skills_explorer');if(hs&&hs[3])hs[3].textContent=t('selected_skill');const tip=document.querySelector('#flowHelpOverlay .t');if(tip)tip.textContent=t('canvas_tips');const tipRows=document.querySelectorAll('#flowHelpOverlay div');if(tipRows&&tipRows[1])tipRows[1].textContent=t('tip1');if(tipRows&&tipRows[2])tipRows[2].textContent=t('tip2');if(tipRows&&tipRows[3])tipRows[3].textContent=t('tip3');if(tipRows&&tipRows[4])tipRows[4].textContent=t('tip4');if(tipRows&&tipRows[5])tipRows[5].textContent=t('tip5');const inlineCheck=document.querySelector('.inline-check');if(inlineCheck){const txt=inlineCheck.childNodes[inlineCheck.childNodes.length-1];if(txt&&txt.nodeType===Node.TEXT_NODE)txt.textContent=' '+t('bidirectional')}const nodeType=E('nodeType');if(nodeType){for(const op of Array.from(nodeType.options||[])){const key=String(op.value||'').trim();if(key)op.textContent=t('node_type_'+key)}}const fromSel=E('edgeFromSide');if(fromSel){const map=['edge_from_auto','edge_from_top','edge_from_right','edge_from_bottom','edge_from_left'];Array.from(fromSel.options||[]).forEach((op,idx)=>{if(map[idx])op.textContent=t(map[idx])})}const toSel=E('edgeToSide');if(toSel){const map=['edge_to_auto','edge_to_top','edge_to_right','edge_to_bottom','edge_to_left'];Array.from(toSel.options||[]).forEach((op,idx)=>{if(map[idx])op.textContent=t(map[idx])})}const zoomOut=E('flowZoomOutBtn');if(zoomOut)zoomOut.title=t('zoom_out');const zoomIn=E('flowZoomInBtn');if(zoomIn)zoomIn.title=t('zoom_in')}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const timeoutMs=Math.max(1000,Math.min(180000,Number(o.timeoutMs||45000)||45000));delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
 function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
-function defaultFlow(){return{nodes:[{id:'goal',type:'goal',title:'Goal',content:'Define target skill behavior.',x:30,y:30},{id:'inputs',type:'input',title:'Inputs',content:'List user intent, constraints, and context.',x:280,y:30},{id:'process',type:'process',title:'Process',content:'Translate into deterministic workflow.',x:530,y:30},{id:'checks',type:'check',title:'Checks',content:'Validate quality and failure handling.',x:280,y:210},{id:'output',type:'output',title:'Output',content:'Emit SKILL.md and inject to ./skills.',x:530,y:210}],edges:[{from:'goal',to:'inputs',label:''},{from:'inputs',to:'process',label:''},{from:'process',to:'checks',label:''},{from:'checks',to:'output',label:''}]}}
+function defaultFlow(){return{nodes:[{id:'goal',type:'goal',title:t('flow_goal_title'),content:t('flow_goal_desc'),x:30,y:30},{id:'inputs',type:'input',title:t('flow_inputs_title'),content:t('flow_inputs_desc'),x:280,y:30},{id:'process',type:'process',title:t('flow_process_title'),content:t('flow_process_desc'),x:530,y:30},{id:'checks',type:'check',title:t('flow_checks_title'),content:t('flow_checks_desc'),x:280,y:210},{id:'output',type:'output',title:t('flow_output_title'),content:t('flow_output_desc'),x:530,y:210}],edges:[{from:'goal',to:'inputs',label:''},{from:'inputs',to:'process',label:''},{from:'process',to:'checks',label:''},{from:'checks',to:'output',label:''}]}}
 function normalizeSkillScan(payload){if(Array.isArray(payload)){const skills=payload.map(x=>({name:x.name||x.qualified_name||'skill',description:x.description||'',path:'',skill_file:x.qualified_name||x.name||'',provider:x.provider_id||'',protocol:x.protocol||'',preview:''}));return{skills_count:skills.length,skills,tree:{type:'dir',name:'skills',path:'',children:skills.map(x=>({type:'skill',...x}))},warnings:[]}}const obj=(payload&&typeof payload==='object')?payload:{};const skills=Array.isArray(obj.skills)?obj.skills:[];const tree=(obj.tree&&typeof obj.tree==='object')?obj.tree:{type:'dir',name:'skills',path:'',children:[]};const warnings=Array.isArray(obj.warnings)?obj.warnings:[];return{skills_count:Number(obj.skills_count||skills.length)||skills.length,skills,tree,warnings}}
 function setStats(){const model=S.config?.model_catalog?.selected||'-';const skills=S.skillScan?.skills_count||0;const rules=(S.rules?.rules||[]).length;E('topStats').innerHTML=[[t('stat_rules'),rules],[t('stat_skills'),skills],[t('stat_model'),model],[t('stat_nodes'),(S.flow.nodes||[]).length]].map(([k,v])=>`<div class=\"stat\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const st=E('skillsStats');if(st)st.textContent=`${skills} ${t('skills_unit')}`}
 function renderModelControls(){const sel=E('modelSelect');if(!sel)return;sel.innerHTML='';const cat=S.config?.model_catalog||{};const opts=cat.options||[];if(opts.length){for(const it of opts){const op=document.createElement('option');op.value=it.selection;op.textContent=it.label||it.selection;sel.appendChild(op)}}else{for(const m of (cat.models||[])){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(cat.selected)sel.value=cat.selected}
-function renderRules(){const r=S.rules||{};E('rulesSummary').innerHTML=`<div>${esc(t('summary'))}: ${esc(r.summary||'-')}</div><div>${esc(t('generated_at'))}: ${esc(r.generated_at||'-')}</div>`;E('rulesList').innerHTML=(r.rules||[]).map(x=>`<div>• ${esc(x)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_rules'))}</div>`;E('sourceList').innerHTML=(r.sources||[]).map(s=>`<div class=\"mono\">${esc(s.path)} (${esc(s.bytes)} bytes)</div>`).join('')||`<div class=\"mono\">${esc(t('no_sources'))}</div>`}
+function renderRules(){const r=S.rules||{};E('rulesSummary').innerHTML=`<div>${esc(t('summary'))}: ${esc(r.summary||'-')}</div><div>${esc(t('generated_at'))}: ${esc(r.generated_at||'-')}</div>`;E('rulesList').innerHTML=(r.rules||[]).map(x=>`<div>• ${esc(x)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_rules'))}</div>`;E('sourceList').innerHTML=(r.sources||[]).map(s=>`<div class=\"mono\">${esc(s.path)} (${esc(s.bytes)} ${esc(t('source_bytes'))})</div>`).join('')||`<div class=\"mono\">${esc(t('no_sources'))}</div>`}
 function buildSkillMap(){S.skillMap={};for(const row of (S.skillScan?.skills||[])){const key=String(row.skill_file||row.path||row.name||'').trim();if(!key)continue;S.skillMap[key]=row}}
 function skillItemHtml(skill){const file=String(skill.skill_file||skill.path||'');const active=(file&&file===S.activeSkillFile)?' active':'';return `<div class=\"skill-item${active}\" data-skill-file=\"${esc(file)}\"><div class=\"name\">${esc(skill.name||'skill')}</div><div class=\"desc\">${esc(skill.description||'')}</div><div class=\"path\">${esc(file||skill.path||'')}</div></div>`}
 function treeNodeHtml(node,depth=0){if(!node||typeof node!=='object')return'';if(String(node.type)==='skill')return skillItemHtml(node);const children=Array.isArray(node.children)?node.children:[];const openAttr=depth<=1?' open':'';const title=esc(node.name||t('folder'));const childHtml=children.length?children.map(x=>treeNodeHtml(x,depth+1)).join(''):`<div class=\"mono\">${esc(t('empty'))}</div>`;return `<details${openAttr}><summary><span class=\"tree-folder\">${title}</span></summary><div class=\"tree-children\">${childHtml}</div></details>`}
@@ -5830,12 +6448,12 @@ function safeNodeId(base,taken){const b=flowSlug(base,'n');if(!taken.has(b)){tak
 function parseFrontMatterMd(md){const src=String(md||'');const m=src.match(/^---\\s*\\n([\\s\\S]*?)\\n---\\s*(?:\\n|$)/);if(!m)return{meta:{},body:src};const meta={};for(const line of String(m[1]||'').split(/\\r?\\n/)){const idx=line.indexOf(':');if(idx<=0)continue;const k=line.slice(0,idx).trim();const v=line.slice(idx+1).trim();if(k)meta[k]=v}return{meta,body:src.slice(m[0].length)}}
 function collectSections(body){const out=[];const lines=String(body||'').split(/\\r?\\n/);let cur={title:'Overview',content:''};for(const line of lines){const hm=String(line||'').match(/^#{1,3}\\s+(.+?)\\s*$/);if(hm){if(String(cur.content||'').trim())out.push(cur);cur={title:String(hm[1]||'').trim()||'Section',content:''};continue}cur.content+=(cur.content?'\\n':'')+line}if(String(cur.content||'').trim())out.push(cur);return out}
 function pickSectionText(sections,keywords,fallback=''){const keys=(keywords||[]).map(k=>String(k).toLowerCase());for(const sec of sections){const t=String(sec?.title||'').toLowerCase();if(keys.some(k=>t.includes(k)))return String(sec?.content||'').trim()}return String(fallback||'').trim()}
-function parseSkillToFlow(md,fallbackName,fallbackDesc){const parsed=parseFrontMatterMd(md);const meta=parsed.meta||{};const body=String(parsed.body||md||'').trim();const sections=collectSections(body);const nonEmptyLines=body.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);const overview=nonEmptyLines.slice(0,8).join('\\n');const title=String(meta.name||fallbackName||'Imported Skill').trim()||'Imported Skill';const desc=String(meta.description||fallbackDesc||'').trim();const goalText=trimText(desc||pickSectionText(sections,['goal','purpose','overview','目标','概述'],overview||'Define target behavior.'),680);const inputText=trimText(pickSectionText(sections,['input','parameter','context','prerequisite','输入','上下文','前置'],'Collect user intent, constraints, and required files.'),720);const processText=trimText(pickSectionText(sections,['workflow','process','steps','instruction','procedure','流程','步骤','执行'],body||'Execute deterministic workflow with clear tool usage and outputs.'),900);const checkText=trimText(pickSectionText(sections,['check','validation','verify','quality','guardrail','failure','test','检查','校验','验证'],'Validate outputs, handle failure paths, and enforce quality gates.'),720);const outputText=trimText(pickSectionText(sections,['output','deliverable','response','result','输出','产出'],'Produce final answer and artifacts with traceable evidence.'),680);const taken=new Set();const nodes=[{id:safeNodeId('goal',taken),type:'goal',title:'Goal',content:goalText,x:30,y:30},{id:safeNodeId('inputs',taken),type:'input',title:'Inputs',content:inputText,x:280,y:30},{id:safeNodeId('process',taken),type:'process',title:'Process',content:processText,x:530,y:30},{id:safeNodeId('checks',taken),type:'check',title:'Checks',content:checkText,x:280,y:220},{id:safeNodeId('output',taken),type:'output',title:'Output',content:outputText,x:530,y:220}];const edges=[{from:nodes[0].id,to:nodes[1].id,label:''},{from:nodes[1].id,to:nodes[2].id,label:''},{from:nodes[2].id,to:nodes[3].id,label:''},{from:nodes[3].id,to:nodes[4].id,label:''}];return{title,description:desc,nodes,edges}}
+function parseSkillToFlow(md,fallbackName,fallbackDesc){const parsed=parseFrontMatterMd(md);const meta=parsed.meta||{};const body=String(parsed.body||md||'').trim();const sections=collectSections(body);const nonEmptyLines=body.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);const overview=nonEmptyLines.slice(0,8).join('\\n');const title=String(meta.name||fallbackName||t('imported_skill')).trim()||t('imported_skill');const desc=String(meta.description||fallbackDesc||'').trim();const goalText=trimText(desc||pickSectionText(sections,['goal','purpose','overview','objective','目标','目標','概述','概要','ゴール','目的'],overview||t('parse_goal_fallback')),680);const inputText=trimText(pickSectionText(sections,['input','parameter','context','prerequisite','输入','輸入','上下文','前置','前提','入力','文脈'],t('parse_input_fallback')),720);const processText=trimText(pickSectionText(sections,['workflow','process','steps','instruction','procedure','流程','步骤','步驟','执行','執行','ワークフロー','手順'],body||t('parse_process_fallback')),900);const checkText=trimText(pickSectionText(sections,['check','validation','verify','quality','guardrail','failure','test','检查','檢查','校验','驗證','検証','品質'],t('parse_checks_fallback')),720);const outputText=trimText(pickSectionText(sections,['output','deliverable','response','result','输出','輸出','产出','產出','成果','出力'],t('parse_output_fallback')),680);const taken=new Set();const nodes=[{id:safeNodeId('goal',taken),type:'goal',title:t('flow_goal_title'),content:goalText,x:30,y:30},{id:safeNodeId('inputs',taken),type:'input',title:t('flow_inputs_title'),content:inputText,x:280,y:30},{id:safeNodeId('process',taken),type:'process',title:t('flow_process_title'),content:processText,x:530,y:30},{id:safeNodeId('checks',taken),type:'check',title:t('flow_checks_title'),content:checkText,x:280,y:220},{id:safeNodeId('output',taken),type:'output',title:t('flow_output_title'),content:outputText,x:530,y:220}];const edges=[{from:nodes[0].id,to:nodes[1].id,label:''},{from:nodes[1].id,to:nodes[2].id,label:''},{from:nodes[2].id,to:nodes[3].id,label:''},{from:nodes[3].id,to:nodes[4].id,label:''}];return{title,description:desc,nodes,edges}}
 function upsertSkillRow(row){if(!row||!row.skill_file)return;const key=String(row.skill_file);if(Array.isArray(S.skillScan?.skills)){const idx=S.skillScan.skills.findIndex(x=>String(x.skill_file||x.path||x.name||'')===key);if(idx>=0){S.skillScan.skills[idx]={...S.skillScan.skills[idx],...row}}}if(S.skillMap)S.skillMap[key]={...(S.skillMap[key]||{}),...row}}
-async function ensureSkillContent(skillFile){const key=String(skillFile||S.activeSkillFile||'').trim();if(!key)throw new Error('no skill selected');const row=S.skillMap[key]||{};if(String(row.content||'').trim())return row;const out=await api('/api/skillslab/skill?skill_file='+encodeURIComponent(key));const merged={...row,...out};upsertSkillRow(merged);return merged}
+async function ensureSkillContent(skillFile){const key=String(skillFile||S.activeSkillFile||'').trim();if(!key)throw new Error(t('no_skill_selected'));const row=S.skillMap[key]||{};if(String(row.content||'').trim())return row;const out=await api('/api/skillslab/skill?skill_file='+encodeURIComponent(key));const merged={...row,...out};upsertSkillRow(merged);return merged}
 async function selectSkill(skillFile){S.activeSkillFile=String(skillFile||'').trim();renderSkills();try{await ensureSkillContent(S.activeSkillFile);renderSkillPreview();showError('')}catch(err){renderSkillPreview();showError(err.message||String(err))}}
-function renderSkillPreview(){const el=E('skillPreview');if(!el)return;const key=S.activeSkillFile||Object.keys(S.skillMap||{})[0]||'';if(!key){el.innerHTML=`<div class=\"mono\">${esc(t('no_skill_selected'))}</div>`;return}S.activeSkillFile=key;const row=S.skillMap[key]||{};const header=`name: ${row.name||'-'}\\npath: ${row.skill_file||row.path||'-'}\\nprovider: ${row.provider||'-'}\\nprotocol: ${row.protocol||'-'}\\ndescription: ${row.description||'-'}`;const fullBody=String(row.content||row.preview||'').trim();el.innerHTML=`<div>${esc(header)}</div><hr><pre>${esc(trimText(fullBody||'(no preview)',3600))}</pre>`}
-function renderUploadReports(){const el=E('skillsUploadList');if(!el)return;const rows=(S.uploadReports||[]).slice(-20).reverse();el.innerHTML=rows.map(r=>`${esc(r.filename)} · imported=${esc(r.imported_count||0)} skipped=${esc(r.skipped_count||0)} errors=${esc(r.error_count||0)}`).join('<br>')||`<div>${esc(t('no_uploads'))}</div>`}
+function renderSkillPreview(){const el=E('skillPreview');if(!el)return;const key=S.activeSkillFile||Object.keys(S.skillMap||{})[0]||'';if(!key){el.innerHTML=`<div class=\"mono\">${esc(t('no_skill_selected'))}</div>`;return}S.activeSkillFile=key;const row=S.skillMap[key]||{};const header=[`${t('meta_name')}: ${row.name||'-'}`,`${t('meta_path')}: ${row.skill_file||row.path||'-'}`,`${t('meta_provider')}: ${row.provider||'-'}`,`${t('meta_protocol')}: ${row.protocol||'-'}`,`${t('meta_description')}: ${row.description||'-'}`].join('\\n');const fullBody=String(row.content||row.preview||'').trim();el.innerHTML=`<div>${esc(header)}</div><hr><pre>${esc(trimText(fullBody||t('no_preview'),3600))}</pre>`}
+function renderUploadReports(){const el=E('skillsUploadList');if(!el)return;const rows=(S.uploadReports||[]).slice(-20).reverse();el.innerHTML=rows.map(r=>`${esc(r.filename)} · ${esc(t('upload_imported'))}=${esc(r.imported_count||0)} ${esc(t('upload_skipped'))}=${esc(r.skipped_count||0)} ${esc(t('upload_errors'))}=${esc(r.error_count||0)}`).join('<br>')||`<div>${esc(t('no_uploads'))}</div>`}
 function renderSkills(){buildSkillMap();const treeEl=E('skillsTree');if(treeEl){const root=S.skillScan?.tree||{type:'dir',name:'skills',path:'',children:[]};treeEl.innerHTML=`<div class=\"skill-tree\">${treeNodeHtml(root,0)}</div>`;for(const el of treeEl.querySelectorAll('.skill-item')){el.onclick=()=>selectSkill(el.getAttribute('data-skill-file')||'').catch(err=>showError(err.message||String(err)));el.ondblclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)))}}renderSkillPreview();renderUploadReports();setStats()}
 async function loadSelectedSkillToFlow(){const key=String(S.activeSkillFile||'').trim();if(!key)throw new Error(t('select_skill_first'));const row=await ensureSkillContent(key);const parsed=parseSkillToFlow(row.content||row.preview||'',row.name,row.description);S.flow={nodes:parsed.nodes,edges:parsed.edges};S.selectedNodeId=S.flow.nodes[0]?.id||null;renderFlow();renderNodeEditor();exportFlow();if(E('skillMarkdown'))E('skillMarkdown').value=String(row.content||'');if(E('skillName')&&!E('skillName').value.trim())E('skillName').value=flowSlug(row.name||parsed.title||'skill','skill');if(E('skillDesc')&&!E('skillDesc').value.trim())E('skillDesc').value=String(row.description||parsed.description||'');showError('')}
 const FLOW_SIDES=['top','right','bottom','left'];
@@ -5881,7 +6499,7 @@ async function scanSkills(){try{const out=await api('/api/skillslab/skills');S.s
 async function generateSkill(){try{const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
 async function saveSkill(){try{const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
 function isUploadSkillCandidate(name){const n=String(name||'').toLowerCase();if(n.endsWith('.zip')||n.endsWith('.md')||n.endsWith('.markdown')||n.endsWith('.txt'))return true;return n.endsWith('/skill.md')||n.endsWith('skill.md')}
-async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`File too large: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
+async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`${t('file_too_large')}: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
 function bindSkillUpload(){const drop=E('skillsUploadDrop');const input=E('skillsUploadInput');const dirInput=E('skillsUploadDirInput');const fileBtn=E('skillsUploadFileBtn');const folderBtn=E('skillsUploadFolderBtn');if(!drop||!input||!dirInput)return;const consume=async(files,resetter)=>{try{await uploadSkillFiles(files)}catch(err){showError(err.message||String(err))}if(typeof resetter==='function')resetter()};drop.onclick=()=>input.click();if(fileBtn)fileBtn.onclick=()=>input.click();if(folderBtn)folderBtn.onclick=()=>dirInput.click();input.onchange=()=>consume(input.files,()=>{input.value=''});dirInput.onchange=()=>consume(dirInput.files,()=>{dirInput.value=''});for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');consume(e.dataTransfer?.files||[])})}
 function bindFlowZoom(){const outBtn=E('flowZoomOutBtn');const inBtn=E('flowZoomInBtn');if(outBtn)outBtn.onclick=()=>zoomFlowBy(-0.1);if(inBtn)inBtn.onclick=()=>zoomFlowBy(0.1);updateFlowZoomUI()}
 function bindFlowPan(){const wrap=E('flowWrap');if(!wrap)return;wrap.addEventListener('mousedown',ev=>{if(ev.button!==0)return;const target=ev.target;if(!target||!target.closest||!target.closest('#flowWrap'))return;if(target.closest('.flow-node,.flow-port,input,textarea,select,button,a,label,.flow-zoom-pill'))return;S.drag=null;S.linkDrag=null;S.pan={sx:ev.clientX,sy:ev.clientY,left:wrap.scrollLeft,top:wrap.scrollTop};wrap.classList.add('flow-panning');ev.preventDefault()})}

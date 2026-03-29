@@ -349,7 +349,7 @@ class SessionManager:
         if clear_cap_cache:
             sess.multimodal_capability_cache = {}
             sess.ollama.clear_probe_cache()
-        sess.ui_language = normalize_ui_language(self.user_language)
+        sess._set_ui_language(self.user_language, relabel_todos=True)
         sess.auto_model_switch = bool(self.auto_model_switch)
         sess.arbiter_enabled = bool(self.arbiter_enabled)
         sess.arbiter_model = str(self.arbiter_model or "").strip()
@@ -824,7 +824,7 @@ class SessionManager:
         with self.lock:
             self.user_language = lang
             for sess in self.sessions.values():
-                sess.ui_language = lang
+                sess._set_ui_language(lang, relabel_todos=True)
                 sess.updated_at = now_ts()
                 sess._persist()
             self._persist_user_prefs()
@@ -836,7 +836,7 @@ class SessionManager:
             sess = self.sessions.get(session_id)
             if not sess:
                 raise KeyError(session_id)
-            sess.ui_language = lang
+            sess._set_ui_language(lang, relabel_todos=True)
             sess.updated_at = now_ts()
             sess._persist()
             if set_user_default:

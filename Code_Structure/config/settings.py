@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from .constants import AUTO_SKILLS_ROOT_CANDIDATES, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MEDIA_CAPABILITY_KEYS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES
+from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MEDIA_CAPABILITY_KEYS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES
 from .paths import WORKDIR
 from ..llm.utils import _is_http_url, _resolve_local_path, complete_chat_endpoint, extract_base_url
 from ..skills.store import ensure_embedded_skills
@@ -113,6 +113,24 @@ def model_language_instruction(lang: str) -> str:
         "Only switch language when user explicitly requests it. "
         "Do not translate code, file paths, commands, API/tool names, or JSON keys."
     )
+
+def backend_i18n_text(language: str, key: str, **kwargs) -> str:
+    code = normalize_ui_language(language)
+    pack = BACKEND_I18N.get(code, BACKEND_I18N["en"])
+    fallback = BACKEND_I18N["en"]
+    template = str(pack.get(key, fallback.get(key, key)))
+    if kwargs:
+        try:
+            return template.format(**{k: ("" if v is None else v) for k, v in kwargs.items()})
+        except Exception:
+            return template
+    return template
+
+def backend_role_label(role: str, language: str) -> str:
+    role_key = str(role or "").strip().lower()
+    if role_key in {"explorer", "developer", "reviewer", "manager", "planner"}:
+        return backend_i18n_text(language, f"role_{role_key}")
+    return backend_i18n_text(language, "role_agent")
 
 def _detect_os_shell_instruction() -> str:
     """Return a shell environment note for the agent system prompt based on the host OS."""
@@ -631,7 +649,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("siliconflow"),
         )
 
-    # ── vLLM (local) ────────────────────────────────────────���─────
+    # ── vLLM (local) ──────────────────────────────────────────────
     vllm_url = str(config.get("vllm_url", "")).strip()
     vllm_model = str(config.get("vllm_model", "")).strip()
     vllm_key = str(config.get("vllm_key", "")).strip()

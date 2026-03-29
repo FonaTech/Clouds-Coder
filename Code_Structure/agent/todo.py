@@ -5,12 +5,65 @@ from __future__ import annotations
 import threading
 
 # ── cross-module imports ─────────────────────────────────────────────────
+from ..config.constants import DEFAULT_UI_LANGUAGE
+from ..config.settings import backend_i18n_text, backend_role_label, normalize_ui_language
 from ..utils.text import normalize_work_text, trim
 
 class TodoManager:
-    def __init__(self):
+    def __init__(self, language: str = DEFAULT_UI_LANGUAGE):
+        self.language = normalize_ui_language(language)
         self.items: list[dict] = []
         self.lock = threading.Lock()
+
+    def _text(self, key: str, **kwargs) -> str:
+        return backend_i18n_text(self.language, key, **kwargs)
+
+    def _owner_label(self, owner: str) -> str:
+        return backend_role_label(owner, self.language) if str(owner or "").strip() else ""
+
+    def no_changes_text(self) -> str:
+        return self._text("todo_no_changes")
+
+    def set_language(self, language: str, *, relabel: bool = True) -> str:
+        with self.lock:
+            self.language = normalize_ui_language(language)
+            if relabel and self.items:
+                refreshed = []
+                for item in self.items:
+                    row = dict(item)
+                    row["activeForm"] = self._default_active_form(
+                        row.get("status", "pending"),
+                        row.get("content", ""),
+                        owner=row.get("owner", ""),
+                    )
+                    refreshed.append(row)
+                self.items = refreshed
+        return self.language
+
+    def _default_active_form(
+        self,
+        status: str,
+        content: str,
+        *,
+        owner: str = "",
+        note: str = "",
+    ) -> str:
+        state = str(status or "pending").strip().lower()
+        base = normalize_work_text(str(content or "").strip(), state) or str(content or "").strip()
+        suffix = f" ({trim(str(note or '').strip(), 180)})" if note else ""
+        final_content = f"{base}{suffix}".strip()
+        owner_label = self._owner_label(owner)
+        if owner_label:
+            if state == "in_progress":
+                return self._text("todo_working_owner", owner=owner_label, content=final_content)
+            if state == "completed":
+                return self._text("todo_completed_owner", owner=owner_label, content=final_content)
+            return self._text("todo_pending_owner", owner=owner_label, content=final_content)
+        if state == "in_progress":
+            return self._text("todo_working", content=final_content)
+        if state == "completed":
+            return self._text("todo_completed", content=final_content)
+        return self._text("todo_pending", content=final_content)
 
     def update(self, items: list[dict]) -> str:
         if not isinstance(items, list):
@@ -70,12 +123,7 @@ class TodoManager:
                     else:
                         worker_in_progress_seen = True
             if not active_form:
-                if status == "in_progress":
-                    active_form = f"Working on: {content}"
-                elif status == "completed":
-                    active_form = f"Completed: {content}"
-                else:
-                    active_form = f"Pending: {content}"
+                active_form = self._default_active_form(status, content, owner=owner)
             row = {"content": content, "status": status, "activeForm": active_form}
             if owner:
                 row["owner"] = owner
@@ -92,11 +140,15 @@ class TodoManager:
             for row in validated:
                 if row["status"] == "pending":
                     row["status"] = "in_progress"
-                    row["activeForm"] = row.get("activeForm") or f"Working on: {row['content']}"
+                    row["activeForm"] = row.get("activeForm") or self._default_active_form(
+                        "in_progress",
+                        row["content"],
+                        owner=row.get("owner", ""),
+                    )
                     break
         with self.lock:
             if self.items == validated:
-                return "No todo changes."
+                return self.no_changes_text()
             self.items = validated
         return self.render()
 
@@ -108,7 +160,7 @@ class TodoManager:
         with self.lock:
             items = list(self.items)
         if not items:
-            return "No todos."
+            return self._text("todo_no_todos")
         lines = []
         for item in items:
             marker = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}.get(
@@ -119,7 +171,7 @@ class TodoManager:
             )
             lines.append(f"{marker} {item['content']}{suffix}")
         done = sum(1 for x in items if x["status"] == "completed")
-        lines.append(f"\n({done}/{len(items)} completed)")
+        lines.append(f"\n{self._text('todo_footer', done=done, total=len(items))}")
         return "\n".join(lines)
 
     def snapshot(self) -> list[dict]:
@@ -143,8 +195,12 @@ class TodoManager:
                     base = normalize_work_text(str(rows[idx].get("content", "")).strip()) or str(
                         rows[idx].get("content", "")
                     ).strip()
-                    suffix = f" ({note})" if note else ""
-                    rows[idx]["activeForm"] = f"Completed: {base}{suffix}".strip()
+                    rows[idx]["activeForm"] = self._default_active_form(
+                        "completed",
+                        base,
+                        owner=rows[idx].get("owner", ""),
+                        note=note,
+                    )
                     changed += 1
             else:
                 for idx, row in enumerate(rows):
@@ -153,8 +209,12 @@ class TodoManager:
                         base = normalize_work_text(str(rows[idx].get("content", "")).strip()) or str(
                             rows[idx].get("content", "")
                         ).strip()
-                        suffix = f" ({note})" if note else ""
-                        rows[idx]["activeForm"] = f"Completed: {base}{suffix}".strip()
+                        rows[idx]["activeForm"] = self._default_active_form(
+                            "completed",
+                            base,
+                            owner=rows[idx].get("owner", ""),
+                            note=note,
+                        )
                         changed = 1
                         break
             if changed > 0:
@@ -177,8 +237,12 @@ class TodoManager:
                 base = normalize_work_text(str(rows[idx].get("content", "")).strip()) or str(
                     rows[idx].get("content", "")
                 ).strip()
-                suffix = f" ({note})" if note else ""
-                rows[idx]["activeForm"] = f"Completed: {base}{suffix}".strip()
+                rows[idx]["activeForm"] = self._default_active_form(
+                    "completed",
+                    base,
+                    owner=rows[idx].get("owner", ""),
+                    note=note,
+                )
                 changed += 1
             if changed > 0:
                 self.items = rows

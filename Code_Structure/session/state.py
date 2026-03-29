@@ -35,9 +35,9 @@ from ..agent.events import EventHub
 from ..agent.tasks import TaskManager
 from ..agent.todo import TodoManager
 from ..agent.worktree import WorktreeManager
-from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_ROLE_LABELS, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, COMPLEXITY_KEYWORDS, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
+from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, COMPLEXITY_KEYWORDS, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
 from ..config.paths import WORKDIR
-from ..config.settings import _detect_os_shell_instruction, _to_bool_like, default_multimodal_capabilities, infer_model_multimodal_capabilities, looks_like_llm_config, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
+from ..config.settings import _detect_os_shell_instruction, _to_bool_like, backend_i18n_text, backend_role_label, default_multimodal_capabilities, infer_model_multimodal_capabilities, looks_like_llm_config, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
 from ..llm.client import OllamaClient, OllamaError
 from ..llm.utils import complete_chat_endpoint, list_loaded_ollama_models, list_ollama_models, list_ollama_models_cached, probe_ollama_environment, resolve_ollama_model, split_thinking_content, strip_thinking_content, wake_ollama_model
 from ..rag.parsers import build_code_preview_rows, is_code_preview_candidate, normalize_rel_preview_path, preview_kind_for_path
@@ -149,7 +149,7 @@ class SessionState:
         self.active_profile_id = ""
         self.multimodal_capability_cache: dict[str, dict] = {}
         self.failed_selections: list[str] = []
-        self.todo = TodoManager()
+        self.todo = TodoManager(self.ui_language)
         self.single_advance_prompt_enhance = False
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
@@ -195,6 +195,7 @@ class SessionState:
         self.runtime_task_complexity = ""
         self.runtime_complexity_floor = ""
         self.runtime_task_level_floor = 0
+        self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
         self.runtime_reclassify_goal = ""
@@ -1286,6 +1287,9 @@ class SessionState:
                 self.runtime_task_level_floor = int(
                     raw.get("runtime_task_level_floor", self.runtime_task_level_floor) or 0
                 )
+                self.runtime_task_level_ceiling = int(
+                    raw.get("runtime_task_level_ceiling", self.runtime_task_level_ceiling) or 0
+                )
                 self.runtime_goal_reset_pending = bool(
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
@@ -1378,6 +1382,7 @@ class SessionState:
                     row["model"] = fmodel.strip()
                     row["selection"] = f"{self.active_profile_id}::{row.get('model','')}"
                     self.model_profiles[self.active_profile_id] = row
+        self._set_ui_language(self.ui_language, relabel_todos=True)
         self._apply_active_profile()
         self._prune_skill_load_cache()
         with self.lock:
@@ -1450,6 +1455,7 @@ class SessionState:
             "runtime_reclassify_required": bool(self.runtime_reclassify_required),
             "runtime_complexity_floor": str(self.runtime_complexity_floor or ""),
             "runtime_task_level_floor": int(self.runtime_task_level_floor or 0),
+            "runtime_task_level_ceiling": int(self.runtime_task_level_ceiling or 0),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
             "runtime_plan_mode_needed": bool(self.runtime_plan_mode_needed),
             "runtime_plan_approved": bool(self.runtime_plan_approved),
@@ -3482,17 +3488,14 @@ class SessionState:
                     {
                         "content": "Split task into small subtasks",
                         "status": "in_progress",
-                        "activeForm": "Working on: Split task into small subtasks",
                     },
                     {
                         "content": "Execute one subtask and persist intermediate result",
                         "status": "pending",
-                        "activeForm": "Pending: Execute one subtask and persist intermediate result",
                     },
                     {
                         "content": "Validate and continue remaining subtasks",
                         "status": "pending",
-                        "activeForm": "Pending: Validate and continue remaining subtasks",
                     },
                 ]
             )
@@ -5652,30 +5655,46 @@ class SessionState:
             return False
         done_markers = [
             "任务完成",
+            "任務完成",
             "已完成",
             "全部完成",
+            "全部完成了",
             "处理完成",
+            "處理完成",
             "修复完成",
+            "修復完成",
             "解释如上",
+            "說明如上",
             "上述代码已为您编写完毕",
             "done",
             "completed",
             "finished",
             "all set",
+            "完了しました",
+            "対応完了",
+            "修正完了",
+            "以上です",
+            "作成しました",
             # 明确表示拒绝/无法完成也应视为终结
             "抱歉",
             "sorry",
             "无法",
             "cannot",
             "unable",
+            "無法",
+            "すみません",
+            "できません",
         ]
         if any(x in t for x in done_markers):
             return False
         continue_markers = [
             "让我",
+            "讓我",
             "我将",
             "继续",
+            "繼續",
             "接下来",
+            "接下來",
             "重新分析",
             "修复代码",
             "i will",
@@ -5683,6 +5702,12 @@ class SessionState:
             "let me",
             "next",
             "continue",
+            "続けます",
+            "これから",
+            "次に",
+            "再分析",
+            "修正します",
+            "進めます",
         ]
         return any(x in t for x in continue_markers)
 
@@ -5703,9 +5728,19 @@ class SessionState:
             "要不要",
             "是否",
             "可选项",
+            "請選擇",
+            "請告訴我",
+            "你希望",
+            "要不要",
+            "是否要",
+            "どの案",
+            "どれを選ぶ",
+            "選んでください",
+            "希望しますか",
+            "必要ですか",
         ]
         has_question = ("?" in t) or ("？" in text)
-        has_option_list = any(token in t for token in ["1.", "2.", "3.", "option", "选项"])
+        has_option_list = any(token in t for token in ["1.", "2.", "3.", "option", "选项", "選項", "方案", "案"])
         return has_question and (has_option_list or any(x in t for x in ask_markers))
 
     def _looks_like_conclusive_reply(self, text: str) -> bool:
@@ -5716,25 +5751,39 @@ class SessionState:
         negative = [
             "未完成",
             "还没完成",
+            "還沒完成",
             "继续",
+            "繼續",
             "next step",
             "todo",
             "pending",
             "in_progress",
             "需要继续",
             "待处理",
+            "待處理",
+            "未完了",
+            "まだ完了していない",
+            "続行",
+            "次のステップ",
+            "保留",
+            "進行中",
         ]
         if any(x in t for x in negative):
             return False
         done_markers = [
             "任务完成",
+            "任務完成",
             "处理完成",
+            "處理完成",
             "修复完成",
+            "修復完成",
             "以上就是",
             "解释如上",
+            "說明如上",
             "上述代码已为您编写完毕",
             "已为您创建",
             "已为你创建",
+            "已為您建立",
             "all set",
             "done",
             "completed",
@@ -5749,6 +5798,12 @@ class SessionState:
             "that's all",
             "that is all",
             "as requested",
+            "完了しました",
+            "対応完了",
+            "修正完了",
+            "以上です",
+            "作成しました",
+            "準備できました",
             # 明确表示无法完成的标记
             "抱歉，我无法",
             "无法直接获取",
@@ -5760,6 +5815,11 @@ class SessionState:
             "建议你通过",
             "i cannot",
             "i'm unable",
+            "抱歉，我無法",
+            "無法直接取得",
+            "無法完成",
+            "できません",
+            "不可能です",
         ]
         return any(x in t for x in done_markers)
 
@@ -5804,6 +5864,19 @@ class SessionState:
             "总结",
             "说明如下",
             "结果如下",
+            "已完成",
+            "修復了",
+            "修改了",
+            "實作了",
+            "總結",
+            "說明如下",
+            "結果如下",
+            "実装しました",
+            "修正しました",
+            "更新しました",
+            "作成しました",
+            "まとめ",
+            "結果は以下",
         ]
         if any(x in low for x in informative_markers):
             return True
@@ -5827,7 +5900,9 @@ class SessionState:
             return False
         markers = [
             "是什么",
+            "是什麼",
             "为什么",
+            "為什麼",
             "怎么",
             "如何",
             "explain",
@@ -5835,6 +5910,13 @@ class SessionState:
             "why",
             "how to",
             "difference",
+            "差異",
+            "とは",
+            "なぜ",
+            "どうやって",
+            "どうすれば",
+            "違い",
+            "何ですか",
         ]
         return any(x in t for x in markers)
 
@@ -5893,6 +5975,13 @@ class SessionState:
             "ready to use",
             "as requested",
             "that is all",
+            "希望這能幫到你",
+            "說明如上",
+            "程式碼已修改完成",
+            "請查看上述程式碼",
+            "完了しました",
+            "以上です",
+            "ご確認ください",
         ]
         if any(x in tail for x in endpoint_markers):
             score += 2
@@ -5915,11 +6004,58 @@ class SessionState:
         low = str(text or "").strip().lower()
         if not low:
             return ""
-        if any(x in low for x in ["task_completed", "task completed", "已完成", "done", "completed", "finished"]):
+        if any(
+            x in low
+            for x in [
+                "task_completed",
+                "task completed",
+                "已完成",
+                "完成",
+                "已完成了",
+                "done",
+                "completed",
+                "finished",
+                "任務完成",
+                "完了",
+                "完了しました",
+            ]
+        ):
             return "TASK_COMPLETED"
-        if any(x in low for x in ["valid_planning", "valid planning", "plan", "planning", "next step", "analysis"]):
+        if any(
+            x in low
+            for x in [
+                "valid_planning",
+                "valid planning",
+                "plan",
+                "planning",
+                "next step",
+                "analysis",
+                "计划",
+                "計畫",
+                "规划",
+                "規劃",
+                "下一步",
+                "分析",
+                "計画",
+                "次のステップ",
+            ]
+        ):
             return "VALID_PLANNING"
-        if any(x in low for x in ["empty_rambling", "empty rambling", "rambling", "idle", "stalled", "hallucination", "空想"]):
+        if any(
+            x in low
+            for x in [
+                "empty_rambling",
+                "empty rambling",
+                "rambling",
+                "idle",
+                "stalled",
+                "hallucination",
+                "空想",
+                "停滞",
+                "停滯",
+                "だらだら",
+            ]
+        ):
             return "EMPTY_RAMBLING"
         return ""
 
@@ -6118,6 +6254,163 @@ class SessionState:
         )
         return result
 
+    def _generate_run_completion_summary(self):
+        """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
+        # Guard: plan proposal is waiting for user selection — run ended but task not started yet
+        if self.runtime_plan_mode_needed and not self.runtime_plan_approved:
+            return
+        try:
+            bb = self._ensure_blackboard()
+            board_md = self._blackboard_read_state_markdown(max_items=10)
+            # Collect completed plan steps
+            plan_steps = [t for t in bb.get("project_todos", []) if t.get("category") == "plan_step"]
+            completed = [t for t in plan_steps if t.get("status") == "completed"]
+            pending = [t for t in plan_steps if t.get("status") != "completed"]
+            # Collect recent file operations from step_files
+            step_files = bb.get("step_files", {})
+            file_list = []
+            for _sf_key, entries in (step_files.items() if isinstance(step_files, dict) else []):
+                if isinstance(entries, list):
+                    for e in entries[-5:]:
+                        fp = str(e.get("path", "") if isinstance(e, dict) else e or "").strip()
+                        if fp:
+                            file_list.append(fp)
+            file_list = list(dict.fromkeys(file_list))[-10:]  # Dedupe, last 10
+            # Build context for LLM summary
+            goal = trim(str(bb.get("original_goal", "") or self.runtime_reclassify_goal or ""), 600)
+            lang_hint = model_language_instruction(self.ui_language)
+            parts = [f"GOAL: {goal}"] if goal else []
+            if completed:
+                parts.append(f"COMPLETED STEPS ({len(completed)}/{len(plan_steps)}):")
+                for t in completed:
+                    idx = int(t.get("plan_step_index", 0) or 0) + 1
+                    parts.append(f"  ✅ {idx}. {trim(str(t.get('content', '')), 100)}")
+            if pending:
+                parts.append(f"REMAINING ({len(pending)}):")
+                for t in pending[:3]:
+                    idx = int(t.get("plan_step_index", 0) or 0) + 1
+                    parts.append(f"  ⬜ {idx}. {trim(str(t.get('content', '')), 100)}")
+            if file_list:
+                parts.append(f"FILES CREATED/MODIFIED: {', '.join(file_list[:8])}")
+            if board_md:
+                parts.append(f"BLACKBOARD STATE:\n{trim(board_md, 800)}")
+            context = "\n".join(parts)
+            # --- Supplement context from messages history when plan steps are unavailable ---
+            # (pure sync mode: no plan steps, so file_list/ops may be empty above)
+            files_from_msgs: list[str] = []
+            ops_from_msgs: list[str] = []
+            agent_conclusion = ""
+            for _m in self.messages[-60:]:
+                if not isinstance(_m, dict):
+                    continue
+                _role = _m.get("role", "")
+                # file_patch type → extract file location
+                if _m.get("type") == "file_patch":
+                    _loc = str(_m.get("location", "") or _m.get("path", "") or "").strip()
+                    if _loc and _loc not in files_from_msgs:
+                        files_from_msgs.append(_loc)
+                # command output → capture brief preview
+                if _m.get("type") == "command" and _role == "system":
+                    _cmd = trim(str(_m.get("content", "") or ""), 120)
+                    if _cmd:
+                        ops_from_msgs.append(_cmd)
+                # last non-manager/non-planner assistant reply → agent self-description
+                if _role == "assistant" and str(_m.get("agent_role", "") or "") not in ("manager", "planner"):
+                    _txt = str(_m.get("content", "") or "").strip()
+                    if _txt:
+                        agent_conclusion = trim(_txt, 400)
+            # Merge: use message-derived file list only when step_files gave nothing
+            if not file_list and files_from_msgs:
+                file_list = files_from_msgs[:8]
+            # Append agent conclusion and bash ops to context if not already present
+            if agent_conclusion and "AGENT LAST OUTPUT" not in context:
+                context += f"\nAGENT LAST OUTPUT:\n{agent_conclusion}"
+            if ops_from_msgs and "BASH OPS" not in context:
+                context += f"\nBASH OPS (last {min(3, len(ops_from_msgs))}):\n" + "\n".join(ops_from_msgs[-3:])
+            # ---
+            prompt = (
+                f"{lang_hint}\n"
+                "Generate a BRIEF completion summary for the user (3-8 sentences).\n"
+                "Include: what was accomplished, key files created, and any remaining work.\n"
+                "Use markdown formatting. Be concise and informative.\n"
+                f"Do NOT include code blocks unless essential.\n\n"
+                f"CONTEXT:\n{context}"
+            )
+            rsp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=800,
+                temperature=0.3,
+            )
+            summary_text = str(rsp.get("content", "") or "").strip()
+            if not summary_text or len(summary_text) < 10:
+                summary_text = self._generate_static_completion_summary(
+                    completed, pending, file_list, goal, agent_text=agent_conclusion
+                )
+            self.messages.append({
+                "role": "assistant",
+                "content": summary_text,
+                "ts": now_ts(),
+                "agent_role": "explorer",
+            })
+            self._emit("message", {
+                "role": "assistant",
+                "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
+                "summary": "run completion summary",
+                "agent_role": "explorer",
+            })
+        except Exception:
+            try:
+                bb = self._ensure_blackboard()
+                plan_steps = [t for t in bb.get("project_todos", []) if t.get("category") == "plan_step"]
+                completed = [t for t in plan_steps if t.get("status") == "completed"]
+                pending = [t for t in plan_steps if t.get("status") != "completed"]
+                goal = trim(str(bb.get("original_goal", "") or ""), 200)
+                summary_text = self._generate_static_completion_summary(completed, pending, [], goal)
+                self.messages.append({
+                    "role": "assistant",
+                    "content": summary_text,
+                    "ts": now_ts(),
+                    "agent_role": "explorer",
+                })
+                self._emit("message", {
+                    "role": "assistant",
+                    "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
+                    "summary": "run completion summary (static)",
+                    "agent_role": "explorer",
+                })
+            except Exception:
+                pass
+
+    def _generate_static_completion_summary(
+        self,
+        completed: list[dict],
+        pending: list[dict],
+        file_list: list[str],
+        goal: str,
+        agent_text: str = "",
+    ) -> str:
+        """Static fallback summary when LLM call fails."""
+        lines = ["## ✅ 任务执行完成\n"]
+        if goal:
+            lines.append(f"**目标：** {trim(goal, 200)}\n")
+        total = len(completed) + len(pending)
+        if completed:
+            lines.append(f"**进度：** {len(completed)}/{total} 步骤已完成")
+            for t in completed[-5:]:
+                idx = int(t.get("plan_step_index", 0) or 0) + 1
+                lines.append(f"- ✅ {idx}. {trim(str(t.get('content', '')), 80)}")
+        if pending:
+            lines.append(f"\n**待完成：** {len(pending)} 步骤")
+            for t in pending[:3]:
+                idx = int(t.get("plan_step_index", 0) or 0) + 1
+                lines.append(f"- ⬜ {idx}. {trim(str(t.get('content', '')), 80)}")
+        # When no plan steps exist (pure sync mode), show agent conclusion text instead
+        if not completed and agent_text:
+            lines.append(f"\n**执行摘要：** {trim(agent_text, 300)}")
+        if file_list:
+            lines.append(f"\n**涉及文件：** {', '.join(file_list[:6])}")
+        return "\n".join(lines)
+
     def _should_soft_pause_no_action(self, assistant_text: str, tool_calls: list | None = None) -> bool:
         if tool_calls:
             return False
@@ -6137,7 +6430,7 @@ class SessionState:
     def _todo_active_brief(self) -> str:
         rows = self.todo.snapshot()
         if not rows:
-            return "No todos."
+            return self._ui_text("todo_no_todos")
         active = []
         open_count = 0
         done_count = 0
@@ -9424,13 +9717,23 @@ class SessionState:
             board["project_todos"] = []
         else:
             clean_todos = []
+            import re as _re_norm
+            _mid_re_norm = _re_norm.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
             for pt in bb_src_todos[:40]:
                 if not isinstance(pt, dict):
                     continue
+                raw_content = trim(str(pt.get("content", "") or ""), 1500)
+                raw_full = trim(str(pt.get("full_content", "") or ""), 1500)
+                # Migration: if full_content is empty but content has sub-steps, auto-split
+                if not raw_full and raw_content and pt.get("category") == "plan_step":
+                    normalized = _mid_re_norm.sub(r"\n\1", raw_content)
+                    if "\n" in normalized:
+                        raw_full = normalized
+                        raw_content = normalized.split("\n")[0].strip()
                 clean_todos.append({
                     "id": trim(str(pt.get("id", "") or ""), 20),
-                    "content": trim(str(pt.get("content", "") or ""), 400),
-                    "full_content": trim(str(pt.get("full_content", "") or ""), 1500),
+                    "content": trim(raw_content, 400),
+                    "full_content": trim(raw_full, 1500),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
                     "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
@@ -10002,16 +10305,7 @@ class SessionState:
         self._blackboard_touch()
 
     def _todo_owner_display_name(self, owner: str) -> str:
-        role = str(owner or "").strip().lower()
-        if role == "manager":
-            return "Manager"
-        if role == "explorer":
-            return "Explorer"
-        if role == "developer":
-            return "Developer"
-        if role == "reviewer":
-            return "Reviewer"
-        return "Agent"
+        return self._agent_display_name(owner)
 
     def _todo_stage_focus_owner(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -10189,21 +10483,24 @@ class SessionState:
         def _owner_desc(owner: str) -> str:
             if owner == "manager":
                 if delegate_target:
-                    return f"Plan route and coordinate current node handoff ({self._agent_display_name(delegate_target)} active)"
-                return "Plan route and coordinate current node handoff"
+                    return self._ui_text(
+                        "node_desc_manager_active",
+                        target=self._agent_display_name(delegate_target),
+                    )
+                return self._ui_text("node_desc_manager")
             if owner == "explorer":
                 if delegate_target == "explorer":
-                    return "Gather constraints/evidence for current node"
-                return "Provide research support and risk notes for current node"
+                    return self._ui_text("node_desc_explorer_active")
+                return self._ui_text("node_desc_explorer")
             if owner == "developer":
                 if delegate_target == "developer":
-                    return "Implement concrete outputs and file/tool changes for current node"
-                return "Prepare and deliver implementation updates for current node"
+                    return self._ui_text("node_desc_developer_active")
+                return self._ui_text("node_desc_developer")
             if owner == "reviewer":
                 if delegate_target == "reviewer":
-                    return "Validate current node and provide pass/fix judgement"
-                return "Review outputs and keep quality gate updated for current node"
-            return "Handle current node work"
+                    return self._ui_text("node_desc_reviewer_active")
+                return self._ui_text("node_desc_reviewer")
+            return self._ui_text("node_desc_generic")
 
         finish_ok, _ = self._can_auto_finish_from_approval(bb)
         rows: list[dict] = []
@@ -10253,13 +10550,17 @@ class SessionState:
             status_value = str(row.get("status", "pending") or "pending")
             topic_suffix = ""
             if node_topic and status_value == "in_progress":
-                topic_suffix = f" | node: {trim(node_topic, 140)}"
+                topic_suffix = self._ui_text("todo_node_suffix", topic=trim(node_topic, 140))
             if status_value == "in_progress":
-                row["activeForm"] = f"Working on ({label}): {text}{topic_suffix}"
+                row["activeForm"] = self._ui_text(
+                    "todo_working_owner",
+                    owner=label,
+                    content=f"{text}{topic_suffix}",
+                )
             elif status_value == "completed":
-                row["activeForm"] = f"Completed ({label}): {text}"
+                row["activeForm"] = self._ui_text("todo_completed_owner", owner=label, content=text)
             else:
-                row["activeForm"] = f"Pending ({label}): {text}"
+                row["activeForm"] = self._ui_text("todo_pending_owner", owner=label, content=text)
         return rows
 
     # ── Project-based todo generation & status tracking ──────────────
@@ -10271,23 +10572,47 @@ class SessionState:
         objective = trim(str(profile.get("direct_objective", "") or ""), 200)
 
         if task_type == "simple_qa":
-            return [{"content": f"回答: {objective}" if objective else "回答用户问题", "category": "implement"}]
+            return [
+                {
+                    "content": self._ui_text("project_answer_objective", objective=objective)
+                    if objective
+                    else self._ui_text("project_answer_default"),
+                    "category": "implement",
+                }
+            ]
 
         if task_type in ("simple_code", "engineering"):
             return [
-                {"content": "分析需求和项目结构", "category": "setup"},
-                {"content": f"实现: {objective}" if objective else "实现编码任务", "category": "implement"},
-                {"content": "编译/语法检查", "category": "compile_test"},
-                {"content": "最小功能测试", "category": "min_test"},
+                {"content": self._ui_text("project_analyze_requirements"), "category": "setup"},
+                {
+                    "content": self._ui_text("project_implement_objective", objective=objective)
+                    if objective
+                    else self._ui_text("project_implement_default"),
+                    "category": "implement",
+                },
+                {"content": self._ui_text("project_compile_check"), "category": "compile_test"},
+                {"content": self._ui_text("project_min_test"), "category": "min_test"},
             ]
 
         if task_type == "research":
             return [
-                {"content": f"调研: {objective}" if objective else "执行调研任务", "category": "implement"},
-                {"content": "整理调研结果", "category": "review"},
+                {
+                    "content": self._ui_text("project_research_objective", objective=objective)
+                    if objective
+                    else self._ui_text("project_research_default"),
+                    "category": "implement",
+                },
+                {"content": self._ui_text("project_research_summary"), "category": "review"},
             ]
 
-        return [{"content": f"执行: {objective}" if objective else "执行任务", "category": "implement"}]
+        return [
+            {
+                "content": self._ui_text("project_execute_objective", objective=objective)
+                if objective
+                else self._ui_text("project_execute_default"),
+                "category": "implement",
+            }
+        ]
 
     def _init_project_todos(self, board: dict | None = None):
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -10385,16 +10710,36 @@ class SessionState:
                 continue
             cat = todo.get("category", "")
             if cat == "setup" and (research_count > 0 or code_count > 0):
-                todo.update(status="completed", completed_at=float(now_ts()), evidence="结构已分析")
+                todo.update(
+                    status="completed",
+                    completed_at=float(now_ts()),
+                    evidence=self._ui_text("evidence_structure_analyzed"),
+                )
             elif cat == "implement" and code_count > 0:
-                todo.update(status="completed", completed_at=float(now_ts()),
-                            completed_by="developer", evidence=f"{code_count} 文件已产出")
+                todo.update(
+                    status="completed",
+                    completed_at=float(now_ts()),
+                    completed_by="developer",
+                    evidence=self._ui_text("evidence_files_produced", count=code_count),
+                )
             elif cat == "compile_test" and self._has_compile_pass_evidence(bb):
-                todo.update(status="completed", completed_at=float(now_ts()), evidence="编译通过")
+                todo.update(
+                    status="completed",
+                    completed_at=float(now_ts()),
+                    evidence=self._ui_text("evidence_compile_passed"),
+                )
             elif cat == "min_test" and self._has_test_pass_evidence(bb):
-                todo.update(status="completed", completed_at=float(now_ts()), evidence="测试通过")
+                todo.update(
+                    status="completed",
+                    completed_at=float(now_ts()),
+                    evidence=self._ui_text("evidence_test_passed"),
+                )
             elif cat == "review" and feedback_pass:
-                todo.update(status="completed", completed_at=float(now_ts()), evidence="审查通过")
+                todo.update(
+                    status="completed",
+                    completed_at=float(now_ts()),
+                    evidence=self._ui_text("evidence_review_passed"),
+                )
             elif cat == "plan_step":
                 # Plan steps 不自动完成，由 _advance_plan_step 显式推进
                 # 但如果当前步骤之前的所有步骤都完成了，标记当前步骤为 in_progress
@@ -10485,7 +10830,7 @@ class SessionState:
         current["status"] = "completed"
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
-        current["evidence"] = trim(str(evidence or "").strip(), 200) or "step completed"
+        current["evidence"] = trim(str(evidence or "").strip(), 200) or self._ui_text("step_completed_evidence")
         # 推进 cursor，激活下一步
         cursor = int(bb.get("plan_step_cursor", 0) or 0)
         bb["plan_step_cursor"] = cursor + 1
@@ -10499,7 +10844,12 @@ class SessionState:
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
-                "summary": f"📋 Plan step {step_idx}/{total}: {trim(str(next_step.get('content', '') or ''), 120)}"
+                "summary": self._ui_text(
+                    "plan_step_summary",
+                    step=step_idx,
+                    total=total,
+                    content=trim(str(next_step.get("content", "") or ""), 120),
+                )
             })
         self.blackboard = bb
         self._blackboard_touch()
@@ -10532,14 +10882,13 @@ class SessionState:
                 _ns_total = int(bb.get("plan_step_total", 0) or 0)
                 _ns_text = trim(str(next_step.get("content", "") or ""), 200)
                 _ns_id = str(next_step.get("id", "") or "")
-                _ns_label = f"Step {_ns_idx}" + (f"/{_ns_total}" if _ns_total else "")
-                _hint = (
-                    f"[plan-step-advance] Previous step completed. Now at {_ns_label}: {_ns_text}\n"
-                    f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
-                    f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
-                    f"Each subtask MUST include parent_step_id='{_ns_id}'. "
-                    f"Create 3-5 items, one marked in_progress, others pending.\n"
-                    f"Do NOT create subtasks for other plan steps."
+                _ns_label = self._ui_text("plan_step_label", step=_ns_idx, total=_ns_total)
+                _hint = self._ui_text(
+                    "plan_step_hint",
+                    step_label=_ns_label,
+                    step_text=_ns_text,
+                    plan_path=PLAN_FILE_RELATIVE_PATH,
+                    parent_step_id=_ns_id,
                 )
                 self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
                 # Also inject into active agent context for multi-agent mode
@@ -10562,6 +10911,19 @@ class SessionState:
             None,
         )
         if not current:
+            # No plan steps — detect finish_current_task for pure-sync mode coordination.
+            # Sets sync_worker_round_done flag so the sync loop can signal the manager.
+            # Only reachable in pure sync mode (no plan steps); plan+sync always has `current`
+            # set, so this branch never executes for plan modes.
+            results = worker_step.get("tool_results", []) or []
+            called_finish = any(
+                isinstance(r, dict) and r.get("ok")
+                and str(r.get("name", "")) in ("finish_current_task", "finish_task")
+                for r in results
+            )
+            if called_finish:
+                bb["sync_worker_round_done"] = True
+                self._save_blackboard(bb)
             return
         # 1. Manager explicitly requested advancement
         manager_requested = bool(route.get("advance_plan_step_requested", False))
@@ -10569,30 +10931,41 @@ class SessionState:
         worker_produced_output = self._worker_step_has_evidence(worker_step)
         # 3. All subtasks for this step are completed
         subtasks_all_done = self._step_subtasks_all_completed(current)
-        # 4. File-evidence fallback: when worker doesn't call TodoWrite, use phase heuristics
+        # 4. Phase-based file+bash evidence (implement requires BOTH write + bash)
         step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
         results = worker_step.get("tool_results", []) or []
-        wrote_files_count = sum(
-            1 for r in results
-            if isinstance(r, dict) and r.get("ok", False)
+        wrote_files = any(
+            isinstance(r, dict) and r.get("ok", False)
             and str(r.get("name", "")) in ("write_file", "edit_file")
+            for r in results
         )
         ran_bash_ok = any(
             isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
             for r in results
         )
-        file_evidence_strong = (
-            phase in ("implement", "design") and wrote_files_count >= 2
-        ) or (
-            phase in ("test", "review") and ran_bash_ok
+        phase_evidence = False
+        if phase in ("research", "design") and wrote_files:
+            phase_evidence = True
+        elif phase == "implement" and wrote_files and ran_bash_ok:
+            phase_evidence = True
+        elif phase in ("test", "review") and ran_bash_ok:
+            phase_evidence = True
+        # 5. finish_current_task is an explicit completion signal — override evidence check
+        called_finish = any(
+            isinstance(r, dict) and r.get("ok")
+            and str(r.get("name", "")) in ("finish_current_task", "finish_task", "mark_done")
+            for r in results
         )
         # Advance when:
+        # - Worker called finish (strongest signal), OR
         # - Manager requested AND worker produced output, OR
         # - All subtasks completed AND worker produced output, OR
-        # - Strong file evidence (fallback when worker forgets TodoWrite)
-        has_strong_evidence = worker_produced_output and (
-            manager_requested or subtasks_all_done or file_evidence_strong
+        # - Phase heuristics confirm (write+bash for implement)
+        has_strong_evidence = called_finish or (
+            worker_produced_output and (
+                manager_requested or subtasks_all_done or phase_evidence
+            )
         )
         if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
@@ -10627,7 +11000,14 @@ class SessionState:
             and str(r.get("parent_step_id", "") or "") == step_id
         ]
         if not worker_items:
-            return False
+            # Fallback: no parent_step_id linkage — check ALL worker items
+            all_worker = [
+                r for r in snap
+                if str(r.get("owner", "") or "").lower() in worker_owners
+            ]
+            if all_worker:
+                return all(str(r.get("status", "")).lower() == "completed" for r in all_worker)
+            return True  # No worker items at all → nothing blocks advancement
         # Extract major step number from plan step content (e.g., "1. Project init" → "1")
         import re
         step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
@@ -10700,12 +11080,12 @@ class SessionState:
         subtasks_done = self._step_subtasks_all_completed(current)
         if subtasks_done and (wrote_files or ran_bash_ok):
             should_advance = True
-        # Priority 2: Phase-based heuristics (relaxed — wrote_files OR bash, not both)
+        # Priority 2: Phase-based heuristics (strict — implement requires BOTH write + bash)
         if not should_advance:
             if phase in ("research", "design") and wrote_files:
                 should_advance = True
-            elif phase == "implement" and wrote_files:
-                # Relaxed: implement step done when files are written (don't require bash)
+            elif phase == "implement" and wrote_files and ran_bash_ok:
+                # Strict: implement step needs both file writes AND successful bash
                 should_advance = True
             elif phase in ("test", "review") and ran_bash_ok and not any(
                 not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
@@ -10739,20 +11119,30 @@ class SessionState:
                     _total = int(_bb_after.get("plan_step_total", 0) or 0)
                     _step_text = trim(str(_new_step.get("content", "") or ""), 200)
                     _step_id = str(_new_step.get("id", "") or "")
-                    _step_label = f"Step {_step_idx}" + (f"/{_total}" if _total else "")
-                    _hint = (
-                        f"[plan-step-advance] Previous step completed. Now at {_step_label}: {_step_text}\n"
-                        f"Read updated plan: read_file {PLAN_FILE_RELATIVE_PATH}\n"
-                        f"Call TodoWrite to set subtasks for THIS step ONLY.\n"
-                        f"Each subtask MUST include parent_step_id='{_step_id}'. "
-                        f"Create 3-5 items, one marked in_progress, others pending.\n"
-                        f"Do NOT create subtasks for other plan steps."
+                    _step_label = self._ui_text("plan_step_label", step=_step_idx, total=_total)
+                    _hint = self._ui_text(
+                        "plan_step_hint",
+                        step_label=_step_label,
+                        step_text=_step_text,
+                        plan_path=PLAN_FILE_RELATIVE_PATH,
+                        parent_step_id=_step_id,
                     )
                     self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
             except Exception:
                 pass
         else:
             self._sync_todos_from_blackboard(reason="single-agent-round")
+            # Nudge: if agent wrote files but didn't call TodoWrite, remind it
+            called_todo = any(str(r.get("name", "")) == "TodoWrite" for r in tool_results)
+            if (wrote_files or ran_bash_ok) and not called_todo and current:
+                _sid = str(current.get("id", "") or "")
+                if _sid:
+                    _nudge = (
+                        f"[todo-sync] You made progress on the current step but did not update TodoWrite.\n"
+                        f"Call TodoWrite to mark completed subtasks and create new ones.\n"
+                        f"Each subtask must include parent_step_id='{_sid}'."
+                    )
+                    self.messages.append({"role": "system", "content": _nudge, "ts": now_ts()})
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -10765,9 +11155,9 @@ class SessionState:
             c = todo.get("content", "")
             ev = todo.get("evidence", "")
             af = {
-                "in_progress": f"Working on: {c}",
-                "completed": f"Done: {c}" + (f" ({ev})" if ev else ""),
-            }.get(s, f"Pending: {c}")
+                "in_progress": self._ui_text("todo_working", content=c),
+                "completed": self._ui_text("todo_completed", content=f"{c}" + (f" ({ev})" if ev else "")),
+            }.get(s, self._ui_text("todo_pending", content=c))
             rows.append({"key": f"bb:proj:{todo.get('id', '')}", "content": c, "status": s, "activeForm": af})
         return rows
 
@@ -10865,8 +11255,11 @@ class SessionState:
             todo_out = self.todo.update(merged)
         except Exception:
             return
-        if todo_out != "No todo changes." and reason:
-            self._emit("status", {"summary": f"project todos synced ({trim(reason, 120)})"})
+        if todo_out != self.todo.no_changes_text() and reason:
+            self._emit(
+                "status",
+                {"summary": self._ui_text("status_project_todos_synced", reason=trim(reason, 120))},
+            )
 
     def _blackboard_set_status(self, status: str, note: str = ""):
         board = self._ensure_blackboard()
@@ -11658,6 +12051,14 @@ class SessionState:
         _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
         if _level_floor > 0 and int(level) < _level_floor:
             level = _level_floor
+        # Ceiling protection: plan-approved risk lock prevents escalation above ceiling
+        _level_ceiling = int(getattr(self, 'runtime_task_level_ceiling', 0) or 0)
+        if _level_ceiling > 0 and int(level) > _level_ceiling:
+            level = _level_ceiling
+            _ceiling_policy = TASK_LEVEL_POLICIES.get(level, {})
+            mode = str(_ceiling_policy.get("execution_mode", mode) or mode)
+            if _ceiling_policy.get("complexity"):
+                complexity = _ceiling_policy["complexity"]
         _complexity_floor = str(getattr(self, 'runtime_complexity_floor', '') or '').strip()
         if _complexity_floor == "complex" and complexity == "simple":
             complexity = "complex"
@@ -13638,6 +14039,14 @@ class SessionState:
         effective_level = int(task_level)
         if int(self.runtime_task_level_floor or 0) > 0:
             effective_level = max(effective_level, int(self.runtime_task_level_floor))
+        # Ceiling protection: plan-approved risk lock prevents manager from escalating above ceiling
+        _level_ceiling = int(self.runtime_task_level_ceiling or 0)
+        if _level_ceiling > 0 and effective_level > _level_ceiling:
+            effective_level = _level_ceiling
+            # Re-derive execution_mode and participants from the capped level's policy
+            _capped_policy = TASK_LEVEL_POLICIES.get(effective_level, {})
+            execution_mode = str(_capped_policy.get("execution_mode", execution_mode) or execution_mode)
+            participants = list(_capped_policy.get("participants", participants) or participants)
         profile["task_level"] = effective_level
         profile["execution_mode"] = execution_mode
         profile["participants"] = list(participants)
@@ -13886,14 +14295,10 @@ class SessionState:
                         _active_step_id = str(_pt.get("id", "") or "")
                         break
             todo_update_note = (
-                f"TODO UPDATE: Call TodoWrite at the START to set subtasks for THIS step ONLY.\n"
-                f"Each subtask MUST include parent_step_id='{_active_step_id}'.\n"
-                f"CRITICAL SCOPE RULE:\n"
-                f"- Create 3-5 subtasks that break down ONLY the current step's work.\n"
-                f"- Do NOT create subtasks for other plan steps (do NOT list step 2, 3, 4 etc.).\n"
-                f"- Do NOT duplicate the plan step titles as subtasks.\n"
-                f"- Each subtask should be a concrete action within THIS step.\n"
-                f"Mark each subtask completed as you finish it. When ALL are done, the step auto-advances.\n"
+                f"TODO PLANNING: At the START, call TodoWrite to list ALL subtasks (status=pending, parent_step_id='{_active_step_id}').\n"
+                f"SCOPE RULE: Create 3-5 subtasks for THIS step ONLY — do NOT list other plan steps or duplicate plan step titles.\n"
+                f"As you complete each subtask, update it to status=completed.\n"
+                f"When ALL subtasks are done: call finish_current_task to signal step completion.\n"
             )
         # Build step_files context note for cross-agent file visibility
         step_files_note = ""
@@ -14535,8 +14940,19 @@ class SessionState:
         if len(self.agent_messages) > int(am_limit * 1.5):
             self.agent_messages = self.agent_messages[-am_limit:]
 
+    def _set_ui_language(self, language: str, *, relabel_todos: bool = True) -> str:
+        lang = normalize_ui_language(language)
+        self.ui_language = lang
+        todo = getattr(self, "todo", None)
+        if isinstance(todo, TodoManager):
+            todo.set_language(lang, relabel=relabel_todos)
+        return lang
+
+    def _ui_text(self, key: str, **kwargs) -> str:
+        return backend_i18n_text(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE), key, **kwargs)
+
     def _agent_display_name(self, role: str) -> str:
-        return AGENT_ROLE_LABELS.get(self._sanitize_agent_role(role), str(role or "").strip().title() or "Agent")
+        return backend_role_label(self._sanitize_agent_role(role), getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
 
     def _emit_agent_message(self, role: str, text: str, summary: str = ""):
         role_key = self._sanitize_agent_role(role)
@@ -14850,7 +15266,6 @@ class SessionState:
                 {
                     "content": content,
                     "status": "pending",
-                    "activeForm": f"Pending: {content}",
                 }
             )
         if not clean_items:
@@ -14859,7 +15274,6 @@ class SessionState:
         if in_progress_index < 0 or in_progress_index >= len(clean_items):
             in_progress_index = 0
         clean_items[in_progress_index]["status"] = "in_progress"
-        clean_items[in_progress_index]["activeForm"] = f"Working on: {clean_items[in_progress_index]['content']}"
         return self.todo.update(clean_items)
 
     def _analyze_todo_result(self, tool_name: str, output: str) -> tuple[str, str]:
@@ -14869,7 +15283,7 @@ class SessionState:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
-        if "no todo changes" in low:
+        if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if self.todo.snapshot():
                 return ("ok", "todo already up to date")
             return ("repeat", "same todo payload repeated")
@@ -15246,22 +15660,18 @@ class SessionState:
             {
                 "content": f"Triage failure root cause ({trim(reason, 120)})",
                 "status": "in_progress",
-                "activeForm": f"Working on: Triage failure root cause ({trim(reason, 80)})",
             },
             {
                 "content": "Recover critical context with context_recall if compacted/truncated",
                 "status": "pending",
-                "activeForm": "Pending: Recover critical context with context_recall if compacted/truncated",
             },
             {
                 "content": f"Split goal into 3-7 subtasks and execute one tool step at a time ({trim(goal, 90)})",
                 "status": "pending",
-                "activeForm": "Pending: Split goal into 3-7 subtasks and execute one tool step at a time",
             },
             {
                 "content": "If still blocked, output explicit blocker and required next input",
                 "status": "pending",
-                "activeForm": "Pending: If still blocked, output explicit blocker and required next input",
             },
         ]
         try:
@@ -15698,7 +16108,7 @@ class SessionState:
                     isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
                     for it in new_items
                 ):
-                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: removed
+                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: E501
                     pass  # Skills are loaded on-demand by the model
             except Exception:
                 pass
@@ -15762,6 +16172,21 @@ class SessionState:
                         )
                     },
                 )
+            # finish_current_task is a strong signal — advance plan step if active
+            try:
+                _bb_fin = self._ensure_blackboard()
+                _cur_ps = next(
+                    (t for t in _bb_fin.get("project_todos", [])
+                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                    None,
+                )
+                if _cur_ps:
+                    self._advance_plan_step(
+                        evidence=f"finish_current_task called: {trim(summary, 100)}",
+                        actor=str(role_key or "developer"),
+                    )
+            except Exception:
+                pass
             return (
                 f"{name} acknowledged{': ' + summary if summary else ''}; "
                 f"todo_completed={updated}"
@@ -16869,6 +17294,8 @@ class SessionState:
 
     def _multi_agent_sync_blackboard_worker(self, *, pinned_selection: str):
         idle_counts = {role: 0 for role in AGENT_ROLES}
+        _prev_delegation_hash = ""
+        _repeat_delegation_count = 0
         media_last_user_ts = -1.0
         media_inputs_pool: list[dict] | None = None
         media_seen_ts_by_role: dict[str, float] = {
@@ -16880,6 +17307,26 @@ class SessionState:
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
         budget_val = self._blackboard_round_budget(board)
+        # Fix 7: Pure sync no-plan — if complex task and no plan steps exist, prompt manager
+        # to create them before delegating. Guard: only fires when no plan_step items exist,
+        # so plan+sync mode (which already has plan steps) is completely unaffected.
+        _sync_has_plan = any(
+            isinstance(t, dict) and t.get("category") == "plan_step"
+            for t in board.get("project_todos", [])
+        )
+        _sync_complexity = str(profile.get("complexity", "simple") or "simple")
+        if not _sync_has_plan and _sync_complexity in ("moderate", "complex", "expert"):
+            self.messages.append({
+                "role": "system",
+                "content": (
+                    "[SYNC-INIT] No plan steps found for this task. Before delegating to workers, "
+                    "use write_to_blackboard to add 3-5 plan_step items to project_todos. "
+                    'Each item: {"category":"plan_step","content":"N. Step title",'
+                    '"status":"pending","owner":"manager"}. '
+                    "This enables proper todo tracking and completion detection."
+                ),
+                "ts": now_ts(),
+            })
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -16975,6 +17422,29 @@ class SessionState:
                 self._mark_all_done_silently(note)
                 self._emit("status", {"summary": "manager decided finish; run paused"})
                 break
+            # Detect manager stuck: same instruction repeated N times → force advance + break
+            import hashlib as _hl_mgr
+            _cur_hash = _hl_mgr.sha1((target + "|" + instruction).encode("utf-8")).hexdigest()[:12]
+            if _cur_hash == _prev_delegation_hash:
+                _repeat_delegation_count += 1
+            else:
+                _repeat_delegation_count = 0
+            _prev_delegation_hash = _cur_hash
+            if _repeat_delegation_count >= 3:
+                self._emit("status", {"summary": f"manager stuck: repeated identical delegation x{_repeat_delegation_count + 1}; forcing advance"})
+                _bb_stuck = self._ensure_blackboard()
+                _stuck_step = next(
+                    (t for t in _bb_stuck.get("project_todos", [])
+                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                    None,
+                )
+                if _stuck_step:
+                    self._advance_plan_step(evidence="manager stuck: repeated delegation", actor="manager")
+                else:
+                    self._blackboard_mark_approved("manager stuck loop break", "manager")
+                    self._mark_all_done_silently("manager stuck: repeated delegation break")
+                    break
+                _repeat_delegation_count = 0
             role = self._sanitize_agent_role(target) or "developer"
             self._inject_manager_instruction(
                 role,
@@ -17003,6 +17473,42 @@ class SessionState:
             self._blackboard_update_from_worker_step(role, step)
             # Post-execution plan step advancement (replaces pre-execution advancement)
             self._post_execution_plan_step_check(route, step if isinstance(step, dict) else {})
+            # Fix 6b: Pure sync no-plan — read worker-done signal and notify manager
+            _bb_sync = self._ensure_blackboard()
+            if _bb_sync.pop("sync_worker_round_done", False):
+                self._save_blackboard(_bb_sync)
+                self._append_agent_context_message(
+                    "manager",
+                    {
+                        "role": "system",
+                        "content": (
+                            "[worker-done] Worker completed the current task and called finish_current_task. "
+                            "Assess progress: assign the next task or conclude the session."
+                        ),
+                        "ts": now_ts(),
+                        "agent_role": "manager",
+                    },
+                    mirror_to_global=False,
+                )
+            # Nudge: if worker wrote files but didn't call TodoWrite, inject reminder
+            _step_dict = step if isinstance(step, dict) else {}
+            _step_results = _step_dict.get("tool_results", []) or []
+            _wrote = any(isinstance(r, dict) and r.get("ok") and str(r.get("name", "")) in ("write_file", "edit_file") for r in _step_results)
+            _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) == "TodoWrite" for r in _step_results)
+            if _wrote and not _did_todo:
+                _bb_nudge = self._ensure_blackboard()
+                _cur_step = next((t for t in _bb_nudge.get("project_todos", []) if t.get("category") == "plan_step" and t.get("status") == "in_progress"), None)
+                if _cur_step:
+                    _nid = str(_cur_step.get("id", "") or "")
+                    if _nid:
+                        _nudge_msg = (
+                            f"[todo-sync] You made progress but did not call TodoWrite.\n"
+                            f"Update your subtasks: mark completed ones, add new ones if needed.\n"
+                            f"Each subtask must include parent_step_id='{_nid}'."
+                        )
+                        self._append_agent_context_message(role, {
+                            "role": "system", "content": _nudge_msg, "ts": now_ts(), "agent_role": role,
+                        }, mirror_to_global=False)
             # ── Agent turn 结束后的终止检测：结论性回复 + 无待办 + 无错误 → 自动 finish ──
             agent_text = self._latest_agent_assistant_text(role)
             if (
@@ -17766,21 +18272,21 @@ class SessionState:
 
     def _emit_stall_conclusion(self, trigger_source: str, last_fault_reason: str = "", stall_context: dict | None = None):
         ctx = stall_context or self._collect_stall_context(last_fault_reason=last_fault_reason)
-        lines = ["## 执行遇阻\n"]
-        lines.append(f"**停止原因：** {trim(str(trigger_source), 200)}")
+        lines = [self._ui_text("stall_execution_blocked_title")]
+        lines.append(self._ui_text("stall_stop_reason", reason=trim(str(trigger_source), 200)))
         if last_fault_reason:
-            lines.append(f"**错误详情：** {trim(str(last_fault_reason), 400)}")
+            lines.append(self._ui_text("stall_error_details", detail=trim(str(last_fault_reason), 400)))
         error_ctx = str(ctx.get("error_context", "") or "").strip()
         if error_ctx:
-            lines.append(f"\n**最近错误：**\n```\n{trim(error_ctx, 600)}\n```")
+            lines.append(f"\n{self._ui_text('stall_recent_error')}\n```\n{trim(error_ctx, 600)}\n```")
         repeated = ctx.get("repeated_tools", [])
         if repeated:
-            lines.append(f"\n**重复工具调用：** {', '.join(repeated)}")
-        lines.append("\n**建议操作：**")
-        lines.append("1. 检查环境是否满足任务要求（文件是否存在、依赖是否安装）")
-        lines.append("2. 手动执行失败的命令，确认错误信息")
-        lines.append("3. 提供更具体的指导或修改任务描述后重试")
-        lines.append("\n请提供进一步指示，我将根据新信息继续执行。")
+            lines.append(f"\n{self._ui_text('stall_repeated_tools', tools=', '.join(repeated))}")
+        lines.append(f"\n{self._ui_text('stall_suggested_actions')}")
+        lines.append(self._ui_text("stall_action_1"))
+        lines.append(self._ui_text("stall_action_2"))
+        lines.append(self._ui_text("stall_action_3"))
+        lines.append(f"\n{self._ui_text('stall_continue_prompt')}")
         conclusion_md = "\n".join(lines)
         self.messages.append({
             "role": "assistant",
@@ -17796,29 +18302,36 @@ class SessionState:
         })
 
     def _format_stall_findings(self, stall_context: dict) -> str:
-        lines = ["### 卡死分析\n"]
+        lines = [self._ui_text("stall_analysis_title")]
         goal = str(stall_context.get("goal", "") or "").strip()
         if goal:
-            lines.append(f"**目标：** {trim(goal, 400)}")
-        lines.append(f"**严重度分数：** {stall_context.get('severity_score', 0)}")
+            lines.append(self._ui_text("stall_goal", goal=trim(goal, 400)))
+        lines.append(self._ui_text("stall_severity", score=stall_context.get("severity_score", 0)))
         events = stall_context.get("stall_events", [])
         if events:
-            lines.append("\n**卡死事件序列：**")
+            lines.append(f"\n{self._ui_text('stall_events')}")
             for ev in events[-6:]:
                 if isinstance(ev, dict):
-                    lines.append(f"- [{ev.get('source', '?')}] +{ev.get('points', 0)} → 累计 {ev.get('cumulative', '?')}")
+                    lines.append(
+                        self._ui_text(
+                            "stall_event_line",
+                            source=ev.get("source", "?"),
+                            points=ev.get("points", 0),
+                            cumulative=ev.get("cumulative", "?"),
+                        )
+                    )
         error_ctx = str(stall_context.get("error_context", "") or "").strip()
         if error_ctx:
-            lines.append(f"\n**错误上下文：**\n```\n{trim(error_ctx, 500)}\n```")
+            lines.append(f"\n{self._ui_text('stall_error_context')}\n```\n{trim(error_ctx, 500)}\n```")
         repeated = stall_context.get("repeated_tools", [])
         if repeated:
-            lines.append(f"\n**重复工具：** {', '.join(repeated)}")
+            lines.append(f"\n{self._ui_text('stall_repeated_tools_label', tools=', '.join(repeated))}")
         fault_reason = str(stall_context.get("last_fault_reason", "") or "").strip()
         if fault_reason:
-            lines.append(f"**最后故障原因：** {trim(fault_reason, 200)}")
+            lines.append(self._ui_text("stall_last_fault_reason", reason=trim(fault_reason, 200)))
         open_todos = stall_context.get("open_todos", [])
         if open_todos:
-            lines.append("\n**未完成任务：**")
+            lines.append(f"\n{self._ui_text('stall_open_todos')}")
             for t in open_todos[:4]:
                 lines.append(f"- {trim(str(t), 100)}")
         return "\n".join(lines)
@@ -17992,8 +18505,9 @@ class SessionState:
                 if not content:
                     continue
                 if content in {
-                    "继续", "continue", "go on", "接着", "a", "b", "c",
-                    "方案a", "方案b", "方案c", "keep going", "proceed",
+                    "继续", "繼續", "continue", "go on", "接着", "接著", "続行", "続けて",
+                    "a", "b", "c", "方案a", "方案b", "方案c", "案a", "案b", "案c",
+                    "keep going", "proceed", "確認", "确认",
                 }:
                     continue
                 if len(content) > 10:
@@ -18060,10 +18574,10 @@ class SessionState:
 
     def _format_plan_file_preselection(self, proposal: dict) -> str:
         """Full MD content with ALL options for model review (no char limit)."""
-        lines = ["# Execution Plan Proposals\n"]
+        lines = [self._ui_text("plan_file_proposals_title")]
         context = str(proposal.get("context", "") or "").strip()
         if context:
-            lines.append(f"## Background\n{context}\n")
+            lines.append(self._ui_text("plan_file_background", context=context))
         recommended = str(proposal.get("recommended", "") or "").strip()
         options = proposal.get("options", [])
         if not isinstance(options, list):
@@ -18073,9 +18587,9 @@ class SessionState:
                 continue
             opt_id = str(opt.get("id", "") or "").strip()
             title = str(opt.get("title", "") or "").strip()
-            header = f"## Option {opt_id}: {title}"
+            header = self._ui_text("plan_file_option", id=opt_id, title=title)
             if opt_id == recommended:
-                header += " [RECOMMENDED]"
+                header += self._ui_text("plan_file_recommended")
             lines.append("---\n")
             lines.append(header)
             summary = str(opt.get("summary", "") or "").strip()
@@ -18083,7 +18597,7 @@ class SessionState:
                 lines.append(summary)
             steps = opt.get("steps", [])
             if isinstance(steps, list) and steps:
-                lines.append("\n### Steps")
+                lines.append(f"\n{self._ui_text('plan_file_steps')}")
                 import re as _re_plan
                 _mid_re = _re_plan.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
                 for i, s in enumerate(steps):
@@ -18102,16 +18616,16 @@ class SessionState:
                         lines.append(f"{i + 1}. {step_str}")
             pros = str(opt.get("pros", "") or "").strip()
             if pros:
-                lines.append(f"\n**Pros:** {pros}")
+                lines.append(f"\n{self._ui_text('plan_file_pros', text=pros)}")
             cons = str(opt.get("cons", "") or "").strip()
             if cons:
-                lines.append(f"**Cons:** {cons}")
+                lines.append(self._ui_text("plan_file_cons", text=cons))
             risk = str(opt.get("risk", "") or "").strip()
             if risk:
-                lines.append(f"**Risk:** {risk}")
+                lines.append(self._ui_text("plan_file_risk", text=risk))
             lines.append("")
         lines.append("---")
-        lines.append("> Awaiting user choice.")
+        lines.append(self._ui_text("plan_file_awaiting_choice"))
         return "\n".join(lines)
 
     def _format_plan_file_execution(self, choice_id: str) -> str:
@@ -18131,14 +18645,14 @@ class SessionState:
         completed = sum(1 for t in plan_todos if t.get("status") == "completed")
         current_idx = completed + 1
 
-        lines = [f"# Active Plan: {title}\n"]
-        lines.append(f"> Status: EXECUTING | Step {current_idx}/{total}")
-        lines.append(f"> Chosen: Option {choice_id}")
+        lines = [self._ui_text("active_plan_title", title=title)]
+        lines.append(self._ui_text("active_plan_status", current=current_idx, total=total))
+        lines.append(self._ui_text("active_plan_chosen", choice=choice_id))
         from datetime import datetime as _dt_cls
-        lines.append(f"> Updated: {_dt_cls.now().isoformat(timespec='seconds')}\n")
+        lines.append(self._ui_text("active_plan_updated", updated=_dt_cls.now().isoformat(timespec="seconds")))
         if summary:
-            lines.append(f"## Summary\n{summary}\n")
-        lines.append("## Steps\n")
+            lines.append(self._ui_text("active_plan_summary", summary=summary))
+        lines.append(self._ui_text("active_plan_steps"))
         import re as _re_exec
         _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
         for t in plan_todos:
@@ -18152,22 +18666,22 @@ class SessionState:
             if status == "completed":
                 actor = str(t.get("completed_by", "") or "")
                 evidence = str(t.get("evidence", "") or "")
-                lines.append(f"- [x] Step {idx}: {header}")
+                lines.append(self._ui_text("active_plan_step_done", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
                 meta_parts = []
                 if actor:
-                    meta_parts.append(f"Completed by: {actor}")
+                    meta_parts.append(self._ui_text("active_plan_completed_by", actor=actor))
                 if evidence:
-                    meta_parts.append(f"Evidence: {evidence}")
+                    meta_parts.append(self._ui_text("active_plan_evidence", evidence=evidence))
                 if meta_parts:
                     lines.append(f"  > {' | '.join(meta_parts)}")
             elif status == "in_progress":
-                lines.append(f"- [>] Step {idx}: {header}  <-- CURRENT")
+                lines.append(self._ui_text("active_plan_step_current", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
             else:
-                lines.append(f"- [ ] Step {idx}: {header}")
+                lines.append(self._ui_text("active_plan_step_pending", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
         return "\n".join(lines) + "\n"
@@ -18186,10 +18700,10 @@ class SessionState:
 
     def _format_plan_bubble_preselection(self, proposal: dict) -> str:
         """Condensed bubble for UI (under PLAN_BUBBLE_MAX_CHARS). No full step listing."""
-        lines = ["## 📋 执行方案\n"]
+        lines = [self._ui_text("plan_bubble_title")]
         context = str(proposal.get("context", "") or "").strip()
         if context:
-            lines.append(f"**背景：** {trim(context, 300)}\n")
+            lines.append(self._ui_text("plan_bubble_background", context=trim(context, 300)))
         recommended = str(proposal.get("recommended", "") or "").strip()
         options = proposal.get("options", [])
         if not isinstance(options, list):
@@ -18200,9 +18714,9 @@ class SessionState:
             opt_id = str(opt.get("id", "") or "").strip()
             title = str(opt.get("title", "") or "").strip()
             is_rec = opt_id == recommended
-            header = f"### 方案 {opt_id}: {title}"
+            header = self._ui_text("plan_bubble_option", id=opt_id, title=title)
             if is_rec:
-                header += " ⭐推荐"
+                header += self._ui_text("plan_bubble_recommended")
             lines.append(header)
             summary = str(opt.get("summary", "") or "").strip()
             if summary:
@@ -18210,14 +18724,14 @@ class SessionState:
             steps = opt.get("steps", [])
             step_count = len(steps) if isinstance(steps, list) else 0
             risk = str(opt.get("risk", "") or "").strip()
-            meta = f"步骤数: {step_count}"
+            meta = self._ui_text("plan_bubble_steps", count=step_count)
             if risk:
-                meta += f" | 风险: {risk}"
+                meta += f" | {self._ui_text('plan_bubble_risk', risk=risk)}"
             lines.append(meta)
             lines.append("")
         lines.append("---")
-        lines.append(f"完整方案详见: `{PLAN_FILE_RELATIVE_PATH}`")
-        lines.append('请回复选择（如"方案A"、"A"、"选1"），或输入修改意见。')
+        lines.append(self._ui_text("plan_bubble_full_ref", path=PLAN_FILE_RELATIVE_PATH))
+        lines.append(self._ui_text("plan_bubble_reply"))
         return trim("\n".join(lines), PLAN_BUBBLE_MAX_CHARS)
 
     def _plan_file_read_instruction(self) -> str:
@@ -18233,19 +18747,14 @@ class SessionState:
                 break
         todo_note = ""
         if active_step_id:
-            todo_note = (
-                f"\nTODO UPDATE: Call TodoWrite at the START to set subtasks for the current step (Step {active_step_idx}) ONLY.\n"
-                f"Each subtask MUST include parent_step_id='{active_step_id}'.\n"
-                f"Create 3-5 subtasks that break down ONLY the current step's work.\n"
-                f"Do NOT create subtasks for other plan steps. Mark each subtask completed as you finish it.\n"
+            todo_note = self._ui_text(
+                "plan_read_todo_note",
+                step_label=self._ui_text("plan_step_label", step=active_step_idx, total=int(bb.get("plan_step_total", 0) or 0)),
+                parent_step_id=active_step_id,
             )
         return (
-            f"[plan-file] The approved execution plan is at `{PLAN_FILE_RELATIVE_PATH}`.\n"
-            f"Use: read_file {PLAN_FILE_RELATIVE_PATH} to review full steps and live status.\n"
-            "The plan file is the authoritative source for step ordering and completion status.\n"
-            "Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing.\n"
-            "If a step references a skill or workflow, call load_skill to load it before proceeding."
-            f"{todo_note}"
+            self._ui_text("plan_read_instruction", path=PLAN_FILE_RELATIVE_PATH)
+            + todo_note
         )
 
     @staticmethod
@@ -18340,10 +18849,10 @@ class SessionState:
     # ── (legacy) _format_plan_proposal_markdown ──────────────────────
 
     def _format_plan_proposal_markdown(self, proposal: dict) -> str:
-        lines = ["## 📋 执行方案\n"]
+        lines = [self._ui_text("plan_proposal_title")]
         context = str(proposal.get("context", "") or "").strip()
         if context:
-            lines.append(f"### 背景分析\n{context}\n")
+            lines.append(self._ui_text("plan_proposal_background", context=context))
         recommended = str(proposal.get("recommended", "") or "").strip()
         options = proposal.get("options", [])
         if not isinstance(options, list):
@@ -18354,30 +18863,30 @@ class SessionState:
             opt_id = str(opt.get("id", "") or "").strip()
             title = str(opt.get("title", "") or "").strip()
             is_recommended = opt_id == recommended
-            header = f"### 方案 {opt_id}: {title}"
+            header = self._ui_text("plan_proposal_option", id=opt_id, title=title)
             if is_recommended:
-                header += " ⭐推荐"
+                header += self._ui_text("plan_proposal_recommended")
             lines.append(header)
             summary = str(opt.get("summary", "") or "").strip()
             if summary:
                 lines.append(summary)
             steps = opt.get("steps", [])
             if isinstance(steps, list) and steps:
-                lines.append("\n**步骤：**")
+                lines.append(f"\n{self._ui_text('plan_proposal_steps')}")
                 for i, s in enumerate(steps):
                     lines.append(f"{i+1}. {s}")
             pros = str(opt.get("pros", "") or "").strip()
             if pros:
-                lines.append(f"\n**优势：** {pros}")
+                lines.append(f"\n{self._ui_text('plan_proposal_pros', text=pros)}")
             cons = str(opt.get("cons", "") or "").strip()
             if cons:
-                lines.append(f"**劣势：** {cons}")
+                lines.append(self._ui_text("plan_proposal_cons", text=cons))
             risk = str(opt.get("risk", "") or "").strip()
             if risk:
-                lines.append(f"**风险：** {risk}")
+                lines.append(self._ui_text("plan_proposal_risk", text=risk))
             lines.append("")
         lines.append("---")
-        lines.append('请回复选择（如"方案A"、"A"、"选1"），或输入修改意见。')
+        lines.append(self._ui_text("plan_proposal_reply"))
         return "\n".join(lines)
 
     def _parse_plan_choice(self, text: str, proposal: dict) -> str:
@@ -18394,14 +18903,14 @@ class SessionState:
             return low.upper()
         # "方案A", "方案 A", "option A"
         import re
-        m = re.search(r'(?:方案|option|选项)\s*([a-zA-Z0-9])', low, re.IGNORECASE)
+        m = re.search(r'(?:方案|選項|选项|option|案|プラン)\s*([a-zA-Z0-9])', low, re.IGNORECASE)
         if m:
             candidate = m.group(1).upper()
             if candidate in option_ids:
                 return candidate
         # "选1", "第1个", "第一个"
         num_map = {"一": "1", "二": "2", "三": "3", "1": "1", "2": "2", "3": "3"}
-        m2 = re.search(r'(?:选|第)\s*([一二三1-3])', low)
+        m2 = re.search(r'(?:选|選|第|choose|pick)\s*([一二三1-3])', low, re.IGNORECASE)
         if m2:
             idx_str = num_map.get(m2.group(1), "")
             if idx_str:
@@ -18410,7 +18919,10 @@ class SessionState:
                     return option_ids[idx]
         # "继续"/"确认"/"推荐" → pick recommended
         recommended = str(proposal.get("recommended", "") or "").strip()
-        confirm_tokens = ("继续", "确认", "推荐", "推荐方案", "go", "proceed", "continue", "yes", "ok")
+        confirm_tokens = (
+            "继续", "繼續", "确认", "確認", "推荐", "推薦", "推荐方案", "推薦方案",
+            "go", "proceed", "continue", "yes", "ok", "続行", "確認する", "おすすめ", "推奨",
+        )
         if any(tok in low for tok in confirm_tokens) and recommended:
             return recommended
         # --- Slow path: LLM semantic matching ---
@@ -18486,7 +18998,33 @@ class SessionState:
         self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen.get('title', '')}")
         # Lock complexity/level floor to prevent manager downgrade during plan execution
         self.runtime_complexity_floor = str(self.runtime_task_complexity or "complex")
-        self.runtime_task_level_floor = int(self.runtime_task_level or 4)
+        # --- Risk-based complexity lock: set floor AND ceiling from plan option's risk field ---
+        # Read risk NOW — blackboard compaction later drops the risk key from options
+        _plan_risk = str(chosen.get("risk", "") or "").strip().lower()
+        if _plan_risk not in ("low", "medium", "high"):
+            # Fallback: scan option summary/description for risk label
+            import re as _re_risk
+            _rt = str(chosen.get("summary", "") or chosen.get("description", "") or "")
+            _rm = _re_risk.search(r'风险[：:]\s*(low|medium|high)|risk[：:]\s*(low|medium|high)', _rt, _re_risk.I)
+            _plan_risk = ((_rm.group(1) or _rm.group(2)) if _rm else "medium").lower()
+        _current_level = int(self.runtime_task_level or 3)
+        _user_override = int(getattr(self, "user_task_level_override", 0) or 0)
+        if _user_override > 0:
+            # User explicitly set level → absolute lock, no up and no down
+            self.runtime_task_level_floor = _user_override
+            self.runtime_task_level_ceiling = _user_override
+        elif _plan_risk == "medium":
+            # Medium risk → exact lock at current level
+            self.runtime_task_level_floor = _current_level
+            self.runtime_task_level_ceiling = _current_level
+        elif _plan_risk == "high":
+            # High risk → allow +1 upgrade, no downgrade
+            self.runtime_task_level_floor = _current_level
+            self.runtime_task_level_ceiling = min(5, _current_level + 1)
+        else:  # low
+            # Low risk → allow -1 downgrade, no upgrade
+            self.runtime_task_level_floor = max(1, _current_level - 1)
+            self.runtime_task_level_ceiling = _current_level
         # Auto-create todos from plan steps → write into bb["project_todos"]
         steps = self._group_plan_steps(chosen.get("steps", []))
         if steps and isinstance(steps, list):
@@ -18524,7 +19062,6 @@ class SessionState:
                             "key": f"bb:proj:{t['id']}",
                             "content": t["content"],
                             "status": t["status"],
-                            "activeForm": f"Working on: {t['content']}" if t["status"] == "in_progress" else f"Pending: {t['content']}",
                         }
                         for t in plan_todos[:40]
                     ])
@@ -19869,6 +20406,11 @@ class SessionState:
                         )
                     },
                 )
+            # Generate completion summary bubble before finishing
+            try:
+                self._generate_run_completion_summary()
+            except Exception:
+                pass
             self._emit("status", {"summary": "run finished"})
             cb = self.run_finished_callback
             if cb:
