@@ -2780,6 +2780,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "body": (
             "# Finish Protocol\n"
             "- Call finish_current_task when all required work is complete.\n"
+            "- If an approved plan still has pending or in_progress steps, do NOT call finish_current_task yet.\n"
             "- Include a concise summary of what was done.\n"
             "- For multi-agent mode: finish triggers auto-summary from blackboard state.\n"
             "- Do not finish if there are known failing tests or unresolved blockers.\n"

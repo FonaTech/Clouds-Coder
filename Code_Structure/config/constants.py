@@ -1337,7 +1337,7 @@ BACKEND_I18N["en"].update(
         "step_completed_evidence": "step completed",
         "plan_step_summary": "📋 Plan step {step}/{total}: {content}",
         "plan_step_label": "Step {step}/{total}",
-        "plan_step_hint": "[plan-step-advance] Previous step completed. Now at {step_label}: {step_text}\nRead updated plan: read_file {plan_path}\nCall TodoWrite to set subtasks for THIS step ONLY.\nEach subtask MUST include parent_step_id='{parent_step_id}'. Create 3-5 items, one marked in_progress, others pending.\nDo NOT create subtasks for other plan steps.",
+        "plan_step_hint": "Moved to {step_label}: {step_text}\nRead the updated plan with: read_file {plan_path}\nNow call TodoWrite only for this step. Each subtask must include parent_step_id='{parent_step_id}'. Create 3-5 items with exactly one in_progress. Do not create subtasks for other plan steps.",
         "stall_execution_blocked_title": "## Execution Blocked\n",
         "stall_stop_reason": "**Stop reason:** {reason}",
         "stall_error_details": "**Error details:** {detail}",
@@ -1385,8 +1385,8 @@ BACKEND_I18N["en"].update(
         "plan_bubble_risk": "Risk: {risk}",
         "plan_bubble_full_ref": "Full plan: `{path}`",
         "plan_bubble_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
-        "plan_read_instruction": "[plan-file] The approved execution plan is at `{path}`.\nUse: read_file {path} to review full steps and live status.\nThe plan file is the authoritative source for step ordering and completion status.\nExecute steps IN ORDER. Do NOT skip ahead. Mark the current step done before advancing.\nIf a step references a skill or workflow, call load_skill before proceeding.",
-        "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-5 subtasks for THIS step ONLY — do NOT list subtasks for other plan steps. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. After EACH completed subtask, immediately call TodoWrite again to mark it completed and move the next subtask to in_progress. Do NOT wait until the end of the step to update todos. When ALL subtasks are done, call finish_current_task to signal step completion.\n",
+        "plan_read_instruction": "Plan approved. Read `{path}` with `read_file {path}` for the authoritative step order and live status.\nExecute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
+        "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-5 subtasks for THIS step ONLY — do NOT list subtasks for other plan steps. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. After EACH completed subtask, immediately call TodoWrite again to mark it completed and move the next subtask to in_progress. Do NOT wait until the end of the step to update todos. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
         "plan_proposal_title": "## 📋 Execution Plans\n",
         "plan_proposal_background": "### Background Analysis\n{context}\n",
         "plan_proposal_option": "### Option {id}: {title}",
@@ -1432,7 +1432,7 @@ BACKEND_I18N["zh-CN"].update(
         "step_completed_evidence": "步骤已完成",
         "plan_step_summary": "📋 计划步骤 {step}/{total}：{content}",
         "plan_step_label": "步骤 {step}/{total}",
-        "plan_step_hint": "[plan-step-advance] 上一步已完成。当前来到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n现在调用 TodoWrite，只为当前步骤拆分子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。创建 3-5 项，其中 1 项为 in_progress，其余为 pending。\n不要为其他计划步骤创建子任务。",
+        "plan_step_hint": "已切换到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n现在调用 TodoWrite，只为当前步骤拆分子任务。每个子任务都必须包含 parent_step_id='{parent_step_id}'。创建 3-5 项，并且只能有 1 项是 in_progress。不要为其他计划步骤创建子任务。",
         "stall_execution_blocked_title": "## 执行遇阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**错误详情：** {detail}",
@@ -1480,7 +1480,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_bubble_risk": "风险：{risk}",
         "plan_bubble_full_ref": "完整方案详见：`{path}`",
         "plan_bubble_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
-        "plan_read_instruction": "[plan-file] 已批准的执行计划位于 `{path}`。\n使用：read_file {path} 查看完整步骤与实时状态。\n计划文件是步骤顺序与完成状态的唯一权威来源。\n请按顺序执行步骤，不要跳步。完成当前步骤后再推进下一步。\n如果某一步引用了 skill 或 workflow，继续前先调用 load_skill。",
+        "plan_read_instruction": "计划已批准。请用 `read_file {path}` 读取 `{path}`，它是步骤顺序和实时状态的唯一权威来源。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
         "plan_read_todo_note": "\nTODO 更新：一开始就调用 TodoWrite，只为当前步骤（{step_label}）设置子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。\n创建 3-5 个只属于当前步骤的子任务；如果当前步骤已经有子任务，就先继续当前 in_progress 子任务，不要重写路线。\n每完成一个子任务后，都要立刻再次调用 TodoWrite，将它标记为 completed，并把下一个子任务切到 in_progress。\n不要等到整步结束后才统一更新。\n不要为其他计划步骤创建子任务。\n",
         "plan_proposal_title": "## 📋 执行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -1527,7 +1527,7 @@ BACKEND_I18N["zh-TW"].update(
         "step_completed_evidence": "步驟已完成",
         "plan_step_summary": "📋 計畫步驟 {step}/{total}：{content}",
         "plan_step_label": "步驟 {step}/{total}",
-        "plan_step_hint": "[plan-step-advance] 上一步已完成。現在來到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n現在呼叫 TodoWrite，只為目前步驟拆分子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。建立 3-5 項，其中 1 項為 in_progress，其餘為 pending。\n不要為其他計畫步驟建立子任務。",
+        "plan_step_hint": "已切換到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n現在呼叫 TodoWrite，只為目前步驟拆分子任務。每個子任務都必須包含 parent_step_id='{parent_step_id}'。建立 3-5 項，而且只能有 1 項是 in_progress。不要為其他計畫步驟建立子任務。",
         "stall_execution_blocked_title": "## 執行受阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**錯誤詳情：** {detail}",
@@ -1575,7 +1575,7 @@ BACKEND_I18N["zh-TW"].update(
         "plan_bubble_risk": "風險：{risk}",
         "plan_bubble_full_ref": "完整方案詳見：`{path}`",
         "plan_bubble_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
-        "plan_read_instruction": "[plan-file] 已核准的執行計畫位於 `{path}`。\n使用：read_file {path} 查看完整步驟與即時狀態。\n計畫檔是步驟順序與完成狀態的唯一權威來源。\n請依序執行步驟，不要跳步。完成目前步驟後再推進下一步。\n如果某一步引用了 skill 或 workflow，繼續前先呼叫 load_skill。",
+        "plan_read_instruction": "計畫已核准。請用 `read_file {path}` 讀取 `{path}`，它是步驟順序與即時狀態的唯一權威來源。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
         "plan_read_todo_note": "\nTODO 更新：一開始就呼叫 TodoWrite，只為目前步驟（{step_label}）設定子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。\n建立 3-5 個只屬於目前步驟的子任務；若目前步驟已經有子任務，請先延續目前的 in_progress 子任務，不要改寫路線。\n每完成一個子任務後，都要立刻再次呼叫 TodoWrite，把它標記為 completed，並把下一個子任務切到 in_progress。\n不要等到整個步驟結束後才一次更新。\n不要為其他計畫步驟建立子任務。\n",
         "plan_proposal_title": "## 📋 執行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -1622,7 +1622,7 @@ BACKEND_I18N["ja"].update(
         "step_completed_evidence": "ステップ完了",
         "plan_step_summary": "📋 計画ステップ {step}/{total}: {content}",
         "plan_step_label": "ステップ {step}/{total}",
-        "plan_step_hint": "[plan-step-advance] 前のステップが完了しました。現在は{step_label}: {step_text}\n更新済みプランを読む: read_file {plan_path}\n今すぐ TodoWrite を呼び出し、現在のステップだけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。3-5 件作成し、1 件を in_progress、残りを pending にしてください。\n他の計画ステップのサブタスクは作成しないでください。",
+        "plan_step_hint": "{step_label} に移動しました: {step_text}\n更新済みプランを読む: read_file {plan_path}\n今すぐ TodoWrite を呼び出し、このステップだけのサブタスクを設定してください。各サブタスクには parent_step_id='{parent_step_id}' を必ず含め、3-5 件作成し、in_progress は 1 件だけにしてください。他の計画ステップのサブタスクは作成しないでください。",
         "stall_execution_blocked_title": "## 実行が停止しました\n",
         "stall_stop_reason": "**停止理由:** {reason}",
         "stall_error_details": "**エラー詳細:** {detail}",
@@ -1670,7 +1670,7 @@ BACKEND_I18N["ja"].update(
         "plan_bubble_risk": "リスク: {risk}",
         "plan_bubble_full_ref": "完全なプラン: `{path}`",
         "plan_bubble_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
-        "plan_read_instruction": "[plan-file] 承認済みの実行計画は `{path}` にあります。\nread_file {path} を使って完全な手順と進行状況を確認してください。\n計画ファイルは手順順序と完了状態の唯一の正式ソースです。\n必ず順番に実行し、飛ばさないでください。現在のステップを完了してから次へ進んでください。\nステップが skill や workflow を参照している場合は、続行前に load_skill を呼び出してください。",
+        "plan_read_instruction": "計画が承認されました。`read_file {path}` で `{path}` を読み、正式な手順順序と進行状況を確認してください。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
         "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite を呼び出し、現在のステップ（{step_label}）だけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。\n現在のステップだけを分解した 3-5 件のサブタスクを作成し、既存のサブタスクがある場合は現在の in_progress サブタスクから先に続行してください。\n各サブタスクを完了した直後に、必ずもう一度 TodoWrite を呼び出して completed に更新し、次のサブタスクを in_progress に切り替えてください。\nステップ全体の最後まで Todo 更新を先送りしないでください。\n他の計画ステップのサブタスクは作成しないでください。\n",
         "plan_proposal_title": "## 📋 実行プラン\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -3673,7 +3673,10 @@ function _deltaApplyRuntimeEvent(evt){
   if(typ==='message'){
     const role=String(data.role||'assistant').trim()||'assistant';
     const rowType=String(data.type||'message').trim()||'message';
-    const text=String(data.text||'');
+    let text=String(data.text||'');
+    if(rowType==='plan_notice'&&!text&&data&&typeof data.data==='object'){
+      text=String(data.data.body||'');
+    }
     const msgRow={role:role,text:text,ts:ts,type:rowType};
     if(data&&typeof data==='object'&&data.data&&typeof data.data==='object')msgRow.data={...data.data};
     const ar=String(data.agent_role||'').trim();
@@ -4968,7 +4971,7 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
-const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','file_patch','upload','command','live_truncation','live_run_notice','skill_loaded']);
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','file_patch','upload','command','live_truncation','live_run_notice','skill_loaded','plan_notice']);
 function _chatVirtFormatDurationMs(ms){
   const n=Number(ms||0);
   if(!Number.isFinite(n)||n<=0)return '';
@@ -5189,6 +5192,7 @@ function _chatVirtBuildMessageNode(m){
   else if(m.type==='live_thinking')kind='live_thinking';
   else if(m.type==='live_truncation')kind='live_truncation';
   else if(m.type==='live_run_notice')kind='live_run_notice';
+  else if(m.type==='plan_notice')kind='plan_notice';
   else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
   else kind='plain_text';
   const d=_chatVirtAcquireNode(kind);
@@ -5396,6 +5400,35 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
+    return d;
+  }
+  if(m.type==='plan_notice'){
+    const info=(m&&typeof m.data==='object')?m.data:{};
+    const title=String(info.title||'Plan Guidance').trim()||'Plan Guidance';
+    const subtitle=String(info.subtitle||'').trim();
+    const note=String(info.note||'').trim();
+    const body=String(info.body||m.text||'').trim();
+    const pills=(Array.isArray(info.pills)?info.pills:[]).map(item=>{
+      if(item&&typeof item==='object'){
+        const txt=String(item.text||'').trim();
+        if(!txt)return'';
+        return _chatVirtEventPillHtml(txt,String(item.tone||'neutral'),item.mono?'mono':'');
+      }
+      const txt=String(item||'').trim();
+      return txt?_chatVirtEventPillHtml(txt,'neutral'):'';
+    }).filter(Boolean);
+    const grid=(Array.isArray(info.rows)?info.rows:[]).map(item=>{
+      if(!item||typeof item!=='object')return'';
+      const label=String(item.label||'').trim();
+      const value=String(item.value||'').trim();
+      if(!label||!value)return'';
+      return _chatVirtEventCellHtml(label,value,{mono:!!item.mono});
+    }).filter(Boolean);
+    const key=`${String(m._vk||'')}:plan-notice`;
+    const noteHtml=note?`<div class="msg-event-note">${esc(note)}</div>`:'';
+    const bodyHtml=`<div class="msg-event-body">${noteHtml}${body?`<div class="msg-md">${renderMarkdownCached(body,key)}</div>`:''}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,'msg-event-card-plan')}`;
+    d.setAttribute('data-math-request',key);
     return d;
   }
   if(m.role==='assistant'&&m.thinking){

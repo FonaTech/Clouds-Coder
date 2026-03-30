@@ -2822,7 +2822,7 @@ class SessionState:
             f"Context limit ~{self.context_token_upper_bound} tokens. "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
-            "Call finish_current_task when done. "
+            "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
             f"{mm_hint}"
             f"{plan_steps_block}"
@@ -12618,14 +12618,16 @@ body{padding:18px}
                     plan_path=PLAN_FILE_RELATIVE_PATH,
                     parent_step_id=_ns_id,
                 )
-                self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
-                # Also inject into active agent context for multi-agent mode
+                target_roles: tuple[str, ...] = ()
                 if self._is_multi_agent_mode():
                     active_role = str(bb.get("active_agent", "") or actor)
                     if active_role:
-                        self._append_agent_context_message(active_role, {
-                            "role": "system", "content": _hint, "ts": now_ts(), "agent_role": active_role,
-                        }, mirror_to_global=False)
+                        target_roles = (active_role,)
+                self._append_plan_guidance_bubble(
+                    _hint,
+                    target_roles=target_roles,
+                    summary=f"plan step bubble injected ({_ns_idx}/{_ns_total})",
+                )
             except Exception:
                 pass
         return True
@@ -12679,21 +12681,12 @@ body{padding:18px}
             phase_evidence = True
         elif phase in ("test", "review") and ran_bash_ok:
             phase_evidence = True
-        # 5. finish_current_task is an explicit completion signal — override evidence check
-        called_finish = any(
-            isinstance(r, dict) and r.get("ok")
-            and str(r.get("name", "")) in ("finish_current_task", "finish_task", "mark_done")
-            for r in results
-        )
         # Advance when:
-        # - Worker called finish (strongest signal), OR
         # - Manager requested AND worker produced output, OR
         # - All subtasks completed AND worker produced output, OR
         # - Phase heuristics confirm (write+bash for implement)
-        has_strong_evidence = called_finish or (
-            worker_produced_output and (
-                manager_requested or subtasks_all_done or phase_evidence
-            )
+        has_strong_evidence = worker_produced_output and (
+            manager_requested or subtasks_all_done or phase_evidence
         )
         if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
@@ -12708,7 +12701,7 @@ body{padding:18px}
         return any(
             r.get("ok", False) and str(r.get("name", "")) in (
                 "write_file", "edit_file", "bash", "read_file",
-                "write_to_blackboard", "finish_current_task",
+                "write_to_blackboard",
             )
             for r in results
             if isinstance(r, dict)
@@ -12727,14 +12720,6 @@ body{padding:18px}
             if str(r.get("owner", "") or "").lower() in worker_owners
             and str(r.get("parent_step_id", "") or "") == step_id
         ]
-        if not worker_items:
-            self._ensure_worker_todos_for_plan_step(plan_step)
-            snap = self.todo.snapshot()
-            worker_items = [
-                r for r in snap
-                if str(r.get("owner", "") or "").lower() in worker_owners
-                and str(r.get("parent_step_id", "") or "") == step_id
-            ]
         if not worker_items:
             expected = self._extract_plan_step_subtasks(plan_step, limit=5)
             if expected:
@@ -12850,6 +12835,258 @@ body{padding:18px}
             return self._active_plan_step_has_worker_todos(role=role)
         return bool(self.todo.snapshot())
 
+    def _plan_worker_todo_identity(self, row: dict | None) -> str:
+        import re
+
+        if not isinstance(row, dict):
+            return ""
+        content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "")
+        content = re.sub(r"\s+", " ", content.strip().lower())
+        if not content:
+            return ""
+        match = re.match(r"^(\d+\.\d+)\b", content)
+        if match:
+            return f"substep:{match.group(1)}"
+        return f"text:{content}"
+
+    def _merge_plan_worker_todo_items(self, items: list[dict], role: str = "") -> str:
+        if not isinstance(items, list):
+            raise ValueError("items must be array")
+        active_step = self._get_active_plan_step()
+        if not isinstance(active_step, dict):
+            return self.todo.update(items)
+        step_id = trim(str(active_step.get("id", "") or ""), 20)
+        if not step_id:
+            return self.todo.update(items)
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner()
+        existing = self.todo.snapshot()
+        preserved: list[dict] = []
+        target_rows: list[dict] = []
+        worker_owners = {"developer", "explorer", "reviewer"}
+        for row in existing:
+            if not isinstance(row, dict):
+                continue
+            owner = str(row.get("owner", "") or "").strip().lower()
+            row_step_id = trim(str(row.get("parent_step_id", "") or ""), 20)
+            if owner in worker_owners and row_step_id == step_id:
+                target_rows.append(dict(row))
+            else:
+                preserved.append(dict(row))
+
+        merged_by_identity: dict[str, dict] = {}
+        ordered_identities: list[str] = []
+        for row in target_rows:
+            identity = self._plan_worker_todo_identity(row)
+            if not identity:
+                continue
+            if identity not in merged_by_identity:
+                merged_by_identity[identity] = dict(row)
+                ordered_identities.append(identity)
+
+        incoming_normalized: list[dict] = []
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                raw = {"content": item, "status": "pending"}
+            elif isinstance(item, dict):
+                raw = dict(item)
+            else:
+                raise ValueError(f"item {idx}: invalid type")
+            key = trim(str(raw.get("key", "") or "").strip(), 120)
+            if key.startswith("bb:"):
+                incoming_normalized.append(raw)
+                continue
+            owner = str(raw.get("owner", "") or "").strip().lower()
+            if owner not in worker_owners:
+                raw["owner"] = role_key
+            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
+            if not parent_step_id:
+                raw["parent_step_id"] = step_id
+            incoming_normalized.append(raw)
+
+        passthrough_rows = [row for row in incoming_normalized if str(row.get("key", "") or "").startswith("bb:")]
+        incoming_worker_rows = [row for row in incoming_normalized if not str(row.get("key", "") or "").startswith("bb:")]
+
+        for row in incoming_worker_rows:
+            identity = self._plan_worker_todo_identity(row)
+            if not identity:
+                identity = f"ad-hoc:{len(ordered_identities)}:{trim(str(row.get('content', '') or ''), 80)}"
+            merged = dict(merged_by_identity.get(identity, {}))
+            if "activeForm" not in row and "active_form" not in row:
+                merged.pop("activeForm", None)
+            merged.update(row)
+            merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
+            merged["parent_step_id"] = trim(str(merged.get("parent_step_id", "") or step_id), 20) or step_id
+            merged_by_identity[identity] = merged
+            if identity not in ordered_identities:
+                ordered_identities.append(identity)
+
+        merged_target_rows = [merged_by_identity[i] for i in ordered_identities if i in merged_by_identity]
+        final_rows = preserved + passthrough_rows + merged_target_rows
+        return self.todo.update(final_rows)
+
+    def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
+        if not isinstance(items, list):
+            raise ValueError("items must be array")
+        role_key = self._sanitize_agent_role(role)
+        if role_key not in {"developer", "explorer", "reviewer"}:
+            return self.todo.update(items)
+        existing = self.todo.snapshot()
+        preserved: list[dict] = []
+        for row in existing:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key", "") or "").strip()
+            owner = str(row.get("owner", "") or "").strip().lower()
+            if key.startswith("bb:"):
+                preserved.append(dict(row))
+                continue
+            if owner == role_key:
+                continue
+            preserved.append(dict(row))
+        normalized: list[dict] = []
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                row = {"content": item, "status": "pending"}
+            elif isinstance(item, dict):
+                row = dict(item)
+            else:
+                raise ValueError(f"item {idx}: invalid type")
+            if str(row.get("key", "") or "").startswith("bb:"):
+                normalized.append(row)
+                continue
+            row["owner"] = role_key
+            normalized.append(row)
+        return self.todo.update(preserved + normalized)
+
+    def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
+        text = trim(str(content or "").strip(), 2200)
+        if not text:
+            return False
+        recent = self.messages[-8:]
+        if any(str(row.get("content", "") or "").strip() == text for row in recent if isinstance(row, dict)):
+            return False
+        stamp = now_ts()
+        self.messages.append({"role": "user", "content": text, "ts": stamp})
+        for role in target_roles:
+            self._append_agent_context_message(
+                role,
+                {
+                    "role": "system",
+                    "content": text,
+                    "ts": stamp,
+                    "agent_role": role,
+                },
+                mirror_to_global=False,
+            )
+        if summary:
+            self._emit("status", {"summary": trim(summary, 120)})
+        return True
+
+    def _build_plan_guidance_notice_data(self, content: str, *, summary: str = "") -> dict:
+        text = trim(str(content or "").strip(), 2200)
+        if not text:
+            return {}
+        lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        if lang == "zh-CN":
+            title = "计划执行提示"
+            note = "当前计划步骤与 Todo 规则已同步到本轮执行上下文。"
+        elif lang == "zh-TW":
+            title = "計畫執行提示"
+            note = "目前計畫步驟與 Todo 規則已同步到本輪執行上下文。"
+        elif lang == "ja":
+            title = "計画実行ガイド"
+            note = "現在の計画ステップと Todo ルールは今回の実行コンテキストへ同期されました。"
+        else:
+            title = "Plan Execution Guidance"
+            note = "The active plan step and Todo rules were synced into the current execution context."
+        bb = self._ensure_blackboard()
+        step = self._current_plan_step_row(bb)
+        total = int(bb.get("plan_step_total", 0) or 0)
+        step_idx = int(step.get("plan_step_index", 0) or 0) + 1 if isinstance(step, dict) else 0
+        step_text = trim(str(step.get("content", "") or ""), 160) if isinstance(step, dict) else ""
+        step_id = str(step.get("id", "") or "") if isinstance(step, dict) else ""
+        step_label = (
+            self._ui_text("plan_step_label", step=step_idx, total=max(1, total))
+            if step_idx > 0
+            else ""
+        )
+        subtitle_parts = [part for part in (step_label, step_text) if part]
+        subtitle = " · ".join(subtitle_parts) or trim(str(summary or ""), 120) or PLAN_FILE_RELATIVE_PATH
+        pills: list[dict] = []
+        if step_label:
+            pills.append({"text": step_label, "tone": "info"})
+        if step_id:
+            pills.append({"text": step_id, "tone": "neutral", "mono": True})
+        rows = [{"label": "plan.md", "value": PLAN_FILE_RELATIVE_PATH, "mono": True}]
+        if step_id:
+            rows.append({"label": "parent_step_id", "value": step_id, "mono": True})
+        return {
+            "title": title,
+            "subtitle": subtitle,
+            "note": note,
+            "body": text,
+            "pills": pills,
+            "rows": rows,
+        }
+
+    def _append_plan_guidance_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
+        text = trim(str(content or "").strip(), 2200)
+        if not text:
+            return False
+        recent = self.messages[-10:]
+        if any(str(row.get("content", "") or "").strip() == text for row in recent if isinstance(row, dict)):
+            return False
+        stamp = now_ts()
+        notice_data = self._build_plan_guidance_notice_data(text, summary=summary)
+        self.messages.append({"role": "user", "content": text, "ts": stamp, "_ui_hidden": True})
+        self.messages.append(
+            {
+                "role": "system",
+                "content": "",
+                "ts": stamp,
+                "type": "plan_notice",
+                "agent_role": "planner",
+                "data": notice_data,
+            }
+        )
+        self._emit(
+            "message",
+            {
+                "role": "system",
+                "type": "plan_notice",
+                "text": "",
+                "data": notice_data,
+                "agent_role": "planner",
+                "summary": trim(summary or str(notice_data.get("subtitle", "") or "plan guidance"), 120),
+            },
+        )
+        for role in target_roles:
+            self._append_agent_context_message(
+                role,
+                {
+                    "role": "system",
+                    "content": text,
+                    "ts": stamp,
+                    "agent_role": role,
+                },
+                mirror_to_global=False,
+            )
+        return True
+
+    def _build_plan_todo_reminder_text(self, plan_step: dict, *, missing_subtasks: bool = False) -> str:
+        if missing_subtasks:
+            return (
+                "<reminder>"
+                "Please call TodoWrite now to update the current subtask before continuing. "
+                "If it fails/repeats, switch to TodoWriteRescue."
+                "</reminder>"
+            )
+        return (
+            "<reminder>"
+            "Update your todos now: finish the current subtask in TodoWrite before moving on."
+            "</reminder>"
+        )
+
     def _plan_todo_discipline_prompt(self, role: str = "", *, for_manager: bool = False) -> str:
         step = self._get_active_plan_step()
         if not isinstance(step, dict):
@@ -12889,7 +13126,7 @@ body{padding:18px}
                 "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
                 "After EACH completed subtask, require a manual TodoWrite or TodoWriteRescue update before the owner starts the next subtask. "
                 "Do not let the owner silently batch multiple subtasks without updating todos. "
-                "Only route to finish_current_task after all subtasks for this step are completed."
+                "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
         return (
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is authoritative. "
@@ -12898,38 +13135,19 @@ body{padding:18px}
             "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
             "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
             "Do not wait until the end of the step to update todos. "
-            "Call finish_current_task only after all subtasks for this step are completed."
+            "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
 
     def _append_plan_single_todo_reminder(self, plan_step: dict, *, missing_subtasks: bool = False) -> bool:
         if not isinstance(plan_step, dict):
             return False
-        step_id = trim(str(plan_step.get("id", "") or ""), 20)
-        if not step_id:
-            return False
+        step_idx = int(plan_step.get("plan_step_index", 0) or 0) + 1
         now_tick = now_ts()
         if (now_tick - self.last_todo_reminder_ts) < 8:
             return False
-        step_idx = int(plan_step.get("plan_step_index", 0) or 0) + 1
-        step_text = trim(str(plan_step.get("content", "") or ""), 140)
-        if missing_subtasks:
-            content = (
-                "<reminder>"
-                f"Please call TodoWrite now for the current plan step before doing more work. "
-                f"Keep following Step {step_idx}: {step_text} in {PLAN_FILE_RELATIVE_PATH}. "
-                f"Create 3-5 subtasks only for this step, include parent_step_id='{step_id}', "
-                "and mark exactly one item in_progress. If TodoWrite fails or repeats, switch to TodoWriteRescue."
-                "</reminder>"
-            )
-        else:
-            content = (
-                "<reminder>"
-                "Update your todos now: finish the current subtask in TodoWrite before moving on. "
-                f"Keep following Step {step_idx}: {step_text} in {PLAN_FILE_RELATIVE_PATH}. "
-                f"Mark the completed subtask completed, set the next one to in_progress, and keep all items under parent_step_id='{step_id}'. "
-                "If TodoWrite fails or repeats, switch to TodoWriteRescue."
-                "</reminder>"
-            )
+        content = self._build_plan_todo_reminder_text(plan_step, missing_subtasks=missing_subtasks)
+        if not content:
+            return False
         self.messages.append({"role": "user", "content": content, "ts": now_tick})
         self.last_todo_reminder_ts = now_tick
         self.todo_reminder_count += 1
@@ -13145,13 +13363,6 @@ body{padding:18px}
                 pass
         else:
             self._sync_todos_from_blackboard(reason="single-agent-round")
-            # Nudge: if agent wrote files but didn't call TodoWrite, remind it
-            called_todo = any(str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in tool_results)
-            if (wrote_files or ran_bash_ok) and not called_todo and current:
-                self._append_plan_single_todo_reminder(
-                    current,
-                    missing_subtasks=not self._active_plan_step_has_worker_todos("developer"),
-                )
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -13187,13 +13398,6 @@ body{padding:18px}
         if has_plan_steps and str(plan_data.get("phase", "") or "").strip() == "executing":
             try:
                 self._update_plan_file_step_status()
-            except Exception:
-                pass
-            try:
-                self._ensure_worker_todos_for_plan_step(
-                    self._get_active_plan_step(bb),
-                    owner=self._current_plan_worker_owner(bb),
-                )
             except Exception:
                 pass
         system_rows = self._todo_project_rows_from_blackboard(bb)
@@ -15339,7 +15543,8 @@ body{padding:18px}
                         "You have been working on this for multiple rounds without visible progress. Consider: "
                         "1) Use ask_colleague to request help from another agent. "
                         "2) Try a completely different tool or approach. "
-                        "3) If the subtask is complete, call finish_current_task with what you have so far."
+                        "3) If the current subtask is complete, update TodoWrite and continue the current plan step. "
+                        "Do not call finish_current_task unless the overall user task is truly complete."
                     )
                     row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
             row["source"] = "anti-stall"
@@ -17518,6 +17723,10 @@ body{padding:18px}
         if in_progress_index < 0 or in_progress_index >= len(clean_items):
             in_progress_index = 0
         clean_items[in_progress_index]["status"] = "in_progress"
+        if active_step is not None:
+            return self._merge_plan_worker_todo_items(clean_items, role=owner_hint)
+        if self._is_multi_agent_mode() and owner_hint in {"developer", "explorer", "reviewer"}:
+            return self._merge_owner_scoped_todo_items(clean_items, role=owner_hint)
         return self.todo.update(clean_items)
 
     def _analyze_todo_result(self, tool_name: str, output: str) -> tuple[str, str]:
@@ -18344,13 +18553,19 @@ body{padding:18px}
                 for t in bb.get("project_todos", [])
             )
             if has_plan_steps:
-                # Tag worker items as sub-tasks so _sync_todos_from_blackboard won't conflict
                 items = args.get("items", [])
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
                             item["owner"] = str(role_key or "developer")
-                result = self.todo.update(items)
+                result = self._merge_plan_worker_todo_items(items, role=str(role_key or "developer"))
+            elif self._is_multi_agent_mode() and role_key in {"developer", "explorer", "reviewer"}:
+                items = args.get("items", [])
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
+                            item["owner"] = str(role_key)
+                result = self._merge_owner_scoped_todo_items(items, role=str(role_key))
             else:
                 result = self.todo.update(args["items"])
             # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
@@ -18376,9 +18591,31 @@ body{padding:18px}
             return result
         if name in {"finish_task", "finish_current_task", "mark_done"}:
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
+            bb_finish = self._ensure_blackboard()
+            plan_steps = [
+                t for t in bb_finish.get("project_todos", [])
+                if isinstance(t, dict) and t.get("category") == "plan_step"
+            ]
+            unfinished_steps = [
+                t for t in plan_steps
+                if str(t.get("status", "") or "").strip().lower() in {"pending", "in_progress"}
+            ]
+            if unfinished_steps:
+                active_step = next(
+                    (t for t in unfinished_steps if str(t.get("status", "") or "").strip().lower() == "in_progress"),
+                    unfinished_steps[0],
+                )
+                active_idx = int(active_step.get("plan_step_index", 0) or 0) + 1
+                active_total = max(1, int(bb_finish.get("plan_step_total", 0) or len(plan_steps) or 1))
+                active_label = self._ui_text("plan_step_label", step=active_idx, total=active_total)
+                active_text = trim(str(active_step.get("content", "") or ""), 140)
+                return (
+                    f"Error: {name} is reserved for finishing the overall user task, not a subtask or a single plan step. "
+                    f"The approved plan is still active at {active_label}: {active_text}. "
+                    "Update TodoWrite/TodoWriteRescue for the current subtask and keep following the current plan step."
+                )
             if role_key == "explorer":
-                bb = self._ensure_blackboard()
-                delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+                delegate = bb_finish.get("last_delegate", {}) if isinstance(bb_finish.get("last_delegate"), dict) else {}
                 delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
                 delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
                 if delegate_target == "explorer" and "summary-handoff" in delegate_reason:
@@ -18425,21 +18662,6 @@ body{padding:18px}
                         )
                     },
                 )
-            # finish_current_task is a strong signal — advance plan step if active
-            try:
-                _bb_fin = self._ensure_blackboard()
-                _cur_ps = next(
-                    (t for t in _bb_fin.get("project_todos", [])
-                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
-                    None,
-                )
-                if _cur_ps:
-                    self._advance_plan_step(
-                        evidence=f"finish_current_task called: {trim(summary, 100)}",
-                        actor=str(role_key or "developer"),
-                    )
-            except Exception:
-                pass
             return (
                 f"{name} acknowledged{': ' + summary if summary else ''}; "
                 f"todo_completed={updated}"
@@ -19753,16 +19975,16 @@ body{padding:18px}
                 _bb_nudge = self._ensure_blackboard()
                 _cur_step = next((t for t in _bb_nudge.get("project_todos", []) if t.get("category") == "plan_step" and t.get("status") == "in_progress"), None)
                 if _cur_step:
-                    _nid = str(_cur_step.get("id", "") or "")
-                    if _nid:
-                        _nudge_msg = (
-                            f"[todo-sync] You made progress but did not call TodoWrite.\n"
-                            f"Update your subtasks now: mark the completed one, set the next one to in_progress, and keep following the active step in {PLAN_FILE_RELATIVE_PATH}.\n"
-                            f"Each subtask must include parent_step_id='{_nid}'."
+                    _msg = self._build_plan_todo_reminder_text(
+                        _cur_step,
+                        missing_subtasks=not self._active_plan_step_has_worker_todos(role),
+                    )
+                    if _msg:
+                        self._append_instruction_bubble(
+                            _msg,
+                            target_roles=(role,),
+                            summary=f"plan+sync todo reminder injected ({role})",
                         )
-                        self._append_agent_context_message(role, {
-                            "role": "system", "content": _nudge_msg, "ts": now_ts(), "agent_role": role,
-                        }, mirror_to_global=False)
             # ── Agent turn 结束后的终止检测：结论性回复 + 无待办 + 无错误 → 自动 finish ──
             agent_text = self._latest_agent_assistant_text(role)
             if (
@@ -21089,19 +21311,11 @@ body{padding:18px}
             return
         target_roles = ("explorer", "developer") if self._is_multi_agent_mode() else ()
         for content in hint_rows:
-            row = {"role": "system", "content": content, "ts": now_ts()}
-            self.messages.append(dict(row))
-            for role in target_roles:
-                self._append_agent_context_message(
-                    role,
-                    {
-                        "role": "system",
-                        "content": content,
-                        "ts": row["ts"],
-                        "agent_role": role,
-                    },
-                    mirror_to_global=False,
-                )
+            self._append_plan_guidance_bubble(
+                content,
+                target_roles=target_roles,
+                summary="plan guidance bubble injected",
+            )
 
     @staticmethod
     def _group_plan_steps(raw_steps: list) -> list[str]:
@@ -22561,7 +22775,7 @@ body{padding:18px}
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                     if dispatched_name == "compress":
                         manual_compact = True
-                    if dispatched_name in {"finish_task", "finish_current_task", "mark_done"}:
+                    if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and not str(output).startswith("Error:"):
                         stop_due_to_finish_task = True
                     self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(output), "ts": now_ts()})
                     single_round_tool_results.append(
@@ -23044,6 +23258,13 @@ body{padding:18px}
                     and all(str(name or "").strip().lower() in {"route_to_next_agent", "routetonext_agent"} for name in tool_names)
                 )
                 text = msg.get("content", "")
+                if (
+                    msg_type == "plan_notice"
+                    and not str(text or "").strip()
+                    and isinstance(msg, dict)
+                    and isinstance(msg.get("data"), dict)
+                ):
+                    text = str((msg.get("data") or {}).get("body", "") or "")
                 # For skill-loaded messages: model sees full content, UI sees compact card
                 if isinstance(msg, dict) and msg.get("_skill_notify") and msg.get("_ui_text"):
                     text = str(msg.get("_ui_text", ""))

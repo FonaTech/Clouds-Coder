@@ -69,10 +69,11 @@ class TodoManager:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         validated = []
-        # Plan-step items (bb:proj: key) and worker/non-plan items each get their
-        # own in_progress slot, so a plan step in_progress doesn't demote worker subtasks.
+        # Plan-step items (bb:proj: key) keep a single in_progress slot.
+        # Worker/non-plan items allow one in_progress per owner so sync-mode agents
+        # do not demote each other's active subtasks.
         plan_in_progress_seen = False
-        worker_in_progress_seen = False
+        worker_in_progress_seen_by_owner: set[str] = set()
         status_alias = {
             "todo": "pending",
             "doing": "in_progress",
@@ -118,10 +119,11 @@ class TodoManager:
                     else:
                         plan_in_progress_seen = True
                 else:
-                    if worker_in_progress_seen:
+                    owner_bucket = owner or "__default__"
+                    if owner_bucket in worker_in_progress_seen_by_owner:
                         status = "pending"
                     else:
-                        worker_in_progress_seen = True
+                        worker_in_progress_seen_by_owner.add(owner_bucket)
             if not active_form:
                 active_form = self._default_active_form(status, content, owner=owner)
             row = {"content": content, "status": status, "activeForm": active_form}
