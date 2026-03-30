@@ -80,7 +80,7 @@ Skills 再利用について：
 
 MiniMax skills の出典表記:
 
-- 本リポジトリ内の `Minimax/` および `Minimax_2/` に含まれるローカル skill パックは、MiniMax AI の公開 skills リポジトリをもとに適用・改変しています: https://github.com/MiniMax-AI/skills
+- 本リポジトリ内の `skills` に含まれるローカル skill パックは、MiniMax AI の公開 skills リポジトリをもとに適用・改変しています: https://github.com/MiniMax-AI/skills
 - 上流の原典ソースは MIT License に基づいて利用しています
 - 元の skill コンテンツ、構成、エコシステム整備を提供した MiniMax AI と上流コントリビューターに感謝します
 
