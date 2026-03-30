@@ -8913,7 +8913,8 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "description": "Todo/Task creation, updates, and best practices",
         "body": (
             "# Task Management Guide\n"
-            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response.\n"
+            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response, UNLESS an approved plan step is active.\n"
+            "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
@@ -19982,6 +19983,8 @@ body{padding:18px}
 
     def _generate_run_completion_summary(self):
         """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
+        if self.cancel_requested:
+            return
         bb = self._ensure_blackboard()
         plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         plan_phase = str(plan.get("phase", "") or "").strip().lower()
@@ -20567,6 +20570,9 @@ body{padding:18px}
                 return False
             self.last_auto_title_ts = now_tick
 
+        if self.cancel_requested:
+            return False
+
         prompt = (
             "Generate one concise session title from current coding task progress.\n"
             "Rules:\n"
@@ -20594,8 +20600,12 @@ body{padding:18px}
             candidate = self._fallback_auto_title()
         if not candidate:
             return False
+        if self.cancel_requested:
+            return False
 
         with self.lock:
+            if self.cancel_requested:
+                return False
             old_title = str(self.title or "").strip()
             if not self._is_default_session_title(old_title):
                 return False
@@ -20722,6 +20732,15 @@ body{padding:18px}
             maximum=MAX_TIMEOUT_SECONDS,
             fallback=DEFAULT_REQUEST_TIMEOUT,
         )
+
+    def _set_runtime_phase(self, phase: str, tool_name: str = ""):
+        with self.lock:
+            self.current_phase = str(phase or "idle")
+            self.current_tool_name = str(tool_name or "")
+
+    def _startup_phase(self, step: str = "") -> str:
+        label = trim(str(step or "").strip(), 80)
+        return f"starting:{label}" if label else "starting"
 
     def _call_interruptible(
         self,
@@ -24877,8 +24896,8 @@ body{padding:18px}
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks exist yet for this step. Start with TodoWrite for THIS step only "
-                f"(parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
+                f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
+                f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
             )
         else:
             state_parts: list[str] = []
@@ -25110,28 +25129,8 @@ body{padding:18px}
         if should_advance:
             evidence = f"single-agent auto-advance: phase={phase}, wrote={wrote_files}, bash_ok={ran_bash_ok}"
             self._advance_plan_step(evidence=evidence, actor="single")
-            # 步骤推进后注入 hint，提示 LLM 为新步骤调用 TodoWrite 更新子任务
             try:
-                _bb_after = self._ensure_blackboard()
-                _new_step = next(
-                    (t for t in _bb_after.get("project_todos", [])
-                     if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
-                    None,
-                )
-                if _new_step:
-                    _step_idx = int(_new_step.get("plan_step_index", 0) or 0) + 1
-                    _total = int(_bb_after.get("plan_step_total", 0) or 0)
-                    _step_text = trim(str(_new_step.get("content", "") or ""), 200)
-                    _step_id = str(_new_step.get("id", "") or "")
-                    _step_label = self._ui_text("plan_step_label", step=_step_idx, total=_total)
-                    _hint = self._ui_text(
-                        "plan_step_hint",
-                        step_label=_step_label,
-                        step_text=_step_text,
-                        plan_path=PLAN_FILE_RELATIVE_PATH,
-                        parent_step_id=_step_id,
-                    )
-                    self.messages.append({"role": "system", "content": _hint, "ts": now_ts()})
+                self._inject_current_plan_step_execution_hints()
             except Exception:
                 pass
         else:
@@ -33051,6 +33050,51 @@ body{padding:18px}
             + todo_note
         )
 
+    def _inject_current_plan_step_execution_hints(self):
+        """Inject the active-step plan/todo hints after plan approval or step advance."""
+        bb = self._ensure_blackboard()
+        step = self._current_plan_step_row(bb)
+        if not isinstance(step, dict):
+            return
+        total = int(bb.get("plan_step_total", 0) or 0)
+        step_idx = int(step.get("plan_step_index", 0) or 0) + 1
+        step_text = trim(str(step.get("content", "") or ""), 200)
+        step_id = str(step.get("id", "") or "")
+        step_label = self._ui_text("plan_step_label", step=step_idx, total=max(1, total))
+        hint_rows: list[str] = []
+        plan_msg = trim(self._plan_file_read_instruction(), 2000)
+        if plan_msg:
+            hint_rows.append(plan_msg)
+        step_hint = trim(
+            self._ui_text(
+                "plan_step_hint",
+                step_label=step_label,
+                step_text=step_text,
+                plan_path=PLAN_FILE_RELATIVE_PATH,
+                parent_step_id=step_id,
+            ),
+            2000,
+        )
+        if step_hint and step_hint not in hint_rows:
+            hint_rows.append(step_hint)
+        if not hint_rows:
+            return
+        target_roles = ("explorer", "developer") if self._is_multi_agent_mode() else ()
+        for content in hint_rows:
+            row = {"role": "system", "content": content, "ts": now_ts()}
+            self.messages.append(dict(row))
+            for role in target_roles:
+                self._append_agent_context_message(
+                    role,
+                    {
+                        "role": "system",
+                        "content": content,
+                        "ts": row["ts"],
+                        "agent_role": role,
+                    },
+                    mirror_to_global=False,
+                )
+
     @staticmethod
     def _group_plan_steps(raw_steps: list) -> list[str]:
         """Group flat step array by major step number (first digit of N.N).
@@ -33404,22 +33448,6 @@ body{padding:18px}
         )
         if not chosen:
             return
-        # Write execution-phase plan file (detailed, for model read_file)
-        # Must happen BEFORE blackboard todos are created so the file reflects initial state
-        plan_msg = self._plan_file_read_instruction()
-        self.messages.append({
-            "role": "system",
-            "content": plan_msg,
-            "ts": now_ts(),
-        })
-        if self._is_multi_agent_mode():
-            for role in ("explorer", "developer"):
-                self._append_agent_context_message(role, {
-                    "role": "system",
-                    "content": plan_msg,
-                    "ts": now_ts(),
-                    "agent_role": role,
-                }, mirror_to_global=False)
         bb = self._ensure_blackboard()
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
@@ -33556,6 +33584,10 @@ body{padding:18px}
             self._write_plan_file(self._format_plan_file_execution(choice_id))
         except Exception:
             pass
+        try:
+            self._inject_current_plan_step_execution_hints()
+        except Exception:
+            pass
         # Pre-load skills explicitly mentioned in plan steps
         try:
             self._preload_skills_from_plan_steps(grouped_steps)
@@ -33600,10 +33632,12 @@ body{padding:18px}
     def _agent_worker(self):
         single_role = "developer"
         try:
+            self._set_runtime_phase(self._startup_phase("model-ready"))
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
             # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
             goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
+            self._set_runtime_phase(self._startup_phase("complexity-precheck"))
             try:
                 self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
             except Exception:
@@ -33632,6 +33666,7 @@ body{padding:18px}
                 media_inputs=initial_policy_media_inputs,
                 roles=["manager"],
             )
+            self._set_runtime_phase(self._startup_phase("policy-classify"))
             self._refresh_runtime_task_policy(
                 pinned_selection=pinned_selection,
                 force=True,
@@ -33663,8 +33698,17 @@ body{padding:18px}
                 )
                 return
             # ── Auto-rename session title early ──
+            self._set_runtime_phase(self._startup_phase("auto-title"))
             try:
-                self._maybe_auto_rename_session_title("run-start")
+                self._call_interruptible(
+                    lambda: self._maybe_auto_rename_session_title("run-start"),
+                    progress_label="startup session title",
+                    progress_interval=1.5,
+                    progress_delay=1.5,
+                )
+            except OllamaError as exc:
+                if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                    raise
             except Exception:
                 pass
             # ── Plan Mode 检查 ──
@@ -33684,7 +33728,13 @@ body{padding:18px}
                 )
                 self._multi_agent_worker(pinned_selection=pinned_selection)
                 return
-            active_caps = self._ensure_active_profile_capabilities(force_probe=False)
+            self._set_runtime_phase(self._startup_phase("profile-capabilities"))
+            active_caps = self._call_interruptible(
+                lambda: self._ensure_active_profile_capabilities(force_probe=False),
+                progress_label="startup capability probe",
+                progress_interval=2.0,
+                progress_delay=2.0,
+            )
             media_last_user_ts = -1.0
             level_budget = int(self.runtime_round_budget or 0)
             if level_budget > 0:
@@ -34854,6 +34904,11 @@ body{padding:18px}
                     "agent_role": single_role,
                 },
             )
+        except OllamaError as exc:
+            if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                self._emit("status", {"summary": "run interrupted"})
+            else:
+                self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
         except Exception as exc:
             self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
         finally:
