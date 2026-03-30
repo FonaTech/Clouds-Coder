@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog</a> ·
   <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
@@ -28,7 +29,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | Previous: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | Previous: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -77,6 +78,12 @@ Skills reuse statement:
 - `skills/generated/*` are extended/generated skills built for Clouds Coder scenarios (reporting, degradation recovery, HTML pipelines, upload parsers, etc.)
 - Runtime tool names/protocols remain compatible with the skill-loading workflow (for example `load_skill`, `list_skills`, `write_skill`)
 
+MiniMax skills source attribution:
+
+- The bundled local skill packs under `Minimax/` and `Minimax_2/` are adapted from MiniMax AI's open-source skills repository: https://github.com/MiniMax-AI/skills
+- Original upstream source is used under the MIT License
+- Thanks to MiniMax AI and upstream contributors for the original skill content, structure, and ecosystem work
+
 ## 1.2 Beyond a Coding CLI: General-Purpose Task Kernel
 
 Clouds Coder is not designed as a coding-only CLI wrapper. It is positioned as a general-purpose agent runtime that can execute and audit mixed knowledge-work flows in one session:
@@ -121,7 +128,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - No-tool idle diagnosis/recovery hints for stalled complex tasks
 - Task/Todo/Background/Team/Worktree mechanisms in one runtime
 - SSE event stream with heartbeat and write-exception handling
-- Rich preview pipeline: markdown/html/file preview + code stage preview
+- Rich preview pipeline: markdown/html/code/PDF/CSV/Excel/Word/PPT/media preview + code stage preview
 - Frontend rendering controls for resource stability (live/static freeze, snapshot strategy, virtualized chat rows)
 - Scientific-work friendly output path: artifact-first steps, traceable stage outputs, and reproducibility-oriented persistence
 
@@ -132,7 +139,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 │                            Clouds Coder                              │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Experience & Traceability Layer                                       │
-│  - Multi-preview hub (Markdown / Code / HTML)                        │
+│  - Multi-preview hub (Markdown / HTML / Code / PDF / Office / Media) │
 │  - Stage-based code history backup + diff/provenance timeline        │
 │  - Runtime progress cards (thinking/run/truncation/recovery)         │
 │  - Skills visual flow builder + SKILL.md generation/injection        │
@@ -987,11 +994,22 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 - Python 3.10+
 - Ollama (for local model serving, optional but recommended)
-- Install dependencies:
+- Install dependencies for full source-mode preview / parsing support:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+This source install enables the richer local preview stack used by the runtime:
+
+- PDF: `pdfminer.six`, `PyMuPDF`
+- CSV / analysis tables: `pandas`
+- Excel: `openpyxl`, `xlrd`
+- Word: `python-docx`
+- PowerPoint: `python-pptx`
+- Image asset handling: `Pillow`
+
+Optional OS-level helpers such as `pdftotext`, `xls2csv`, `antiword`, `catdoc`, `catppt`, and `textutil` can still improve legacy-format fallback parsing, but they are not required for the base source install.
 
 ### 9.2 Run (Source Install)
 
@@ -1073,7 +1091,7 @@ Notes:
 ## 11.1 Architecture Advantages
 
 - All-in-one runtime kernel (`Clouds_Coder.py`): agent loop, tool router, session state manager, HTTP APIs, SSE stream, Web UI bridge, and Skills Studio are integrated in one process. This reduces cross-service coordination cost and cuts distributed failure points for local-first usage.
-- Lightweight and deployment-friendly: dependency surface is intentionally small (`requirements.txt` is minimal), startup is a single command, and packaging scripts support PyInstaller/Nuitka in both onedir and onefile modes.
+- Flexible deployment profile: PyPI install keeps the base runtime lightweight, while source install via `requirements.txt` enables the richer PDF / Office / table / image preview stack; packaging scripts still support PyInstaller/Nuitka in both onedir and onefile modes.
 - Native multimodal model support: provider capability inference and per-provider media endpoint mapping are built into profile parsing, so image/audio/video workflows can be routed without adding a separate multimodal proxy layer.
 - Broad local + web model support with small-model optimization: supports Ollama and OpenAI-compatible backends, while adding constrained-model safeguards such as context limit control, truncation continuation passes, no-tool idle recovery, and unified timeout scheduling.
 
@@ -1246,5 +1264,3 @@ flowchart TD
 ## 13. License
 
 This project is released under the MIT License. See [LICENSE](./LICENSE).
-
-

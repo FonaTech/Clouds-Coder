@@ -11,7 +11,7 @@ from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKE
 from ..config.paths import LLM_CONFIG_PATH
 from ..config.settings import infer_model_multimodal_capabilities, merge_multimodal_capabilities, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
 from ..llm.client import OllamaClient
-from ..llm.utils import complete_chat_endpoint, extract_base_url, list_ollama_models_cached, probe_ollama_environment
+from ..llm.utils import complete_chat_endpoint, extract_base_url, is_openai_compat_provider, list_ollama_models_cached, probe_ollama_environment
 from .state import SessionState
 from ..utils.crypto import CryptoBox
 from ..utils.files import try_read_text
@@ -151,16 +151,9 @@ class SessionManager:
         return dict(self.user_model_profiles.get(self.user_active_profile_id, {}))
 
     def _sync_ollama_defaults(self, active_profile: dict | None = None):
-        picked: dict = {}
-        if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
-            picked = dict(active_profile)
-        else:
-            for row in self.user_model_profiles.values():
-                if str(row.get("provider", "")).lower() == "ollama":
-                    picked = dict(row)
-                    break
-        if not picked:
+        if not (isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama"):
             return
+        picked = dict(active_profile)
         model = str(picked.get("model", self.model) or self.model).strip()
         base = extract_base_url(str(picked.get("base_url", self.ollama_base) or self.ollama_base)).strip()
         if model:
@@ -187,24 +180,27 @@ class SessionManager:
                 if sid != pid:
                     self.user_model_profiles.pop(pid, None)
                 return
-        pid = "ollama"
-        n = 2
-        while pid in self.user_model_profiles:
-            pid = f"ollama-{n}"
-            n += 1
-        self.user_model_profiles[pid] = {
-            "id": pid,
+        if self.user_model_profiles:
+            return
+        self.user_model_profiles["ollama"] = {
+            "id": "ollama",
             "provider": "ollama",
             "label": "Ollama",
             "model": self.model,
             "base_url": self.ollama_base,
             "temperature": 0.2,
             "request_timeout": DEFAULT_REQUEST_TIMEOUT,
-            "selection": f"{pid}::{self.model}",
+            "selection": f"ollama::{self.model}",
             "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
             "media_endpoints": {},
-            "source": "auto-added",
+            "source": "fallback",
         }
+
+    def _has_non_ollama_user_profiles(self) -> bool:
+        for profile in self.user_model_profiles.values():
+            if str((profile or {}).get("provider", "")).lower() != "ollama":
+                return True
+        return False
 
     def _persist_user_prefs(self):
         data = {
@@ -219,6 +215,8 @@ class SessionManager:
         self.crypto.write_json(self.user_prefs_path, data)
 
     def _prefer_ollama_profile_from_tags(self):
+        if self._has_non_ollama_user_profiles():
+            return
         tags = list_ollama_models_cached(self.ollama_base)
         if tags:
             self.ollama_env_tags = list(tags)
@@ -279,7 +277,7 @@ class SessionManager:
         if not self.user_model_profiles:
             self.user_model_profiles, self.user_active_profile_id = self._profiles_from_config(self.default_llm_config)
         self._ensure_user_ollama_profile()
-        if not loaded:
+        if not loaded and not self._has_non_ollama_user_profiles():
             self._prefer_ollama_profile_from_tags()
         if self.user_active_profile_id not in self.user_model_profiles:
             self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
@@ -328,6 +326,7 @@ class SessionManager:
         sess._persist()
 
     def _apply_user_defaults_to_session(self, sess: SessionState, *, clear_cap_cache: bool = False):
+        sess.model_profiles = {}
         for pid, profile in self.user_model_profiles.items():
             row = dict(profile)
             row["id"] = pid
@@ -533,7 +532,7 @@ class SessionManager:
         if provider == "ollama":
             base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
             return bool(base)
-        if provider in {"openai_compat", "openai", "siliconflow"}:
+        if is_openai_compat_provider(provider):
             endpoint = str(profile.get("endpoint", "") or "").strip()
             base = str(profile.get("base_url", "") or "").strip()
             return bool(endpoint or complete_chat_endpoint(base))
@@ -692,7 +691,28 @@ class SessionManager:
             opts = runnable_opts
         active = self.user_model_profiles.get(self.user_active_profile_id, {})
         selected = f"{self.user_active_profile_id}::{active.get('model','')}" if active else ""
-        if opts and selected not in {str(x.get("selection", "")) for x in opts}:
+        option_map = {str(x.get("selection", "")) for x in opts}
+        if active and selected and selected not in option_map:
+            active_caps = merge_multimodal_capabilities(
+                infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),
+                parse_capability_overrides(active.get("capabilities", {})),
+            )
+            opts.insert(
+                0,
+                {
+                    "selection": selected,
+                    "profile_id": self.user_active_profile_id,
+                    "provider": active.get("provider", "unknown"),
+                    "model": str(active.get("model", "") or ""),
+                    "label": f"{active.get('label', self.user_active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
+                    "source": active.get("source", "active-profile"),
+                    "thinking_hint": bool(active.get("thinking_hint", False)),
+                    "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "capabilities": active_caps,
+                },
+            )
+            option_map.add(selected)
+        if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),

@@ -75,16 +75,9 @@ class AppContext:
         return roots
 
     def _sync_global_ollama_defaults(self, active_profile: dict | None = None):
-        picked: dict = {}
-        if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
-            picked = dict(active_profile)
-        else:
-            for row in self.global_profiles.values():
-                if str(row.get("provider", "")).lower() == "ollama":
-                    picked = dict(row)
-                    break
-        if not picked:
+        if not (isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama"):
             return
+        picked = dict(active_profile)
         model = str(picked.get("model", self.model) or self.model).strip()
         base = extract_base_url(str(picked.get("base_url", self.base_url) or self.base_url)).strip()
         if model:
@@ -2283,6 +2276,26 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             )
         selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
         selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
+        option_map = {str(x.get("selection", "")) for x in opts}
+        if selected_profile and selected and selected not in option_map:
+            opts.insert(
+                0,
+                {
+                    "selection": selected,
+                    "profile_id": self.global_active_profile_id,
+                    "provider": selected_profile.get("provider", ""),
+                    "model": str(selected_profile.get("model", self.model) or self.model),
+                    "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
+                    "source": selected_profile.get("source", "active-profile"),
+                    "capabilities": merge_multimodal_capabilities(
+                        infer_model_multimodal_capabilities(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                        ),
+                        parse_capability_overrides(selected_profile.get("capabilities", {})),
+                    ),
+                },
+            )
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(
                 str(selected_profile.get("provider", "")),

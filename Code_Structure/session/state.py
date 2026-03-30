@@ -11,6 +11,7 @@ import hashlib
 import io
 import importlib.util
 import json
+import math
 import os
 import queue
 import re
@@ -22,6 +23,7 @@ import subprocess
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -35,11 +37,11 @@ from ..agent.events import EventHub
 from ..agent.tasks import TaskManager
 from ..agent.todo import TodoManager
 from ..agent.worktree import WorktreeManager
-from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, COMPLEXITY_KEYWORDS, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
+from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
 from ..config.paths import WORKDIR
-from ..config.settings import _detect_os_shell_instruction, _to_bool_like, backend_i18n_text, backend_role_label, default_multimodal_capabilities, infer_model_multimodal_capabilities, looks_like_llm_config, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
+from ..config.settings import _detect_os_shell_instruction, _to_bool_like, backend_i18n_text, backend_role_label, default_multimodal_capabilities, infer_model_multimodal_capabilities, infer_user_complexity_value, looks_like_llm_config, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
 from ..llm.client import OllamaClient, OllamaError
-from ..llm.utils import complete_chat_endpoint, list_loaded_ollama_models, list_ollama_models, list_ollama_models_cached, probe_ollama_environment, resolve_ollama_model, split_thinking_content, strip_thinking_content, wake_ollama_model
+from ..llm.utils import complete_chat_endpoint, extract_base_url, is_openai_compat_provider, list_loaded_ollama_models, list_ollama_models, list_ollama_models_cached, probe_ollama_environment, resolve_ollama_model, split_thinking_content, strip_thinking_content, wake_ollama_model
 from ..rag.parsers import build_code_preview_rows, is_code_preview_candidate, normalize_rel_preview_path, preview_kind_for_path
 from ..skills.store import SkillStore, ensure_runtime_skills
 from ..utils.compress import compress_text_blob, decompress_text_blob
@@ -679,26 +681,36 @@ class SessionState:
         }
 
     def _ensure_ollama_profile(self):
-        for profile in self.model_profiles.values():
-            if str(profile.get("provider", "")).lower() == "ollama":
-                return
-        pid = "ollama"
-        n = 2
-        while pid in self.model_profiles:
-            pid = f"ollama-{n}"
-            n += 1
-        self.model_profiles[pid] = {
-            "id": pid,
+        for pid, profile in list(self.model_profiles.items()):
+            if str(profile.get("provider", "")).lower() != "ollama":
+                continue
+            row = dict(profile)
+            sid = self._sanitize_profile_id(str(row.get("id", pid) or pid))
+            model = str(row.get("model", self.ollama.model) or self.ollama.model).strip()
+            base = extract_base_url(str(row.get("base_url", self.ollama.base_url) or self.ollama.base_url)).strip()
+            row["id"] = sid
+            row["label"] = str(row.get("label", "") or "Ollama").strip() or "Ollama"
+            row["model"] = model
+            row["base_url"] = base
+            row["selection"] = f"{sid}::{row.get('model','')}"
+            self.model_profiles[sid] = row
+            if sid != pid:
+                self.model_profiles.pop(pid, None)
+            return
+        if self.model_profiles:
+            return
+        self.model_profiles["ollama"] = {
+            "id": "ollama",
             "provider": "ollama",
             "label": "Ollama",
             "model": self.ollama.model,
             "base_url": self.ollama.base_url,
             "temperature": 0.2,
             "request_timeout": DEFAULT_REQUEST_TIMEOUT,
-            "selection": f"{pid}::{self.ollama.model}",
+            "selection": f"ollama::{self.ollama.model}",
             "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
             "media_endpoints": {},
-            "source": "auto-added",
+            "source": "fallback",
         }
 
     def _init_llm_profiles(self, config: dict):
@@ -772,7 +784,7 @@ class SessionState:
         if provider == "ollama":
             base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
             return bool(base)
-        if provider in {"openai_compat", "openai", "siliconflow"}:
+        if is_openai_compat_provider(provider):
             endpoint = str(profile.get("endpoint", "") or "").strip()
             base = str(profile.get("base_url", "") or "").strip()
             return bool(endpoint or complete_chat_endpoint(base))
@@ -899,7 +911,30 @@ class SessionState:
             opts = runnable_opts
         active = self.model_profiles.get(self.active_profile_id, {})
         selected = f"{self.active_profile_id}::{active.get('model','')}" if active else ""
-        if opts and selected not in {str(x.get("selection", "")) for x in opts}:
+        option_map = {str(x.get("selection", "")) for x in opts}
+        if active and selected and selected not in option_map:
+            active_cache_key = self._profile_cache_key(active if isinstance(active, dict) else {})
+            active_cache_entry = self.multimodal_capability_cache.get(active_cache_key, {})
+            opts.insert(
+                0,
+                {
+                    "selection": selected,
+                    "profile_id": self.active_profile_id,
+                    "provider": active.get("provider", "unknown"),
+                    "model": str(active.get("model", "") or ""),
+                    "label": f"{active.get('label', self.active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
+                    "source": active.get("source", "active-profile"),
+                    "thinking_hint": bool(active.get("thinking_hint", False)),
+                    "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
+                    "capabilities_probed": bool(active_cache_entry),
+                    "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
+                    if isinstance(active_cache_entry, dict)
+                    else 0.0,
+                },
+            )
+            option_map.add(selected)
+        if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
         active_caps = self._capabilities_from_profile(active if isinstance(active, dict) else {})
         active_cache = self.multimodal_capability_cache.get(self._profile_cache_key(active if isinstance(active, dict) else {}), {})
@@ -989,7 +1024,7 @@ class SessionState:
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
         self.ollama.clear_probe_cache()
-        merged = dict(self.model_profiles)
+        merged: dict[str, dict] = {}
         for idx, profile in enumerate(parsed.get("profiles", [])):
             pid = self._sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
             row = dict(profile)
@@ -1008,7 +1043,7 @@ class SessionState:
             self.active_profile_id = next(iter(self.model_profiles.keys()))
         active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
         if not self._profile_is_runnable(active_profile):
-            fallback = self._pick_runnable_selection(preferred_provider="ollama")
+            fallback = self._pick_runnable_selection()
             if fallback:
                 fpid, fmodel = fallback.split("::", 1) if "::" in fallback else (self.active_profile_id, "")
                 self.active_profile_id = self._sanitize_profile_id(fpid)
@@ -1373,7 +1408,7 @@ class SessionState:
             self.active_profile_id = next(iter(self.model_profiles.keys()))
         active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
         if not self._profile_is_runnable(active_profile):
-            fallback = self._pick_runnable_selection(preferred_provider="ollama")
+            fallback = self._pick_runnable_selection()
             if fallback:
                 fpid, fmodel = fallback.split("::", 1) if "::" in fallback else (self.active_profile_id, "")
                 self.active_profile_id = self._sanitize_profile_id(fpid)
@@ -1620,6 +1655,95 @@ class SessionState:
         self.runtime_code_reference_meta = {}
         return removed_hints
 
+    def _restore_runtime_policy_from_blackboard_locked(self) -> None:
+        bb = self._ensure_blackboard()
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
+        try:
+            level = int(
+                getattr(self, "user_task_level_override", 0)
+                or profile.get("task_level", judgement.get("task_level", 0))
+                or 0
+            )
+        except Exception:
+            level = 0
+        if level not in TASK_LEVEL_CHOICES:
+            return
+        self.runtime_task_level = int(level)
+        self._prev_applied_task_level = int(level)
+        self.runtime_execution_mode = normalize_execution_mode(
+            profile.get("execution_mode", judgement.get("execution_mode", self.execution_mode or EXECUTION_MODE_SYNC)),
+            default=EXECUTION_MODE_SYNC,
+        )
+        assigned = self._sanitize_agent_role(
+            str(
+                profile.get(
+                    "assigned_expert",
+                    judgement.get("assigned_expert", self.runtime_assigned_expert or "developer"),
+                )
+                or ""
+            )
+        ) or "developer"
+        participants: list[str] = []
+        raw_participants = profile.get(
+            "participants",
+            judgement.get("participants", profile.get("recommended_agents", [])),
+        )
+        if isinstance(raw_participants, list):
+            for item in raw_participants:
+                role = self._sanitize_agent_role(item)
+                if role and role not in participants:
+                    participants.append(role)
+        self.runtime_assigned_expert = assigned
+        self.runtime_participants = participants or [assigned]
+        try:
+            round_budget = int(profile.get("round_budget", self.runtime_round_budget or 0) or 0)
+        except Exception:
+            round_budget = int(self.runtime_round_budget or 0)
+        if round_budget <= 0:
+            try:
+                remaining = int(judgement.get("remaining_rounds", 0) or 0)
+            except Exception:
+                remaining = 0
+            round_budget = int(remaining)
+        self.runtime_round_budget = int(round_budget)
+        self.runtime_requires_confirmation = bool(
+            profile.get("requires_user_confirmation", self.runtime_requires_confirmation)
+        )
+        self.runtime_confirmation_needed = bool(self.runtime_requires_confirmation)
+        self.runtime_task_judgement = trim(
+            str(judgement.get("progress", self.runtime_task_judgement) or ""),
+            200,
+        )
+        task_type = trim(
+            str(profile.get("task_type", judgement.get("task_type", self.runtime_task_type or "")) or "").strip().lower(),
+            40,
+        )
+        if task_type in TASK_PROFILE_TYPES:
+            self.runtime_task_type = task_type
+        complexity = trim(
+            str(profile.get("complexity", judgement.get("complexity", self.runtime_task_complexity or "")) or "").strip().lower(),
+            20,
+        )
+        if complexity in TASK_COMPLEXITY_LEVELS:
+            self.runtime_task_complexity = complexity
+        scale_preference = trim(
+            str(
+                profile.get(
+                    "scale_preference",
+                    judgement.get("scale_preference", self.runtime_scale_preference or "balanced"),
+                )
+                or ""
+            ).strip().lower(),
+            20,
+        )
+        if scale_preference in TASK_SCALE_PREFERENCES:
+            self.runtime_scale_preference = scale_preference
+        self.runtime_direct_objective = trim(
+            str(profile.get("direct_objective", self.runtime_direct_objective or "") or "").strip(),
+            800,
+        )
+
     def _reset_blackboard_plan_state_locked(self) -> None:
         """Clear plan/todo/skills state from a completed run so the next run starts fresh.
 
@@ -1630,6 +1754,7 @@ class SessionState:
         """
         bb = self._ensure_blackboard()
         bb["project_todos"] = []
+        bb["plan"] = {}
         bb["plan_steps"] = []
         bb["plan_step_cursor"] = 0
         bb["plan_step_total"] = 0
@@ -1638,9 +1763,17 @@ class SessionState:
         bb["plan_findings"] = ""
         bb["plan_proposal"] = ""
         bb["plan_risks"] = ""
+        bb["plan_meta"] = {}
         bb["loaded_skills"] = {}
         bb["loaded_skills_goal_sig"] = ""
         self.blackboard = bb
+        self.runtime_plan_mode_needed = False
+        self.runtime_plan_approved = False
+        self.runtime_plan_proposal = {}
+        self.runtime_plan_choice = ""
+        self.runtime_task_level_floor = 0
+        self.runtime_task_level_ceiling = 0
+        self.runtime_complexity_floor = ""
         try:
             self.todo.items = []
         except Exception:
@@ -2061,6 +2194,13 @@ class SessionState:
     def _current_plan_step_text(self, board: dict | None = None) -> str:
         row = self._current_plan_step_row(board)
         return trim(str((row or {}).get("content", "") or "").strip(), 400)
+
+    def _current_plan_step_full_text(self, board: dict | None = None, max_len: int = 1200) -> str:
+        row = self._current_plan_step_row(board)
+        return trim(
+            str((row or {}).get("full_content", "") or (row or {}).get("content", "") or "").strip(),
+            max_len,
+        )
 
     def _current_execution_focus_text(self) -> str:
         bb = self._ensure_blackboard()
@@ -2667,6 +2807,8 @@ class SessionState:
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
             plan_steps_block = f"{plan_ctx}\n"
+        plan_todo_note = self._plan_todo_discipline_prompt(role="developer")
+        plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         return (
@@ -2684,6 +2826,7 @@ class SessionState:
             f"{skill_hint}"
             f"{mm_hint}"
             f"{plan_steps_block}"
+            f"{plan_todo_block}"
             f"{html_block}"
             f"{research_block}"
             f"{knowledge_block}"
@@ -2838,11 +2981,17 @@ class SessionState:
                         o.pop("cons", None)
                         o.pop("risk", None)
         elif tier >= 3:
-            # Minimal: only phase, chosen, steps — but preserve project_todos
-            phase = plan.get("phase", "")
-            chosen = plan.get("chosen", "")
-            steps = plan.get("steps", [])
-            bb["plan"] = {"phase": phase, "chosen": chosen, "steps": steps}
+            # Minimal: keep execution snapshot fields that drive plan.md/todos.
+            compact_plan = {
+                "phase": plan.get("phase", ""),
+                "chosen": plan.get("chosen", ""),
+                "steps": plan.get("steps", []),
+            }
+            for key in ("title", "summary", "risk"):
+                value = plan.get(key)
+                if value:
+                    compact_plan[key] = value
+            bb["plan"] = compact_plan
         self.blackboard = bb
         # Also trim plan proposal in runtime state
         if tier >= 2 and self.runtime_plan_proposal:
@@ -4533,6 +4682,22 @@ class SessionState:
             pass
         return str(target)
 
+    def _is_runtime_managed_session_path(self, path_text: object) -> bool:
+        try:
+            target = self._session_path(self._normalize_tool_path_text(path_text)).resolve()
+            return target == self._plan_file_path().resolve()
+        except Exception:
+            return False
+
+    def _runtime_managed_path_tool_error(self, path_text: object, action: str) -> str:
+        if not self._is_runtime_managed_session_path(path_text):
+            return ""
+        return (
+            f"Error: {action} blocked for runtime-managed file '{PLAN_FILE_RELATIVE_PATH}'. "
+            "This file mirrors the approved execution plan and is auto-generated from blackboard state. "
+            "Use read_file to inspect it; do not modify it with write_file/edit_file."
+        )
+
     def _code_preview_bucket_dir(self, rel_path: str) -> Path:
         rel = normalize_rel_preview_path(rel_path)
         digest = hashlib.sha1(rel.encode("utf-8", errors="ignore")).hexdigest()[:14]
@@ -4804,6 +4969,1521 @@ class SessionState:
             "truncated": bool(truncated),
             "full_text": after_text,
         }
+
+    def _preview_html_shell(self, title: str, body_html: str, extra_css: str = "") -> str:
+        safe_title = html.escape(str(title or "Preview"))
+        base_css = """
+:root{color-scheme:light}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:#f4f7fb;color:#18212f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+body{padding:18px}
+.pv-shell{max-width:1400px;margin:0 auto}
+.pv-card{background:#fff;border:1px solid #dbe5f0;border-radius:18px;box-shadow:0 12px 28px rgba(15,23,42,.08);padding:18px}
+.pv-title{margin:0 0 6px;font-size:1.1rem;font-weight:800}
+.pv-note{margin:0 0 14px;color:#5b6b82;font-size:.84rem}
+.pv-block+.pv-block{margin-top:18px}
+.pv-block-title{margin:0 0 10px;font-size:.98rem;font-weight:800}
+.pv-block-sub{margin:0 0 10px;color:#6b7b92;font-size:.8rem}
+.pv-pre{margin:0;white-space:pre-wrap;word-break:break-word;background:#f8fbff;border:1px solid #dbe5f0;border-radius:14px;padding:14px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+.pv-table-wrap{overflow:auto;border:1px solid #dbe5f0;border-radius:14px;background:#fff}
+.pv-grid{border-collapse:separate;border-spacing:0;min-width:100%;font-size:.84rem}
+.pv-grid th,.pv-grid td{padding:8px 10px;border-right:1px solid #e6edf5;border-bottom:1px solid #e6edf5;vertical-align:top;white-space:pre-wrap;word-break:break-word}
+.pv-grid thead th{position:sticky;top:0;background:#eef5ff;z-index:2;font-weight:800}
+.pv-grid .pv-corner{left:0;z-index:3;background:#e7f0ff}
+.pv-grid .pv-rowhead{position:sticky;left:0;background:#f8fbff;z-index:1;text-align:right;font-variant-numeric:tabular-nums;color:#62748c;min-width:54px}
+.pv-grid tr:last-child td,.pv-grid tr:last-child th{border-bottom:0}
+.pv-grid tr td:last-child,.pv-grid tr th:last-child{border-right:0}
+.pv-doc-page{max-width:980px;margin:0 auto;background:#fff;border:1px solid #dbe5f0;border-radius:18px;box-shadow:0 12px 28px rgba(15,23,42,.08);padding:42px 52px}
+.pv-doc-pages{display:flex;flex-direction:column;gap:24px}
+.pv-doc-page-shell{max-width:1080px;margin:0 auto}
+.pv-doc-title{margin:0 0 8px;font-size:1.15rem;font-weight:800}
+.pv-doc-sub{margin:0 0 20px;color:#64758b;font-size:.84rem}
+.pv-doc-header,.pv-doc-footer{font-size:.8rem;color:#5f6f87;border-bottom:1px solid #e7eef7;padding-bottom:10px;margin-bottom:18px;white-space:pre-wrap;word-break:break-word}
+.pv-doc-footer{border-bottom:0;border-top:1px solid #e7eef7;padding-bottom:0;padding-top:10px;margin-top:20px;margin-bottom:0}
+.pv-doc-page-no{float:right;color:#8a99ad}
+.pv-doc-flow{font-family:Georgia,'Times New Roman',serif;color:#1c2431;line-height:1.62}
+.pv-doc-para{margin:0 0 .85em;white-space:pre-wrap;word-break:break-word}
+.pv-doc-para:last-child{margin-bottom:0}
+.pv-doc-heading-1{font-size:2rem;font-weight:800;line-height:1.22;margin:0 0 .6em}
+.pv-doc-heading-2{font-size:1.55rem;font-weight:800;line-height:1.28;margin:0 0 .65em}
+.pv-doc-heading-3{font-size:1.28rem;font-weight:800;line-height:1.34;margin:0 0 .7em}
+.pv-doc-heading-4,.pv-doc-heading-5,.pv-doc-heading-6{font-size:1.05rem;font-weight:800;line-height:1.4;margin:0 0 .7em}
+.pv-doc-list-bullet::before{content:'• ';font-weight:800}
+.pv-doc-list-number{position:relative}
+.pv-doc-run-u{text-decoration:underline}
+.pv-doc-run-s{text-decoration:line-through}
+.pv-doc-run-sub{vertical-align:sub;font-size:.82em}
+.pv-doc-run-super{vertical-align:super;font-size:.82em}
+.pv-doc-note-ref{vertical-align:super;font-size:.72em;color:#3b82f6;font-weight:700}
+.pv-doc-table{width:100%;border-collapse:collapse;margin:1.05em 0;font-size:.92rem}
+.pv-doc-table td,.pv-doc-table th{border:1px solid #dbe5f0;padding:8px 10px;vertical-align:top;white-space:pre-wrap;word-break:break-word}
+.pv-doc-table tr:first-child td,.pv-doc-table tr:first-child th{background:#f6f9ff;font-weight:700}
+.pv-doc-toc-entry{font-size:.95rem;color:#1f2937}
+.pv-doc-toc-level-1{padding-left:0}
+.pv-doc-toc-level-2{padding-left:14pt}
+.pv-doc-toc-level-3{padding-left:28pt}
+.pv-doc-toc-level-4,.pv-doc-toc-level-5,.pv-doc-toc-level-6{padding-left:42pt}
+.pv-doc-toc-row{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:end}
+.pv-doc-toc-dots{border-bottom:1px dotted #9caec6;transform:translateY(-2px)}
+.pv-doc-toc-page{font-variant-numeric:tabular-nums;color:#5a6d88}
+.pv-doc-textbox{margin:1em auto;padding:10px 14px;max-width:72%;border:1px solid #d7e3f2;border-radius:12px;background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);box-shadow:0 10px 22px rgba(15,23,42,.08)}
+.pv-doc-float-left{float:left;clear:left;max-width:42%;margin:4px 18px 14px 0}
+.pv-doc-float-right{float:right;clear:right;max-width:42%;margin:4px 0 14px 18px}
+.pv-doc-flow::after{content:'';display:block;clear:both}
+.pv-doc-image-wrap{margin:1em 0;text-align:center}
+.pv-doc-image{display:inline-block;max-width:100%;height:auto;border-radius:10px;box-shadow:0 8px 20px rgba(15,23,42,.10);background:#fff}
+.pv-doc-image-cap{margin-top:6px;color:#6b7b92;font-size:.78rem}
+.pv-doc-pagebreak{height:0;border-top:2px dashed #dbe5f0;margin:18px 0}
+.pv-doc-notes{margin-top:22px;padding-top:16px;border-top:2px solid #e6edf7}
+.pv-doc-notes h2{margin:0 0 12px;font-size:1rem;font-weight:800}
+.pv-doc-note-item{display:grid;grid-template-columns:42px 1fr;gap:10px;margin:0 0 10px}
+.pv-doc-note-index{font-size:.8rem;font-weight:800;color:#4b6385;text-align:right;padding-top:2px}
+.pv-slides{display:flex;flex-direction:column;gap:22px}
+.pv-slide-card{background:#fff;border:1px solid #dbe5f0;border-radius:18px;box-shadow:0 12px 28px rgba(15,23,42,.08);padding:14px}
+.pv-slide-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.pv-slide-title{font-size:1rem;font-weight:800}
+.pv-slide-meta{font-size:.8rem;color:#66768c}
+.pv-slide-stage{position:relative;width:100%;overflow:hidden;border:1px solid #dbe5f0;border-radius:14px;background:#f8fbff}
+.pv-slide-stage.theme-gradient{background:linear-gradient(135deg,#eff6ff 0%,#dbeafe 45%,#ffffff 100%)}
+.pv-slide-canvas{position:absolute;inset:0;overflow:hidden}
+.pv-slide-item{position:absolute;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+.pv-slide-text{padding:2px 4px}
+.pv-slide-box{border:1px solid rgba(107,123,146,.18);border-radius:8px}
+.pv-slide-line{pointer-events:none}
+.pv-slide-line-core{position:absolute;left:0;top:50%;height:2px;transform-origin:left center;border-radius:999px}
+.pv-slide-shape-placeholder{display:flex;align-items:center;justify-content:center;text-align:center;padding:8px;font-size:.72rem;color:#5f6f87;font-weight:700;background:rgba(255,255,255,.52)}
+.pv-slide-shape-round{border-radius:999px}
+.pv-slide-shape-pill{border-radius:999px}
+.pv-slide-caption{font-size:.72rem;color:#61728a}
+.pv-slide-chart{display:flex;flex-direction:column;gap:8px;padding:8px 10px;background:rgba(255,255,255,.72)}
+.pv-slide-chart-meta{font-size:.72rem;color:#5d6f88}
+.pv-slide-smartart{display:flex;flex-direction:column;gap:8px;padding:10px}
+.pv-slide-smartart-node{padding:8px 10px;border-radius:10px;border:1px solid rgba(129,152,183,.32);background:rgba(255,255,255,.72);font-size:.8rem;font-weight:600}
+.pv-slide-bars{display:flex;flex-direction:column;gap:6px;padding:8px 10px}
+.pv-slide-bar-row{display:grid;grid-template-columns:minmax(72px,120px) 1fr auto;gap:8px;align-items:center;font-size:.74rem}
+.pv-slide-bar-track{height:10px;border-radius:999px;background:rgba(226,232,240,.95);overflow:hidden}
+.pv-slide-bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#60a5fa,#2563eb)}
+.pv-slide-smartart-flow{display:flex;flex-direction:column;gap:6px;padding:10px}
+.pv-slide-smartart-step{display:flex;align-items:center;gap:8px}
+.pv-slide-smartart-arrow{color:#7c8da6;font-weight:800}
+.pv-slide-image{display:block;width:100%;height:100%;object-fit:contain}
+.pv-slide-table{width:100%;height:100%;border-collapse:collapse;font-size:.78rem;background:rgba(255,255,255,.88)}
+.pv-slide-table td,.pv-slide-table th{border:1px solid rgba(201,214,231,.9);padding:4px 6px;vertical-align:top;white-space:pre-wrap;word-break:break-word}
+.pv-slide-table tr:first-child td,.pv-slide-table tr:first-child th{background:#eef5ff;font-weight:700}
+"""
+        return (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            f"<title>{safe_title}</title>"
+            f"<style>{base_css}{str(extra_css or '')}</style>"
+            "</head><body>"
+            f"<div class=\"pv-shell\">{body_html}</div>"
+            "</body></html>"
+        )
+
+    def _preview_parsed_markdown_path(self, fp: Path) -> Path | None:
+        try:
+            if str(fp.name).lower().endswith(".parsed.md") and fp.exists() and fp.is_file():
+                return fp
+        except Exception:
+            return None
+        cand = fp.parent / f"{fp.stem}.parsed.md"
+        if cand.exists() and cand.is_file():
+            return cand
+        return None
+
+    def _preview_fallback_markdown_html(self, fp: Path, reason: str = "") -> str:
+        parsed_fp = self._preview_parsed_markdown_path(fp)
+        note = html.escape(str(reason or "").strip())
+        text = ""
+        if parsed_fp is not None:
+            text = try_read_text(parsed_fp, max_bytes=320_000) or ""
+        if not text:
+            text = "(preview unavailable)"
+        note_html = f"<div class=\"pv-note\">{note}</div>" if note else ""
+        body = (
+            "<div class=\"pv-card\">"
+            f"<h1 class=\"pv-title\">{html.escape(fp.name)}</h1>"
+            f"{note_html}"
+            f"<pre class=\"pv-pre\">{html.escape(text)}</pre>"
+            "</div>"
+        )
+        return self._preview_html_shell(fp.name, body)
+
+    def _preview_value_text(self, value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return f"{value:.12g}"
+        return str(value)
+
+    def _preview_excel_col_label(self, idx: int) -> str:
+        n = max(1, int(idx or 1))
+        out = []
+        while n > 0:
+            n, rem = divmod(n - 1, 26)
+            out.append(chr(65 + rem))
+        return "".join(reversed(out)) or "A"
+
+    def _preview_table_block_html(self, title: str, rows: list[list[str]], *, truncated: bool = False, subtitle: str = "") -> str:
+        grid_rows = [list(r) for r in (rows or [])]
+        col_count = max((len(r) for r in grid_rows), default=0)
+        if col_count <= 0:
+            subtitle_html = f"<div class=\"pv-block-sub\">{html.escape(subtitle)}</div>" if subtitle else ""
+            return (
+                "<section class=\"pv-block pv-card\">"
+                f"<h2 class=\"pv-block-title\">{html.escape(str(title or 'Table'))}</h2>"
+                f"{subtitle_html}"
+                "<div class=\"pv-note\">(empty sheet)</div></section>"
+            )
+        header_html = "".join(f"<th>{html.escape(self._preview_excel_col_label(i + 1))}</th>" for i in range(col_count))
+        body_rows = []
+        for row_idx, row in enumerate(grid_rows, start=1):
+            vals = list(row) + ([""] * max(0, col_count - len(row)))
+            cells = "".join(f"<td>{html.escape(str(v or ''))}</td>" for v in vals)
+            body_rows.append(f"<tr><th class=\"pv-rowhead\">{row_idx}</th>{cells}</tr>")
+        trunc_note = " · truncated" if truncated else ""
+        sub = str(subtitle or "").strip()
+        if trunc_note:
+            sub = f"{sub}{trunc_note}" if sub else trunc_note.lstrip(" ·")
+        sub_html = f"<div class=\"pv-block-sub\">{html.escape(sub)}</div>" if sub else ""
+        return (
+            "<section class=\"pv-block pv-card\">"
+            f"<h2 class=\"pv-block-title\">{html.escape(str(title or 'Table'))}</h2>"
+            f"{sub_html}"
+            "<div class=\"pv-table-wrap\"><table class=\"pv-grid\">"
+            f"<thead><tr><th class=\"pv-corner\">#</th>{header_html}</tr></thead>"
+            f"<tbody>{''.join(body_rows)}</tbody>"
+            "</table></div></section>"
+        )
+
+    def _preview_csv_rows(self, fp: Path) -> tuple[list[list[str]], bool]:
+        raw = fp.read_bytes()
+        text = self._decode_text_bytes(raw)
+        if not text:
+            return [], False
+        sample = "\n".join(text.splitlines()[:40])
+        dialect = csv.excel_tab if fp.suffix.lower() == ".tsv" else csv.excel
+        try:
+            if fp.suffix.lower() != ".tsv":
+                dialect = csv.Sniffer().sniff(sample)
+        except Exception:
+            pass
+        out: list[list[str]] = []
+        truncated = False
+        try:
+            reader = csv.reader(io.StringIO(text), dialect)
+            for ridx, row in enumerate(reader):
+                if ridx >= 200:
+                    truncated = True
+                    break
+                if len(row) > 40:
+                    truncated = True
+                vals = [self._preview_value_text(v).strip() for v in row[:40]]
+                if any(v != "" for v in vals):
+                    out.append(vals)
+        except Exception:
+            return [], False
+        return out, truncated
+
+    def _preview_csv_html(self, fp: Path) -> str:
+        rows, truncated = self._preview_csv_rows(fp)
+        body = self._preview_table_block_html(fp.name, rows, truncated=truncated, subtitle="CSV/TSV preview")
+        return self._preview_html_shell(fp.name, body)
+
+    def _preview_xlsx_html(self, fp: Path) -> str:
+        if not self._module_available("openpyxl"):
+            return self._preview_fallback_markdown_html(fp, "openpyxl unavailable; using parsed markdown fallback")
+        try:
+            import openpyxl  # type: ignore
+
+            wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+            blocks = []
+            for ws in list(wb.worksheets)[:6]:
+                rows: list[list[str]] = []
+                for row in ws.iter_rows(min_row=1, max_row=200, max_col=40, values_only=True):
+                    vals = [self._preview_value_text(v) for v in row]
+                    if any(v != "" for v in vals):
+                        rows.append(vals)
+                truncated = bool((ws.max_row or 0) > 200 or (ws.max_column or 0) > 40)
+                subtitle = f"{int(ws.max_row or 0)} rows · {int(ws.max_column or 0)} cols"
+                blocks.append(self._preview_table_block_html(ws.title, rows, truncated=truncated, subtitle=subtitle))
+            wb.close()
+            if not blocks:
+                return self._preview_fallback_markdown_html(fp, "worksheet preview empty; using parsed markdown fallback")
+            return self._preview_html_shell(fp.name, "".join(blocks))
+        except Exception as exc:
+            return self._preview_fallback_markdown_html(fp, f"xlsx preview fallback: {trim(str(exc), 180)}")
+
+    def _preview_xls_html(self, fp: Path) -> str:
+        if not self._module_available("xlrd"):
+            return self._preview_fallback_markdown_html(fp, "xlrd unavailable; using parsed markdown fallback")
+        try:
+            import xlrd  # type: ignore
+
+            wb = xlrd.open_workbook(str(fp), on_demand=True)
+            blocks = []
+            for si in range(min(int(wb.nsheets or 0), 6)):
+                sh = wb.sheet_by_index(si)
+                rows: list[list[str]] = []
+                row_cap = min(int(sh.nrows or 0), 200)
+                col_cap = min(int(sh.ncols or 0), 40)
+                for ridx in range(row_cap):
+                    vals = [self._preview_value_text(sh.cell_value(ridx, cidx)) for cidx in range(col_cap)]
+                    if any(v != "" for v in vals):
+                        rows.append(vals)
+                truncated = bool(int(sh.nrows or 0) > 200 or int(sh.ncols or 0) > 40)
+                subtitle = f"{int(sh.nrows or 0)} rows · {int(sh.ncols or 0)} cols"
+                blocks.append(self._preview_table_block_html(sh.name, rows, truncated=truncated, subtitle=subtitle))
+            wb.release_resources()
+            if not blocks:
+                return self._preview_fallback_markdown_html(fp, "worksheet preview empty; using parsed markdown fallback")
+            return self._preview_html_shell(fp.name, "".join(blocks))
+        except Exception as exc:
+            return self._preview_fallback_markdown_html(fp, f"xls preview fallback: {trim(str(exc), 180)}")
+
+    def _preview_doc_length_pt(self, value: object) -> float:
+        if value is None:
+            return 0.0
+        pt = getattr(value, "pt", None)
+        if isinstance(pt, (int, float)) and math.isfinite(pt):
+            return float(pt)
+        try:
+            num = float(value)  # type: ignore[arg-type]
+        except Exception:
+            return 0.0
+        return num / 12700.0 if math.isfinite(num) else 0.0
+
+    def _preview_doc_color_css(self, value: object) -> str:
+        if value is None:
+            return ""
+        rgb = getattr(value, "rgb", None)
+        if rgb is not None:
+            return f"#{str(rgb)}"
+        txt = str(value).strip().lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", txt):
+            return f"#{txt}"
+        return ""
+
+    def _preview_doc_align_css(self, value: object) -> str:
+        txt = str(value or "").upper()
+        if "CENTER" in txt:
+            return "center"
+        if "RIGHT" in txt:
+            return "right"
+        if "JUSTIFY" in txt or "DISTRIBUTE" in txt:
+            return "justify"
+        return "left"
+
+    def _preview_doc_run_html(self, run: object, default_font: str = "", default_color: str = "") -> str:
+        try:
+            text = str(getattr(run, "text", "") or "")
+        except Exception:
+            text = ""
+        if not text:
+            return ""
+        safe = html.escape(text).replace("\n", "<br>")
+        styles: list[str] = []
+        classes: list[str] = []
+        try:
+            font = getattr(run, "font", None)
+        except Exception:
+            font = None
+        if font is not None:
+            size_pt = self._preview_doc_length_pt(getattr(font, "size", None))
+            if size_pt > 0:
+                styles.append(f"font-size:{size_pt:.2f}pt")
+            name = str(getattr(font, "name", "") or "").strip()
+            if name:
+                styles.append(f"font-family:{json.dumps(name)}")
+            color_css = self._preview_doc_color_css(getattr(font, "color", None))
+            if color_css:
+                styles.append(f"color:{color_css}")
+        if default_font and not any(s.startswith("font-family:") for s in styles):
+            styles.append(f"font-family:{json.dumps(str(default_font))}")
+        if default_color and not any(s.startswith("color:") for s in styles):
+            styles.append(f"color:{str(default_color)}")
+        if bool(getattr(run, "bold", False)):
+            styles.append("font-weight:700")
+        if bool(getattr(run, "italic", False)):
+            styles.append("font-style:italic")
+        if bool(getattr(run, "underline", False)):
+            classes.append("pv-doc-run-u")
+        if bool(getattr(run, "strike", False)) or bool(getattr(run, "double_strike", False)):
+            classes.append("pv-doc-run-s")
+        subscript = bool(getattr(font, "subscript", False)) if font is not None else False
+        superscript = bool(getattr(font, "superscript", False)) if font is not None else False
+        if subscript:
+            classes.append("pv-doc-run-sub")
+        if superscript:
+            classes.append("pv-doc-run-super")
+        style_attr = f' style="{";".join(styles)}"' if styles else ""
+        class_attr = f' class="{" ".join(classes)}"' if classes else ""
+        return f"<span{class_attr}{style_attr}>{safe}</span>"
+
+    def _preview_doc_image_htmls_from_element(self, part: object, element: object, *, max_width_pt: float = 460.0) -> list[str]:
+        out: list[str] = []
+        try:
+            rels = getattr(part, "related_parts", {})
+        except Exception:
+            rels = {}
+        if not rels or element is None:
+            return out
+        xml_text = ""
+        try:
+            xml_text = str(getattr(element, "xml", "") or "")
+        except Exception:
+            xml_text = ""
+        low_xml = xml_text.lower()
+        float_cls = ""
+        if "<wp:anchor" in low_xml or "<anchor" in low_xml:
+            if re.search(r"<wp:align>\s*right\s*</wp:align>", low_xml) or 'relativefrom="rightmargin"' in low_xml:
+                float_cls = " pv-doc-float-right"
+            else:
+                float_cls = " pv-doc-float-left"
+        if xml_text and ("txbxcontent" in low_xml or "textbox" in low_xml):
+            try:
+                root = ET.fromstring(xml_text)
+                boxes = list(root.findall(".//{*}txbxContent"))
+            except Exception:
+                boxes = []
+            for box in boxes:
+                try:
+                    box_xml = ET.tostring(box, encoding="unicode")
+                except Exception:
+                    box_xml = ""
+                tokens = self._extract_xml_text_tokens(box_xml, ("t",))
+                if not tokens:
+                    continue
+                paras = "".join(f"<p class=\"pv-doc-para\">{html.escape(tok)}</p>" for tok in tokens if str(tok).strip())
+                if paras:
+                    out.append(f"<div class=\"pv-doc-textbox{float_cls}\">{paras}</div>")
+        try:
+            blips = list(element.findall(".//{*}blip"))
+        except Exception:
+            blips = []
+        for blip in blips:
+            try:
+                rid = str(
+                    blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed", "")
+                    or blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}link", "")
+                    or ""
+                ).strip()
+            except Exception:
+                rid = ""
+            if not rid:
+                continue
+            img_part = rels.get(rid)
+            if img_part is None:
+                continue
+            blob = getattr(img_part, "blob", b"") or b""
+            if not blob:
+                continue
+            mime = str(
+                getattr(img_part, "content_type", "")
+                or guess_mime_from_name(str(getattr(img_part, "partname", "image.png") or "image.png"), "image/png")
+            )
+            try:
+                ext_node = blip.find(".//{*}ext")
+            except Exception:
+                ext_node = None
+            width_pt = 0.0
+            height_pt = 0.0
+            if ext_node is not None:
+                try:
+                    width_pt = max(0.0, float(ext_node.get("cx", "0") or 0) / 12700.0)
+                    height_pt = max(0.0, float(ext_node.get("cy", "0") or 0) / 12700.0)
+                except Exception:
+                    width_pt = 0.0
+                    height_pt = 0.0
+            width_pt = min(max_width_pt, width_pt) if width_pt > 0 else min(max_width_pt, 360.0)
+            style_bits = [f"max-width:{width_pt:.2f}pt", "width:100%", "height:auto"]
+            if height_pt > 0 and width_pt > 0:
+                style_bits.insert(0, f"aspect-ratio:{max(1.0, width_pt):.4f}/{max(1.0, height_pt):.4f}")
+            b64 = base64.b64encode(blob).decode("ascii", errors="ignore")
+            out.append(
+                f"<div class=\"pv-doc-image-wrap{float_cls}\">"
+                f"<img class=\"pv-doc-image\" src=\"data:{html.escape(mime)};base64,{b64}\" style=\"{';'.join(style_bits)}\" alt=\"\">"
+                "</div>"
+            )
+        return out
+
+    def _preview_doc_note_maps(self, fp: Path) -> dict[str, dict[str, str]]:
+        out = {"footnote": {}, "endnote": {}}
+        ns_id = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id"
+        ns_type = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type"
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                for kind, rel_name in (("footnote", "word/footnotes.xml"), ("endnote", "word/endnotes.xml")):
+                    if rel_name not in zf.namelist():
+                        continue
+                    root = ET.fromstring(zf.read(rel_name))
+                    for node in list(root):
+                        local = str(node.tag).rsplit("}", 1)[-1]
+                        if local not in {"footnote", "endnote"}:
+                            continue
+                        note_id = str(node.get(ns_id, "") or node.get("id", "") or "").strip()
+                        note_type = str(node.get(ns_type, "") or "").strip().lower()
+                        if (not note_id) or note_type in {"separator", "continuationseparator", "continuationnotice"} or note_id.startswith("-"):
+                            continue
+                        try:
+                            note_xml = ET.tostring(node, encoding="unicode")
+                        except Exception:
+                            note_xml = ""
+                        tokens = [tok for tok in self._extract_xml_text_tokens(note_xml, ("t",)) if str(tok).strip()]
+                        if tokens:
+                            out[kind][note_id] = " ".join(str(tok).strip() for tok in tokens)
+        except Exception:
+            return out
+        return out
+
+    def _preview_doc_paragraph_payload(self, para: object, part: object | None = None, *, default_font: str = "", default_color: str = "", note_maps: dict[str, dict[str, str]] | None = None) -> dict:
+        part_obj = part or getattr(para, "part", None)
+        hard_break_after = False
+        note_refs: list[tuple[str, str]] = []
+        style_name = ""
+        try:
+            style_name = str(getattr(getattr(para, "style", None), "name", "") or "").strip()
+        except Exception:
+            style_name = ""
+        low_style = style_name.lower()
+        tag = "p"
+        classes = ["pv-doc-para"]
+        if low_style.startswith("heading"):
+            lvl_match = re.search(r"(\d+)", low_style)
+            lvl = max(1, min(6, int(lvl_match.group(1)) if lvl_match else 1))
+            tag = f"h{lvl}"
+            classes.append(f"pv-doc-heading-{lvl}")
+        elif "list bullet" in low_style:
+            classes.append("pv-doc-list-bullet")
+        elif "list number" in low_style:
+            classes.append("pv-doc-list-number")
+        styles: list[str] = []
+        try:
+            pf = getattr(para, "paragraph_format", None)
+        except Exception:
+            pf = None
+        align = self._preview_doc_align_css(getattr(para, "alignment", None))
+        if align != "left":
+            styles.append(f"text-align:{align}")
+        if pf is not None:
+            left_pt = self._preview_doc_length_pt(getattr(pf, "left_indent", None))
+            right_pt = self._preview_doc_length_pt(getattr(pf, "right_indent", None))
+            first_pt = self._preview_doc_length_pt(getattr(pf, "first_line_indent", None))
+            before_pt = self._preview_doc_length_pt(getattr(pf, "space_before", None))
+            after_pt = self._preview_doc_length_pt(getattr(pf, "space_after", None))
+            line_spacing = getattr(pf, "line_spacing", None)
+            if left_pt:
+                styles.append(f"padding-left:{left_pt:.2f}pt")
+            if right_pt:
+                styles.append(f"padding-right:{right_pt:.2f}pt")
+            if first_pt:
+                styles.append(f"text-indent:{first_pt:.2f}pt")
+            if before_pt:
+                styles.append(f"margin-top:{before_pt:.2f}pt")
+            if after_pt:
+                styles.append(f"margin-bottom:{after_pt:.2f}pt")
+            if isinstance(line_spacing, (int, float)) and math.isfinite(float(line_spacing)) and float(line_spacing) > 0:
+                if float(line_spacing) < 10:
+                    styles.append(f"line-height:{float(line_spacing):.3g}")
+                else:
+                    styles.append(f"line-height:{self._preview_doc_length_pt(line_spacing):.2f}pt")
+        pieces: list[str] = []
+        runs = list(getattr(para, "runs", []) or [])
+        run_map: dict[int, object] = {}
+        for run in runs:
+            try:
+                run_map[id(getattr(run, "_element", None))] = run
+            except Exception:
+                continue
+        try:
+            children = list(getattr(para, "_p", para).iterchildren())
+        except Exception:
+            children = []
+        if children:
+            for child in children:
+                local = str(getattr(child, "tag", "") or "").rsplit("}", 1)[-1]
+                if local in {"r", "hyperlink"}:
+                    try:
+                        iter_nodes = list(child.iterchildren()) if local == "hyperlink" else [child]
+                    except Exception:
+                        iter_nodes = [child]
+                    for node in iter_nodes:
+                        node_run = run_map.get(id(node))
+                        if node_run is not None:
+                            frag = self._preview_doc_run_html(node_run, default_font=default_font, default_color=default_color)
+                            if frag:
+                                pieces.append(frag)
+                        if part_obj is not None:
+                            pieces.extend(self._preview_doc_image_htmls_from_element(part_obj, node))
+                        for ref_kind, ref_local in (("footnote", "footnoteReference"), ("endnote", "endnoteReference")):
+                            try:
+                                refs = list(node.findall(f".//{{*}}{ref_local}"))
+                            except Exception:
+                                refs = []
+                            for ref in refs:
+                                note_id = str(
+                                    ref.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}id", "")
+                                    or ref.get("id", "")
+                                    or ""
+                                ).strip()
+                                if not note_id:
+                                    continue
+                                note_refs.append((ref_kind, note_id))
+                                note_tip = ""
+                                if note_maps:
+                                    try:
+                                        note_tip = trim(str(((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "")).strip(), 240)
+                                    except Exception:
+                                        note_tip = ""
+                                title_attr = f' title="{html.escape(note_tip)}"' if note_tip else ""
+                                pieces.append(f"<span class=\"pv-doc-note-ref\"{title_attr}>[{html.escape(note_id)}]</span>")
+                        try:
+                            for br in node.findall(".//{*}br"):
+                                if str(br.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type", "") or "").strip().lower() == "page":
+                                    hard_break_after = True
+                        except Exception:
+                            pass
+                        try:
+                            if node.find(".//{*}lastRenderedPageBreak") is not None:
+                                hard_break_after = True
+                        except Exception:
+                            pass
+                elif part_obj is not None:
+                    pieces.extend(self._preview_doc_image_htmls_from_element(part_obj, child))
+        else:
+            for run in runs:
+                frag = self._preview_doc_run_html(run, default_font=default_font, default_color=default_color)
+                if frag:
+                    pieces.append(frag)
+        if not pieces:
+            raw_text = html.escape(str(getattr(para, "text", "") or "")).replace("\n", "<br>")
+            pieces.append(raw_text or "&nbsp;")
+        style_attr = f' style="{";".join(styles)}"' if styles else ""
+        toc_match = re.search(r"toc\s*(\d+)", low_style)
+        if toc_match:
+            lvl = max(1, min(6, int(toc_match.group(1) or "1")))
+            parts = str(getattr(para, "text", "") or "").split("\t")
+            title_txt = html.escape(parts[0].strip()) if parts else ""
+            page_txt = html.escape(parts[-1].strip()) if len(parts) >= 2 else ""
+            toc_body = (
+                f"<div class=\"pv-doc-toc-row\"><span>{title_txt}</span><span class=\"pv-doc-toc-dots\"></span><span class=\"pv-doc-toc-page\">{page_txt}</span></div>"
+                if page_txt else title_txt
+            )
+            html_text = f"<div class=\"pv-doc-para pv-doc-toc-entry pv-doc-toc-level-{lvl}\"{style_attr}>{toc_body}</div>"
+        else:
+            html_text = f"<{tag} class=\"{' '.join(classes)}\"{style_attr}>{''.join(pieces)}</{tag}>"
+        plain_text = re.sub(r"<[^>]+>", " ", html_text)
+        weight = max(120, min(2600, len(plain_text) // 3 + (700 * html_text.count("pv-doc-image")) + (280 if tag.startswith("h") else 0)))
+        return {"html": html_text, "hard_break_after": hard_break_after, "weight": weight, "note_refs": note_refs}
+
+    def _preview_doc_paragraph_html(self, para: object) -> str:
+        return str(self._preview_doc_paragraph_payload(para).get("html", "") or "")
+
+    def _preview_doc_table_payload(self, table: object, part: object | None = None, *, default_font: str = "", default_color: str = "", note_maps: dict[str, dict[str, str]] | None = None) -> dict:
+        rows_html = []
+        note_refs: list[tuple[str, str]] = []
+        part_obj = part or getattr(table, "part", None)
+        for row in list(getattr(table, "rows", []) or []):
+            cells_html = []
+            for cell in list(getattr(row, "cells", []) or []):
+                cell_parts = []
+                for para in list(getattr(cell, "paragraphs", []) or []):
+                    payload = self._preview_doc_paragraph_payload(
+                        para,
+                        part=part_obj,
+                        default_font=default_font,
+                        default_color=default_color,
+                        note_maps=note_maps,
+                    )
+                    frag = str(payload.get("html", "") or "")
+                    if frag:
+                        cell_parts.append(frag)
+                    note_refs.extend(list(payload.get("note_refs", []) or []))
+                if not cell_parts:
+                    cell_parts.append("<p class=\"pv-doc-para\">&nbsp;</p>")
+                cells_html.append(f"<td>{''.join(cell_parts)}</td>")
+            rows_html.append(f"<tr>{''.join(cells_html)}</tr>")
+        html_text = f"<table class=\"pv-doc-table\">{''.join(rows_html)}</table>"
+        plain_text = re.sub(r"<[^>]+>", " ", html_text)
+        weight = max(680, min(3400, len(plain_text) // 2 + 800))
+        return {"html": html_text, "hard_break_after": False, "weight": weight, "note_refs": note_refs}
+
+    def _preview_doc_table_html(self, table: object) -> str:
+        return str(self._preview_doc_table_payload(table).get("html", "") or "")
+
+    def _preview_docx_html(self, fp: Path) -> str:
+        if not self._module_available("docx"):
+            return self._preview_fallback_markdown_html(fp, "python-docx unavailable; using parsed markdown fallback")
+        try:
+            import docx  # type: ignore
+            from docx.document import Document as _DocxDocument  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
+            from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.table import Table as _DocxTable  # type: ignore
+            from docx.text.paragraph import Paragraph as _DocxParagraph  # type: ignore
+
+            doc = docx.Document(str(fp))
+            note_maps = self._preview_doc_note_maps(fp)
+
+            def _iter_doc_blocks(parent: object):
+                if isinstance(parent, _DocxDocument):
+                    parent_elm = parent.element.body
+                else:
+                    parent_elm = parent._tc  # type: ignore[attr-defined]
+                for child in parent_elm.iterchildren():
+                    if isinstance(child, CT_P):
+                        yield _DocxParagraph(child, parent)
+                    elif isinstance(child, CT_Tbl):
+                        yield _DocxTable(child, parent)
+
+            def _header_footer_html(container: object) -> str:
+                part_obj = getattr(container, "part", None) or getattr(container, "_part", None)
+                items = []
+                try:
+                    paragraphs = list(getattr(container, "paragraphs", []) or [])
+                except Exception:
+                    paragraphs = []
+                for para in paragraphs:
+                    payload = self._preview_doc_paragraph_payload(para, part=part_obj)
+                    frag = str(payload.get("html", "") or "").strip()
+                    plain = re.sub(r"<[^>]+>", " ", frag).strip()
+                    if frag and plain:
+                        items.append(frag)
+                return "".join(items)
+
+            page_style = ""
+            try:
+                sec = doc.sections[0]
+                page_width_pt = self._preview_doc_length_pt(getattr(sec, "page_width", None))
+                left_pt = self._preview_doc_length_pt(getattr(sec, "left_margin", None))
+                right_pt = self._preview_doc_length_pt(getattr(sec, "right_margin", None))
+                top_pt = self._preview_doc_length_pt(getattr(sec, "top_margin", None))
+                bottom_pt = self._preview_doc_length_pt(getattr(sec, "bottom_margin", None))
+                inner_width = max(480.0, page_width_pt - left_pt - right_pt) if page_width_pt > 0 else 720.0
+                styles = [f"max-width:{inner_width:.2f}pt"]
+                if top_pt:
+                    styles.append(f"padding-top:{top_pt:.2f}pt")
+                if right_pt:
+                    styles.append(f"padding-right:{right_pt:.2f}pt")
+                if bottom_pt:
+                    styles.append(f"padding-bottom:{bottom_pt:.2f}pt")
+                if left_pt:
+                    styles.append(f"padding-left:{left_pt:.2f}pt")
+                page_style = ";".join(styles)
+            except Exception:
+                page_style = ""
+
+            header_html = ""
+            footer_html = ""
+            try:
+                for sec in list(getattr(doc, "sections", []) or []):
+                    if not header_html:
+                        header_html = _header_footer_html(getattr(sec, "header", None))
+                    if not footer_html:
+                        footer_html = _header_footer_html(getattr(sec, "footer", None))
+                    if header_html and footer_html:
+                        break
+            except Exception:
+                header_html = ""
+                footer_html = ""
+
+            entries: list[dict] = []
+            ordered_note_refs: list[tuple[str, str]] = []
+            seen_note_refs: set[tuple[str, str]] = set()
+            for block in _iter_doc_blocks(doc):
+                if isinstance(block, _DocxParagraph):
+                    payload = self._preview_doc_paragraph_payload(block, part=doc.part, note_maps=note_maps)
+                    entries.append(payload)
+                    for ref in list(payload.get("note_refs", []) or []):
+                        key = (str(ref[0]), str(ref[1]))
+                        if key in seen_note_refs:
+                            continue
+                        seen_note_refs.add(key)
+                        ordered_note_refs.append(key)
+                elif isinstance(block, _DocxTable):
+                    payload = self._preview_doc_table_payload(block, part=doc.part, note_maps=note_maps)
+                    entries.append(payload)
+                    for ref in list(payload.get("note_refs", []) or []):
+                        key = (str(ref[0]), str(ref[1]))
+                        if key in seen_note_refs:
+                            continue
+                        seen_note_refs.add(key)
+                        ordered_note_refs.append(key)
+            if not entries:
+                return self._preview_fallback_markdown_html(fp, "docx preview empty; using parsed markdown fallback")
+            pages: list[list[str]] = []
+            cur: list[str] = []
+            cur_weight = 0
+            cur_count = 0
+            for entry in entries:
+                frag = str(entry.get("html", "") or "")
+                if not frag:
+                    continue
+                weight = max(60, int(entry.get("weight", 240) or 240))
+                hard_break_after = bool(entry.get("hard_break_after", False))
+                if cur and (cur_weight + weight > 5400 or cur_count >= 18):
+                    pages.append(cur)
+                    cur = []
+                    cur_weight = 0
+                    cur_count = 0
+                cur.append(frag)
+                cur_weight += weight
+                cur_count += 1
+                if hard_break_after:
+                    cur.append("<div class=\"pv-doc-pagebreak\"></div>")
+                    pages.append(cur)
+                    cur = []
+                    cur_weight = 0
+                    cur_count = 0
+            if cur:
+                pages.append(cur)
+            if not pages:
+                return self._preview_fallback_markdown_html(fp, "docx preview empty; using parsed markdown fallback")
+            note_sections: list[str] = []
+            for kind, label in (("footnote", "Footnotes"), ("endnote", "Endnotes")):
+                items = []
+                for ref_kind, note_id in ordered_note_refs:
+                    if ref_kind != kind:
+                        continue
+                    note_text = str(((note_maps.get(kind, {}) or {}).get(note_id, "") or "")).strip()
+                    note_body = html.escape(note_text).replace("\n", "<br>") if note_text else "<em>(note content unavailable)</em>"
+                    items.append(
+                        "<div class=\"pv-doc-note-item\">"
+                        f"<div class=\"pv-doc-note-index\">[{html.escape(note_id)}]</div>"
+                        f"<div>{note_body}</div>"
+                        "</div>"
+                    )
+                if items:
+                    note_sections.append(f"<h2>{label}</h2>{''.join(items)}")
+            if note_sections:
+                notes_html = f"<section class=\"pv-doc-notes\">{''.join(note_sections)}</section>"
+                if pages and len(pages[-1]) < 12:
+                    pages[-1].append(notes_html)
+                else:
+                    pages.append([notes_html])
+            page_attr = f' style="{page_style}"' if page_style else ""
+            shells = []
+            total_pages = len(pages)
+            for idx, page_blocks in enumerate(pages, start=1):
+                header = f"<div class=\"pv-doc-header\">{header_html}<span class=\"pv-doc-page-no\">{idx}/{total_pages}</span></div>" if header_html else f"<div class=\"pv-doc-header\"><span class=\"pv-doc-page-no\">{idx}/{total_pages}</span></div>"
+                footer = f"<div class=\"pv-doc-footer\">{footer_html}</div>" if footer_html else ""
+                shells.append(
+                    "<section class=\"pv-doc-page-shell\">"
+                    f"<div class=\"pv-doc-page\"{page_attr}>"
+                    + (f"<h1 class=\"pv-doc-title\">{html.escape(fp.name)}</h1><div class=\"pv-doc-sub\">DOCX preview</div>" if idx == 1 else "")
+                    + header
+                    + f"<div class=\"pv-doc-flow\">{''.join(page_blocks)}</div>"
+                    + footer
+                    + "</div></section>"
+                )
+            body = f"<div class=\"pv-doc-pages\">{''.join(shells)}</div>"
+            return self._preview_html_shell(fp.name, body)
+        except Exception as exc:
+            return self._preview_fallback_markdown_html(fp, f"docx preview fallback: {trim(str(exc), 180)}")
+
+    def _preview_doc_html(self, fp: Path) -> str:
+        return self._preview_fallback_markdown_html(fp, "legacy .doc preview is using parsed markdown fallback")
+
+    def _preview_ppt_theme(self, fp: Path) -> dict:
+        out = {"major_font": "", "minor_font": "", "colors": {}}
+        try:
+            with zipfile.ZipFile(fp, "r") as zf:
+                theme_files = [n for n in zf.namelist() if re.match(r"^ppt/theme/theme\d+\.xml$", n)]
+                if not theme_files:
+                    return out
+                root = ET.fromstring(zf.read(sorted(theme_files)[0]))
+                for node in root.iter():
+                    local = str(node.tag).rsplit("}", 1)[-1]
+                    if local == "clrScheme":
+                        for child in list(node):
+                            key = str(child.tag).rsplit("}", 1)[-1]
+                            color = ""
+                            for cc in child.iter():
+                                c_local = str(cc.tag).rsplit("}", 1)[-1]
+                                if c_local == "srgbClr":
+                                    color = f"#{str(cc.get('val', '') or '').strip()}"
+                                    break
+                                if c_local == "sysClr":
+                                    last = str(cc.get("lastClr", "") or "").strip()
+                                    if last:
+                                        color = f"#{last}"
+                                        break
+                            if color:
+                                out["colors"][key] = color
+                    elif local == "majorFont":
+                        latin = next((x for x in node if str(x.tag).rsplit("}", 1)[-1] == "latin"), None)
+                        if latin is not None:
+                            out["major_font"] = str(latin.get("typeface", "") or "").strip()
+                    elif local == "minorFont":
+                        latin = next((x for x in node if str(x.tag).rsplit("}", 1)[-1] == "latin"), None)
+                        if latin is not None:
+                            out["minor_font"] = str(latin.get("typeface", "") or "").strip()
+        except Exception:
+            return out
+        return out
+
+    def _preview_ppt_theme_color_css(self, theme: dict | None, color_obj: object, fallback_key: str = "") -> str:
+        direct = self._preview_doc_color_css(color_obj)
+        if direct:
+            return direct
+        colors = dict((theme or {}).get("colors", {}) or {})
+        raw = str(getattr(color_obj, "theme_color", "") or color_obj or "").strip().upper()
+        raw = raw.rsplit(".", 1)[-1]
+        mapping = {
+            "ACCENT_1": "accent1",
+            "ACCENT_2": "accent2",
+            "ACCENT_3": "accent3",
+            "ACCENT_4": "accent4",
+            "ACCENT_5": "accent5",
+            "ACCENT_6": "accent6",
+            "TEXT_1": "dk1",
+            "TEXT_2": "dk2",
+            "BACKGROUND_1": "lt1",
+            "BACKGROUND_2": "lt2",
+            "LIGHT_1": "lt1",
+            "LIGHT_2": "lt2",
+            "DARK_1": "dk1",
+            "DARK_2": "dk2",
+            "HYPERLINK": "hlink",
+            "FOLLOWED_HYPERLINK": "folHlink",
+        }
+        key = mapping.get(raw, "")
+        if key and colors.get(key):
+            return str(colors.get(key) or "")
+        if fallback_key and colors.get(fallback_key):
+            return str(colors.get(fallback_key) or "")
+        return ""
+
+    def _preview_xml_text(self, obj: object) -> str:
+        if obj is None:
+            return ""
+        try:
+            txt = str(getattr(obj, "xml", "") or "")
+        except Exception:
+            txt = ""
+        if txt:
+            return txt
+        for attr in ("_element", "element"):
+            try:
+                node = getattr(obj, attr, None)
+            except Exception:
+                node = None
+            if node is None:
+                continue
+            try:
+                txt = str(getattr(node, "xml", "") or "")
+            except Exception:
+                txt = ""
+            if txt:
+                return txt
+        return ""
+
+    def _preview_ppt_xml_color_css(self, node: object, theme: dict | None = None, fallback_key: str = "") -> str:
+        colors = dict((theme or {}).get("colors", {}) or {})
+        preset_map = {
+            "black": "#000000",
+            "white": "#ffffff",
+            "red": "#ef4444",
+            "blue": "#2563eb",
+            "green": "#16a34a",
+            "yellow": "#eab308",
+            "orange": "#f97316",
+            "purple": "#9333ea",
+            "gray": "#9ca3af",
+            "grey": "#9ca3af",
+            "ltgray": "#d1d5db",
+            "dkgray": "#4b5563",
+            "cyan": "#06b6d4",
+            "magenta": "#d946ef",
+        }
+        if node is None:
+            return str(colors.get(fallback_key) or "")
+        root = node
+        if isinstance(node, str):
+            try:
+                root = ET.fromstring(node)
+            except Exception:
+                return str(colors.get(fallback_key) or "")
+        try:
+            nodes = list(root.iter())  # type: ignore[attr-defined]
+        except Exception:
+            nodes = []
+        if not nodes:
+            nodes = [root]
+        for cand in nodes:
+            local = str(getattr(cand, "tag", "") or "").rsplit("}", 1)[-1]
+            if local == "srgbClr":
+                raw = str(cand.get("val", "") or "").strip().lstrip("#")
+                if re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
+                    return f"#{raw}"
+            elif local == "sysClr":
+                raw = str(cand.get("lastClr", "") or "").strip().lstrip("#")
+                if re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
+                    return f"#{raw}"
+            elif local == "schemeClr":
+                raw = str(cand.get("val", "") or "").strip()
+                key = {
+                    "accent1": "accent1",
+                    "accent2": "accent2",
+                    "accent3": "accent3",
+                    "accent4": "accent4",
+                    "accent5": "accent5",
+                    "accent6": "accent6",
+                    "tx1": "dk1",
+                    "tx2": "dk2",
+                    "bg1": "lt1",
+                    "bg2": "lt2",
+                    "lt1": "lt1",
+                    "lt2": "lt2",
+                    "dk1": "dk1",
+                    "dk2": "dk2",
+                    "hlink": "hlink",
+                    "folHlink": "folHlink",
+                }.get(raw, raw)
+                if colors.get(key):
+                    return str(colors.get(key) or "")
+            elif local == "prstClr":
+                raw = str(cand.get("val", "") or "").strip().lower()
+                if raw in preset_map:
+                    return preset_map[raw]
+        if fallback_key and colors.get(fallback_key):
+            return str(colors.get(fallback_key) or "")
+        return ""
+
+    def _preview_ppt_gradient_css(self, xml_text: str, theme: dict | None = None, fallback_key: str = "") -> str:
+        if not str(xml_text or "").strip():
+            return ""
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return ""
+        grad = root.find(".//{*}gradFill")
+        if grad is None:
+            return ""
+        angle = 135.0
+        try:
+            lin = grad.find(".//{*}lin")
+            if lin is not None:
+                angle = float(lin.get("ang", "0") or 0.0) / 60000.0
+        except Exception:
+            angle = 135.0
+        stops: list[tuple[float, str]] = []
+        for gs in list(grad.findall(".//{*}gs")):
+            color = self._preview_ppt_xml_color_css(gs, theme=theme, fallback_key=fallback_key)
+            if not color:
+                continue
+            try:
+                pos = max(0.0, min(100.0, float(gs.get("pos", "0") or 0.0) / 1000.0))
+            except Exception:
+                pos = 0.0
+            stops.append((pos, color))
+        if not stops:
+            return ""
+        stops.sort(key=lambda item: item[0])
+        if len(stops) == 1:
+            return f"background:{stops[0][1]}"
+        css = ",".join(f"{color} {pos:.2f}%" for pos, color in stops)
+        return f"background:linear-gradient({angle:.2f}deg,{css})"
+
+    def _preview_ppt_group_xfrm(self, shape: object) -> dict[str, float]:
+        out = {"ch_off_x": 0.0, "ch_off_y": 0.0, "ch_ext_x": 0.0, "ch_ext_y": 0.0}
+        xml_text = self._preview_xml_text(shape)
+        if not xml_text:
+            return out
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return out
+        xfrm = root.find(".//{*}grpSpPr/{*}xfrm")
+        if xfrm is None:
+            return out
+        for local_name, key_x, key_y in (
+            ("chOff", "ch_off_x", "ch_off_y"),
+            ("chExt", "ch_ext_x", "ch_ext_y"),
+        ):
+            node = xfrm.find(f".//{{*}}{local_name}")
+            if node is None:
+                continue
+            try:
+                out[key_x] = float(node.get("x", "0") or 0.0)
+                out[key_y] = float(node.get("y", "0") or 0.0)
+            except Exception:
+                continue
+        return out
+
+    def _preview_ppt_smartart_texts(self, shape: object) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def _push(val: object) -> None:
+            txt = " ".join(str(val or "").split()).strip()
+            if not txt or txt in seen:
+                return
+            seen.add(txt)
+            out.append(txt)
+
+        xml_text = self._preview_xml_text(shape)
+        if xml_text:
+            low_xml = xml_text.lower()
+            if ("dgm:" in low_xml) or ("diagram" in low_xml) or ("smartart" in str(getattr(shape, "name", "") or "").lower()):
+                for tok in self._extract_xml_text_tokens(xml_text, ("t",)):
+                    _push(tok)
+                try:
+                    root = ET.fromstring(xml_text)
+                except Exception:
+                    root = None
+                part = getattr(shape, "part", None)
+                rels = getattr(part, "related_parts", {}) if part is not None else {}
+                if root is not None and rels:
+                    for node in root.iter():
+                        for attr_name, attr_val in dict(getattr(node, "attrib", {}) or {}).items():
+                            local_attr = str(attr_name).rsplit("}", 1)[-1]
+                            rid = str(attr_val or "").strip()
+                            if (not rid.startswith("rId")) or local_attr not in {"dm", "lo", "qs", "cs", "style"}:
+                                continue
+                            rel_part = rels.get(rid)
+                            if rel_part is None:
+                                continue
+                            rel_xml = self._preview_xml_text(rel_part)
+                            if not rel_xml:
+                                blob = getattr(rel_part, "blob", b"") or b""
+                                if blob:
+                                    rel_xml = blob.decode("utf-8", errors="ignore")
+                            for tok in self._extract_xml_text_tokens(rel_xml, ("t",)):
+                                _push(tok)
+        return out[:12]
+
+    def _preview_ppt_smartart_html(self, shape: object, *, theme: dict | None = None, default_font: str = "", default_color: str = "") -> str:
+        texts = self._preview_ppt_smartart_texts(shape)
+        if not texts:
+            return ""
+        node_style_bits = []
+        if default_font:
+            node_style_bits.append(f"font-family:{json.dumps(default_font)}")
+        if default_color:
+            node_style_bits.append(f"color:{default_color}")
+        accent = str(((theme or {}).get("colors", {}) or {}).get("accent1") or "#60a5fa")
+        node_style_bits.append(f"border-color:{accent}")
+        node_style = f' style="{";".join(node_style_bits)}"' if node_style_bits else ""
+        if len(texts) <= 1:
+            return f"<div class=\"pv-slide-smartart\"><div class=\"pv-slide-smartart-node\"{node_style}>{html.escape(texts[0])}</div></div>"
+        steps = []
+        for idx, txt in enumerate(texts):
+            steps.append(
+                "<div class=\"pv-slide-smartart-step\">"
+                f"<div class=\"pv-slide-smartart-node\"{node_style}>{html.escape(txt)}</div>"
+                "</div>"
+            )
+            if idx < len(texts) - 1:
+                steps.append("<div class=\"pv-slide-smartart-step\"><span class=\"pv-slide-smartart-arrow\">↓</span></div>")
+        return f"<div class=\"pv-slide-smartart-flow\">{''.join(steps)}</div>"
+
+    def _preview_ppt_hex_is_dark(self, css_color: str) -> bool:
+        txt = str(css_color or "").strip().lstrip("#")
+        if len(txt) != 6 or not re.fullmatch(r"[0-9A-Fa-f]{6}", txt):
+            return False
+        r = int(txt[0:2], 16)
+        g = int(txt[2:4], 16)
+        b = int(txt[4:6], 16)
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        return lum < 0.52
+
+    def _preview_ppt_default_text_color(self, theme: dict | None, background_css: str = "") -> str:
+        colors = dict((theme or {}).get("colors", {}) or {})
+        if background_css and self._preview_ppt_hex_is_dark(background_css):
+            return str(colors.get("lt1") or "#ffffff")
+        return str(colors.get("dk1") or "#1f2937")
+
+    def _preview_ppt_fill_css(self, fill: object, theme: dict | None = None, fallback_key: str = "", xml_text: str = "") -> str:
+        grad_css = self._preview_ppt_gradient_css(str(xml_text or self._preview_xml_text(fill) or ""), theme=theme, fallback_key=fallback_key)
+        if grad_css:
+            return grad_css
+        try:
+            fore = getattr(fill, "fore_color", None)
+        except Exception:
+            fore = None
+        color = self._preview_ppt_theme_color_css(theme, fore, fallback_key=fallback_key)
+        return f"background:{color}" if color else ""
+
+    def _preview_ppt_line_css(self, line: object, theme: dict | None = None, fallback_key: str = "accent1") -> str:
+        try:
+            color_obj = getattr(line, "color", None)
+        except Exception:
+            color_obj = None
+        color = self._preview_ppt_theme_color_css(theme, color_obj, fallback_key=fallback_key)
+        return f"border:1px solid {color}" if color else ""
+
+    def _preview_ppt_textframe_html(self, text_frame: object, *, default_font: str = "", default_color: str = "") -> str:
+        paras = []
+        for para in list(getattr(text_frame, "paragraphs", []) or []):
+            runs = list(getattr(para, "runs", []) or [])
+            pieces = []
+            if runs:
+                for run in runs:
+                    frag = self._preview_doc_run_html(run, default_font=default_font, default_color=default_color)
+                    if frag:
+                        pieces.append(frag)
+            else:
+                txt = html.escape(str(getattr(para, "text", "") or "")).replace("\n", "<br>")
+                if txt:
+                    color_style = f"color:{default_color};" if default_color else ""
+                    font_style = f"font-family:{json.dumps(default_font)};" if default_font else ""
+                    pieces.append(f"<span style=\"{font_style}{color_style}\">{txt}</span>" if (color_style or font_style) else txt)
+            if not pieces:
+                continue
+            align = self._preview_doc_align_css(getattr(para, "alignment", None))
+            level = max(0, int(getattr(para, "level", 0) or 0))
+            indent = 18 * level
+            style_bits = []
+            if align != "left":
+                style_bits.append(f"text-align:{align}")
+            if indent:
+                style_bits.append(f"padding-left:{indent}px")
+            style_attr = f' style="{";".join(style_bits)}"' if style_bits else ""
+            paras.append(f"<p class=\"pv-doc-para\"{style_attr}>{''.join(pieces)}</p>")
+        return "".join(paras) or ""
+
+    def _preview_ppt_table_html(self, shape: object, *, default_font: str = "", default_color: str = "") -> str:
+        try:
+            table = getattr(shape, "table", None)
+        except Exception:
+            table = None
+        if table is None:
+            return ""
+        rows_html = []
+        for row in list(getattr(table, "rows", []) or []):
+            cells = []
+            for cell in list(getattr(row, "cells", []) or []):
+                txt = self._preview_ppt_textframe_html(getattr(cell, "text_frame", None), default_font=default_font, default_color=default_color) or html.escape(str(getattr(cell, "text", "") or ""))
+                cells.append(f"<td>{txt or '&nbsp;'}</td>")
+            rows_html.append(f"<tr>{''.join(cells)}</tr>")
+        return f"<table class=\"pv-slide-table\">{''.join(rows_html)}</table>"
+
+    def _preview_ppt_chart_html(self, shape: object, *, theme: dict | None = None, default_font: str = "", default_color: str = "") -> str:
+        try:
+            chart = getattr(shape, "chart", None)
+        except Exception:
+            chart = None
+        if chart is None:
+            return ""
+        chart_type = str(getattr(chart, "chart_type", "") or "").rsplit(".", 1)[-1].replace("_", " ").strip().upper()
+        category_labels: list[str] = []
+        chart_xml = self._preview_xml_text(chart)
+        if chart_xml:
+            try:
+                root = ET.fromstring(chart_xml)
+                for node in root.findall(".//{*}cat//{*}pt//{*}v"):
+                    txt = " ".join(str(node.text or "").split()).strip()
+                    if txt:
+                        category_labels.append(txt)
+            except Exception:
+                category_labels = []
+        bars: list[dict[str, str | float]] = []
+        rows = []
+        try:
+            plots = list(getattr(chart, "plots", []) or [])
+            if plots:
+                plot_series = list(getattr(plots[0], "series", []) or [])[:6]
+                if len(plot_series) == 1:
+                    series = plot_series[0]
+                    values = list(getattr(series, "values", []) or [])[:10]
+                    for idx, val in enumerate(values):
+                        label = category_labels[idx] if idx < len(category_labels) else f"Point {idx + 1}"
+                        try:
+                            numeric = float(val)
+                        except Exception:
+                            numeric = 0.0
+                        bars.append({"label": label, "value": numeric, "text": self._preview_value_text(val), "series": str(getattr(series, 'name', '') or 'Series')})
+                else:
+                    for series in plot_series:
+                        raw_values = list(getattr(series, "values", []) or [])[:8]
+                        name = str(getattr(series, "name", "") or "Series")
+                        vals_text = ", ".join(self._preview_value_text(v) for v in raw_values)
+                        rows.append(f"<tr><td><strong>{html.escape(name)}</strong></td><td>{html.escape(vals_text)}</td></tr>")
+                        numeric_vals = []
+                        for val in raw_values:
+                            try:
+                                numeric_vals.append(float(val))
+                            except Exception:
+                                continue
+                        if numeric_vals:
+                            bars.append(
+                                {
+                                    "label": name,
+                                    "value": max(numeric_vals, key=lambda item: abs(item)),
+                                    "text": self._preview_value_text(sum(numeric_vals) if len(numeric_vals) > 1 else numeric_vals[0]),
+                                    "series": name,
+                                }
+                            )
+        except Exception:
+            rows = []
+            bars = []
+        caption_style = ""
+        if default_font:
+            caption_style += f"font-family:{json.dumps(default_font)};"
+        if default_color:
+            caption_style += f"color:{default_color};"
+        if not rows and not bars:
+            return f"<div class=\"pv-slide-shape-placeholder pv-slide-box\" style=\"{caption_style}\">CHART</div>"
+        accent_keys = ["accent1", "accent2", "accent3", "accent4", "accent5", "accent6"]
+        max_abs = max((abs(float(row.get("value", 0.0) or 0.0)) for row in bars), default=1.0) or 1.0
+        total_abs = sum(abs(float(row.get("value", 0.0) or 0.0)) for row in bars) or max_abs
+        bar_rows = []
+        for idx, row in enumerate(bars[:10]):
+            numeric = float(row.get("value", 0.0) or 0.0)
+            if "PIE" in chart_type or "DOUGHNUT" in chart_type:
+                width = max(4.0, min(100.0, (abs(numeric) / total_abs) * 100.0))
+                metric = f"{(abs(numeric) / total_abs) * 100.0:.1f}%"
+            else:
+                width = max(4.0, min(100.0, (abs(numeric) / max_abs) * 100.0))
+                metric = str(row.get("text", "") or self._preview_value_text(numeric))
+            fill_color = str((((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6"))
+            bar_rows.append(
+                "<div class=\"pv-slide-bar-row\">"
+                f"<div>{html.escape(str(row.get('label', '') or ''))}</div>"
+                "<div class=\"pv-slide-bar-track\">"
+                f"<div class=\"pv-slide-bar-fill\" style=\"width:{width:.2f}%;background:{fill_color}\"></div>"
+                "</div>"
+                f"<div>{html.escape(metric)}</div>"
+                "</div>"
+            )
+        chart_meta = f"{html.escape(chart_type.title() if chart_type else 'Chart')} · {len(bars) or len(rows)} series"
+        table_html = f"<table class=\"pv-slide-table\">{''.join(rows)}</table>" if rows else ""
+        bars_html = f"<div class=\"pv-slide-bars\">{''.join(bar_rows)}</div>" if bar_rows else ""
+        return (
+            f"<div class=\"pv-slide-box pv-slide-chart\">"
+            f"<div class=\"pv-slide-caption\" style=\"{caption_style}\">Chart preview</div>"
+            f"<div class=\"pv-slide-chart-meta\" style=\"{caption_style}\">{chart_meta}</div>"
+            f"{bars_html}{table_html}"
+            "</div>"
+        )
+
+    def _preview_ppt_shape_html(self, shape: object, slide_w: float, slide_h: float, *, theme: dict | None = None, offset_left: float = 0.0, offset_top: float = 0.0, scale_x: float = 1.0, scale_y: float = 1.0, origin_x: float = 0.0, origin_y: float = 0.0, default_font: str = "", default_color: str = "") -> str:
+        try:
+            raw_left = float(getattr(shape, "left", 0) or 0)
+            raw_top = float(getattr(shape, "top", 0) or 0)
+            raw_width = max(1.0, float(getattr(shape, "width", 1) or 1))
+            raw_height = max(1.0, float(getattr(shape, "height", 1) or 1))
+            left = max(0.0, offset_left + ((raw_left - origin_x) * scale_x))
+            top = max(0.0, offset_top + ((raw_top - origin_y) * scale_y))
+            width = max(1.0, raw_width * scale_x)
+            height = max(1.0, raw_height * scale_y)
+        except Exception:
+            raw_width, raw_height = 1.0, 1.0
+            left, top, width, height = 0.0, 0.0, 1.0, 1.0
+        shape_xml = self._preview_xml_text(shape)
+        pos = [
+            f"left:{(left / slide_w) * 100:.4f}%",
+            f"top:{(top / slide_h) * 100:.4f}%",
+            f"width:{(width / slide_w) * 100:.4f}%",
+            f"height:{(height / slide_h) * 100:.4f}%",
+        ]
+        try:
+            shape_type_name = str(getattr(shape, "shape_type", "") or "").upper()
+        except Exception:
+            shape_type_name = ""
+        try:
+            auto_raw = getattr(shape, "auto_shape_type", "")
+            auto_name = str(auto_raw or "").upper()
+        except Exception:
+            auto_name = ""
+        classes = ["pv-slide-item"]
+        inner = ""
+        try:
+            if "GROUP" in shape_type_name:
+                grp_xfrm = self._preview_ppt_group_xfrm(shape)
+                child_scale_x = width / max(1.0, float(grp_xfrm.get("ch_ext_x", 0.0) or raw_width or 1.0))
+                child_scale_y = height / max(1.0, float(grp_xfrm.get("ch_ext_y", 0.0) or raw_height or 1.0))
+                child_origin_x = float(grp_xfrm.get("ch_off_x", 0.0) or 0.0)
+                child_origin_y = float(grp_xfrm.get("ch_off_y", 0.0) or 0.0)
+                parts = []
+                for child in list(getattr(shape, "shapes", []) or []):
+                    frag = self._preview_ppt_shape_html(
+                        child,
+                        slide_w,
+                        slide_h,
+                        theme=theme,
+                        offset_left=left,
+                        offset_top=top,
+                        scale_x=child_scale_x,
+                        scale_y=child_scale_y,
+                        origin_x=child_origin_x,
+                        origin_y=child_origin_y,
+                        default_font=default_font,
+                        default_color=default_color,
+                    )
+                    if frag:
+                        parts.append(frag)
+                return "".join(parts)
+            smartart_html = self._preview_ppt_smartart_html(shape, theme=theme, default_font=default_font, default_color=default_color)
+            if smartart_html:
+                classes.extend(["pv-slide-box"])
+                fill_css = self._preview_ppt_fill_css(getattr(shape, "fill", None), theme=theme, fallback_key="lt2", xml_text=shape_xml)
+                line_css = self._preview_ppt_line_css(getattr(shape, "line", None), theme=theme)
+                if fill_css:
+                    pos.append(fill_css)
+                if line_css:
+                    pos.append(line_css)
+                inner = smartart_html
+            elif bool(getattr(shape, "has_table", False)):
+                classes.append("pv-slide-box")
+                inner = self._preview_ppt_table_html(shape, default_font=default_font, default_color=default_color)
+            elif bool(getattr(shape, "has_chart", False)):
+                classes.append("pv-slide-box")
+                inner = self._preview_ppt_chart_html(shape, theme=theme, default_font=default_font, default_color=default_color)
+            elif bool(getattr(shape, "has_text_frame", False)):
+                classes.append("pv-slide-text")
+                fill_css = self._preview_ppt_fill_css(getattr(shape, "fill", None), theme=theme, xml_text=shape_xml)
+                line_css = self._preview_ppt_line_css(getattr(shape, "line", None), theme=theme)
+                if fill_css:
+                    pos.append(fill_css)
+                    classes.append("pv-slide-box")
+                if line_css:
+                    pos.append(line_css)
+                    classes.append("pv-slide-box")
+                if any(tok in auto_name for tok in ("OVAL", "ELLIPSE", "CIRCULAR")):
+                    classes.append("pv-slide-shape-round")
+                elif any(tok in auto_name for tok in ("ROUND", "PILL", "CAPSULE")):
+                    classes.append("pv-slide-shape-pill")
+                inner = self._preview_ppt_textframe_html(getattr(shape, "text_frame", None), default_font=default_font, default_color=default_color)
+            elif "LINE" in shape_type_name or "CONNECTOR" in shape_type_name:
+                classes.append("pv-slide-line")
+                line_color = self._preview_ppt_theme_color_css(theme, getattr(getattr(shape, "line", None), "color", None), fallback_key="accent1")
+                angle = math.degrees(math.atan2(max(0.1, height), max(0.1, width)))
+                inner = f"<div class=\"pv-slide-line-core\" style=\"width:100%;background:{line_color or '#7c8da6'};transform:rotate({angle:.3f}deg)\"></div>"
+            else:
+                try:
+                    image = getattr(shape, "image", None)
+                except Exception:
+                    image = None
+                if image is not None:
+                    mime = guess_mime_from_name(str(getattr(image, "filename", "image.png") or "image.png"), "image/png")
+                    blob = getattr(image, "blob", b"") or b""
+                    b64 = base64.b64encode(blob).decode("ascii", errors="ignore") if blob else ""
+                    if b64:
+                        inner = f"<img class=\"pv-slide-image\" src=\"data:{mime};base64,{b64}\" alt=\"\">"
+                else:
+                    fill_css = self._preview_ppt_fill_css(getattr(shape, "fill", None), theme=theme, fallback_key="lt2", xml_text=shape_xml)
+                    line_css = self._preview_ppt_line_css(getattr(shape, "line", None), theme=theme)
+                    if fill_css:
+                        pos.append(fill_css)
+                    if line_css:
+                        pos.append(line_css)
+                    classes.extend(["pv-slide-box", "pv-slide-shape-placeholder"])
+                    label = html.escape(str(getattr(shape, "name", "") or auto_name or shape_type_name or "SHAPE"))
+                    inner = label
+        except Exception:
+            inner = ""
+        if not inner:
+            return ""
+        return f"<div class=\"{' '.join(classes)}\" style=\"{';'.join(pos)}\">{inner}</div>"
+
+    def _preview_pptx_html(self, fp: Path) -> str:
+        if not self._module_available("pptx"):
+            return self._preview_fallback_markdown_html(fp, "python-pptx unavailable; using parsed markdown fallback")
+        try:
+            import pptx  # type: ignore
+
+            pres = pptx.Presentation(str(fp))
+            theme = self._preview_ppt_theme(fp)
+            slide_w = max(1.0, float(getattr(pres, "slide_width", 13_333_333) or 13_333_333))
+            slide_h = max(1.0, float(getattr(pres, "slide_height", 7_500_000) or 7_500_000))
+            cards = []
+            for idx, slide in enumerate(list(pres.slides)[:24], start=1):
+                bg_fill = self._preview_ppt_fill_css(
+                    getattr(getattr(slide, "background", None), "fill", None),
+                    theme=theme,
+                    fallback_key="lt1",
+                    xml_text=self._preview_xml_text(getattr(slide, "background", None)),
+                )
+                bg_probe = ""
+                try:
+                    bg_probe = re.search(r"#[0-9A-Fa-f]{6}", bg_fill or "")[0]
+                except Exception:
+                    bg_probe = str(theme.get("colors", {}).get("lt1") or "#ffffff")
+                bg_style = bg_fill or f"background:{bg_probe}"
+                default_color = self._preview_ppt_default_text_color(theme, bg_probe)
+                shapes_html = []
+                title_shape = None
+                try:
+                    title_shape = getattr(slide.shapes, "title", None)
+                except Exception:
+                    title_shape = None
+                for shape in list(getattr(slide, "shapes", []) or []):
+                    is_title = bool(title_shape is not None and shape == title_shape)
+                    frag = self._preview_ppt_shape_html(
+                        shape,
+                        slide_w,
+                        slide_h,
+                        theme=theme,
+                        default_font=str(theme.get("major_font") or theme.get("minor_font") or "") if is_title else str(theme.get("minor_font") or theme.get("major_font") or ""),
+                        default_color=default_color,
+                    )
+                    if frag:
+                        shapes_html.append(frag)
+                title = ""
+                try:
+                    title = str(getattr(title_shape, "text", "") or "").strip() if title_shape is not None else ""
+                except Exception:
+                    title = ""
+                stage_style = f"aspect-ratio:{slide_w:.0f}/{slide_h:.0f};{bg_style};font-family:{json.dumps(str(theme.get('minor_font') or ''))};color:{default_color}" if theme.get("minor_font") else f"aspect-ratio:{slide_w:.0f}/{slide_h:.0f};{bg_style};color:{default_color}"
+                stage_cls = "pv-slide-stage theme-gradient" if "linear-gradient(" in bg_style else "pv-slide-stage"
+                cards.append(
+                    "<section class=\"pv-slide-card\">"
+                    "<div class=\"pv-slide-head\">"
+                    f"<div class=\"pv-slide-title\">Slide {idx}{f' · {html.escape(title)}' if title else ''}</div>"
+                    f"<div class=\"pv-slide-meta\">{len(list(getattr(slide, 'shapes', []) or []))} shapes · bg {html.escape(bg_probe)}</div>"
+                    "</div>"
+                    f"<div class=\"{stage_cls}\" style=\"{stage_style}\">"
+                    f"<div class=\"pv-slide-canvas\">{''.join(shapes_html)}</div>"
+                    "</div></section>"
+                )
+            if not cards:
+                return self._preview_fallback_markdown_html(fp, "pptx preview empty; using parsed markdown fallback")
+            body = (
+                f"<div class=\"pv-card\"><h1 class=\"pv-title\">{html.escape(fp.name)}</h1>"
+                f"<div class=\"pv-note\">PPTX preview · {len(list(pres.slides))} slides · aspect {slide_w:.0f}:{slide_h:.0f} · theme {html.escape(str(theme.get('minor_font') or theme.get('major_font') or '-'))}</div></div>"
+                f"<div class=\"pv-slides\">{''.join(cards)}</div>"
+            )
+            return self._preview_html_shell(fp.name, body)
+        except Exception as exc:
+            return self._preview_fallback_markdown_html(fp, f"pptx preview fallback: {trim(str(exc), 180)}")
+
+    def _preview_ppt_html(self, fp: Path) -> str:
+        return self._preview_fallback_markdown_html(fp, "legacy .ppt preview is using parsed markdown fallback")
+
+    def preview_html_payload(self, rel_path: str) -> str:
+        fp = self._session_path(rel_path)
+        rel = normalize_rel_preview_path(self._session_rel(fp))
+        if not rel:
+            raise ValueError("path required")
+        if not fp.exists() or not fp.is_file():
+            raise FileNotFoundError(f"file not found: {rel}")
+        kind = preview_kind_for_path(rel)
+        ext = fp.suffix.lower()
+        if kind == "csv":
+            return self._preview_csv_html(fp)
+        if kind == "excel":
+            if ext in {".xlsx", ".xlsm"}:
+                return self._preview_xlsx_html(fp)
+            if ext == ".xls":
+                return self._preview_xls_html(fp)
+        if kind == "document":
+            if ext in {".docx", ".docm"}:
+                return self._preview_docx_html(fp)
+            if ext == ".doc":
+                return self._preview_doc_html(fp)
+        if kind == "presentation":
+            if ext in {".pptx", ".pptm"}:
+                return self._preview_pptx_html(fp)
+            if ext == ".ppt":
+                return self._preview_ppt_html(fp)
+        raise ValueError(f"html preview not supported for: {rel}")
 
     def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
         root = self.files_root.resolve()
@@ -6256,11 +7936,33 @@ class SessionState:
 
     def _generate_run_completion_summary(self):
         """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
-        # Guard: plan proposal is waiting for user selection — run ended but task not started yet
-        if self.runtime_plan_mode_needed and not self.runtime_plan_approved:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        proposal_waiting = bool(self.runtime_plan_proposal) and not bool(self.runtime_plan_approved)
+        board_has_proposal = isinstance(plan.get("proposal"), dict) and bool(plan.get("proposal"))
+        # Guard: plan mode paused for user selection or still in intermediate planning phases
+        if (
+            (plan_phase in {"awaiting_choice", "research", "synthesis"} and not self.runtime_plan_approved)
+            or proposal_waiting
+            or (plan_phase == "awaiting_choice" and board_has_proposal)
+        ):
             return
+        # Guard: approved-plan execution uses its own plan/todo progress UI; avoid redundant completion bubble
+        if self.runtime_plan_approved or plan_phase == "executing":
+            return
+        # Guard: in single-agent mode the developer already replied directly — no redundant summary
+        _exec_mode = self._effective_execution_mode()
+        if _exec_mode == EXECUTION_MODE_SINGLE:
+            for _m in reversed(self.messages[-20:]):
+                if not isinstance(_m, dict):
+                    continue
+                _r = str(_m.get("role", "") or "")
+                _ar = str(_m.get("agent_role", "") or "")
+                if _r == "assistant" and _ar not in ("manager", "planner", ""):
+                    return
+        _summary_role = "developer"
         try:
-            bb = self._ensure_blackboard()
             board_md = self._blackboard_read_state_markdown(max_items=10)
             # Collect completed plan steps
             plan_steps = [t for t in bb.get("project_todos", []) if t.get("category") == "plan_step"]
@@ -6350,13 +8052,13 @@ class SessionState:
                 "role": "assistant",
                 "content": summary_text,
                 "ts": now_ts(),
-                "agent_role": "explorer",
+                "agent_role": _summary_role,
             })
             self._emit("message", {
                 "role": "assistant",
                 "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
                 "summary": "run completion summary",
-                "agent_role": "explorer",
+                "agent_role": _summary_role,
             })
         except Exception:
             try:
@@ -6370,13 +8072,13 @@ class SessionState:
                     "role": "assistant",
                     "content": summary_text,
                     "ts": now_ts(),
-                    "agent_role": "explorer",
+                    "agent_role": _summary_role,
                 })
                 self._emit("message", {
                     "role": "assistant",
                     "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
                     "summary": "run completion summary (static)",
-                    "agent_role": "explorer",
+                    "agent_role": _summary_role,
                 })
             except Exception:
                 pass
@@ -6613,6 +8315,7 @@ class SessionState:
     def _infer_task_profile(self, goal: str) -> dict:
         clean = strip_thinking_content(str(goal or "")).strip()
         low = clean.lower()
+        explicit_complexity = infer_user_complexity_value(clean)
         # Use cached LLM complexity result (set by _agent_worker entry point)
         llm_complexity = str(getattr(self, '_cached_llm_complexity', '') or '')
         nontrivial = self._looks_nontrivial_request(clean) or llm_complexity == "complex"
@@ -6656,7 +8359,7 @@ class SessionState:
         if direct_question and (not nontrivial) and (not has_code_intent) and length <= 220:
             return {
                 "task_type": "simple_qa",
-                "complexity": "simple",
+                "complexity": explicit_complexity or "simple",
                 "direct_objective": (
                     "Directly answer the user question in natural language. "
                     "Do not create or edit files unless explicitly requested."
@@ -6670,7 +8373,7 @@ class SessionState:
         if has_code_intent and (not nontrivial) and length <= 260:
             return {
                 "task_type": "simple_code",
-                "complexity": "simple",
+                "complexity": explicit_complexity or "simple",
                 "direct_objective": (
                     "Deliver one minimal concrete code change, run one quick verification, then conclude."
                 ),
@@ -6683,7 +8386,7 @@ class SessionState:
         if has_research_intent and (not has_code_intent):
             return {
                 "task_type": "research",
-                "complexity": "complex" if (nontrivial or length >= 280) else "simple",
+                "complexity": explicit_complexity or ("complex" if (nontrivial or length >= 280) else "simple"),
                 "direct_objective": "Collect evidence first, then synthesize a concise actionable answer.",
                 "recommended_agents": ["explorer", "developer", "reviewer"],
                 "round_budget": 10 if (nontrivial or length >= 280) else 6,
@@ -6694,7 +8397,7 @@ class SessionState:
         if nontrivial or has_code_intent or length >= 280:
             return {
                 "task_type": "engineering",
-                "complexity": "complex",
+                "complexity": explicit_complexity or "complex",
                 "direct_objective": (
                     "Use blackboard collaboration to implement, validate, and converge with concrete outputs."
                 ),
@@ -6706,7 +8409,7 @@ class SessionState:
             }
         return {
             "task_type": "general",
-            "complexity": "simple",
+            "complexity": explicit_complexity or "simple",
             "direct_objective": (
                 "Provide the most direct useful response with minimal orchestration, "
                 "anchored to the current project context and user goal."
@@ -6908,7 +8611,11 @@ class SessionState:
         if current_model:
             loaded = list_loaded_ollama_models(self.ollama.base_url, timeout=5)
             if current_model not in set(loaded):
-                woke, wake_err = wake_ollama_model(self.ollama.base_url, current_model, timeout=40)
+                woke, wake_err = wake_ollama_model(
+                    self.ollama.base_url,
+                    current_model,
+                    timeout=self._global_wait_timeout_seconds(),
+                )
                 if woke:
                     self._emit(
                         "status",
@@ -6956,6 +8663,19 @@ class SessionState:
         profile = dict(self.model_profiles.get(self.active_profile_id, {}))
         model = str(profile.get("model", self.ollama.model) or self.ollama.model).strip()
         return f"{self.active_profile_id}::{model}"
+
+    def _global_wait_timeout_seconds(self) -> int:
+        raw = (
+            self.max_run_seconds
+            or getattr(self.ollama, "timeout", 0)
+            or DEFAULT_REQUEST_TIMEOUT
+        )
+        return normalize_timeout_seconds(
+            raw,
+            minimum=MIN_TIMEOUT_SECONDS,
+            maximum=MAX_TIMEOUT_SECONDS,
+            fallback=DEFAULT_REQUEST_TIMEOUT,
+        )
 
     def _call_interruptible(
         self,
@@ -7124,7 +8844,11 @@ class SessionState:
                     wake_attempted = True
                     model_now = str(self.ollama.model or "").strip()
                     if model_now:
-                        woke, wake_err = wake_ollama_model(self.ollama.base_url, model_now, timeout=35)
+                        woke, wake_err = wake_ollama_model(
+                            self.ollama.base_url,
+                            model_now,
+                            timeout=self._global_wait_timeout_seconds(),
+                        )
                         if woke:
                             wake_note = " | wake=ok"
                         elif wake_err:
@@ -10621,21 +12345,7 @@ class SessionState:
         # 如果有已审批的 plan steps，优先用 plan steps 生成 todos
         plan = bb.get("plan", {})
         if isinstance(plan, dict) and plan.get("phase") == "executing" and plan.get("steps"):
-            steps = plan["steps"]
-            plan_todos = [
-                {
-                    "id": f"pt:{i:03d}",
-                    "content": trim(str(s or "").strip(), 400),
-                    "status": "in_progress" if i == 0 else "pending",
-                    "category": "plan_step",
-                    "plan_step_index": i,
-                    "created_at": float(now_ts()),
-                    "completed_at": None,
-                    "completed_by": "",
-                    "evidence": "",
-                }
-                for i, s in enumerate(steps) if str(s or "").strip()
-            ][:10]
+            plan_todos = self._build_plan_todos_from_steps(plan.get("steps", []), limit=40)
             if plan_todos:
                 bb["project_todos"] = plan_todos
                 bb["plan_step_cursor"] = 0
@@ -11000,6 +12710,17 @@ class SessionState:
             and str(r.get("parent_step_id", "") or "") == step_id
         ]
         if not worker_items:
+            self._ensure_worker_todos_for_plan_step(plan_step)
+            snap = self.todo.snapshot()
+            worker_items = [
+                r for r in snap
+                if str(r.get("owner", "") or "").lower() in worker_owners
+                and str(r.get("parent_step_id", "") or "") == step_id
+            ]
+        if not worker_items:
+            expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+            if expected:
+                return False
             # Fallback: no parent_step_id linkage — check ALL worker items
             all_worker = [
                 r for r in snap
@@ -11045,6 +12766,243 @@ class SessionState:
                 path = str(r.get("args", {}).get("path", "") or "")
                 parts.append(f"read: {path}")
         return trim("; ".join(parts) or "post-execution evidence", 200)
+
+    def _get_active_plan_step(self, board: dict | None = None) -> dict | None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos", []), list) else []
+        for todo in todos:
+            if isinstance(todo, dict) and todo.get("category") == "plan_step" and todo.get("status") == "in_progress":
+                return todo
+        return None
+
+    def _current_plan_worker_owner(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        candidates = [
+            str(self.active_agent_role or "").strip().lower(),
+            str(bb.get("active_agent", "") or "").strip().lower(),
+            str(delegate.get("target", "") or "").strip().lower(),
+        ]
+        for cand in candidates:
+            if cand in {"developer", "explorer", "reviewer"}:
+                return cand
+        return "developer"
+
+    def _active_plan_worker_todo_rows(self, step_id: str, role: str = "") -> list[dict]:
+        step_key = str(step_id or "").strip()
+        if not step_key:
+            return []
+        role_key = self._sanitize_agent_role(role)
+        all_rows: list[dict] = []
+        for row in self.todo.snapshot():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("parent_step_id", "") or "").strip() != step_key:
+                continue
+            owner = str(row.get("owner", "") or "").strip().lower()
+            if owner not in {"developer", "explorer", "reviewer"}:
+                continue
+            all_rows.append(dict(row))
+        if not all_rows:
+            return []
+        rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
+        if role_key and not rows:
+            rows = list(all_rows)
+        order = {"in_progress": 0, "pending": 1, "completed": 2}
+        rows.sort(
+            key=lambda r: (
+                order.get(str(r.get("status", "pending") or "pending").strip().lower(), 9),
+                str(r.get("owner", "") or "").strip().lower(),
+                str(r.get("content", "") or "").strip().lower(),
+            )
+        )
+        return rows
+
+    def _plan_todo_discipline_prompt(self, role: str = "", *, for_manager: bool = False) -> str:
+        step = self._get_active_plan_step()
+        if not isinstance(step, dict):
+            return ""
+        step_id = trim(str(step.get("id", "") or ""), 20)
+        step_idx = int(step.get("plan_step_index", 0) or 0) + 1
+        step_text = trim(str(step.get("content", "") or ""), 220)
+        rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
+        pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
+        completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
+        if not rows:
+            todo_state = (
+                f"No worker subtasks exist yet for this step. Start with TodoWrite for THIS step only "
+                f"(parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
+            )
+        else:
+            state_parts: list[str] = []
+            if current:
+                state_parts.append(
+                    f"Current in_progress subtask: {trim(str(current.get('content', '') or ''), 160)}. "
+                )
+            elif pending:
+                state_parts.append(
+                    f"Next pending subtask: {trim(str(pending[0].get('content', '') or ''), 160)}. "
+                )
+            state_parts.append(
+                f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
+            )
+            todo_state = "".join(state_parts)
+        if for_manager:
+            return (
+                f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is the authoritative execution path. "
+                f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
+                f"{todo_state}"
+                "Treat existing worker subtasks as live execution state, not optional notes. "
+                "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
+                "After EACH completed subtask, require a manual TodoWrite or TodoWriteRescue update before the owner starts the next subtask. "
+                "Do not let the owner silently batch multiple subtasks without updating todos. "
+                "Only route to finish_current_task after all subtasks for this step are completed."
+            )
+        return (
+            f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is authoritative. "
+            f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
+            f"{todo_state}"
+            "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
+            "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
+            "Do not wait until the end of the step to update todos. "
+            "Call finish_current_task only after all subtasks for this step are completed."
+        )
+
+    def _extract_plan_step_subtasks(self, plan_step: dict, limit: int = 5) -> list[str]:
+        import re
+
+        if not isinstance(plan_step, dict):
+            return []
+        raw = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        if not raw.strip():
+            return []
+        lines = [trim(str(line or "").strip(), 300) for line in raw.replace("\r\n", "\n").split("\n")]
+        lines = [line for line in lines if line]
+        if not lines:
+            return []
+        header = lines[0]
+        numbered: list[str] = []
+        bullet_fallback: list[str] = []
+        substep_re = re.compile(r"^(?:[-*•]\s*)?(\d+\.\d+)\s+(.+)$")
+        bullet_re = re.compile(r"^(?:[-*•]\s+)(.+)$")
+        shellish_re = re.compile(r"^(?:mkdir|npx|npm|pnpm|yarn|pip|python|pytest|node|go|cargo|git|curl|wget)\b", re.I)
+        for raw_line in lines[1:]:
+            line = trim(raw_line, 300)
+            if not line:
+                continue
+            m = substep_re.match(line)
+            if m:
+                text = f"{m.group(1)} {trim(m.group(2), 260)}".strip()
+                if text and text not in numbered:
+                    numbered.append(text)
+                continue
+            mb = bullet_re.match(line)
+            if mb:
+                text = trim(mb.group(1), 260)
+                if text and not shellish_re.match(text):
+                    bullet_fallback.append(text)
+        picked = numbered or bullet_fallback
+        if not picked:
+            prose = [line for line in lines[1:] if not shellish_re.match(line)]
+            for line in prose[: max(1, limit)]:
+                text = trim(line, 260)
+                if text and text != header and text not in picked:
+                    picked.append(text)
+        if not picked:
+            phase = self._plan_step_phase_hint(raw.lower())
+            phase_defaults = {
+                "research": ["Read relevant context", "Collect required references", "Summarize findings for this step"],
+                "design": ["Define the implementation scope", "Draft the interfaces for this step", "Confirm the design constraints"],
+                "implement": ["Create the required files", "Implement the core logic for this step", "Run a quick verification"],
+                "test": ["Prepare the test inputs", "Run the required checks", "Review the failing and passing results"],
+                "review": ["Inspect the generated changes", "Validate the critical paths", "Summarize review findings"],
+            }
+            picked = phase_defaults.get(phase, ["Break down the current step", "Execute the core work", "Verify the result"])
+        out: list[str] = []
+        max_items = max(1, min(int(limit or 5), 7))
+        for text in picked:
+            clean = normalize_work_text(text) or str(text or "").strip()
+            if not clean or clean == header or clean in out:
+                continue
+            out.append(clean)
+            if len(out) >= max_items:
+                break
+        return out
+
+    def _ensure_worker_todos_for_plan_step(self, plan_step: dict | None, force_refresh: bool = False, owner: str = "") -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return False
+        expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+        if not expected:
+            return False
+        owner_key = str(owner or "").strip().lower()
+        if owner_key not in {"developer", "explorer", "reviewer"}:
+            owner_key = self._current_plan_worker_owner()
+
+        import re
+
+        def _fingerprint(text: str) -> str:
+            base = normalize_work_text(str(text or "")) or str(text or "")
+            return re.sub(r"\s+", " ", base.strip().lower())
+
+        expected_keys = [_fingerprint(text) for text in expected if _fingerprint(text)]
+        if not expected_keys:
+            return False
+        snap = self.todo.snapshot()
+        worker_owners = {"developer", "explorer", "reviewer"}
+        linked_rows = [
+            dict(row) for row in snap
+            if isinstance(row, dict)
+            and str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and str(row.get("parent_step_id", "") or "").strip() == step_id
+        ]
+        linked_by_key: dict[str, dict] = {}
+        for row in linked_rows:
+            fp = _fingerprint(str(row.get("content", "") or ""))
+            if fp and fp not in linked_by_key:
+                linked_by_key[fp] = row
+        already_exact = (
+            len(linked_rows) == len(expected_keys)
+            and all(key in linked_by_key for key in expected_keys)
+        )
+        if already_exact and not force_refresh:
+            return False
+        replacement: list[dict] = []
+        for text in expected:
+            fp = _fingerprint(text)
+            prev = linked_by_key.get(fp, {})
+            status = str(prev.get("status", "pending") or "pending").strip().lower()
+            if status not in {"pending", "in_progress", "completed"}:
+                status = "pending"
+            row = {
+                "content": text,
+                "status": status,
+                "owner": str(prev.get("owner", "") or owner_key).strip().lower() or owner_key,
+                "parent_step_id": step_id,
+            }
+            replacement.append(row)
+        if replacement and not any(r.get("status") == "in_progress" for r in replacement) and any(r.get("status") == "pending" for r in replacement):
+            for row in replacement:
+                if row.get("status") == "pending":
+                    row["status"] = "in_progress"
+                    break
+        if not replacement:
+            return False
+        preserved = [
+            dict(row) for row in snap
+            if isinstance(row, dict)
+            and not (
+                str(row.get("owner", "") or "").strip().lower() in worker_owners
+                and str(row.get("parent_step_id", "") or "").strip() == step_id
+            )
+        ]
+        with self.todo.lock:
+            self.todo.items = preserved + replacement
+        return True
 
     def _single_agent_plan_step_check(self, tool_results: list[dict]):
         """In single-agent mode, check if current plan step should be advanced based on tool results."""
@@ -11133,13 +13091,14 @@ class SessionState:
         else:
             self._sync_todos_from_blackboard(reason="single-agent-round")
             # Nudge: if agent wrote files but didn't call TodoWrite, remind it
-            called_todo = any(str(r.get("name", "")) == "TodoWrite" for r in tool_results)
+            called_todo = any(str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in tool_results)
             if (wrote_files or ran_bash_ok) and not called_todo and current:
                 _sid = str(current.get("id", "") or "")
                 if _sid:
                     _nudge = (
                         f"[todo-sync] You made progress on the current step but did not update TodoWrite.\n"
-                        f"Call TodoWrite to mark completed subtasks and create new ones.\n"
+                        f"Call TodoWrite now to mark the subtask you just completed and move the next subtask to in_progress.\n"
+                        f"Keep following the current step in {PLAN_FILE_RELATIVE_PATH}; do not silently batch multiple subtasks.\n"
                         f"Each subtask must include parent_step_id='{_sid}'."
                     )
                     self.messages.append({"role": "system", "content": _nudge, "ts": now_ts()})
@@ -11174,6 +13133,19 @@ class SessionState:
             return
         self._init_project_todos(bb)
         self._update_project_todo_status(bb)
+        plan_data = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if has_plan_steps and str(plan_data.get("phase", "") or "").strip() == "executing":
+            try:
+                self._update_plan_file_step_status()
+            except Exception:
+                pass
+            try:
+                self._ensure_worker_todos_for_plan_step(
+                    self._get_active_plan_step(bb),
+                    owner=self._current_plan_worker_owner(bb),
+                )
+            except Exception:
+                pass
         system_rows = self._todo_project_rows_from_blackboard(bb)
         existing = self.todo.snapshot()
         worker_rows: list[dict] = []
@@ -11192,6 +13164,9 @@ class SessionState:
             if is_system_key or owner == "manager":
                 continue
             non_system_rows.append(dict(row))
+        if has_plan_steps:
+            worker_rows = [r for r in worker_rows if str(r.get("parent_step_id", "") or "").strip()]
+            non_system_rows = []
         # Smart trim: keep all active (in_progress/pending) system rows,
         # but only recent 3 completed system rows to save capacity for worker subtasks
         active_system = [r for r in system_rows if r.get("status") != "completed"]
@@ -11498,7 +13473,7 @@ class SessionState:
                 {
                     "target": {"type": "string", "enum": list(MANAGER_ROUTE_TARGETS)},
                     "instruction": {"type": "string"},
-                    "task_level": {"type": "integer", "enum": list(TASK_LEVEL_CHOICES)},
+                    "task_level": {"type": "integer"},
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
@@ -11529,7 +13504,7 @@ class SessionState:
                     "for this run. Do not delegate here."
                 ),
                 {
-                    "level": {"type": "integer", "enum": list(TASK_LEVEL_CHOICES)},
+                    "level": {"type": "integer"},
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
@@ -11894,11 +13869,20 @@ class SessionState:
             level = 3
         if level not in TASK_LEVEL_CHOICES:
             level = 3
+        explicit_complexity = self._user_explicit_complexity_value(str(goal_text or ""))
+        previous_complexity = trim(str(getattr(self, "runtime_task_complexity", "") or "").strip().lower(), 20)
+        if previous_complexity not in TASK_COMPLEXITY_LEVELS:
+            previous_complexity = ""
+        preserve_existing_complexity = False
         # Complexity inheritance: if user didn't mention complexity, inherit previous level
         previous_level = int(getattr(self, "runtime_task_level", 0) or 0)
-        if previous_level > 0 and not self._user_mentions_complexity(str(goal_text or "")):
+        if previous_level > 0 and not explicit_complexity:
             # Inherit when: plan choice, explicit inherit flag, OR active high-level task has progress
-            _should_inherit = bool(inherit_previous_state) or self._is_plan_choice_response(str(goal_text or ""))
+            _should_inherit = (
+                bool(inherit_previous_state)
+                or self._is_plan_choice_response(str(goal_text or ""))
+                or bool(int(getattr(self, "user_task_level_override", 0) or 0) > 0)
+            )
             if not _should_inherit and previous_level >= 3:
                 board = self._ensure_blackboard()
                 has_progress = bool(
@@ -11912,6 +13896,15 @@ class SessionState:
                     _should_inherit = True
             if _should_inherit:
                 level = previous_level
+                preserve_existing_complexity = bool(previous_complexity)
+        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+            level = int(self.user_task_level_override)
+        _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
+        if _level_floor > 0 and int(level) < _level_floor:
+            level = _level_floor
+        _level_ceiling = int(getattr(self, 'runtime_task_level_ceiling', 0) or 0)
+        if _level_ceiling > 0 and int(level) > _level_ceiling:
+            level = _level_ceiling
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
         config_mode = normalize_execution_mode(self.execution_mode, default="")
@@ -11929,18 +13922,12 @@ class SessionState:
                 role = self._sanitize_agent_role(item)
                 if role and role not in participants:
                     participants.append(role)
-        if mode == EXECUTION_MODE_SINGLE:
-            participants = [assigned]
-        else:
-            min_count = 2 if level == 3 else 3 if level in {4, 5} else 1
-            for role in AGENT_ROLES:
-                if len(participants) >= min_count:
-                    break
-                if role not in participants:
-                    participants.append(role)
-            if assigned not in participants:
-                assigned = participants[0] if participants else assigned
-        participants = participants[:3] or [assigned]
+        mode, participants, assigned = self._resolve_level_assignment(
+            level,
+            assigned=assigned,
+            participants=participants,
+            mode=mode,
+        )
         if level == 5:
             round_budget = 0
         else:
@@ -12039,26 +14026,16 @@ class SessionState:
         complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
         if complexity not in TASK_COMPLEXITY_LEVELS:
             complexity = fallback_complexity
+        if explicit_complexity in TASK_COMPLEXITY_LEVELS:
+            complexity = explicit_complexity
+        elif preserve_existing_complexity and previous_complexity in TASK_COMPLEXITY_LEVELS:
+            complexity = previous_complexity
         low_confidence_reason = trim(str(row.get("low_confidence_reason", "") or "").strip(), 220)
         judgement = trim(str(row.get("judgement", "") or "").strip(), 200) or "manager classified task level"
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if not objective:
             objective = fallback_objective
         _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
-        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
-            level = int(self.user_task_level_override)
-        # Floor protection: if plan was approved, do not allow downgrade below floor
-        _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
-        if _level_floor > 0 and int(level) < _level_floor:
-            level = _level_floor
-        # Ceiling protection: plan-approved risk lock prevents escalation above ceiling
-        _level_ceiling = int(getattr(self, 'runtime_task_level_ceiling', 0) or 0)
-        if _level_ceiling > 0 and int(level) > _level_ceiling:
-            level = _level_ceiling
-            _ceiling_policy = TASK_LEVEL_POLICIES.get(level, {})
-            mode = str(_ceiling_policy.get("execution_mode", mode) or mode)
-            if _ceiling_policy.get("complexity"):
-                complexity = _ceiling_policy["complexity"]
         _complexity_floor = str(getattr(self, 'runtime_complexity_floor', '') or '').strip()
         if _complexity_floor == "complex" and complexity == "simple":
             complexity = "complex"
@@ -12333,10 +14310,68 @@ class SessionState:
             return False
         return True
 
+    def _user_explicit_complexity_value(self, text: str) -> str:
+        return infer_user_complexity_value(text)
+
     def _user_mentions_complexity(self, text: str) -> bool:
-        """Check if user text explicitly mentions complexity-related keywords."""
-        t = str(text or "").strip().lower()
-        return any(kw in t for kw in COMPLEXITY_KEYWORDS)
+        """Check if user text explicitly mentions a complexity preference."""
+        return bool(self._user_explicit_complexity_value(text))
+
+    def _resolve_level_assignment(
+        self,
+        level: int,
+        *,
+        assigned: str = "",
+        participants: list[str] | None = None,
+        mode: str = "",
+    ) -> tuple[str, list[str], str]:
+        try:
+            level_value = int(level or 3)
+        except Exception:
+            level_value = 3
+        if level_value not in TASK_LEVEL_CHOICES:
+            level_value = 3
+        policy = dict(TASK_LEVEL_POLICIES.get(level_value, TASK_LEVEL_POLICIES[3]))
+        resolved_assigned = self._sanitize_agent_role(assigned) or self._sanitize_agent_role(
+            policy.get("assigned_expert", "developer")
+        ) or "developer"
+        config_mode = normalize_execution_mode(self.execution_mode, default="")
+        policy_mode = normalize_execution_mode(
+            policy.get("execution_mode", EXECUTION_MODE_SYNC),
+            default=EXECUTION_MODE_SYNC,
+        )
+        if config_mode == EXECUTION_MODE_SINGLE:
+            resolved_mode = EXECUTION_MODE_SINGLE
+        else:
+            resolved_mode = normalize_execution_mode(mode, default=policy_mode)
+        resolved_participants: list[str] = []
+        raw_participants = participants if isinstance(participants, list) else []
+        for item in raw_participants:
+            role = self._sanitize_agent_role(item)
+            if role and role not in resolved_participants:
+                resolved_participants.append(role)
+        if resolved_mode == EXECUTION_MODE_SINGLE:
+            return resolved_mode, [resolved_assigned], resolved_assigned
+        if not resolved_participants:
+            fallback_roles = policy.get("participants", [])
+            if isinstance(fallback_roles, list):
+                for item in fallback_roles:
+                    role = self._sanitize_agent_role(item)
+                    if role and role not in resolved_participants:
+                        resolved_participants.append(role)
+        min_count = 2 if level_value == 3 else 3 if level_value in {4, 5} else 1
+        if resolved_assigned not in resolved_participants:
+            resolved_participants.insert(0, resolved_assigned)
+        for role_name in AGENT_ROLES:
+            role = self._sanitize_agent_role(role_name)
+            if len(resolved_participants) >= min_count:
+                break
+            if role and role not in resolved_participants:
+                resolved_participants.append(role)
+        resolved_participants = resolved_participants[:3] or [resolved_assigned]
+        if resolved_assigned not in resolved_participants:
+            resolved_assigned = resolved_participants[0]
+        return resolved_mode, resolved_participants, resolved_assigned
 
     def _refresh_runtime_task_policy(
         self,
@@ -12353,13 +14388,19 @@ class SessionState:
         _utlo = int(getattr(self, 'user_task_level_override', 0) or 0)
         if _utlo > 0 and _utlo in TASK_LEVEL_CHOICES:
             policy = TASK_LEVEL_POLICIES.get(_utlo, {})
+            current_complexity = trim(
+                str(self.runtime_task_complexity or policy.get("complexity", "simple") or "simple"),
+                20,
+            )
+            if current_complexity not in TASK_COMPLEXITY_LEVELS:
+                current_complexity = str(policy.get("complexity", "simple") or "simple")
             decision = {
                 "level": _utlo,
                 "execution_mode": self._effective_execution_mode(),
                 "participants": list(self.runtime_participants or []),
                 "assigned_expert": str(self.runtime_assigned_expert or ""),
                 "task_type": str(self.runtime_task_type or "general"),
-                "complexity": str(policy.get("complexity", self.runtime_task_complexity or "simple")),
+                "complexity": current_complexity,
                 "scale_preference": "thorough" if _utlo >= 4 else str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(policy.get("round_budget", self.runtime_round_budget or 0) or 0),
                 "requires_user_confirmation": False,
@@ -12467,6 +14508,9 @@ class SessionState:
                 f"Each phase has its own expertise — let {preferred} lead this phase independently. "
                 "Do NOT carry over implementation patterns from previous phases. "
             )
+        todo_note = self._plan_todo_discipline_prompt(for_manager=True)
+        if todo_note:
+            lines.append(todo_note)
         return "\n".join(lines) + "\n"
 
     def _plan_step_phase_hint(self, step_content: str) -> str:
@@ -12588,6 +14632,13 @@ class SessionState:
                     f"Blackboard has {exec_count} execution_log(s) — "
                     "if these reflect this step's test run, set advance_plan_step=true. "
                 )
+            elif is_test_step and exec_count == 0 and not worker_hint:
+                bb_evidence_hint = (
+                    "⛔ TEST STEP: no bash execution evidence found yet. "
+                    "You MUST actually run the tests (e.g. `python -m pytest`, `npm test`, `bash run_tests.sh`) "
+                    "and confirm exit code before setting advance_plan_step=true. "
+                    "Creating test files is NOT sufficient — execute them. "
+                )
             return (
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
                 f"({len(completed)} completed, {len(pending)} remaining) "
@@ -12663,6 +14714,7 @@ class SessionState:
                 "follow the loaded skill's workflow and scripts. Do NOT invent alternative approaches "
                 "when a loaded skill already defines the correct procedure. "
             )
+        todo_route_note = self._plan_todo_discipline_prompt(for_manager=True)
         return (
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
@@ -12674,14 +14726,16 @@ class SessionState:
             f"{'Reviewer=DEBUG MODE (bash/read_file/write_file/edit_file/finish_task — can fix bugs directly). ' if bool(self.reviewer_debug_mode) else 'Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). '}"
             f"{'NEVER delegate file-writing tasks to Explorer. Reviewer is in debug mode and can fix bugs. ' if bool(self.reviewer_debug_mode) else 'NEVER delegate file-writing tasks to Explorer or Reviewer. '}"
             "TODO & SKILL CHAIN MANAGEMENT: "
-            "When delegating to Developer, ALWAYS instruct them to update TodoWrite after completing each step. "
-            "This triggers automatic skill re-evaluation — the system loads new skills for the next phase. "
-            "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), ensure each phase is a separate delegation "
-            "with explicit instruction to mark the previous step completed via TodoWrite before starting the next. "
-            "If the task needs skills not yet loaded, instruct Developer to call load_skill first. "
+            "When a plan step is active, `.clouds_coder/plan.md` and the worker todo list are the source of truth. "
+            "Do NOT reinterpret the current step or let the owner skip ahead. "
+            "Require the owner to manually update TodoWrite or TodoWriteRescue immediately after EACH completed subtask, "
+            "before starting the next subtask. Never assume todo progress unless the worker actually called the todo tool. "
+            "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), each phase must be explicitly closed in todos before the next phase begins. "
+            "If the task needs skills not yet loaded, instruct the owner to call load_skill before the subtask that needs it. "
             f"{coding_hint}"
             f"{project_todo_hint}"
             f"{plan_context}"
+            f"{todo_route_note}"
             f"{phase_hint}"
             f"{failure_hint}"
             f"{skills_constraint}"
@@ -13692,6 +15746,111 @@ class SessionState:
         }
         return text, data
 
+    def _sanitize_instruction_for_current_plan_step(self, text: str) -> str:
+        raw, policy = self._split_language_policy_from_text(text, max_len=4000)
+        cleaned = str(raw or "")
+        if cleaned:
+            cleaned = re.sub(
+                r"(?is)Execute ONLY the approved current plan step\.\s*"
+                r"Current plan step\s+\d+/\d+:\s*.*?"
+                r"Do not rewrite the plan or invent a new one\.\s*",
+                "\n",
+                cleaned,
+            )
+        keep_lines: list[str] = []
+        seen: set[str] = set()
+        for line in str(cleaned).splitlines():
+            s = trim(str(line or "").strip(), 600)
+            if not s:
+                continue
+            low = s.lower()
+            if low in {"objective", "instruction"}:
+                continue
+            if low.startswith("direct objective:"):
+                continue
+            if low.startswith("execute only the approved current plan step"):
+                continue
+            if low.startswith("current plan step"):
+                continue
+            if low.startswith("do not replace it with a different project"):
+                continue
+            if re.match(r"^(?:步骤|执行计划步骤)\s*\d+(?:\s*/\s*\d+)?[:：]", s):
+                continue
+            step_match = re.match(r"(?i)^step\s*\d+(?:\s*/\s*\d+)?[:：]\s*(.*)$", s)
+            if step_match:
+                tail = trim(str(step_match.group(1) or "").strip(), 400)
+                for sep in (" - ", " — ", " – ", ":", "："):
+                    if sep in tail:
+                        tail = trim(tail.split(sep, 1)[-1].strip(), 400)
+                        break
+                if tail and not re.match(r"(?i)^(project initialization|current plan step)\b", tail):
+                    low_tail = re.sub(r"\s+", " ", tail).strip().lower()
+                    if low_tail and low_tail not in seen:
+                        seen.add(low_tail)
+                        keep_lines.append(tail)
+                continue
+            critical_match = re.match(r"(?i)^critical:\s*(.*)$", s)
+            if critical_match:
+                tail = trim(str(critical_match.group(1) or "").strip(), 500)
+                if tail:
+                    low_tail = re.sub(r"\s+", " ", tail).strip().lower()
+                    if low_tail not in seen:
+                        seen.add(low_tail)
+                        keep_lines.append(tail)
+                continue
+            if low.startswith("tasks to complete:"):
+                continue
+            if re.match(r"^\d+(?:\.\d+)*[.)]\s+", s):
+                continue
+            if re.match(r"^[-*]\s+", s):
+                continue
+            if re.match(
+                r"(?i)^(mkdir\s+-p|run:|create directories:|create project|create directory|initialize project|cmake\b|python\s+-m\s+venv\b|npx\b)",
+                s,
+            ):
+                continue
+            if re.match(r"^(创建|初始化|运行|目录结构|项目根目录结构)[:：]?", s):
+                continue
+            norm = re.sub(r"\s+", " ", s).strip().lower()
+            if norm and norm not in seen:
+                seen.add(norm)
+                keep_lines.append(s)
+        body = trim("\n".join(keep_lines).strip(), 900)
+        if not body:
+            body = "Continue implementation for the approved step only and report concrete evidence."
+        if policy:
+            body = trim(f"{body}\n{policy}", 1200)
+        return body
+
+    def _align_route_with_current_plan_step(self, route_row: dict, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._current_plan_step_row(bb)
+        if not isinstance(current, dict) or current.get("category") != "plan_step":
+            return dict(route_row or {})
+        row = dict(route_row or {})
+        step_idx = int(current.get("plan_step_index", 0) or 0) + 1
+        total = int(bb.get("plan_step_total", 0) or 0)
+        header = trim(str(current.get("content", "") or "").strip(), 260)
+        full_text = self._current_plan_step_full_text(bb, max_len=1200)
+        canonical_objective = self._ui_text(
+            "plan_step_label",
+            step=step_idx,
+            total=max(1, total),
+        ) + f": {header}"
+        instruction = self._sanitize_instruction_for_current_plan_step(
+            str(row.get("instruction", "") or "").strip()
+        )
+        preface = (
+            f"Execute ONLY the approved current plan step.\n"
+            f"Current plan step {step_idx}/{max(1, total)}:\n{full_text}\n"
+            "Do not replace it with a different project, destination, domain, or file target. "
+            "Do not rewrite the plan or invent a new one.\n"
+        )
+        instruction = trim(f"{preface}{instruction}", 1200)
+        row["direct_objective"] = canonical_objective
+        row["instruction"] = instruction
+        return row
+
     def _manager_delegate_turn(
         self,
         *,
@@ -13965,6 +16124,17 @@ class SessionState:
                 scale_preference = "balanced"
         judgement = trim(str(route.get("judgement", "") or "").strip(), 200)
         objective = trim(str(route.get("direct_objective", "") or "").strip(), 800)
+        if target in AGENT_ROLES and target != "finish":
+            _aligned_route = self._align_route_with_current_plan_step(
+                {
+                    "target": target,
+                    "instruction": instruction,
+                    "direct_objective": objective,
+                },
+                board,
+            )
+            instruction = trim(str(_aligned_route.get("instruction", instruction) or "").strip(), 1200)
+            objective = trim(str(_aligned_route.get("direct_objective", objective) or "").strip(), 800)
         participants: list[str] = []
         raw_participants = route.get("participants", active_profile.get("participants", []))
         if isinstance(raw_participants, list):
@@ -14043,10 +16213,34 @@ class SessionState:
         _level_ceiling = int(self.runtime_task_level_ceiling or 0)
         if _level_ceiling > 0 and effective_level > _level_ceiling:
             effective_level = _level_ceiling
-            # Re-derive execution_mode and participants from the capped level's policy
-            _capped_policy = TASK_LEVEL_POLICIES.get(effective_level, {})
-            execution_mode = str(_capped_policy.get("execution_mode", execution_mode) or execution_mode)
-            participants = list(_capped_policy.get("participants", participants) or participants)
+        execution_mode, participants, assigned_expert = self._resolve_level_assignment(
+            effective_level,
+            assigned=assigned_expert,
+            participants=list(participants),
+            mode=execution_mode,
+        )
+        if effective_level == 5:
+            round_budget = 0
+        elif effective_level != int(task_level):
+            _effective_policy = dict(TASK_LEVEL_POLICIES.get(effective_level, TASK_LEVEL_POLICIES[3]))
+            round_budget = max(
+                1,
+                min(
+                    int(self.max_agent_rounds or MAX_AGENT_ROUNDS),
+                    int(_effective_policy.get("round_budget", round_budget) or round_budget),
+                ),
+            )
+        remaining_rounds = (
+            -1
+            if int(round_budget) <= 0
+            else max(0, int(round_budget) - int(board.get("manager_cycles", 0) or 0))
+        )
+        route_row["task_level"] = int(effective_level)
+        route_row["execution_mode"] = execution_mode
+        route_row["participants"] = list(participants)
+        route_row["assigned_expert"] = assigned_expert
+        route_row["round_budget"] = int(round_budget)
+        route_row["remaining_rounds"] = int(remaining_rounds)
         profile["task_level"] = effective_level
         profile["execution_mode"] = execution_mode
         profile["participants"] = list(participants)
@@ -14080,12 +16274,15 @@ class SessionState:
         profile["updated_at"] = float(now_ts())
         profile["reason"] = "manager-judged"
         board["task_profile"] = profile
+        effective_runtime_level = int(effective_level)
+        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+            effective_runtime_level = int(self.user_task_level_override)
         board["manager_judgement"] = {
             "task_type": str(profile.get("task_type", "")),
             "complexity": str(profile.get("complexity", "")),
             "scale_preference": str(profile.get("scale_preference", "balanced") or "balanced"),
             "progress": judgement or self._manager_progress_state(board),
-            "task_level": int(task_level),
+            "task_level": int(effective_runtime_level),
             "execution_mode": execution_mode,
             "participants": list(participants),
             "assigned_expert": assigned_expert,
@@ -14094,9 +16291,7 @@ class SessionState:
             "remaining_rounds": int(remaining_rounds),
             "updated_at": float(now_ts()),
         }
-        if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
-            task_level = int(self.user_task_level_override)
-        self.runtime_task_level = int(task_level)
+        self.runtime_task_level = int(effective_runtime_level)
         self.runtime_round_budget = int(round_budget)
         self.runtime_task_judgement = judgement or self.runtime_task_judgement
         self.runtime_task_type = str(profile.get("task_type", self.runtime_task_type) or "")
@@ -14284,22 +16479,9 @@ class SessionState:
                         f"Your work must directly execute THIS step. Do not skip or replace it.\n"
                     )
                     break
-        # developer 被调用时有活跃 plan step，要求在开始前调用 TodoWrite 刷新子任务
         todo_update_note = ""
-        if role_key == "developer" and current_plan_step_note:
-            # Extract step_id from the matched plan step for parent_step_id linkage
-            _active_step_id = ""
-            if isinstance(plan_todos, list):
-                for _pt in plan_todos:
-                    if isinstance(_pt, dict) and _pt.get("category") == "plan_step" and _pt.get("status") == "in_progress":
-                        _active_step_id = str(_pt.get("id", "") or "")
-                        break
-            todo_update_note = (
-                f"TODO PLANNING: At the START, call TodoWrite to list ALL subtasks (status=pending, parent_step_id='{_active_step_id}').\n"
-                f"SCOPE RULE: Create 3-5 subtasks for THIS step ONLY — do NOT list other plan steps or duplicate plan step titles.\n"
-                f"As you complete each subtask, update it to status=completed.\n"
-                f"When ALL subtasks are done: call finish_current_task to signal step completion.\n"
-            )
+        if role_key in {"developer", "explorer", "reviewer"} and current_plan_step_note:
+            todo_update_note = self._plan_todo_discipline_prompt(role=role_key) + "\n"
         # Build step_files context note for cross-agent file visibility
         step_files_note = ""
         if current_plan_step_note:
@@ -15100,6 +17282,7 @@ class SessionState:
         role_key = self._sanitize_agent_role(role) or "developer"
         skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
+        plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
@@ -15117,6 +17300,8 @@ class SessionState:
         if mm_note:
             base = base + mm_note
         base = base + skills_block
+        if plan_todo_note:
+            base = base + plan_todo_note + " "
         if role_key == "explorer":
             return base + (
                 "Role: analyze goals, inspect codebase, produce research notes. "
@@ -15162,11 +17347,10 @@ class SessionState:
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
             "TODO TRACKING (mandatory): "
-            "After completing each logical step, call TodoWrite to update progress — "
-            "mark completed items as 'completed' and set the next item to 'in_progress'. "
-            "This is critical because skill re-evaluation is triggered on step completion. "
-            "If the task has multiple phases (e.g., analyze PDF then make PPT), "
-            "each phase must be a separate todo item so the right skills get loaded for each phase. "
+            "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
+            "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
+            "Do not silently batch multiple subtasks and do not delay todo updates until the end of the step. "
+            "This manual update is critical because skill re-evaluation is triggered by actual todo progress. "
             "EDIT METHODOLOGY (follow strictly): "
             "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
             "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
@@ -15253,21 +17437,31 @@ class SessionState:
         if not isinstance(raw_items, list) or not raw_items:
             raise ValueError("items must be a non-empty array")
         limited = raw_items[:7]
+        active_step = self._get_active_plan_step()
+        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
+        owner_hint = self._current_plan_worker_owner()
         clean_items = []
         for idx, item in enumerate(limited):
             if isinstance(item, dict):
                 content = str(item.get("content", item.get("text", item.get("title", "")))).strip()
+                owner = str(item.get("owner", "") or owner_hint).strip().lower()
+                parent_step_id = trim(str(item.get("parent_step_id", "") or active_step_id), 20)
             else:
                 content = str(item).strip()
+                owner = owner_hint
+                parent_step_id = active_step_id
             content = normalize_work_text(content) or content
             if not content:
                 continue
-            clean_items.append(
-                {
-                    "content": content,
-                    "status": "pending",
-                }
-            )
+            row = {
+                "content": content,
+                "status": "pending",
+            }
+            if owner in {"developer", "explorer", "reviewer"}:
+                row["owner"] = owner
+            if parent_step_id:
+                row["parent_step_id"] = parent_step_id
+            clean_items.append(row)
         if not clean_items:
             raise ValueError("no valid todo item text")
         in_progress_index = int(args.get("in_progress_index", 0) or 0)
@@ -15984,6 +18178,9 @@ class SessionState:
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            protected = self._runtime_managed_path_tool_error(args.get("path", ""), "write_file")
+            if protected:
+                return protected
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -16036,6 +18233,9 @@ class SessionState:
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            protected = self._runtime_managed_path_tool_error(args.get("path", ""), "edit_file")
+            if protected:
+                return protected
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -16811,6 +19011,7 @@ class SessionState:
                 if _awaiting_plan_choice:
                     # Restore plan proposal so choice can be parsed
                     self.runtime_plan_mode_needed = True
+                    self._restore_runtime_policy_from_blackboard_locked()
                 # Reset completed plan/todo/skills blackboard state so the manager
                 # does not see status=COMPLETED on the very first round and immediately finish.
                 # But preserve plan state if user is continuing an existing task.
@@ -17494,7 +19695,7 @@ class SessionState:
             _step_dict = step if isinstance(step, dict) else {}
             _step_results = _step_dict.get("tool_results", []) or []
             _wrote = any(isinstance(r, dict) and r.get("ok") and str(r.get("name", "")) in ("write_file", "edit_file") for r in _step_results)
-            _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) == "TodoWrite" for r in _step_results)
+            _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in _step_results)
             if _wrote and not _did_todo:
                 _bb_nudge = self._ensure_blackboard()
                 _cur_step = next((t for t in _bb_nudge.get("project_todos", []) if t.get("category") == "plan_step" and t.get("status") == "in_progress"), None)
@@ -17503,7 +19704,7 @@ class SessionState:
                     if _nid:
                         _nudge_msg = (
                             f"[todo-sync] You made progress but did not call TodoWrite.\n"
-                            f"Update your subtasks: mark completed ones, add new ones if needed.\n"
+                            f"Update your subtasks now: mark the completed one, set the next one to in_progress, and keep following the active step in {PLAN_FILE_RELATIVE_PATH}.\n"
                             f"Each subtask must include parent_step_id='{_nid}'."
                         )
                         self._append_agent_context_message(role, {
@@ -18421,9 +20622,11 @@ class SessionState:
             "Judge from the task content and research findings whether the task involves writing, "
             "modifying, or generating code/scripts/configurations. If it does:\n"
             "- Include compile/build/lint verification steps after implementation steps.\n"
-            "- Include a dedicated testing step with specific commands before final review.\n"
+            "- Include a dedicated testing step with SPECIFIC run commands (e.g. `python -m pytest`, `npm test`) before final review.\n"
+            "- Testing step sub-steps must end with: actually RUNNING the tests and checking exit code, not just writing test files.\n"
             "- For large plans (10+ steps), insert intermediate test checkpoints.\n"
             "- If the task modifies existing code, include a regression test step.\n"
+            "- The LAST step must include a sub-step: 'Generate delivery report: summarize what was built, how to run it, and key outputs.'\n"
             "If the task is pure research, analysis, or document generation with no executable code, "
             "skip compile/test steps — use your judgement.\n"
         )
@@ -18572,6 +20775,31 @@ class SessionState:
         except Exception:
             return ""
 
+    def _build_plan_todos_from_steps(self, raw_steps: list, *, limit: int = 40) -> list[dict]:
+        grouped_steps = self._group_plan_steps(raw_steps if isinstance(raw_steps, list) else [])
+        plan_todos: list[dict] = []
+        for i, step in enumerate(grouped_steps[:max(1, int(limit))]):
+            step_text = trim(str(step or "").strip(), 1500)
+            if not step_text:
+                continue
+            step_lines = step_text.split("\n")
+            step_header = trim(step_lines[0].strip(), 400)
+            plan_todos.append(
+                {
+                    "id": f"pt:{i:03d}",
+                    "content": step_header,
+                    "full_content": step_text,
+                    "status": "in_progress" if not plan_todos else "pending",
+                    "category": "plan_step",
+                    "plan_step_index": i,
+                    "created_at": float(now_ts()),
+                    "completed_at": None,
+                    "completed_by": "",
+                    "evidence": "",
+                }
+            )
+        return plan_todos
+
     def _format_plan_file_preselection(self, proposal: dict) -> str:
         """Full MD content with ALL options for model review (no char limit)."""
         lines = [self._ui_text("plan_file_proposals_title")]
@@ -18631,23 +20859,43 @@ class SessionState:
     def _format_plan_file_execution(self, choice_id: str) -> str:
         """Render execution-phase plan.md with live step statuses from blackboard."""
         bb = self._ensure_blackboard()
-        proposal = self.runtime_plan_proposal or {}
-        chosen = next(
-            (o for o in proposal.get("options", [])
-             if isinstance(o, dict) and o.get("id") == choice_id),
-            None,
-        )
-        title = str((chosen or {}).get("title", "") or choice_id).strip()
-        summary = str((chosen or {}).get("summary", "") or "").strip()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_choice = str(plan.get("chosen", "") or choice_id).strip() or choice_id
+        title = trim(str(plan.get("title", "") or "").strip(), 240)
+        summary = trim(str(plan.get("summary", "") or "").strip(), 1200)
+        if not title or not summary:
+            proposal = self.runtime_plan_proposal or {}
+            chosen = next(
+                (
+                    o for o in proposal.get("options", [])
+                    if isinstance(o, dict) and o.get("id") == plan_choice
+                ),
+                None,
+            )
+            if not title:
+                title = trim(str((chosen or {}).get("title", "") or plan_choice).strip(), 240)
+            if not summary:
+                summary = trim(str((chosen or {}).get("summary", "") or "").strip(), 1200)
         todos = bb.get("project_todos", [])
         plan_todos = [t for t in todos if t.get("category") == "plan_step"]
+        if not plan_todos and isinstance(plan.get("steps"), list):
+            plan_todos = self._build_plan_todos_from_steps(plan.get("steps", []))
         total = len(plan_todos)
         completed = sum(1 for t in plan_todos if t.get("status") == "completed")
-        current_idx = completed + 1
+        active_row = next(
+            (t for t in plan_todos if str(t.get("status", "") or "") == "in_progress"),
+            None,
+        )
+        if isinstance(active_row, dict):
+            current_idx = int(active_row.get("plan_step_index", 0) or 0) + 1
+        elif total > 0:
+            current_idx = min(total, completed + (0 if completed >= total else 1))
+        else:
+            current_idx = 0
 
         lines = [self._ui_text("active_plan_title", title=title)]
         lines.append(self._ui_text("active_plan_status", current=current_idx, total=total))
-        lines.append(self._ui_text("active_plan_chosen", choice=choice_id))
+        lines.append(self._ui_text("active_plan_chosen", choice=plan_choice))
         from datetime import datetime as _dt_cls
         lines.append(self._ui_text("active_plan_updated", updated=_dt_cls.now().isoformat(timespec="seconds")))
         if summary:
@@ -18889,6 +21137,98 @@ class SessionState:
         lines.append(self._ui_text("plan_proposal_reply"))
         return "\n".join(lines)
 
+    @staticmethod
+    def _normalize_plan_choice_text(text: str) -> str:
+        raw = unicodedata.normalize("NFKC", str(text or "")).strip().lower()
+        raw = raw.replace("⭐", " ").replace("★", " ")
+        raw = re.sub(r"[\"'`“”‘’]+", " ", raw)
+        raw = re.sub(r"\s+", " ", raw)
+        return raw.strip()
+
+    def _compact_plan_choice_text(self, text: str) -> str:
+        norm = self._normalize_plan_choice_text(text)
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff\u3040-\u30ff]+", "", norm)
+
+    def _plan_choice_title_aliases(self, title: str) -> list[str]:
+        norm = self._normalize_plan_choice_text(title)
+        if not norm:
+            return []
+        aliases: list[str] = []
+
+        def _add(value: str):
+            cleaned = self._normalize_plan_choice_text(value)
+            if cleaned and cleaned not in aliases:
+                aliases.append(cleaned)
+
+        _add(norm)
+        trimmed = re.sub(
+            r"\s*(?:⭐|★)?\s*(?:recommended|recommend|推荐|推薦|推奨)\s*$",
+            "",
+            norm,
+            flags=re.IGNORECASE,
+        ).strip()
+        _add(trimmed)
+
+        if ":" in trimmed or "：" in trimmed:
+            left, right = re.split(r"[:：]", trimmed, maxsplit=1)
+            _add(right)
+            if re.search(r"(?:方案|選項|选项|option|plan|案)$", left.strip(), re.IGNORECASE):
+                _add(left)
+
+        descriptor_match = re.match(
+            r"^\s*((?:完整|简化|簡化|专业|專業|推荐|推薦)[^:：]{0,12}?(?:方案|選項|选项|option|plan|案))\s*[:：-]?\s*(.*)$",
+            trimmed,
+            re.IGNORECASE,
+        )
+        if descriptor_match:
+            _add(descriptor_match.group(1))
+            _add(descriptor_match.group(2))
+        return aliases
+
+    def _match_plan_choice_by_title(self, text: str, options: list[dict]) -> str:
+        user_norm = self._normalize_plan_choice_text(text)
+        user_compact = self._compact_plan_choice_text(text)
+        if not user_norm or not user_compact:
+            return ""
+
+        prefix_hits: list[str] = []
+        best_contains_id = ""
+        best_contains_len = 0
+        best_reverse_id = ""
+        best_reverse_len = 0
+
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            oid = str(opt.get("id", "") or "").strip()
+            if not oid:
+                continue
+            aliases = self._plan_choice_title_aliases(str(opt.get("title", "") or ""))
+            for alias in aliases:
+                alias_compact = self._compact_plan_choice_text(alias)
+                if not alias_compact:
+                    continue
+                if user_compact == alias_compact:
+                    return oid
+                if len(alias_compact) >= 4 and user_compact.startswith(alias_compact):
+                    prefix_hits.append(oid)
+                if len(alias_compact) >= 4 and alias_compact in user_compact and len(alias_compact) > best_contains_len:
+                    best_contains_id = oid
+                    best_contains_len = len(alias_compact)
+                min_reverse = max(4, len(alias_compact) // 2)
+                if len(user_compact) >= min_reverse and user_compact in alias_compact and len(user_compact) > best_reverse_len:
+                    best_reverse_id = oid
+                    best_reverse_len = len(user_compact)
+
+        unique_prefix_hits = list(dict.fromkeys(prefix_hits))
+        if len(unique_prefix_hits) == 1:
+            return unique_prefix_hits[0]
+        if best_contains_id:
+            return best_contains_id
+        if best_reverse_id:
+            return best_reverse_id
+        return ""
+
     def _parse_plan_choice(self, text: str, proposal: dict) -> str:
         if not text or not proposal:
             return ""
@@ -18917,6 +21257,10 @@ class SessionState:
                 idx = int(idx_str) - 1
                 if 0 <= idx < len(option_ids):
                     return option_ids[idx]
+        # Semantic title match: allow users to reply with the option title itself
+        semantic = self._match_plan_choice_by_title(text, [o for o in options if isinstance(o, dict)])
+        if semantic:
+            return semantic
         # "继续"/"确认"/"推荐" → pick recommended
         recommended = str(proposal.get("recommended", "") or "").strip()
         confirm_tokens = (
@@ -18946,6 +21290,8 @@ class SessionState:
             + "\n".join(options_desc)
             + rec_hint
             + f"\n\nThe user replied: \"{trim(user_text, 300)}\"\n\n"
+            "Infer the choice semantically from the ongoing plan-selection conversation. "
+            "Treat replies that mention an option title, title prefix, or descriptive label as a valid selection.\n"
             f"Which option did the user choose? Reply with ONLY the option ID "
             f"(one of: {', '.join(option_ids)}), or \"NONE\" if the user did not choose any option "
             f"and instead asked a question or gave feedback."
@@ -18967,6 +21313,42 @@ class SessionState:
         except Exception:
             pass
         return ""
+
+    def _resolve_plan_option_risk(self, option: dict) -> str:
+        if not isinstance(option, dict):
+            return "medium"
+        risk = str(option.get("risk", "") or "").strip().lower()
+        if risk in {"low", "medium", "high"}:
+            return risk
+        import re as _re_risk
+        haystacks = [
+            str(option.get("summary", "") or ""),
+            str(option.get("description", "") or ""),
+            str(option.get("title", "") or ""),
+        ]
+        for text in haystacks:
+            if not text:
+                continue
+            match = _re_risk.search(
+                r'风险[：:]\s*(low|medium|high)|風險[：:]\s*(low|medium|high)|risk[：:]\s*(low|medium|high)',
+                text,
+                _re_risk.I,
+            )
+            if match:
+                found = str(match.group(1) or match.group(2) or match.group(3) or "").strip().lower()
+                if found in {"low", "medium", "high"}:
+                    return found
+        return "medium"
+
+    def _plan_risk_target_task_level(self, current_level: int, risk: str, user_override: int = 0) -> int:
+        if int(user_override or 0) in TASK_LEVEL_CHOICES:
+            return int(user_override)
+        base_level = int(current_level or 3)
+        if base_level not in TASK_LEVEL_CHOICES:
+            base_level = 3
+        shift = {"low": -1, "medium": 0, "high": 1}.get(str(risk or "").strip().lower(), 0)
+        target = base_level + int(shift)
+        return max(min(TASK_LEVEL_CHOICES), min(max(TASK_LEVEL_CHOICES), int(target)))
 
     def _inject_plan_into_context(self, choice_id: str):
         chosen = next(
@@ -18993,61 +21375,117 @@ class SessionState:
                     "agent_role": role,
                 }, mirror_to_global=False)
         bb = self._ensure_blackboard()
-        bb["plan"] = {"phase": "executing", "chosen": choice_id, "steps": chosen.get("steps", [])}
-        self.blackboard = bb
-        self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen.get('title', '')}")
-        # Lock complexity/level floor to prevent manager downgrade during plan execution
-        self.runtime_complexity_floor = str(self.runtime_task_complexity or "complex")
-        # --- Risk-based complexity lock: set floor AND ceiling from plan option's risk field ---
-        # Read risk NOW — blackboard compaction later drops the risk key from options
-        _plan_risk = str(chosen.get("risk", "") or "").strip().lower()
-        if _plan_risk not in ("low", "medium", "high"):
-            # Fallback: scan option summary/description for risk label
-            import re as _re_risk
-            _rt = str(chosen.get("summary", "") or chosen.get("description", "") or "")
-            _rm = _re_risk.search(r'风险[：:]\s*(low|medium|high)|risk[：:]\s*(low|medium|high)', _rt, _re_risk.I)
-            _plan_risk = ((_rm.group(1) or _rm.group(2)) if _rm else "medium").lower()
-        _current_level = int(self.runtime_task_level or 3)
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
+        grouped_steps = self._group_plan_steps(chosen.get("steps", []))
+        chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 240)
+        chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), 1200)
+        # Preserve current complexity unless the user explicitly changes it elsewhere.
+        _current_complexity = trim(
+            str(
+                self.runtime_task_complexity
+                or profile.get("complexity", judgement.get("complexity", ""))
+                or ""
+            ).strip().lower(),
+            20,
+        )
+        if _current_complexity in TASK_COMPLEXITY_LEVELS:
+            self.runtime_task_complexity = _current_complexity
+        else:
+            _current_complexity = trim(str(self.runtime_task_complexity or "").strip().lower(), 20)
+        self.runtime_complexity_floor = str(_current_complexity or "complex")
+        _plan_risk = self._resolve_plan_option_risk(chosen)
+        try:
+            _current_level = int(
+                self.runtime_task_level
+                or profile.get("task_level", judgement.get("task_level", 3))
+                or 3
+            )
+        except Exception:
+            _current_level = 3
+        if _current_level not in TASK_LEVEL_CHOICES:
+            _current_level = 3
         _user_override = int(getattr(self, "user_task_level_override", 0) or 0)
-        if _user_override > 0:
-            # User explicitly set level → absolute lock, no up and no down
-            self.runtime_task_level_floor = _user_override
-            self.runtime_task_level_ceiling = _user_override
-        elif _plan_risk == "medium":
-            # Medium risk → exact lock at current level
-            self.runtime_task_level_floor = _current_level
-            self.runtime_task_level_ceiling = _current_level
-        elif _plan_risk == "high":
-            # High risk → allow +1 upgrade, no downgrade
-            self.runtime_task_level_floor = _current_level
-            self.runtime_task_level_ceiling = min(5, _current_level + 1)
-        else:  # low
-            # Low risk → allow -1 downgrade, no upgrade
-            self.runtime_task_level_floor = max(1, _current_level - 1)
-            self.runtime_task_level_ceiling = _current_level
+        _target_level = self._plan_risk_target_task_level(_current_level, _plan_risk, _user_override)
+        bb["plan"] = {
+            "phase": "executing",
+            "chosen": choice_id,
+            "title": chosen_title,
+            "summary": chosen_summary,
+            "risk": _plan_risk,
+            "steps": grouped_steps,
+        }
+        self.blackboard = bb
+        self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen_title}")
+        self.runtime_task_level = int(_target_level)
+        self.runtime_task_level_floor = int(_target_level)
+        self.runtime_task_level_ceiling = int(_target_level)
+        _policy = dict(TASK_LEVEL_POLICIES.get(_target_level, TASK_LEVEL_POLICIES[3]))
+        if _target_level == 5:
+            _target_budget = 0
+        else:
+            _target_budget = max(
+                1,
+                min(
+                    int(self.max_agent_rounds or MAX_AGENT_ROUNDS),
+                    int(_policy.get("round_budget", self.max_agent_rounds) or self.max_agent_rounds),
+                ),
+            )
+        _resolved_mode, _resolved_participants, _resolved_assigned = self._resolve_level_assignment(
+            _target_level,
+            assigned=str(
+                profile.get("assigned_expert", judgement.get("assigned_expert", self.runtime_assigned_expert or "developer"))
+                or "developer"
+            ),
+            participants=list(profile.get("participants", judgement.get("participants", self.runtime_participants or [])) or []),
+            mode=str(profile.get("execution_mode", judgement.get("execution_mode", self.runtime_execution_mode or "")) or ""),
+        )
+        self.runtime_execution_mode = _resolved_mode
+        self.runtime_participants = list(_resolved_participants)
+        self.runtime_assigned_expert = _resolved_assigned
+        self.runtime_round_budget = int(_target_budget)
+        if isinstance(bb.get("task_profile"), dict):
+            bb["task_profile"]["task_level"] = int(_target_level)
+            bb["task_profile"]["execution_mode"] = _resolved_mode
+            bb["task_profile"]["participants"] = list(_resolved_participants)
+            bb["task_profile"]["assigned_expert"] = _resolved_assigned
+            bb["task_profile"]["round_budget"] = int(_target_budget)
+            bb["task_profile"]["complexity"] = str(
+                _current_complexity or bb["task_profile"].get("complexity", "")
+            )
+            bb["task_profile"]["updated_at"] = float(now_ts())
+        if isinstance(bb.get("manager_judgement"), dict):
+            bb["manager_judgement"]["task_level"] = int(_target_level)
+            bb["manager_judgement"]["execution_mode"] = _resolved_mode
+            bb["manager_judgement"]["participants"] = list(_resolved_participants)
+            bb["manager_judgement"]["assigned_expert"] = _resolved_assigned
+            bb["manager_judgement"]["remaining_rounds"] = (
+                -1 if int(_target_budget) <= 0 else int(_target_budget)
+            )
+            bb["manager_judgement"]["complexity"] = str(
+                _current_complexity or bb["manager_judgement"].get("complexity", "")
+            )
+            bb["manager_judgement"]["updated_at"] = float(now_ts())
+        bb.setdefault("plan_meta", {})
+        if isinstance(bb.get("plan_meta"), dict):
+            bb["plan_meta"]["risk"] = _plan_risk
+            bb["plan_meta"]["task_level"] = int(_target_level)
+            bb["plan_meta"]["complexity"] = str(_current_complexity or "")
+            bb["plan_meta"]["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"plan risk applied: risk={_plan_risk} "
+                    f"level={_current_level}->{_target_level} "
+                    f"complexity={_current_complexity or '-'}"
+                )
+            },
+        )
         # Auto-create todos from plan steps → write into bb["project_todos"]
-        steps = self._group_plan_steps(chosen.get("steps", []))
-        if steps and isinstance(steps, list):
-            plan_todos = []
-            for i, step in enumerate(steps):
-                step_text = trim(str(step or "").strip(), 1500)
-                if not step_text:
-                    continue
-                # Extract header (first line) for todo display; keep full text for plan.md rendering
-                step_lines = step_text.split("\n")
-                step_header = step_lines[0].strip()
-                plan_todos.append({
-                    "id": f"pt:{i:03d}",
-                    "content": step_header,
-                    "full_content": step_text,
-                    "status": "in_progress" if i == 0 else "pending",
-                    "category": "plan_step",
-                    "plan_step_index": i,
-                    "created_at": float(now_ts()),
-                    "completed_at": None,
-                    "completed_by": "",
-                    "evidence": "",
-                })
+        if grouped_steps and isinstance(grouped_steps, list):
+            plan_todos = self._build_plan_todos_from_steps(grouped_steps, limit=40)
             if plan_todos:
                 bb["project_todos"] = plan_todos[:40]
                 bb["plan_step_cursor"] = 0
@@ -19074,7 +21512,7 @@ class SessionState:
             pass
         # Pre-load skills explicitly mentioned in plan steps
         try:
-            self._preload_skills_from_plan_steps(chosen.get("steps", []))
+            self._preload_skills_from_plan_steps(grouped_steps)
         except Exception:
             pass
 
@@ -20315,14 +22753,14 @@ class SessionState:
                         self.messages.append(
                             {
                                 "role": "user",
-                                "content": "<reminder>Please call TodoWrite now. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
+                                "content": "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
                                 "ts": now_tick,
                             }
                         )
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
-                        self.messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>", "ts": now_tick})
+                        self.messages.append({"role": "user", "content": "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>", "ts": now_tick})
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                 if manual_compact:

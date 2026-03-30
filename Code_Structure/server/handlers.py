@@ -13,10 +13,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..app.context import AppContext
-from ..config.constants import APP_VERSION, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SYNC, MIN_RUN_TIMEOUT_SECONDS, PLAN_MODE_USER_CHOICES, RAG_GRAPH_MAX_NODES, SSE_HEARTBEAT_SECONDS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, UI_STYLE_LABELS
+from ..config.constants import APP_VERSION, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SYNC, MIN_RUN_TIMEOUT_SECONDS, PLAN_MODE_USER_CHOICES, RAG_GRAPH_MAX_NODES, SSE_HEARTBEAT_SECONDS, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, UI_STYLE_LABELS
 from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, WORKDIR
-from ..config.settings import _to_bool_like, looks_like_llm_config, normalize_execution_mode, normalize_ui_language, normalize_ui_style, resolve_web_ui_dir_path, supported_ui_languages_payload
-from ..llm.utils import list_ollama_models
+from ..config.settings import _to_bool_like, infer_user_complexity_value, looks_like_llm_config, normalize_execution_mode, normalize_ui_language, normalize_ui_style, resolve_web_ui_dir_path, supported_ui_languages_payload
+from ..llm.utils import extract_base_url, extract_openai_compat_model_ids, list_ollama_models, normalize_openai_compat_provider_name, openai_compat_model_list_urls, openai_compat_probe_headers
 from ..session.manager import SessionManager
 from ..session.state import SessionState
 from ..skills.store import analyze_skill_building_knowledge
@@ -24,6 +24,7 @@ from ..utils.files import safe_path, try_read_text
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.media import guess_mime_from_name
 from ..utils.misc import now_ts, swallow_benign_socket_error, user_id_from_ip
+from ..utils.text import trim
 
 class AgentHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -258,22 +259,126 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/openai_compat/models":
             base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
             api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
+            provider = normalize_openai_compat_provider_name(
+                str((query.get("provider", [""]) or [""])[0]).strip()
+            )
             if not base_url:
-                return self._send_json({"ok": False, "models": [], "error": "base_url required"})
+                return self._send_json({"ok": False, "reachable": False, "models": [], "error": "base_url required"})
             try:
                 import urllib.request
-                models_url = base_url.rstrip("/") + "/models"
-                req = urllib.request.Request(models_url, method="GET")
-                req.add_header("Accept", "application/json")
-                if api_key:
-                    req.add_header("Authorization", f"Bearer {api_key}")
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                data = raw.get("data", [])
-                model_ids = [str(m.get("id", "")) for m in data if isinstance(m, dict) and m.get("id")]
-                return self._send_json({"ok": True, "models": model_ids, "base_url": base_url})
+                import urllib.error
+                normalized_base = extract_base_url(base_url)
+                reachable = False
+                last_error = ""
+                notes: list[str] = []
+                probe_headers = openai_compat_probe_headers(provider, api_key)
+                for models_url in openai_compat_model_list_urls(normalized_base, provider):
+                    try:
+                        req = urllib.request.Request(models_url, method="GET")
+                        for hk, hv in probe_headers.items():
+                            if str(hk or "").strip() and str(hv or "").strip():
+                                req.add_header(str(hk), str(hv))
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            body_text = resp.read().decode("utf-8", errors="replace")
+                        reachable = True
+                        try:
+                            payload = json.loads(body_text)
+                        except Exception:
+                            payload = {}
+                        model_ids = extract_openai_compat_model_ids(payload)
+                        if model_ids:
+                            return self._send_json(
+                                {
+                                    "ok": True,
+                                    "reachable": True,
+                                    "provider": provider,
+                                    "models": model_ids,
+                                    "base_url": normalized_base,
+                                    "scanned_url": models_url,
+                                }
+                            )
+                        notes.append(f"{models_url}:empty")
+                    except urllib.error.HTTPError as exc:
+                        body_text = ""
+                        try:
+                            body_text = exc.read().decode("utf-8", errors="replace")
+                        except Exception:
+                            body_text = ""
+                        status_code = int(getattr(exc, "code", 0) or 0)
+                        if status_code in {200, 401, 403, 404, 405}:
+                            reachable = True
+                        try:
+                            payload = json.loads(body_text) if body_text else {}
+                        except Exception:
+                            payload = {}
+                        model_ids = extract_openai_compat_model_ids(payload)
+                        if model_ids:
+                            return self._send_json(
+                                {
+                                    "ok": True,
+                                    "reachable": True,
+                                    "provider": provider,
+                                    "models": model_ids,
+                                    "base_url": normalized_base,
+                                    "scanned_url": models_url,
+                                }
+                            )
+                        msg = trim(body_text or str(exc), 220)
+                        last_error = f"HTTP {status_code}: {msg}" if msg else f"HTTP {status_code}"
+                        notes.append(f"{models_url}:http-{status_code}")
+                    except Exception as exc:
+                        last_error = trim(str(exc), 300)
+                        notes.append(f"{models_url}:error")
+                if not reachable and normalized_base:
+                    try:
+                        base_req = urllib.request.Request(normalized_base, method="GET")
+                        for hk, hv in probe_headers.items():
+                            if str(hk or "").strip() and str(hv or "").strip():
+                                base_req.add_header(str(hk), str(hv))
+                        with urllib.request.urlopen(base_req, timeout=8):
+                            pass
+                        reachable = True
+                    except urllib.error.HTTPError as exc:
+                        if int(getattr(exc, "code", 0) or 0) in {200, 401, 403, 405}:
+                            reachable = True
+                            last_error = f"HTTP {int(getattr(exc, 'code', 0) or 0)}"
+                    except Exception:
+                        pass
+                if reachable:
+                    return self._send_json(
+                        {
+                            "ok": True,
+                            "reachable": True,
+                            "provider": provider,
+                            "models": [],
+                            "base_url": normalized_base,
+                            "note": "endpoint reachable; no standard model list returned",
+                            "error": last_error,
+                            "attempts": notes[-6:],
+                        }
+                    )
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "reachable": False,
+                        "provider": provider,
+                        "models": [],
+                        "error": last_error or "unable to reach endpoint",
+                        "base_url": normalized_base,
+                        "attempts": notes[-6:],
+                    }
+                )
             except Exception as exc:
-                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": base_url})
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "reachable": False,
+                        "provider": provider,
+                        "models": [],
+                        "error": str(exc)[:300],
+                        "base_url": extract_base_url(base_url),
+                    }
+                )
         if path == "/api/skills":
             return self._send_json(self.app.skills_catalog())
         if path == "/api/skills/providers":
@@ -335,6 +440,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(payload)
+        m = re.match(r"^/api/sessions/([^/]+)/preview-html/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                html_text = sess.preview_html_payload(rel)
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
         m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -639,7 +759,19 @@ class Handler(BaseHTTPRequestHandler):
                     sess.runtime_task_level = level
                     policy = TASK_LEVEL_POLICIES.get(level, {})
                     sess.runtime_round_budget = int(policy.get("round_budget", 0) or 0)
-                    sess.runtime_task_complexity = str(policy.get("complexity", "simple"))
+                    explicit_complexity = infer_user_complexity_value(
+                        str(body.get("complexity", body.get("task_complexity", "")) or "")
+                    )
+                    current_complexity = trim(
+                        str(getattr(sess, "runtime_task_complexity", "") or "").strip().lower(),
+                        20,
+                    )
+                    if explicit_complexity in TASK_COMPLEXITY_LEVELS:
+                        sess.runtime_task_complexity = explicit_complexity
+                    elif current_complexity in TASK_COMPLEXITY_LEVELS:
+                        sess.runtime_task_complexity = current_complexity
+                    else:
+                        sess.runtime_task_complexity = str(policy.get("complexity", "simple"))
                     sess.runtime_scale_preference = "thorough" if level >= 4 else "balanced"
             return self._send_json({"task_level": level})
         return self._send_json({"error": "not found"}, status=404)
@@ -831,6 +963,8 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "supported_languages": supported_ui_languages_payload(),
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
+                    "run_timeout": int(mgr.max_run_seconds),
+                    "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
             )
         if path == "/api/skillslab/rules":

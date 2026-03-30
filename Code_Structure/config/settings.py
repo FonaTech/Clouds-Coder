@@ -4,17 +4,18 @@
 from __future__ import annotations
 import json
 import os
+import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MEDIA_CAPABILITY_KEYS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES
+from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MEDIA_CAPABILITY_KEYS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES, USER_COMPLEXITY_COMPLEX_TOKENS, USER_COMPLEXITY_SIMPLE_TOKENS
 from .paths import WORKDIR
-from ..llm.utils import _is_http_url, _resolve_local_path, complete_chat_endpoint, extract_base_url
+from ..llm.utils import _is_http_url, _resolve_local_path, complete_chat_endpoint, extract_base_url, is_openai_like_provider, normalize_openai_compat_provider_name, strip_thinking_content
 from ..skills.store import ensure_embedded_skills
 from ..utils.json_utils import parse_json_object
-from ..utils.misc import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, normalize_timeout_seconds
+from ..utils.misc import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, normalize_timeout_seconds, sanitize_profile_id
 from ..utils.text import trim
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -352,7 +353,7 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
         if any(x in m for x in ("omni", "video")):
             caps["input_video"] = True
         return caps
-    if p in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+    if is_openai_like_provider(p):
         if any(
             x in m
             for x in (
@@ -450,6 +451,18 @@ def parse_media_endpoints(raw: object) -> dict[str, str]:
             out[media_type] = v
     return out
 
+def infer_user_complexity_value(text: str) -> str:
+    low = strip_thinking_content(str(text or "")).strip().lower()
+    if not low:
+        return ""
+    for token in USER_COMPLEXITY_SIMPLE_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "simple"
+    for token in USER_COMPLEXITY_COMPLEX_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "complex"
+    return ""
+
 def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeout: int = 20) -> tuple[dict, str]:
     raw = str(source or "").strip()
     if not raw:
@@ -505,16 +518,34 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
     if not isinstance(raw_global_media_endpoints, dict):
         raw_global_media_endpoints = {}
 
+    def _provider_aliases(provider_key: str, provider: str) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in (
+            provider_key,
+            str(provider_key or "").replace("-", "_"),
+            provider,
+            str(provider or "").replace("-", "_"),
+            normalize_openai_compat_provider_name(provider),
+        ):
+            key = str(raw or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
     def build_profile_capabilities(provider_key: str, provider: str, model: str) -> dict[str, bool]:
         caps = infer_model_multimodal_capabilities(provider, model)
         if any(k in raw_global_caps for k in MEDIA_CAPABILITY_KEYS):
             caps = merge_multimodal_capabilities(caps, parse_capability_overrides(raw_global_caps))
-        nested_global = raw_global_caps.get(provider_key)
-        if nested_global is not None:
-            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(nested_global))
-        direct_override = config.get(f"{provider_key}_capabilities")
-        if direct_override is not None:
-            caps = merge_multimodal_capabilities(caps, parse_capability_overrides(direct_override))
+        for alias in _provider_aliases(provider_key, provider):
+            nested_global = raw_global_caps.get(alias)
+            if nested_global is not None:
+                caps = merge_multimodal_capabilities(caps, parse_capability_overrides(nested_global))
+            direct_override = config.get(f"{alias}_capabilities")
+            if direct_override is not None:
+                caps = merge_multimodal_capabilities(caps, parse_capability_overrides(direct_override))
         model_override = model_caps_map.get(model) or model_caps_map.get(str(model or "").lower())
         if model_override is not None:
             caps = merge_multimodal_capabilities(caps, parse_capability_overrides(model_override))
@@ -524,17 +555,56 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         out: dict[str, str] = {}
         if any(k in raw_global_media_endpoints for k in ("image", "audio", "video")):
             out.update(parse_media_endpoints(raw_global_media_endpoints))
-        nested = raw_global_media_endpoints.get(provider_key)
-        if nested is not None:
-            out.update(parse_media_endpoints(nested))
-        direct = config.get(f"{provider_key}_media_endpoints")
-        if direct is not None:
-            out.update(parse_media_endpoints(direct))
-        for media_type in ("image", "audio", "video"):
-            specific = str(config.get(f"{provider_key}_{media_type}_endpoint", "") or "").strip()
-            if specific:
-                out[media_type] = specific
+        for alias in _provider_aliases(provider_key, provider_key):
+            nested = raw_global_media_endpoints.get(alias)
+            if nested is not None:
+                out.update(parse_media_endpoints(nested))
+            direct = config.get(f"{alias}_media_endpoints")
+            if direct is not None:
+                out.update(parse_media_endpoints(direct))
+            for media_type in ("image", "audio", "video"):
+                specific = str(config.get(f"{alias}_{media_type}_endpoint", "") or "").strip()
+                if specific:
+                    out[media_type] = specific
         return out
+
+    def default_model_for_provider(provider: str) -> str:
+        normalized = str(provider or "").strip().lower()
+        if normalized == "ollama":
+            return default_ollama_model
+        defaults = {
+            "openai_compat": "gpt-4o-mini",
+            "siliconflow": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+            "vllm": "auto",
+            "lmstudio": "auto",
+            "anthropic": "claude-sonnet-4-20250514",
+            "glm": "glm-4-flash",
+            "kimi": "moonshot-v1-8k",
+            "openrouter": "meta-llama/llama-3.1-8b-instruct",
+            "custom_http": "custom-model",
+        }
+        return defaults.get(normalized, "model")
+
+    def normalize_profile_provider(raw: str) -> str:
+        value = str(raw or "").strip().lower().replace("-", "_")
+        if not value:
+            return ""
+        if value == "ollama":
+            return "ollama"
+        if value == "anthropic":
+            return "anthropic"
+        if is_openai_like_provider(value):
+            return normalize_openai_compat_provider_name(value)
+        return value
+
+    def parse_profile_headers(raw: object) -> dict:
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items()}
+        if isinstance(raw, str):
+            parsed = parse_json_object(raw, {})
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        return {}
 
     def add_profile(
         out: list[dict],
@@ -592,22 +662,190 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
     thinking_stream_default = bool(
         config.get("thinking_stream", config.get("stream_thinking", False))
     )
+    explicit_default_profile_id = sanitize_profile_id(
+        str(
+            config.get("default_profile_id")
+            or config.get("active_profile_id")
+            or config.get("selected_profile_id")
+            or ""
+        )
+    )
+    explicit_default_candidates: list[str] = []
 
+    raw_profiles = (
+        config.get("profiles")
+        if config.get("profiles") is not None
+        else config.get("model_profiles")
+        if config.get("model_profiles") is not None
+        else config.get("llm_profiles")
+        if config.get("llm_profiles") is not None
+        else config.get("llms")
+    )
+    explicit_rows: list[dict] = []
+    if isinstance(raw_profiles, dict):
+        for key, value in raw_profiles.items():
+            if not isinstance(value, dict):
+                continue
+            row = dict(value)
+            row.setdefault("id", key)
+            explicit_rows.append(row)
+    elif isinstance(raw_profiles, list):
+        for value in raw_profiles:
+            if isinstance(value, dict):
+                explicit_rows.append(dict(value))
+
+    for idx, raw_profile in enumerate(explicit_rows):
+        provider_hint = (
+            raw_profile.get("provider")
+            or raw_profile.get("vendor")
+            or raw_profile.get("type")
+            or raw_profile.get("kind")
+            or ""
+        )
+        provider = normalize_profile_provider(str(provider_hint or ""))
+        if not provider:
+            inferred = (
+                raw_profile.get("id")
+                or raw_profile.get("profile_id")
+                or raw_profile.get("name")
+                or raw_profile.get("label")
+                or ""
+            )
+            provider = normalize_profile_provider(str(inferred or ""))
+        base_hint = str(
+            raw_profile.get("base_url")
+            or raw_profile.get("url")
+            or raw_profile.get("api_base")
+            or raw_profile.get("api_url")
+            or raw_profile.get("host")
+            or raw_profile.get("endpoint")
+            or ""
+        ).strip()
+        endpoint = str(
+            raw_profile.get("endpoint")
+            or raw_profile.get("chat_endpoint")
+            or raw_profile.get("completion_endpoint")
+            or ""
+        ).strip()
+        if not provider and (base_hint or endpoint):
+            provider = "openai_compat"
+        if not provider:
+            continue
+        profile_id = sanitize_profile_id(
+            str(
+                raw_profile.get("id")
+                or raw_profile.get("profile_id")
+                or raw_profile.get("name")
+                or raw_profile.get("label")
+                or raw_profile.get("title")
+                or f"profile-{idx+1}"
+            )
+        )
+        label = str(
+            raw_profile.get("label")
+            or raw_profile.get("name")
+            or raw_profile.get("title")
+            or raw_profile.get("display_name")
+            or profile_id
+        ).strip() or profile_id
+        model = str(
+            raw_profile.get("model")
+            or raw_profile.get("model_name")
+            or raw_profile.get("default_model")
+            or ""
+        ).strip()
+        if not model:
+            model = default_model_for_provider(provider)
+        base_url = extract_base_url(base_hint or endpoint)
+        if provider == "ollama" and not base_url:
+            base_url = extract_base_url(default_ollama_url)
+        api_key = str(
+            raw_profile.get("api_key")
+            or raw_profile.get("key")
+            or raw_profile.get("token")
+            or ""
+        ).strip()
+        headers = parse_profile_headers(raw_profile.get("headers"))
+        payload_template = str(
+            raw_profile.get("payload_template")
+            or raw_profile.get("payload")
+            or raw_profile.get("template")
+            or ""
+        ).strip()
+        if provider == "anthropic":
+            anth_base = base_url or "https://api.anthropic.com"
+            endpoint = endpoint or anth_base.rstrip("/") + "/v1/messages"
+            base_url = extract_base_url(anth_base)
+        elif is_openai_like_provider(provider):
+            endpoint = endpoint or complete_chat_endpoint(base_url)
+        caps_key = str(raw_profile.get("capabilities_key") or profile_id or provider)
+        capabilities = build_profile_capabilities(caps_key, provider, model)
+        if raw_profile.get("capabilities") is not None:
+            capabilities = merge_multimodal_capabilities(
+                capabilities,
+                parse_capability_overrides(raw_profile.get("capabilities")),
+            )
+        media_endpoints = build_profile_media_endpoints(caps_key)
+        if raw_profile.get("media_endpoints") is not None:
+            media_endpoints.update(parse_media_endpoints(raw_profile.get("media_endpoints")))
+        for media_type in ("image", "audio", "video"):
+            specific = str(
+                raw_profile.get(f"{media_type}_endpoint")
+                or raw_profile.get(f"{media_type}_url")
+                or ""
+            ).strip()
+            if specific:
+                media_endpoints[media_type] = specific
+        add_profile(
+            profiles,
+            profile_id=profile_id,
+            provider=provider,
+            label=label,
+            model=model,
+            base_url=base_url,
+            endpoint=endpoint,
+            api_key=api_key,
+            headers=headers,
+            payload_template=payload_template,
+            thinking_stream=bool(
+                raw_profile.get(
+                    "thinking_stream",
+                    raw_profile.get(
+                        "stream_thinking",
+                        raw_profile.get("thinking", thinking_stream_default),
+                    ),
+                )
+            ),
+            temperature=float(raw_profile.get("temperature", temp) or temp),
+            request_timeout=raw_profile.get("request_timeout", timeout),
+            capabilities=capabilities,
+            media_endpoints=media_endpoints,
+            source=str(raw_profile.get("source", "profiles") or "profiles"),
+        )
+        if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
+            explicit_default_candidates.append(profile_id)
+
+    ollama_requested = bool(
+        provider == "ollama"
+        or str(config.get("ollama_url", "")).strip()
+        or str(config.get("ollama_model", "")).strip()
+    )
     ollama_url = str(config.get("ollama_url", default_ollama_url)).strip() or default_ollama_url
     ollama_model = str(config.get("ollama_model", default_ollama_model)).strip() or default_ollama_model
-    add_profile(
-        profiles,
-        profile_id="ollama",
-        provider="ollama",
-        label="Ollama",
-        model=ollama_model,
-        base_url=extract_base_url(ollama_url),
-        thinking_stream=bool(config.get("ollama_thinking_stream", thinking_stream_default)),
-        temperature=temp,
-        request_timeout=timeout,
-        capabilities=build_profile_capabilities("ollama", "ollama", ollama_model),
-        media_endpoints=build_profile_media_endpoints("ollama"),
-    )
+    if ollama_requested:
+        add_profile(
+            profiles,
+            profile_id="ollama",
+            provider="ollama",
+            label="Ollama",
+            model=ollama_model,
+            base_url=extract_base_url(ollama_url),
+            thinking_stream=bool(config.get("ollama_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("ollama", "ollama", ollama_model),
+            media_endpoints=build_profile_media_endpoints("ollama"),
+        )
 
     openai_url = str(config.get("openai_url", "")).strip()
     openai_model = str(config.get("openai_model", "")).strip()
@@ -616,7 +854,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="openai",
-            provider="openai_compat",
+            provider=normalize_profile_provider("openai"),
             label="OpenAI Compatible",
             model=openai_model or "gpt-4o-mini",
             base_url=extract_base_url(openai_url),
@@ -625,7 +863,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("openai_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("openai", "openai_compat", openai_model or "gpt-4o-mini"),
+            capabilities=build_profile_capabilities("openai", normalize_profile_provider("openai"), openai_model or "gpt-4o-mini"),
             media_endpoints=build_profile_media_endpoints("openai"),
         )
 
@@ -636,7 +874,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="siliconflow",
-            provider="openai_compat",
+            provider=normalize_profile_provider("siliconflow"),
             label="SiliconFlow",
             model=sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct",
             base_url=extract_base_url(sf_url),
@@ -645,7 +883,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("siliconflow_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("siliconflow", "openai_compat", sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct"),
+            capabilities=build_profile_capabilities("siliconflow", normalize_profile_provider("siliconflow"), sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct"),
             media_endpoints=build_profile_media_endpoints("siliconflow"),
         )
 
@@ -658,7 +896,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="vllm",
-            provider="openai_compat",
+            provider=normalize_profile_provider("vllm"),
             label="vLLM",
             model=vllm_model or "auto",
             base_url=extract_base_url(vllm_url or _vllm_default),
@@ -667,7 +905,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("vllm_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("vllm", "openai_compat", vllm_model or "auto"),
+            capabilities=build_profile_capabilities("vllm", normalize_profile_provider("vllm"), vllm_model or "auto"),
             media_endpoints=build_profile_media_endpoints("vllm"),
         )
 
@@ -679,7 +917,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="lmstudio",
-            provider="openai_compat",
+            provider=normalize_profile_provider("lmstudio"),
             label="LM Studio",
             model=lms_model or "auto",
             base_url=extract_base_url(lms_url or _lms_default),
@@ -687,7 +925,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("lmstudio_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("lmstudio", "openai_compat", lms_model or "auto"),
+            capabilities=build_profile_capabilities("lmstudio", normalize_profile_provider("lmstudio"), lms_model or "auto"),
             media_endpoints=build_profile_media_endpoints("lmstudio"),
         )
 
@@ -722,7 +960,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="glm",
-            provider="openai_compat",
+            provider=normalize_profile_provider("glm"),
             label="GLM",
             model=glm_model or "glm-4-flash",
             base_url=extract_base_url(glm_url or _glm_default),
@@ -731,7 +969,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("glm_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("glm", "openai_compat", glm_model or "glm-4-flash"),
+            capabilities=build_profile_capabilities("glm", normalize_profile_provider("glm"), glm_model or "glm-4-flash"),
             media_endpoints=build_profile_media_endpoints("glm"),
         )
 
@@ -744,7 +982,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="kimi",
-            provider="openai_compat",
+            provider=normalize_profile_provider("kimi"),
             label="KIMI (Moonshot)",
             model=kimi_model or "moonshot-v1-8k",
             base_url=extract_base_url(kimi_url or _kimi_default),
@@ -753,7 +991,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("kimi_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("kimi", "openai_compat", kimi_model or "moonshot-v1-8k"),
+            capabilities=build_profile_capabilities("kimi", normalize_profile_provider("kimi"), kimi_model or "moonshot-v1-8k"),
             media_endpoints=build_profile_media_endpoints("kimi"),
         )
 
@@ -766,7 +1004,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="openrouter",
-            provider="openai_compat",
+            provider=normalize_profile_provider("openrouter"),
             label="OpenRouter",
             model=or_model or "meta-llama/llama-3.1-8b-instruct",
             base_url=extract_base_url(or_url or _or_default),
@@ -775,7 +1013,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("openrouter_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("openrouter", "openai_compat", or_model or "meta-llama/llama-3.1-8b-instruct"),
+            capabilities=build_profile_capabilities("openrouter", normalize_profile_provider("openrouter"), or_model or "meta-llama/llama-3.1-8b-instruct"),
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
@@ -787,7 +1025,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         add_profile(
             profiles,
             profile_id="custom",
-            provider="custom_http",
+            provider=normalize_profile_provider("custom_http"),
             label="Custom HTTP",
             model=str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model"),
             base_url=extract_base_url(custom_url),
@@ -798,7 +1036,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             thinking_stream=bool(config.get("custom_thinking_stream", thinking_stream_default)),
             temperature=temp,
             request_timeout=timeout,
-            capabilities=build_profile_capabilities("custom", "custom_http", str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model")),
+            capabilities=build_profile_capabilities("custom", normalize_profile_provider("custom_http"), str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model")),
             media_endpoints=build_profile_media_endpoints("custom"),
         )
 
@@ -831,7 +1069,14 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         "custom": "custom",
     }
     profile_ids = {p["id"] for p in profiles}
-    default_profile_id = active_map.get(provider, "")
+    default_profile_id = explicit_default_profile_id if explicit_default_profile_id in profile_ids else ""
+    if (not default_profile_id) and explicit_default_candidates:
+        for candidate in explicit_default_candidates:
+            if candidate in profile_ids:
+                default_profile_id = candidate
+                break
+    if not default_profile_id:
+        default_profile_id = active_map.get(provider, "")
     if not default_profile_id or default_profile_id not in profile_ids:
         # Fallback: first non-ollama profile that was explicitly configured
         for p in profiles:
@@ -848,6 +1093,12 @@ def looks_like_llm_config(config: dict) -> bool:
     keys = {str(k).strip().lower() for k in config.keys()}
     markers = {
         "provider",
+        "profiles",
+        "model_profiles",
+        "llm_profiles",
+        "llms",
+        "default_profile_id",
+        "active_profile_id",
         "ollama_url",
         "ollama_model",
         "openai_url",
