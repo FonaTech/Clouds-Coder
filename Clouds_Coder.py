@@ -24883,6 +24883,20 @@ body{padding:18px}
         )
         return rows
 
+    def _active_plan_step_has_worker_todos(self, role: str = "") -> bool:
+        step = self._get_active_plan_step()
+        if not isinstance(step, dict):
+            return False
+        step_id = str(step.get("id", "") or "").strip()
+        if not step_id:
+            return False
+        return bool(self._active_plan_worker_todo_rows(step_id, role=role))
+
+    def _todo_runtime_has_worker_rows(self, role: str = "") -> bool:
+        if self._get_active_plan_step() is not None:
+            return self._active_plan_step_has_worker_todos(role=role)
+        return bool(self.todo.snapshot())
+
     def _plan_todo_discipline_prompt(self, role: str = "", *, for_manager: bool = False) -> str:
         step = self._get_active_plan_step()
         if not isinstance(step, dict):
@@ -29518,19 +29532,22 @@ body{padding:18px}
     def _analyze_todo_result(self, tool_name: str, output: str) -> tuple[str, str]:
         txt = str(output or "").strip()
         low = txt.lower()
+        has_worker_rows = self._todo_runtime_has_worker_rows()
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
-            if self.todo.snapshot():
+            if has_worker_rows:
                 return ("ok", "todo already up to date")
             return ("repeat", "same todo payload repeated")
         if tool_name == "TodoWriteRescue":
-            return ("ok", "rescue path success")
-        if self.todo.snapshot():
+            if has_worker_rows:
+                return ("ok", "rescue path success")
+            return ("failed", "todo rescue returned but active worker subtasks are still missing")
+        if has_worker_rows:
             return ("ok", "todo updated")
-        return ("unknown", trim(txt, 120))
+        return ("failed", trim(txt, 120) or "todo tool returned without creating worker subtasks")
 
     def _inject_todo_rescue_hint(self, reason: str):
         goal = self._latest_user_goal_text()
@@ -34537,9 +34554,20 @@ body{padding:18px}
                         else:
                             self.todo_write_issue_count += 1
                             self.todo_last_issue = reason
-                            if self.todo_write_issue_count >= 2 and not self.todo.snapshot():
+                            if self.todo_write_issue_count >= 2 and not self._todo_runtime_has_worker_rows(single_role):
+                                self._emit(
+                                    "status",
+                                    {
+                                        "summary": (
+                                            "todo update failed; rescue required "
+                                            f"({trim(reason, 100)})"
+                                        )
+                                    },
+                                )
                                 self._inject_todo_rescue_hint(reason)
                                 self.todo_write_issue_count = 1
+                                retry_requested_this_round = True
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
                     if dispatched_name == "compress":
                         manual_compact = True
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"}:
@@ -34839,13 +34867,37 @@ body{padding:18px}
                     self.rounds_without_todo = 0
                     self.todo_reminder_count = 0
                 elif todo_attempted:
-                    self.rounds_without_todo = max(0, self.rounds_without_todo - 1)
+                    if self._todo_runtime_has_worker_rows(single_role):
+                        self.rounds_without_todo = max(0, self.rounds_without_todo - 1)
+                    else:
+                        self.rounds_without_todo += 1
                 else:
                     self.rounds_without_todo += 1
+                if (
+                    todo_attempted
+                    and not used_todo
+                    and self._get_active_plan_step() is not None
+                    and not self._active_plan_step_has_worker_todos(single_role)
+                ):
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "todo update missing for active plan step; "
+                                "rescue guidance injected"
+                            )
+                        },
+                    )
+                    if not retry_requested_this_round:
+                        self._inject_todo_rescue_hint(
+                            self.todo_last_issue or "TodoWrite did not create worker subtasks for the active plan step"
+                        )
+                    retry_requested_this_round = True
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
                 now_tick = now_ts()
                 can_remind = (now_tick - self.last_todo_reminder_ts) >= 20
                 if can_remind and self.todo_reminder_count < 2:
-                    if not self.todo.snapshot() and self.rounds_without_todo >= 2:
+                    if not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
                         self.messages.append(
                             {
                                 "role": "user",
