@@ -80,7 +80,7 @@ Skills reuse statement:
 
 MiniMax skills source attribution:
 
-- The bundled local skill packs under `Minimax/` and `Minimax_2/` are adapted from MiniMax AI's open-source skills repository: https://github.com/MiniMax-AI/skills
+- The bundled local skill packs under `skills` are adapted from MiniMax AI's open-source skills repository: https://github.com/MiniMax-AI/skills
 - Original upstream source is used under the MIT License
 - Thanks to MiniMax AI and upstream contributors for the original skill content, structure, and ecosystem work
 
