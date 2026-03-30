@@ -80,7 +80,7 @@ Skills 复用说明：
 
 MiniMax skills 来源说明：
 
-- 本仓库内 `Minimax/` 与 `Minimax_2/` 下打包的本地 skill 套件，基于 MiniMax AI 的开源 skills 仓库改编而来：https://github.com/MiniMax-AI/skills
+- 本仓库内 `skills` 下打包的本地 skill 套件，基于 MiniMax AI 的开源 skills 仓库改编而来：https://github.com/MiniMax-AI/skills
 - 上游原始源码依据 MIT License 使用
 - 感谢 MiniMax AI 及其上游贡献者提供原始 skill 内容、结构设计与生态建设
 
