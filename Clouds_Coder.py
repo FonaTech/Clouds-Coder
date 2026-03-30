@@ -24948,6 +24948,49 @@ body{padding:18px}
             "Call finish_current_task only after all subtasks for this step are completed."
         )
 
+    def _append_plan_single_todo_reminder(self, plan_step: dict, *, missing_subtasks: bool = False) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return False
+        now_tick = now_ts()
+        if (now_tick - self.last_todo_reminder_ts) < 8:
+            return False
+        step_idx = int(plan_step.get("plan_step_index", 0) or 0) + 1
+        step_text = trim(str(plan_step.get("content", "") or ""), 140)
+        if missing_subtasks:
+            content = (
+                "<reminder>"
+                f"Please call TodoWrite now for the current plan step before doing more work. "
+                f"Keep following Step {step_idx}: {step_text} in {PLAN_FILE_RELATIVE_PATH}. "
+                f"Create 3-5 subtasks only for this step, include parent_step_id='{step_id}', "
+                "and mark exactly one item in_progress. If TodoWrite fails or repeats, switch to TodoWriteRescue."
+                "</reminder>"
+            )
+        else:
+            content = (
+                "<reminder>"
+                "Update your todos now: finish the current subtask in TodoWrite before moving on. "
+                f"Keep following Step {step_idx}: {step_text} in {PLAN_FILE_RELATIVE_PATH}. "
+                f"Mark the completed subtask completed, set the next one to in_progress, and keep all items under parent_step_id='{step_id}'. "
+                "If TodoWrite fails or repeats, switch to TodoWriteRescue."
+                "</reminder>"
+            )
+        self.messages.append({"role": "user", "content": content, "ts": now_tick})
+        self.last_todo_reminder_ts = now_tick
+        self.todo_reminder_count += 1
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "plan+single todo reminder injected "
+                    f"(step={step_idx}, missing_subtasks={'yes' if missing_subtasks else 'no'})"
+                )
+            },
+        )
+        return True
+
     def _extract_plan_step_subtasks(self, plan_step: dict, limit: int = 5) -> list[str]:
         import re
 
@@ -25152,15 +25195,10 @@ body{padding:18px}
             # Nudge: if agent wrote files but didn't call TodoWrite, remind it
             called_todo = any(str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in tool_results)
             if (wrote_files or ran_bash_ok) and not called_todo and current:
-                _sid = str(current.get("id", "") or "")
-                if _sid:
-                    _nudge = (
-                        f"[todo-sync] You made progress on the current step but did not update TodoWrite.\n"
-                        f"Call TodoWrite now to mark the subtask you just completed and move the next subtask to in_progress.\n"
-                        f"Keep following the current step in {PLAN_FILE_RELATIVE_PATH}; do not silently batch multiple subtasks.\n"
-                        f"Each subtask must include parent_step_id='{_sid}'."
-                    )
-                    self.messages.append({"role": "system", "content": _nudge, "ts": now_ts()})
+                self._append_plan_single_todo_reminder(
+                    current,
+                    missing_subtasks=not self._active_plan_step_has_worker_todos("developer"),
+                )
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
