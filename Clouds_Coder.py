@@ -9493,7 +9493,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
-            "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
+            "- Always try TodoWrite first. Use TodoWriteRescue only after TodoWrite actually fails or repeats unchanged in the current run.\n"
             "- Use task_create/task_update/task_list for multi-step structured work.\n"
         ),
     },
@@ -26045,7 +26045,7 @@ body{padding:18px}
             return (
                 "<reminder>"
                 "Please call TodoWrite now to update the current subtask before continuing. "
-                "If it fails/repeats, switch to TodoWriteRescue."
+                "Only if TodoWrite fails or repeats unchanged in this run should you switch to TodoWriteRescue."
                 "</reminder>"
             )
         return (
@@ -26091,7 +26091,8 @@ body{padding:18px}
                 f"{todo_state}"
                 "Treat existing worker subtasks as live execution state, not optional notes. "
                 "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
-                "After EACH completed subtask, require a manual TodoWrite or TodoWriteRescue update before the owner starts the next subtask. "
+                "After EACH completed subtask, require a manual TodoWrite update before the owner starts the next subtask. "
+                "Use TodoWriteRescue only if TodoWrite actually fails or repeats unchanged in this run. "
                 "Do not let the owner silently batch multiple subtasks without updating todos. "
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
@@ -26100,7 +26101,8 @@ body{padding:18px}
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
             f"{todo_state}"
             "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
-            "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
+            "After EACH completed subtask, immediately call TodoWrite to mark it completed and set the next subtask to in_progress before continuing. "
+            "Use TodoWriteRescue only if TodoWrite actually fails or repeats unchanged in this run. "
             "Do not wait until the end of the step to update todos. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
@@ -31275,18 +31277,28 @@ body{padding:18px}
         }
         return json_dumps(payload, indent=2)
 
-    def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
+    def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
         if name not in {"TodoWrite", "TodoWriteRescue"}:
-            return False, ""
+            return False, "", ""
         items = self._extract_text_items_from_raw_args(raw_args)
         if not items:
-            return False, "no recoverable todo items from malformed arguments"
+            return False, "no recoverable todo items from malformed arguments", ""
+        if name == "TodoWrite":
+            todo_items = [{"content": item, "status": "pending"} for item in items]
+            if todo_items:
+                todo_items[0]["status"] = "in_progress"
+            try:
+                output = self._dispatch_tool("TodoWrite", {"items": todo_items})
+                if not str(output or "").startswith("Error:"):
+                    return True, output, "TodoWrite"
+            except Exception:
+                pass
         try:
             output = self._dispatch_tool("TodoWriteRescue", {"items": items, "in_progress_index": 0})
-            return True, output
+            return True, output, "TodoWriteRescue"
         except Exception as exc:
-            return False, f"rescue failed: {exc}"
+            return False, f"rescue failed: {exc}", ""
 
     def _missing_required_args(self, name: str, args: dict) -> list[str]:
         name = canonicalize_tool_name(name)
@@ -35619,15 +35631,15 @@ body{padding:18px}
                     output = ""
                     skip_dispatch = False
                     if args_error:
-                        repaired, repaired_output = self._attempt_malformed_tool_repair(name, raw_args)
+                        repaired, repaired_output, repaired_name = self._attempt_malformed_tool_repair(name, raw_args)
                         if repaired:
                             output = repaired_output
-                            dispatched_name = "TodoWriteRescue"
+                            dispatched_name = repaired_name or name
                             skip_dispatch = True
                             self._emit(
                                 "status",
                                 {
-                                    "summary": f"tool args auto-repaired: {name} -> TodoWriteRescue"
+                                    "summary": f"tool args auto-repaired: {name} -> {dispatched_name}"
                                 },
                             )
                         else:
@@ -35685,15 +35697,15 @@ body{padding:18px}
                     if not skip_dispatch:
                         missing = self._missing_required_args(name, args)
                         if missing:
-                            repaired, repaired_output = self._attempt_malformed_tool_repair(name, args)
+                            repaired, repaired_output, repaired_name = self._attempt_malformed_tool_repair(name, args)
                             if repaired:
                                 output = repaired_output
-                                dispatched_name = "TodoWriteRescue"
+                                dispatched_name = repaired_name or name
                                 skip_dispatch = True
                                 self._emit(
                                     "status",
                                     {
-                                        "summary": f"tool args auto-repaired: {name} missing {', '.join(missing)}"
+                                        "summary": f"tool args auto-repaired: {name} missing {', '.join(missing)} -> {dispatched_name}"
                                     },
                                 )
                             else:
