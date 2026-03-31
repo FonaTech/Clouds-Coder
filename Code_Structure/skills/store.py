@@ -2717,7 +2717,8 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "description": "Todo/Task creation, updates, and best practices",
         "body": (
             "# Task Management Guide\n"
-            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response.\n"
+            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response, UNLESS an approved plan step is active.\n"
+            "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
@@ -2779,6 +2780,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "body": (
             "# Finish Protocol\n"
             "- Call finish_current_task when all required work is complete.\n"
+            "- If an approved plan still has pending or in_progress steps, do NOT call finish_current_task yet.\n"
             "- Include a concise summary of what was done.\n"
             "- For multi-agent mode: finish triggers auto-summary from blackboard state.\n"
             "- Do not finish if there are known failing tests or unresolved blockers.\n"

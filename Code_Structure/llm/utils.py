@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
+from ..config.constants import OPENAI_COMPAT_PROVIDER_NAMES, OPENAI_LIKE_PROVIDER_NAMES
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.text import trim
 
@@ -292,6 +293,111 @@ def complete_chat_endpoint(endpoint_or_base: str) -> str:
     if low.endswith("/v1"):
         return s.rstrip("/") + "/chat/completions"
     return s.rstrip("/") + "/v1/chat/completions"
+
+def normalize_openai_compat_provider_name(raw: str) -> str:
+    value = str(raw or "").strip().lower().replace("-", "_")
+    aliases = {
+        "openai": "openai_compat",
+        "openai_compat": "openai_compat",
+        "siliconflow": "siliconflow",
+        "vllm": "vllm",
+        "lmstudio": "lmstudio",
+        "glm": "glm",
+        "kimi": "kimi",
+        "moonshot": "kimi",
+        "openrouter": "openrouter",
+        "custom": "custom_http",
+        "custom_http": "custom_http",
+    }
+    return aliases.get(value, value or "openai_compat")
+
+def is_openai_compat_provider(provider: str) -> bool:
+    return normalize_openai_compat_provider_name(provider) in OPENAI_COMPAT_PROVIDER_NAMES
+
+def is_openai_like_provider(provider: str) -> bool:
+    return normalize_openai_compat_provider_name(provider) in OPENAI_LIKE_PROVIDER_NAMES
+
+def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
+    normalized = normalize_openai_compat_provider_name(provider)
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Clouds-Coder/1.0",
+    }
+    if str(api_key or "").strip():
+        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    if normalized == "openrouter":
+        headers.setdefault("HTTP-Referer", "https://clouds-coder.local")
+        headers.setdefault("X-Title", "Clouds Coder")
+    return headers
+
+def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> list[str]:
+    base = extract_base_url(endpoint_or_base).rstrip("/")
+    if not base:
+        return []
+    normalized_provider = normalize_openai_compat_provider_name(provider)
+    candidates: list[str] = [base + "/models"]
+    if base.lower().endswith("/v1"):
+        root = base[:-3].rstrip("/")
+        if root:
+            candidates.append(root + "/models")
+    else:
+        candidates.append(base + "/v1/models")
+    provider_specific: dict[str, list[str]] = {
+        "openai_compat": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "siliconflow": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "vllm": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "lmstudio": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "glm": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "kimi": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "openrouter": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "custom_http": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+    }
+    for candidate in provider_specific.get(normalized_provider, provider_specific["openai_compat"]):
+        candidates.append(candidate)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        url = str(item or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+def extract_openai_compat_model_ids(payload: object) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    def _add(value: object):
+        text = trim(str(value or "").strip(), 240)
+        if not text:
+            return
+        low = text.lower()
+        if low in {"list", "model", "models", "object", "data"}:
+            return
+        if text in seen:
+            return
+        seen.add(text)
+        out.append(text)
+    def _walk(node: object, depth: int = 0):
+        if depth > 5 or node is None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, depth + 1)
+            return
+        if isinstance(node, dict):
+            for key in ("id", "model", "name"):
+                value = node.get(key)
+                if isinstance(value, (str, int, float)):
+                    _add(value)
+            for key in ("data", "models", "items", "result", "results", "value"):
+                if key in node:
+                    _walk(node.get(key), depth + 1)
+            return
+        if depth <= 1 and isinstance(node, (str, int, float)):
+            _add(node)
+    _walk(payload, 0)
+    return out
 
 def _is_http_url(text: str) -> bool:
     try:

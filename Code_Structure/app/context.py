@@ -8,6 +8,7 @@ import io
 import re
 import threading
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
@@ -19,7 +20,7 @@ from ..llm.utils import extract_base_url
 from ..rag.ingestion import CodeIngestionService, RAGIngestionService
 from ..rag.parsers import CodeContentParser, RAGContentParser
 from ..rag.store import CodeLibraryStore, RAGLibraryStore
-from ..session.manager import SessionManager
+from ..session.manager import SessionCreationLimitExceeded, SessionManager
 from ..session.state import SessionState
 from ..skills.store import SkillStore, _sanitize_skill_slug, analyze_skill_building_knowledge, ensure_runtime_skills
 from ..utils.crypto import CryptoBox
@@ -75,16 +76,9 @@ class AppContext:
         return roots
 
     def _sync_global_ollama_defaults(self, active_profile: dict | None = None):
-        picked: dict = {}
-        if isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama":
-            picked = dict(active_profile)
-        else:
-            for row in self.global_profiles.values():
-                if str(row.get("provider", "")).lower() == "ollama":
-                    picked = dict(row)
-                    break
-        if not picked:
+        if not (isinstance(active_profile, dict) and str(active_profile.get("provider", "")).lower() == "ollama"):
             return
+        picked = dict(active_profile)
         model = str(picked.get("model", self.model) or self.model).strip()
         base = extract_base_url(str(picked.get("base_url", self.base_url) or self.base_url)).strip()
         if model:
@@ -115,6 +109,9 @@ class AppContext:
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         max_user: int = 0,
         max_user_sessions: int = 0,
+        daily_session_limit_per_ip: int = 0,
+        daily_session_reset_hour: int = 8,
+        js_lib_download_enabled: bool = True,
         rag_include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
     ):
         self.workspace = Path(workspace).resolve()
@@ -178,6 +175,9 @@ class AppContext:
         self._lock = threading.Lock()
         self.max_user = max(0, int(max_user or 0))
         self.max_user_sessions = max(0, int(max_user_sessions or 0))
+        self.daily_session_limit_per_ip = max(0, int(daily_session_limit_per_ip or 0))
+        self.daily_session_reset_hour = max(0, min(23, int(daily_session_reset_hour or 8)))
+        self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self._task_queue: deque[dict] = deque()
         self._task_queue_seq = 0
         self.tool_specs = TOOLS
@@ -309,6 +309,9 @@ class AppContext:
             "dir": str(self.web_ui_dir),
             "show_upload_list": bool(getattr(self, "show_upload_list", False)),
             "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
+            "js_lib_download_enabled": bool(getattr(self, "js_lib_download_enabled", True)),
+            "daily_session_limit_per_ip": int(getattr(self, "daily_session_limit_per_ip", 0) or 0),
+            "daily_session_reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
             "validation": dict(self.web_ui_validation or {}),
         }
 
@@ -1238,6 +1241,91 @@ class AppContext:
             self.code_service.shutdown()
         except Exception:
             pass
+
+    def _daily_session_window_info(self, now_dt: datetime | None = None) -> dict:
+        now_local = now_dt.astimezone() if isinstance(now_dt, datetime) else datetime.now().astimezone()
+        reset_hour = int(getattr(self, "daily_session_reset_hour", 8) or 8)
+        boundary = now_local.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        start_at = boundary if now_local >= boundary else (boundary - timedelta(days=1))
+        reset_at = start_at + timedelta(days=1)
+        return {
+            "window_key": start_at.isoformat(),
+            "window_start": start_at.isoformat(),
+            "reset_at": reset_at.isoformat(),
+            "reset_at_display": reset_at.strftime("%Y-%m-%d %H:%M:%S %z"),
+            "now": now_local.isoformat(),
+        }
+
+    def _session_daily_limit_state_path(self, user_id: str) -> Path:
+        return self.user_root(user_id) / "session_daily_limit.json"
+
+    def _load_session_daily_limit_state_locked(self, user_id: str) -> dict:
+        path = self._session_daily_limit_state_path(user_id)
+        raw = self.crypto.read_json(path, {})
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _save_session_daily_limit_state_locked(self, user_id: str, state: dict) -> None:
+        path = self._session_daily_limit_state_path(user_id)
+        payload = dict(state or {})
+        payload["updated_at"] = datetime.now().astimezone().isoformat()
+        self.crypto.write_json(path, payload)
+
+    def _session_creation_quota_status_locked(self, user_id: str, client_ip: str = "") -> dict:
+        limit = max(0, int(getattr(self, "daily_session_limit_per_ip", 0) or 0))
+        window = self._daily_session_window_info()
+        state = self._load_session_daily_limit_state_locked(user_id)
+        if str(state.get("window_key", "") or "") != str(window.get("window_key", "")):
+            state = {
+                "window_key": str(window.get("window_key", "")),
+                "used": 0,
+            }
+        used = max(0, int(state.get("used", 0) or 0))
+        enabled = bool(limit > 0)
+        remaining = max(0, limit - used) if enabled else None
+        value = f"{used}/{limit}" if enabled else "∞"
+        status = {
+            "enabled": enabled,
+            "limit": int(limit),
+            "used": int(used),
+            "remaining": remaining,
+            "display_value": value,
+            "window_key": str(window.get("window_key", "")),
+            "window_start": str(window.get("window_start", "")),
+            "reset_at": str(window.get("reset_at", "")),
+            "reset_at_display": str(window.get("reset_at_display", "")),
+            "reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
+            "client_ip": str(client_ip or ""),
+            "user_id": str(user_id or ""),
+        }
+        if enabled and used >= limit:
+            status["message"] = (
+                f"daily session limit reached ({used}/{limit}); "
+                f"resets at {status['reset_at_display']}"
+            )
+        return status
+
+    def session_creation_quota_status(self, user_id: str, client_ip: str = "") -> dict:
+        with self._lock:
+            return self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+
+    def create_session_for_user(self, user_id: str, title: str | None = None, client_ip: str = "") -> tuple[SessionState, dict]:
+        mgr = self.manager_for_user(user_id)
+        with self._lock:
+            status_before = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+            if bool(status_before.get("enabled")) and int(status_before.get("remaining", 0) or 0) <= 0:
+                raise SessionCreationLimitExceeded(status_before)
+            sess = mgr.create(title)
+            state = self._load_session_daily_limit_state_locked(user_id)
+            if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
+                state = {
+                    "window_key": str(status_before.get("window_key", "")),
+                    "used": 0,
+                }
+            state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
+            state["window_key"] = str(status_before.get("window_key", ""))
+            self._save_session_daily_limit_state_locked(user_id, state)
+            status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+        return sess, status_after
 
     def user_root(self, user_id: str) -> Path:
         root = self.codes_root / user_id
@@ -2283,6 +2371,26 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             )
         selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
         selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
+        option_map = {str(x.get("selection", "")) for x in opts}
+        if selected_profile and selected and selected not in option_map:
+            opts.insert(
+                0,
+                {
+                    "selection": selected,
+                    "profile_id": self.global_active_profile_id,
+                    "provider": selected_profile.get("provider", ""),
+                    "model": str(selected_profile.get("model", self.model) or self.model),
+                    "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
+                    "source": selected_profile.get("source", "active-profile"),
+                    "capabilities": merge_multimodal_capabilities(
+                        infer_model_multimodal_capabilities(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                        ),
+                        parse_capability_overrides(selected_profile.get("capabilities", {})),
+                    ),
+                },
+            )
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(
                 str(selected_profile.get("provider", "")),

@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import DEFAULT_REQUEST_TIMEOUT, OLLAMA_THINKING_TOOL_BUFFER, SAMPLE_AUDIO_WAV_B64, SAMPLE_IMAGE_PNG_B64, SAMPLE_VIDEO_MP4_B64
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, parse_capability_overrides, parse_media_endpoints
-from .utils import complete_chat_endpoint, split_thinking_content
+from .utils import complete_chat_endpoint, is_openai_compat_provider, is_openai_like_provider, split_thinking_content
 from ..utils.json_utils import canonicalize_tool_name, json_dumps, parse_json_object, parse_tool_arguments, parse_tool_arguments_with_error
 from ..utils.misc import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, make_id, normalize_timeout_seconds, now_ts
 from ..utils.text import trim
@@ -357,7 +357,7 @@ class OllamaClient:
                 return f"{self.base_url.rstrip('/')}{direct}"
             return direct
         provider = str(self.provider or "").strip().lower()
-        if provider in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+        if is_openai_like_provider(provider):
             base = str(self.base_url or "").strip().rstrip("/")
             if not base:
                 return ""
@@ -979,7 +979,7 @@ class OllamaClient:
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
         # Some providers require all system messages at the beginning (or merged into one)
-        if provider in {"openai_compat", "openai", "siliconflow", "custom_http"}:
+        if is_openai_like_provider(provider):
             sys_msgs = [m for m in req_messages if m.get("role") == "system"]
             non_sys_msgs = [m for m in req_messages if m.get("role") != "system"]
             if len(sys_msgs) > 1:
@@ -992,7 +992,7 @@ class OllamaClient:
                 req_messages = [{"role": "system", "content": merged_system}] + non_sys_msgs
             elif sys_msgs:
                 req_messages = sys_msgs + non_sys_msgs
-        if provider in {"openai_compat", "openai", "siliconflow"}:
+        if is_openai_compat_provider(provider):
             return self._chat_openai_compat(
                 req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
             )

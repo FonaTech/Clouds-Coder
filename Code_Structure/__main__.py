@@ -10,7 +10,7 @@ import threading
 from .app.context import AppContext
 from .config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_PORT_OFFSET, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_PORT_OFFSET, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, TOKEN_THRESHOLD, UI_LANGUAGE_LABELS, UI_STYLE_LABELS
 from .config.paths import LLM_CONFIG_PATH, REPO_ROOT, WORKDIR
-from .config.settings import _to_bool_like, extract_js_lib_download_setting, extract_show_upload_list_setting, extract_ui_style_setting, load_llm_config_from_source, load_web_ui_config_file, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path, select_preferred_skills_root
+from .config.settings import _to_bool_like, extract_daily_session_limit_setting, extract_js_lib_download_setting, extract_show_upload_list_setting, extract_ui_style_setting, load_llm_config_from_source, load_web_ui_config_file, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path, select_preferred_skills_root
 from .llm.utils import list_ollama_models
 from .server.handlers import AgentHTTPServer, CodeAdminHandler, Handler, RagAdminHandler, SkillsHandler
 from .skills.store import ensure_embedded_skills_at_root, ensure_runtime_skills
@@ -193,7 +193,11 @@ def main():
     parser.add_argument(
         "--config",
         default="",
-        help="LLM config source (URL or local file path)",
+        help=(
+            "LLM config source (URL or local file path). "
+            "Also reads startup keys like download_js_lib and daily_session_limit "
+            "(aliases: daily_sessions_per_ip / max_daily_sessions_per_ip / session_daily_limit)."
+        ),
     )
     parser.add_argument("--ollama-base-url", default=DEFAULT_OLLAMA_BASE_URL)
     parser.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
@@ -305,6 +309,7 @@ def main():
         )
     )
     resolved_show_upload_list = False
+    resolved_daily_session_limit_per_ip = 0
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -328,6 +333,9 @@ def main():
             external_show_upload_list = extract_show_upload_list_setting(external_config)
             if external_show_upload_list is not None:
                 resolved_show_upload_list = bool(external_show_upload_list)
+            external_daily_session_limit = extract_daily_session_limit_setting(external_config)
+            if external_daily_session_limit is not None:
+                resolved_daily_session_limit_per_ip = int(external_daily_session_limit)
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -335,12 +343,20 @@ def main():
     web_ui_show_upload_list = extract_show_upload_list_setting(web_ui_config)
     if web_ui_show_upload_list is not None:
         resolved_show_upload_list = bool(web_ui_show_upload_list)
+    web_ui_daily_session_limit = extract_daily_session_limit_setting(web_ui_config)
+    if web_ui_daily_session_limit is not None:
+        resolved_daily_session_limit_per_ip = int(web_ui_daily_session_limit)
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(web_ui_config) or "").strip()
     resolved_ui_style = normalize_ui_style(raw_ui_style or DEFAULT_UI_STYLE)
+    _js_dl_enabled = extract_js_lib_download_setting(external_config)
+    if _js_dl_enabled is None:
+        _js_dl_enabled = extract_js_lib_download_setting(web_ui_config)
+    if _js_dl_enabled is None:
+        _js_dl_enabled = True
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
@@ -573,6 +589,9 @@ def main():
         resolved_max_output_tokens,
         resolved_max_user,
         resolved_max_user_sessions,
+        resolved_daily_session_limit_per_ip,
+        8,
+        bool(_js_dl_enabled),
         resolved_rag_include_filename_entities,
     )
     config_apply_result: dict = {}
@@ -584,9 +603,13 @@ def main():
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
     # JS lib download (default on; set download_js_lib: false in --config to disable)
-    _js_dl_enabled = extract_js_lib_download_setting(external_config)
-    if _js_dl_enabled is None:
-        _js_dl_enabled = True
+    app.js_lib_download_enabled = bool(_js_dl_enabled)
+    print(
+        "[web-agent] session_creation_limit_per_ip="
+        + ("∞" if resolved_daily_session_limit_per_ip <= 0 else str(int(resolved_daily_session_limit_per_ip)))
+        + " reset=08:00 local"
+    )
+    print(f"[web-agent] download_js_lib={'on' if _js_dl_enabled else 'off'}")
     if _js_dl_enabled:
         try:
             app.offline_js_summary = ensure_offline_js_libs(
