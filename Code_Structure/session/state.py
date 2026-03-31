@@ -16395,19 +16395,6 @@ body{padding:18px}
                         seen.add(low_tail)
                         keep_lines.append(tail)
                 continue
-            if low.startswith("tasks to complete:"):
-                continue
-            if re.match(r"^\d+(?:\.\d+)*[.)]\s+", s):
-                continue
-            if re.match(r"^[-*]\s+", s):
-                continue
-            if re.match(
-                r"(?i)^(mkdir\s+-p|run:|create directories:|create project|create directory|initialize project|cmake\b|python\s+-m\s+venv\b|npx\b)",
-                s,
-            ):
-                continue
-            if re.match(r"^(创建|初始化|运行|目录结构|项目根目录结构)[:：]?", s):
-                continue
             norm = re.sub(r"\s+", " ", s).strip().lower()
             if norm and norm not in seen:
                 seen.add(norm)
