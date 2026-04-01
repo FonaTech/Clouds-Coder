@@ -10,7 +10,7 @@ from pathlib import Path
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..utils.text import trim
 
-SCRIPT_DIR = Path('/Users/macbookair/Downloads/Split Coder').resolve()
+SCRIPT_DIR = Path('/Users/Fona/Downloads/Split Tools').resolve()
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()

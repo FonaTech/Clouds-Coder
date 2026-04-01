@@ -3238,7 +3238,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
-            "- Always try TodoWrite first. Use TodoWriteRescue only after TodoWrite actually fails or repeats unchanged in the current run.\n"
+            "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
             "- Use task_create/task_update/task_list for multi-step structured work.\n"
         ),
     },

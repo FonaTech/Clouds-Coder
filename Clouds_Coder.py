@@ -9493,7 +9493,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
-            "- Always try TodoWrite first. Use TodoWriteRescue only after TodoWrite actually fails or repeats unchanged in the current run.\n"
+            "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
             "- Use task_create/task_update/task_list for multi-step structured work.\n"
         ),
     },
@@ -15000,7 +15000,7 @@ class SessionState:
                 pass
         t = threading.Thread(target=_llm_match, daemon=True)
         t.start()
-        t.join(timeout=60.0)
+        t.join(timeout=5.0)
         if llm_result:
             matched_names = llm_result
             self._emit("status", {"summary": f"skill discovery (LLM task analysis): {matched_names} ({trigger})"})
@@ -15034,7 +15034,7 @@ class SessionState:
         # --- Path 3: Deferred LLM pickup if still running ---
         if not matched_names and t.is_alive():
             def _deferred_llm_pickup():
-                t.join(timeout=60.0)
+                t.join(timeout=8.0)
                 if llm_result and not self._loaded_skill_rows():
                     for name_str in llm_result[:3]:
                         try:
@@ -15431,7 +15431,6 @@ class SessionState:
             "ENGINEERING EXECUTION DISCIPLINE: "
             "For coding, bug-fix, architecture, integration, and testing work, proactively use the skill system when a matching skill exists. "
             "Do not wait for failure before calling list_skills/load_skill for debugging, API, frontend, parser, or recovery workflows. "
-            "Already-loaded skills appear as <loaded-skill> messages — use them directly without reloading. "
             "Use a root-cause-first loop: inspect the exact error or failing behavior, read the implicated file or path, form one concrete hypothesis, apply one bounded fix, then run at least one fix-and-verify cycle before declaring success. "
             "If read_file or bash reports a missing path, empty folder, or mismatched filename, stop repeating the same lookup. "
             "Reconcile the path against uploads, recent file paths, file explorer entries, and close workspace matches; then either open the closest candidate or create the intended target. "
@@ -26045,7 +26044,7 @@ body{padding:18px}
             return (
                 "<reminder>"
                 "Please call TodoWrite now to update the current subtask before continuing. "
-                "Only if TodoWrite fails or repeats unchanged in this run should you switch to TodoWriteRescue."
+                "If it fails/repeats, switch to TodoWriteRescue."
                 "</reminder>"
             )
         return (
@@ -26091,8 +26090,7 @@ body{padding:18px}
                 f"{todo_state}"
                 "Treat existing worker subtasks as live execution state, not optional notes. "
                 "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
-                "After EACH completed subtask, require a manual TodoWrite update before the owner starts the next subtask. "
-                "Use TodoWriteRescue only if TodoWrite actually fails or repeats unchanged in this run. "
+                "After EACH completed subtask, require a manual TodoWrite or TodoWriteRescue update before the owner starts the next subtask. "
                 "Do not let the owner silently batch multiple subtasks without updating todos. "
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
@@ -26101,8 +26099,7 @@ body{padding:18px}
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
             f"{todo_state}"
             "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
-            "After EACH completed subtask, immediately call TodoWrite to mark it completed and set the next subtask to in_progress before continuing. "
-            "Use TodoWriteRescue only if TodoWrite actually fails or repeats unchanged in this run. "
+            "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
             "Do not wait until the end of the step to update todos. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
@@ -29020,6 +29017,19 @@ body{padding:18px}
                         seen.add(low_tail)
                         keep_lines.append(tail)
                 continue
+            if low.startswith("tasks to complete:"):
+                continue
+            if re.match(r"^\d+(?:\.\d+)*[.)]\s+", s):
+                continue
+            if re.match(r"^[-*]\s+", s):
+                continue
+            if re.match(
+                r"(?i)^(mkdir\s+-p|run:|create directories:|create project|create directory|initialize project|cmake\b|python\s+-m\s+venv\b|npx\b)",
+                s,
+            ):
+                continue
+            if re.match(r"^(创建|初始化|运行|目录结构|项目根目录结构)[:：]?", s):
+                continue
             norm = re.sub(r"\s+", " ", s).strip().lower()
             if norm and norm not in seen:
                 seen.add(norm)
@@ -30559,10 +30569,6 @@ body{padding:18px}
             "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
-            "AUTONOMOUS SKILL LOADING: When starting a coding, debugging, or architecture task, "
-            "call list_skills to discover available skills, then load_skill to activate the most relevant ones. "
-            "Load skills BEFORE you start working, not after you're stuck. "
-            "Already-loaded skills appear as <loaded-skill> messages in your context — use them directly without reloading. "
             "TODO TRACKING (mandatory): "
             "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
             "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
@@ -31277,28 +31283,18 @@ body{padding:18px}
         }
         return json_dumps(payload, indent=2)
 
-    def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str, str]:
+    def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
         if name not in {"TodoWrite", "TodoWriteRescue"}:
-            return False, "", ""
+            return False, ""
         items = self._extract_text_items_from_raw_args(raw_args)
         if not items:
-            return False, "no recoverable todo items from malformed arguments", ""
-        if name == "TodoWrite":
-            todo_items = [{"content": item, "status": "pending"} for item in items]
-            if todo_items:
-                todo_items[0]["status"] = "in_progress"
-            try:
-                output = self._dispatch_tool("TodoWrite", {"items": todo_items})
-                if not str(output or "").startswith("Error:"):
-                    return True, output, "TodoWrite"
-            except Exception:
-                pass
+            return False, "no recoverable todo items from malformed arguments"
         try:
             output = self._dispatch_tool("TodoWriteRescue", {"items": items, "in_progress_index": 0})
-            return True, output, "TodoWriteRescue"
+            return True, output
         except Exception as exc:
-            return False, f"rescue failed: {exc}", ""
+            return False, f"rescue failed: {exc}"
 
     def _missing_required_args(self, name: str, args: dict) -> list[str]:
         name = canonicalize_tool_name(name)
@@ -32880,7 +32876,7 @@ body{padding:18px}
             else:
                 _repeat_delegation_count = 0
             _prev_delegation_hash = _cur_hash
-            if _repeat_delegation_count >= 15:
+            if _repeat_delegation_count >= 3:
                 self._emit("status", {"summary": f"manager stuck: repeated identical delegation x{_repeat_delegation_count + 1}; forcing advance"})
                 _bb_stuck = self._ensure_blackboard()
                 _stuck_step = next(
@@ -32914,13 +32910,6 @@ body{padding:18px}
                 media_inputs_pool=media_inputs_pool,
                 media_seen_ts_by_role=media_seen_ts_by_role,
             )
-            # Sync-mode skill auto-discovery: same mechanism as plan mode's step-completed trigger.
-            # Runs on early rounds for developer/explorer. Uses goal_sig dedup — no re-loading if already loaded.
-            if role in ("developer", "explorer") and rounds_used <= 2:
-                try:
-                    self._refresh_loaded_skills_for_execution_focus(trigger=f"sync-worker-pre:{role}")
-                except Exception:
-                    pass
             board_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
             step = self._multi_agent_turn(
                 role,
@@ -32930,49 +32919,6 @@ body{padding:18px}
             self._blackboard_update_from_worker_step(role, step)
             # Post-execution plan step advancement (replaces pre-execution advancement)
             self._post_execution_plan_step_check(route, step if isinstance(step, dict) else {})
-            # Sync-mode failure recovery: detect all-tools-failed and inject recovery hint + auto-load debugging skill
-            _step_dict = step if isinstance(step, dict) else {}
-            _step_results = _step_dict.get("tool_results", []) or []
-            if _step_results:
-                _sync_err_count = sum(1 for r in _step_results if isinstance(r, dict) and not r.get("ok", False))
-                _sync_ok_count = sum(1 for r in _step_results if isinstance(r, dict) and r.get("ok", False))
-                if _sync_err_count > 0 and _sync_ok_count == 0:
-                    # All tool calls failed in this worker turn — inject recovery guidance
-                    _failed_tools = [str(r.get("name", "")) for r in _step_results if isinstance(r, dict)][:4]
-                    _err_outputs = " | ".join(
-                        trim(str(r.get("output", "") or ""), 120)
-                        for r in _step_results if isinstance(r, dict) and not r.get("ok", False)
-                    )[:400]
-                    self._append_agent_context_message(
-                        role,
-                        {
-                            "role": "user",
-                            "content": (
-                                "<failure-recovery>"
-                                f"All tool calls failed in this turn ({', '.join(_failed_tools)}). "
-                                f"Errors: {_err_outputs}\n"
-                                "Before retrying, STOP and diagnose:\n"
-                                "1) If a debugging skill is available, call load_skill('systematic-debugging') and follow its workflow.\n"
-                                "2) Read the EXACT error message — identify the root cause, not just the symptom.\n"
-                                "3) Form ONE hypothesis about the cause before making any changes.\n"
-                                "4) Apply ONE targeted fix, then verify with a test/build command.\n"
-                                "5) If still blocked after 2 attempts, report the exact blocker to the user."
-                                "</failure-recovery>"
-                            ),
-                            "ts": now_ts(),
-                            "agent_role": role,
-                        },
-                        mirror_to_global=False,
-                    )
-                    # Auto-load systematic-debugging if failure involves code errors
-                    _code_err_kw = ("bash", "compile", "syntax", "test", "build", "traceback", "error:")
-                    if any(kw in _err_outputs.lower() for kw in _code_err_kw):
-                        _bb_sk = self._ensure_blackboard().get("loaded_skills", {})
-                        if isinstance(_bb_sk, dict) and "systematic-debugging" not in _bb_sk:
-                            try:
-                                self._load_skill_with_cache("systematic-debugging", load_source="auto:sync-worker-failure")
-                            except Exception:
-                                pass
             # Fix 6b: Pure sync no-plan — read worker-done signal and notify manager
             _bb_sync = self._ensure_blackboard()
             if _bb_sync.pop("sync_worker_round_done", False):
@@ -35019,13 +34965,6 @@ body{padding:18px}
                     self.agent_round_index = int(self.agent_round_index) + 1
                     self.current_phase = "model-call"
                     self.current_tool_name = ""
-                # Single-mode skill auto-discovery: same as plan mode. Runs on first 2 rounds only.
-                # Uses goal_sig dedup — if skills already loaded for this goal, no-op.
-                if int(self.agent_round_index) <= 2:
-                    try:
-                        self._refresh_loaded_skills_for_execution_focus(trigger="single-worker-pre")
-                    except Exception:
-                        pass
                 if level_budget > 0 and int(self.agent_round_index) > int(level_budget):
                     force_single_tool_rounds = max(force_single_tool_rounds, 2)
                     if not compact_budget_notified:
@@ -35631,15 +35570,15 @@ body{padding:18px}
                     output = ""
                     skip_dispatch = False
                     if args_error:
-                        repaired, repaired_output, repaired_name = self._attempt_malformed_tool_repair(name, raw_args)
+                        repaired, repaired_output = self._attempt_malformed_tool_repair(name, raw_args)
                         if repaired:
                             output = repaired_output
-                            dispatched_name = repaired_name or name
+                            dispatched_name = "TodoWriteRescue"
                             skip_dispatch = True
                             self._emit(
                                 "status",
                                 {
-                                    "summary": f"tool args auto-repaired: {name} -> {dispatched_name}"
+                                    "summary": f"tool args auto-repaired: {name} -> TodoWriteRescue"
                                 },
                             )
                         else:
@@ -35697,15 +35636,15 @@ body{padding:18px}
                     if not skip_dispatch:
                         missing = self._missing_required_args(name, args)
                         if missing:
-                            repaired, repaired_output, repaired_name = self._attempt_malformed_tool_repair(name, args)
+                            repaired, repaired_output = self._attempt_malformed_tool_repair(name, args)
                             if repaired:
                                 output = repaired_output
-                                dispatched_name = repaired_name or name
+                                dispatched_name = "TodoWriteRescue"
                                 skip_dispatch = True
                                 self._emit(
                                     "status",
                                     {
-                                        "summary": f"tool args auto-repaired: {name} missing {', '.join(missing)} -> {dispatched_name}"
+                                        "summary": f"tool args auto-repaired: {name} missing {', '.join(missing)}"
                                     },
                                 )
                             else:
@@ -40234,8 +40173,7 @@ function _chatVirtBuildMessageNode(m){
     const pillsHtml=pills.map(x=>`<span class=\"manager-delegate-pill\">${esc(String(x))}</span>`).join('');
     const routeHtml=`<div class=\"manager-delegate-route\"><span class=\"agent-bus-pill manager\">${esc(t('role_manager'))}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${targetRole?(' '+targetRole):''}\">${esc(targetLabel)}</span></div>`;
     const objectiveHtml=(objective&&instruction&&objective.toLowerCase()===instruction.toLowerCase())?'':(objective?`<div class=\"manager-delegate-line\"><span>${esc(t('event_objective'))}</span><div>${esc(objective)}</div></div>`:'');
-    const instructionKey=`${String(m._vk||'')}:manager-instruction`;
-    const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>${esc(t('event_instruction'))}</span><div class=\"msg-md\">${renderMarkdownCached(instruction,instructionKey)}</div></div>`:'';
+    const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>${esc(t('event_instruction'))}</span><div>${esc(instruction)}</div></div>`:'';
     d.innerHTML=`${roleBadge}<div class=\"manager-delegate-card\"><div class=\"manager-delegate-head\">${esc(t('event_manager_delegate_title'))}</div>${routeHtml}<div class=\"manager-delegate-pills\">${pillsHtml}</div>${objectiveHtml}${instructionHtml}</div>`;
     return d;
   }

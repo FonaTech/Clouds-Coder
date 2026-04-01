@@ -1796,7 +1796,7 @@ class AppContext:
     def source_bundle(self) -> bytes:
         bio = io.BytesIO()
         with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("Clouds_Coder.py", Path('/Users/macbookair/Downloads/Split Coder/Clouds_Coder.py').read_text(encoding="utf-8"))
+            zf.writestr("Clouds_Coder.py", Path('/Users/Fona/Downloads/Split Tools/Clouds_Coder.py').read_text(encoding="utf-8"))
             zf.writestr("frontend/index.html", INDEX_HTML)
             zf.writestr("frontend/style.css", APP_CSS)
             zf.writestr("frontend/app.js", APP_JS)
