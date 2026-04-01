@@ -510,6 +510,520 @@ Return:
         ),
     )
 
+def ensure_generated_systematic_debugging_skill(skills_root: Path):
+    generated_root = skills_root / "generated"
+    root = generated_root / "systematic-debugging"
+    skill_md = """---
+name: systematic-debugging
+description: Adaptive root-cause analysis engine that scales debugging depth to error severity — from quick-fix pattern matching to deep multi-layer causal tracing across Python, JS, Go, Rust, Java, and C/C++.
+---
+
+# Systematic Debugging
+
+## Trigger
+Task involves fixing bugs, resolving errors, diagnosing failures, analyzing stack traces, or investigating unexpected behavior.
+
+## Adaptive Depth Selection (decide BEFORE acting)
+
+Assess the error and pick the matching depth. This is the single most important decision — wrong depth wastes time or misses the cause.
+
+| Signal | Depth | Budget | Strategy |
+|--------|-------|--------|----------|
+| Typo, missing import, syntax error | **Shallow** | 1-2 tool calls | Pattern-match fix directly from error message |
+| Single clear exception with traceback | **Standard** | 3-6 tool calls | Trace call chain, read crash site ±20 lines, fix + verify |
+| Intermittent / multi-component / no clear trace | **Deep** | 8-15 tool calls | Hypothesize → isolate → instrument → validate causal chain |
+| Reproduces only under specific state / concurrency | **Forensic** | 15-25 tool calls | State reconstruction, bisect, invariant analysis |
+
+**Rule**: Start at the depth the signals suggest. Escalate only when the current depth's budget is exhausted without resolution.
+
+## Core Method: Causal Chain Tracing
+
+Every bug has a causal chain: **trigger → propagation → manifestation**. Most developers only see the manifestation. Your job is to trace backward to the trigger.
+
+### Step 1: Read the Error as a Structured Signal
+- The error message is DATA, not just text. Extract: error type, location (file:line), variable state, and the operation that failed.
+- Stack traces read BOTTOM-UP: the last frame is where it crashed, but the cause is often 2-5 frames higher.
+- Compiler errors: the FIRST error is usually the real one; subsequent errors are cascading noise.
+
+### Step 2: Form a Hypothesis Before Reading Code
+- Based on the error signal, form 1-3 hypotheses about the TRIGGER (not the manifestation).
+- Rank hypotheses by probability. Investigate the most likely first.
+- **Anti-pattern**: Reading random files hoping to stumble on the cause. Always have a hypothesis.
+
+### Step 3: Targeted Investigation
+- Read ONLY the code that your hypothesis predicts is involved.
+- Use `read_file` with offset/limit — read the crash site ±20 lines, not the whole file.
+- If hypothesis is wrong, update it based on what you learned. Don't restart from scratch.
+
+### Step 4: Fix at the Trigger, Not the Symptom
+- **Wrong**: Add a try/catch around the crash site.
+- **Right**: Fix why the invalid state reached the crash site in the first place.
+- One fix per root cause. Never bundle unrelated changes.
+
+### Step 5: Verify the Causal Chain is Broken
+- Re-run the exact failing command. Must succeed.
+- Run the full test suite. No regressions.
+- If the bug was at a boundary, add a test for that boundary.
+
+## Language-Specific Deep Patterns
+
+### Python
+- `Traceback` → Read bottom-up. The real cause is where the wrong VALUE was created, not where the wrong TYPE was detected.
+- `AttributeError: 'NoneType'` → Trace backward: who returned None? Usually a missing DB record, failed API call, or uninitialized optional.
+- `ImportError` / `ModuleNotFoundError` → Check: venv active? Package installed in correct env? Relative vs absolute import? sys.path manipulation?
+- `RecursionError` → Find the cycle: which function calls itself without converging? Often mutual recursion via A→B→A.
+
+### JavaScript / TypeScript
+- `TypeError: Cannot read properties of undefined` → The object is fine, the CHAIN has a null link. Trace: `a.b.c.d` — which of a/b/c is undefined?
+- `Unhandled Promise rejection` → An async function threw but nobody awaited or caught. Find the un-awaited call.
+- `ReferenceError` in production but not dev → Hoisting, tree-shaking, or module resolution difference. Check build config.
+- TS compile errors → Read the EXPECTED type vs ACTUAL type. The fix is usually at the producer, not the consumer.
+
+### Go
+- `panic: runtime error: invalid memory address` → nil pointer dereference. Find which pointer isn't checked. Often from interface method call on nil receiver.
+- `data race detected` → Two goroutines accessing shared state. The fix is either mutex, channel, or restructure to avoid sharing.
+- `context deadline exceeded` → Upstream is slow. Check: is the timeout reasonable? Is the upstream healthy? Is there a retry storm?
+
+### Rust
+- `E0382 use of moved value` → Ownership transferred. Fix: clone (if cheap), borrow (&/&mut), or restructure to avoid the double-use.
+- `E0277 trait bound not satisfied` → The type doesn't implement what the function requires. Check: does the type need a derive? Is a generic constraint missing?
+- `lifetime errors` → Draw the lifetime diagram: which reference outlives its source? Usually need to restructure borrows or use owned types.
+
+### Java
+- `NullPointerException` → The modern fix is Optional + .orElseThrow with a descriptive message, not null checks everywhere.
+- `ClassCastException` → Type erasure hiding a wrong type in a collection. Check the generic types at insertion point.
+- `ConcurrentModificationException` → Iterating and modifying the same collection. Use Iterator.remove(), streams, or concurrent collections.
+
+### C / C++
+- Segfault → Use ASan (`-fsanitize=address`). The FIRST ASan error is the real one. Common: use-after-free, buffer overflow, null deref.
+- Undefined behavior → The compiler assumes UB doesn't happen and optimizes accordingly. The "bug" may be correct code that relies on UB. Use UBSan.
+- Memory leak → Valgrind or ASan. Every allocation must have exactly one deallocation on every code path including error paths.
+
+## Advanced Strategies (Deep/Forensic Depth Only)
+
+### Binary Search Debugging
+When you can't pinpoint the cause: comment out half the suspicious code, check if error persists. Halve the remaining range. Converges in O(log n) steps.
+
+### Differential Diagnosis
+When multiple hypotheses remain: design a single test that distinguishes between them. Run it. Eliminate hypotheses. Repeat.
+
+### State Reconstruction
+For state-dependent bugs: trace the state of the key variable backward through time. At each mutation point, ask: was this mutation correct given its inputs?
+
+### Invariant Analysis
+Identify what must ALWAYS be true (e.g., "list is sorted", "pointer is non-null", "balance >= 0"). Find where the invariant is violated. That's the bug.
+
+## Output Contract
+1. Error classification (type + depth selected + reasoning).
+2. Causal chain: trigger → propagation → manifestation.
+3. Fix applied: exact file, line, change, and WHY this fixes the trigger.
+4. Verification: command run, output confirming fix.
+5. If blocked: exact missing information and what to try next.
+"""
+    error_ref = """# Debugging Decision Heuristics
+
+## When to Escalate Depth
+- Shallow fix didn't work after 2 attempts → escalate to Standard
+- Standard investigation found no cause in 5 tool calls → escalate to Deep
+- Error is intermittent or state-dependent → start at Deep
+- Multiple components involved → start at Deep
+
+## Red Flags (your fix is wrong)
+- Error moves to a different line → you fixed a symptom
+- A new error appears → your fix introduced a regression
+- Error only disappears in some conditions → you're masking, not fixing
+- You added a try/catch → almost certainly wrong unless it's a boundary
+
+## Efficiency Rules
+- Never read a file you already read in this session
+- Never read > 50 lines when 20 would suffice
+- If you can't form a hypothesis after reading the error, re-read the error more carefully before reading any code
+- The fastest debug session is the one where you fix it from the error message alone
+
+## Error Classification Deep Reference
+
+### 1. SYNTAX — Code rejected before execution
+
+**Signals**: `SyntaxError`, `unexpected token`, `parse error`, compiler exits with line/column reference, no runtime stack trace.
+
+**Sub-types and causal patterns**:
+- **Lexical**: Invalid character, unterminated string/comment, encoding mismatch (BOM, non-UTF8). Fix: look at the exact byte the compiler points to.
+- **Grammatical**: Missing bracket/brace/paren, mismatched delimiters, dangling comma. The error line is often AFTER the real mistake — scan backward from the error for the unclosed construct.
+- **Semantic-syntax**: Valid tokens in invalid order (`return` outside function, `await` outside async, double `mut`). The compiler knows the rule — read its suggestion first.
+- **Cross-file**: Import/include of a file that itself has syntax errors. The reported file is the victim, not the cause — check the imported file.
+
+**Common misdiagnosis**: "Syntax error on line 50" when the real problem is an unclosed bracket on line 30. Always scan backward from the error point for unmatched delimiters.
+
+**Language-specific traps**:
+- Python: Mixing tabs and spaces (invisible). `IndentationError` is syntax, not runtime.
+- JS: Missing semicolon after object in `export default { ... }` before another statement.
+- Go: Unused import/variable is a compile error, not a warning. Fix or remove, don't comment out.
+- Rust: Lifetime annotations are syntax-level. `expected lifetime parameter` = missing `<'a>`.
+- C/C++: Missing semicolon after class/struct definition causes cascading errors on the NEXT file.
+
+---
+
+### 2. RUNTIME — Crash during execution
+
+**Signals**: Exception with stack trace, panic, segfault, core dump, non-zero exit code with error message.
+
+**Sub-types and causal patterns**:
+- **Null/nil dereference**: Variable is None/null/nil when accessed. Root cause is NOT at the access point — trace backward to find WHO produced the null. Common sources: failed DB lookup, missing config, uninitialized optional, API returning null on error.
+- **Type mismatch**: Value has wrong type at usage point. Root cause: producer created wrong type, or a collection/map holds mixed types. In dynamic languages, trace the value to its origin and check what type the producer guarantees.
+- **Index/bounds**: Array/slice index out of range. Check: is the array empty when it shouldn't be? Is the index computed from user input without bounds check? Is there an off-by-one in a loop?
+- **Assertion/contract**: `assert`, `require`, `precondition` failed. This is the most informative runtime error — the developer who wrote it TOLD you what went wrong. Read the assertion message.
+- **Resource exhaustion**: OOM, too many open files, stack overflow. Not a logic bug — check for leaks (unclosed handles), unbounded recursion, or legitimate scale problems.
+- **Encoding/serialization**: JSON parse error, UTF-8 decode failure, protobuf mismatch. The data is corrupt or the schema changed. Check: who produced this data? Has the format been updated without updating the consumer?
+
+**Causal chain discipline**: The stack trace tells you WHERE it crashed, not WHY. Read bottom-up: the crash frame shows the operation, the frames above show who called it with bad arguments. The root cause is usually 2-5 frames up where the bad value was CREATED.
+
+**Common misdiagnosis**: Adding a null check at the crash point. This turns a crash into silent wrong behavior — the null still exists, you just stopped reporting it. Fix the null at its SOURCE.
+
+---
+
+### 3. LOGIC — Wrong output, no crash
+
+**Signals**: Tests fail with wrong value, infinite loop, incorrect behavior reported by user, function returns unexpected result, state machine reaches impossible state.
+
+**This is the hardest category** because the code runs "successfully" — there's no error message to guide you.
+
+**Sub-types and causal patterns**:
+- **Off-by-one**: Loop iterates one too many/few times, array sliced at wrong boundary, fence-post error in pagination. Check: is it `<` or `<=`? Is the index 0-based or 1-based? Is the range inclusive or exclusive?
+- **Wrong branch**: Conditional goes the wrong way. Check: is the boolean logic correct? Are `&&`/`||` precedence correct? Is the comparison `==` when it should be `===` (JS)? Is a variable being shadowed?
+- **Stale state**: Cache/memo returns outdated value, event handler references captured variable from closure, state not reset between iterations. Check: when was this value last updated? Is there a cache invalidation path?
+- **Algorithm error**: Sorting wrong field, aggregating wrong column, applying wrong formula. The code is clean but implements the wrong spec. Re-read the requirement, then re-read the code — find where they diverge.
+- **Ordering dependency**: Operations executed in wrong order (write before read, commit before validate, render before data load). Trace the execution order and compare to the required order.
+- **Silent truncation**: Integer overflow wrapping silently, string truncated, floating-point precision loss. The code looks correct but produces wrong results at scale.
+
+**Diagnostic strategy**: Add assertions at intermediate points. State what the value SHOULD be. The first assertion that fails localizes the bug. This is faster than reading code and trying to reason about what it does.
+
+**Common misdiagnosis**: Patching the output instead of fixing the logic. If `calculate_total()` returns 99 instead of 100, don't add +1 at the call site. Find WHY it's computing 99.
+
+---
+
+### 4. INTEGRATION — Failure at component boundaries
+
+**Signals**: HTTP 4xx/5xx, connection refused, timeout at API boundary, serialization mismatch between services, auth failure, "unexpected response format", database constraint violation.
+
+**Sub-types and causal patterns**:
+- **Contract mismatch**: Caller sends field `user_id`, receiver expects `userId`. Or type mismatch: string vs integer. Always verify the contract on BOTH sides independently — don't trust either side's assumption.
+- **Auth/permission**: Token expired, wrong scope, missing header, CORS blocking. Check: is the auth mechanism correct? Is the token fresh? Does the user/service have the right permissions?
+- **Version skew**: Client uses v1 API, server upgraded to v2. Or dependency updated with breaking change. Check: when was the last deploy? Did any dependency versions change?
+- **Network/infra**: DNS resolution, firewall rules, TLS certificate, connection pool exhaustion. Check: can you reach the endpoint with `curl`? Is the service actually running?
+- **Data contract**: Database schema changed but code not updated. Migration ran partially. Foreign key constraint violated because related record doesn't exist yet (ordering problem).
+- **Protocol mismatch**: REST vs gRPC, JSON vs form-encoded, websocket upgrade failed. Check Content-Type headers and request format.
+
+**Diagnostic strategy**: Isolate which SIDE is wrong. Send a known-good request to the receiver. Send the caller's actual request to a mock. The side that fails with known-good input is the one with the bug.
+
+**Common misdiagnosis**: Blaming the other service. Always verify YOUR side first. Send the request manually and examine the raw response before assuming the other side is broken.
+
+---
+
+### 5. PERFORMANCE — Slow or resource-hungry
+
+**Signals**: Timeout, high latency, OOM, CPU spike, slow query log, user reports "it's slow", load test failures.
+
+**Sub-types and causal patterns**:
+- **Algorithmic**: O(n²) or worse where O(n) or O(n log n) is possible. Common: nested loops over large collections, repeated linear search, string concatenation in loop. Profile to find the hotspot, then analyze the algorithm.
+- **N+1 queries**: One query to get a list, then one query per item to get details. The fix is a JOIN or batch query, not caching.
+- **Missing index**: Database full-table scan on a frequently queried column. Check `EXPLAIN` output. Add index on the filtered/sorted columns.
+- **Memory leak**: Allocation without deallocation. Growing collections that are never pruned. Event listeners registered but never removed. Closures capturing large objects.
+- **Unnecessary work**: Re-computing what could be cached, re-fetching what's already in memory, serializing/deserializing on every call when the object hasn't changed.
+- **Contention**: Lock held too long, all threads waiting for same resource, connection pool too small, single-threaded bottleneck in parallel system.
+
+**Diagnostic strategy**: ALWAYS profile before optimizing. The bottleneck is almost never where you think it is. Measure first, then fix the ONE thing that dominates the profile. Re-measure after fixing.
+
+**Common misdiagnosis**: Optimizing code that runs once instead of the code that runs 10,000 times. Or adding caching without understanding why the original is slow (caching a bug makes the bug faster, not fixed).
+
+---
+
+### 6. CONCURRENCY — Non-deterministic failures
+
+**Signals**: Test passes sometimes and fails sometimes, data corruption under load, deadlock (program hangs), race condition detected by sanitizer, "impossible" state in logs.
+
+**This is the second-hardest category** because bugs may not reproduce reliably.
+
+**Sub-types and causal patterns**:
+- **Data race**: Two threads/goroutines/coroutines read-write the same memory without synchronization. The fix is either: mutex/lock, atomic operation, channel/message-passing, or restructure to eliminate shared state.
+- **Deadlock**: Thread A holds lock X, waits for lock Y. Thread B holds lock Y, waits for lock X. Fix: consistent lock ordering (always acquire X before Y), or use try-lock with timeout, or restructure to use fewer locks.
+- **Lost update**: Read-modify-write without atomicity. Two threads read value=5, both add 1, both write 6 (should be 7). Fix: use atomic operations or wrap in transaction.
+- **Stale read**: Reading a value that another thread has already invalidated. Common with double-checked locking done wrong, or reading non-volatile fields in Java.
+- **Ordering violation**: Assuming operation A completes before B starts, but no synchronization enforces this. Fix: explicit synchronization (barrier, semaphore, channel, `await`).
+- **Resource starvation**: One thread/process monopolizes a resource (CPU, lock, connection), others timeout. Fix: fair scheduling, lock timeout, connection pool limits.
+
+**Diagnostic strategy**: First, make it reproducible. Run with thread sanitizer (`-fsanitize=thread`, Go race detector `go test -race`). If it can't be reproduced, analyze the code for shared mutable state — every read and write to shared state must be synchronized. No exceptions.
+
+**Common misdiagnosis**: Adding `sleep()` to "fix" a race condition. Sleep changes timing, doesn't fix the race. The bug will return under different load. Also: adding more locks without understanding the existing lock ordering — this often introduces deadlocks.
+
+---
+
+### Classification Decision Tree
+
+When an error doesn't fit one category cleanly:
+
+1. Does the code fail to compile/parse? → **Syntax**
+2. Does it crash with an exception/trace? → **Runtime**
+3. Does it produce wrong results silently? → **Logic**
+4. Does it fail at a service/module boundary? → **Integration**
+5. Does it work but too slowly or use too many resources? → **Performance**
+6. Does it fail non-deterministically under load? → **Concurrency**
+
+If ambiguous between two categories, investigate as the MORE severe one:
+- Syntax < Runtime < Logic < Integration < Performance < Concurrency
+
+The rightward categories are harder to diagnose and their bugs have wider blast radius. Overestimating severity wastes a few tool calls. Underestimating it wastes the entire debug session.
+"""
+    _write_text_if_changed(root / "SKILL.md", skill_md)
+    _write_text_if_changed(root / "references" / "debugging-heuristics.md", error_ref)
+    _write_text_if_changed(
+        generated_root / "systematic-debugging-capabilities.json",
+        json_dumps({
+            "generated_at": int(now_ts()),
+            "skill": "systematic-debugging",
+            "focus": ["causal-chain-tracing", "adaptive-depth", "multi-language-patterns", "invariant-analysis"],
+        }, indent=2),
+    )
+
+def ensure_generated_code_engineering_mastery_skill(skills_root: Path):
+    generated_root = skills_root / "generated"
+    root = generated_root / "code-engineering-mastery"
+    skill_md = """---
+name: code-engineering-mastery
+description: Adaptive software engineering methodology that scales from rapid prototyping to production-grade architecture — covering requirements analysis, design decision-making, implementation strategy, cross-language mastery, and verification-driven development.
+---
+
+# Code Engineering Mastery
+
+## Trigger
+Task involves implementing features, refactoring code, designing architecture, writing APIs, building systems, or any non-trivial coding work.
+
+## Adaptive Engineering Budget
+
+Before writing any code, assess the task and select the engineering level. This determines how much design and verification overhead is warranted.
+
+| Signal | Level | Design Budget | Verification |
+|--------|-------|--------------|-------------|
+| Single function, clear spec, isolated scope | **Tactical** | 0 — implement directly | Run once, spot-check |
+| New module or feature, touches 2-5 files | **Standard** | Sketch interfaces first, then implement | Unit tests for core logic |
+| Cross-cutting change, API design, architectural | **Strategic** | Full design: interfaces → data flow → error handling → tests | Integration tests, edge cases |
+| System-level, distributed, performance-critical | **Architectural** | Design doc: constraints → trade-offs → failure modes → capacity | Load test, chaos scenarios |
+
+**Rule**: Match the level to the ACTUAL complexity, not the perceived importance. A critical bugfix can be Tactical; a "simple" feature touching auth is Strategic.
+
+## Phase 1: Understand Before Building
+
+### Codebase Reconnaissance (do ONCE per project)
+- Identify: entry points, build system, test framework, deployment mechanism.
+- Map: which directories own which concerns. Where does business logic live vs infra?
+- Note: code conventions (naming, error handling, logging patterns) — your code must match.
+
+### Requirements Decomposition
+- Separate WHAT (user-facing behavior) from HOW (implementation approach).
+- For each requirement, ask: what's the simplest implementation that's correct? Start there.
+- Identify the RISKY parts — things you're unsure about. Prototype those first, not last.
+
+## Phase 2: Design Decisions (Standard+ only)
+
+### Interface-First Design
+- Define the public API before writing implementation. What goes in, what comes out, what errors are possible?
+- Each function should have ONE reason to exist. If you can't name it clearly, the abstraction is wrong.
+- Prefer narrow interfaces. A function taking 6 parameters probably does too much.
+
+### Data Flow Analysis
+- Trace how data moves: input → validation → transformation → storage → output.
+- At each boundary, ask: what can go wrong? Invalid data? Timeout? Partial failure?
+- Design error handling at boundaries, not in the middle of business logic.
+
+### Dependency Direction
+- High-level modules should not depend on low-level details. Both should depend on abstractions.
+- If module A imports module B, A should be able to work with any implementation of B's interface.
+- Circular dependencies are ALWAYS a design error. Break the cycle by extracting the shared concept.
+
+## Phase 3: Implementation Strategy
+
+### The Build Order Principle
+Implement in the order that lets you VERIFY each piece:
+1. Data models and types first (they're the foundation everything else depends on).
+2. Core business logic (pure functions, no I/O — easiest to test).
+3. Integration layer (connect core to external systems).
+4. API/UI surface (thin layer that delegates to core).
+
+### Cross-Language Engineering Patterns
+
+**Python**: Use type hints as executable documentation. `dataclass` for data, `Protocol` for interfaces. `pathlib` not string paths. Context managers for resources. `pytest` with parametrize for coverage.
+
+**TypeScript**: Strict mode always. Define types/interfaces before implementation. `const` default, `let` only when needed. async/await over callbacks. Discriminated unions for state machines.
+
+**Go**: Accept interfaces, return structs. Wrap errors with context (`fmt.Errorf("op: %w", err)`). Table-driven tests. Package by feature not by layer. Channels for coordination, mutexes for state protection.
+
+**Rust**: Model states as types (newtype pattern). `Result<T, E>` for all fallible ops. `?` operator for propagation. Builder pattern for complex construction. Property-based testing with proptest.
+
+**Java**: Records for immutable data. Optional over null. Sealed interfaces for type-safe hierarchies. JUnit 5 + AssertJ. Stream API for collection transforms.
+
+**C/C++**: RAII for resource management. Smart pointers (`unique_ptr` default, `shared_ptr` when needed). Sanitizers in CI (`-fsanitize=address,undefined`). CMake + CTest. `string_view` over `const char*`.
+
+## Phase 4: Verification Strategy
+
+### Test Writing as Design Validation
+Tests aren't about coverage numbers — they verify that your DESIGN DECISIONS are correct.
+- Test the BEHAVIOR, not the implementation. "Given X input, expect Y output" — not "function calls Z internally".
+- Test boundaries: empty input, max size, null/none, concurrent access, timeout.
+- Test error paths: does the code fail CORRECTLY when things go wrong?
+
+### Verification Escalation
+| Level | What to Verify | How |
+|-------|---------------|-----|
+| Tactical | It works for the happy path | Run once manually |
+| Standard | Core logic + key edge cases | Unit tests |
+| Strategic | Integration + error paths + regression | Integration tests + CI |
+| Architectural | Performance + failure modes + recovery | Load test + fault injection |
+
+## Phase 5: Code Quality Self-Review
+
+Before declaring "done", check:
+- **Correctness**: Does it satisfy ALL requirements, including edge cases?
+- **Performance**: Any obvious O(n²) where O(n) is possible? Unnecessary allocations in hot paths?
+- **Security**: User input validated? No injection paths? Secrets not hardcoded?
+- **Maintainability**: Would a new team member understand this code in 5 minutes?
+- **Error handling**: Every failure mode has a clear response. No silent swallowing.
+
+## Output Contract
+1. Engineering level selected with reasoning.
+2. Design decisions made (for Standard+).
+3. Implementation: files created/modified with clear purpose for each.
+4. Verification: tests written and passing, or manual verification documented.
+5. If blocked: exact technical constraint and proposed alternatives.
+"""
+    _write_text_if_changed(root / "SKILL.md", skill_md)
+    _write_text_if_changed(
+        generated_root / "code-engineering-mastery-capabilities.json",
+        json_dumps({
+            "generated_at": int(now_ts()),
+            "skill": "code-engineering-mastery",
+            "focus": ["adaptive-engineering", "interface-first-design", "cross-language", "verification-driven"],
+        }, indent=2),
+    )
+
+def ensure_generated_smart_file_navigation_skill(skills_root: Path):
+    generated_root = skills_root / "generated"
+    root = generated_root / "smart-file-navigation"
+    skill_md = """---
+name: smart-file-navigation
+description: Adaptive codebase exploration engine that scales reading strategy to project size and task scope — from surgical line-range reads to systematic dependency-graph traversal, with built-in loop prevention and workspace awareness.
+---
+
+# Smart File Navigation
+
+## Trigger
+Task involves exploring unfamiliar code, tracing dependencies, navigating from errors to root cause, or any work requiring reading multiple files.
+
+## Adaptive Reading Budget
+
+Decide your reading strategy BEFORE opening any file. Wrong strategy wastes your entire tool budget on irrelevant reads.
+
+| Task Scope | Strategy | Read Budget | Key Principle |
+|-----------|----------|-------------|---------------|
+| Fix a specific error with file:line | **Surgical** | 2-4 reads | Read crash site ±20 lines. Follow ONE call chain. |
+| Implement feature in known area | **Focused** | 5-10 reads | Scan interfaces of affected modules. Read implementations you'll modify. |
+| Understand unfamiliar module | **Exploratory** | 8-15 reads | Structure scan → entry points → data flow → key abstractions. |
+| Full codebase assessment | **Systematic** | 15-25 reads | Top-down: build config → architecture → module boundaries → hot paths. |
+
+**Rule**: Every read must answer a SPECIFIC question. If you can't state the question, don't read the file.
+
+## Core Method: Question-Driven Navigation
+
+### The Navigation Loop
+1. **State your question**: "What does function X do?" / "Where is Y defined?" / "How does data flow from A to B?"
+2. **Predict the answer's location**: Based on naming conventions, directory structure, imports.
+3. **Read the minimum needed**: Use offset/limit. Never read 500 lines when 30 suffice.
+4. **Record the answer**: Note it in your reasoning. Don't re-read to "remember".
+5. **Derive the next question**: Each answer either resolves your task or generates a more specific question.
+
+If step 5 generates the SAME question you already answered → you're in a loop. STOP and act on what you know.
+
+## Reading Strategies by File Size
+
+| File Size | Strategy |
+|-----------|----------|
+| < 150 lines | Read entire file — it's cheap |
+| 150-500 lines | Read first 30 lines (imports, class defs), then jump to target with offset |
+| 500-2000 lines | Grep for the specific function/class, read 50-line window around match |
+| 2000+ lines | NEVER read more than 100 lines at a time. Grep → offset → targeted read |
+
+## Dependency Tracing
+
+When you see an import, make a TRIAGE decision:
+
+| Import Type | Action | Reasoning |
+|------------|--------|-----------|
+| Standard library (os, json, http) | **Skip** | You know what it does |
+| Third-party (requests, numpy, express) | **Skip** unless the bug is in the call | Read the API docs, not the source |
+| Project internal, irrelevant to your task | **Note path, skip** | You may need it later |
+| Project internal, relevant to your task | **Queue for reading** | Read after finishing current file |
+
+### Import Resolution Quick Reference
+- Python: `from foo.bar import X` → `foo/bar.py` or `foo/bar/__init__.py`
+- JS/TS: `import X from './foo'` → `./foo.js`, `./foo.ts`, `./foo/index.js`, `./foo/index.ts`
+- Go: `import "project/pkg/foo"` → `pkg/foo/*.go`
+- Rust: `use crate::foo::bar` → `src/foo/bar.rs` or `src/foo/mod.rs`
+- Java: `import com.example.Foo` → `src/.../com/example/Foo.java`
+- C/C++: `#include "foo.h"` → search include paths, check CMakeLists.txt
+
+## Error-Driven Navigation
+
+When you have an error with a location:
+1. Read `file:line` with offset = line-10, limit = 30. This gives you the crash site with context.
+2. Identify the VARIABLE or EXPRESSION that caused the error.
+3. Trace BACKWARD: where was that variable last assigned? Read THAT location.
+4. If the assignment depends on another function's return value, read THAT function (just the return statements).
+5. You now have the causal chain. Fix at the earliest point where the wrong value was introduced.
+
+## Loop Prevention (Critical)
+
+### Self-Monitoring Rules
+- **Track what you've read**: After each read, note "file X, lines Y-Z, learned: ...".
+- **Never re-read the same file range**: If you already read lines 50-100 of foo.py, you have that information. Use it.
+- **The 3-read limit**: If you've read 3 different files without taking ANY action (write, edit, bash), you're probably lost. Stop reading and:
+  1. Write down what you know so far.
+  2. Identify the SPECIFIC gap in your knowledge.
+  3. Take an action based on what you know (even if imperfect).
+
+### Recovery from Navigation Dead Ends
+If you can't find what you're looking for:
+- Check the build system (Makefile, package.json, CMakeLists.txt) — it knows where everything is.
+- Check the test directory — tests often reveal the intended API and file organization.
+- Use `bash grep -r "function_name" --include="*.py" -l` to locate definitions.
+- Ask yourself: am I looking for the right thing? Restate your question.
+
+## Workspace Awareness
+
+### First-Visit Protocol (do ONCE per project)
+1. `bash ls -la` the root directory. Note the structure.
+2. Read README.md or equivalent (first 50 lines).
+3. Read the build config file (package.json / Makefile / Cargo.toml / go.mod).
+4. Record on blackboard: project type, language, entry points, test location.
+
+### Mental Map Maintenance
+- After reading each file, update your mental model: "module X is responsible for Y, exports Z".
+- When navigating, consult your model BEFORE reading. "Based on the structure, the auth logic is probably in src/auth/".
+- If your prediction is wrong, update the model — don't just read more files hoping to stumble on it.
+
+## Output Contract
+1. Files read with specific questions answered per file.
+2. Key findings relevant to the current task.
+3. Updated mental model of project structure (if first visit).
+4. If target not found: files checked, hypotheses eliminated, next approach.
+"""
+    _write_text_if_changed(root / "SKILL.md", skill_md)
+    _write_text_if_changed(
+        generated_root / "smart-file-navigation-capabilities.json",
+        json_dumps({
+            "generated_at": int(now_ts()),
+            "skill": "smart-file-navigation",
+            "focus": ["question-driven-navigation", "adaptive-reading", "loop-prevention", "dependency-tracing"],
+        }, indent=2),
+    )
+
 def ensure_generated_html_frontend_report_skills(skills_root: Path):
     generated_root = skills_root / "generated"
     html_root = generated_root / "html-report-engineering"
@@ -2692,6 +3206,9 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_image_coding_feedback_skill(skills_root)
     ensure_generated_skills_gen_skill(skills_root)
     ensure_generated_execution_recovery_skill(skills_root)
+    ensure_generated_systematic_debugging_skill(skills_root)
+    ensure_generated_code_engineering_mastery_skill(skills_root)
+    ensure_generated_smart_file_navigation_skill(skills_root)
     ensure_generated_html_frontend_report_skills(skills_root)
     ensure_generated_deep_research_skills(skills_root)
     ensure_generated_research_scientific_skills(skills_root)

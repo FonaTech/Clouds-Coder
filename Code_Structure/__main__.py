@@ -195,9 +195,54 @@ def main():
         default="",
         help=(
             "LLM config source (URL or local file path). "
-            "Also reads startup keys like download_js_lib and daily_session_limit "
-            "(aliases: daily_sessions_per_ip / max_daily_sessions_per_ip / session_daily_limit)."
+            "Also reads startup keys like show_upload_list, download_js_lib and "
+            "daily_session_limit (aliases: daily_sessions_per_ip / "
+            "max_daily_sessions_per_ip / session_daily_limit)."
         ),
+    )
+    parser.add_argument(
+        "--show_upload_list",
+        "--show-upload-list",
+        dest="show_upload_list",
+        action="store_true",
+        help="Show the upload list panel in WebUI (overrides config).",
+    )
+    parser.add_argument(
+        "--no_show_upload_list",
+        "--no-show-upload-list",
+        dest="show_upload_list",
+        action="store_false",
+        help="Hide the upload list panel in WebUI (overrides config).",
+    )
+    parser.add_argument(
+        "--download_js_lib",
+        "--download-js-lib",
+        dest="download_js_lib",
+        action="store_true",
+        help="Enable JS library download/bootstrap on startup (overrides config).",
+    )
+    parser.add_argument(
+        "--no_download_js_lib",
+        "--no-download-js-lib",
+        dest="download_js_lib",
+        action="store_false",
+        help="Disable JS library download/bootstrap on startup (overrides config).",
+    )
+    parser.add_argument(
+        "--daily_session_limit_per_ip",
+        "--daily-session-limit-per-ip",
+        "--daily_session_limit",
+        "--daily-session-limit",
+        "--daily_sessions_per_ip",
+        "--daily-sessions-per-ip",
+        "--max_daily_sessions_per_ip",
+        "--max-daily-sessions-per-ip",
+        "--session_daily_limit",
+        "--session-daily-limit",
+        dest="daily_session_limit_per_ip",
+        default=None,
+        type=int,
+        help="Per-IP daily session creation limit; 0 means unlimited. Resets at 08:00 server local time.",
     )
     parser.add_argument("--ollama-base-url", default=DEFAULT_OLLAMA_BASE_URL)
     parser.add_argument("--model", default=DEFAULT_OLLAMA_MODEL)
@@ -281,7 +326,13 @@ def main():
         default="",
         help="Whether TF-Graph_IDF RAG treats file names as semantic entities (on|off). Default off.",
     )
-    parser.set_defaults(auto_model_switch=False, use_external_web_ui=None, arbiter_enabled=True)
+    parser.set_defaults(
+        auto_model_switch=False,
+        use_external_web_ui=None,
+        arbiter_enabled=True,
+        show_upload_list=None,
+        download_js_lib=None,
+    )
     args = parser.parse_args()
     ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
@@ -343,9 +394,15 @@ def main():
     web_ui_show_upload_list = extract_show_upload_list_setting(web_ui_config)
     if web_ui_show_upload_list is not None:
         resolved_show_upload_list = bool(web_ui_show_upload_list)
+    cli_show_upload_list = getattr(args, "show_upload_list", None)
+    if cli_show_upload_list is not None:
+        resolved_show_upload_list = bool(cli_show_upload_list)
     web_ui_daily_session_limit = extract_daily_session_limit_setting(web_ui_config)
     if web_ui_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = int(web_ui_daily_session_limit)
+    cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
+    if cli_daily_session_limit is not None:
+        resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -357,6 +414,9 @@ def main():
         _js_dl_enabled = extract_js_lib_download_setting(web_ui_config)
     if _js_dl_enabled is None:
         _js_dl_enabled = True
+    cli_js_dl_enabled = getattr(args, "download_js_lib", None)
+    if cli_js_dl_enabled is not None:
+        _js_dl_enabled = bool(cli_js_dl_enabled)
     startup_tags = list_ollama_models(bootstrap_base_url)
     if startup_tags:
         resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]

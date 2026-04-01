@@ -11,6 +11,7 @@ import hashlib
 import io
 import importlib.util
 import json
+import locale
 import math
 import os
 import queue
@@ -27,7 +28,7 @@ import unicodedata
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
@@ -37,7 +38,7 @@ from ..agent.events import EventHub
 from ..agent.tasks import TaskManager
 from ..agent.todo import TodoManager
 from ..agent.worktree import WorktreeManager
-from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
+from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MESSAGE_EVENT_MAX_CHARS, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_USER_CHOICES, PLAN_NOTICE_BODY_MAX_CHARS, PLAN_STEP_FULL_CONTENT_MAX_CHARS, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
 from ..config.paths import WORKDIR
 from ..config.settings import _detect_os_shell_instruction, _to_bool_like, backend_i18n_text, backend_role_label, default_multimodal_capabilities, infer_model_multimodal_capabilities, infer_user_complexity_value, looks_like_llm_config, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
 from ..llm.client import OllamaClient, OllamaError
@@ -198,6 +199,7 @@ class SessionState:
         self.runtime_complexity_floor = ""
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
+        self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
         self.runtime_reclassify_goal = ""
@@ -2386,6 +2388,26 @@ class SessionState:
             matched_names = self._keyword_match_skills(goal_low, skill_catalog)
             if matched_names:
                 self._emit("status", {"summary": f"skill discovery (keyword fallback): {matched_names} ({trigger})"})
+        debug_goal = any(
+            token in goal_low
+            for token in (
+                "debug", "bug", "fix", "error", "traceback", "loop", "stuck",
+                "卡死", "空循环", "死循环", "恢复", "recovery", "test", "测试",
+                "integration", "集成", "architecture", "架构",
+            )
+        )
+        if debug_goal and not matched_names:
+            recovery_match = next(
+                (
+                    str(s.get("qname", "") or s.get("name", "")).strip()
+                    for s in skill_catalog
+                    if "execution-degradation-recovery" in str(s.get("qname", "") or s.get("name", "")).strip().lower()
+                ),
+                "",
+            )
+            if recovery_match:
+                matched_names = [recovery_match]
+                self._emit("status", {"summary": f"skill discovery (recovery bias): {matched_names} ({trigger})"})
 
         # --- Path 3: Deferred LLM pickup if still running ---
         if not matched_names and t.is_alive():
@@ -2410,7 +2432,7 @@ class SessionState:
         for name_str in matched_names[:4]:
             name_low = str(name_str or "").strip().lower()
             is_infra = any(pat in name_low for pat in _INFRA_SKILL_PATTERNS)
-            if is_infra:
+            if is_infra and not (debug_goal and "execution-degradation-recovery" in name_low):
                 infra_skills.append(name_str)
             else:
                 task_skills.append(name_str)
@@ -2620,6 +2642,7 @@ class SessionState:
             "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
             "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
             "call list_skills to discover options, then load_skill to activate the right one. "
+            "For bug-fix, debugging, testing, integration, API, or architecture steps, proactively check for a matching skill instead of waiting until you are stuck. "
             "Load a skill AT THE MOMENT you begin the step that requires it. "
             "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
             "For simple tasks, direct questions, and multimodal analysis, do NOT load skills. "
@@ -2762,7 +2785,7 @@ class SessionState:
                 preview += ", ..."
             source_hint = (
                 f" Discovered external raw code-corpus roots: {preview}. "
-                "Those raw corpora are source trees, not the query index itself, unless they have been imported into the Code Library."
+            "Those raw corpora are source trees, not the query index itself, unless they have been imported into the Code Library."
             )
         return (
             f"{header}:\n"
@@ -2771,6 +2794,26 @@ class SessionState:
             f"{source_hint} "
             "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
             "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
+        )
+
+    def _engineering_execution_boost_instruction(self) -> str:
+        goal = str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "").lower()
+        signals = (
+            "bug", "debug", "fix", "error", "traceback", "loop", "卡死", "空循环", "死循环",
+            "测试", "test", "验证", "verify", "regression", "接口", "api", "架构", "architecture",
+            "编程", "代码", "工程", "integration", "集成", "build", "compile", "lint",
+        )
+        if not any(sig in goal for sig in signals):
+            return ""
+        return (
+            "ENGINEERING EXECUTION DISCIPLINE: "
+            "For coding, bug-fix, architecture, integration, and testing work, proactively use the skill system when a matching skill exists. "
+            "Do not wait for failure before calling list_skills/load_skill for debugging, API, frontend, parser, or recovery workflows. "
+            "Use a root-cause-first loop: inspect the exact error or failing behavior, read the implicated file or path, form one concrete hypothesis, apply one bounded fix, then run at least one fix-and-verify cycle before declaring success. "
+            "If read_file or bash reports a missing path, empty folder, or mismatched filename, stop repeating the same lookup. "
+            "Reconcile the path against uploads, recent file paths, file explorer entries, and close workspace matches; then either open the closest candidate or create the intended target. "
+            "For large helper scripts or unfamiliar tools, prefer black-box usage first: run --help or inspect usage before reading large source files. "
+            "When claiming progress, capture observable evidence such as command exit codes, test summaries, API responses, rendered output, or parsed results; file existence alone is not sufficient evidence."
         )
 
     def _system_prompt(self) -> str:
@@ -2783,6 +2826,7 @@ class SessionState:
         research_hint = self._deep_research_boost_instruction()
         knowledge_hint = self._knowledge_library_prompt_block()
         code_hint = self._code_library_prompt_block()
+        engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
@@ -2791,6 +2835,7 @@ class SessionState:
         research_block = f"{research_hint}\n\n" if research_hint else ""
         knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
+        engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
@@ -2831,6 +2876,7 @@ class SessionState:
             f"{research_block}"
             f"{knowledge_block}"
             f"{code_hint_block}"
+            f"{engineering_block}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
@@ -6955,29 +7001,107 @@ body{padding:18px}
         lines = []
         remaining = max_chars
         for item in items:
+            item_kind = str(item.get("kind", "file") or "file")
+            wp = str(item.get("workspace_path", "") or "")
+            filename = str(item.get("filename", "") or "")
             lines.append(
-                f"- {item.get('filename','')} => {item.get('workspace_path','')} "
-                f"({item.get('kind','file')}, {item.get('size',0)} bytes)"
+                f"- {filename} => {wp} "
+                f"({item_kind}, {item.get('size',0)} bytes)"
             )
             excerpt = str(item.get("parsed_excerpt", "")).strip()
             if not excerpt or remaining < 200:
+                full_ref = ""
+                if wp:
+                    if item_kind not in ("text", "code"):
+                        from pathlib import PurePosixPath
+                        stem = PurePosixPath(wp).stem
+                        parent = str(PurePosixPath(wp).parent)
+                        full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+                    else:
+                        full_ref = wp
+                if full_ref:
+                    lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
                 continue
-            chunk = excerpt[: min(len(excerpt), min(3000, remaining))]
+            chunk_cap = min(2200, remaining)
+            if self._upload_is_code_like(item):
+                chunk_cap = min(1200, remaining)
+            elif item_kind == "text":
+                chunk_cap = min(1600, remaining)
+            chunk = self._prepare_upload_excerpt(
+                filename,
+                wp,
+                item_kind,
+                excerpt,
+                max_chars=chunk_cap,
+                max_lines=36 if self._upload_is_code_like(item) else 72,
+            )
+            if not chunk:
+                continue
             lines.append(f"<uploaded_excerpt path=\"{item.get('workspace_path','')}\">")
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
-            # 提示模型可直接读取 .parsed.md 文件获取完整解析文本
-            item_kind = item.get("kind", "file")
-            if item_kind not in ("text", "code"):
-                wp = item.get("workspace_path", "")
-                if wp:
+            full_ref = ""
+            if wp:
+                if item_kind not in ("text", "code"):
                     from pathlib import PurePosixPath
                     stem = PurePosixPath(wp).stem
                     parent = str(PurePosixPath(wp).parent)
-                    parsed_rel = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                    lines.append(f"  (parsed text available at: {parsed_rel} — use read_file to access full content)")
+                    full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+                else:
+                    full_ref = wp
+            if full_ref:
+                lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
         return "\n".join(lines)
+
+    def _upload_is_code_like(self, item: dict | None = None, *, filename: str = "", workspace_path: str = "", kind: str = "") -> bool:
+        info = item if isinstance(item, dict) else {}
+        name = str(info.get("filename", "") or filename or "").strip().lower()
+        rel = str(info.get("workspace_path", "") or workspace_path or "").strip().lower()
+        kind_value = str(info.get("kind", "") or kind or "").strip().lower()
+        target = rel or name
+        if kind_value == "code":
+            return True
+        code_like_ext = {
+            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c",
+            ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".go", ".rs",
+            ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh",
+            ".fish", ".sql", ".html", ".htm", ".css", ".sass", ".scss", ".less", ".styl",
+            ".json", ".jsonc", ".yaml", ".yml", ".xml", ".toml", ".ini", ".cfg", ".conf",
+            ".properties", ".md", ".mdx", ".rst", ".txt", ".log", ".ipynb", ".vue",
+            ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".f", ".f90", ".f95",
+            ".f03", ".f08", ".for", ".fpp", ".zig", ".nim", ".v", ".d", ".adb", ".ads",
+            ".asm", ".s", ".ps1", ".gradle", ".groovy", ".jl", ".lua", ".mk", ".cmake",
+            ".ml", ".mli", ".nix", ".pas", ".proto", ".sol", ".sv", ".svh", ".vh",
+            ".vhd", ".vhdl", ".tcl", ".tf", ".tfvars", ".hcl", ".tex", ".wat", ".diff",
+            ".patch", ".graphql", ".gql", ".prisma",
+        }
+        special_names = {"dockerfile", "makefile", "cmakelists.txt", "requirements.txt"}
+        if any(target.endswith(ext) for ext in code_like_ext):
+            return True
+        if Path(name or target).name.lower() in special_names:
+            return True
+        return False
+
+    def _prepare_upload_excerpt(
+        self,
+        filename: str,
+        workspace_path: str,
+        kind: str,
+        text: str,
+        *,
+        max_chars: int,
+        max_lines: int,
+    ) -> str:
+        body = str(text or "").strip()
+        if not body:
+            return ""
+        is_code = self._upload_is_code_like(filename=filename, workspace_path=workspace_path, kind=kind)
+        line_cap = min(max(1, int(max_lines or 1)), 40 if is_code else 80)
+        lines = body.replace("\r\n", "\n").split("\n")
+        if len(lines) > line_cap:
+            body = "\n".join(lines[:line_cap])
+        return trim(body, max_chars)
 
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
@@ -7049,7 +7173,8 @@ body{padding:18px}
         parsed_excerpt = ""
         needs_async_parse = False
         if kind == "text":
-            parsed_excerpt = trim(self._decode_text_bytes(raw), 24_000)
+            excerpt_cap = 8_000 if self._upload_is_code_like(filename=safe_name, kind=kind) else 12_000
+            parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
         elif kind in ("pdf", "csv", "excel", "presentation", "document"):
             needs_async_parse = True
         workspace_target = self._upload_workspace_target(safe_name)
@@ -7076,8 +7201,17 @@ body{padding:18px}
             self.updated_at = now_ts()
             self._persist()
         if parsed_excerpt:
-            bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
-            self._blackboard_append_section("research_notes", "system", bb_content)
+            bb_excerpt = self._prepare_upload_excerpt(
+                safe_name,
+                workspace_rel,
+                kind,
+                parsed_excerpt,
+                max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
+                max_lines=60,
+            )
+            if bb_excerpt:
+                bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
+                self._blackboard_append_section("research_notes", "system", bb_content)
         if not needs_async_parse:
             self._emit(
                 "upload",
@@ -7211,8 +7345,17 @@ body{padding:18px}
                     self._persist()
                     break
             if parsed_excerpt:
-                bb_content = f"[upload:{safe_name}]\n{trim(parsed_excerpt, BLACKBOARD_MAX_TEXT - 200)}"
-                self._blackboard_append_section("research_notes", "system", bb_content)
+                bb_excerpt = self._prepare_upload_excerpt(
+                    safe_name,
+                    self._session_rel(workspace_target),
+                    kind,
+                    parsed_excerpt,
+                    max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
+                    max_lines=60,
+                )
+                if bb_excerpt:
+                    bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
+                    self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
             workspace_rel = self._session_rel(workspace_target)
             self._emit("upload", {
@@ -9441,11 +9584,134 @@ body{padding:18px}
             pass
         return fp
 
+    def _suggest_workspace_paths(self, rel: str, limit: int = 6, max_scan: int = 1800) -> list[str]:
+        target = str(rel or "").strip().replace("\\", "/")
+        if not target:
+            return []
+        wanted = PurePosixPath(target)
+        desired_name = wanted.name.lower()
+        desired_compact = desired_name.replace(" ", "")
+        desired_stem = wanted.stem.lower()
+        parent_hint = str(wanted.parent).strip(". /").lower()
+        if not desired_name and not parent_hint:
+            return []
+        scored: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        scanned = 0
+        skip_dirs = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+        for root, dirs, files in os.walk(self.files_root):
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+            entries = list(files) + list(dirs)
+            for name in entries:
+                scanned += 1
+                if scanned > max_scan:
+                    break
+                full = Path(root) / name
+                try:
+                    rel_path = full.relative_to(self.files_root).as_posix()
+                except Exception:
+                    continue
+                if rel_path in seen:
+                    continue
+                low = rel_path.lower()
+                base = name.lower()
+                compact = base.replace(" ", "")
+                stem = Path(base).stem
+                score = 0
+                if desired_name and base == desired_name:
+                    score += 90
+                if desired_compact and compact == desired_compact:
+                    score += 80
+                if desired_stem and stem == desired_stem:
+                    score += 65
+                if desired_name and desired_name in low:
+                    score += 28
+                if desired_stem and desired_stem in stem:
+                    score += 22
+                if parent_hint and parent_hint in low:
+                    score += 12
+                if score <= 0:
+                    continue
+                seen.add(rel_path)
+                scored.append((score, rel_path))
+            if scanned > max_scan:
+                break
+        scored.sort(key=lambda row: (-row[0], len(row[1]), row[1]))
+        return [path for _, path in scored[: max(1, int(limit or 1))]]
+
+    def _render_directory_read(self, fp: Path, rel: str, limit: int | None = None, offset: int | None = None) -> str:
+        entries = sorted(
+            list(fp.iterdir()),
+            key=lambda p: (0 if p.is_dir() else 1, p.name.lower()),
+        )
+        total = len(entries)
+        if total == 0:
+            return f"[read_file directory path={rel} entries=0]\n(empty directory)"
+        offset_val = max(0, int(offset or 0))
+        requested_limit = max(1, int(limit or 60))
+        if offset_val >= total:
+            return (
+                f"[read_file directory path={rel} entries=0 of {total} offset={offset_val}]\n"
+                "[end_of_directory]"
+            )
+        page = entries[offset_val: offset_val + requested_limit]
+        lines = [
+            f"[read_file directory path={rel} entries={offset_val + 1}-{offset_val + len(page)} of {total} offset={offset_val} limit={requested_limit}]"
+        ]
+        for child in page:
+            kind = "dir" if child.is_dir() else "file"
+            try:
+                size_text = f" ({child.stat().st_size} bytes)" if child.is_file() else ""
+            except Exception:
+                size_text = ""
+            lines.append(f"{kind} {child.name}{size_text}")
+        next_offset = offset_val + len(page)
+        if next_offset < total:
+            lines.append(f"[next_page read_file path=\"{rel}\" offset={next_offset} limit={requested_limit}]")
+        if offset_val > 0:
+            prev_offset = max(0, offset_val - requested_limit)
+            lines.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
+        return "\n".join(lines)
+
+    def _read_text_with_fallback(self, fp: Path) -> str:
+        tried: list[str] = []
+        for enc in ("utf-8", "utf-8-sig", locale.getpreferredencoding(False) or "utf-8", "gb18030"):
+            enc_norm = str(enc or "").strip() or "utf-8"
+            if enc_norm in tried:
+                continue
+            tried.append(enc_norm)
+            try:
+                return fp.read_text(encoding=enc_norm)
+            except UnicodeDecodeError:
+                continue
+        return fp.read_text(encoding="utf-8", errors="replace")
+
+    def _render_missing_read_hint(self, rel: str) -> str:
+        suggestions = self._suggest_workspace_paths(rel, limit=6)
+        parent = PurePosixPath(str(rel or "").replace("\\", "/")).parent.as_posix()
+        lines = [f"Error: FileNotFoundError: {rel}"]
+        if suggestions:
+            lines.append("Closest workspace matches:")
+            lines.extend(f"- {cand}" for cand in suggestions)
+        if parent and parent not in {".", ""}:
+            lines.append(
+                f"Path hint: if `{parent}` is the intended folder, read that directory or create `{rel}` with write_file."
+            )
+        lines.append(
+            "Next action: reconcile the path against uploads/recent file paths, open one close match, "
+            "or create the missing target instead of repeating the same failed read."
+        )
+        return "\n".join(lines)
+
     def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
             rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
+            if not fp.exists():
+                return self._render_missing_read_hint(rel)
+            if fp.is_dir():
+                return self._render_directory_read(fp, rel, limit=limit, offset=offset)
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -9454,7 +9720,7 @@ body{padding:18px}
                 return self._run_read_media(fp, rel, "audio")
             if ext in VIDEO_EXTS:
                 return self._run_read_media(fp, rel, "video")
-            lines = fp.read_text(encoding="utf-8").splitlines()
+            lines = self._read_text_with_fallback(fp).splitlines()
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
@@ -11464,8 +11730,8 @@ body{padding:18px}
             for pt in bb_src_todos[:40]:
                 if not isinstance(pt, dict):
                     continue
-                raw_content = trim(str(pt.get("content", "") or ""), 1500)
-                raw_full = trim(str(pt.get("full_content", "") or ""), 1500)
+                raw_content = trim(str(pt.get("content", "") or ""), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+                raw_full = trim(str(pt.get("full_content", "") or ""), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
                 # Migration: if full_content is empty but content has sub-steps, auto-split
                 if not raw_full and raw_content and pt.get("category") == "plan_step":
                     normalized = _mid_re_norm.sub(r"\n\1", raw_content)
@@ -11475,11 +11741,12 @@ body{padding:18px}
                 clean_todos.append({
                     "id": trim(str(pt.get("id", "") or ""), 20),
                     "content": trim(raw_content, 400),
-                    "full_content": trim(raw_full, 1500),
+                    "full_content": trim(raw_full, PLAN_STEP_FULL_CONTENT_MAX_CHARS),
                     "status": str(pt.get("status", "pending") or "pending") if str(pt.get("status", "pending") or "pending") in ("pending", "in_progress", "completed") else "pending",
                     "category": trim(str(pt.get("category", "") or ""), 40),
                     "plan_step_index": int(pt.get("plan_step_index", -1)) if pt.get("plan_step_index") is not None else -1,
                     "created_at": float(pt.get("created_at", 0.0) or 0.0),
+                    "activated_at": float(pt.get("activated_at", 0.0) or 0.0) if pt.get("activated_at") else None,
                     "completed_at": float(pt.get("completed_at", 0.0) or 0.0) if pt.get("completed_at") else None,
                     "completed_by": trim(str(pt.get("completed_by", "") or ""), 40),
                     "evidence": trim(str(pt.get("evidence", "") or ""), 200),
@@ -12406,6 +12673,263 @@ body{padding:18px}
                 return True
         return False
 
+    def _tool_result_output_excerpt(self, item: dict, max_chars: int = 160) -> str:
+        if not isinstance(item, dict):
+            return ""
+        raw = trim(str(item.get("output", "") or "").strip(), max_chars * 2)
+        if not raw:
+            return ""
+        clean, _ = filter_runtime_noise_lines(raw)
+        text = trim(clean.replace("\r\n", "\n"), max_chars * 2)
+        if not text:
+            return ""
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return ""
+        return trim(lines[0], max_chars)
+
+    def _tool_results_have_validation_evidence(self, plan_step: dict, results: list[dict]) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        rows = [r for r in (results or []) if isinstance(r, dict) and r.get("ok", False)]
+        if not rows:
+            return False
+        step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_text)
+        wrote_files = any(str(r.get("name", "")) in ("write_file", "edit_file") for r in rows)
+        read_back = any(
+            str(r.get("name", "")) == "read_file" and bool(self._tool_result_output_excerpt(r, 140))
+            for r in rows
+        )
+        knowledge_signal = any(
+            str(r.get("name", "")) in ("write_to_blackboard", "read_from_blackboard", "query_code_library", "query_knowledge_library")
+            for r in rows
+        )
+        bash_rows = [r for r in rows if str(r.get("name", "")) == "bash"]
+        observed_signal = False
+        compile_signal = False
+        test_signal = False
+        negative_hints = ("error:", "failed", "failure", "traceback", "fatal error", "assertionerror", "exception")
+        compile_hints = ("compiled successfully", "build successful", "build succeeded", "syntax ok", "lint passed", "no issues found", "0 errors")
+        test_hints = ("test passed", "tests passed", "all tests passed", "0 failed", "100%", "ok", "success")
+        validation_cmd_tokens = ("pytest", "test", "unittest", "jest", "vitest", "cargo test", "go test", "build", "compile", "lint", "run")
+        for row in bash_rows:
+            cmd = str(row.get("args", {}).get("command", "") or "").strip().lower()
+            excerpt = self._tool_result_output_excerpt(row, 180)
+            low = excerpt.lower()
+            if excerpt and not any(neg in low for neg in negative_hints):
+                observed_signal = True
+            if any(tok in cmd for tok in validation_cmd_tokens):
+                observed_signal = True
+            if low and any(tok in low for tok in compile_hints) and not any(neg in low for neg in negative_hints):
+                compile_signal = True
+            if low and any(tok in low for tok in test_hints) and not any(neg in low for neg in negative_hints):
+                test_signal = True
+        wants_test = phase in ("test", "review") or any(
+            tok in step_text for tok in ("test", "pytest", "unit", "integration", "验证", "測試", "测试", "回归", "assert")
+        )
+        wants_runtime_validation = wants_test or phase == "implement" or any(
+            tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
+        )
+        if wants_test:
+            return test_signal or (bool(bash_rows) and observed_signal)
+        if phase == "implement":
+            return wrote_files and (compile_signal or test_signal or observed_signal or read_back)
+        if phase in ("research", "design"):
+            return knowledge_signal or read_back or observed_signal or wrote_files
+        if wants_runtime_validation:
+            return observed_signal or read_back or wrote_files
+        return wrote_files or read_back or knowledge_signal or observed_signal
+
+    def _plan_step_activation_ts(self, plan_step: dict) -> float:
+        if not isinstance(plan_step, dict):
+            return 0.0
+        try:
+            activated = float(plan_step.get("activated_at", 0.0) or 0.0)
+        except Exception:
+            activated = 0.0
+        if activated > 0:
+            return activated
+        try:
+            return float(plan_step.get("created_at", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _plan_step_blackboard_signals(self, plan_step: dict, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
+        since_ts = self._plan_step_activation_ts(plan_step)
+
+        def _rows_since(rows: object) -> list[dict]:
+            out: list[dict] = []
+            if not isinstance(rows, list):
+                return out
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                txt = trim(str(row.get("content", "") or "").strip(), 1200)
+                if not txt:
+                    continue
+                try:
+                    ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                    continue
+                out.append({"ts": ts, "content": txt, "actor": trim(str(row.get("actor", "") or ""), 40)})
+            return out
+
+        def _recent_excerpt(rows: list[dict], max_chars: int = 120) -> str:
+            if not rows:
+                return ""
+            return trim(str(rows[-1].get("content", "") or "").replace("\r\n", "\n"), max_chars)
+
+        negative_hints = ("error:", "failed", "failure", "traceback", "fatal error", "assertionerror", "exception")
+        compile_hints = ("compiled successfully", "build successful", "build succeeded", "syntax ok", "lint passed", "no issues found", "0 errors", "编译成功")
+        test_hints = ("test passed", "tests passed", "all tests passed", "0 failed", "100%", "ok", "success", "测试通过")
+
+        step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        step_entries = step_files_raw.get(step_id, []) if step_id and isinstance(step_files_raw.get(step_id), list) else []
+        filtered_entries: list[dict] = []
+        for entry in step_entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                ts = float(entry.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                continue
+            filtered_entries.append(entry)
+        step_entries = filtered_entries
+
+        artifact_rows: list[dict] = []
+        raw_artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        for path, meta in raw_artifacts.items():
+            if not isinstance(meta, dict):
+                continue
+            try:
+                ts = float(meta.get("updated_at", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                continue
+            artifact_rows.append({
+                "path": trim(str(path or "").strip(), 240),
+                "summary": trim(str(meta.get("summary", "") or "").strip(), 200),
+                "updated_at": ts,
+            })
+
+        research_rows = _rows_since(bb.get("research_notes", []))
+        exec_rows = _rows_since(bb.get("execution_logs", []))
+        review_rows = _rows_since(bb.get("review_feedback", []))
+
+        file_ops = {
+            trim(str(entry.get("op", "") or "").strip(), 40)
+            for entry in step_entries
+            if isinstance(entry, dict)
+        }
+        has_write = any(op in {"write_file", "edit_file"} for op in file_ops) or bool(artifact_rows)
+        has_read = "read_file" in file_ops
+
+        def _has_positive(rows: list[dict], hints: tuple[str, ...]) -> bool:
+            for row in reversed(rows[-6:]):
+                low = str(row.get("content", "") or "").lower()
+                if not low or any(neg in low for neg in negative_hints):
+                    continue
+                if any(tok in low for tok in hints):
+                    return True
+            return False
+
+        def _has_observed(rows: list[dict]) -> bool:
+            for row in reversed(rows[-6:]):
+                low = str(row.get("content", "") or "").lower()
+                if low and not any(neg in low for neg in negative_hints):
+                    return True
+            return False
+
+        recent_files = [row.get("path", "") for row in artifact_rows[-4:] if row.get("path")]
+        if not recent_files:
+            recent_files = [
+                trim(str(entry.get("path", "") or "").strip(), 240)
+                for entry in step_entries[-4:]
+                if isinstance(entry, dict) and str(entry.get("path", "") or "").strip()
+            ]
+
+        return {
+            "since_ts": since_ts,
+            "has_write": has_write,
+            "has_read": has_read,
+            "has_research": bool(research_rows),
+            "has_exec": _has_observed(exec_rows),
+            "has_review": _has_observed(review_rows),
+            "has_compile_pass": _has_positive(exec_rows + review_rows, compile_hints),
+            "has_test_pass": _has_positive(exec_rows + review_rows, test_hints),
+            "recent_files": list(dict.fromkeys(recent_files))[-4:],
+            "recent_exec_excerpt": _recent_excerpt(exec_rows, 140),
+            "recent_review_excerpt": _recent_excerpt(review_rows, 140),
+            "recent_research_excerpt": _recent_excerpt(research_rows, 140),
+        }
+
+    def _plan_step_has_blackboard_evidence(self, plan_step: dict, board: dict | None = None) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        sig = self._plan_step_blackboard_signals(plan_step, board)
+        step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_text)
+        wants_test = phase in ("test", "review") or any(
+            tok in step_text for tok in ("test", "pytest", "unit", "integration", "验证", "測試", "测试", "回归", "assert")
+        )
+        wants_runtime_validation = wants_test or phase == "implement" or any(
+            tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
+        )
+        if wants_test:
+            return sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
+        if phase == "implement":
+            return sig["has_write"] and (
+                sig["has_compile_pass"] or sig["has_test_pass"] or sig["has_exec"] or sig["has_read"] or sig["has_review"]
+            )
+        if phase in ("research", "design"):
+            return sig["has_research"] or sig["has_read"] or sig["has_exec"] or sig["has_write"]
+        if wants_runtime_validation:
+            return sig["has_exec"] or sig["has_read"] or sig["has_write"] or sig["has_review"]
+        return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
+
+    def _step_has_accumulated_evidence(self, plan_step: dict, bb: dict | None = None) -> bool:
+        """Fix 3: Check if step has accumulated evidence across ALL turns (not just current turn).
+        Uses step_files registry + blackboard signals to detect writes/execution during step lifetime."""
+        if not isinstance(plan_step, dict):
+            return False
+        sig = self._plan_step_blackboard_signals(plan_step, bb)
+        return sig["has_write"] or sig["has_exec"] or sig["has_research"]
+
+    def _collect_accumulated_step_evidence(self, plan_step: dict, bb: dict | None = None) -> str:
+        """Fix 1 support: Collect evidence summary from accumulated step history (across all turns)."""
+        if not isinstance(plan_step, dict):
+            return ""
+        sig = self._plan_step_blackboard_signals(plan_step, bb)
+        parts: list[str] = []
+        if sig.get("recent_files"):
+            parts.append("files: " + ", ".join(sig["recent_files"][:4]))
+        if sig.get("recent_exec_excerpt"):
+            parts.append("exec: " + trim(sig["recent_exec_excerpt"], 80))
+        if sig.get("recent_research_excerpt"):
+            parts.append("research: " + trim(sig["recent_research_excerpt"], 80))
+        return trim("; ".join(parts) or "accumulated-step-evidence", 200)
+
+    def _collect_blackboard_step_evidence(self, plan_step: dict, board: dict | None = None) -> str:
+        sig = self._plan_step_blackboard_signals(plan_step, board)
+        parts: list[str] = []
+        if sig.get("recent_files"):
+            parts.append("files: " + ", ".join(sig["recent_files"][:3]))
+        if sig.get("recent_exec_excerpt"):
+            parts.append(f"logs: {sig['recent_exec_excerpt']}")
+        if sig.get("recent_review_excerpt"):
+            parts.append(f"review: {sig['recent_review_excerpt']}")
+        if sig.get("recent_research_excerpt"):
+            parts.append(f"notes: {sig['recent_research_excerpt']}")
+        return trim("; ".join(parts), 200)
+
     def _has_test_pass_evidence(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
@@ -12431,24 +12955,42 @@ body{padding:18px}
             return
         code_count = len(bb.get("code_artifacts", {}) or {})
         research_count = len(bb.get("research_notes", []) or [])
+        exec_count = len(bb.get("execution_logs", []) or [])
         feedback_pass = self._manager_feedback_passed_from_blackboard(bb)
 
         for todo in todos:
             if todo.get("status") == "completed":
                 continue
             cat = todo.get("category", "")
+            if cat == "plan_step" and todo.get("status") == "in_progress" and not todo.get("activated_at"):
+                step_idx = int(todo.get("plan_step_index", 0) or 0)
+                prior_done_ts = [
+                    float(t.get("completed_at", 0.0) or 0.0)
+                    for t in todos
+                    if t.get("category") == "plan_step"
+                    and int(t.get("plan_step_index", 0) or 0) < step_idx
+                    and t.get("completed_at")
+                ]
+                todo["activated_at"] = (
+                    max(prior_done_ts)
+                    if prior_done_ts
+                    else (float(todo.get("created_at", 0.0) or 0.0) or float(now_ts()))
+                )
             if cat == "setup" and (research_count > 0 or code_count > 0):
                 todo.update(
                     status="completed",
                     completed_at=float(now_ts()),
                     evidence=self._ui_text("evidence_structure_analyzed"),
                 )
-            elif cat == "implement" and code_count > 0:
+            elif cat == "implement" and code_count > 0 and (exec_count > 0 or feedback_pass):
                 todo.update(
                     status="completed",
                     completed_at=float(now_ts()),
                     completed_by="developer",
-                    evidence=self._ui_text("evidence_files_produced", count=code_count),
+                    evidence=trim(
+                        f"{self._ui_text('evidence_files_produced', count=code_count)} + observable execution evidence",
+                        200,
+                    ),
                 )
             elif cat == "compile_test" and self._has_compile_pass_evidence(bb):
                 todo.update(
@@ -12485,11 +13027,14 @@ body{padding:18px}
                         if t.get("category") == "plan_step"
                     ):
                         todo["status"] = "in_progress"
+                        todo["activated_at"] = float(now_ts())
 
         if not any(t.get("status") == "in_progress" for t in todos):
             for t in todos:
                 if t.get("status") == "pending":
                     t["status"] = "in_progress"
+                    if not t.get("activated_at"):
+                        t["activated_at"] = float(now_ts())
                     break
 
         bb["project_todos"] = todos
@@ -12555,6 +13100,11 @@ body{padding:18px}
                 break
         if not current:
             return False
+        # Fix 5c: Reset TodoWrite loop counter on step advancement
+        try:
+            self._todowrite_step_counter.clear()
+        except Exception:
+            pass
         current["status"] = "completed"
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
@@ -12569,6 +13119,7 @@ body{padding:18px}
                 break
         if next_step:
             next_step["status"] = "in_progress"
+            next_step["activated_at"] = float(now_ts())
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -12674,26 +13225,64 @@ body{padding:18px}
             isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
             for r in results
         )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
-        if phase in ("research", "design") and wrote_files:
+        if phase in ("research", "design") and validation_ok:
             phase_evidence = True
-        elif phase == "implement" and wrote_files and ran_bash_ok:
+        elif phase == "implement" and (
+            (wrote_files and validation_ok_current)
+            or (bb_sig["has_write"] and validation_ok_blackboard)
+        ):
             phase_evidence = True
-        elif phase in ("test", "review") and ran_bash_ok:
+        elif phase in ("test", "review") and (
+            (ran_bash_ok and validation_ok_current)
+            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+        ):
             phase_evidence = True
+        todo_progress_signal = any(
+            isinstance(r, dict) and r.get("ok", False)
+            and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
+            for r in results
+        )
         # Advance when:
         # - Manager requested AND worker produced output, OR
         # - All subtasks completed AND worker produced output, OR
-        # - Phase heuristics confirm (write+bash for implement)
-        has_strong_evidence = worker_produced_output and (
-            manager_requested or subtasks_all_done or phase_evidence
+        # - Phase heuristics confirm BUT ONLY if no incomplete subtasks exist
+        # - Fix 3: All subtasks completed + accumulated step evidence (covers TodoWrite-only turns)
+        # CRITICAL: When subtasks exist, phase_evidence alone CANNOT bypass subtask completion.
+        _has_subtasks = bool(self._active_plan_worker_todo_rows(
+            str(current.get("id", "") or ""), role=""
+        ))
+        _phase_gate = phase_evidence and (subtasks_all_done or not _has_subtasks)
+        accumulated_evidence_path = (
+            subtasks_all_done
+            and todo_progress_signal
+            and self._step_has_accumulated_evidence(current, bb)
         )
+        has_strong_evidence = (
+            validation_ok and (
+                (
+                    worker_produced_output
+                    and (manager_requested or subtasks_all_done or _phase_gate)
+                )
+                or (
+                    todo_progress_signal
+                    and subtasks_all_done
+                    and validation_ok_blackboard
+                )
+            )
+        ) or accumulated_evidence_path
         if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
             self._advance_plan_step(
                 evidence=evidence,
                 actor=str(route.get("target", "developer") or "developer"),
             )
+        else:
+            self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
         """Check if worker step produced concrete tool outputs."""
@@ -12709,7 +13298,8 @@ body{padding:18px}
 
     def _step_subtasks_all_completed(self, plan_step: dict) -> bool:
         """Check if all worker subtasks linked to this plan step are completed.
-        Filters out cross-step subtasks (e.g., 2.1 under step 1) to prevent blocking."""
+        Filters out cross-step subtasks (e.g., 2.1 under step 1) to prevent blocking.
+        Fix 6: Also excludes 'next-step intent' items that were added alongside completed items."""
         step_id = str(plan_step.get("id", "") or "")
         if not step_id:
             return False
@@ -12749,7 +13339,294 @@ body{padding:18px}
                 relevant.append(r)
             if relevant:
                 worker_items = relevant
-        return all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
+        # Fix 6: Exclude "next-step intent" pending items when all other items are completed.
+        # When the worker completes step N and creates step N+1 subtasks in the same TodoWrite call,
+        # the new pending items get parent_step_id of step N, blocking its advancement.
+        completed_items = [r for r in worker_items if str(r.get("status", "")).lower() == "completed"]
+        pending_items = [r for r in worker_items if str(r.get("status", "")).lower() != "completed"]
+        if completed_items and pending_items:
+            # Check if pending items are content-wise duplicates of completed items
+            # (indicating the worker re-sent the same items but some got stuck as pending)
+            completed_content = {
+                normalize_work_text(str(r.get("content", ""))).strip().lower()
+                for r in completed_items
+                if str(r.get("content", "") or "").strip()
+            }
+            truly_new_pending = [
+                r for r in pending_items
+                if normalize_work_text(str(r.get("content", ""))).strip().lower() not in completed_content
+            ]
+            # If all pending items are duplicates of completed items, they don't block
+            if not truly_new_pending:
+                worker_items = completed_items
+            # If there are truly new pending items but all original items are done,
+            # check if the new items match future plan step content
+            elif truly_new_pending and len(completed_items) >= 2:
+                bb = self._ensure_blackboard()
+                future_step_content = set()
+                found_current = False
+                for t in bb.get("project_todos", []):
+                    if not isinstance(t, dict) or t.get("category") != "plan_step":
+                        continue
+                    if str(t.get("id", "") or "") == step_id:
+                        found_current = True
+                        continue
+                    if found_current:
+                        fc = str(t.get("full_content", "") or t.get("content", "") or "").strip().lower()
+                        future_step_content.add(fc)
+                        for line in fc.split("\n"):
+                            sl = line.strip().lower()
+                            if sl:
+                                future_step_content.add(sl)
+                if future_step_content:
+                    _still_blocking = []
+                    for pi in truly_new_pending:
+                        pc = normalize_work_text(str(pi.get("content", ""))).strip().lower()
+                        # Check if this pending item's content appears in any future step
+                        is_future = any(pc in fsc or fsc in pc for fsc in future_step_content if len(fsc) > 4)
+                        if not is_future:
+                            _still_blocking.append(pi)
+                    if not _still_blocking:
+                        worker_items = completed_items
+        all_marked_done = all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
+        if not all_marked_done:
+            return False
+        # Acceptance verification: check that each "completed" subtask has real evidence
+        # Don't just trust the model's TodoWrite status — verify against accumulated tool outputs
+        if worker_items:
+            bb = self._ensure_blackboard()
+            unverified = self._verify_subtasks_acceptance(worker_items, step_id, bb)
+            if unverified:
+                return False
+        return True
+
+    def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
+        """Verify each completed subtask has real evidence. Returns list of unverified subtask descriptions.
+        Checks step_files and execution_logs against what each subtask's content implies."""
+        import re
+        # Gather accumulated evidence for this step
+        step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        step_entries = step_files_raw.get(step_id, []) if step_id and isinstance(step_files_raw.get(step_id), list) else []
+        written_paths = set()
+        for entry in step_entries:
+            if isinstance(entry, dict) and str(entry.get("op", "")) in ("write_file", "edit_file"):
+                written_paths.add(str(entry.get("path", "") or "").strip().lower())
+        # Gather bash execution evidence
+        exec_logs = bb.get("execution_logs", [])
+        if not isinstance(exec_logs, list):
+            exec_logs = []
+        bash_outputs_lower = []
+        for log in exec_logs[-30:]:
+            if isinstance(log, dict):
+                c = str(log.get("content", "") or "").lower()
+                if c:
+                    bash_outputs_lower.append(c)
+        all_bash_text = " ".join(bash_outputs_lower)
+        negative_hints = ("error:", "failed", "failure", "traceback", "fatal", "not found",
+                          "no such file", "command not found", "permission denied")
+        has_bash_failure = any(neg in all_bash_text for neg in negative_hints)
+        # Define acceptance patterns from subtask content
+        _file_create_re = re.compile(
+            r"(?:创建|生成|编写|写入|create|write|generate|implement|scaffold)\s+(.+?)(?:\s|$|，|。|,|\()",
+            re.IGNORECASE,
+        )
+        _run_test_kw = ("运行", "测试", "验证", "test", "pytest", "verify", "validate",
+                        "run", "check", "确认", "检查")
+        _compile_kw = ("编译", "构建", "compile", "build", "cmake", "make", "gcc", "gfortran")
+        _install_kw = ("安装", "install", "pip install", "npm install", "apt install")
+        unverified: list[str] = []
+        for st in subtasks:
+            content = str(st.get("content", "") or "").strip()
+            if not content:
+                continue
+            content_lower = content.lower()
+            # Rule 1: If subtask mentions creating a file, check it was actually written
+            m = _file_create_re.search(content)
+            if m:
+                target = m.group(1).strip().strip("\"'`").lower()
+                # Extract just filename from path-like strings
+                if "/" in target:
+                    target_parts = [p for p in target.split("/") if p.strip()]
+                    target_name = target_parts[-1] if target_parts else target
+                else:
+                    target_name = target
+                if target_name and len(target_name) > 2:
+                    found = any(target_name in wp for wp in written_paths)
+                    if not found:
+                        unverified.append(f"file not created: {target_name}")
+                        continue
+            # Rule 2: If subtask mentions testing/running/verifying, check bash was executed
+            if any(kw in content_lower for kw in _run_test_kw):
+                if not bash_outputs_lower:
+                    unverified.append(f"no bash execution for: {trim(content, 60)}")
+                    continue
+                # Check for test failures in recent bash output
+                if has_bash_failure and any(kw in content_lower for kw in ("test", "测试", "pytest")):
+                    # Only block if failure keywords appear near test-related content
+                    test_related_failures = any(
+                        ("test" in line or "pytest" in line or "assert" in line)
+                        and any(neg in line for neg in negative_hints)
+                        for line in bash_outputs_lower[-10:]
+                    )
+                    if test_related_failures:
+                        unverified.append(f"test failures detected for: {trim(content, 60)}")
+                        continue
+            # Rule 3: If subtask mentions compiling/building, check bash + no compile errors
+            if any(kw in content_lower for kw in _compile_kw):
+                if not bash_outputs_lower:
+                    unverified.append(f"no bash execution for compile: {trim(content, 60)}")
+                    continue
+                compile_failures = any(
+                    any(neg in line for neg in ("error:", "failed", "failure"))
+                    and any(kw in line for kw in ("compil", "build", "cmake", "make", "link"))
+                    for line in bash_outputs_lower[-10:]
+                )
+                if compile_failures:
+                    unverified.append(f"compile failures for: {trim(content, 60)}")
+                    continue
+            # Rule 4: If subtask mentions installing, check bash was run
+            if any(kw in content_lower for kw in _install_kw):
+                if not bash_outputs_lower:
+                    unverified.append(f"no bash for install: {trim(content, 60)}")
+                    continue
+            # If none of the specific rules matched, the subtask is considered verified
+            # (generic subtasks like "design" or "analyze" don't need tool evidence)
+        return unverified
+
+    def _inject_rework_if_needed(self, plan_step: dict, worker_step: dict):
+        """When subtasks are marked completed but acceptance fails, inject rework instruction.
+        Prevents the system from getting stuck or silently skipping unfinished work."""
+        try:
+            step_id = str(plan_step.get("id", "") or "")
+            if not step_id:
+                return
+            rows = self._active_plan_worker_todo_rows(step_id, role="")
+            completed_rows = [r for r in rows if str(r.get("status", "")).lower() == "completed"]
+            pending_rows = [r for r in rows if str(r.get("status", "")).lower() != "completed"]
+            if not completed_rows:
+                return
+            bb = self._ensure_blackboard()
+            failures = self._verify_subtasks_acceptance(completed_rows, step_id, bb)
+            if not failures:
+                return
+            # LLM-based acceptance check: semantic analysis over heuristics
+            llm_verdict = self._llm_verify_subtask_acceptance(plan_step, completed_rows, bb)
+            if llm_verdict.get("all_passed", False):
+                return
+            rework_items = llm_verdict.get("rework_items", failures)
+            if not rework_items:
+                return
+            # Rate-limit rework injection
+            _rework_key = f"_rework_injected_{step_id}"
+            _last_rework = getattr(self, _rework_key, 0.0)
+            if float(now_ts()) - float(_last_rework) < 30.0:
+                return
+            setattr(self, _rework_key, float(now_ts()))
+            step_label = trim(str(plan_step.get("content", "") or ""), 80)
+            rework_text = (
+                f"<step-rework>\n"
+                f"Step \"{step_label}\" acceptance check FAILED. "
+                f"The following subtasks were marked completed but did not pass verification:\n"
+            )
+            for i, item in enumerate(rework_items[:5]):
+                rework_text += f"  {i+1}. {trim(str(item), 120)}\n"
+            rework_text += (
+                f"\nACTION REQUIRED: Fix these issues NOW before the step can advance.\n"
+                f"- For missing files: create them with write_file\n"
+                f"- For failed tests/builds: run the command again and fix errors\n"
+                f"- For unverified installs: re-run the install command\n"
+                f"After fixing, update TodoWrite to reflect the corrected state.\n"
+                f"</step-rework>"
+            )
+            # Revert false "completed" status back to in_progress
+            _snap = self.todo.snapshot()
+            _modified = False
+            for row in _snap:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("parent_step_id", "") or "") != step_id:
+                    continue
+                if str(row.get("status", "")).lower() != "completed":
+                    continue
+                rc = str(row.get("content", "") or "").strip().lower()
+                for fail in rework_items:
+                    fail_lower = str(fail).lower()
+                    if rc and (rc[:20] in fail_lower or any(w in fail_lower for w in rc.split()[:3] if len(w) > 3)):
+                        row["status"] = "in_progress"
+                        _modified = True
+                        break
+            if _modified:
+                try:
+                    self.todo.update(_snap)
+                except Exception:
+                    pass
+            target_roles: tuple[str, ...] = ()
+            if self._is_multi_agent_mode():
+                active_role = str(bb.get("active_agent", "") or "developer")
+                if active_role:
+                    target_roles = (active_role,)
+            self._append_plan_guidance_bubble(
+                rework_text,
+                target_roles=target_roles,
+                summary=f"step rework: {len(rework_items)} items failed acceptance",
+            )
+        except Exception:
+            pass
+
+    def _llm_verify_subtask_acceptance(self, plan_step: dict, completed_subtasks: list[dict], bb: dict) -> dict:
+        """Use LLM semantic analysis to verify if subtasks are truly completed.
+        Returns {"all_passed": bool, "rework_items": list[str]}."""
+        try:
+            step_id = str(plan_step.get("id", "") or "")
+            step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+            step_entries = step_files_raw.get(step_id, []) if step_id else []
+            files_summary = []
+            for entry in (step_entries[-15:] if isinstance(step_entries, list) else []):
+                if isinstance(entry, dict):
+                    files_summary.append(f"{entry.get('op','?')}: {entry.get('path','?')}")
+            exec_logs = bb.get("execution_logs", [])
+            recent_exec = []
+            for log in (exec_logs[-8:] if isinstance(exec_logs, list) else []):
+                if isinstance(log, dict):
+                    c = trim(str(log.get("content", "") or ""), 200)
+                    if c:
+                        recent_exec.append(c)
+            subtask_list = "\n".join(
+                f"- [{str(st.get('status','')).upper()}] {trim(str(st.get('content','') or ''), 120)}"
+                for st in completed_subtasks[:8]
+            )
+            prompt = (
+                "Analyze whether these subtasks are TRULY completed based on the evidence.\n\n"
+                f"SUBTASKS:\n{subtask_list}\n\n"
+                f"FILES CREATED/MODIFIED:\n{chr(10).join(files_summary[-10:]) or '(none)'}\n\n"
+                f"RECENT EXECUTION OUTPUT:\n{chr(10).join(recent_exec[-5:]) or '(none)'}\n\n"
+                "For each subtask, determine if it's genuinely done:\n"
+                "- File creation tasks: was the file actually created?\n"
+                "- Test/verify tasks: was a test/command actually run? Did it pass?\n"
+                "- Build/compile tasks: was compilation attempted? Any errors?\n"
+                "- Install tasks: was the install command run?\n\n"
+                "Reply ONLY as JSON: {\"all_passed\": true/false, \"rework_items\": [\"description of what failed\"]}\n"
+                "If all subtasks pass, return {\"all_passed\": true, \"rework_items\": []}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON.",
+                max_tokens=300,
+                think=False,
+            )
+            import json
+            text = str(resp.get("text", "") or "").strip()
+            if "{" in text:
+                json_str = text[text.index("{"):text.rindex("}") + 1]
+                result = json.loads(json_str)
+                if isinstance(result, dict):
+                    return {
+                        "all_passed": bool(result.get("all_passed", False)),
+                        "rework_items": list(result.get("rework_items", [])),
+                    }
+        except Exception:
+            pass
+        return {"all_passed": False, "rework_items": []}
 
     def _collect_step_evidence(self, plan_step: dict, worker_step: dict) -> str:
         """Collect evidence summary from worker step for plan step completion."""
@@ -12764,10 +13641,19 @@ body{padding:18px}
                 parts.append(f"{name}: {path}")
             elif name == "bash":
                 cmd = trim(str(r.get("args", {}).get("command", "") or ""), 80)
-                parts.append(f"bash: {cmd}")
+                out = self._tool_result_output_excerpt(r, 120)
+                parts.append(f"bash: {cmd}" + (f" => {out}" if out else ""))
             elif name == "read_file":
                 path = str(r.get("args", {}).get("path", "") or "")
-                parts.append(f"read: {path}")
+                out = self._tool_result_output_excerpt(r, 90)
+                parts.append(f"read: {path}" + (f" => {out}" if out else ""))
+            elif name in ("write_to_blackboard", "query_code_library", "query_knowledge_library"):
+                out = self._tool_result_output_excerpt(r, 100)
+                parts.append(f"{name}" + (f": {out}" if out else ""))
+        if not parts:
+            bb_evidence = self._collect_blackboard_step_evidence(plan_step)
+            if bb_evidence:
+                return bb_evidence
         return trim("; ".join(parts) or "post-execution evidence", 200)
 
     def _get_active_plan_step(self, board: dict | None = None) -> dict | None:
@@ -12875,10 +13761,13 @@ body{padding:18px}
 
         merged_by_identity: dict[str, dict] = {}
         ordered_identities: list[str] = []
+        # Fix 2: Compute existing identities for next-step detection
+        _existing_identities: set[str] = set()
         for row in target_rows:
             identity = self._plan_worker_todo_identity(row)
             if not identity:
                 continue
+            _existing_identities.add(identity)
             if identity not in merged_by_identity:
                 merged_by_identity[identity] = dict(row)
                 ordered_identities.append(identity)
@@ -12916,11 +13805,42 @@ body{padding:18px}
             merged.update(row)
             merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
             merged["parent_step_id"] = trim(str(merged.get("parent_step_id", "") or step_id), 20) or step_id
+            # Fix 2 support: Timestamp new items for next-step detection
+            if identity not in _existing_identities and "created_at" not in merged:
+                merged["created_at"] = float(now_ts())
+            if str(merged.get("status", "")).lower() == "completed" and "updated_at" not in merged:
+                merged["updated_at"] = float(now_ts())
             merged_by_identity[identity] = merged
             if identity not in ordered_identities:
                 ordered_identities.append(identity)
 
         merged_target_rows = [merged_by_identity[i] for i in ordered_identities if i in merged_by_identity]
+
+        # Fix 4: Content-based deduplication to prevent duplicate subtasks from accumulating
+        _seen_content: set[str] = set()
+        _deduped_target: list[dict] = []
+        for row in merged_target_rows:
+            _ck = normalize_work_text(str(row.get("content", ""))).strip().lower()
+            if _ck in _seen_content:
+                continue
+            _seen_content.add(_ck)
+            _deduped_target.append(row)
+        merged_target_rows = _deduped_target
+
+        # Fix 2: Detect "next-step intent" — if all existing items are completed,
+        # new pending items that don't match existing identities are for the next step.
+        # Remove their parent_step_id so they don't block current step advancement.
+        _all_existing_done = (
+            bool(target_rows) and
+            all(str(r.get("status", "")).lower() == "completed" for r in target_rows)
+        )
+        if _all_existing_done:
+            for row in merged_target_rows:
+                _rid = self._plan_worker_todo_identity(row)
+                if (_rid and _rid not in _existing_identities
+                        and str(row.get("status", "")).lower() != "completed"):
+                    row.pop("parent_step_id", None)  # Not for current step
+
         final_rows = preserved + passthrough_rows + merged_target_rows
         return self.todo.update(final_rows)
 
@@ -12959,7 +13879,7 @@ body{padding:18px}
         return self.todo.update(preserved + normalized)
 
     def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
-        text = trim(str(content or "").strip(), 2200)
+        text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
             return False
         recent = self.messages[-8:]
@@ -12983,7 +13903,7 @@ body{padding:18px}
         return True
 
     def _build_plan_guidance_notice_data(self, content: str, *, summary: str = "") -> dict:
-        text = trim(str(content or "").strip(), 2200)
+        text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
             return {}
         lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
@@ -13030,7 +13950,7 @@ body{padding:18px}
         }
 
     def _append_plan_guidance_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
-        text = trim(str(content or "").strip(), 2200)
+        text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
             return False
         recent = self.messages[-10:]
@@ -13325,23 +14245,46 @@ body{padding:18px}
             str(r.get("name", "")) == "bash" and r.get("ok", False)
             for r in tool_results
         )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, tool_results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
         # Auto-advance conditions:
         should_advance = False
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
-        if subtasks_done and (wrote_files or ran_bash_ok):
+        if subtasks_done and validation_ok:
             should_advance = True
-        # Priority 2: Phase-based heuristics (strict — implement requires BOTH write + bash)
+        # Fix 3 (single mode): Accumulated evidence path — subtasks done + accumulated evidence
+        # Covers TodoWrite-only turns where validation_ok_current is False
+        if not should_advance and subtasks_done:
+            todo_progress_signal = any(
+                isinstance(r, dict) and r.get("ok", False)
+                and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
+                for r in tool_results
+            )
+            if todo_progress_signal and self._step_has_accumulated_evidence(current, bb):
+                should_advance = True
+        # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
+        # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
         if not should_advance:
-            if phase in ("research", "design") and wrote_files:
-                should_advance = True
-            elif phase == "implement" and wrote_files and ran_bash_ok:
-                # Strict: implement step needs both file writes AND successful bash
-                should_advance = True
-            elif phase in ("test", "review") and ran_bash_ok and not any(
-                not r.get("ok", False) for r in tool_results if str(r.get("name", "")) == "bash"
-            ):
-                should_advance = True
+            _has_subtasks_s = bool(self._active_plan_worker_todo_rows(
+                str(current.get("id", "") or ""), role=""
+            ))
+            _can_use_phase_heuristic = subtasks_done or not _has_subtasks_s
+            if _can_use_phase_heuristic:
+                if phase in ("research", "design") and validation_ok:
+                    should_advance = True
+                elif phase == "implement" and (
+                    (wrote_files and validation_ok_current)
+                    or (bb_sig["has_write"] and validation_ok_blackboard)
+                ):
+                    should_advance = True
+                elif phase in ("test", "review") and (
+                    (ran_bash_ok and validation_ok_current)
+                    or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+                ):
+                    should_advance = True
         # Also check if the agent explicitly mentioned step completion
         if not should_advance:
             # Check last assistant message for step completion signals
@@ -13352,16 +14295,17 @@ body{padding:18px}
                     break
             step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
                                  "next step", "下一步", "proceed to step", "进入下一")
-            if any(sig in last_text for sig in step_done_signals):
+            if validation_ok and any(sig in last_text for sig in step_done_signals):
                 should_advance = True
         if should_advance:
-            evidence = f"single-agent auto-advance: phase={phase}, wrote={wrote_files}, bash_ok={ran_bash_ok}"
+            evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
             self._advance_plan_step(evidence=evidence, actor="single")
             try:
                 self._inject_current_plan_step_execution_hints()
             except Exception:
                 pass
         else:
+            self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
@@ -17537,6 +18481,7 @@ body{padding:18px}
         role_key = self._sanitize_agent_role(role) or "developer"
         skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
+        engineering_note = self._engineering_execution_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
@@ -17548,6 +18493,7 @@ body{padding:18px}
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{code_note + ' ' if code_note else ''}"
+            f"{engineering_note + ' ' if engineering_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -17588,7 +18534,9 @@ body{padding:18px}
                 "For runtime errors: identify the traceback, exception type, and the triggering line. "
                 "For test failures: identify which test failed, the assertion, expected vs actual. "
                 "For lint/type errors: identify the rule violation and exact location. "
-                "4) When sending fix_request via ask_colleague, you MUST include: "
+                "4) Do not approve based only on created files. Require observable evidence such as exit codes, test summaries, API responses, screenshots, or parsed results. "
+                "5) Do not declare success until at least one fix-and-verify cycle has completed. "
+                "6) When sending fix_request via ask_colleague, you MUST include: "
                 "the exact error output, the file and line number, the root cause analysis, "
                 "the error category (compilation/runtime/test/lint/build/deploy), "
                 "and the precise fix (what to change FROM and TO). "
@@ -17613,15 +18561,17 @@ body{padding:18px}
             "4) If edit_file fails 'text not found': IMMEDIATELY re-read the file, compare whitespace, retry with exact content. "
             "5) If edit_file fails 2+ times on same file: switch to write_file to rewrite entire file. "
             "6) After every successful edit, run build/test to verify. "
-            "NEVER loop on read_file without attempting a concrete edit_file or write_file call. "
+            "NEVER loop on read_file without attempting a concrete edit_file, write_file, path reconciliation, or verification call. "
             "PROBLEM-SOLVING (critical): "
             "When you discover missing files, broken imports, or incomplete source code: "
             "A) Think deeply about what the missing content should contain based on ALL available context "
             "(documentation, Makefile, imports, existing code patterns, architecture docs). "
             "B) CREATE the missing files yourself using write_file — do not wait or re-read. "
             "C) If compilation fails due to missing dependencies, write stub implementations. "
-            "D) NEVER re-read the same directory/file more than twice — after 2 reads, you MUST act. "
-            "E) If truly blocked, explain WHY to the user and propose alternatives. "
+            "D) If read_file or bash says a path is missing, empty, or mismatched, reconcile the path against uploads, recent files, and close matches before trying again. "
+            "E) NEVER re-read the same directory/file more than twice — after 2 reads, you MUST act. "
+            "F) Do not declare success until at least one fix-and-verify cycle is complete and the evidence is observable. "
+            "G) If truly blocked, explain WHY to the user and propose alternatives. "
         )
 
     def _seed_multi_agent_contexts_if_needed(self, user_text: str = ""):
@@ -17688,29 +18638,71 @@ body{padding:18px}
             )
 
     def _todo_write_rescue(self, args: dict) -> str:
+        """Rescue todo writer — accepts both strings and dicts, auto-normalizes.
+        FIXED: Now preserves status from incoming items (especially 'completed')
+        instead of resetting everything to 'pending'."""
         raw_items = args.get("items", [])
         if not isinstance(raw_items, list) or not raw_items:
             raise ValueError("items must be a non-empty array")
-        limited = raw_items[:7]
+        limited = raw_items[:12]  # Allow more items (was 7) — plans can have 5+ subtasks
         active_step = self._get_active_plan_step()
         active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
         owner_hint = self._current_plan_worker_owner()
         clean_items = []
+        _status_alias = {
+            "todo": "pending", "doing": "in_progress", "inprogress": "in_progress",
+            "in-progress": "in_progress", "done": "completed", "finish": "completed",
+            "finished": "completed",
+        }
         for idx, item in enumerate(limited):
             if isinstance(item, dict):
                 content = str(item.get("content", item.get("text", item.get("title", "")))).strip()
                 owner = str(item.get("owner", "") or owner_hint).strip().lower()
                 parent_step_id = trim(str(item.get("parent_step_id", "") or active_step_id), 20)
+                # Preserve status from incoming dict (critical for subtask state tracking)
+                raw_status = str(item.get("status", item.get("state", "pending"))).strip().lower()
+                status = _status_alias.get(raw_status, raw_status)
+                if status not in {"pending", "in_progress", "completed"}:
+                    status = "pending"
             else:
                 content = str(item).strip()
                 owner = owner_hint
                 parent_step_id = active_step_id
+                # Parse status from string prefix markers:
+                # "✅ task" / "[x] task" / "[done] task" / "[completed] task" → completed
+                # "▶ task" / "[>] task" / "[doing] task" / "[in_progress] task" → in_progress
+                # "⬜ task" / "[ ] task" / "[pending] task" / "[todo] task" → pending
+                import re as _re_status
+                _prefix_m = _re_status.match(
+                    r'^(?:'
+                    r'[\u2705\u2611]\s*'                           # ✅ ☑
+                    r'|\[x\]\s*|\[done\]\s*|\[completed\]\s*|\[finish(?:ed)?\]\s*'
+                    r'|\(done\)\s*|\(completed\)\s*|\(x\)\s*'
+                    r')',
+                    content, _re_status.IGNORECASE
+                )
+                _prefix_ip = _re_status.match(
+                    r'^(?:'
+                    r'[\u25b6\u25ba\u27a1]\s*'                    # ▶ ► ➡
+                    r'|\[>\]\s*|\[doing\]\s*|\[in.?progress\]\s*'
+                    r'|\(doing\)\s*|\(in.?progress\)\s*'
+                    r')',
+                    content, _re_status.IGNORECASE
+                )
+                if _prefix_m:
+                    status = "completed"
+                    content = content[_prefix_m.end():].strip()
+                elif _prefix_ip:
+                    status = "in_progress"
+                    content = content[_prefix_ip.end():].strip()
+                else:
+                    status = "pending"
             content = normalize_work_text(content) or content
             if not content:
                 continue
             row = {
                 "content": content,
-                "status": "pending",
+                "status": status,
             }
             if owner in {"developer", "explorer", "reviewer"}:
                 row["owner"] = owner
@@ -17719,10 +18711,18 @@ body{padding:18px}
             clean_items.append(row)
         if not clean_items:
             raise ValueError("no valid todo item text")
-        in_progress_index = int(args.get("in_progress_index", 0) or 0)
-        if in_progress_index < 0 or in_progress_index >= len(clean_items):
-            in_progress_index = 0
-        clean_items[in_progress_index]["status"] = "in_progress"
+        # Only apply in_progress_index if NO items already have in_progress status
+        has_in_progress = any(r["status"] == "in_progress" for r in clean_items)
+        if not has_in_progress:
+            in_progress_index = int(args.get("in_progress_index", 0) or 0)
+            if in_progress_index < 0 or in_progress_index >= len(clean_items):
+                in_progress_index = 0
+            # Only set in_progress on a pending item
+            for i, r in enumerate(clean_items):
+                if r["status"] == "pending":
+                    if i >= in_progress_index:
+                        r["status"] = "in_progress"
+                        break
         if active_step is not None:
             return self._merge_plan_worker_todo_items(clean_items, role=owner_hint)
         if self._is_multi_agent_mode() and owner_hint in {"developer", "explorer", "reviewer"}:
@@ -18375,6 +19375,16 @@ body{padding:18px}
 
     def _dispatch_tool_inner(self, name: str, args: dict, role_key: str = "") -> str:
         """Inner tool dispatcher — all tool logic lives here."""
+        # Fix 5d: Reset TodoWrite loop counter on non-TodoWrite tool calls
+        if name not in ("TodoWrite", "TodoWriteRescue") and hasattr(self, '_todowrite_step_counter'):
+            try:
+                _rst_step = self._get_active_plan_step()
+                if isinstance(_rst_step, dict):
+                    _rst_id = str(_rst_step.get("id", "") or "")
+                    if _rst_id:
+                        self._todowrite_step_counter.pop(_rst_id, None)
+            except Exception:
+                pass
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
@@ -18568,6 +19578,50 @@ body{padding:18px}
                 result = self._merge_owner_scoped_todo_items(items, role=str(role_key))
             else:
                 result = self.todo.update(args["items"])
+            # Fix 1: Auto-advance plan step when all subtasks are completed
+            # This handles the case where the worker's last turn only calls TodoWrite
+            # and _post_execution_plan_step_check would miss it due to no "real" tool evidence
+            if has_plan_steps:
+                try:
+                    _as = self._get_active_plan_step()
+                    if isinstance(_as, dict):
+                        _as_id = str(_as.get("id", "") or "")
+                        if _as_id and self._step_subtasks_all_completed(_as):
+                            _acc_ev = self._collect_accumulated_step_evidence(_as)
+                            if _acc_ev and _acc_ev != "accumulated-step-evidence":
+                                # Has real evidence — auto-advance
+                                self._advance_plan_step(
+                                    evidence=_acc_ev or "subtasks-all-completed",
+                                    actor=str(role_key or "developer"),
+                                )
+                            elif self._step_has_accumulated_evidence(_as, bb):
+                                self._advance_plan_step(
+                                    evidence="subtasks-all-completed",
+                                    actor=str(role_key or "developer"),
+                                )
+                except Exception:
+                    pass
+            # Fix 5b: TodoWrite loop detection — force-advance after 3 consecutive calls
+            if has_plan_steps:
+                try:
+                    _as5 = self._get_active_plan_step()
+                    if isinstance(_as5, dict):
+                        _as5_id = str(_as5.get("id", "") or "")
+                        if _as5_id:
+                            if not hasattr(self, '_todowrite_step_counter'):
+                                self._todowrite_step_counter = {}
+                            cnt = self._todowrite_step_counter.get(_as5_id, 0) + 1
+                            self._todowrite_step_counter[_as5_id] = cnt
+                            if (cnt >= 3
+                                    and self._step_subtasks_all_completed(_as5)
+                                    and self._step_has_accumulated_evidence(_as5, bb)):
+                                # Force advance — worker is stuck in a loop AND step has real evidence
+                                self._advance_plan_step(
+                                    evidence="force-advance:todowrite-loop-detected",
+                                    actor=str(role_key or "developer"),
+                                )
+                except Exception:
+                    pass
             # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
             # This fires in ALL modes (single/sync/plan) when developer writes todos
             try:
@@ -20340,7 +21394,7 @@ body{padding:18px}
         })
         self._emit("message", {
             "role": "assistant",
-            "text": trim(bubble_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
+            "text": trim(bubble_text, int(PLAN_MESSAGE_EVENT_MAX_CHARS)),
             "summary": "plan-mode proposal",
             "agent_role": "planner",
         })
@@ -20860,6 +21914,9 @@ body{padding:18px}
             f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
             f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
             f"- Each step should be completable in 1-3 tool calls\n"
+            f"- Every major step must include an explicit acceptance signal: how to know the step is done.\n"
+            f"- Acceptance signals must use observable evidence such as exit code, test summary, API response, rendered output, parsed rows, numerical thresholds, or screenshot/result inspection.\n"
+            f"- File creation alone is NOT valid acceptance evidence.\n"
             f"\nSTEP STRUCTURE — MAJOR STEPS WITH SUB-STEPS:\n"
             f"Organize steps into MAJOR numbered groups. Each major step has:\n"
             f"  1) A summary title line: \"N. Summary Title\" (e.g., \"1. Project Initialization\")\n"
@@ -20899,6 +21956,8 @@ body{padding:18px}
             "- Include compile/build/lint verification steps after implementation steps.\n"
             "- Include a dedicated testing step with SPECIFIC run commands (e.g. `python -m pytest`, `npm test`) before final review.\n"
             "- Testing step sub-steps must end with: actually RUNNING the tests and checking exit code, not just writing test files.\n"
+            "- Testing steps must include expected results or pass criteria (for example: exit code 0, `3 passed`, HTTP 200 with required fields, rendered page shows target widget).\n"
+            "- Non-test implementation steps must also state the validation artifact to inspect before the step can be treated as done.\n"
             "- For large plans (10+ steps), insert intermediate test checkpoints.\n"
             "- If the task modifies existing code, include a regression test step.\n"
             "- The LAST step must include a sub-step: 'Generate delivery report: summarize what was built, how to run it, and key outputs.'\n"
@@ -21054,7 +22113,7 @@ body{padding:18px}
         grouped_steps = self._group_plan_steps(raw_steps if isinstance(raw_steps, list) else [])
         plan_todos: list[dict] = []
         for i, step in enumerate(grouped_steps[:max(1, int(limit))]):
-            step_text = trim(str(step or "").strip(), 1500)
+            step_text = trim(str(step or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
             if not step_text:
                 continue
             step_lines = step_text.split("\n")
@@ -21068,6 +22127,7 @@ body{padding:18px}
                     "category": "plan_step",
                     "plan_step_index": i,
                     "created_at": float(now_ts()),
+                    "activated_at": float(now_ts()) if not plan_todos else None,
                     "completed_at": None,
                     "completed_by": "",
                     "evidence": "",
@@ -21136,8 +22196,8 @@ body{padding:18px}
         bb = self._ensure_blackboard()
         plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         plan_choice = str(plan.get("chosen", "") or choice_id).strip() or choice_id
-        title = trim(str(plan.get("title", "") or "").strip(), 240)
-        summary = trim(str(plan.get("summary", "") or "").strip(), 1200)
+        title = trim(str(plan.get("title", "") or "").strip(), 800)
+        summary = trim(str(plan.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
         if not title or not summary:
             proposal = self.runtime_plan_proposal or {}
             chosen = next(
@@ -21148,9 +22208,9 @@ body{padding:18px}
                 None,
             )
             if not title:
-                title = trim(str((chosen or {}).get("title", "") or plan_choice).strip(), 240)
+                title = trim(str((chosen or {}).get("title", "") or plan_choice).strip(), 800)
             if not summary:
-                summary = trim(str((chosen or {}).get("summary", "") or "").strip(), 1200)
+                summary = trim(str((chosen or {}).get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
         todos = bb.get("project_todos", [])
         plan_todos = [t for t in todos if t.get("category") == "plan_step"]
         if not plan_todos and isinstance(plan.get("steps"), list):
@@ -21222,11 +22282,11 @@ body{padding:18px}
         return self._write_plan_file(content)
 
     def _format_plan_bubble_preselection(self, proposal: dict) -> str:
-        """Condensed bubble for UI (under PLAN_BUBBLE_MAX_CHARS). No full step listing."""
+        """Condensed bubble for UI. Keeps major details, but is still shorter than plan.md."""
         lines = [self._ui_text("plan_bubble_title")]
         context = str(proposal.get("context", "") or "").strip()
         if context:
-            lines.append(self._ui_text("plan_bubble_background", context=trim(context, 300)))
+            lines.append(self._ui_text("plan_bubble_background", context=trim(context, 1200)))
         recommended = str(proposal.get("recommended", "") or "").strip()
         options = proposal.get("options", [])
         if not isinstance(options, list):
@@ -21243,7 +22303,7 @@ body{padding:18px}
             lines.append(header)
             summary = str(opt.get("summary", "") or "").strip()
             if summary:
-                lines.append(trim(summary, 200))
+                lines.append(trim(summary, 800))
             steps = opt.get("steps", [])
             step_count = len(steps) if isinstance(steps, list) else 0
             risk = str(opt.get("risk", "") or "").strip()
@@ -21674,8 +22734,8 @@ body{padding:18px}
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
-        chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 240)
-        chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), 1200)
+        chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
+        chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
         # Preserve current complexity unless the user explicitly changes it elsewhere.
         _current_complexity = trim(
             str(
@@ -22998,6 +24058,22 @@ body{padding:18px}
                                 "ts": now_ts(),
                             }
                         )
+                        # Auto-load debugging skill on code/compilation/test failures
+                        _code_error_keywords = ("bash", "compile", "syntax", "test", "build", "traceback")
+                        _is_code_error = any(
+                            kw in str(last_fault_reason or "").lower()
+                            for kw in _code_error_keywords
+                        )
+                        if _is_code_error:
+                            _bb_skills = self._ensure_blackboard().get("loaded_skills", {})
+                            if isinstance(_bb_skills, dict) and "systematic-debugging" not in _bb_skills:
+                                try:
+                                    self._load_skill_with_cache(
+                                        "systematic-debugging",
+                                        load_source="auto:code-error-recovery"
+                                    )
+                                except Exception:
+                                    pass
                         self._emit(
                             "status",
                             {

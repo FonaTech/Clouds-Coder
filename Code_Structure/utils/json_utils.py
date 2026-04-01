@@ -228,12 +228,12 @@ TOOLS = [
     ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     tool_def("edit_file", "Edit a file by replacing first match.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
-    tool_def("TodoWrite", "Update todo list.", {"items": {"type": "array", "items": {"type": "object"}}}, ["items"]),
+    tool_def("TodoWrite", "Update todo list. Items can be strings or objects with content/status/owner fields.", {"items": {"type": "array", "items": {}}}, ["items"]),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer when TodoWrite keeps failing/repeating. Accepts simple string items and auto-normalizes schema.",
+        "Fallback todo writer. Accepts strings with status prefixes: '[x] task' or '✅ task' = completed, '[>] task' = in_progress, plain text = pending. Also accepts dicts with status field.",
         {
-            "items": {"type": "array", "items": {"type": "string"}},
+            "items": {"type": "array", "items": {}},
             "in_progress_index": {"type": "integer"},
         },
         ["items"],
