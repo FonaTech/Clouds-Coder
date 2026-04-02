@@ -6,7 +6,7 @@ import base64
 import json
 import re
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import DEFAULT_REQUEST_TIMEOUT, OLLAMA_THINKING_TOOL_BUFFER, SAMPLE_AUDIO_WAV_B64, SAMPLE_IMAGE_PNG_B64, SAMPLE_VIDEO_MP4_B64

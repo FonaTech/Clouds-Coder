@@ -12,7 +12,7 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import OFFLINE_JS_LIB_CATALOG, OFFLINE_JS_LIB_INDEX_FILE, OFFLINE_JS_LIB_README_FILE

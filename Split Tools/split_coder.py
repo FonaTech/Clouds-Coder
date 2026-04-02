@@ -979,14 +979,24 @@ class CodeGenerator:
         parts.append(self.HEADER_TEMPLATE)
 
         referenced_names = self.dep_analyzer.compute_referenced_names(module_nodes)
-        import_lines = self.analyzer.select_import_lines(referenced_names)
+        dep_map = self.dep_analyzer.compute_dependency_map(module_path, module_nodes)
+        cross_imported_names: Set[str] = set()
+        for names in dep_map.values():
+            cross_imported_names.update(names)
+        import_lines = self.analyzer.select_import_lines(referenced_names - cross_imported_names)
         compact = self._compact_imports("\n".join(import_lines))
         if compact:
             parts.append(compact)
             parts.append("")
 
         # Cross-module imports
-        cross_imports = self.dep_analyzer.compute_imports(module_path, module_nodes)
+        cross_imports = []
+        for dep_mod, names in sorted(dep_map.items()):
+            if not names:
+                continue
+            rel = self.dep_analyzer._relative_import(module_path, dep_mod)
+            names_str = ", ".join(sorted(names))
+            cross_imports.append(f"from {rel} import {names_str}")
         if cross_imports:
             parts.append("# ── cross-module imports ─────────────────────────────────────────────────")
             parts.extend(cross_imports)

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import OPENAI_COMPAT_PROVIDER_NAMES, OPENAI_LIKE_PROVIDER_NAMES

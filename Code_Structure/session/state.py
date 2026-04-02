@@ -29,7 +29,7 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..agent.background import BackgroundManager

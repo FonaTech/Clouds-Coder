@@ -10,7 +10,6 @@ import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..app.context import AppContext
