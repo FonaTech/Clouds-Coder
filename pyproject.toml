@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clouds-coder"
-version = "2026.4.2"
+version = "2026.4.2.1"
 description = "Clouds Coder: local-first Cloud CLI coder runtime with Web UI and Skills Studio."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ classifiers = [
 ]
 dependencies = [
   "anthropic>=0.25.0",
+  "certifi>=2024.2.2",
   "python-dotenv>=1.0.0"
 ]
 
@@ -45,3 +46,10 @@ clouds-coder = "Clouds_Coder:main"
 
 [tool.setuptools]
 py-modules = ["Clouds_Coder"]
+
+[tool.ruff]
+exclude = [
+  "build",
+  "dist",
+  "*.egg-info",
+]
