@@ -37,7 +37,6 @@ classifiers = [
 ]
 dependencies = [
   "anthropic>=0.25.0",
-  "certifi>=2024.2.2",
   "python-dotenv>=1.0.0"
 ]
 
@@ -46,10 +45,3 @@ clouds-coder = "Clouds_Coder:main"
 
 [tool.setuptools]
 py-modules = ["Clouds_Coder"]
-
-[tool.ruff]
-exclude = [
-  "build",
-  "dist",
-  "*.egg-info",
-]
