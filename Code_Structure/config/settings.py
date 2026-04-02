@@ -10,10 +10,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MEDIA_CAPABILITY_KEYS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES, USER_COMPLEXITY_COMPLEX_TOKENS, USER_COMPLEXITY_SIMPLE_TOKENS
+from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MEDIA_CAPABILITY_KEYS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES, USER_COMPLEXITY_COMPLEX_TOKENS, USER_COMPLEXITY_SIMPLE_TOKENS
 from .paths import WORKDIR
 from ..llm.utils import _is_http_url, _resolve_local_path, complete_chat_endpoint, extract_base_url, is_openai_like_provider, normalize_openai_compat_provider_name, strip_thinking_content
 from ..skills.store import ensure_embedded_skills
+from ..utils.http import urlopen
 from ..utils.json_utils import parse_json_object
 from ..utils.misc import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, normalize_timeout_seconds, sanitize_profile_id
 from ..utils.text import trim
@@ -362,6 +363,54 @@ def extract_daily_session_limit_setting(raw: object) -> int | None:
         for key in keys:
             if key in section:
                 return _parse_non_negative_int(section.get(key))
+    return None
+
+def extract_shell_command_timeout_setting(raw: object) -> int | None:
+    """Read shell/bash command timeout from config dict.
+
+    Accepted keys:
+      - shell_command_timeout
+      - shell_timeout
+      - bash_timeout
+      - command_timeout
+    Sections searched: top-level, then 'startup' / 'runtime' / 'shell' / 'tools' / 'execution'.
+    Returns a clamped positive integer, or None if no setting is present.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _parse_timeout(value: object) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            text = str(value).strip()
+            if not text:
+                return None
+            return normalize_timeout_seconds(
+                text,
+                minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+                maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+                fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+
+    keys = (
+        "shell_command_timeout",
+        "shell_timeout",
+        "bash_timeout",
+        "command_timeout",
+    )
+    for key in keys:
+        if key in raw:
+            return _parse_timeout(raw.get(key))
+    for section_key in ("startup", "runtime", "shell", "tools", "execution"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _parse_timeout(section.get(key))
     return None
 
 def default_multimodal_capabilities() -> dict[str, bool]:

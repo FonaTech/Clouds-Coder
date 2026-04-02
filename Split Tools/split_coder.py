@@ -178,6 +178,12 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "parse_front_matter", "make_numbered_diff", "make_unified_diff", "render_numbered_diff_text",
         "_compress_rows_keep_hotspot", "_hotspot_index", "_row_is_hot", "_skip_row",
     ],
+    "utils/http.py": [
+        "_URL_OPEN_ORIGINAL",
+        "_HTTP_SSL_CONTEXT",
+        "_shared_http_ssl_context",
+        "urlopen",
+    ],
     "utils/media.py": [
         "guess_mime_from_name", "_convert_image_to_safe_format", "guess_ext_from_mime",
     ],

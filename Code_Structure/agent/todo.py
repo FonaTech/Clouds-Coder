@@ -89,13 +89,17 @@ class TodoManager:
             elif isinstance(item, dict):
                 raw = item
             else:
-                raise ValueError(f"item {idx}: invalid type")
+                # Tolerant: convert to string instead of raising
+                try:
+                    raw = {"content": str(item).strip(), "status": "pending"}
+                except Exception:
+                    continue  # Skip unparseable items
             raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
             content = normalize_work_text(raw_content)
             if not content:
                 content = raw_content
             if not content:
-                raise ValueError(f"item {idx}: content required")
+                continue  # Skip empty items instead of raising
             raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
             status = status_alias.get(raw_status, raw_status or "pending")
             if status not in {"pending", "in_progress", "completed"}:

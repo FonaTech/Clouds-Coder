@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import OPENAI_COMPAT_PROVIDER_NAMES, OPENAI_LIKE_PROVIDER_NAMES
+from ..utils.http import urlopen
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.text import trim
 

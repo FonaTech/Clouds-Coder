@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, EXECUTION_MODE_SYNC, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, TOKEN_THRESHOLD
+from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, EXECUTION_MODE_SYNC, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, TOKEN_THRESHOLD
 from ..config.paths import LLM_CONFIG_PATH
 from ..config.settings import infer_model_multimodal_capabilities, merge_multimodal_capabilities, normalize_execution_mode, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles
 from ..llm.client import OllamaClient
@@ -41,6 +41,7 @@ class SessionManager:
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
+        shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -85,6 +86,12 @@ class SessionManager:
             minimum=MIN_RUN_TIMEOUT_SECONDS,
             maximum=MAX_RUN_TIMEOUT_SECONDS,
             fallback=MAX_RUN_SECONDS,
+        )
+        self.shell_command_timeout_seconds = normalize_timeout_seconds(
+            shell_command_timeout_seconds if shell_command_timeout_seconds is not None else DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
@@ -368,6 +375,12 @@ class SessionManager:
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
+        sess.shell_command_timeout_seconds = normalize_timeout_seconds(
+            self.shell_command_timeout_seconds,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
         sess._persist()
@@ -428,6 +441,7 @@ class SessionManager:
                 context_limit_locked=self.context_limit_locked,
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
+                shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -477,6 +491,7 @@ class SessionManager:
                 context_limit_locked=self.context_limit_locked,
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
+                shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,

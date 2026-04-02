@@ -18,6 +18,7 @@ from ..config.constants import BUILTIN_CLAWHUB_SKILLS_VERSION, EMBEDDED_CLAWHUB_
 from ..config.paths import WORKDIR
 from ..llm.utils import _is_http_url
 from ..utils.files import _render_offline_js_catalog_md, safe_path, try_read_text
+from ..utils.http import urlopen
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.misc import _meta_string_list, _module_exists, now_ts
 from ..utils.text import parse_front_matter, trim
@@ -1094,9 +1095,11 @@ Use this skill when:
 6. Report rewritten count, copied files, and unresolved URLs.
 
 ## Rules
+- Treat `./js_lib` and `/js_lib/...` as workspace lookup locations only, not final browser-facing URLs.
 - Keep `./js` per HTML location (do not hardcode global absolute paths).
 - Keep file names deterministic and safe (`[A-Za-z0-9._-]`).
 - Preserve existing relative local script paths if already offline-ready.
+- Final HTML must not point to `/js_lib/...`, `/assets/js_lib/...`, or other virtual asset aliases; copy first, then use plain relative paths.
 
 ## Output Contract
 Return:

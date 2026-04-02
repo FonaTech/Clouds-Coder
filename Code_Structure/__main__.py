@@ -8,9 +8,9 @@ import threading
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from .app.context import AppContext
-from .config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_PORT_OFFSET, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_PORT_OFFSET, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, TOKEN_THRESHOLD, UI_LANGUAGE_LABELS, UI_STYLE_LABELS
+from .config.constants import AGENT_MAX_OUTPUT_TOKENS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_PORT_OFFSET, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, OFFLINE_JS_LIB_CATALOG, RAG_ADMIN_PORT_OFFSET, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, TOKEN_THRESHOLD, UI_LANGUAGE_LABELS, UI_STYLE_LABELS
 from .config.paths import LLM_CONFIG_PATH, REPO_ROOT, WORKDIR
-from .config.settings import _to_bool_like, extract_daily_session_limit_setting, extract_js_lib_download_setting, extract_show_upload_list_setting, extract_ui_style_setting, load_llm_config_from_source, load_web_ui_config_file, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path, select_preferred_skills_root
+from .config.settings import _to_bool_like, extract_daily_session_limit_setting, extract_js_lib_download_setting, extract_shell_command_timeout_setting, extract_show_upload_list_setting, extract_ui_style_setting, load_llm_config_from_source, load_web_ui_config_file, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path, select_preferred_skills_root
 from .llm.utils import list_ollama_models
 from .server.handlers import AgentHTTPServer, CodeAdminHandler, Handler, RagAdminHandler, SkillsHandler
 from .skills.store import ensure_embedded_skills_at_root, ensure_runtime_skills
@@ -44,6 +44,25 @@ def main():
         help=(
             "Global timeout scheduler in seconds "
             f"(minimum {MIN_RUN_TIMEOUT_SECONDS}, model-active time excluded)"
+        ),
+    )
+    parser.add_argument(
+        "--shell_command_timeout",
+        "--shell-command-timeout",
+        "--bash_timeout",
+        "--bash-timeout",
+        "--command_timeout",
+        "--command-timeout",
+        dest="shell_command_timeout",
+        default=None,
+        type=int,
+        help=(
+            "Per-command shell/bash timeout in seconds "
+            f"(default {DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS}; allowed "
+            f"{MIN_SHELL_COMMAND_TIMEOUT_SECONDS}-{MAX_SHELL_COMMAND_TIMEOUT_SECONDS}). "
+            "Independent from the global run timeout. Also configurable via --config keys "
+            "shell_command_timeout / shell_timeout / bash_timeout / command_timeout and env "
+            "AGENT_SHELL_COMMAND_TIMEOUT / AGENT_BASH_TIMEOUT / AGENT_COMMAND_TIMEOUT."
         ),
     )
     parser.add_argument(
@@ -195,9 +214,10 @@ def main():
         default="",
         help=(
             "LLM config source (URL or local file path). "
-            "Also reads startup keys like show_upload_list, download_js_lib and "
+            "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
-            "max_daily_sessions_per_ip / session_daily_limit)."
+            "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
+            "shell_timeout / bash_timeout / command_timeout)."
         ),
     )
     parser.add_argument(
@@ -332,6 +352,7 @@ def main():
         arbiter_enabled=True,
         show_upload_list=None,
         download_js_lib=None,
+        shell_command_timeout=None,
     )
     args = parser.parse_args()
     ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
@@ -361,6 +382,7 @@ def main():
     )
     resolved_show_upload_list = False
     resolved_daily_session_limit_per_ip = 0
+    resolved_shell_command_timeout = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -387,6 +409,14 @@ def main():
             external_daily_session_limit = extract_daily_session_limit_setting(external_config)
             if external_daily_session_limit is not None:
                 resolved_daily_session_limit_per_ip = int(external_daily_session_limit)
+            external_shell_command_timeout = extract_shell_command_timeout_setting(external_config)
+            if external_shell_command_timeout is not None:
+                resolved_shell_command_timeout = normalize_timeout_seconds(
+                    external_shell_command_timeout,
+                    minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                )
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -400,9 +430,25 @@ def main():
     web_ui_daily_session_limit = extract_daily_session_limit_setting(web_ui_config)
     if web_ui_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = int(web_ui_daily_session_limit)
+    web_ui_shell_command_timeout = extract_shell_command_timeout_setting(web_ui_config)
+    if web_ui_shell_command_timeout is not None:
+        resolved_shell_command_timeout = normalize_timeout_seconds(
+            web_ui_shell_command_timeout,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
     cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
     if cli_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
+    cli_shell_command_timeout = getattr(args, "shell_command_timeout", None)
+    if cli_shell_command_timeout is not None:
+        resolved_shell_command_timeout = normalize_timeout_seconds(
+            cli_shell_command_timeout,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -457,6 +503,7 @@ def main():
             f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
             f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
         )
+    print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
     if resolved_live_input_delay_write != requested_live_input_delay_write:
@@ -639,6 +686,7 @@ def main():
         ctx_limit_locked,
         resolved_max_rounds,
         resolved_run_timeout,
+        resolved_shell_command_timeout,
         resolved_auto_model_switch,
         resolved_arbiter_enabled,
         resolved_arbiter_model,
