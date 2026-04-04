@@ -27,6 +27,7 @@ import subprocess
 import symtable
 import sys
 import textwrap
+import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -38,8 +39,8 @@ from typing import Dict, List, Optional, Set, Tuple
 @dataclass
 class NodeInfo:
     """Metadata for one top-level AST node."""
-    name: str                     # Symbol name (class/function name, or const assignment target)
-    kind: str                     # "class" | "function" | "constant" | "assignment" | "other"
+    name: str                     # Symbol name (class/function name, or synthetic expression label)
+    kind: str                     # "class" | "function" | "constant" | "assignment" | "expression" | "other"
     lineno: int                   # Start line (1-based)
     end_lineno: int               # End line (1-based)
     source_hash: str = ""         # SHA256 of the source lines
@@ -140,6 +141,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         # UPPER_CASE constants
         "~^[A-Z][A-Z0-9_]{3,}$",
         "APP_VERSION",
+        "_SHELL_AUTO_CONFIRM_PATTERNS",
         "_TOOL_TIMEOUT_MAP",
         "_DEFAULT_TOOL_TIMEOUT",
         "RUNTIME_CONTROL_HINT_PREFIXES",
@@ -152,6 +154,9 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     ],
     "config/settings.py": [
         "normalize_ui_language", "normalize_ui_style", "supported_ui_languages_payload",
+        "backend_i18n_text", "backend_role_label",
+        "infer_user_complexity_value", "normalize_task_complexity",
+        "task_complexity_rank", "task_complexity_at_least", "max_task_complexity",
         "normalize_execution_mode", "model_language_instruction", "_detect_os_shell_instruction",
         "resolve_web_ui_dir_path", "resolve_optional_file_path", "resolve_skills_root_path",
         "_count_skill_markdown_files", "select_preferred_skills_root",
@@ -171,9 +176,18 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     "utils/text.py": [
         "MAX_TOOL_OUTPUT", "SOCKET_NOISE_LINE_PATTERNS",
         "trim", "_fmt_export_ts", "_html_esc", "_text_to_minimal_pdf",
+        "normalize_embedded_newlines", "_map_todo_status_token",
+        "split_todo_status_text", "extract_todo_rows_from_text",
+        "infer_todo_status_from_text", "split_structured_todo_content",
         "normalize_work_text", "filter_runtime_noise_lines",
         "parse_front_matter", "make_numbered_diff", "make_unified_diff", "render_numbered_diff_text",
         "_compress_rows_keep_hotspot", "_hotspot_index", "_row_is_hot", "_skip_row",
+    ],
+    "utils/http.py": [
+        "_URL_OPEN_ORIGINAL",
+        "_HTTP_SSL_CONTEXT",
+        "_shared_http_ssl_context",
+        "urlopen",
     ],
     "utils/media.py": [
         "guess_mime_from_name", "_convert_image_to_safe_format", "guess_ext_from_mime",
@@ -189,7 +203,13 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     ],
     "utils/files.py": [
         "safe_path", "_safe_js_filename", "_sha256_bytes", "_sha256_file",
-        "_download_http_bytes", "offline_js_lib_root", "_render_offline_js_catalog_md",
+        "_normalize_js_lib_asset_ref", "_resolve_js_lib_asset_path",
+        "_discover_extra_js_lib_files", "_download_http_bytes",
+        "_offline_js_entry_relative_path", "_archive_member_relative_path",
+        "_path_size_bytes", "_extract_archive_to_dir",
+        "_package_required_paths", "_package_install_ready",
+        "_postprocess_offline_js_package", "_ensure_offline_js_package",
+        "offline_js_lib_root", "_render_offline_js_catalog_md",
         "load_offline_js_lib_index", "ensure_offline_js_libs",
         "_normalize_external_js_url", "is_external_js_src",
         "match_offline_js_catalog_by_url", "cache_external_js_url",
@@ -217,6 +237,9 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "strip_thinking_content", "check_ollama_model_ready", "list_loaded_ollama_models",
         "wake_ollama_model", "try_pull_ollama_model", "ordered_model_candidates",
         "pick_working_ollama_model", "extract_base_url", "complete_chat_endpoint",
+        "normalize_openai_compat_provider_name", "is_openai_compat_provider",
+        "is_openai_like_provider", "openai_compat_probe_headers",
+        "openai_compat_model_list_urls", "extract_openai_compat_model_ids",
         "_is_http_url", "_resolve_local_path",
         "_OLLAMA_TAG_CACHE", "_OLLAMA_TAG_CACHE_LOCK",
     ],
@@ -401,11 +424,11 @@ class ArchitectureAnalyzer:
                 results.append(info)
 
         elif isinstance(node, ast.Expr):
-            # Try block, string expression, etc.
+            # Top-level expression statements: dict updates, docstrings, registry calls, etc.
             end = node.end_lineno or node.lineno
             info = NodeInfo(
-                name=f"_expr_{node.lineno}",
-                kind="other",
+                name=self._expression_node_name(node),
+                kind="expression",
                 lineno=node.lineno,
                 end_lineno=end,
             )
@@ -443,6 +466,142 @@ class ArchitectureAnalyzer:
         if isinstance(node, ast.Attribute):
             return node.attr
         return ""
+
+    def _expression_node_name(self, node: ast.Expr) -> str:
+        base = self._expression_anchor_label(node)
+        return f"{base}_l{node.lineno}"
+
+    def _expression_anchor_label(self, node: ast.Expr) -> str:
+        value = node.value
+        if (
+            self.tree is not None
+            and self.tree.body
+            and self.tree.body[0] is node
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            return "module_docstring"
+        if isinstance(value, ast.Call):
+            tokens = self._anchor_tokens(value.func)
+            return "call_" + "_".join(tokens or ["anonymous"])
+        if isinstance(value, ast.Constant):
+            return self._literal_expression_label(value.value)
+        if isinstance(value, ast.Dict):
+            return "dict_literal"
+        if isinstance(value, ast.List):
+            return "list_literal"
+        if isinstance(value, ast.Tuple):
+            return "tuple_literal"
+        if isinstance(value, ast.Set):
+            return "set_literal"
+        if isinstance(value, ast.JoinedStr):
+            return "formatted_string"
+        if isinstance(value, ast.Compare):
+            return "comparison"
+        if isinstance(value, ast.BoolOp):
+            return "boolean_operation"
+        if isinstance(value, ast.BinOp):
+            return "binary_operation"
+        if isinstance(value, ast.UnaryOp):
+            return "unary_operation"
+        return f"{self._slugify_fragment(type(value).__name__) or 'value'}_expression"
+
+    def _anchor_tokens(self, node: ast.AST, depth: int = 0) -> List[str]:
+        if depth > 6:
+            return []
+        if isinstance(node, ast.Name):
+            token = self._slugify_fragment(node.id)
+            return [token] if token else []
+        if isinstance(node, ast.Attribute):
+            return self._merge_anchor_tokens(
+                self._anchor_tokens(node.value, depth + 1),
+                self._slugify_fragment(node.attr),
+            )
+        if isinstance(node, ast.Subscript):
+            return self._merge_anchor_tokens(
+                self._anchor_tokens(node.value, depth + 1),
+                self._anchor_tokens(node.slice, depth + 1),
+            )
+        if isinstance(node, ast.Call):
+            return self._merge_anchor_tokens(self._anchor_tokens(node.func, depth + 1), "result")
+        if isinstance(node, ast.Constant):
+            token = self._constant_anchor_token(node.value)
+            return [token] if token else []
+        if isinstance(node, (ast.Tuple, ast.List)):
+            tokens: List[str] = []
+            for elt in node.elts[:2]:
+                tokens = self._merge_anchor_tokens(tokens, self._anchor_tokens(elt, depth + 1))
+            return tokens
+        if isinstance(node, ast.Dict):
+            return ["dict"]
+        if isinstance(node, ast.Slice):
+            return ["slice"]
+        return []
+
+    @staticmethod
+    def _merge_anchor_tokens(*parts: object) -> List[str]:
+        merged: List[str] = []
+        for part in parts:
+            if not part:
+                continue
+            if isinstance(part, list):
+                items = part
+            else:
+                items = [part]
+            for item in items:
+                token = str(item or "").strip("_")
+                if not token:
+                    continue
+                if merged and merged[-1] == token:
+                    continue
+                merged.append(token)
+                if len(merged) >= 6:
+                    return merged
+        return merged
+
+    @staticmethod
+    def _literal_expression_label(value: object) -> str:
+        if isinstance(value, str):
+            return "string_literal"
+        if isinstance(value, bytes):
+            return "bytes_literal"
+        if isinstance(value, bool):
+            return "boolean_literal"
+        if isinstance(value, (int, float, complex)):
+            return "numeric_literal"
+        if value is None:
+            return "none_literal"
+        return "literal_value"
+
+    def _constant_anchor_token(self, value: object) -> str:
+        if isinstance(value, str):
+            token = self._slugify_fragment(value)
+            return token if token and token != "value" else "string"
+        if isinstance(value, bytes):
+            return "bytes"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return self._slugify_fragment(value)
+        if value is None:
+            return "none"
+        return self._slugify_fragment(type(value).__name__) or "value"
+
+    @staticmethod
+    def _slugify_fragment(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        normalized = normalized.lower()
+        normalized = re.sub(r"[^a-z0-9_]+", "_", normalized)
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        if not normalized:
+            digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+            return f"u_{digest}"
+        if normalized[0].isdigit():
+            normalized = f"n_{normalized}"
+        return normalized[:48]
 
     @staticmethod
     def _is_main_guard(node: ast.If) -> bool:
@@ -562,6 +721,7 @@ class ModuleRouter:
 
     def __init__(self, layout: Dict[str, List[str]]) -> None:
         self.layout = layout
+        self._fallback_classifier = AutoLayoutGenerator()
         # Pre-compile: list of (module_path, list_of_matchers)
         self._rules: List[Tuple[str, List[Tuple[str, object]]]] = []
         for mod_path, patterns in layout.items():
@@ -593,12 +753,67 @@ class ModuleRouter:
                 if kind == "regex" and matcher.search(name):
                     return mod_path
 
+        fallback_module = self._fallback_classifier._classify(node)
+        if fallback_module != "_unclassified.py":
+            return fallback_module
+
         return "_unclassified.py"
 
     def assign_all(self, nodes: List[NodeInfo]) -> None:
         """Assign target_module to all nodes in-place."""
         for node in nodes:
             node.target_module = self.route(node)
+        self._adopt_contextual_expression_nodes(nodes)
+
+    def _adopt_contextual_expression_nodes(self, nodes: List[NodeInfo]) -> None:
+        """Attach anonymous top-level expressions to the nearest classified neighbor."""
+        for index, node in enumerate(nodes):
+            if node.target_module != "_unclassified.py":
+                continue
+            if node.kind != "expression":
+                continue
+            contextual_module = self._nearest_contextual_module(nodes, index)
+            if contextual_module:
+                node.target_module = contextual_module
+
+    def _nearest_contextual_module(self, nodes: List[NodeInfo], index: int) -> str:
+        current = nodes[index]
+        prev_node = self._nearest_classified_neighbor(nodes, index, -1)
+        next_node = self._nearest_classified_neighbor(nodes, index, 1)
+
+        if prev_node and next_node and prev_node.target_module == next_node.target_module:
+            return prev_node.target_module
+
+        candidates: List[Tuple[int, int, str]] = []
+        if prev_node and prev_node.target_module:
+            gap = max(0, current.lineno - prev_node.end_lineno)
+            candidates.append((gap, 0, prev_node.target_module))
+        if next_node and next_node.target_module:
+            gap = max(0, next_node.lineno - current.end_lineno)
+            candidates.append((gap, 1, next_node.target_module))
+        if not candidates:
+            return ""
+
+        candidates.sort()
+        closest_gap, _, module = candidates[0]
+        return module if closest_gap <= 240 or len(candidates) == 1 else ""
+
+    @staticmethod
+    def _nearest_classified_neighbor(
+        nodes: List[NodeInfo],
+        index: int,
+        direction: int,
+    ) -> Optional[NodeInfo]:
+        cursor = index + direction
+        while 0 <= cursor < len(nodes):
+            candidate = nodes[cursor]
+            if candidate.kind == "import":
+                cursor += direction
+                continue
+            if candidate.target_module and candidate.target_module != "_unclassified.py":
+                return candidate
+            cursor += direction
+        return None
 
 
 # ─── Dependency Analyzer ──────────────────────────────────────────────────────
@@ -769,14 +984,24 @@ class CodeGenerator:
         parts.append(self.HEADER_TEMPLATE)
 
         referenced_names = self.dep_analyzer.compute_referenced_names(module_nodes)
-        import_lines = self.analyzer.select_import_lines(referenced_names)
+        dep_map = self.dep_analyzer.compute_dependency_map(module_path, module_nodes)
+        cross_imported_names: Set[str] = set()
+        for names in dep_map.values():
+            cross_imported_names.update(names)
+        import_lines = self.analyzer.select_import_lines(referenced_names - cross_imported_names)
         compact = self._compact_imports("\n".join(import_lines))
         if compact:
             parts.append(compact)
             parts.append("")
 
         # Cross-module imports
-        cross_imports = self.dep_analyzer.compute_imports(module_path, module_nodes)
+        cross_imports = []
+        for dep_mod, names in sorted(dep_map.items()):
+            if not names:
+                continue
+            rel = self.dep_analyzer._relative_import(module_path, dep_mod)
+            names_str = ", ".join(sorted(names))
+            cross_imports.append(f"from {rel} import {names_str}")
         if cross_imports:
             parts.append("# ── cross-module imports ─────────────────────────────────────────────────")
             parts.extend(cross_imports)
@@ -1009,6 +1234,68 @@ def _collect_top_level_names(path: Path) -> Set[str]:
     return names
 
 
+def _is_split_coder_generated_python_file(path: Path) -> bool:
+    if path.suffix != ".py" or not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            first_line = fh.readline()
+    except Exception:
+        return False
+    return first_line.startswith("# Auto-generated by split_coder.py")
+
+
+def _expected_python_output_paths(module_paths: List[str]) -> Set[str]:
+    expected: Set[str] = {"__init__.py"}
+    for rel_path in module_paths:
+        if rel_path == "_imports":
+            continue
+        expected.add(rel_path)
+        parts = rel_path.split("/")
+        for i in range(1, len(parts)):
+            expected.add("/".join(parts[:i]) + "/__init__.py")
+    return expected
+
+
+def _remove_stale_generated_python_files(output_dir: Path, keep_paths: Set[str]) -> List[str]:
+    removed: List[str] = []
+    if not output_dir.exists():
+        return removed
+
+    for path in sorted(
+        (p for p in output_dir.rglob("*.py") if "__pycache__" not in p.parts),
+        key=lambda p: (len(p.parts), p.as_posix()),
+        reverse=True,
+    ):
+        rel = path.relative_to(output_dir).as_posix()
+        if rel in keep_paths or not _is_split_coder_generated_python_file(path):
+            continue
+        try:
+            path.unlink()
+            removed.append(rel)
+        except FileNotFoundError:
+            continue
+
+    for path in sorted(
+        (p for p in output_dir.rglob("*") if p.is_dir() and "__pycache__" not in p.parts),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    ):
+        if path == output_dir:
+            continue
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        except Exception:
+            continue
+
+    return sorted(removed)
+
+
 def _clear_pycache_dirs(root: Path) -> List[str]:
     removed: List[str] = []
     if not root.exists():
@@ -1057,6 +1344,28 @@ def run_self_check(source_path: Path, output_dir: Path, *, expect_report: bool =
             print(f"         first error: {compile_errors[0]}")
         else:
             print(f"  [OK] py_compile passed for {len(py_files)} files")
+
+        manifest = SplitManifest.load(output_dir)
+        if manifest:
+            expected_non_init = {
+                entry.target_module
+                for entry in manifest.nodes
+                if entry.target_module not in {"_imports", "__init__.py"}
+                and not entry.target_module.endswith("/__init__.py")
+            }
+            stale_generated = [
+                path.relative_to(output_dir).as_posix()
+                for path in py_files
+                if path.name != "__init__.py"
+                and path.relative_to(output_dir).as_posix() not in expected_non_init
+                and _is_split_coder_generated_python_file(path)
+            ]
+            if stale_generated:
+                ok = False
+                print(f"  [FAIL] stale generated python files detected ({len(stale_generated)})")
+                print(f"         sample: {stale_generated[:5]}")
+            else:
+                print("  [OK] no stale generated python files detected")
 
         if expect_report:
             report_path = output_dir / report_name
@@ -1225,6 +1534,7 @@ class Splitter:
         for mp in self.layout:
             if mp.endswith("__init__.py") and mp not in modules:
                 all_target_modules.append(mp)
+        expected_python_paths = _expected_python_output_paths(sorted(set(all_target_modules)))
 
         for mod_path in sorted(set(all_target_modules)):
             if mod_path == "_imports":
@@ -1287,10 +1597,16 @@ class Splitter:
         if not self.dry_run:
             manifest.save(self.output_dir)
 
+        removed_stale: List[str] = []
+        if not self.dry_run:
+            removed_stale = _remove_stale_generated_python_files(self.output_dir, expected_python_paths)
+
         # ── Summary ────────────────────────────────────────────────────────
         print(f"\n{'─'*60}")
         print(f"  Written : {len(writer.written)} files")
         print(f"  Skipped : {len(writer.skipped)} unchanged files")
+        if removed_stale:
+            print(f"  Removed : {len(removed_stale)} stale generated files")
         print(f"  Output  : {self.output_dir}")
         print(f"{'─'*60}")
 
@@ -1327,8 +1643,15 @@ class AutoLayoutGenerator:
         "LLM_CONFIG_PATH": "config/paths.py",
         "REPO_ROOT": "config/paths.py",
         "detect_repo_root": "config/paths.py",
+        "_SHELL_AUTO_CONFIRM_PATTERNS": "config/constants.py",
         "MAX_TOOL_OUTPUT": "utils/text.py",
         "SOCKET_NOISE_LINE_PATTERNS": "utils/text.py",
+        "normalize_embedded_newlines": "utils/text.py",
+        "_map_todo_status_token": "utils/text.py",
+        "split_todo_status_text": "utils/text.py",
+        "extract_todo_rows_from_text": "utils/text.py",
+        "infer_todo_status_from_text": "utils/text.py",
+        "split_structured_todo_content": "utils/text.py",
         "_compress_rows_keep_hotspot": "utils/text.py",
         "_hotspot_index": "utils/text.py",
         "_row_is_hot": "utils/text.py",
@@ -1345,6 +1668,17 @@ class AutoLayoutGenerator:
         "DEFAULT_TIMEOUT_SECONDS": "utils/misc.py",
         "BENIGN_SOCKET_DEBUG_LOG_ENABLED": "utils/misc.py",
         "BENIGN_SOCKET_LOG_INTERVAL_SECONDS": "utils/misc.py",
+        "_normalize_js_lib_asset_ref": "utils/files.py",
+        "_resolve_js_lib_asset_path": "utils/files.py",
+        "_discover_extra_js_lib_files": "utils/files.py",
+        "_offline_js_entry_relative_path": "utils/files.py",
+        "_archive_member_relative_path": "utils/files.py",
+        "_path_size_bytes": "utils/files.py",
+        "_extract_archive_to_dir": "utils/files.py",
+        "_package_required_paths": "utils/files.py",
+        "_package_install_ready": "utils/files.py",
+        "_postprocess_offline_js_package": "utils/files.py",
+        "_ensure_offline_js_package": "utils/files.py",
         "detect_upload_parser_capabilities": "skills/store.py",
         "_render_cap_markdown": "skills/store.py",
         "_rag_safe_name": "rag/parsers.py",
@@ -1363,6 +1697,15 @@ class AutoLayoutGenerator:
         "_rag_chunk_text": "rag/parsers.py",
         "_code_language_from_name": "rag/parsers.py",
         "_code_is_test_path": "rag/parsers.py",
+        "backend_i18n_text": "config/settings.py",
+        "backend_role_label": "config/settings.py",
+        "infer_user_complexity_value": "config/settings.py",
+        "normalize_openai_compat_provider_name": "llm/utils.py",
+        "is_openai_compat_provider": "llm/utils.py",
+        "is_openai_like_provider": "llm/utils.py",
+        "openai_compat_probe_headers": "llm/utils.py",
+        "openai_compat_model_list_urls": "llm/utils.py",
+        "extract_openai_compat_model_ids": "llm/utils.py",
     }
 
     # Name prefix/suffix → module path
@@ -1444,6 +1787,12 @@ class AutoLayoutGenerator:
         ("merge_multimodal",       "config/settings.py"),
         ("parse_media_endpoints",  "config/settings.py"),
         ("load_llm_config",        "config/settings.py"),
+        ("infer_user_complexity",  "config/settings.py"),
+        ("normalize_openai_compat","llm/utils.py"),
+        ("is_openai_compat",       "llm/utils.py"),
+        ("is_openai_like",         "llm/utils.py"),
+        ("openai_compat_",         "llm/utils.py"),
+        ("extract_openai_compat",  "llm/utils.py"),
         ("_resolve_default_agent", "config/paths.py"),
         ("_migrate_legacy",        "config/paths.py"),
         ("now_ts",                 "utils/misc.py"),
@@ -1457,8 +1806,21 @@ class AutoLayoutGenerator:
         ("trim",                   "utils/text.py"),
         ("_html_esc",              "utils/text.py"),
         ("_text_to_minimal",       "utils/text.py"),
+        ("normalize_embedded_newlines", "utils/text.py"),
+        ("split_todo_status_text", "utils/text.py"),
+        ("extract_todo_rows_from_text", "utils/text.py"),
+        ("infer_todo_status_from_text", "utils/text.py"),
+        ("split_structured_todo_content", "utils/text.py"),
         ("normalize_work_text",    "utils/text.py"),
         ("ensure_generated_",      "skills/store.py"),
+    ]
+
+    FUNCTION_REGEX_RULES: List[Tuple[str, str]] = [
+        (r"^extract_.*_setting$", "config/settings.py"),
+        (r"^(?:load|parse)_.*config(?:_from_.*)?$", "config/settings.py"),
+        (r"^backend_(?:i18n|role)_.*$", "config/settings.py"),
+        (r"^resolve_.*(?:path|dir|root)$", "config/paths.py"),
+        (r"^(?:load|ensure|match|cache|offline|download|extract|resolve)_.*(?:js_lib|offline_js|external_js).*$", "utils/files.py"),
     ]
 
     def generate(self, nodes: List[NodeInfo]) -> Dict[str, List[str]]:
@@ -1504,6 +1866,9 @@ class AutoLayoutGenerator:
 
         # Check function prefixes
         if node.kind in ("function", "assignment"):
+            for pattern, module in self.FUNCTION_REGEX_RULES:
+                if re.match(pattern, name):
+                    return module
             for prefix, module in self.FUNCTION_PREFIXES:
                 if name.startswith(prefix) or name == prefix.rstrip("_"):
                     return module
