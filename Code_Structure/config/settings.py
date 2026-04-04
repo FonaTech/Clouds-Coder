@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MEDIA_CAPABILITY_KEYS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, SUPPORTED_UI_LANGUAGES, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES, USER_COMPLEXITY_COMPLEX_TOKENS, USER_COMPLEXITY_SIMPLE_TOKENS
+from .constants import AUTO_SKILLS_ROOT_CANDIDATES, BACKEND_I18N, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_CONFIG, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MEDIA_CAPABILITY_KEYS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, SUPPORTED_UI_LANGUAGES, TASK_COMPLEXITY_LEVELS, TASK_COMPLEXITY_RANKS, UI_LANGUAGE_LABELS, UI_STYLE_CHOICES, USER_COMPLEXITY_COMPLEX_TOKENS, USER_COMPLEXITY_EXPERT_TOKENS, USER_COMPLEXITY_MODERATE_TOKENS, USER_COMPLEXITY_SIMPLE_TOKENS
 from .paths import WORKDIR
 from ..llm.utils import _is_http_url, _resolve_local_path, complete_chat_endpoint, extract_base_url, is_openai_like_provider, normalize_openai_compat_provider_name, strip_thinking_content
 from ..skills.store import ensure_embedded_skills
@@ -549,6 +549,12 @@ def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
     if not low:
         return ""
+    for token in USER_COMPLEXITY_EXPERT_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "expert"
+    for token in USER_COMPLEXITY_MODERATE_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "moderate"
     for token in USER_COMPLEXITY_SIMPLE_TOKENS:
         if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
             return "simple"
@@ -556,6 +562,53 @@ def infer_user_complexity_value(text: str) -> str:
         if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
             return "complex"
     return ""
+
+def normalize_task_complexity(raw: object, default: str = "simple") -> str:
+    value = str(raw or "").strip().lower()
+    aliases = {
+        "simple": "simple",
+        "low": "simple",
+        "basic": "simple",
+        "minimal": "simple",
+        "moderate": "moderate",
+        "medium": "moderate",
+        "mid": "moderate",
+        "balanced": "moderate",
+        "standard": "moderate",
+        "complex": "complex",
+        "high": "complex",
+        "hard": "complex",
+        "difficult": "complex",
+        "expert": "expert",
+        "advanced": "expert",
+        "system": "expert",
+        "system_level": "expert",
+        "production": "expert",
+    }
+    normalized = aliases.get(value, value)
+    if normalized in TASK_COMPLEXITY_LEVELS:
+        return normalized
+    fallback = str(default or "").strip().lower()
+    if not fallback:
+        return ""
+    return fallback if fallback in TASK_COMPLEXITY_LEVELS else "simple"
+
+def task_complexity_rank(raw: object, default: str = "simple") -> int:
+    return int(TASK_COMPLEXITY_RANKS.get(normalize_task_complexity(raw, default=default), 1))
+
+def task_complexity_at_least(raw: object, threshold: str) -> bool:
+    return task_complexity_rank(raw) >= task_complexity_rank(threshold)
+
+def max_task_complexity(*values: object, default: str = "simple") -> str:
+    best = normalize_task_complexity(default, default=default)
+    best_rank = task_complexity_rank(best, default=default)
+    for value in values:
+        cur = normalize_task_complexity(value, default=default)
+        cur_rank = task_complexity_rank(cur, default=default)
+        if cur_rank > best_rank:
+            best = cur
+            best_rank = cur_rank
+    return best
 
 def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeout: int = 20) -> tuple[dict, str]:
     raw = str(source or "").strip()

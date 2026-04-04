@@ -1427,6 +1427,14 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        try:
+            mgr = self.manager_for_user(user_id)
+            sess = mgr.get(session_id)
+            if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
+                mgr._sync_from_session(sess, apply_to_all=False)
+                sess._deferred_runtime_sync_requested = False
+        except Exception:
+            pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []

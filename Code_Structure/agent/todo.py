@@ -7,7 +7,7 @@ import threading
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import DEFAULT_UI_LANGUAGE
 from ..config.settings import backend_i18n_text, backend_role_label, normalize_ui_language
-from ..utils.text import normalize_work_text, trim
+from ..utils.text import infer_todo_status_from_text, normalize_work_text, split_structured_todo_content, trim
 
 class TodoManager:
     def __init__(self, language: str = DEFAULT_UI_LANGUAGE):
@@ -68,6 +68,31 @@ class TodoManager:
     def update(self, items: list[dict]) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
+        expanded_items: list[dict] = []
+        for item in items:
+            if isinstance(item, str):
+                raw = {"content": item, "status": "pending"}
+            elif isinstance(item, dict):
+                raw = dict(item)
+            else:
+                try:
+                    raw = {"content": str(item).strip(), "status": "pending"}
+                except Exception:
+                    continue
+            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            split_rows = split_structured_todo_content(raw_content, limit=7)
+            if len(split_rows) <= 1:
+                expanded_items.append(raw)
+                continue
+            base_status = str(raw.get("status", raw.get("state", "pending")) or "pending").strip().lower()
+            for split_idx, split_content in enumerate(split_rows):
+                split_raw = dict(raw)
+                split_raw["content"] = split_content
+                split_raw["status"] = infer_todo_status_from_text(
+                    split_content,
+                    default=(base_status if split_idx == 0 else "pending"),
+                )
+                expanded_items.append(split_raw)
         validated = []
         # Plan-step items (bb:proj: key) keep a single in_progress slot.
         # Worker/non-plan items allow one in_progress per owner so sync-mode agents
@@ -83,18 +108,10 @@ class TodoManager:
             "finish": "completed",
             "finished": "completed",
         }
-        for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                raw = item
-            else:
-                # Tolerant: convert to string instead of raising
-                try:
-                    raw = {"content": str(item).strip(), "status": "pending"}
-                except Exception:
-                    continue  # Skip unparseable items
+        for idx, item in enumerate(expanded_items):
+            raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
             raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            inferred_status = infer_todo_status_from_text(raw_content, default="")
             content = normalize_work_text(raw_content)
             if not content:
                 content = raw_content
@@ -102,8 +119,10 @@ class TodoManager:
                 continue  # Skip empty items instead of raising
             raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
             status = status_alias.get(raw_status, raw_status or "pending")
+            if inferred_status and status in {"", "pending", "todo"}:
+                status = inferred_status
             if status not in {"pending", "in_progress", "completed"}:
-                status = "pending"
+                status = inferred_status or "pending"
             content = normalize_work_text(content, status) or content
             active_form = str(
                 raw.get(
