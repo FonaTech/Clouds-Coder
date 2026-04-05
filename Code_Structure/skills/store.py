@@ -11,13 +11,14 @@ import shutil
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import BUILTIN_CLAWHUB_SKILLS_VERSION, EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64, EMBEDDED_SKILLS_ARCHIVE_B64, EMBEDDED_SKILLS_ARCHIVE_FILES, EMBEDDED_SKILLS_ARCHIVE_SHA256, SKILLS_EXTERNAL_MOUNT, SKILLS_VIRTUAL_PREFIX, SKILL_BODY_COMPACT_THRESHOLD_CHARS, SKILL_BODY_PREVIEW_CHARS, SKILL_DEFAULT_ATTACHMENT_GLOBS, SKILL_INLINE_ATTACHMENT_MAX_CHARS, SKILL_INLINE_ATTACHMENT_MAX_FILES, SKILL_PROMPT_MAX_CHARS, SKILL_PROMPT_MAX_ITEMS, SKILL_PROTOCOL_CLAWHUB, SKILL_PROTOCOL_HTTP_JSON, SKILL_PROTOCOL_LOCAL, SKILL_PROTOCOL_SPECS, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RESOURCE_MANIFEST_MAX_ITEMS
 from ..config.paths import WORKDIR
 from ..llm.utils import _is_http_url
 from ..utils.files import _render_offline_js_catalog_md, safe_path, try_read_text
+from ..utils.http import urlopen
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.misc import _meta_string_list, _module_exists, now_ts
 from ..utils.text import parse_front_matter, trim
@@ -1094,9 +1095,11 @@ Use this skill when:
 6. Report rewritten count, copied files, and unresolved URLs.
 
 ## Rules
+- Treat `./js_lib` and `/js_lib/...` as workspace lookup locations only, not final browser-facing URLs.
 - Keep `./js` per HTML location (do not hardcode global absolute paths).
 - Keep file names deterministic and safe (`[A-Za-z0-9._-]`).
 - Preserve existing relative local script paths if already offline-ready.
+- Final HTML must not point to `/js_lib/...`, `/assets/js_lib/...`, or other virtual asset aliases; copy first, then use plain relative paths.
 
 ## Output Contract
 Return:

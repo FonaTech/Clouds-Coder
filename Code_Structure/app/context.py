@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
-from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, SCRIPT_DIR, _migrate_legacy_runtime_roots
+from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
+from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, _migrate_legacy_runtime_roots
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_capability_overrides, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path
 from ..llm.client import OllamaClient
 from ..llm.utils import extract_base_url
@@ -99,6 +99,7 @@ class AppContext:
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
+        shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -119,7 +120,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
-        self.js_lib_root = offline_js_lib_root(SCRIPT_DIR)
+        self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
             self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
@@ -141,6 +142,12 @@ class AppContext:
             minimum=MIN_RUN_TIMEOUT_SECONDS,
             maximum=MAX_RUN_TIMEOUT_SECONDS,
             fallback=MAX_RUN_SECONDS,
+        )
+        self.shell_command_timeout_seconds = normalize_timeout_seconds(
+            shell_command_timeout_seconds if shell_command_timeout_seconds is not None else DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
@@ -310,6 +317,7 @@ class AppContext:
             "show_upload_list": bool(getattr(self, "show_upload_list", False)),
             "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "js_lib_download_enabled": bool(getattr(self, "js_lib_download_enabled", True)),
+            "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
             "daily_session_limit_per_ip": int(getattr(self, "daily_session_limit_per_ip", 0) or 0),
             "daily_session_reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
             "validation": dict(self.web_ui_validation or {}),
@@ -1419,6 +1427,14 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        try:
+            mgr = self.manager_for_user(user_id)
+            sess = mgr.get(session_id)
+            if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
+                mgr._sync_from_session(sess, apply_to_all=False)
+                sess._deferred_runtime_sync_requested = False
+        except Exception:
+            pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -1553,6 +1569,7 @@ class AppContext:
                 self.context_limit_locked,
                 self.max_rounds,
                 self.max_run_seconds,
+                self.shell_command_timeout_seconds,
                 self.auto_model_switch,
                 self.arbiter_enabled,
                 self.arbiter_model,

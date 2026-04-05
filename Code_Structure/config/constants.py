@@ -131,7 +131,7 @@ HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 
-FUSED_FAULT_BREAK_THRESHOLD = 3
+FUSED_FAULT_BREAK_THRESHOLD = 15
 
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
 
@@ -161,6 +161,41 @@ MAX_RUN_TIMEOUT_SECONDS = 86_400
 
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 
+_SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
+    b"ok to proceed? (y)",
+    b"proceed? (y)",
+    b"? (y)",
+    b"[y/n]",
+    b"[y/n]:",
+    b"[yes/no]",
+    b"(y/n)",
+    b"(yes/no)",
+    b"continue? (y/n)",
+    b"do you want to continue",
+    b"press enter to continue",
+    b"enter to continue",
+)
+
+MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
+
+MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
+
+DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
+    MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+    min(
+        MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+        int(
+            str(
+                os.getenv(
+                    "AGENT_SHELL_COMMAND_TIMEOUT",
+                    os.getenv("AGENT_BASH_TIMEOUT", os.getenv("AGENT_COMMAND_TIMEOUT", "240")),
+                )
+                or "240"
+            )
+        ),
+    ),
+)
+
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 
 AGENT_MAX_OUTPUT_TOKENS = 16384
@@ -189,7 +224,7 @@ WATCHDOG_STEP_MAX_ATTEMPTS = 2
 
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 
-EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2
+EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
 
 THINKING_BUDGET_FORCE_RATIO = 0.85
 
@@ -381,7 +416,14 @@ BLACKBOARD_STATUSES = (
     "PAUSED",
 )
 
-TASK_COMPLEXITY_LEVELS = ("simple", "complex")
+TASK_COMPLEXITY_LEVELS = ("simple", "moderate", "complex", "expert")
+
+TASK_COMPLEXITY_RANKS = {
+    "simple": 1,
+    "moderate": 2,
+    "complex": 3,
+    "expert": 4,
+}
 
 TASK_PROFILE_TYPES = (
     "simple_qa",
@@ -423,7 +465,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 16,
         "requires_user_confirmation": False,
-        "complexity": "simple",
+        "complexity": "moderate",
     },
     4: {
         "name": "complex_collaboration",
@@ -441,7 +483,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "explorer",
         "round_budget": 0,  # 0 means unlimited by tier budget (still guarded by global safeguards).
         "requires_user_confirmation": True,
-        "complexity": "complex",
+        "complexity": "expert",
     },
 }
 
@@ -529,7 +571,7 @@ TASK_PHASE_ROUTING = {
 COMPLEXITY_KEYWORDS = (
     "简单", "复杂", "难", "容易", "快速", "详细", "深入",
     "l1", "l2", "l3", "l4", "l5",
-    "simple", "complex", "easy", "hard", "difficult",
+    "simple", "moderate", "medium", "complex", "expert", "easy", "hard", "difficult",
     "thorough", "quick", "fast", "lightweight", "heavy",
 )
 
@@ -539,13 +581,27 @@ USER_COMPLEXITY_SIMPLE_TOKENS = (
     "l1", "l2",
 )
 
+USER_COMPLEXITY_MODERATE_TOKENS = (
+    "中等复杂度", "中等难度", "适中", "平衡", "标准", "普通", "常规",
+    "medium", "mid", "moderate", "balanced", "standard", "normal",
+    "l3",
+)
+
 USER_COMPLEXITY_COMPLEX_TOKENS = (
-    "复杂", "深入", "详细", "高复杂度", "高难度", "中等复杂度", "中高复杂度",
-    "medium", "mid", "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
-    "l3", "l4", "l5",
+    "复杂", "深入", "详细", "高复杂度", "高难度", "中高复杂度",
+    "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
+    "l4",
+)
+
+USER_COMPLEXITY_EXPERT_TOKENS = (
+    "专家级", "系統級", "系统级", "生产级", "企業級", "企业级", "高风险", "超高复杂度",
+    "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
+    "l5",
 )
 
 PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
+
+PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
 
@@ -559,7 +615,7 @@ EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before force
 
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
 
-PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 6144
+PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 
 PLAN_MODE_MAX_OPTIONS = 3
 
@@ -3219,7 +3275,7 @@ function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!c
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
-async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
+async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
@@ -3792,7 +3848,7 @@ function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?s
 function boardsSignature(snap){return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
-function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
+function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;E('topStats').innerHTML=`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`}
 function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
@@ -6244,7 +6300,7 @@ async function renameSession(){if(!S.activeId){showError(t('select_session_first
 async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
-async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
+async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await waitForPendingUploads();await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}

@@ -25,6 +25,7 @@ import selectors
 import signal
 import shutil
 import shlex
+import ssl
 import socket
 import subprocess
 import sys
@@ -45,13 +46,46 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 try:
+    import certifi as _certifi
+except Exception:
+    _certifi = None
+try:
     import yaml as _yaml
 except Exception:
     _yaml = None
+_URL_OPEN_ORIGINAL = urlopen
+_HTTP_SSL_CONTEXT = None
 APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+def _shared_http_ssl_context():
+    global _HTTP_SSL_CONTEXT
+    if _HTTP_SSL_CONTEXT is not None:
+        return _HTTP_SSL_CONTEXT
+    cafile = str(os.getenv("SSL_CERT_FILE", "") or "").strip()
+    if not cafile and _certifi is not None:
+        try:
+            cafile = str(_certifi.where() or "").strip()
+        except Exception:
+            cafile = ""
+    try:
+        ctx = ssl.create_default_context(cafile=cafile or None)
+    except Exception:
+        ctx = ssl.create_default_context()
+    _HTTP_SSL_CONTEXT = ctx
+    return ctx
+
+def urlopen(url, *args, **kwargs):
+    if "context" not in kwargs:
+        target = getattr(url, "full_url", url)
+        if str(target or "").strip().lower().startswith("https://"):
+            try:
+                kwargs["context"] = _shared_http_ssl_context()
+            except Exception:
+                pass
+    return _URL_OPEN_ORIGINAL(url, *args, **kwargs)
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
@@ -158,7 +192,7 @@ REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 3
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
-FUSED_FAULT_BREAK_THRESHOLD = 3
+FUSED_FAULT_BREAK_THRESHOLD = 15
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
 STALL_SEVERITY_WEIGHT_BASH_READ_LOOP = 2
 STALL_SEVERITY_WEIGHT_REPEATED_TOOL = 3
@@ -182,6 +216,39 @@ DEFAULT_TIMEOUT_SECONDS = max(
     ),
 )
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
+# Patterns that indicate the shell process is waiting for interactive confirmation.
+# Checked against the tail of combined stdout+stderr (lowercased bytes).
+_SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
+    b"ok to proceed? (y)",
+    b"proceed? (y)",
+    b"? (y)",
+    b"[y/n]",
+    b"[y/n]:",
+    b"[yes/no]",
+    b"(y/n)",
+    b"(yes/no)",
+    b"continue? (y/n)",
+    b"do you want to continue",
+    b"press enter to continue",
+    b"enter to continue",
+)
+MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
+MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
+DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
+    MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+    min(
+        MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+        int(
+            str(
+                os.getenv(
+                    "AGENT_SHELL_COMMAND_TIMEOUT",
+                    os.getenv("AGENT_BASH_TIMEOUT", os.getenv("AGENT_COMMAND_TIMEOUT", "240")),
+                )
+                or "240"
+            )
+        ),
+    ),
+)
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 AGENT_MAX_OUTPUT_TOKENS = 16384
 OLLAMA_THINKING_TOOL_BUFFER = 4096
@@ -196,7 +263,7 @@ WATCHDOG_CONTEXT_NEAR_RATIO = 0.92
 WATCHDOG_MAX_DECOMPOSE_STEPS = 12
 WATCHDOG_STEP_MAX_ATTEMPTS = 2
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
-EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 2
+EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
 THINKING_BUDGET_FORCE_RATIO = 0.85
 # --- Tool timeout configuration ---
 _TOOL_TIMEOUT_MAP = {
@@ -347,7 +414,13 @@ BLACKBOARD_STATUSES = (
     "COMPLETED",
     "PAUSED",
 )
-TASK_COMPLEXITY_LEVELS = ("simple", "complex")
+TASK_COMPLEXITY_LEVELS = ("simple", "moderate", "complex", "expert")
+TASK_COMPLEXITY_RANKS = {
+    "simple": 1,
+    "moderate": 2,
+    "complex": 3,
+    "expert": 4,
+}
 TASK_PROFILE_TYPES = (
     "simple_qa",
     "simple_code",
@@ -384,7 +457,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 16,
         "requires_user_confirmation": False,
-        "complexity": "simple",
+        "complexity": "moderate",
     },
     4: {
         "name": "complex_collaboration",
@@ -402,7 +475,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "explorer",
         "round_budget": 0,  # 0 means unlimited by tier budget (still guarded by global safeguards).
         "requires_user_confirmation": True,
-        "complexity": "complex",
+        "complexity": "expert",
     },
 }
 MANAGER_ROUTE_TARGETS = ("explorer", "developer", "reviewer", "finish")
@@ -469,7 +542,7 @@ TASK_PHASE_ROUTING = {
 COMPLEXITY_KEYWORDS = (
     "简单", "复杂", "难", "容易", "快速", "详细", "深入",
     "l1", "l2", "l3", "l4", "l5",
-    "simple", "complex", "easy", "hard", "difficult",
+    "simple", "moderate", "medium", "complex", "expert", "easy", "hard", "difficult",
     "thorough", "quick", "fast", "lightweight", "heavy",
 )
 USER_COMPLEXITY_SIMPLE_TOKENS = (
@@ -477,12 +550,23 @@ USER_COMPLEXITY_SIMPLE_TOKENS = (
     "low", "simple", "easy", "quick", "fast", "lightweight", "basic", "minimal",
     "l1", "l2",
 )
+USER_COMPLEXITY_MODERATE_TOKENS = (
+    "中等复杂度", "中等难度", "适中", "平衡", "标准", "普通", "常规",
+    "medium", "mid", "moderate", "balanced", "standard", "normal",
+    "l3",
+)
 USER_COMPLEXITY_COMPLEX_TOKENS = (
-    "复杂", "深入", "详细", "高复杂度", "高难度", "中等复杂度", "中高复杂度",
-    "medium", "mid", "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
-    "l3", "l4", "l5",
+    "复杂", "深入", "详细", "高复杂度", "高难度", "中高复杂度",
+    "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
+    "l4",
+)
+USER_COMPLEXITY_EXPERT_TOKENS = (
+    "专家级", "系統級", "系统级", "生产级", "企業級", "企业级", "高风险", "超高复杂度",
+    "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
+    "l5",
 )
 PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
+PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
 REVIEWER_DEBUG_TOOL_ALLOWLIST = {
@@ -492,7 +576,7 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
 }
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
-PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 6144
+PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
 PLAN_BUBBLE_MAX_CHARS = 12_000
@@ -2014,6 +2098,55 @@ def extract_daily_session_limit_setting(raw: object) -> int | None:
     return None
 
 
+def extract_shell_command_timeout_setting(raw: object) -> int | None:
+    """Read shell/bash command timeout from config dict.
+
+    Accepted keys:
+      - shell_command_timeout
+      - shell_timeout
+      - bash_timeout
+      - command_timeout
+    Sections searched: top-level, then 'startup' / 'runtime' / 'shell' / 'tools' / 'execution'.
+    Returns a clamped positive integer, or None if no setting is present.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def _parse_timeout(value: object) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            text = str(value).strip()
+            if not text:
+                return None
+            return normalize_timeout_seconds(
+                text,
+                minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+                maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+                fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+
+    keys = (
+        "shell_command_timeout",
+        "shell_timeout",
+        "bash_timeout",
+        "command_timeout",
+    )
+    for key in keys:
+        if key in raw:
+            return _parse_timeout(raw.get(key))
+    for section_key in ("startup", "runtime", "shell", "tools", "execution"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _parse_timeout(section.get(key))
+    return None
+
+
 class SessionCreationLimitExceeded(RuntimeError):
     def __init__(self, status: dict):
         self.status = dict(status or {})
@@ -2986,19 +3119,243 @@ def decompress_text_blob(blob_b64: str) -> str:
     except Exception:
         return ""
 
-def normalize_work_text(text: object, status: str = "") -> str:
-    s = re.sub(r"\s+", " ", str(text or "")).strip()
+def normalize_embedded_newlines(text: object) -> str:
+    s = str(text or "")
     if not s:
         return ""
-    s = re.sub(r"^\[[ x>\-]\]\s*", "", s, flags=re.IGNORECASE)
+    s = s.replace("\u2028", "\n").replace("\u2029", "\n")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    if "\\n" in s or "\\r" in s or "\\t" in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\\t", "\t")
+    return s
+
+
+def _map_todo_status_token(token: str) -> str:
+    raw = str(token or "").strip().lower().replace("_", " ").replace("-", " ")
+    raw = re.sub(r"\s+", " ", raw)
+    return {
+        "pending": "pending",
+        "待处理": "pending",
+        "待處理": "pending",
+        "未着手": "pending",
+        "in progress": "in_progress",
+        "进行中": "in_progress",
+        "進行中": "in_progress",
+        "completed": "completed",
+        "已完成": "completed",
+        "完了": "completed",
+        "blocked": "pending",
+    }.get(raw, "")
+
+
+def split_todo_status_text(text: object) -> tuple[str, str]:
+    probe = normalize_embedded_newlines(text).strip()
+    if not probe:
+        return "", ""
+    status = ""
+    marker_prefix = r"(?:[-*•>]+\s*)?"
+    for _ in range(4):
+        before = probe
+        probe = re.sub(r"^\s+", "", probe)
+        matched = False
+        for row_status, pattern in (
+            (
+                "completed",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[x\]\s*"
+                rf")",
+            ),
+            (
+                "in_progress",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[>\]\s*"
+                rf")",
+            ),
+            (
+                "pending",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[\s*\]\s*"
+                rf")",
+            ),
+        ):
+            m = re.match(pattern, probe, flags=re.IGNORECASE)
+            if not m:
+                continue
+            status = row_status
+            probe = probe[m.end():].strip()
+            matched = True
+            break
+        if matched:
+            continue
+        m = re.match(
+            rf"^(?:{marker_prefix})"
+            rf"(pending|in[_\-\s]?progress|completed|blocked|"
+            rf"待处理|待處理|未着手|进行中|進行中|已完成|完了)"
+            rf"\s*[：:\-\]]\s*",
+            probe,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            mapped = _map_todo_status_token(str(m.group(1) or ""))
+            if mapped:
+                status = mapped
+            probe = probe[m.end():].strip()
+            continue
+        if probe == before:
+            break
+    return status, probe.strip()
+
+
+def extract_todo_rows_from_text(
+    text: object,
+    *,
+    default_parent_step_id: str = "",
+    limit: int = 12,
+) -> list[dict]:
+    src = normalize_embedded_newlines(text)
+    if not src.strip():
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    capped = max(1, min(40, int(limit or 12)))
+    parent_step_id = trim(str(default_parent_step_id or "").strip(), 20)
+    for raw_line in src.splitlines():
+        line = trim(str(raw_line or "").strip(), 600)
+        if not line:
+            continue
+        variants: list[str] = []
+        for candidate in (
+            line,
+            re.sub(r"^\s*(?:[-*•>]+\s*)+", "", line).strip(),
+            re.sub(r"^\s*\*\*([^*]+)\*\*\s*([：:])\s*", r"\1\2 ", line).strip(),
+            re.sub(r"^\s*(?:[-*•>]+\s*)*\*\*([^*]+)\*\*\s*([：:])\s*", r"\1\2 ", line).strip(),
+        ):
+            candidate = trim(str(candidate or "").strip(), 600)
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        matched = False
+        for candidate in variants:
+            status, content = split_todo_status_text(candidate)
+            if not status or not content:
+                continue
+            cleaned = normalize_work_text(content, status) or content
+            cleaned = trim(cleaned.strip(), 400)
+            if not cleaned:
+                continue
+            low = cleaned.lower()
+            if low in {
+                "todo",
+                "todos",
+                "task",
+                "tasks",
+                "subtask",
+                "subtasks",
+                "待办",
+                "待辦",
+                "子任务",
+                "子任務",
+            }:
+                continue
+            row = {"content": cleaned, "status": status}
+            if parent_step_id:
+                row["parent_step_id"] = parent_step_id
+            identity = (
+                status,
+                normalize_work_text(cleaned, status).strip().lower(),
+                parent_step_id,
+            )
+            if identity in seen:
+                matched = True
+                break
+            seen.add(identity)
+            out.append(row)
+            matched = True
+            break
+        if matched and len(out) >= capped:
+            break
+    return out
+
+
+def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
+    status, content = split_todo_status_text(text)
+    if not content and not status:
+        return default
+    if status:
+        return status
+    return default
+
+
+def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
+    src = normalize_embedded_newlines(text).strip()
+    if not src:
+        return []
+    lines = [trim(str(line or "").strip(), 500) for line in src.split("\n")]
+    lines = [line for line in lines if line]
+    if len(lines) <= 1:
+        return [src]
+    major_re = re.compile(r"^(\d+)\.\s+(.+)$")
+    sub_re = re.compile(r"^(\d+)\.(\d+)\s+(.+)$")
+    bullet_re = re.compile(r"^(?:[-*•]\s+)(.+)$")
+    header_major = ""
+    m0 = major_re.match(lines[0])
+    if m0:
+        header_major = str(m0.group(1) or "")
+    picked: list[str] = []
+    for idx, line in enumerate(lines):
+        if idx == 0 and header_major:
+            continue
+        m_sub = sub_re.match(line)
+        if m_sub:
+            major = str(m_sub.group(1) or "")
+            if header_major and major != header_major:
+                if picked:
+                    break
+                continue
+            picked.append(f"{major}.{m_sub.group(2)} {trim(str(m_sub.group(3) or '').strip(), 420)}".strip())
+            continue
+        m_bullet = bullet_re.match(line)
+        if m_bullet and (header_major or picked):
+            picked.append(trim(str(m_bullet.group(1) or "").strip(), 420))
+            continue
+        if picked and re.match(r"^\d+\.\s+", line):
+            break
+    if not picked:
+        for line in lines:
+            m_sub = sub_re.match(line)
+            if m_sub:
+                picked.append(f"{m_sub.group(1)}.{m_sub.group(2)} {trim(str(m_sub.group(3) or '').strip(), 420)}".strip())
+                if len(picked) >= max(1, int(limit or 7)):
+                    break
+    if not picked:
+        return [src]
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in picked:
+        key = re.sub(r"\s+", " ", str(line or "").strip()).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+        if len(out) >= max(1, int(limit or 7)):
+            break
+    return out or [src]
+
+
+def normalize_work_text(text: object, status: str = "") -> str:
+    parsed_status, parsed_content = split_todo_status_text(text)
+    s = re.sub(r"\s+", " ", parsed_content or normalize_embedded_newlines(text)).strip()
+    if not s:
+        return ""
     s = re.sub(
-        r"^(pending|in[_\-\s]?progress|completed|done|blocked)\s*[·:\-\]]\s*",
+        r"^(pending|todo|in[_\-\s]?progress|doing|working|completed|done|finished|blocked|"
+        r"待处理|待處理|未着手|进行中|進行中|作業中|已完成|完成|完了)\s*[·：:\-\]]\s*",
         "",
         s,
         flags=re.IGNORECASE,
     )
-    if status:
-        status_pattern = re.escape(status).replace("_", r"[_\-\s]?")
+    status_key = _map_todo_status_token(status) or _map_todo_status_token(parsed_status) or str(status or "").strip().lower()
+    if status_key:
+        status_pattern = re.escape(status_key).replace("_", r"[_\-\s]?")
         s = re.sub(
             rf"\s*[—-]\s*{status_pattern}\s*$",
             "",
@@ -3429,6 +3786,12 @@ def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
     if not low:
         return ""
+    for token in USER_COMPLEXITY_EXPERT_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "expert"
+    for token in USER_COMPLEXITY_MODERATE_TOKENS:
+        if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
+            return "moderate"
     for token in USER_COMPLEXITY_SIMPLE_TOKENS:
         if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
             return "simple"
@@ -3436,6 +3799,53 @@ def infer_user_complexity_value(text: str) -> str:
         if re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", low) if token.isascii() else token in low:
             return "complex"
     return ""
+
+def normalize_task_complexity(raw: object, default: str = "simple") -> str:
+    value = str(raw or "").strip().lower()
+    aliases = {
+        "simple": "simple",
+        "low": "simple",
+        "basic": "simple",
+        "minimal": "simple",
+        "moderate": "moderate",
+        "medium": "moderate",
+        "mid": "moderate",
+        "balanced": "moderate",
+        "standard": "moderate",
+        "complex": "complex",
+        "high": "complex",
+        "hard": "complex",
+        "difficult": "complex",
+        "expert": "expert",
+        "advanced": "expert",
+        "system": "expert",
+        "system_level": "expert",
+        "production": "expert",
+    }
+    normalized = aliases.get(value, value)
+    if normalized in TASK_COMPLEXITY_LEVELS:
+        return normalized
+    fallback = str(default or "").strip().lower()
+    if not fallback:
+        return ""
+    return fallback if fallback in TASK_COMPLEXITY_LEVELS else "simple"
+
+def task_complexity_rank(raw: object, default: str = "simple") -> int:
+    return int(TASK_COMPLEXITY_RANKS.get(normalize_task_complexity(raw, default=default), 1))
+
+def task_complexity_at_least(raw: object, threshold: str) -> bool:
+    return task_complexity_rank(raw) >= task_complexity_rank(threshold)
+
+def max_task_complexity(*values: object, default: str = "simple") -> str:
+    best = normalize_task_complexity(default, default=default)
+    best_rank = task_complexity_rank(best, default=default)
+    for value in values:
+        cur = normalize_task_complexity(value, default=default)
+        cur_rank = task_complexity_rank(cur, default=default)
+        if cur_rank > best_rank:
+            best = cur
+            best_rank = cur_rank
+    return best
 
 def normalize_openai_compat_provider_name(raw: str) -> str:
     value = str(raw or "").strip().lower().replace("-", "_")
@@ -5236,6 +5646,31 @@ class TodoManager:
     def update(self, items: list[dict]) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
+        expanded_items: list[dict] = []
+        for item in items:
+            if isinstance(item, str):
+                raw = {"content": item, "status": "pending"}
+            elif isinstance(item, dict):
+                raw = dict(item)
+            else:
+                try:
+                    raw = {"content": str(item).strip(), "status": "pending"}
+                except Exception:
+                    continue
+            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            split_rows = split_structured_todo_content(raw_content, limit=7)
+            if len(split_rows) <= 1:
+                expanded_items.append(raw)
+                continue
+            base_status = str(raw.get("status", raw.get("state", "pending")) or "pending").strip().lower()
+            for split_idx, split_content in enumerate(split_rows):
+                split_raw = dict(raw)
+                split_raw["content"] = split_content
+                split_raw["status"] = infer_todo_status_from_text(
+                    split_content,
+                    default=(base_status if split_idx == 0 else "pending"),
+                )
+                expanded_items.append(split_raw)
         validated = []
         # Plan-step items (bb:proj: key) keep a single in_progress slot.
         # Worker/non-plan items allow one in_progress per owner so sync-mode agents
@@ -5251,18 +5686,10 @@ class TodoManager:
             "finish": "completed",
             "finished": "completed",
         }
-        for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                raw = item
-            else:
-                # Tolerant: convert to string instead of raising
-                try:
-                    raw = {"content": str(item).strip(), "status": "pending"}
-                except Exception:
-                    continue  # Skip unparseable items
+        for idx, item in enumerate(expanded_items):
+            raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
             raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            inferred_status = infer_todo_status_from_text(raw_content, default="")
             content = normalize_work_text(raw_content)
             if not content:
                 content = raw_content
@@ -5270,8 +5697,10 @@ class TodoManager:
                 continue  # Skip empty items instead of raising
             raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
             status = status_alias.get(raw_status, raw_status or "pending")
+            if inferred_status and status in {"", "pending", "todo"}:
+                status = inferred_status
             if status not in {"pending", "in_progress", "completed"}:
-                status = "pending"
+                status = inferred_status or "pending"
             content = normalize_work_text(content, status) or content
             active_form = str(
                 raw.get(
@@ -7055,9 +7484,11 @@ Use this skill when:
 6. Report rewritten count, copied files, and unresolved URLs.
 
 ## Rules
+- Treat `./js_lib` and `/js_lib/...` as workspace lookup locations only, not final browser-facing URLs.
 - Keep `./js` per HTML location (do not hardcode global absolute paths).
 - Keep file names deterministic and safe (`[A-Za-z0-9._-]`).
 - Preserve existing relative local script paths if already offline-ready.
+- Final HTML must not point to `/js_lib/...`, `/assets/js_lib/...`, or other virtual asset aliases; copy first, then use plain relative paths.
 
 ## Output Contract
 Return:
@@ -12424,10 +12855,10 @@ TOOLS = [
     ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     tool_def("edit_file", "Edit a file by replacing first match.", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
-    tool_def("TodoWrite", "Update todo list. Items can be strings or objects with content/status/owner fields.", {"items": {"type": "array", "items": {}}}, ["items"]),
+    tool_def("TodoWrite", "Update todo list. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.", {"items": {"type": "array", "items": {}}}, ["items"]),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer. Accepts strings with status prefixes: '[x] task' or '✅ task' = completed, '[>] task' = in_progress, plain text = pending. Also accepts dicts with status field.",
+        "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "in_progress_index": {"type": "integer"},
@@ -12698,6 +13129,7 @@ class SessionState:
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
+        shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -12860,6 +13292,8 @@ class SessionState:
         self._cached_llm_complexity = ""
         self._cached_complexity_dimensions: dict = {}  # scope/steps/skill/output dimensions
         self._pending_media_inputs: list[dict] = []
+        self._pending_runtime_updates: list[dict] = []
+        self._deferred_runtime_sync_requested = False
         self.tool_retry_counts: dict[str, int] = {}
         self.last_auto_title_ts = 0.0
         self.live_thinking_text = ""
@@ -12907,6 +13341,12 @@ class SessionState:
             minimum=MIN_RUN_TIMEOUT_SECONDS,
             maximum=MAX_RUN_TIMEOUT_SECONDS,
             fallback=MAX_RUN_SECONDS,
+        )
+        self.shell_command_timeout_seconds = normalize_timeout_seconds(
+            shell_command_timeout_seconds if shell_command_timeout_seconds is not None else DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.truncation_count = 0
         self.last_truncation_ts = 0.0
@@ -14350,9 +14790,9 @@ class SessionState:
         )
         if task_type in TASK_PROFILE_TYPES:
             self.runtime_task_type = task_type
-        complexity = trim(
-            str(profile.get("complexity", judgement.get("complexity", self.runtime_task_complexity or "")) or "").strip().lower(),
-            20,
+        complexity = normalize_task_complexity(
+            profile.get("complexity", judgement.get("complexity", self.runtime_task_complexity or "")),
+            default="simple",
         )
         if complexity in TASK_COMPLEXITY_LEVELS:
             self.runtime_task_complexity = complexity
@@ -14822,12 +15262,15 @@ class SessionState:
 
     def _current_plan_step_text(self, board: dict | None = None) -> str:
         row = self._current_plan_step_row(board)
-        return trim(str((row or {}).get("content", "") or "").strip(), 400)
+        content = normalize_embedded_newlines((row or {}).get("content", "") or "").strip()
+        if "\n" in content:
+            content = content.split("\n", 1)[0].strip()
+        return trim(content, 400)
 
     def _current_plan_step_full_text(self, board: dict | None = None, max_len: int = 1200) -> str:
         row = self._current_plan_step_row(board)
         return trim(
-            str((row or {}).get("full_content", "") or (row or {}).get("content", "") or "").strip(),
+            normalize_embedded_newlines((row or {}).get("full_content", "") or (row or {}).get("content", "") or "").strip(),
             max_len,
         )
 
@@ -15489,6 +15932,10 @@ class SessionState:
             f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
             f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS require) or pptxgen.bundle.js (browser). "
             f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
+            "IMPORTANT: '/js_lib/...' is a tool/runtime alias, not a stable final HTML asset URL. "
+            "If an HTML file uses any asset from js_lib, copy that file into a task-local relative asset folder "
+            "(for example './js/' or './assets/vendor/') next to the deliverable, then reference it with a plain relative path in HTML. "
+            "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases inside final exported HTML. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{self.context_token_upper_bound} tokens. "
@@ -19872,11 +20319,17 @@ body{padding:18px}
             with self.lock:
                 if self.running:
                     config_delayed = True
-                    self._pending_media_inputs.append({
-                        "type": "deferred_config",
-                        "config": cfg_obj,
-                        "source": workspace_rel,
-                    })
+            if config_delayed:
+                self._queue_deferred_runtime_update(
+                    "llm_config",
+                    {"config": cfg_obj, "source": workspace_rel},
+                )
+                loaded_config = self.model_catalog()
+                if isinstance(loaded_config, dict):
+                    loaded_config["queued"] = True
+                    loaded_config["note"] = (
+                        "session is running; llm config queued and will apply after the current run finishes"
+                    )
             if not config_delayed:
                 loaded_config = self.load_llm_config(cfg_obj, source=workspace_rel)
             self._emit("config_applied", {
@@ -21042,7 +21495,7 @@ body{padding:18px}
         return any(x in t for x in markers)
 
     def _llm_classify_task_complexity(self, goal_text: str) -> str:
-        """LLM semantic pre-screening: classify task as simple/complex via 4-dimension analysis. 5s timeout."""
+        """LLM semantic pre-screening: classify task into 4 complexity bands via 4-dimension analysis. 5s timeout."""
         goal = trim(str(goal_text or ""), 400)
         if not goal or len(goal) < 6:
             return "simple"
@@ -21059,8 +21512,7 @@ body{padding:18px}
                         f"SKILL: does it need specialized tools, skills, research, or APIs?\n"
                         f"OUTPUT: what is expected (1=text answer, 2=single file, 3=system/multi-file)?\n\n"
                         f"Output exactly one line:\n"
-                        f"SCOPE:N STEPS:N SKILL:N OUTPUT:N VERDICT:SIMPLE|COMPLEX\n"
-                        f"(COMPLEX if any dimension >= 2)"
+                        f"SCOPE:N STEPS:N SKILL:N OUTPUT:N VERDICT:SIMPLE|MODERATE|COMPLEX|EXPERT"
                     )}],
                     system="/no_think\nAnalyze task dimensions. One line output only.",
                     max_tokens=40,
@@ -21075,8 +21527,26 @@ body{padding:18px}
                         dims[dim.lower()] = int(m.group(1))
                 if dims:
                     self._cached_complexity_dimensions = dims
-                if "COMPLEX" in answer:
+                    vals = [int(v) for v in dims.values()]
+                    max_dim = max(vals) if vals else 1
+                    count_ge2 = sum(1 for v in vals if int(v) >= 2)
+                    count_ge3 = sum(1 for v in vals if int(v) >= 3)
+                    if max_dim <= 1:
+                        result_box[0] = "simple"
+                    elif max_dim == 2:
+                        result_box[0] = "moderate"
+                    elif count_ge3 >= 2 or count_ge2 >= 4:
+                        result_box[0] = "expert"
+                    else:
+                        result_box[0] = "complex"
+                if "VERDICT:EXPERT" in answer:
+                    result_box[0] = "expert"
+                elif "VERDICT:COMPLEX" in answer:
                     result_box[0] = "complex"
+                elif "VERDICT:MODERATE" in answer:
+                    result_box[0] = "moderate"
+                elif "VERDICT:SIMPLE" in answer:
+                    result_box[0] = "simple"
             except Exception:
                 pass
         t = threading.Thread(target=_classify, daemon=True)
@@ -21089,9 +21559,9 @@ body{padding:18px}
         low = clean.lower()
         explicit_complexity = infer_user_complexity_value(clean)
         # Use cached LLM complexity result (set by _agent_worker entry point)
-        llm_complexity = str(getattr(self, '_cached_llm_complexity', '') or '')
-        nontrivial = self._looks_nontrivial_request(clean) or llm_complexity == "complex"
-        direct_question = self._looks_like_direct_question_request(clean) and llm_complexity != "complex"
+        llm_complexity = normalize_task_complexity(str(getattr(self, '_cached_llm_complexity', '') or ''), default="simple")
+        nontrivial = self._looks_nontrivial_request(clean) or task_complexity_at_least(llm_complexity, "moderate")
+        direct_question = self._looks_like_direct_question_request(clean) and (not task_complexity_at_least(llm_complexity, "moderate"))
         code_markers = [
             # 代码/编程
             "代码", "寫代碼", "写代码", "脚本", "模块", "函数", "class", "bug",
@@ -21128,6 +21598,7 @@ body{padding:18px}
         has_code_intent = any(x in low for x in code_markers)
         has_research_intent = any(x in low for x in research_markers)
         length = len(clean)
+        derived_complexity = max_task_complexity(explicit_complexity, llm_complexity, default="simple")
         if direct_question and (not nontrivial) and (not has_code_intent) and length <= 220:
             return {
                 "task_type": "simple_qa",
@@ -21158,7 +21629,11 @@ body{padding:18px}
         if has_research_intent and (not has_code_intent):
             return {
                 "task_type": "research",
-                "complexity": explicit_complexity or ("complex" if (nontrivial or length >= 280) else "simple"),
+                "complexity": explicit_complexity or max_task_complexity(
+                    derived_complexity,
+                    ("complex" if length >= 480 else "moderate" if (nontrivial or length >= 280) else "simple"),
+                    default="simple",
+                ),
                 "direct_objective": "Collect evidence first, then synthesize a concise actionable answer.",
                 "recommended_agents": ["explorer", "developer", "reviewer"],
                 "round_budget": 10 if (nontrivial or length >= 280) else 6,
@@ -21169,7 +21644,15 @@ body{padding:18px}
         if nontrivial or has_code_intent or length >= 280:
             return {
                 "task_type": "engineering",
-                "complexity": explicit_complexity or "complex",
+                "complexity": explicit_complexity or max_task_complexity(
+                    derived_complexity,
+                    (
+                        "expert"
+                        if ((has_code_intent and has_research_intent) or length >= 900)
+                        else "complex"
+                    ),
+                    default="moderate",
+                ),
                 "direct_objective": (
                     "Use blackboard collaboration to implement, validate, and converge with concrete outputs."
                 ),
@@ -21181,7 +21664,7 @@ body{padding:18px}
             }
         return {
             "task_type": "general",
-            "complexity": explicit_complexity or "simple",
+            "complexity": explicit_complexity or derived_complexity or "simple",
             "direct_objective": (
                 "Provide the most direct useful response with minimal orchestration, "
                 "anchored to the current project context and user goal."
@@ -21442,6 +21925,66 @@ body{padding:18px}
         profile = dict(self.model_profiles.get(self.active_profile_id, {}))
         model = str(profile.get("model", self.ollama.model) or self.ollama.model).strip()
         return f"{self.active_profile_id}::{model}"
+
+    def _queue_deferred_runtime_update(self, kind: str, payload: dict) -> int:
+        row = {
+            "kind": str(kind or "").strip().lower(),
+            "payload": dict(payload or {}),
+            "queued_at": float(now_ts()),
+        }
+        if not row["kind"]:
+            raise ValueError("deferred runtime update kind required")
+        with self.lock:
+            self._pending_runtime_updates.append(row)
+            self._pending_runtime_updates = self._pending_runtime_updates[-16:]
+            queued = len(self._pending_runtime_updates)
+            self.updated_at = now_ts()
+            self._persist()
+        return queued
+
+    def _apply_deferred_runtime_updates(self) -> list[str]:
+        with self.lock:
+            if self.running or not self._pending_runtime_updates:
+                return []
+            queued = list(self._pending_runtime_updates)
+            self._pending_runtime_updates = []
+            self.updated_at = now_ts()
+            self._persist()
+        applied_notes: list[str] = []
+        sync_needed = False
+        for item in queued:
+            kind = str(item.get("kind", "") or "").strip().lower()
+            payload = item.get("payload", {}) if isinstance(item.get("payload"), dict) else {}
+            try:
+                if kind == "llm_config":
+                    source = str(payload.get("source", "") or "deferred-config").strip()
+                    config = payload.get("config", {})
+                    if isinstance(config, dict) and config:
+                        self.load_llm_config(config, source=source)
+                        applied_notes.append(f"deferred llm config applied: {trim(source, 120)}")
+                        sync_needed = True
+                elif kind == "model_selection":
+                    selection = str(payload.get("selection", "") or "").strip()
+                    model_override = payload.get("model_override")
+                    self.set_runtime_selection(
+                        selection,
+                        model_override if isinstance(model_override, str) else None,
+                    )
+                    applied_notes.append(f"deferred model switch applied: {trim(selection, 120)}")
+                    sync_needed = True
+            except Exception as exc:
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"deferred runtime update failed ({kind or 'unknown'}): "
+                            f"{trim(str(exc), 180)}"
+                        )
+                    },
+                )
+        if sync_needed:
+            self._deferred_runtime_sync_requested = True
+        return applied_notes
 
     def _global_wait_timeout_seconds(self) -> int:
         raw = (
@@ -21994,6 +22537,7 @@ body{padding:18px}
             _spawn_reader("stdout", proc.stdout)
             _spawn_reader("stderr", proc.stderr)
 
+            _auto_confirmed: set[bytes] = set()
             while True:
                 now = time.time()
                 elapsed = now - start
@@ -22001,10 +22545,12 @@ body{padding:18px}
                     _stop_process(proc)
                     meta["error"] = "Error: interrupted by user"
                     meta["exit_code"] = -130
+                    break
                 elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
                     _stop_process(proc)
                     meta["error"] = f"Error: timeout ({timeout}s)"
                     meta["exit_code"] = -1
+                    break
                 try:
                     label, chunk = io_queue.get(timeout=0.12)
                     if chunk is None:
@@ -22037,6 +22583,18 @@ body{padding:18px}
                         },
                     )
                     next_progress_emit = now + 0.8
+                # Auto-confirm interactive prompts (Windows reader thread path)
+                if proc.stdin and not proc.stdin.closed:
+                    _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                    for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                        if _pat in _tail and _pat not in _auto_confirmed:
+                            try:
+                                proc.stdin.write(b"y\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+                            _auto_confirmed.add(_pat)
+                            break
                 if (proc.poll() is not None) and (not active_readers) and io_queue.empty():
                     break
 
@@ -22077,6 +22635,7 @@ body{padding:18px}
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
+                "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "text": False,
@@ -22089,6 +22648,7 @@ body{padding:18px}
                 if create_group > 0:
                     popen_kwargs["creationflags"] = create_group
             proc = subprocess.Popen(effective_command, **popen_kwargs)
+            self._running_bash_proc = proc
             if os.name == "nt":
                 # Windows: read PIPE output via blocking reader threads + queue.
                 _collect_with_reader_threads(proc)
@@ -22107,6 +22667,7 @@ body{padding:18px}
                             except Exception:
                                 pass
                             sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+                        _auto_confirmed: set[bytes] = set()
                         while True:
                             now = time.time()
                             elapsed = now - start
@@ -22114,10 +22675,12 @@ body{padding:18px}
                                 _stop_process(proc)
                                 meta["error"] = "Error: interrupted by user"
                                 meta["exit_code"] = -130
+                                break
                             elif timeout > 0 and elapsed >= timeout:
                                 _stop_process(proc)
                                 meta["error"] = f"Error: timeout ({timeout}s)"
                                 meta["exit_code"] = -1
+                                break
                             events = sel.select(timeout=0.12)
                             for key, _ in events:
                                 stream = key.fileobj
@@ -22148,6 +22711,18 @@ body{padding:18px}
                                     },
                                 )
                                 next_progress_emit = now + 0.8
+                            # Auto-confirm interactive prompts (e.g. "Ok to proceed? (y)")
+                            if proc.stdin and not proc.stdin.closed:
+                                _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                                for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                                    if _pat in _tail and _pat not in _auto_confirmed:
+                                        try:
+                                            proc.stdin.write(b"y\n")
+                                            proc.stdin.flush()
+                                        except Exception:
+                                            pass
+                                        _auto_confirmed.add(_pat)
+                                        break
                             if (proc.poll() is not None) and (not sel.get_map()):
                                 break
                         merged_raw = _merge_output_text()
@@ -22175,6 +22750,8 @@ body{padding:18px}
                 meta["error"] = f"Error: {exc}"
                 meta["output"] = meta["error"]
                 meta["exit_code"] = -1
+        finally:
+            self._running_bash_proc = None
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
@@ -22185,11 +22762,19 @@ body{padding:18px}
                     str(meta.get("output") or meta.get("error") or "(no output)"),
                     cwd=cwd,
                 )
-            )
+        )
         return meta
 
+    def _shell_command_timeout(self) -> int:
+        return normalize_timeout_seconds(
+            getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+
     def _run_bash(self, command: str) -> str:
-        return self._run_shell_meta(command, self.files_root, 120)["output"]
+        return self._run_shell_meta(command, self.files_root, self._shell_command_timeout())["output"]
 
     def _fuzzy_resolve_path(self, fp: Path) -> Path:
         """If fp doesn't exist, try stripping spaces from the filename to find a close match.
@@ -22887,10 +23472,10 @@ body{padding:18px}
             "3) scaffold semantic HTML; "
             "4) apply CSS tokens + responsive layout; "
             "5) wire JS state/data interactions; "
-            "6) localize external JS dependencies to ./js from ./js_lib; "
+            "6) localize external JS dependencies to a task-local relative folder such as ./js from ./js_lib, and rewrite final HTML to plain relative paths; "
             "7) run QA loop for desktop/mobile/a11y/performance and iterate. "
             f"Offline JS libs available now: {libs_hint}. "
-            "Final exported HTML should avoid unresolved CDN-only script src."
+            "Final exported HTML should avoid unresolved CDN-only script src and must not keep '/js_lib/...' or '/assets/js_lib/...' virtual URLs."
         )
 
     def _contains_any_keyword(self, text: str, keywords: tuple[str, ...]) -> bool:
@@ -23054,9 +23639,10 @@ body{padding:18px}
         ) or str(base.get("task_type", "general"))
         if task_type not in TASK_PROFILE_TYPES:
             task_type = str(base.get("task_type", "general"))
-        complexity = str(src.get("complexity", base.get("complexity", "simple")) or "").strip().lower()
-        if complexity not in TASK_COMPLEXITY_LEVELS:
-            complexity = str(base.get("complexity", "simple"))
+        complexity = normalize_task_complexity(
+            src.get("complexity", base.get("complexity", "simple")),
+            default=str(base.get("complexity", "simple") or "simple"),
+        )
         src_direct_objective = trim(str(src.get("direct_objective", "") or "").strip(), 800)
         legacy_objectives = {
             "Provide the most direct useful response with minimal orchestration.",
@@ -23093,9 +23679,9 @@ body{padding:18px}
             if raw_level not in TASK_LEVEL_CHOICES:
                 if task_type == "simple_qa":
                     raw_level = 1 if len(str(goal or "")) <= 180 else 2
-                elif task_type in {"simple_code", "research"} and complexity == "simple":
+                elif task_type in {"simple_code", "research"} and task_complexity_rank(complexity) <= task_complexity_rank("moderate"):
                     raw_level = 3
-                elif complexity == "complex":
+                elif task_complexity_at_least(complexity, "complex"):
                     raw_level = 4
                 else:
                     raw_level = 2
@@ -23184,7 +23770,7 @@ body{padding:18px}
         goal = str(bb.get("original_goal", "") or "")
         current = bb.get("task_profile", {})
         profile = self._normalize_task_profile(goal, {} if force else current)
-        if profile.get("complexity") == "simple":
+        if task_complexity_rank(profile.get("complexity", "simple")) < task_complexity_rank("complex"):
             logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
             tail = "\n".join(
                 str((row or {}).get("content", "") or "")
@@ -23288,10 +23874,16 @@ body{padding:18px}
         # Project todo gate: coding tasks must pass compile + test
         profile = self._ensure_blackboard_task_profile(bb)
         task_type = str(profile.get("task_type", "general") or "general")
+        exec_mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
         if task_type in ("simple_code", "engineering"):
             for todo in bb.get("project_todos", []):
                 if todo.get("category") in ("compile_test", "min_test") and todo.get("status") != "completed":
                     return False, f"project-todo-incomplete:{todo.get('category', '')}"
+        if exec_mode == EXECUTION_MODE_SYNC and not self._manager_feedback_passed_from_blackboard(bb):
+            return False, "sync-review-missing"
         return True, "ok"
 
     def _invalidate_stale_approval_if_needed(
@@ -23509,6 +24101,10 @@ body{padding:18px}
     def _watchdog_state_fingerprint(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(bb)
+        step_snapshot = self._active_plan_progress_snapshot(bb)
+        last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        last_reply_role = self._sanitize_agent_role(last_reply.get("role", ""))
+        last_reply_text = trim(str(last_reply.get("text", "") or "").strip(), 240)
         payload = {
             "status": self._normalize_blackboard_status(bb.get("status", "INITIALIZING")),
             "goal": trim(str(bb.get("original_goal", "") or "").strip(), 400),
@@ -23521,6 +24117,16 @@ body{padding:18px}
             "approved": bool((bb.get("approval", {}) or {}).get("approved", False)),
             "task_type": str(profile.get("task_type", "general") or "general"),
             "complexity": str(profile.get("complexity", "simple") or "simple"),
+            "plan_step_id": str(step_snapshot.get("step_id", "") or ""),
+            "plan_step_text": trim(str(step_snapshot.get("step_text", "") or "").strip(), 180),
+            "worker_todo_count": int(step_snapshot.get("worker_todo_count", 0) or 0),
+            "worker_todo_completed": int(step_snapshot.get("completed_count", 0) or 0),
+            "worker_todo_in_progress": int(step_snapshot.get("in_progress_count", 0) or 0),
+            "worker_todo_pending": int(step_snapshot.get("pending_count", 0) or 0),
+            "current_subtask": trim(str(step_snapshot.get("current_subtask", "") or "").strip(), 180),
+            "next_pending_subtask": trim(str(step_snapshot.get("next_pending_subtask", "") or "").strip(), 180),
+            "last_worker_reply_role": last_reply_role,
+            "last_worker_reply_text": last_reply_text,
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -24165,6 +24771,7 @@ body{padding:18px}
                 "instruction": "",
                 "reason": "",
                 "source": "",
+                "progress_fp": "",
                 "is_mandatory": False,
                 "ts": 0.0,
             },
@@ -24220,6 +24827,7 @@ body{padding:18px}
                 "instruction": trim(str(raw_delegate.get("instruction", "") or "").strip(), 1200),
                 "reason": trim(str(raw_delegate.get("reason", "") or "").strip(), 600),
                 "source": trim(str(raw_delegate.get("source", "") or "").strip(), 40),
+                "progress_fp": trim(str(raw_delegate.get("progress_fp", "") or "").strip(), 80),
                 "is_mandatory": _to_bool_like(raw_delegate.get("is_mandatory", False), default=False),
                 "ts": float(raw_delegate.get("ts", 0.0) or 0.0),
             }
@@ -24357,8 +24965,8 @@ body{padding:18px}
             for pt in bb_src_todos[:40]:
                 if not isinstance(pt, dict):
                     continue
-                raw_content = trim(str(pt.get("content", "") or ""), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
-                raw_full = trim(str(pt.get("full_content", "") or ""), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+                raw_content = trim(normalize_embedded_newlines(pt.get("content", "")), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+                raw_full = trim(normalize_embedded_newlines(pt.get("full_content", "")), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
                 # Migration: if full_content is empty but content has sub-steps, auto-split
                 if not raw_full and raw_content and pt.get("category") == "plan_step":
                     normalized = _mid_re_norm.sub(r"\n\1", raw_content)
@@ -24771,7 +25379,8 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         delegations = fl.get("repeated_delegations", [])
-        fp = hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12]
+        progress_fp = self._watchdog_state_fingerprint(bb)
+        fp = hashlib.sha1((str(instruction or "") + "|" + progress_fp).encode("utf-8")).hexdigest()[:12]
         for entry in delegations:
             if entry.get("instruction_hash") == fp and entry.get("target") == target:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -24784,6 +25393,7 @@ body{padding:18px}
             "target": trim(str(target or ""), 40),
             "instruction_hash": fp,
             "instruction_preview": trim(str(instruction or ""), 200),
+            "progress_fp": progress_fp,
             "count": 1,
             "first_round": int(getattr(self, "agent_round_index", 0) or 0),
             "last_round": int(getattr(self, "agent_round_index", 0) or 0),
@@ -24848,6 +25458,12 @@ body{padding:18px}
         board = self._ensure_blackboard()
         board["updated_at"] = float(now_ts())
         self.blackboard = board
+
+    def _save_blackboard(self, bb: dict):
+        """Persist a blackboard dict as the current blackboard and touch updated_at."""
+        if isinstance(bb, dict):
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
 
     def _blackboard_reset_for_goal(self, goal: str):
         # Preserve plan state when safe, but refresh loaded skills on goal change.
@@ -25736,6 +26352,16 @@ body{padding:18px}
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
         current["evidence"] = trim(str(evidence or "").strip(), 200) or self._ui_text("step_completed_evidence")
+        # Clear single-mode validation gate flags for the completed step
+        try:
+            _completed_id = str(current.get("id", "") or "")
+            for _attr_name in (f"_smvg_{_completed_id}", f"_smvg_ts_{_completed_id}", f"_smvg_n_{_completed_id}", f"_sync_exec_gate_n_{_completed_id}", f"_sync_sv_ts_{_completed_id}"):
+                try:
+                    delattr(self, _attr_name)
+                except AttributeError:
+                    pass
+        except Exception:
+            pass
         # 推进 cursor，激活下一步
         cursor = int(bb.get("plan_step_cursor", 0) or 0)
         bb["plan_step_cursor"] = cursor + 1
@@ -25903,7 +26529,33 @@ body{padding:18px}
             )
         ) or accumulated_evidence_path
         if has_strong_evidence:
+            # Sync mode exec gate: when all subtasks done for implement/test/deploy phases,
+            # require at least some execution evidence (bash/test/compile ran at any point).
+            # Manager-requested advancement has its own escape hatch after 10 blocks.
+            _exec_gate_needed = (
+                subtasks_all_done
+                and phase in ("implement", "test", "deploy")
+            )
+            if _exec_gate_needed:
+                # Require model's explicit <step-verified/> tag in agent_messages since step activation
+                _has_verified = self._check_step_verified_tag(current, messages=self.agent_messages)
+                if not _has_verified:
+                    _sync_n_flag = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
+                    _sync_n = int(getattr(self, _sync_n_flag, 0))
+                    if _sync_n < 10:
+                        setattr(self, _sync_n_flag, _sync_n + 1)
+                        # No verified tag yet — push worker to evaluate and emit <step-verified/>
+                        self._inject_sync_mode_verification_hint(current, worker_step)
+                        return
+                    # After 10 blocks, allow advancement to prevent permanent stall
             evidence = self._collect_step_evidence(current, worker_step)
+            # Clear sync exec gate counter on successful advance
+            try:
+                _sync_clear = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
+                if hasattr(self, _sync_clear):
+                    delattr(self, _sync_clear)
+            except Exception:
+                pass
             self._advance_plan_step(
                 evidence=evidence,
                 actor=str(route.get("target", "developer") or "developer"),
@@ -26018,13 +26670,6 @@ body{padding:18px}
         all_marked_done = all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
         if not all_marked_done:
             return False
-        # Acceptance verification: check that each "completed" subtask has real evidence
-        # Don't just trust the model's TodoWrite status — verify against accumulated tool outputs
-        if worker_items:
-            bb = self._ensure_blackboard()
-            unverified = self._verify_subtasks_acceptance(worker_items, step_id, bb)
-            if unverified:
-                return False
         return True
 
     def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
@@ -26129,7 +26774,6 @@ body{padding:18px}
                 return
             rows = self._active_plan_worker_todo_rows(step_id, role="")
             completed_rows = [r for r in rows if str(r.get("status", "")).lower() == "completed"]
-            pending_rows = [r for r in rows if str(r.get("status", "")).lower() != "completed"]
             if not completed_rows:
                 return
             bb = self._ensure_blackboard()
@@ -26158,12 +26802,12 @@ body{padding:18px}
             for i, item in enumerate(rework_items[:5]):
                 rework_text += f"  {i+1}. {trim(str(item), 120)}\n"
             rework_text += (
-                f"\nACTION REQUIRED: Fix these issues NOW before the step can advance.\n"
-                f"- For missing files: create them with write_file\n"
-                f"- For failed tests/builds: run the command again and fix errors\n"
-                f"- For unverified installs: re-run the install command\n"
-                f"After fixing, update TodoWrite to reflect the corrected state.\n"
-                f"</step-rework>"
+                "\nACTION REQUIRED: Fix these issues NOW before the step can advance.\n"
+                "- For missing files: create them with write_file\n"
+                "- For failed tests/builds: run the command again and fix errors\n"
+                "- For unverified installs: re-run the install command\n"
+                "After fixing, update TodoWrite to reflect the corrected state.\n"
+                "</step-rework>"
             )
             # Revert false "completed" status back to in_progress
             _snap = self.todo.snapshot()
@@ -26272,6 +26916,10 @@ body{padding:18px}
                 parts.append(f"bash: {cmd}" + (f" => {out}" if out else ""))
             elif name == "read_file":
                 path = str(r.get("args", {}).get("path", "") or "")
+                # Skip plan-infrastructure reads — not meaningful implementation evidence
+                _p = str(path)
+                if (_p.endswith("plan.md") and ".clouds_coder" in _p) or ".clouds_coder/skills_cache/" in _p:
+                    continue
                 out = self._tool_result_output_excerpt(r, 90)
                 parts.append(f"read: {path}" + (f" => {out}" if out else ""))
             elif name in ("write_to_blackboard", "query_code_library", "query_knowledge_library"):
@@ -26343,10 +26991,342 @@ body{padding:18px}
             return False
         return bool(self._active_plan_worker_todo_rows(step_id, role=role))
 
+    def _bridge_flat_todos_to_active_plan_step(
+        self,
+        rows: list[dict] | None,
+        board: dict | None = None,
+    ) -> tuple[list[dict], bool]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return (list(rows or []), False)
+        step_id = trim(str(step.get("id", "") or ""), 20)
+        if not step_id:
+            return (list(rows or []), False)
+        snap = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        if not snap:
+            return (snap, False)
+        worker_owners = {"developer", "explorer", "reviewer"}
+        if any(str(row.get("parent_step_id", "") or "").strip() for row in snap):
+            return (snap, False)
+        if any(
+            str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and str(row.get("parent_step_id", "") or "").strip() == step_id
+            for row in snap
+        ):
+            return (snap, False)
+        owner_key = self._current_plan_worker_owner(bb)
+        bridged: list[dict] = []
+        migrated = False
+        for row in snap:
+            key = trim(str(row.get("key", "") or "").strip(), 120)
+            if key.startswith("bb:"):
+                bridged.append(dict(row))
+                continue
+            content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "").strip()
+            if not content:
+                continue
+            new_row = dict(row)
+            new_row["content"] = content
+            new_row["parent_step_id"] = step_id
+            owner = str(new_row.get("owner", "") or "").strip().lower()
+            if owner not in worker_owners:
+                new_row["owner"] = owner_key
+            bridged.append(new_row)
+            migrated = True
+        return (bridged, migrated)
+
+    def _active_plan_progress_snapshot(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._current_plan_step_row(bb)
+        if not isinstance(step, dict):
+            return {
+                "step_id": "",
+                "step_index": 0,
+                "step_text": "",
+                "expected_count": 0,
+                "worker_todo_count": 0,
+                "completed_count": 0,
+                "in_progress_count": 0,
+                "pending_count": 0,
+                "current_subtask": "",
+                "next_pending_subtask": "",
+                "owners": [],
+            }
+        step_id = trim(str(step.get("id", "") or ""), 20)
+        rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
+        expected = self._extract_plan_step_subtasks(step, limit=5)
+        completed_count = 0
+        in_progress_count = 0
+        pending_count = 0
+        current_subtask = ""
+        next_pending_subtask = ""
+        owners: set[str] = set()
+        for row in rows:
+            status = str(row.get("status", "pending") or "pending").strip().lower()
+            content = trim(str(row.get("content", "") or "").strip(), 220)
+            owner = self._sanitize_agent_role(row.get("owner", ""))
+            if owner:
+                owners.add(owner)
+            if status == "completed":
+                completed_count += 1
+            elif status == "in_progress":
+                in_progress_count += 1
+                if content and not current_subtask:
+                    current_subtask = content
+            else:
+                pending_count += 1
+                if content and not next_pending_subtask:
+                    next_pending_subtask = content
+        return {
+            "step_id": step_id,
+            "step_index": max(0, int(step.get("plan_step_index", 0) or 0)),
+            "step_text": self._current_plan_step_text(bb),
+            "expected_count": len(expected),
+            "worker_todo_count": len(rows),
+            "completed_count": completed_count,
+            "in_progress_count": in_progress_count,
+            "pending_count": pending_count,
+            "current_subtask": current_subtask,
+            "next_pending_subtask": next_pending_subtask,
+            "owners": sorted(owners),
+        }
+
+    def _manager_worker_progress_capsule(self, role: str, step: dict, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role) or "developer"
+        safe_step = step if isinstance(step, dict) else {}
+        snapshot = self._active_plan_progress_snapshot(bb)
+        tool_results = safe_step.get("tool_results", []) or []
+        tool_names: list[str] = []
+        for item in tool_results:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if not name or name in tool_names:
+                continue
+            tool_names.append(name)
+            if len(tool_names) >= 5:
+                break
+        parts = [
+            f"[worker-progress] owner={role_key}",
+            f"status={trim(str(safe_step.get('status', '') or ''), 40) or '-'}",
+        ]
+        if tool_names:
+            parts.append("tools=" + ",".join(tool_names))
+        step_text = trim(str(snapshot.get("step_text", "") or ""), 180)
+        if step_text:
+            parts.append(f"step={step_text}")
+        todo_state = (
+            f"todos={int(snapshot.get('completed_count', 0) or 0)}/"
+            f"{int(snapshot.get('in_progress_count', 0) or 0)}/"
+            f"{int(snapshot.get('pending_count', 0) or 0)}"
+        )
+        if int(snapshot.get("worker_todo_count", 0) or 0) > 0:
+            parts.append(todo_state)
+        elif int(snapshot.get("expected_count", 0) or 0) > 0:
+            parts.append(f"todos=missing/{int(snapshot.get('expected_count', 0) or 0)}")
+        focus = trim(str(snapshot.get("current_subtask", "") or ""), 160)
+        if focus:
+            parts.append(f"focus={focus}")
+        elif str(snapshot.get("next_pending_subtask", "") or "").strip():
+            parts.append(f"next={trim(str(snapshot.get('next_pending_subtask', '') or ''), 160)}")
+        current_step = self._current_plan_step_row(bb)
+        if isinstance(current_step, dict):
+            evidence = self._collect_blackboard_step_evidence(current_step, bb)
+            if evidence:
+                parts.append(f"evidence={trim(evidence, 180)}")
+            if self._step_subtasks_all_completed(current_step) and self._plan_step_has_blackboard_evidence(current_step, bb):
+                parts.append("acceptance=ready")
+        reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        if self._sanitize_agent_role(reply.get("role", "")) == role_key:
+            reply_text = trim(str(reply.get("text", "") or "").strip(), 180)
+            if reply_text:
+                parts.append(f"reply={reply_text}")
+        return trim(" | ".join(parts), 1600)
+
+    def _manager_recovery_route_for_repeated_delegate(self, route: dict, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        row = dict(route or {})
+        step = self._current_plan_step_row(bb)
+        if not isinstance(step, dict):
+            row["target"] = "developer"
+            row["instruction"] = (
+                "Recovery routing after repeated identical delegation. "
+                "Continue the current objective with one concrete tool action and write observable progress."
+            )
+            row["reason"] = trim(f"{row.get('reason', '')}|loop-recovery-no-plan-step", 600)
+            row["source"] = "loop-recovery"
+            row["is_mandatory"] = True
+            return row
+        snapshot = self._active_plan_progress_snapshot(bb)
+        step_text = trim(str(snapshot.get("step_text", "") or ""), 220)
+        full_text = self._current_plan_step_full_text(bb, max_len=600)
+        phase = self._plan_step_phase_hint(full_text)
+        expected_count = int(snapshot.get("expected_count", 0) or 0)
+        worker_todo_count = int(snapshot.get("worker_todo_count", 0) or 0)
+        current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
+        next_pending = trim(str(snapshot.get("next_pending_subtask", "") or ""), 180)
+        subtasks_done = self._step_subtasks_all_completed(step)
+        has_evidence = self._plan_step_has_blackboard_evidence(step, bb)
+        reviewer_available = True
+        profile = self._ensure_blackboard_task_profile(bb)
+        participants = profile.get("participants", []) if isinstance(profile.get("participants"), list) else []
+        participants_norm = [self._sanitize_agent_role(x) for x in participants]
+        participants_norm = [x for x in participants_norm if x]
+        if participants_norm:
+            reviewer_available = "reviewer" in participants_norm
+        if subtasks_done and has_evidence and reviewer_available:
+            row["target"] = "reviewer"
+            row["instruction"] = trim(
+                (
+                    "Recovery routing after repeated identical delegation. "
+                    f"Validate ONLY the current plan step: {step_text}. "
+                    "Worker subtasks are complete and blackboard evidence already exists. "
+                    "Run acceptance for this step only, record pass/fix with concrete evidence, and do not jump ahead."
+                ),
+                1200,
+            )
+            row["reason"] = trim(f"{row.get('reason', '')}|loop-recovery-acceptance", 600)
+            row["source"] = "loop-recovery"
+            row["is_mandatory"] = True
+            return row
+        default_owner = "explorer" if phase in {"research", "design"} else "developer"
+        owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
+        if owner not in {"developer", "explorer"}:
+            owner = default_owner
+        if expected_count > 0 and worker_todo_count == 0:
+            action_text = (
+                "First call TodoWrite for the current plan step and create the missing worker subtasks "
+                "before any more implementation."
+            )
+        elif current_subtask:
+            action_text = f"Continue ONLY the current in_progress subtask: {current_subtask}."
+        elif next_pending:
+            action_text = f"Resume the next pending subtask: {next_pending}."
+        else:
+            action_text = "Continue the current plan step with one concrete tool action."
+        evidence_text = ""
+        if has_evidence:
+            evidence_text = (
+                " Blackboard already contains partial evidence for this step; build on that work instead of restarting."
+            )
+        row["target"] = owner
+        row["instruction"] = trim(
+            (
+                "Recovery routing after repeated identical delegation. "
+                f"Stay on the current plan step: {step_text}. "
+                f"{action_text} "
+                "Do not branch to a different step or restate the whole plan. "
+                "After the subtask is finished, immediately call TodoWrite to mark it completed and move the next subtask to in_progress."
+                f"{evidence_text}"
+            ),
+            1200,
+        )
+        row["reason"] = trim(f"{row.get('reason', '')}|loop-recovery-execute", 600)
+        row["source"] = "loop-recovery"
+        row["is_mandatory"] = True
+        return row
+
+    def _todo_has_plan_steps(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        return any(
+            isinstance(todo, dict) and todo.get("category") == "plan_step"
+            for todo in todos
+        )
+
+    def _todo_worker_role_hint(self, role: str = "", board: dict | None = None) -> str:
+        role_key = self._sanitize_agent_role(role)
+        if role_key in {"developer", "explorer", "reviewer"}:
+            return role_key
+        return self._current_plan_worker_owner(board)
+
+    def _todo_route_kind(self, role: str = "", board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if self._todo_has_plan_steps(bb):
+            return "plan_sync" if self._is_multi_agent_mode() else "plan_single"
+        role_key = self._todo_worker_role_hint(role, bb)
+        if self._is_multi_agent_mode() and role_key in {"developer", "explorer", "reviewer"}:
+            return "pure_sync"
+        return "pure_single"
+
+    def _todo_row_kind(self, row: dict | None) -> str:
+        if not isinstance(row, dict):
+            return ""
+        key = str(row.get("key", "") or "").strip()
+        if key.startswith("bb:"):
+            return "system"
+        owner = str(row.get("owner", "") or "").strip().lower()
+        parent_step_id = str(row.get("parent_step_id", "") or "").strip()
+        if owner in {"developer", "explorer", "reviewer"} and parent_step_id:
+            return "plan_worker"
+        if owner in {"developer", "explorer", "reviewer"}:
+            return "owner_worker"
+        return "flat"
+
+    def _todo_route_rows(
+        self,
+        route_kind: str,
+        *,
+        rows: list[dict] | None = None,
+        role: str = "",
+        board: dict | None = None,
+    ) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        snap = [dict(row) for row in (rows if isinstance(rows, list) else self.todo.snapshot()) if isinstance(row, dict)]
+        if route_kind in {"plan_single", "plan_sync"}:
+            step = self._get_active_plan_step(bb)
+            step_id = trim(str((step or {}).get("id", "") or ""), 20)
+            if not step_id:
+                return []
+            return [
+                row for row in snap
+                if self._todo_row_kind(row) == "plan_worker"
+                and str(row.get("parent_step_id", "") or "").strip() == step_id
+            ]
+        if route_kind == "pure_sync":
+            role_key = self._todo_worker_role_hint(role, bb)
+            owner_rows = [row for row in snap if self._todo_row_kind(row) == "owner_worker"]
+            if role_key in {"developer", "explorer", "reviewer"}:
+                scoped = [
+                    row for row in owner_rows
+                    if str(row.get("owner", "") or "").strip().lower() == role_key
+                ]
+                if scoped:
+                    return scoped
+            return owner_rows
+        if route_kind == "pure_single":
+            return [row for row in snap if self._todo_row_kind(row) == "flat"]
+        return []
+
     def _todo_runtime_has_worker_rows(self, role: str = "") -> bool:
-        if self._get_active_plan_step() is not None:
-            return self._active_plan_step_has_worker_todos(role=role)
-        return bool(self.todo.snapshot())
+        route_kind = self._todo_route_kind(role=role)
+        return bool(self._todo_route_rows(route_kind, role=role))
+
+    def _merge_todo_signal_rows(self, items: list[dict], role: str = "", board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        role_key = self._sanitize_agent_role(role)
+        route_kind = self._todo_route_kind(role=role_key, board=bb)
+        step = self._get_active_plan_step(bb) if route_kind in {"plan_single", "plan_sync"} else None
+        step_id = trim(str((step or {}).get("id", "") or ""), 20)
+        normalized: list[dict] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if role_key in {"developer", "explorer", "reviewer"} and not str(row.get("owner", "") or "").strip():
+                row["owner"] = role_key
+            if step_id and not str(row.get("parent_step_id", "") or "").strip():
+                row["parent_step_id"] = step_id
+            normalized.append(row)
+        if not normalized:
+            return self.todo.no_changes_text()
+        if route_kind in {"plan_single", "plan_sync"}:
+            return self._merge_plan_worker_todo_items(normalized, role=role_key)
+        if route_kind == "pure_sync":
+            return self._merge_owner_scoped_todo_items(normalized, role=role_key)
+        return self._merge_flat_todo_items(normalized, role=role_key)
 
     def _plan_worker_todo_identity(self, row: dict | None) -> str:
         import re
@@ -26361,6 +27341,96 @@ body{padding:18px}
         if match:
             return f"substep:{match.group(1)}"
         return f"text:{content}"
+
+    def _flat_todo_identity(self, row: dict | None) -> str:
+        import re
+
+        if not isinstance(row, dict):
+            return ""
+        key = trim(str(row.get("key", "") or "").strip(), 120)
+        if key.startswith("bb:"):
+            return f"system:{key}"
+        content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "")
+        content = re.sub(r"\s+", " ", content.strip().lower())
+        if not content:
+            return ""
+        match = re.match(r"^(\d+\.\d+)\b", content)
+        if match:
+            return f"substep:{match.group(1)}"
+        return f"text:{content}"
+
+    def _merge_flat_todo_items(self, items: list[dict], role: str = "") -> str:
+        if not isinstance(items, list):
+            raise ValueError("items must be array")
+        role_key = self._sanitize_agent_role(role)
+        existing = self.todo.snapshot()
+        route_existing = self._todo_route_rows("pure_single", rows=existing, role=role_key)
+        existing_by_identity: dict[str, dict] = {}
+        preserved_system: list[dict] = []
+        for row in existing:
+            if self._todo_row_kind(row) != "system":
+                continue
+            preserved_system.append(dict(row))
+        for row in route_existing:
+            if not isinstance(row, dict):
+                continue
+            identity = self._flat_todo_identity(row)
+            if not identity:
+                continue
+            if identity not in existing_by_identity:
+                existing_by_identity[identity] = dict(row)
+
+        status_alias = {
+            "todo": "pending",
+            "doing": "in_progress",
+            "inprogress": "in_progress",
+            "in-progress": "in_progress",
+            "done": "completed",
+            "finish": "completed",
+            "finished": "completed",
+        }
+        passthrough_rows: list[dict] = []
+        merged_rows: list[dict] = []
+        seen_identities: set[str] = set()
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                raw = {"content": item}
+            elif isinstance(item, dict):
+                raw = dict(item)
+            else:
+                raise ValueError(f"item {idx}: invalid type")
+            key = trim(str(raw.get("key", "") or "").strip(), 120)
+            if key.startswith("bb:"):
+                passthrough_rows.append(raw)
+                continue
+            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            content = normalize_work_text(raw_content) or raw_content
+            if not content:
+                continue
+            normalized: dict[str, object] = {"content": content}
+            raw_status = str(raw.get("status", raw.get("state", "")) or "").strip().lower()
+            if raw_status:
+                normalized["status"] = status_alias.get(raw_status, raw_status)
+            owner = str(raw.get("owner", "") or "").strip().lower()
+            if owner in {"manager", "explorer", "developer", "reviewer"}:
+                normalized["owner"] = owner
+            elif role_key == "manager" and owner == "":
+                normalized["owner"] = role_key
+            active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
+            if active_form:
+                normalized["activeForm"] = active_form
+            identity = self._flat_todo_identity(normalized)
+            if not identity:
+                identity = f"ad-hoc:{idx}:{trim(content, 80)}"
+            merged = dict(existing_by_identity.get(identity, {}))
+            if "activeForm" not in normalized:
+                merged.pop("activeForm", None)
+            merged.update(normalized)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            merged_rows.append(merged)
+        return self.todo.update(preserved_system + passthrough_rows + merged_rows)
 
     def _merge_plan_worker_todo_items(self, items: list[dict], role: str = "") -> str:
         if not isinstance(items, list):
@@ -26378,6 +27448,12 @@ body{padding:18px}
         worker_owners = {"developer", "explorer", "reviewer"}
         for row in existing:
             if not isinstance(row, dict):
+                continue
+            row_kind = self._todo_row_kind(row)
+            if row_kind == "system":
+                preserved.append(dict(row))
+                continue
+            if row_kind != "plan_worker":
                 continue
             owner = str(row.get("owner", "") or "").strip().lower()
             row_step_id = trim(str(row.get("parent_step_id", "") or ""), 20)
@@ -26468,7 +27544,16 @@ body{padding:18px}
                         and str(row.get("status", "")).lower() != "completed"):
                     row.pop("parent_step_id", None)  # Not for current step
 
-        final_rows = preserved + passthrough_rows + merged_target_rows
+        # Insert merged_target_rows right after the active plan step's bb: row in preserved,
+        # so subtasks appear nested under their parent step rather than at the list bottom.
+        _step_key = str(active_step.get("key", "") or "")
+        _insert_idx = len(preserved)  # fallback: append at end
+        if _step_key:
+            for _i, _r in enumerate(preserved):
+                if str(_r.get("key", "") or "") == _step_key:
+                    _insert_idx = _i + 1
+                    break
+        final_rows = preserved[:_insert_idx] + passthrough_rows + merged_target_rows + preserved[_insert_idx:]
         return self.todo.update(final_rows)
 
     def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
@@ -26695,7 +27780,7 @@ body{padding:18px}
         content = self._build_plan_todo_reminder_text(plan_step, missing_subtasks=missing_subtasks)
         if not content:
             return False
-        self.messages.append({"role": "user", "content": content, "ts": now_tick})
+        self._append_plan_guidance_bubble(content, summary="todo reminder")
         self.last_todo_reminder_ts = now_tick
         self.todo_reminder_count += 1
         self._emit(
@@ -26714,7 +27799,7 @@ body{padding:18px}
 
         if not isinstance(plan_step, dict):
             return []
-        raw = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        raw = normalize_embedded_newlines(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
         if not raw.strip():
             return []
         lines = [trim(str(line or "").strip(), 300) for line in raw.replace("\r\n", "\n").split("\n")]
@@ -26844,6 +27929,136 @@ body{padding:18px}
             self.todo.items = preserved + replacement
         return True
 
+    def _check_step_verified_tag(self, plan_step: dict, *, messages: list | None = None) -> bool:
+        """Return True if the agent has emitted <step-verified> in any assistant message
+        since this plan step was activated (i.e., after plan_step['activated_at']).
+        Pass messages=self.agent_messages for sync mode; defaults to self.messages."""
+        activated_at = float(plan_step.get("activated_at", 0.0) or 0.0)
+        msg_list = messages if messages is not None else self.messages
+        for msg in reversed(msg_list):
+            if not isinstance(msg, dict):
+                continue
+            msg_ts = float(msg.get("ts", 0.0) or 0.0)
+            # Stop once we reach messages predating step activation
+            if activated_at > 0 and msg_ts > 0 and msg_ts < activated_at:
+                break
+            if msg.get("role") == "assistant":
+                content = str(msg.get("content", "") or "")
+                if "<step-verified" in content:
+                    return True
+        return False
+
+    def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
+        """Gate passes when:
+          1. Phase is research/design (no execution needed)
+          2. Model emitted <step-verified/> since step activation
+          3. Blackboard shows phase-appropriate accumulated evidence (has_write+has_exec for implement)
+          4. Escape hatch: 10 consecutive blocks
+        Research/design phases exempt. Escape hatch prevents permanent stall."""
+        step_id = str(plan_step.get("id", "") or "")
+        _flag = f"_smvg_{step_id}"
+        if getattr(self, _flag, False):
+            return True  # Already validated in a previous round
+        step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        if phase in ("research", "design"):
+            setattr(self, _flag, True)
+            return True  # No verification needed for non-execution phases
+        # Escape hatch: after 10 consecutive blocks, unblock to prevent permanent stall
+        _n_flag = f"_smvg_n_{step_id}"
+        _n_blocked = int(getattr(self, _n_flag, 0))
+        if _n_blocked >= 10:
+            setattr(self, _flag, True)
+            return True
+        # Path A: model explicit tag
+        if self._check_step_verified_tag(plan_step):
+            setattr(self, _flag, True)
+            return True
+        # Path B: blackboard shows phase-appropriate accumulated evidence
+        # implement: has_write AND (has_exec OR ...) — wrote files + ran bash
+        # test/review: has_exec OR has_test_pass — ran tests
+        # other: use generic evidence check
+        if self._plan_step_has_blackboard_evidence(plan_step):
+            setattr(self, _flag, True)
+            return True
+        # Gate blocked — increment counter and inject hint
+        setattr(self, _n_flag, _n_blocked + 1)
+        self._inject_single_mode_validation_hint(plan_step)
+        return False
+
+    def _inject_single_mode_validation_hint(self, plan_step: dict):
+        """Inject a hint (rate-limited 20s) instructing the model to emit <step-verified/>
+        after evaluating bash output against the step's acceptance criteria."""
+        step_id = str(plan_step.get("id", "") or "")
+        _ts_flag = f"_smvg_ts_{step_id}"
+        _last_ts = float(getattr(self, _ts_flag, 0.0))
+        if float(now_ts()) - _last_ts < 20.0:
+            return
+        setattr(self, _ts_flag, float(now_ts()))
+        step_label = trim(str(plan_step.get("content", "") or ""), 80)
+        full_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        # Extract ACCEPTANCE criteria line if present
+        acceptance = ""
+        for line in full_content.splitlines():
+            if line.strip().upper().startswith("ACCEPTANCE:"):
+                acceptance = line.strip()[len("ACCEPTANCE:"):].strip()
+                break
+        phase = self._plan_step_phase_hint(full_content.lower())
+        if phase == "test":
+            action = "run the tests with bash and evaluate the results"
+        else:
+            action = "run the build/compile/run command with bash and evaluate the output"
+        accept_line = f"\nAcceptance criteria: {acceptance}" if acceptance else ""
+        msg = (
+            f"<verification-required>\n"
+            f"All subtasks for \"{step_label}\" are marked complete.{accept_line}\n"
+            f"Before this step can advance, you must:\n"
+            f"1. {action}\n"
+            f"2. Review the bash output and confirm it meets the acceptance criteria\n"
+            f"3. If it passes, emit exactly: <step-verified/>\n"
+            f"4. If it fails, fix the issue and retry — do NOT emit <step-verified/> until resolved\n"
+            f"</verification-required>"
+        )
+        _recent = self.messages[-5:]
+        if not any("<verification-required>" in str(m.get("content", "") or "") for m in _recent if isinstance(m, dict)):
+            self.messages.append({"role": "user", "content": msg, "ts": now_ts()})
+
+    def _inject_sync_mode_verification_hint(self, plan_step: dict, worker_step: dict):
+        """Inject a verification hint into agent_messages (rate-limited 30s) for sync mode.
+        Instructs the worker to emit <step-verified/> after evaluating bash output."""
+        step_id = str(plan_step.get("id", "") or "")
+        _ts_flag = f"_sync_sv_ts_{step_id}"
+        _last_ts = float(getattr(self, _ts_flag, 0.0))
+        if float(now_ts()) - _last_ts < 30.0:
+            return
+        setattr(self, _ts_flag, float(now_ts()))
+        step_label = trim(str(plan_step.get("content", "") or ""), 80)
+        full_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+        acceptance = ""
+        for line in full_content.splitlines():
+            if line.strip().upper().startswith("ACCEPTANCE:"):
+                acceptance = line.strip()[len("ACCEPTANCE:"):].strip()
+                break
+        phase = self._plan_step_phase_hint(full_content.lower())
+        if phase == "test":
+            action = "run the tests with bash and evaluate results"
+        else:
+            action = "run the build/compile command with bash and evaluate the output"
+        accept_line = f"\nAcceptance criteria: {acceptance}" if acceptance else ""
+        msg = (
+            f"<verification-required>\n"
+            f"All subtasks for \"{step_label}\" are marked complete.{accept_line}\n"
+            f"Before this step can advance:\n"
+            f"1. {action}\n"
+            f"2. Review the output and confirm acceptance criteria are met\n"
+            f"3. If it passes, emit exactly: <step-verified/>\n"
+            f"4. If it fails, fix and retry — do NOT emit <step-verified/> until resolved\n"
+            f"</verification-required>"
+        )
+        _recent = self.agent_messages[-5:]
+        if not any("<verification-required>" in str(m.get("content", "") or "") for m in _recent if isinstance(m, dict)):
+            self.agent_messages.append({"role": "user", "content": msg, "ts": now_ts()})
+
     def _single_agent_plan_step_check(self, tool_results: list[dict]):
         """In single-agent mode, check if current plan step should be advanced based on tool results."""
         bb = self._ensure_blackboard()
@@ -26861,6 +28076,24 @@ body{padding:18px}
         if not current:
             self._sync_todos_from_blackboard(reason="single-agent-round")
             return
+        # When a new step is activated with no subtasks yet, require TodoWrite first
+        _cur_step_id = str(current.get("id", "") or "")
+        if _cur_step_id:
+            _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+            if not _existing_subs:
+                _step_label_s = trim(str(current.get("content", "") or ""), 60)
+                _force_tw_msg = (
+                    f"<action-required>\n"
+                    f"Step \"{_step_label_s}\" has no subtasks yet. "
+                    f"Your FIRST action MUST be to call TodoWrite with "
+                    f"parent_step_id=\"{_cur_step_id}\" to create this step's subtasks "
+                    f"(e.g. N.1, N.2 ...) before executing any other work.\n"
+                    f"</action-required>"
+                )
+                _recent_msgs = self.messages[-4:]
+                if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
+                    self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
+                return  # Wait for TodoWrite before doing other checks
         # Heuristic: check if tool results indicate step completion
         step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
@@ -26876,25 +28109,29 @@ body{padding:18px}
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
         bb_sig = self._plan_step_blackboard_signals(current, bb)
+        todo_progress_signal = any(
+            isinstance(r, dict) and r.get("ok", False)
+            and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
+            for r in tool_results
+        )
         # Auto-advance conditions:
         should_advance = False
+        _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
-        if subtasks_done and validation_ok:
-            should_advance = True
-        # Fix 3 (single mode): Accumulated evidence path — subtasks done + accumulated evidence
-        # Covers TodoWrite-only turns where validation_ok_current is False
-        if not should_advance and subtasks_done:
-            todo_progress_signal = any(
-                isinstance(r, dict) and r.get("ok", False)
-                and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
-                for r in tool_results
-            )
-            if todo_progress_signal and self._step_has_accumulated_evidence(current, bb):
+        if subtasks_done:
+            # Validation gate: passes when model emitted <step-verified/>, blackboard has
+            # phase-appropriate evidence, or escape hatch (10 blocks). Gate is the authoritative
+            # "step done" check — no additional validation_ok required after gate passes.
+            _gate_ok = self._single_mode_validation_gate(current, tool_results)
+            if _gate_ok:
                 should_advance = True
+            else:
+                _gate_blocked = True  # Gate blocked — disable ALL remaining advancement paths
         # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
         # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
-        if not should_advance:
+        # Skipped when validation gate has blocked advancement (subtasks_done + gate failed)
+        if not should_advance and not _gate_blocked:
             _has_subtasks_s = bool(self._active_plan_worker_todo_rows(
                 str(current.get("id", "") or ""), role=""
             ))
@@ -26913,7 +28150,8 @@ body{padding:18px}
                 ):
                     should_advance = True
         # Also check if the agent explicitly mentioned step completion
-        if not should_advance:
+        # Also blocked by validation gate when subtasks_done path was blocked
+        if not should_advance and not _gate_blocked:
             # Check last assistant message for step completion signals
             last_text = ""
             for msg in reversed(self.messages[-3:]):
@@ -26921,7 +28159,8 @@ body{padding:18px}
                     last_text = str(msg.get("content", "") or "").lower()
                     break
             step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一")
+                                 "next step", "下一步", "proceed to step", "进入下一",
+                                 "全部完成", "✅", "all subtasks")
             if validation_ok and any(sig in last_text for sig in step_done_signals):
                 should_advance = True
         if should_advance:
@@ -26934,6 +28173,23 @@ body{padding:18px}
         else:
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
+            if todo_progress_signal and not subtasks_done:
+                step_rows = self._active_plan_worker_todo_rows(str(current.get("id", "") or ""), role="")
+                next_row = next(
+                    (r for r in step_rows if str(r.get("status", "") or "").strip().lower() == "in_progress"),
+                    None,
+                )
+                focus_text = trim(str((next_row or {}).get("content", "") or "").strip(), 180)
+                if focus_text:
+                    focus_msg = (
+                        "<todo-focus>"
+                        f"Continue ONLY the current in_progress subtask: {focus_text}. "
+                        "Do not branch away from the active plan step."
+                        "</todo-focus>"
+                    )
+                    recent = self.messages[-6:]
+                    if not any(str(msg.get("content", "") or "").strip() == focus_msg for msg in recent if isinstance(msg, dict)):
+                        self._append_plan_guidance_bubble(focus_msg, summary="todo focus: continue current subtask")
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -26943,7 +28199,9 @@ body{padding:18px}
         rows = []
         for todo in todos:
             s = todo.get("status", "pending")
-            c = todo.get("content", "")
+            c = normalize_embedded_newlines(todo.get("content", "") or "")
+            if str(todo.get("category", "") or "") == "plan_step" and "\n" in c:
+                c = c.split("\n", 1)[0].strip()
             ev = todo.get("evidence", "")
             af = {
                 "in_progress": self._ui_text("todo_working", content=c),
@@ -26956,12 +28214,9 @@ body{padding:18px}
         if bool(self.runtime_reclassify_required):
             return
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        # In single mode, still sync plan_step todos if they exist
-        has_plan_steps = any(
-            isinstance(t, dict) and t.get("category") == "plan_step"
-            for t in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
-        )
-        if not self._is_multi_agent_mode() and not has_plan_steps:
+        route_kind = self._todo_route_kind(board=bb)
+        has_plan_steps = route_kind in {"plan_single", "plan_sync"}
+        if route_kind == "pure_single":
             return
         self._init_project_todos(bb)
         self._update_project_todo_status(bb)
@@ -26973,25 +28228,25 @@ body{padding:18px}
                 pass
         system_rows = self._todo_project_rows_from_blackboard(bb)
         existing = self.todo.snapshot()
+        bridged_flat_rows = False
         worker_rows: list[dict] = []
         non_system_rows: list[dict] = []
-        for row in existing:
-            if not isinstance(row, dict):
-                continue
-            key = str(row.get("key", "") or "").strip()
-            owner = str(row.get("owner", "") or "").strip().lower()
-            is_system_key = key.startswith(("bb:owner:", "bb:node:", "bb:proj:"))
-            # Preserve worker-owned items (from TodoWrite) separately
-            is_worker_item = owner in ("developer", "explorer", "reviewer") and not is_system_key
-            if is_worker_item:
-                worker_rows.append(dict(row))
-                continue
-            if is_system_key or owner == "manager":
-                continue
-            non_system_rows.append(dict(row))
-        if has_plan_steps:
-            worker_rows = [r for r in worker_rows if str(r.get("parent_step_id", "") or "").strip()]
-            non_system_rows = []
+        if route_kind == "plan_single":
+            worker_rows = self._todo_route_rows(route_kind, rows=existing, board=bb)
+            if not worker_rows:
+                flat_rows = self._todo_route_rows("pure_single", rows=existing, board=bb)
+                bridged_rows, bridged_flat_rows = self._bridge_flat_todos_to_active_plan_step(flat_rows, board=bb)
+                if bridged_flat_rows:
+                    worker_rows = self._todo_route_rows(route_kind, rows=bridged_rows, board=bb)
+        elif route_kind == "plan_sync":
+            worker_rows = self._todo_route_rows(route_kind, rows=existing, board=bb)
+        elif route_kind == "pure_sync":
+            worker_rows = self._todo_route_rows(
+                route_kind,
+                rows=existing,
+                role=self._todo_worker_role_hint(board=bb),
+                board=bb,
+            )
         # Smart trim: keep all active (in_progress/pending) system rows,
         # but only recent 3 completed system rows to save capacity for worker subtasks
         active_system = [r for r in system_rows if r.get("status") != "completed"]
@@ -27055,6 +28310,11 @@ body{padding:18px}
             todo_out = self.todo.update(merged)
         except Exception:
             return
+        if bridged_flat_rows:
+            self._emit(
+                "status",
+                {"summary": "flat todos attached to current plan step"},
+            )
         if todo_out != self.todo.no_changes_text() and reason:
             self._emit(
                 "status",
@@ -27387,7 +28647,7 @@ body{padding:18px}
         task_type = trim(str(row.get("task_type", "") or "").strip().lower(), 40)
         if task_type in TASK_PROFILE_TYPES:
             merged["task_type"] = task_type
-        complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
+        complexity = normalize_task_complexity(row.get("complexity", ""), default="")
         if complexity in TASK_COMPLEXITY_LEVELS:
             merged["complexity"] = complexity
         scale = trim(str(row.get("scale_preference", "") or "").strip().lower(), 20)
@@ -27432,7 +28692,7 @@ body{padding:18px}
     def _fallback_task_level_decision(self, goal_text: str) -> dict:
         profile = self._infer_task_profile(goal_text)
         task_type = str(profile.get("task_type", "general") or "general")
-        complexity = str(profile.get("complexity", "simple") or "simple")
+        complexity = normalize_task_complexity(profile.get("complexity", "simple"), default="simple")
         low = str(goal_text or "").lower()
         inherit_previous_state = False
         if bool(self.runtime_goal_reset_pending):
@@ -27551,9 +28811,9 @@ body{padding:18px}
         level = 3
         if task_type == "simple_qa":
             level = 1 if len(str(goal_text or "")) <= 180 else 2
-        elif complexity == "simple" and task_type in {"general"}:
+        elif task_complexity_rank(complexity) <= task_complexity_rank("simple") and task_type in {"general"}:
             level = 2
-        elif complexity == "simple":
+        elif task_complexity_rank(complexity) <= task_complexity_rank("moderate"):
             level = 3
         elif any(tok in low for tok in ("system-level", "系统级", "blackboard", "orchestrator", "内核", "基础设施")):
             level = 5
@@ -27615,7 +28875,9 @@ body{padding:18px}
             "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
             "User-stated preference overrides your default strategy. "
             "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
-            "Output exactly one classify_task_level tool call with concise judgement, inherit_previous_state, "
+            "CRITICAL OUTPUT CONTRACT: You MUST output exactly one classify_task_level tool call and no plain-text answer. "
+            "A prose-only response is invalid and will be discarded.\n"
+            "The tool call must include concise judgement, inherit_previous_state, "
             "and semantic_confidence (high|medium|low). "
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
             f"{model_language_instruction(self.ui_language)}"
@@ -27626,6 +28888,28 @@ body{padding:18px}
                 "Favor level 1-2 for straightforward tasks; only assign level 3+ when genuine multi-step complexity demands it."
             )
         return base
+
+    def _extract_classify_task_level_row(self, response: dict | None) -> dict:
+        if not isinstance(response, dict):
+            return {}
+        tool_calls = response.get("tool_calls", []) if isinstance(response.get("tool_calls", []), list) else []
+        for tc in tool_calls:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            if str(fn.get("name", "") or "").strip() != "classify_task_level":
+                continue
+            args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+            if isinstance(args, dict):
+                return dict(args)
+            if isinstance(args, str):
+                parsed, _ = parse_tool_arguments_with_error(args)
+                if isinstance(parsed, dict):
+                    return dict(parsed)
+        content = str(response.get("content", "") or "").strip()
+        if content:
+            parsed, _ = parse_tool_arguments_with_error(content)
+            if isinstance(parsed, dict) and parsed.get("level") is not None:
+                return dict(parsed)
+        return {}
 
     def _skill_aware_reeval_task_level(
         self,
@@ -27820,7 +29104,7 @@ body{padding:18px}
         if low_confidence_mode:
             rule_profile = self._infer_task_profile(goal_text)
             fallback_task_type = str(rule_profile.get("task_type", "general") or "general")
-            fallback_complexity = str(rule_profile.get("complexity", "simple") or "simple")
+            fallback_complexity = normalize_task_complexity(rule_profile.get("complexity", "simple"), default="simple")
             fallback_objective = trim(str(rule_profile.get("direct_objective", "") or ""), 800)
         else:
             board_now = self._ensure_blackboard()
@@ -27831,12 +29115,10 @@ body{padding:18px}
             )
             if fallback_task_type not in TASK_PROFILE_TYPES:
                 fallback_task_type = "general"
-            fallback_complexity = trim(
-                str(self.runtime_task_complexity or board_profile.get("complexity", "simple") or "simple"),
-                20,
+            fallback_complexity = normalize_task_complexity(
+                self.runtime_task_complexity or board_profile.get("complexity", "simple") or "simple",
+                default="simple",
             )
-            if fallback_complexity not in TASK_COMPLEXITY_LEVELS:
-                fallback_complexity = "simple"
             fallback_objective = trim(
                 str(self.runtime_direct_objective or board_profile.get("direct_objective", "") or "").strip(),
                 800,
@@ -27848,22 +29130,20 @@ body{padding:18px}
         task_type = trim(str(row.get("task_type", "") or "").strip().lower(), 40)
         if task_type not in TASK_PROFILE_TYPES:
             task_type = fallback_task_type
-        complexity = trim(str(row.get("complexity", "") or "").strip().lower(), 20)
-        if complexity not in TASK_COMPLEXITY_LEVELS:
-            complexity = fallback_complexity
+        complexity = normalize_task_complexity(row.get("complexity", ""), default=fallback_complexity)
         if explicit_complexity in TASK_COMPLEXITY_LEVELS:
-            complexity = explicit_complexity
+            complexity = normalize_task_complexity(explicit_complexity, default=fallback_complexity)
         elif preserve_existing_complexity and previous_complexity in TASK_COMPLEXITY_LEVELS:
-            complexity = previous_complexity
+            complexity = normalize_task_complexity(previous_complexity, default=fallback_complexity)
         low_confidence_reason = trim(str(row.get("low_confidence_reason", "") or "").strip(), 220)
         judgement = trim(str(row.get("judgement", "") or "").strip(), 200) or "manager classified task level"
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if not objective:
             objective = fallback_objective
         _prev_level_val = int(getattr(self, '_prev_applied_task_level', 0) or 0)
-        _complexity_floor = str(getattr(self, 'runtime_complexity_floor', '') or '').strip()
-        if _complexity_floor == "complex" and complexity == "simple":
-            complexity = "complex"
+        _complexity_floor = normalize_task_complexity(getattr(self, 'runtime_complexity_floor', '') or '', default="")
+        if _complexity_floor in TASK_COMPLEXITY_LEVELS and task_complexity_rank(complexity) < task_complexity_rank(_complexity_floor):
+            complexity = _complexity_floor
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
         self.runtime_execution_mode = mode
@@ -28055,34 +29335,50 @@ body{padding:18px}
             retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
             media_inputs=media_inputs_round,
         )
-        tool_calls = response.get("tool_calls", []) if isinstance(response, dict) else []
-        for tc in tool_calls or []:
-            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            if str(fn.get("name", "") or "").strip() != "classify_task_level":
-                continue
-            args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
-            if isinstance(args, dict):
-                row = dict(args)
-                row["inherit_previous_state"] = _to_bool_like(
-                    row.get("inherit_previous_state", False),
-                    default=False,
-                )
-                row["semantic_confidence"] = self._normalize_semantic_confidence(
-                    row.get("semantic_confidence", "medium"),
-                    default="medium",
-                )
-                if str(row.get("semantic_confidence", "medium")) == "low":
-                    # Skill-aware re-evaluation before falling back to keyword heuristic
-                    reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
-                    fallback_row = self._fallback_task_level_decision(goal_text)
-                    merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
-                    return merged
-                row["source"] = "manager"
-                return row
+        row = self._extract_classify_task_level_row(response)
+        if not row:
+            repair_prompt = (
+                "Previous answer was invalid because it did not produce a valid classify_task_level tool call. "
+                "Retry now. Output exactly one classify_task_level tool call and no prose."
+            )
+            repair_response = self._chat_with_same_model_retry(
+                [
+                    {"role": "user", "content": prompt, "ts": now_ts()},
+                    {"role": "user", "content": repair_prompt, "ts": now_ts()},
+                ],
+                tools=self._manager_task_classify_tools(),
+                system=self._manager_classification_system_prompt(),
+                max_tokens=220,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="manager classify repair",
+                retries=1,
+                media_inputs=media_inputs_round,
+            )
+            row = self._extract_classify_task_level_row(repair_response)
+        if row:
+            row["inherit_previous_state"] = _to_bool_like(
+                row.get("inherit_previous_state", False),
+                default=False,
+            )
+            row["semantic_confidence"] = self._normalize_semantic_confidence(
+                row.get("semantic_confidence", "medium"),
+                default="medium",
+            )
+            if str(row.get("semantic_confidence", "medium")) == "low":
+                # Skill-aware re-evaluation before falling back to keyword heuristic
+                reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
+                fallback_row = self._fallback_task_level_decision(goal_text)
+                merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
+                return merged
+            row["source"] = "manager"
+            return row
         row = self._fallback_task_level_decision(goal_text)
         row["source"] = "fallback-no-toolcall"
         row["semantic_confidence"] = "low"
-        row["low_confidence_reason"] = "manager classifier returned no valid tool call"
+        row["low_confidence_reason"] = "manager classifier returned no valid classify_task_level tool call"
         return row
 
     # ------------------------------------------------------------------
@@ -28529,6 +29825,7 @@ body{padding:18px}
                 "IMPORTANT: Previous fix attempts FAILED. You MUST change your approach — "
                 "do NOT repeat the same instruction. Include the exact error output in your delegation. "
             )
+        html_hint = self._html_frontend_boost_instruction()
         # Loaded skills constraint for manager
         skills_constraint = self._loaded_skills_prompt_hint(for_role="manager")
         bb_skills = board.get("loaded_skills", {})
@@ -28563,6 +29860,7 @@ body{padding:18px}
             f"{todo_route_note}"
             f"{phase_hint}"
             f"{failure_hint}"
+            f"{html_hint}"
             f"{skills_constraint}"
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
@@ -28888,7 +30186,7 @@ body{padding:18px}
                         "reason": "conclusive-reply-detected",
                         "source": "fallback",
                     }
-        if complexity == "simple" and task_type == "simple_code":
+        if task_complexity_rank(complexity) <= task_complexity_rank("moderate") and task_type == "simple_code":
             if has_error_log:
                 return {
                     "target": "developer",
@@ -29026,6 +30324,10 @@ body{padding:18px}
         task_type_low = str(row.get("task_type", "") or "").strip().lower()
         # 5a: Merge in-memory routes with persisted routes for detection
         bb_for_routes = self._ensure_blackboard()
+        current_progress_fp = self._watchdog_state_fingerprint(bb_for_routes)
+        last_delegate = bb_for_routes.get("last_delegate", {}) if isinstance(bb_for_routes.get("last_delegate"), dict) else {}
+        last_progress_fp = trim(str(last_delegate.get("progress_fp", "") or "").strip(), 80)
+        no_progress_since_last_delegate = bool(last_progress_fp and last_progress_fp == current_progress_fp)
         persisted_routes = bb_for_routes.get("persisted_manager_routes", [])
         if not isinstance(persisted_routes, list):
             persisted_routes = []
@@ -29037,22 +30339,16 @@ body{padding:18px}
                 if (
                     isinstance(deleg, dict)
                     and str(deleg.get("target", "") or "").strip().lower() == target
+                    and (
+                        not str(deleg.get("progress_fp", "") or "").strip()
+                        or str(deleg.get("progress_fp", "") or "").strip() == current_progress_fp
+                    )
                     and int(deleg.get("count", 0) or 0) >= 3
                 ):
-                    alt_targets = [r for r in ("reviewer", "developer", "explorer") if r != target]
-                    if len(bb_for_routes.get("code_artifacts", {}) or {}) > 0:
-                        row["target"] = "finish"
-                        row["instruction"] = (
-                            f"Anti-stall: delegation to '{target}' repeated {deleg.get('count')} times with same instruction. "
-                            "Forcing finish to break loop."
-                        )
-                    else:
-                        row["target"] = alt_targets[0] if alt_targets else "developer"
-                        row["instruction"] = (
-                            f"Anti-stall: delegation to '{target}' repeated {deleg.get('count')} times. "
-                            f"Switching to {row['target']} with fresh approach."
-                        )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall-repeated-delegation"
+                    if not no_progress_since_last_delegate:
+                        continue
+                    row = self._manager_recovery_route_for_repeated_delegate(row, board=bb_for_routes)
+                    row["reason"] = trim(f"{row.get('reason', '')}|anti-stall-repeated-delegation", 600)
                     row["source"] = "anti-stall"
                     return row
         if task_type_low in ("simple_code", "engineering") and target == "explorer":
@@ -29075,7 +30371,7 @@ body{padding:18px}
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
-        if len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
+        if no_progress_since_last_delegate and len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
             board = bb_for_routes
             low_reason = str(row.get("reason", "") or "").strip().lower()
             if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
@@ -29120,7 +30416,7 @@ body{padding:18px}
                     row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
             row["source"] = "anti-stall"
             return row
-        if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
+        if no_progress_since_last_delegate and len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
             board = bb_for_routes
             if len(board.get("code_artifacts", {}) or {}) > 0:
                 row["target"] = "finish"
@@ -29201,9 +30497,7 @@ body{padding:18px}
         task_type = trim(str(row.get("task_type", default_type) or "").strip().lower(), 40) or default_type
         if task_type not in TASK_PROFILE_TYPES:
             task_type = default_type
-        complexity = trim(str(row.get("complexity", default_complexity) or "").strip().lower(), 20) or default_complexity
-        if complexity not in TASK_COMPLEXITY_LEVELS:
-            complexity = default_complexity
+        complexity = normalize_task_complexity(row.get("complexity", default_complexity) or default_complexity, default=default_complexity)
         scale_preference = trim(
             str(row.get("scale_preference", profile.get("scale_preference", self.runtime_scale_preference)) or "").strip().lower(),
             20,
@@ -29994,6 +31288,7 @@ body{padding:18px}
             "instruction": instruction,
             "reason": trim(str(route.get("reason", "") or "").strip(), 600),
             "source": trim(str(route.get("source", "") or "").strip(), 40),
+            "progress_fp": self._watchdog_state_fingerprint(board),
             "task_level": int(task_level),
             "execution_mode": execution_mode,
             "task_type": task_type,
@@ -30078,8 +31373,9 @@ body{padding:18px}
             profile["task_type"] = task_type
         if complexity in TASK_COMPLEXITY_LEVELS:
             # Floor protection: if plan mode set a floor, do not allow downgrade
-            if self.runtime_complexity_floor == "complex" and complexity == "simple":
-                complexity = "complex"
+            _route_complexity_floor = normalize_task_complexity(self.runtime_complexity_floor, default="")
+            if _route_complexity_floor in TASK_COMPLEXITY_LEVELS and task_complexity_rank(complexity) < task_complexity_rank(_route_complexity_floor):
+                complexity = _route_complexity_floor
             profile["complexity"] = complexity
         profile["scale_preference"] = scale_preference if scale_preference in TASK_SCALE_PREFERENCES else "balanced"
         if objective:
@@ -30449,8 +31745,25 @@ body{padding:18px}
                     )
                     self._emit("status", {"summary": f"reviewer finish blocked: {gate_reason}"})
             else:
+                bb_finish = self._ensure_blackboard()
+                profile_finish = self._ensure_blackboard_task_profile(bb_finish)
+                exec_mode = normalize_execution_mode(
+                    profile_finish.get("execution_mode", self._effective_execution_mode()),
+                    default=self._effective_execution_mode(),
+                )
                 approval_note = summary_arg or output or "finish tool acknowledged"
-                self._blackboard_mark_approved(approval_note, role_key)
+                if exec_mode == EXECUTION_MODE_SYNC:
+                    self._blackboard_append_section(
+                        "execution_logs",
+                        role_key,
+                        (
+                            "finish requested but deferred: sync mode requires reviewer pass before approval.\n"
+                            f"summary: {approval_note}"
+                        ),
+                    )
+                    self._emit("status", {"summary": "finish deferred: sync mode requires reviewer approval"})
+                else:
+                    self._blackboard_mark_approved(approval_note, role_key)
         if not ok and output:
             self._blackboard_append_section(
                 "execution_logs",
@@ -30488,6 +31801,7 @@ body{padding:18px}
         role_key = self._sanitize_agent_role(role)
         status = str((step or {}).get("status", "") or "")
         text = trim(str((step or {}).get("text", "") or "").strip(), BLACKBOARD_MAX_TEXT)
+        tool_results = (step or {}).get("tool_results", []) if isinstance((step or {}).get("tool_results"), list) else []
         if role_key and text:
             board = self._ensure_blackboard()
             board["last_worker_reply"] = {
@@ -30508,7 +31822,28 @@ body{padding:18px}
                 self._blackboard_set_status("REVIEWING")
                 if self._reviewer_deems_done(text):
                     self._blackboard_mark_approved(text, role_key)
-        for item in (step or {}).get("tool_results", []) or []:
+        explicit_todo_write = any(
+            isinstance(item, dict) and str(item.get("name", "") or "") in {"TodoWrite", "TodoWriteRescue"}
+            for item in tool_results
+        )
+        if role_key and not explicit_todo_write:
+            source_text = text or self._latest_agent_assistant_text(role_key)
+            if re.search(r"(?m)^\s*(?:[-*•>]+\s*)?\[(?: |>|x)\]\s+\S", source_text or ""):
+                board = self._ensure_blackboard()
+                step_id = trim(str((self._get_active_plan_step(board) or {}).get("id", "") or ""), 20)
+                parsed_rows = extract_todo_rows_from_text(
+                    source_text,
+                    default_parent_step_id=step_id,
+                    limit=12,
+                )
+                if parsed_rows:
+                    merged = self._merge_todo_signal_rows(parsed_rows, role=role_key, board=board)
+                    if merged != self.todo.no_changes_text():
+                        self._emit(
+                            "status",
+                            {"summary": f"todo synced from canonical {role_key} text"},
+                        )
+        for item in tool_results:
             if isinstance(item, dict) and bool(item.get("bb_applied", False)):
                 continue
             self._blackboard_update_from_tool_result(role_key, item)
@@ -31109,6 +32444,7 @@ body{padding:18px}
         skills_block = self._skills_awareness_block(for_role=role_key)
         code_note = self._runtime_code_reference_prompt_block(max_chars=2600)
         engineering_note = self._engineering_execution_boost_instruction()
+        html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
@@ -31117,10 +32453,15 @@ body{padding:18px}
             f"Structure: flat .js files at $JS_LIB_ROOT/<name>.min.js; "
             f"pptxgenjs at $JS_LIB_ROOT/pptxgenjs/dist/pptxgen.cjs.js (CommonJS) or pptxgen.bundle.js (browser). "
             f"Do NOT look in node_modules — libs are installed directly under $JS_LIB_ROOT. "
+            "IMPORTANT: '/js_lib/...' is a tool/runtime alias, not a stable final HTML asset URL. "
+            "If an HTML deliverable needs any asset from js_lib, copy it into a task-local relative asset folder "
+            "such as './js/' or './assets/vendor/' next to the deliverable, then reference it with a plain relative path. "
+            "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases in final exported HTML. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{code_note + ' ' if code_note else ''}"
             f"{engineering_note + ' ' if engineering_note else ''}"
+            f"{html_note + ' ' if html_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{model_language_instruction(self.ui_language)} "
         )
@@ -31179,6 +32520,10 @@ body{padding:18px}
             "TODO TRACKING (mandatory): "
             "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
             "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
+            "Prefer TodoWrite items as objects with explicit fields: "
+            "{content, status, owner?, parent_step_id?}. "
+            "If you must use strings, use ONLY canonical prefixes: '[ ]', '[>]', '[x]'. "
+            "Do not use emoji markers or free-form localized status labels in TodoWrite payloads. "
             "Do not silently batch multiple subtasks and do not delay todo updates until the end of the step. "
             "This manual update is critical because skill re-evaluation is triggered by actual todo progress. "
             "EDIT METHODOLOGY (follow strictly): "
@@ -31295,35 +32640,9 @@ body{padding:18px}
                 content = str(item).strip()
                 owner = owner_hint
                 parent_step_id = active_step_id
-                # Parse status from string prefix markers:
-                # "✅ task" / "[x] task" / "[done] task" / "[completed] task" → completed
-                # "▶ task" / "[>] task" / "[doing] task" / "[in_progress] task" → in_progress
-                # "⬜ task" / "[ ] task" / "[pending] task" / "[todo] task" → pending
-                import re as _re_status
-                _prefix_m = _re_status.match(
-                    r'^(?:'
-                    r'[\u2705\u2611]\s*'                           # ✅ ☑
-                    r'|\[x\]\s*|\[done\]\s*|\[completed\]\s*|\[finish(?:ed)?\]\s*'
-                    r'|\(done\)\s*|\(completed\)\s*|\(x\)\s*'
-                    r')',
-                    content, _re_status.IGNORECASE
-                )
-                _prefix_ip = _re_status.match(
-                    r'^(?:'
-                    r'[\u25b6\u25ba\u27a1]\s*'                    # ▶ ► ➡
-                    r'|\[>\]\s*|\[doing\]\s*|\[in.?progress\]\s*'
-                    r'|\(doing\)\s*|\(in.?progress\)\s*'
-                    r')',
-                    content, _re_status.IGNORECASE
-                )
-                if _prefix_m:
-                    status = "completed"
-                    content = content[_prefix_m.end():].strip()
-                elif _prefix_ip:
-                    status = "in_progress"
-                    content = content[_prefix_ip.end():].strip()
-                else:
-                    status = "pending"
+                parsed_status, parsed_content = split_todo_status_text(content)
+                status = parsed_status or "pending"
+                content = parsed_content or content
             content = normalize_work_text(content) or content
             if not content:
                 continue
@@ -31350,13 +32669,40 @@ body{padding:18px}
                     if i >= in_progress_index:
                         r["status"] = "in_progress"
                         break
-        if active_step is not None:
+        route_kind = self._todo_route_kind(role=owner_hint)
+        if route_kind in {"plan_single", "plan_sync"}:
             return self._merge_plan_worker_todo_items(clean_items, role=owner_hint)
-        if self._is_multi_agent_mode() and owner_hint in {"developer", "explorer", "reviewer"}:
+        if route_kind == "pure_sync":
             return self._merge_owner_scoped_todo_items(clean_items, role=owner_hint)
         return self.todo.update(clean_items)
 
-    def _analyze_todo_result(self, tool_name: str, output: str) -> tuple[str, str]:
+    def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
+        items = rows if isinstance(rows, list) else self.todo.snapshot()
+        sig: list[tuple[str, str, str, str]] = []
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            sig.append(
+                (
+                    normalize_work_text(str(row.get("content", "") or "")).strip().lower(),
+                    str(row.get("status", "pending") or "pending").strip().lower(),
+                    str(row.get("owner", "") or "").strip().lower(),
+                    str(row.get("parent_step_id", "") or "").strip(),
+                )
+            )
+        return sig
+
+    def _todo_progress_changed(self, before_rows: list[dict] | None, after_rows: list[dict] | None) -> bool:
+        return self._todo_progress_signature(before_rows) != self._todo_progress_signature(after_rows)
+
+    def _analyze_todo_result(
+        self,
+        tool_name: str,
+        output: str,
+        *,
+        before_rows: list[dict] | None = None,
+        after_rows: list[dict] | None = None,
+    ) -> tuple[str, str]:
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
@@ -31677,6 +33023,36 @@ body{padding:18px}
             if budget_forced
             else ""
         )
+        # If in plan mode, include the current in-progress subtask and the <step-verified/> escape path
+        plan_subtask_hint = ""
+        try:
+            bb = self._ensure_blackboard()
+            todos = bb.get("project_todos", [])
+            active_step = next(
+                (t for t in todos if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                None,
+            )
+            if active_step:
+                step_id = str(active_step.get("id", "") or "")
+                active_subtask = next(
+                    (
+                        t for t in todos
+                        if t.get("category") != "plan_step"
+                        and t.get("status") == "in_progress"
+                        and str(t.get("parent_step_id", "") or "") == step_id
+                    ),
+                    None,
+                )
+                if active_subtask:
+                    subtask_text = trim(str(active_subtask.get("content", "") or ""), 120)
+                    plan_subtask_hint = (
+                        f"\n当前子任务: {subtask_text}\n"
+                        "如果此子任务需要视觉/浏览器验证而无法通过 bash 完整执行，"
+                        "请创建相关文件，通过代码审查确认实现正确，"
+                        "然后在回复中发出 <step-verified/> 并调用 TodoWrite 将子任务标记为 completed。"
+                    )
+        except Exception:
+            pass
         self.messages.append(
             {
                 "role": "user",
@@ -31685,6 +33061,7 @@ body{padding:18px}
                     f"系统检测到空动作回合（consecutive_empty_action={int(streak)}）。"
                     "你刚才进行了深入思考，但没有输出任何最终结果或工具调用。"
                     f"{budget_note}"
+                    f"{plan_subtask_hint}"
                     "请结束思考，立即基于现有推导输出最终结论，或发起一个明确、可执行的工具调用。 "
                     "System notice: you returned thinking-only content without final answer or tool calls. "
                     "Stop internal reasoning now and immediately output either the final conclusion or exactly one "
@@ -31820,12 +33197,15 @@ body{padding:18px}
             except Exception:
                 token_decoded = token
             token_decoded = token_decoded.strip()
-            if token_decoded and token_decoded not in out:
-                out.append(token_decoded)
+            for piece in split_structured_todo_content(token_decoded, limit=7):
+                piece_text = str(piece or "").strip()
+                if piece_text and piece_text not in out:
+                    out.append(piece_text)
         if out:
             return out[:7]
         # Fallback: parse non-empty lines / bullets
-        for line in text.splitlines():
+        normalized_text = normalize_embedded_newlines(text)
+        for line in normalized_text.splitlines():
             s = line.strip().strip(",")
             s = re.sub(r"^[\-\*\d\.\)\s]+", "", s).strip()
             if not s:
@@ -32016,7 +33396,7 @@ body{padding:18px}
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 return guard_error
-            meta = self._run_shell_meta(args["command"], self.files_root, 120)
+            meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
             self._emit(
                 "command",
                 {
@@ -32183,20 +33563,16 @@ body{padding:18px}
                 )
             return out
         if name == "TodoWrite":
-            # Protect plan_step todos: worker TodoWrite creates sub-items, not replacements
             bb = self._ensure_blackboard()
-            has_plan_steps = any(
-                t.get("category") == "plan_step"
-                for t in bb.get("project_todos", [])
-            )
-            if has_plan_steps:
+            route_kind = self._todo_route_kind(role=str(role_key or ""), board=bb)
+            if route_kind in {"plan_single", "plan_sync"}:
                 items = args.get("items", [])
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
                             item["owner"] = str(role_key or "developer")
                 result = self._merge_plan_worker_todo_items(items, role=str(role_key or "developer"))
-            elif self._is_multi_agent_mode() and role_key in {"developer", "explorer", "reviewer"}:
+            elif route_kind == "pure_sync":
                 items = args.get("items", [])
                 if isinstance(items, list):
                     for item in items:
@@ -32205,50 +33581,6 @@ body{padding:18px}
                 result = self._merge_owner_scoped_todo_items(items, role=str(role_key))
             else:
                 result = self.todo.update(args["items"])
-            # Fix 1: Auto-advance plan step when all subtasks are completed
-            # This handles the case where the worker's last turn only calls TodoWrite
-            # and _post_execution_plan_step_check would miss it due to no "real" tool evidence
-            if has_plan_steps:
-                try:
-                    _as = self._get_active_plan_step()
-                    if isinstance(_as, dict):
-                        _as_id = str(_as.get("id", "") or "")
-                        if _as_id and self._step_subtasks_all_completed(_as):
-                            _acc_ev = self._collect_accumulated_step_evidence(_as)
-                            if _acc_ev and _acc_ev != "accumulated-step-evidence":
-                                # Has real evidence — auto-advance
-                                self._advance_plan_step(
-                                    evidence=_acc_ev or "subtasks-all-completed",
-                                    actor=str(role_key or "developer"),
-                                )
-                            elif self._step_has_accumulated_evidence(_as, bb):
-                                self._advance_plan_step(
-                                    evidence="subtasks-all-completed",
-                                    actor=str(role_key or "developer"),
-                                )
-                except Exception:
-                    pass
-            # Fix 5b: TodoWrite loop detection — force-advance after 3 consecutive calls
-            if has_plan_steps:
-                try:
-                    _as5 = self._get_active_plan_step()
-                    if isinstance(_as5, dict):
-                        _as5_id = str(_as5.get("id", "") or "")
-                        if _as5_id:
-                            if not hasattr(self, '_todowrite_step_counter'):
-                                self._todowrite_step_counter = {}
-                            cnt = self._todowrite_step_counter.get(_as5_id, 0) + 1
-                            self._todowrite_step_counter[_as5_id] = cnt
-                            if (cnt >= 3
-                                    and self._step_subtasks_all_completed(_as5)
-                                    and self._step_has_accumulated_evidence(_as5, bb)):
-                                # Force advance — worker is stuck in a loop AND step has real evidence
-                                self._advance_plan_step(
-                                    evidence="force-advance:todowrite-loop-detected",
-                                    actor=str(role_key or "developer"),
-                                )
-                except Exception:
-                    pass
             # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
             # This fires in ALL modes (single/sync/plan) when developer writes todos
             try:
@@ -32610,7 +33942,7 @@ body{padding:18px}
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), wt_path)
             if guard_error:
                 return guard_error
-            meta = self._run_shell_meta(args["command"], wt_path, 300)
+            meta = self._run_shell_meta(args["command"], wt_path, self._shell_command_timeout())
             self._emit(
                 "command",
                 {
@@ -33067,6 +34399,18 @@ body{padding:18px}
                 },
             )
             self._persist()
+        _proc = getattr(self, "_running_bash_proc", None)
+        if _proc is not None:
+            try:
+                if os.name == "posix":
+                    try:
+                        os.killpg(os.getpgid(_proc.pid), signal.SIGKILL)
+                    except Exception:
+                        _proc.kill()
+                else:
+                    _proc.kill()
+            except Exception:
+                pass
 
     def _reviewer_approval_log_gate(self, board: dict | None = None) -> tuple[bool, str]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -33471,8 +34815,8 @@ body{padding:18px}
             isinstance(t, dict) and t.get("category") == "plan_step"
             for t in board.get("project_todos", [])
         )
-        _sync_complexity = str(profile.get("complexity", "simple") or "simple")
-        if not _sync_has_plan and _sync_complexity in ("moderate", "complex", "expert"):
+        _sync_complexity = normalize_task_complexity(profile.get("complexity", "simple"), default="simple")
+        if not _sync_has_plan and task_complexity_at_least(_sync_complexity, "moderate"):
             self.messages.append({
                 "role": "system",
                 "content": (
@@ -33579,29 +34923,59 @@ body{padding:18px}
                 self._mark_all_done_silently(note)
                 self._emit("status", {"summary": "manager decided finish; run paused"})
                 break
-            # Detect manager stuck: same instruction repeated N times → force advance + break
+            # Detect manager loop: same instruction repeated with unchanged progress.
             import hashlib as _hl_mgr
-            _cur_hash = _hl_mgr.sha1((target + "|" + instruction).encode("utf-8")).hexdigest()[:12]
+            _delegate_progress_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
+            _cur_hash = _hl_mgr.sha1((target + "|" + instruction + "|" + _delegate_progress_fp).encode("utf-8")).hexdigest()[:12]
             if _cur_hash == _prev_delegation_hash:
                 _repeat_delegation_count += 1
             else:
                 _repeat_delegation_count = 0
             _prev_delegation_hash = _cur_hash
             if _repeat_delegation_count >= 3:
-                self._emit("status", {"summary": f"manager stuck: repeated identical delegation x{_repeat_delegation_count + 1}; forcing advance"})
                 _bb_stuck = self._ensure_blackboard()
                 _stuck_step = next(
                     (t for t in _bb_stuck.get("project_todos", [])
                      if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
                     None,
                 )
-                if _stuck_step:
-                    self._advance_plan_step(evidence="manager stuck: repeated delegation", actor="manager")
-                else:
-                    self._blackboard_mark_approved("manager stuck loop break", "manager")
-                    self._mark_all_done_silently("manager stuck: repeated delegation break")
-                    break
+                _step_note = trim(str((_stuck_step or {}).get("content", "") or ""), 200)
+                route = self._manager_recovery_route_for_repeated_delegate(route, board=_bb_stuck)
+                target = str(route.get("target", "") or "").strip().lower()
+                instruction = trim(str(route.get("instruction", "") or "").strip(), 1400)
                 _repeat_delegation_count = 0
+                _prev_delegation_hash = ""
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"manager loop recovery: repeated identical delegation under unchanged progress; "
+                            f"rerouting to {target}"
+                        )
+                    },
+                )
+                self._append_manager_context(
+                    {
+                        "role": "system",
+                        "content": (
+                            "[manager-loop-guard] Repeated identical delegation detected under unchanged progress. "
+                            "Do NOT mark the active step completed just because the owner was delegated repeatedly. "
+                            "Use a recovery route based on current step evidence and worker todo state."
+                            + (f" Active step: {_step_note}." if _step_note else "")
+                            + (f" Recovery target: {target}." if target else "")
+                        ),
+                        "ts": now_ts(),
+                    }
+                )
+                self._blackboard_append_section(
+                    "execution_logs",
+                    "manager",
+                    (
+                        "manager repeated identical delegation; applied recovery reroute"
+                        + (f"\nactive_step: {_step_note}" if _step_note else "")
+                        + (f"\nrecovery_target: {target}" if target else "")
+                    ),
+                )
             role = self._sanitize_agent_role(target) or "developer"
             self._inject_manager_instruction(
                 role,
@@ -33630,6 +35004,24 @@ body{padding:18px}
             self._blackboard_update_from_worker_step(role, step)
             # Post-execution plan step advancement (replaces pre-execution advancement)
             self._post_execution_plan_step_check(route, step if isinstance(step, dict) else {})
+            progress_capsule = self._manager_worker_progress_capsule(
+                role,
+                step if isinstance(step, dict) else {},
+                self._ensure_blackboard(),
+            )
+            if progress_capsule:
+                recent_mgr = self.manager_context[-4:] if isinstance(self.manager_context, list) else []
+                if not any(
+                    isinstance(msg, dict) and str(msg.get("content", "") or "").strip() == progress_capsule
+                    for msg in recent_mgr
+                ):
+                    self._append_manager_context(
+                        {
+                            "role": "system",
+                            "content": progress_capsule,
+                            "ts": now_ts(),
+                        }
+                    )
             # Fix 6b: Pure sync no-plan — read worker-done signal and notify manager
             _bb_sync = self._ensure_blackboard()
             if _bb_sync.pop("sync_worker_round_done", False):
@@ -33978,17 +35370,19 @@ body{padding:18px}
         bb["plan"]["phase"] = "synthesis"
         self.blackboard = bb
 
-        # Synthesis with retry (up to 2 attempts) + minimal fallback
+        # Synthesis with retry + model fallback + deterministic fallback
         proposal = None
-        for _synth_attempt in range(2):
+        for _synth_attempt in range(PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS):
             proposal = self._plan_mode_synthesize_proposal(pinned_selection)
             if proposal and proposal.get("options"):
                 break
-            if _synth_attempt == 0:
+            if _synth_attempt < (PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS - 1):
                 self._emit("status", {"summary": "plan-mode: synthesis retry"})
         if not proposal or not proposal.get("options"):
             # Last resort: minimal fallback with simpler prompt and higher token budget
             proposal = self._synthesis_minimal_fallback(pinned_selection)
+        if not proposal or not proposal.get("options"):
+            proposal = self._synthesis_programmatic_fallback()
         if not proposal or not proposal.get("options"):
             self._emit("status", {"summary": "plan-mode: synthesis failed, falling back to direct execution"})
             self.runtime_plan_mode_needed = False
@@ -34394,21 +35788,29 @@ body{padding:18px}
             f"- Option A: Direct workaround — bypass the blocker with an alternative method\n"
             f"- Option B: Different path — re-approach the goal from a completely different angle\n"
             f"- Option C: Minimal viable + user action items — do what's possible now, list what the user needs to do manually\n\n"
-            f"Call the submit_plan_proposal tool with:\n"
+            f"You MUST call the submit_plan_proposal tool exactly once with:\n"
             f"- context: brief failure analysis (what was tried, what failed, why)\n"
             f"- options: array of 3 options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
-            f"- recommended: id of the recommended option\n\n"
+            f"- recommended: id of the recommended option\n"
+            f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n\n"
             f"{model_language_instruction(self.ui_language)}"
         )
         synthesis_ctx = [
-            {"role": "system", "content": "You are a recovery planner analyzing execution failures and proposing alternative approaches.", "ts": now_ts()},
+            {
+                "role": "system",
+                "content": (
+                    "You are a recovery planner analyzing execution failures and proposing alternative approaches. "
+                    "You MUST call submit_plan_proposal exactly once."
+                ),
+                "ts": now_ts(),
+            },
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
         try:
             response = self._chat_with_same_model_retry(
                 synthesis_ctx,
                 tools=self._plan_mode_synthesis_tools(),
-                system="Generate a structured stall recovery plan. Use the submit_plan_proposal tool.",
+                system="Generate a structured stall recovery plan. You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
                 max_tokens=STALL_PLAN_SYNTHESIS_MAX_TOKENS,
                 think=False,
                 stream_thinking=False,
@@ -34417,12 +35819,33 @@ body{padding:18px}
                 context_label="stall-plan synthesis",
                 retries=MODEL_OUTPUT_RETRY_TIMES,
             )
-            tool_calls = response.get("tool_calls", [])
-            for tc in tool_calls:
-                if tc.get("function", {}).get("name") == "submit_plan_proposal":
-                    args = tc["function"].get("arguments", {})
-                    if isinstance(args, dict) and args.get("options"):
-                        return dict(args)
+            proposal = self._extract_plan_proposal_from_response(response)
+            if proposal.get("options"):
+                return proposal
+            repair_response = self._chat_with_same_model_retry(
+                synthesis_ctx + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Previous answer was invalid because it did not produce a valid submit_plan_proposal tool call. "
+                            "Retry now. Output exactly one submit_plan_proposal tool call and no prose."
+                        ),
+                        "ts": now_ts(),
+                    }
+                ],
+                tools=self._plan_mode_synthesis_tools(),
+                system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
+                max_tokens=STALL_PLAN_SYNTHESIS_MAX_TOKENS,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="stall-plan synthesis repair",
+                retries=1,
+            )
+            proposal = self._extract_plan_proposal_from_response(repair_response)
+            if proposal.get("options"):
+                return proposal
         except Exception as exc:
             self._emit("status", {"summary": f"stall plan synthesis error: {exc}"})
         return {}
@@ -34493,6 +35916,186 @@ body{padding:18px}
                 lines.append(f"- {trim(str(t), 100)}")
         return "\n".join(lines)
 
+    def _normalize_plan_proposal_option(self, raw: dict, *, fallback_id: str) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        opt_id = trim(str(raw.get("id", "") or fallback_id).strip().upper(), 8) or fallback_id
+        title = trim(str(raw.get("title", "") or "").strip(), 200)
+        summary = trim(str(raw.get("summary", "") or "").strip(), 600)
+        steps_raw = raw.get("steps", [])
+        steps: list[str] = []
+        if isinstance(steps_raw, list):
+            for item in steps_raw:
+                text = normalize_embedded_newlines(str(item or "")).strip()
+                if text:
+                    steps.append(trim(text, PLAN_STEP_FULL_CONTENT_MAX_CHARS))
+        elif isinstance(steps_raw, str):
+            text = normalize_embedded_newlines(steps_raw).strip()
+            if text:
+                steps.append(trim(text, PLAN_STEP_FULL_CONTENT_MAX_CHARS))
+        pros = trim(str(raw.get("pros", "") or "").strip(), 400)
+        cons = trim(str(raw.get("cons", "") or "").strip(), 400)
+        risk = trim(str(raw.get("risk", "") or "").strip().lower(), 20)
+        if risk not in {"low", "medium", "high"}:
+            risk = "medium"
+        if not title and summary:
+            title = trim(summary.split("\n", 1)[0], 120)
+        if not title and steps:
+            title = trim(steps[0].split("\n", 1)[0], 120)
+        if not summary and steps:
+            summary = trim(steps[0], 300)
+        if not steps:
+            return None
+        return {
+            "id": opt_id,
+            "title": title or f"Option {opt_id}",
+            "summary": summary or title or f"Plan {opt_id}",
+            "steps": steps,
+            "pros": pros,
+            "cons": cons,
+            "risk": risk,
+        }
+
+    def _normalize_plan_proposal_payload(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        context = trim(str(src.get("context", "") or "").strip(), 2000)
+        raw_options = src.get("options", [])
+        if isinstance(raw_options, dict):
+            raw_options = [raw_options]
+        if not isinstance(raw_options, list):
+            raw_options = []
+        option_ids = ("A", "B", "C")
+        options: list[dict] = []
+        seen_ids: set[str] = set()
+        for idx, item in enumerate(raw_options[: max(1, PLAN_MODE_MAX_OPTIONS * 2)]):
+            normalized = self._normalize_plan_proposal_option(
+                item,
+                fallback_id=option_ids[min(idx, len(option_ids) - 1)],
+            )
+            if not normalized:
+                continue
+            opt_id = str(normalized.get("id", "") or "").strip().upper() or option_ids[min(idx, len(option_ids) - 1)]
+            if opt_id in seen_ids:
+                opt_id = option_ids[min(len(seen_ids), len(option_ids) - 1)]
+                normalized["id"] = opt_id
+            if opt_id in seen_ids:
+                continue
+            seen_ids.add(opt_id)
+            options.append(normalized)
+            if len(options) >= PLAN_MODE_MAX_OPTIONS:
+                break
+        recommended = trim(str(src.get("recommended", "") or "").strip().upper(), 8)
+        valid_ids = {str(opt.get("id", "") or "").strip().upper() for opt in options}
+        if recommended not in valid_ids:
+            recommended = str(options[0].get("id", "A") or "A") if options else ""
+        return {
+            "context": context,
+            "options": options,
+            "recommended": recommended,
+        }
+
+    def _parse_plan_proposal_from_text(self, text: str) -> dict:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        candidates: list[str] = [raw]
+        fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE)
+        for block in fence_matches:
+            block_text = str(block or "").strip()
+            if block_text:
+                candidates.append(block_text)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(raw[start : end + 1].strip())
+        for candidate in candidates:
+            repaired = repair_truncated_json_object(candidate)
+            for probe in [candidate, repaired]:
+                if not probe:
+                    continue
+                try:
+                    parsed = json.loads(probe)
+                except Exception:
+                    continue
+                if isinstance(parsed, list):
+                    parsed = {"context": "", "options": parsed, "recommended": ""}
+                proposal = self._normalize_plan_proposal_payload(parsed)
+                if proposal.get("options"):
+                    return proposal
+        return {}
+
+    def _extract_plan_proposal_from_response(self, response: dict | None) -> dict:
+        if not isinstance(response, dict):
+            return {}
+        tool_calls = response.get("tool_calls", [])
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                if str(fn.get("name", "") or "").strip() != "submit_plan_proposal":
+                    continue
+                args = fn.get("arguments", {})
+                if isinstance(args, dict):
+                    proposal = self._normalize_plan_proposal_payload(args)
+                    if proposal.get("options"):
+                        return proposal
+                elif isinstance(args, str):
+                    parsed, _ = parse_tool_arguments_with_error(args)
+                    proposal = self._normalize_plan_proposal_payload(parsed)
+                    if proposal.get("options"):
+                        return proposal
+        return self._parse_plan_proposal_from_text(str(response.get("content", "") or ""))
+
+    def _synthesis_programmatic_fallback(self) -> dict:
+        bb = self._ensure_blackboard()
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 1200)
+        findings = bb.get("plan", {}).get("findings", []) if isinstance(bb.get("plan"), dict) else []
+        finding_lines: list[str] = []
+        for row in findings[:6]:
+            if not isinstance(row, dict):
+                continue
+            content = trim(str(row.get("content", "") or "").strip(), 280)
+            if content:
+                finding_lines.append(content)
+        context = trim(
+            (
+                "Fallback synthesis generated automatically from the user goal and current research findings. "
+                + (" | ".join(finding_lines[:3]) if finding_lines else goal)
+            ),
+            1800,
+        )
+        detailed_steps = [
+            "1. Scope and constraints\nClarify the exact deliverable, inputs, and acceptance criteria for this task.",
+            "2. Core implementation\nBuild the main artifact for the request using the most direct workable path.",
+            "3. Verification\nRun at least one observable validation and capture the result.",
+            "4. Delivery report\nSummarize what was built, how to run it, and the key outputs.",
+        ]
+        if finding_lines:
+            detailed_steps = [
+                "1. Review findings and lock scope\nUse the collected findings to define the exact execution boundary and required inputs.",
+                "2. Prepare files and dependencies\nCreate or align the necessary files, folders, and runtime prerequisites for the task.",
+                "3. Implement the main work\nExecute the core build/change/generation work for the requested output.",
+                "4. Validate with observable evidence\nRun a concrete check and confirm the expected output, exit code, or rendered result.",
+                "5. Generate delivery report\nSummarize what was built, how to run it, and the key outputs.",
+            ]
+        proposal = {
+            "context": context,
+            "options": [
+                {
+                    "id": "A",
+                    "title": "Direct Execution Plan",
+                    "summary": trim(goal or "Execute the requested task with a direct, verifiable plan.", 240),
+                    "steps": detailed_steps,
+                    "pros": "Deterministic fallback that keeps plan-mode available even when model synthesis formatting is unstable.",
+                    "cons": "Less tailored than a fully synthesized multi-option proposal.",
+                    "risk": "medium",
+                }
+            ],
+            "recommended": "A",
+        }
+        return self._normalize_plan_proposal_payload(proposal)
+
     def _plan_mode_synthesize_proposal(self, pinned_selection: str) -> dict:
         bb = self._ensure_blackboard()
         plan_data = bb.get("plan", {})
@@ -34528,10 +36131,11 @@ body{padding:18px}
             f"## Research Findings\n{trim(findings_text, 6000)}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"Call the submit_plan_proposal tool with:\n"
+            f"You MUST call the submit_plan_proposal tool exactly once with:\n"
             f"- context: brief background analysis\n"
             f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
-            f"- recommended: id of the recommended option\n\n"
+            f"- recommended: id of the recommended option\n"
+            f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n\n"
             f"STEP QUALITY REQUIREMENTS:\n"
             f"- Each step must be a concrete, actionable instruction (NOT vague like 'analyze reports')\n"
             f"- Include specific file paths (e.g., 'Read uploaded/IEDM_.parsed.md to extract key findings')\n"
@@ -34603,7 +36207,11 @@ body{padding:18px}
         response = self._chat_with_same_model_retry(
             synthesis_ctx,
             tools=self._plan_mode_synthesis_tools(),
-            system="Generate a structured plan proposal. Use the submit_plan_proposal tool.",
+            system=(
+                "Generate a structured plan proposal. "
+                "You MUST call submit_plan_proposal exactly once. "
+                "Do not answer with plain text."
+            ),
             max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
             think=False,
             stream_thinking=False,
@@ -34612,13 +36220,31 @@ body{padding:18px}
             context_label="plan-mode synthesis",
             retries=MODEL_OUTPUT_RETRY_TIMES,
         )
-        tool_calls = response.get("tool_calls", [])
-        for tc in tool_calls:
-            if tc.get("function", {}).get("name") == "submit_plan_proposal":
-                args = tc["function"].get("arguments", {})
-                if isinstance(args, dict) and args.get("options"):
-                    return dict(args)
-        return {}
+        proposal = self._extract_plan_proposal_from_response(response)
+        if proposal.get("options"):
+            return proposal
+        repair_response = self._chat_with_same_model_retry(
+            synthesis_ctx + [
+                {
+                    "role": "user",
+                    "content": (
+                        "Previous answer was invalid because it did not produce a valid submit_plan_proposal tool call. "
+                        "Retry now. Output exactly one submit_plan_proposal tool call and no prose."
+                    ),
+                    "ts": now_ts(),
+                }
+            ],
+            tools=self._plan_mode_synthesis_tools(),
+            system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
+            max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
+            think=False,
+            stream_thinking=False,
+            on_thinking_chunk=self._append_live_thinking,
+            pinned_selection=pinned_selection,
+            context_label="plan-mode synthesis repair",
+            retries=1,
+        )
+        return self._extract_plan_proposal_from_response(repair_response)
 
     def _synthesis_minimal_fallback(self, pinned_selection: str) -> dict:
         """Last-resort: ask model for a single simple plan with higher max_tokens."""
@@ -34630,33 +36256,63 @@ body{padding:18px}
             for f in (findings[:5] if isinstance(findings, list) else [])
         )
         prompt = (
-            f"Generate ONE simple plan for this task. Call submit_plan_proposal with exactly 1 option.\n\n"
+            f"Generate ONE simple plan for this task. You MUST call submit_plan_proposal with exactly 1 option.\n\n"
             f"Task: {goal}\n\nFindings: {trim(findings_text, 3000)}\n\n"
             f"Return a single option with id='A', title, summary, and 5-10 concrete steps.\n"
+            f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n"
             f"{model_language_instruction(self.ui_language)}"
         )
         ctx = [
-            {"role": "system", "content": "You must call submit_plan_proposal tool.", "ts": now_ts()},
+            {
+                "role": "system",
+                "content": (
+                    "You MUST call submit_plan_proposal exactly once. "
+                    "Do not answer with plain text."
+                ),
+                "ts": now_ts(),
+            },
             {"role": "user", "content": prompt, "ts": now_ts()},
         ]
         try:
             response = self._chat_with_same_model_retry(
                 ctx,
                 tools=self._plan_mode_synthesis_tools(),
-                system="Call submit_plan_proposal now.",
+                system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
                 max_tokens=6000,
                 think=False,
                 stream_thinking=False,
                 on_thinking_chunk=self._append_live_thinking,
                 pinned_selection=pinned_selection,
                 context_label="plan-mode minimal fallback",
-                retries=2,
+                retries=3,
             )
-            for tc in response.get("tool_calls", []):
-                if tc.get("function", {}).get("name") == "submit_plan_proposal":
-                    args = tc["function"].get("arguments", {})
-                    if isinstance(args, dict) and args.get("options"):
-                        return dict(args)
+            proposal = self._extract_plan_proposal_from_response(response)
+            if proposal.get("options"):
+                return proposal
+            repair_response = self._chat_with_same_model_retry(
+                ctx + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Previous answer was invalid because it did not produce a valid submit_plan_proposal tool call. "
+                            "Retry now. Output exactly one submit_plan_proposal tool call and no prose."
+                        ),
+                        "ts": now_ts(),
+                    }
+                ],
+                tools=self._plan_mode_synthesis_tools(),
+                system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
+                max_tokens=6000,
+                think=False,
+                stream_thinking=False,
+                on_thinking_chunk=self._append_live_thinking,
+                pinned_selection=pinned_selection,
+                context_label="plan-mode minimal fallback repair",
+                retries=1,
+            )
+            proposal = self._extract_plan_proposal_from_response(repair_response)
+            if proposal.get("options"):
+                return proposal
         except Exception:
             pass
         return {}
@@ -34740,7 +36396,7 @@ body{padding:18px}
         grouped_steps = self._group_plan_steps(raw_steps if isinstance(raw_steps, list) else [])
         plan_todos: list[dict] = []
         for i, step in enumerate(grouped_steps[:max(1, int(limit))]):
-            step_text = trim(str(step or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+            step_text = trim(normalize_embedded_newlines(step).strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
             if not step_text:
                 continue
             step_lines = step_text.split("\n")
@@ -34867,7 +36523,7 @@ body{padding:18px}
         _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
         for t in plan_todos:
             idx = int(t.get("plan_step_index", 0) or 0) + 1
-            full = str(t.get("full_content", "") or t.get("content", "")).strip()
+            full = normalize_embedded_newlines(t.get("full_content", "") or t.get("content", "")).strip()
             # Normalize: split concatenated N.N sub-steps onto own lines
             full = _mid_re_exec.sub(r"\n\1", full)
             header = full.split("\n")[0] if "\n" in full else full
@@ -35029,7 +36685,7 @@ body{padding:18px}
         # Phase 0: Normalize — split mid-string N.N onto own lines
         normalized: list[str] = []
         for s in raw_steps:
-            text = str(s or "").strip()
+            text = normalize_embedded_newlines(s).strip()
             if not text:
                 continue
             fixed = mid_numbered_re.sub(r"\n\1", text)
@@ -35364,18 +37020,16 @@ body{padding:18px}
         chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
         chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
         # Preserve current complexity unless the user explicitly changes it elsewhere.
-        _current_complexity = trim(
-            str(
-                self.runtime_task_complexity
-                or profile.get("complexity", judgement.get("complexity", ""))
-                or ""
-            ).strip().lower(),
-            20,
+        _current_complexity = normalize_task_complexity(
+            self.runtime_task_complexity
+            or profile.get("complexity", judgement.get("complexity", ""))
+            or "",
+            default="",
         )
         if _current_complexity in TASK_COMPLEXITY_LEVELS:
             self.runtime_task_complexity = _current_complexity
         else:
-            _current_complexity = trim(str(self.runtime_task_complexity or "").strip().lower(), 20)
+            _current_complexity = normalize_task_complexity(str(self.runtime_task_complexity or "").strip().lower(), default="")
         self.runtime_complexity_floor = str(_current_complexity or "complex")
         _plan_risk = self._resolve_plan_option_risk(chosen)
         try:
@@ -35927,7 +37581,7 @@ body{padding:18px}
                         )
                         continue
                     stop_note = (
-                        "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=3）。"
+                        "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=15）。"
                         "请尝试拆分任务，或切换更强的推理模型后继续。"
                     )
                     raise CircuitBreakerTriggered(stop_note)
@@ -36274,6 +37928,7 @@ body{padding:18px}
                         self.current_phase = f"tool:{name}"
                         self.current_tool_name = name
                     round_tool_names.append(name)
+                    todo_rows_before = self.todo.snapshot() if name in {"TodoWrite", "TodoWriteRescue"} else None
                     args = tc["function"]["arguments"]
                     args_error = str(tc.get("args_error", "") or "").strip()
                     raw_args = tc.get("raw_arguments")
@@ -36438,15 +38093,41 @@ body{padding:18px}
                         recovery_retry_rounds = 0
                     if dispatched_name in {"TodoWrite", "TodoWriteRescue"}:
                         todo_attempted = True
-                        state, reason = self._analyze_todo_result(dispatched_name, output)
+                        todo_rows_after = self.todo.snapshot()
+                        state, reason = self._analyze_todo_result(
+                            dispatched_name,
+                            output,
+                            before_rows=todo_rows_before,
+                            after_rows=todo_rows_after,
+                        )
                         if state == "ok":
                             used_todo = True
                             self.todo_write_issue_count = 0
                             self.todo_last_issue = ""
+                            self._emit(
+                                "status",
+                                {"summary": f"todo updated ({trim(reason, 100)})"},
+                            )
                         else:
                             self.todo_write_issue_count += 1
                             self.todo_last_issue = reason
-                            if self.todo_write_issue_count >= 2 and not self._todo_runtime_has_worker_rows(single_role):
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "todo update produced no progress "
+                                        f"({trim(reason, 100)})"
+                                    )
+                                },
+                            )
+                            repeat_no_progress = any(
+                                token in str(reason or "").lower()
+                                for token in ("repeated", "no progress", "without changing")
+                            )
+                            if self.todo_write_issue_count >= 2 and (
+                                not self._todo_runtime_has_worker_rows(single_role)
+                                or repeat_no_progress
+                            ):
                                 self._emit(
                                     "status",
                                     {
@@ -36473,6 +38154,22 @@ body{padding:18px}
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    # Update blackboard signals (step_files, execution_logs) for plan+single mode.
+                    # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
+                    # plan+single there is no worker turn — we must update inline so that
+                    # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
+                    try:
+                        self._blackboard_update_from_tool_result(
+                            "developer",
+                            {
+                                "name": dispatched_name or name,
+                                "args": args if isinstance(args, dict) else {},
+                                "output": trim(str(output or ""), 3000),
+                                "ok": not str(output).startswith("Error:"),
+                            },
+                        )
+                    except Exception:
+                        pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
                     _sa_ok = not str(output or "").startswith("Error")
@@ -36781,6 +38478,22 @@ body{padding:18px}
                         self.rounds_without_todo += 1
                 else:
                     self.rounds_without_todo += 1
+                concrete_work_without_todo = (
+                    not used_todo
+                    and self._todo_runtime_has_worker_rows(single_role)
+                    and any(
+                        isinstance(r, dict)
+                        and r.get("ok", False)
+                        and str(r.get("name", "") or "") in {
+                            "write_file",
+                            "edit_file",
+                            "bash",
+                            "read_file",
+                            "write_to_blackboard",
+                        }
+                        for r in single_round_tool_results
+                    )
+                )
                 if (
                     todo_attempted
                     and not used_todo
@@ -36805,18 +38518,25 @@ body{padding:18px}
                 now_tick = now_ts()
                 can_remind = (now_tick - self.last_todo_reminder_ts) >= 20
                 if can_remind and self.todo_reminder_count < 2:
-                    if not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        self.messages.append(
-                            {
-                                "role": "user",
-                                "content": "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
-                                "ts": now_tick,
-                            }
+                    if concrete_work_without_todo:
+                        self._append_plan_guidance_bubble(
+                            "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
+                            summary="todo reminder",
+                        )
+                        self.last_todo_reminder_ts = now_tick
+                        self.todo_reminder_count += 1
+                    elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
+                        self._append_plan_guidance_bubble(
+                            "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
+                            summary="todo reminder",
                         )
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
-                        self.messages.append({"role": "user", "content": "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>", "ts": now_tick})
+                        self._append_plan_guidance_bubble(
+                            "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
+                            summary="todo reminder",
+                        )
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                 if manual_compact:
@@ -36908,6 +38628,12 @@ body{padding:18px}
             # Generate completion summary bubble before finishing
             try:
                 self._generate_run_completion_summary()
+            except Exception:
+                pass
+            try:
+                _applied_runtime_updates = self._apply_deferred_runtime_updates()
+                for _note in _applied_runtime_updates[:6]:
+                    self._emit("status", {"summary": _note})
             except Exception:
                 pass
             self._emit("status", {"summary": "run finished"})
@@ -37188,6 +38914,7 @@ body{padding:18px}
                 "live_run_notice_elapsed": round(float(self.live_run_notice_elapsed or 0.0), 1),
                 "max_agent_rounds": int(self.max_agent_rounds),
                 "max_run_seconds": int(self.max_run_seconds),
+                "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                 "auto_model_switch": bool(self.auto_model_switch),
                 "arbiter_enabled": bool(self.arbiter_enabled),
                 "arbiter_model": str(self.arbiter_model or ""),
@@ -37367,6 +39094,7 @@ class SessionManager:
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
+        shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -37411,6 +39139,12 @@ class SessionManager:
             minimum=MIN_RUN_TIMEOUT_SECONDS,
             maximum=MAX_RUN_TIMEOUT_SECONDS,
             fallback=MAX_RUN_SECONDS,
+        )
+        self.shell_command_timeout_seconds = normalize_timeout_seconds(
+            shell_command_timeout_seconds if shell_command_timeout_seconds is not None else DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
@@ -37694,6 +39428,12 @@ class SessionManager:
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
+        sess.shell_command_timeout_seconds = normalize_timeout_seconds(
+            self.shell_command_timeout_seconds,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
         sess._persist()
@@ -37754,6 +39494,7 @@ class SessionManager:
                 context_limit_locked=self.context_limit_locked,
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
+                shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -37803,6 +39544,7 @@ class SessionManager:
                 context_limit_locked=self.context_limit_locked,
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
+                shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -38851,7 +40593,7 @@ function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!c
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
-async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
+async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
@@ -39424,7 +41166,7 @@ function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?s
 function boardsSignature(snap){return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
-function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
+function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;E('topStats').innerHTML=`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`}
 function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
@@ -41876,7 +43618,7 @@ async function renameSession(){if(!S.activeId){showError(t('select_session_first
 async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
-async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError('');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
+async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await waitForPendingUploads();await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
@@ -49236,6 +50978,7 @@ class AppContext:
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
+        shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -49256,7 +50999,7 @@ class AppContext:
         self.base_url = base_url
         self.model = model
         self.thinking = False
-        self.js_lib_root = offline_js_lib_root(SCRIPT_DIR)
+        self.js_lib_root = offline_js_lib_root(self.workspace)
         self.offline_js_summary: dict = {}
         try:
             self.offline_js_summary = load_offline_js_lib_index(self.js_lib_root)
@@ -49278,6 +51021,12 @@ class AppContext:
             minimum=MIN_RUN_TIMEOUT_SECONDS,
             maximum=MAX_RUN_TIMEOUT_SECONDS,
             fallback=MAX_RUN_SECONDS,
+        )
+        self.shell_command_timeout_seconds = normalize_timeout_seconds(
+            shell_command_timeout_seconds if shell_command_timeout_seconds is not None else DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
@@ -49447,6 +51196,7 @@ class AppContext:
             "show_upload_list": bool(getattr(self, "show_upload_list", False)),
             "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "js_lib_download_enabled": bool(getattr(self, "js_lib_download_enabled", True)),
+            "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
             "daily_session_limit_per_ip": int(getattr(self, "daily_session_limit_per_ip", 0) or 0),
             "daily_session_reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
             "validation": dict(self.web_ui_validation or {}),
@@ -50556,6 +52306,14 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        try:
+            mgr = self.manager_for_user(user_id)
+            sess = mgr.get(session_id)
+            if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
+                mgr._sync_from_session(sess, apply_to_all=False)
+                sess._deferred_runtime_sync_requested = False
+        except Exception:
+            pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -50690,6 +52448,7 @@ class AppContext:
                 self.context_limit_locked,
                 self.max_rounds,
                 self.max_run_seconds,
+                self.shell_command_timeout_seconds,
                 self.auto_model_switch,
                 self.arbiter_enabled,
                 self.arbiter_model,
@@ -51758,6 +53517,7 @@ class Handler(BaseHTTPRequestHandler):
                         "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
                         "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                         "run_timeout": int(mgr.max_run_seconds),
+                        "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     }
                 )
             model_cat = mgr.model_catalog()
@@ -51804,6 +53564,7 @@ class Handler(BaseHTTPRequestHandler):
                     "context_token_limit": int(mgr.context_token_limit),
                     "context_limit_locked": bool(mgr.context_limit_locked),
                     "run_timeout": int(mgr.max_run_seconds),
+                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
@@ -51856,7 +53617,7 @@ class Handler(BaseHTTPRequestHandler):
                         for hk, hv in probe_headers.items():
                             if str(hk or "").strip() and str(hv or "").strip():
                                 req.add_header(str(hk), str(hv))
-                        with urllib.request.urlopen(req, timeout=8) as resp:
+                        with urlopen(req, timeout=8) as resp:
                             body_text = resp.read().decode("utf-8", errors="replace")
                         reachable = True
                         try:
@@ -51913,7 +53674,7 @@ class Handler(BaseHTTPRequestHandler):
                         for hk, hv in probe_headers.items():
                             if str(hk or "").strip() and str(hv or "").strip():
                                 base_req.add_header(str(hk), str(hv))
-                        with urllib.request.urlopen(base_req, timeout=8):
+                        with urlopen(base_req, timeout=8):
                             pass
                         reachable = True
                     except urllib.error.HTTPError as exc:
@@ -52164,9 +53925,26 @@ class Handler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             model_override = payload.get("model_override")
+            if bool(getattr(sess, "running", False)):
+                try:
+                    sess._queue_deferred_runtime_update(
+                        "model_selection",
+                        {
+                            "selection": selection,
+                            "model_override": model_override if isinstance(model_override, str) else "",
+                        },
+                    )
+                except Exception as exc:
+                    return self._send_json({"error": str(exc)}, status=400)
+                queued = sess.model_catalog()
+                queued["queued"] = True
+                queued["note"] = (
+                    "session is running; model switch queued and will apply after the current run finishes"
+                )
+                return self._send_json(queued)
             try:
                 out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
-                mgr._sync_from_session(sess, apply_to_all=True)
+                mgr._sync_from_session(sess, apply_to_all=False)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(out)
@@ -52265,9 +54043,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) > 20 * 1024 * 1024:
                 return self._send_json({"error": "max upload size is 20MB"}, status=413)
             meta = sess.add_upload(filename, raw, mime)
-            if isinstance(meta.get("model_catalog"), dict):
+            if isinstance(meta.get("model_catalog"), dict) and not bool(meta.get("model_catalog", {}).get("queued")):
                 try:
-                    mgr._sync_from_session(sess, apply_to_all=True)
+                    mgr._sync_from_session(sess, apply_to_all=False)
                 except Exception:
                     pass
             return self._send_json(meta, status=201)
@@ -52361,16 +54139,16 @@ class Handler(BaseHTTPRequestHandler):
                     explicit_complexity = infer_user_complexity_value(
                         str(body.get("complexity", body.get("task_complexity", "")) or "")
                     )
-                    current_complexity = trim(
-                        str(getattr(sess, "runtime_task_complexity", "") or "").strip().lower(),
-                        20,
+                    current_complexity = normalize_task_complexity(
+                        getattr(sess, "runtime_task_complexity", "") or "",
+                        default="",
                     )
                     if explicit_complexity in TASK_COMPLEXITY_LEVELS:
-                        sess.runtime_task_complexity = explicit_complexity
+                        sess.runtime_task_complexity = normalize_task_complexity(explicit_complexity, default="")
                     elif current_complexity in TASK_COMPLEXITY_LEVELS:
                         sess.runtime_task_complexity = current_complexity
                     else:
-                        sess.runtime_task_complexity = str(policy.get("complexity", "simple"))
+                        sess.runtime_task_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
                     sess.runtime_scale_preference = "thorough" if level >= 4 else "balanced"
             return self._send_json({"task_level": level})
         return self._send_json({"error": "not found"}, status=404)
@@ -52563,6 +54341,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
+                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
             )
@@ -52995,6 +54774,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shell_command_timeout",
+        "--shell-command-timeout",
+        "--bash_timeout",
+        "--bash-timeout",
+        "--command_timeout",
+        "--command-timeout",
+        dest="shell_command_timeout",
+        default=None,
+        type=int,
+        help=(
+            "Per-command shell/bash timeout in seconds "
+            f"(default {DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS}; allowed "
+            f"{MIN_SHELL_COMMAND_TIMEOUT_SECONDS}-{MAX_SHELL_COMMAND_TIMEOUT_SECONDS}). "
+            "Independent from the global run timeout. Also configurable via --config keys "
+            "shell_command_timeout / shell_timeout / bash_timeout / command_timeout and env "
+            "AGENT_SHELL_COMMAND_TIMEOUT / AGENT_BASH_TIMEOUT / AGENT_COMMAND_TIMEOUT."
+        ),
+    )
+    parser.add_argument(
         "--live_input_delay_write",
         default=LIVE_INPUT_DELAY_WRITE_ROUNDS,
         type=int,
@@ -53143,9 +54941,10 @@ def main():
         default="",
         help=(
             "LLM config source (URL or local file path). "
-            "Also reads startup keys like show_upload_list, download_js_lib and "
+            "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
-            "max_daily_sessions_per_ip / session_daily_limit)."
+            "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
+            "shell_timeout / bash_timeout / command_timeout)."
         ),
     )
     parser.add_argument(
@@ -53280,6 +55079,7 @@ def main():
         arbiter_enabled=True,
         show_upload_list=None,
         download_js_lib=None,
+        shell_command_timeout=None,
     )
     args = parser.parse_args()
     ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
@@ -53309,6 +55109,7 @@ def main():
     )
     resolved_show_upload_list = False
     resolved_daily_session_limit_per_ip = 0
+    resolved_shell_command_timeout = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -53335,6 +55136,14 @@ def main():
             external_daily_session_limit = extract_daily_session_limit_setting(external_config)
             if external_daily_session_limit is not None:
                 resolved_daily_session_limit_per_ip = int(external_daily_session_limit)
+            external_shell_command_timeout = extract_shell_command_timeout_setting(external_config)
+            if external_shell_command_timeout is not None:
+                resolved_shell_command_timeout = normalize_timeout_seconds(
+                    external_shell_command_timeout,
+                    minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                )
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -53348,9 +55157,25 @@ def main():
     web_ui_daily_session_limit = extract_daily_session_limit_setting(web_ui_config)
     if web_ui_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = int(web_ui_daily_session_limit)
+    web_ui_shell_command_timeout = extract_shell_command_timeout_setting(web_ui_config)
+    if web_ui_shell_command_timeout is not None:
+        resolved_shell_command_timeout = normalize_timeout_seconds(
+            web_ui_shell_command_timeout,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
     cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
     if cli_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
+    cli_shell_command_timeout = getattr(args, "shell_command_timeout", None)
+    if cli_shell_command_timeout is not None:
+        resolved_shell_command_timeout = normalize_timeout_seconds(
+            cli_shell_command_timeout,
+            minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
+            maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+            fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -53405,6 +55230,7 @@ def main():
             f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
             f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
         )
+    print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
     if resolved_live_input_delay_write != requested_live_input_delay_write:
@@ -53587,6 +55413,7 @@ def main():
         ctx_limit_locked,
         resolved_max_rounds,
         resolved_run_timeout,
+        resolved_shell_command_timeout,
         resolved_auto_model_switch,
         resolved_arbiter_enabled,
         resolved_arbiter_model,

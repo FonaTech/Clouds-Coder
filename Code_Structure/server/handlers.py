@@ -13,14 +13,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..app.context import AppContext
-from ..config.constants import APP_VERSION, DEFAULT_REQUEST_TIMEOUT, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SYNC, MIN_RUN_TIMEOUT_SECONDS, PLAN_MODE_USER_CHOICES, RAG_GRAPH_MAX_NODES, SSE_HEARTBEAT_SECONDS, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, UI_STYLE_LABELS
+from ..config.constants import APP_VERSION, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SYNC, MIN_RUN_TIMEOUT_SECONDS, PLAN_MODE_USER_CHOICES, RAG_GRAPH_MAX_NODES, SSE_HEARTBEAT_SECONDS, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, UI_STYLE_LABELS
 from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, WORKDIR
-from ..config.settings import _to_bool_like, infer_user_complexity_value, looks_like_llm_config, normalize_execution_mode, normalize_ui_language, normalize_ui_style, resolve_web_ui_dir_path, supported_ui_languages_payload
+from ..config.settings import _to_bool_like, infer_user_complexity_value, looks_like_llm_config, normalize_execution_mode, normalize_task_complexity, normalize_ui_language, normalize_ui_style, resolve_web_ui_dir_path, supported_ui_languages_payload
 from ..llm.utils import extract_base_url, extract_openai_compat_model_ids, list_ollama_models, normalize_openai_compat_provider_name, openai_compat_model_list_urls, openai_compat_probe_headers
 from ..session.manager import SessionCreationLimitExceeded, SessionManager
 from ..session.state import SessionState
 from ..skills.store import analyze_skill_building_knowledge
 from ..utils.files import safe_path, try_read_text
+from ..utils.http import urlopen
 from ..utils.json_utils import json_dumps, parse_json_object
 from ..utils.media import guess_mime_from_name
 from ..utils.misc import now_ts, swallow_benign_socket_error, user_id_from_ip
@@ -200,6 +201,7 @@ class Handler(BaseHTTPRequestHandler):
                         "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
                         "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                         "run_timeout": int(mgr.max_run_seconds),
+                        "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     }
                 )
             model_cat = mgr.model_catalog()
@@ -246,6 +248,7 @@ class Handler(BaseHTTPRequestHandler):
                     "context_token_limit": int(mgr.context_token_limit),
                     "context_limit_locked": bool(mgr.context_limit_locked),
                     "run_timeout": int(mgr.max_run_seconds),
+                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
@@ -298,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                         for hk, hv in probe_headers.items():
                             if str(hk or "").strip() and str(hv or "").strip():
                                 req.add_header(str(hk), str(hv))
-                        with urllib.request.urlopen(req, timeout=8) as resp:
+                        with urlopen(req, timeout=8) as resp:
                             body_text = resp.read().decode("utf-8", errors="replace")
                         reachable = True
                         try:
@@ -355,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
                         for hk, hv in probe_headers.items():
                             if str(hk or "").strip() and str(hv or "").strip():
                                 base_req.add_header(str(hk), str(hv))
-                        with urllib.request.urlopen(base_req, timeout=8):
+                        with urlopen(base_req, timeout=8):
                             pass
                         reachable = True
                     except urllib.error.HTTPError as exc:
@@ -606,9 +609,26 @@ class Handler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             model_override = payload.get("model_override")
+            if bool(getattr(sess, "running", False)):
+                try:
+                    sess._queue_deferred_runtime_update(
+                        "model_selection",
+                        {
+                            "selection": selection,
+                            "model_override": model_override if isinstance(model_override, str) else "",
+                        },
+                    )
+                except Exception as exc:
+                    return self._send_json({"error": str(exc)}, status=400)
+                queued = sess.model_catalog()
+                queued["queued"] = True
+                queued["note"] = (
+                    "session is running; model switch queued and will apply after the current run finishes"
+                )
+                return self._send_json(queued)
             try:
                 out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
-                mgr._sync_from_session(sess, apply_to_all=True)
+                mgr._sync_from_session(sess, apply_to_all=False)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(out)
@@ -707,9 +727,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(raw) > 20 * 1024 * 1024:
                 return self._send_json({"error": "max upload size is 20MB"}, status=413)
             meta = sess.add_upload(filename, raw, mime)
-            if isinstance(meta.get("model_catalog"), dict):
+            if isinstance(meta.get("model_catalog"), dict) and not bool(meta.get("model_catalog", {}).get("queued")):
                 try:
-                    mgr._sync_from_session(sess, apply_to_all=True)
+                    mgr._sync_from_session(sess, apply_to_all=False)
                 except Exception:
                     pass
             return self._send_json(meta, status=201)
@@ -803,16 +823,16 @@ class Handler(BaseHTTPRequestHandler):
                     explicit_complexity = infer_user_complexity_value(
                         str(body.get("complexity", body.get("task_complexity", "")) or "")
                     )
-                    current_complexity = trim(
-                        str(getattr(sess, "runtime_task_complexity", "") or "").strip().lower(),
-                        20,
+                    current_complexity = normalize_task_complexity(
+                        getattr(sess, "runtime_task_complexity", "") or "",
+                        default="",
                     )
                     if explicit_complexity in TASK_COMPLEXITY_LEVELS:
-                        sess.runtime_task_complexity = explicit_complexity
+                        sess.runtime_task_complexity = normalize_task_complexity(explicit_complexity, default="")
                     elif current_complexity in TASK_COMPLEXITY_LEVELS:
                         sess.runtime_task_complexity = current_complexity
                     else:
-                        sess.runtime_task_complexity = str(policy.get("complexity", "simple"))
+                        sess.runtime_task_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
                     sess.runtime_scale_preference = "thorough" if level >= 4 else "balanced"
             return self._send_json({"task_level": level})
         return self._send_json({"error": "not found"}, status=404)
@@ -1005,6 +1025,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
+                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
             )

@@ -6,12 +6,13 @@ import base64
 import json
 import re
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 # ── cross-module imports ─────────────────────────────────────────────────
 from ..config.constants import DEFAULT_REQUEST_TIMEOUT, OLLAMA_THINKING_TOOL_BUFFER, SAMPLE_AUDIO_WAV_B64, SAMPLE_IMAGE_PNG_B64, SAMPLE_VIDEO_MP4_B64
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, parse_capability_overrides, parse_media_endpoints
 from .utils import complete_chat_endpoint, is_openai_compat_provider, is_openai_like_provider, split_thinking_content
+from ..utils.http import urlopen
 from ..utils.json_utils import canonicalize_tool_name, json_dumps, parse_json_object, parse_tool_arguments, parse_tool_arguments_with_error
 from ..utils.misc import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS, make_id, normalize_timeout_seconds, now_ts
 from ..utils.text import trim

@@ -141,6 +141,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         # UPPER_CASE constants
         "~^[A-Z][A-Z0-9_]{3,}$",
         "APP_VERSION",
+        "_SHELL_AUTO_CONFIRM_PATTERNS",
         "_TOOL_TIMEOUT_MAP",
         "_DEFAULT_TOOL_TIMEOUT",
         "RUNTIME_CONTROL_HINT_PREFIXES",
@@ -154,6 +155,8 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     "config/settings.py": [
         "normalize_ui_language", "normalize_ui_style", "supported_ui_languages_payload",
         "backend_i18n_text", "backend_role_label",
+        "infer_user_complexity_value", "normalize_task_complexity",
+        "task_complexity_rank", "task_complexity_at_least", "max_task_complexity",
         "normalize_execution_mode", "model_language_instruction", "_detect_os_shell_instruction",
         "resolve_web_ui_dir_path", "resolve_optional_file_path", "resolve_skills_root_path",
         "_count_skill_markdown_files", "select_preferred_skills_root",
@@ -173,9 +176,18 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     "utils/text.py": [
         "MAX_TOOL_OUTPUT", "SOCKET_NOISE_LINE_PATTERNS",
         "trim", "_fmt_export_ts", "_html_esc", "_text_to_minimal_pdf",
+        "normalize_embedded_newlines", "_map_todo_status_token",
+        "split_todo_status_text", "extract_todo_rows_from_text",
+        "infer_todo_status_from_text", "split_structured_todo_content",
         "normalize_work_text", "filter_runtime_noise_lines",
         "parse_front_matter", "make_numbered_diff", "make_unified_diff", "render_numbered_diff_text",
         "_compress_rows_keep_hotspot", "_hotspot_index", "_row_is_hot", "_skip_row",
+    ],
+    "utils/http.py": [
+        "_URL_OPEN_ORIGINAL",
+        "_HTTP_SSL_CONTEXT",
+        "_shared_http_ssl_context",
+        "urlopen",
     ],
     "utils/media.py": [
         "guess_mime_from_name", "_convert_image_to_safe_format", "guess_ext_from_mime",
@@ -225,6 +237,9 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "strip_thinking_content", "check_ollama_model_ready", "list_loaded_ollama_models",
         "wake_ollama_model", "try_pull_ollama_model", "ordered_model_candidates",
         "pick_working_ollama_model", "extract_base_url", "complete_chat_endpoint",
+        "normalize_openai_compat_provider_name", "is_openai_compat_provider",
+        "is_openai_like_provider", "openai_compat_probe_headers",
+        "openai_compat_model_list_urls", "extract_openai_compat_model_ids",
         "_is_http_url", "_resolve_local_path",
         "_OLLAMA_TAG_CACHE", "_OLLAMA_TAG_CACHE_LOCK",
     ],
@@ -969,14 +984,24 @@ class CodeGenerator:
         parts.append(self.HEADER_TEMPLATE)
 
         referenced_names = self.dep_analyzer.compute_referenced_names(module_nodes)
-        import_lines = self.analyzer.select_import_lines(referenced_names)
+        dep_map = self.dep_analyzer.compute_dependency_map(module_path, module_nodes)
+        cross_imported_names: Set[str] = set()
+        for names in dep_map.values():
+            cross_imported_names.update(names)
+        import_lines = self.analyzer.select_import_lines(referenced_names - cross_imported_names)
         compact = self._compact_imports("\n".join(import_lines))
         if compact:
             parts.append(compact)
             parts.append("")
 
         # Cross-module imports
-        cross_imports = self.dep_analyzer.compute_imports(module_path, module_nodes)
+        cross_imports = []
+        for dep_mod, names in sorted(dep_map.items()):
+            if not names:
+                continue
+            rel = self.dep_analyzer._relative_import(module_path, dep_mod)
+            names_str = ", ".join(sorted(names))
+            cross_imports.append(f"from {rel} import {names_str}")
         if cross_imports:
             parts.append("# ── cross-module imports ─────────────────────────────────────────────────")
             parts.extend(cross_imports)
@@ -1618,8 +1643,15 @@ class AutoLayoutGenerator:
         "LLM_CONFIG_PATH": "config/paths.py",
         "REPO_ROOT": "config/paths.py",
         "detect_repo_root": "config/paths.py",
+        "_SHELL_AUTO_CONFIRM_PATTERNS": "config/constants.py",
         "MAX_TOOL_OUTPUT": "utils/text.py",
         "SOCKET_NOISE_LINE_PATTERNS": "utils/text.py",
+        "normalize_embedded_newlines": "utils/text.py",
+        "_map_todo_status_token": "utils/text.py",
+        "split_todo_status_text": "utils/text.py",
+        "extract_todo_rows_from_text": "utils/text.py",
+        "infer_todo_status_from_text": "utils/text.py",
+        "split_structured_todo_content": "utils/text.py",
         "_compress_rows_keep_hotspot": "utils/text.py",
         "_hotspot_index": "utils/text.py",
         "_row_is_hot": "utils/text.py",
@@ -1667,6 +1699,13 @@ class AutoLayoutGenerator:
         "_code_is_test_path": "rag/parsers.py",
         "backend_i18n_text": "config/settings.py",
         "backend_role_label": "config/settings.py",
+        "infer_user_complexity_value": "config/settings.py",
+        "normalize_openai_compat_provider_name": "llm/utils.py",
+        "is_openai_compat_provider": "llm/utils.py",
+        "is_openai_like_provider": "llm/utils.py",
+        "openai_compat_probe_headers": "llm/utils.py",
+        "openai_compat_model_list_urls": "llm/utils.py",
+        "extract_openai_compat_model_ids": "llm/utils.py",
     }
 
     # Name prefix/suffix → module path
@@ -1748,6 +1787,12 @@ class AutoLayoutGenerator:
         ("merge_multimodal",       "config/settings.py"),
         ("parse_media_endpoints",  "config/settings.py"),
         ("load_llm_config",        "config/settings.py"),
+        ("infer_user_complexity",  "config/settings.py"),
+        ("normalize_openai_compat","llm/utils.py"),
+        ("is_openai_compat",       "llm/utils.py"),
+        ("is_openai_like",         "llm/utils.py"),
+        ("openai_compat_",         "llm/utils.py"),
+        ("extract_openai_compat",  "llm/utils.py"),
         ("_resolve_default_agent", "config/paths.py"),
         ("_migrate_legacy",        "config/paths.py"),
         ("now_ts",                 "utils/misc.py"),
@@ -1761,6 +1806,11 @@ class AutoLayoutGenerator:
         ("trim",                   "utils/text.py"),
         ("_html_esc",              "utils/text.py"),
         ("_text_to_minimal",       "utils/text.py"),
+        ("normalize_embedded_newlines", "utils/text.py"),
+        ("split_todo_status_text", "utils/text.py"),
+        ("extract_todo_rows_from_text", "utils/text.py"),
+        ("infer_todo_status_from_text", "utils/text.py"),
+        ("split_structured_todo_content", "utils/text.py"),
         ("normalize_work_text",    "utils/text.py"),
         ("ensure_generated_",      "skills/store.py"),
     ]

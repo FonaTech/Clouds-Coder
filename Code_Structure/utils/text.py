@@ -198,19 +198,237 @@ def _text_to_minimal_pdf(text: str) -> bytes:
     buf += b"%%EOF\n"
     return buf
 
-def normalize_work_text(text: object, status: str = "") -> str:
-    s = re.sub(r"\s+", " ", str(text or "")).strip()
+def normalize_embedded_newlines(text: object) -> str:
+    s = str(text or "")
     if not s:
         return ""
-    s = re.sub(r"^\[[ x>\-]\]\s*", "", s, flags=re.IGNORECASE)
+    s = s.replace("\u2028", "\n").replace("\u2029", "\n")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    if "\\n" in s or "\\r" in s or "\\t" in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\\t", "\t")
+    return s
+
+def _map_todo_status_token(token: str) -> str:
+    raw = str(token or "").strip().lower().replace("_", " ").replace("-", " ")
+    raw = re.sub(r"\s+", " ", raw)
+    return {
+        "pending": "pending",
+        "待处理": "pending",
+        "待處理": "pending",
+        "未着手": "pending",
+        "in progress": "in_progress",
+        "进行中": "in_progress",
+        "進行中": "in_progress",
+        "completed": "completed",
+        "已完成": "completed",
+        "完了": "completed",
+        "blocked": "pending",
+    }.get(raw, "")
+
+def split_todo_status_text(text: object) -> tuple[str, str]:
+    probe = normalize_embedded_newlines(text).strip()
+    if not probe:
+        return "", ""
+    status = ""
+    marker_prefix = r"(?:[-*•>]+\s*)?"
+    for _ in range(4):
+        before = probe
+        probe = re.sub(r"^\s+", "", probe)
+        matched = False
+        for row_status, pattern in (
+            (
+                "completed",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[x\]\s*"
+                rf")",
+            ),
+            (
+                "in_progress",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[>\]\s*"
+                rf")",
+            ),
+            (
+                "pending",
+                rf"^(?:{marker_prefix})(?:"
+                rf"\[\s*\]\s*"
+                rf")",
+            ),
+        ):
+            m = re.match(pattern, probe, flags=re.IGNORECASE)
+            if not m:
+                continue
+            status = row_status
+            probe = probe[m.end():].strip()
+            matched = True
+            break
+        if matched:
+            continue
+        m = re.match(
+            rf"^(?:{marker_prefix})"
+            rf"(pending|in[_\-\s]?progress|completed|blocked|"
+            rf"待处理|待處理|未着手|进行中|進行中|已完成|完了)"
+            rf"\s*[：:\-\]]\s*",
+            probe,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            mapped = _map_todo_status_token(str(m.group(1) or ""))
+            if mapped:
+                status = mapped
+            probe = probe[m.end():].strip()
+            continue
+        if probe == before:
+            break
+    return status, probe.strip()
+
+def extract_todo_rows_from_text(
+    text: object,
+    *,
+    default_parent_step_id: str = "",
+    limit: int = 12,
+) -> list[dict]:
+    src = normalize_embedded_newlines(text)
+    if not src.strip():
+        return []
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    capped = max(1, min(40, int(limit or 12)))
+    parent_step_id = trim(str(default_parent_step_id or "").strip(), 20)
+    for raw_line in src.splitlines():
+        line = trim(str(raw_line or "").strip(), 600)
+        if not line:
+            continue
+        variants: list[str] = []
+        for candidate in (
+            line,
+            re.sub(r"^\s*(?:[-*•>]+\s*)+", "", line).strip(),
+            re.sub(r"^\s*\*\*([^*]+)\*\*\s*([：:])\s*", r"\1\2 ", line).strip(),
+            re.sub(r"^\s*(?:[-*•>]+\s*)*\*\*([^*]+)\*\*\s*([：:])\s*", r"\1\2 ", line).strip(),
+        ):
+            candidate = trim(str(candidate or "").strip(), 600)
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        matched = False
+        for candidate in variants:
+            status, content = split_todo_status_text(candidate)
+            if not status or not content:
+                continue
+            cleaned = normalize_work_text(content, status) or content
+            cleaned = trim(cleaned.strip(), 400)
+            if not cleaned:
+                continue
+            low = cleaned.lower()
+            if low in {
+                "todo",
+                "todos",
+                "task",
+                "tasks",
+                "subtask",
+                "subtasks",
+                "待办",
+                "待辦",
+                "子任务",
+                "子任務",
+            }:
+                continue
+            row = {"content": cleaned, "status": status}
+            if parent_step_id:
+                row["parent_step_id"] = parent_step_id
+            identity = (
+                status,
+                normalize_work_text(cleaned, status).strip().lower(),
+                parent_step_id,
+            )
+            if identity in seen:
+                matched = True
+                break
+            seen.add(identity)
+            out.append(row)
+            matched = True
+            break
+        if matched and len(out) >= capped:
+            break
+    return out
+
+def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
+    status, content = split_todo_status_text(text)
+    if not content and not status:
+        return default
+    if status:
+        return status
+    return default
+
+def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
+    src = normalize_embedded_newlines(text).strip()
+    if not src:
+        return []
+    lines = [trim(str(line or "").strip(), 500) for line in src.split("\n")]
+    lines = [line for line in lines if line]
+    if len(lines) <= 1:
+        return [src]
+    major_re = re.compile(r"^(\d+)\.\s+(.+)$")
+    sub_re = re.compile(r"^(\d+)\.(\d+)\s+(.+)$")
+    bullet_re = re.compile(r"^(?:[-*•]\s+)(.+)$")
+    header_major = ""
+    m0 = major_re.match(lines[0])
+    if m0:
+        header_major = str(m0.group(1) or "")
+    picked: list[str] = []
+    for idx, line in enumerate(lines):
+        if idx == 0 and header_major:
+            continue
+        m_sub = sub_re.match(line)
+        if m_sub:
+            major = str(m_sub.group(1) or "")
+            if header_major and major != header_major:
+                if picked:
+                    break
+                continue
+            picked.append(f"{major}.{m_sub.group(2)} {trim(str(m_sub.group(3) or '').strip(), 420)}".strip())
+            continue
+        m_bullet = bullet_re.match(line)
+        if m_bullet and (header_major or picked):
+            picked.append(trim(str(m_bullet.group(1) or "").strip(), 420))
+            continue
+        if picked and re.match(r"^\d+\.\s+", line):
+            break
+    if not picked:
+        for line in lines:
+            m_sub = sub_re.match(line)
+            if m_sub:
+                picked.append(f"{m_sub.group(1)}.{m_sub.group(2)} {trim(str(m_sub.group(3) or '').strip(), 420)}".strip())
+                if len(picked) >= max(1, int(limit or 7)):
+                    break
+    if not picked:
+        return [src]
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in picked:
+        key = re.sub(r"\s+", " ", str(line or "").strip()).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+        if len(out) >= max(1, int(limit or 7)):
+            break
+    return out or [src]
+
+def normalize_work_text(text: object, status: str = "") -> str:
+    parsed_status, parsed_content = split_todo_status_text(text)
+    s = re.sub(r"\s+", " ", parsed_content or normalize_embedded_newlines(text)).strip()
+    if not s:
+        return ""
     s = re.sub(
-        r"^(pending|in[_\-\s]?progress|completed|done|blocked)\s*[·:\-\]]\s*",
+        r"^(pending|todo|in[_\-\s]?progress|doing|working|completed|done|finished|blocked|"
+        r"待处理|待處理|未着手|进行中|進行中|作業中|已完成|完成|完了)\s*[·：:\-\]]\s*",
         "",
         s,
         flags=re.IGNORECASE,
     )
-    if status:
-        status_pattern = re.escape(status).replace("_", r"[_\-\s]?")
+    status_key = _map_todo_status_token(status) or _map_todo_status_token(parsed_status) or str(status or "").strip().lower()
+    if status_key:
+        status_pattern = re.escape(status_key).replace("_", r"[_\-\s]?")
         s = re.sub(
             rf"\s*[—-]\s*{status_pattern}\s*$",
             "",
