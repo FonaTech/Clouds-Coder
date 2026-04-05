@@ -141,6 +141,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         # UPPER_CASE constants
         "~^[A-Z][A-Z0-9_]{3,}$",
         "APP_VERSION",
+        "_SHELL_AUTO_CONFIRM_PATTERNS",
         "_TOOL_TIMEOUT_MAP",
         "_DEFAULT_TOOL_TIMEOUT",
         "RUNTIME_CONTROL_HINT_PREFIXES",
@@ -1642,6 +1643,7 @@ class AutoLayoutGenerator:
         "LLM_CONFIG_PATH": "config/paths.py",
         "REPO_ROOT": "config/paths.py",
         "detect_repo_root": "config/paths.py",
+        "_SHELL_AUTO_CONFIRM_PATTERNS": "config/constants.py",
         "MAX_TOOL_OUTPUT": "utils/text.py",
         "SOCKET_NOISE_LINE_PATTERNS": "utils/text.py",
         "normalize_embedded_newlines": "utils/text.py",

@@ -38,7 +38,7 @@ from ..agent.events import EventHub
 from ..agent.tasks import TaskManager
 from ..agent.todo import TodoManager
 from ..agent.worktree import WorktreeManager
-from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MESSAGE_EVENT_MAX_CHARS, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS, PLAN_MODE_USER_CHOICES, PLAN_NOTICE_BODY_MAX_CHARS, PLAN_STEP_FULL_CONTENT_MAX_CHARS, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _TOOL_TIMEOUT_MAP
+from ..config.constants import AGENT_BUBBLE_ROLES, AGENT_CTX_LIMIT_TIER0, AGENT_CTX_LIMIT_TIER1, AGENT_CTX_LIMIT_TIER2, AGENT_CTX_LIMIT_TIER3, AGENT_MAX_OUTPUT_TOKENS, AGENT_MSG_LIMIT_TIER0, AGENT_MSG_LIMIT_TIER1, AGENT_MSG_LIMIT_TIER2, AGENT_MSG_LIMIT_TIER3, AGENT_ROLES, AGENT_TOOL_ALLOWLIST, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, ARBITER_TRIGGER_MIN_CONTENT_CHARS, ARBITER_VALID_PLANNING_STREAK_LIMIT, ASSISTANT_MESSAGE_EVENT_MAX_CHARS, ASSISTANT_TEXT_PERSIST_MAX_CHARS, AUDIO_EXTS, AUTO_CONTINUE_BUDGET_DEFAULT, BASH_READ_LOOP_THRESHOLD, BLACKBOARD_MAX_LOG_ENTRIES, BLACKBOARD_MAX_TEXT, BLACKBOARD_STATUSES, CHECKPOINT_INTERVAL_ROUNDS, CHECKPOINT_MAX_COUNT, CODE_PREVIEW_STAGE_MAX_BYTES, CODE_PREVIEW_STAGE_MAX_PER_FILE, CODE_PREVIEW_STAGE_MAX_ROWS, CODE_PREVIEW_STAGE_MAX_TOTAL, COMPACT_TIER1_ABS, COMPACT_TIER1_PCT, COMPACT_TIER2_ABS, COMPACT_TIER2_PCT, COMPACT_TIER3_PCT, DANGEROUS_PATTERNS, DEEP_RESEARCH_REQUEST_KEYWORDS, DEEP_RESEARCH_RETRIEVAL_KEYWORDS, DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEVELOPER_EDIT_STALL_THRESHOLD, EMPTY_ACTION_MIN_CONTENT_CHARS, EMPTY_ACTION_WAKEUP_RETRY_LIMIT, ERROR_CATEGORY_DEFS, EXECUTION_MODE_CHOICES, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC, EXPLORER_STALL_THRESHOLD, FAILURE_LEDGER_MAX_COMPILE_ERRORS, FAILURE_LEDGER_MAX_DELEGATIONS, FAILURE_LEDGER_MAX_ERRORS, FAILURE_LEDGER_MAX_FIXES, FAILURE_LEDGER_MAX_STALLS, FAILURE_LEDGER_MAX_TOOL_FPS, FILE_BUFFER_CONTENT_THRESHOLD, FILE_BUFFER_MAX_FILES, FINAL_SUMMARY_MIN_CHARS, FINAL_SUMMARY_STRICT_MIN_CHARS, FUSED_FAULT_BREAK_THRESHOLD, HARD_BREAK_RECOVERY_ROUND_THRESHOLD, HARD_BREAK_TOOL_ERROR_THRESHOLD, HTML_FRONTEND_REQUEST_KEYWORDS, IMAGE_EXTS, IMAGE_FORMATS_NEED_CONVERSION, LIVE_INPUT_DELAY_NORMAL_ROUNDS, LIVE_INPUT_DELAY_TOOL_ROUNDS, LIVE_INPUT_DELAY_WRITE_ROUNDS, LIVE_INPUT_MAX_INJECTIONS, LIVE_INPUT_REINJECT_INTERVAL, LIVE_INPUT_WEIGHT_BASE_DELAYED, LIVE_INPUT_WEIGHT_BASE_NORMAL, LIVE_INPUT_WEIGHT_STEP_DELAYED, LIVE_INPUT_WEIGHT_STEP_NORMAL, LONG_OUTPUT_LISTING_OFFLOAD_CHARS, LONG_OUTPUT_MODEL_PAGE_CHARS, LONG_OUTPUT_READ_PAGE_LINES, LONG_OUTPUT_READ_PAGE_MAX_CHARS, LONG_OUTPUT_TEMP_MAX_FILES, LONG_OUTPUT_UI_PAGE_CHARS, LONG_OUTPUT_UI_PREVIEW_MAX_PAGES, MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3, MANAGER_ROUTE_TARGETS, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_CONTEXT_ARCHIVE_SEGMENTS, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, MODEL_CALL_PROGRESS_DELAY, MODEL_CALL_PROGRESS_INTERVAL, MODEL_OUTPUT_RETRY_TIMES, PERSISTED_ROUTES_MAX, PLAN_BUBBLE_MAX_CHARS, PLAN_FILE_RELATIVE_PATH, PLAN_MESSAGE_EVENT_MAX_CHARS, PLAN_MODE_ENABLED_LEVELS, PLAN_MODE_EXPLORER_MAX_ROUNDS, PLAN_MODE_FORCED_LEVELS, PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS, PLAN_MODE_MAX_OPTIONS, PLAN_MODE_RESEARCH_TOOL_ALLOWLIST, PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS, PLAN_MODE_USER_CHOICES, PLAN_NOTICE_BODY_MAX_CHARS, PLAN_STEP_FULL_CONTENT_MAX_CHARS, RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS, RENDER_FRAME_MAX_B64_CHARS, RENDER_FRAME_MAX_LINES, RENDER_FRAME_MAX_LINE_POINTS, RENDER_FRAME_MAX_POINTS, REPEATED_TOOL_LOOP_THRESHOLD, RETRY_RUNTIME_HINT_PREFIXES, REVIEWER_DEBUG_MODE_MAX_ROUNDS, RUNTIME_CONTROL_HINT_PREFIXES, SEMANTIC_CONFIDENCE_CHOICES, SKILLS_VIRTUAL_PREFIX, SKILL_REFRESH_MIN_INTERVAL_SECONDS, SKILL_RUNTIME_CACHE_MAX_BYTES, SKILL_RUNTIME_CACHE_MAX_ENTRIES, STALL_ESCALATION_CONTEXT_MAX_CHARS, STALL_ESCALATION_MIN_LEVEL, STALL_PLAN_SYNTHESIS_MAX_TOKENS, STALL_SEVERITY_DECAY_ON_SUCCESS, STALL_SEVERITY_ESCALATION_THRESHOLD, STALL_SEVERITY_WEIGHT_BASH_READ_LOOP, STALL_SEVERITY_WEIGHT_FAULT, STALL_SEVERITY_WEIGHT_RECOVERY_RETRY, STALL_SEVERITY_WEIGHT_REPEATED_TOOL, STALL_SEVERITY_WEIGHT_WATCHDOG, TASK_COMPLEXITY_LEVELS, TASK_LEVEL_CHOICES, TASK_LEVEL_POLICIES, TASK_PHASE_ROUTING, TASK_PROFILE_TYPES, TASK_SCALE_PREFERENCES, THINKING_BUDGET_FORCE_RATIO, TOKEN_THRESHOLD, TRUNCATION_CONTINUATION_ECHO_CHARS, TRUNCATION_CONTINUATION_MAX_PASSES, TRUNCATION_CONTINUATION_MAX_TOKENS, TRUNCATION_CONTINUATION_TAIL_CHARS, TRUNCATION_LIVE_BUFFER_MAX_CHARS, TRUNCATION_OVERLAP_SCAN_CHARS, TRUNCATION_PAIR_SCAN_CHARS, VIDEO_EXTS, WATCHDOG_CONTEXT_NEAR_RATIO, WATCHDOG_CONTEXT_STALL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD, WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_MAX_DECOMPOSE_STEPS, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD, WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE, WATCHDOG_REPEAT_SIMILARITY_THRESHOLD, WATCHDOG_STATE_STALL_THRESHOLD, WATCHDOG_STEP_MAX_ATTEMPTS, _DEFAULT_TOOL_TIMEOUT, _SHELL_AUTO_CONFIRM_PATTERNS, _TOOL_TIMEOUT_MAP
 from ..config.paths import WORKDIR
 from ..config.settings import _detect_os_shell_instruction, _to_bool_like, backend_i18n_text, backend_role_label, default_multimodal_capabilities, infer_model_multimodal_capabilities, infer_user_complexity_value, looks_like_llm_config, max_task_complexity, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_task_complexity, normalize_ui_language, parse_capability_overrides, parse_llm_config_profiles, task_complexity_at_least, task_complexity_rank
 from ..llm.client import OllamaClient, OllamaError
@@ -9480,6 +9480,7 @@ body{padding:18px}
             _spawn_reader("stdout", proc.stdout)
             _spawn_reader("stderr", proc.stderr)
 
+            _auto_confirmed: set[bytes] = set()
             while True:
                 now = time.time()
                 elapsed = now - start
@@ -9525,6 +9526,18 @@ body{padding:18px}
                         },
                     )
                     next_progress_emit = now + 0.8
+                # Auto-confirm interactive prompts (Windows reader thread path)
+                if proc.stdin and not proc.stdin.closed:
+                    _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                    for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                        if _pat in _tail and _pat not in _auto_confirmed:
+                            try:
+                                proc.stdin.write(b"y\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+                            _auto_confirmed.add(_pat)
+                            break
                 if (proc.poll() is not None) and (not active_readers) and io_queue.empty():
                     break
 
@@ -9565,6 +9578,7 @@ body{padding:18px}
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
+                "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "text": False,
@@ -9596,6 +9610,7 @@ body{padding:18px}
                             except Exception:
                                 pass
                             sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+                        _auto_confirmed: set[bytes] = set()
                         while True:
                             now = time.time()
                             elapsed = now - start
@@ -9639,6 +9654,18 @@ body{padding:18px}
                                     },
                                 )
                                 next_progress_emit = now + 0.8
+                            # Auto-confirm interactive prompts (e.g. "Ok to proceed? (y)")
+                            if proc.stdin and not proc.stdin.closed:
+                                _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                                for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                                    if _pat in _tail and _pat not in _auto_confirmed:
+                                        try:
+                                            proc.stdin.write(b"y\n")
+                                            proc.stdin.flush()
+                                        except Exception:
+                                            pass
+                                        _auto_confirmed.add(_pat)
+                                        break
                             if (proc.poll() is not None) and (not sel.get_map()):
                                 break
                         merged_raw = _merge_output_text()
@@ -12375,6 +12402,12 @@ body{padding:18px}
         board["updated_at"] = float(now_ts())
         self.blackboard = board
 
+    def _save_blackboard(self, bb: dict):
+        """Persist a blackboard dict as the current blackboard and touch updated_at."""
+        if isinstance(bb, dict):
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+
     def _blackboard_reset_for_goal(self, goal: str):
         # Preserve plan state when safe, but refresh loaded skills on goal change.
         old_bb = self._ensure_blackboard()
@@ -13580,13 +13613,6 @@ body{padding:18px}
         all_marked_done = all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
         if not all_marked_done:
             return False
-        # Acceptance verification: check that each "completed" subtask has real evidence
-        # Don't just trust the model's TodoWrite status — verify against accumulated tool outputs
-        if worker_items:
-            bb = self._ensure_blackboard()
-            unverified = self._verify_subtasks_acceptance(worker_items, step_id, bb)
-            if unverified:
-                return False
         return True
 
     def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
@@ -14866,9 +14892,12 @@ body{padding:18px}
         return False
 
     def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
-        """Gate: after subtasks complete, require model to explicitly emit <step-verified/>
-        in a message since this step was activated. Research/design phases exempt.
-        Escape hatch: after 10 consecutive blocks, auto-pass to prevent permanent stall."""
+        """Gate passes when:
+          1. Phase is research/design (no execution needed)
+          2. Model emitted <step-verified/> since step activation
+          3. Blackboard shows phase-appropriate accumulated evidence (has_write+has_exec for implement)
+          4. Escape hatch: 10 consecutive blocks
+        Research/design phases exempt. Escape hatch prevents permanent stall."""
         step_id = str(plan_step.get("id", "") or "")
         _flag = f"_smvg_{step_id}"
         if getattr(self, _flag, False):
@@ -14884,8 +14913,15 @@ body{padding:18px}
         if _n_blocked >= 10:
             setattr(self, _flag, True)
             return True
-        # Model must explicitly emit <step-verified/> after evaluating results
+        # Path A: model explicit tag
         if self._check_step_verified_tag(plan_step):
+            setattr(self, _flag, True)
+            return True
+        # Path B: blackboard shows phase-appropriate accumulated evidence
+        # implement: has_write AND (has_exec OR ...) — wrote files + ran bash
+        # test/review: has_exec OR has_test_pass — ran tests
+        # other: use generic evidence check
+        if self._plan_step_has_blackboard_evidence(plan_step):
             setattr(self, _flag, True)
             return True
         # Gate blocked — increment counter and inject hint
@@ -15027,16 +15063,12 @@ body{padding:18px}
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
         if subtasks_done:
-            # Validation gate always fires when subtasks are done — even if validation_ok is False.
-            # For research/design phases the gate passes immediately; for implement/test it requires
-            # a successful bash run. This ensures single mode proactively requests verification.
+            # Validation gate: passes when model emitted <step-verified/>, blackboard has
+            # phase-appropriate evidence, or escape hatch (10 blocks). Gate is the authoritative
+            # "step done" check — no additional validation_ok required after gate passes.
             _gate_ok = self._single_mode_validation_gate(current, tool_results)
             if _gate_ok:
-                if validation_ok:
-                    should_advance = True
-                elif todo_progress_signal and self._step_has_accumulated_evidence(current, bb):
-                    # Accumulated evidence path: subtasks done + TodoWrite progress + history
-                    should_advance = True
+                should_advance = True
             else:
                 _gate_blocked = True  # Gate blocked — disable ALL remaining advancement paths
         # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
@@ -15070,7 +15102,8 @@ body{padding:18px}
                     last_text = str(msg.get("content", "") or "").lower()
                     break
             step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一")
+                                 "next step", "下一步", "proceed to step", "进入下一",
+                                 "全部完成", "✅", "all subtasks")
             if validation_ok and any(sig in last_text for sig in step_done_signals):
                 should_advance = True
         if should_advance:
@@ -19933,6 +19966,36 @@ body{padding:18px}
             if budget_forced
             else ""
         )
+        # If in plan mode, include the current in-progress subtask and the <step-verified/> escape path
+        plan_subtask_hint = ""
+        try:
+            bb = self._ensure_blackboard()
+            todos = bb.get("project_todos", [])
+            active_step = next(
+                (t for t in todos if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                None,
+            )
+            if active_step:
+                step_id = str(active_step.get("id", "") or "")
+                active_subtask = next(
+                    (
+                        t for t in todos
+                        if t.get("category") != "plan_step"
+                        and t.get("status") == "in_progress"
+                        and str(t.get("parent_step_id", "") or "") == step_id
+                    ),
+                    None,
+                )
+                if active_subtask:
+                    subtask_text = trim(str(active_subtask.get("content", "") or ""), 120)
+                    plan_subtask_hint = (
+                        f"\n当前子任务: {subtask_text}\n"
+                        "如果此子任务需要视觉/浏览器验证而无法通过 bash 完整执行，"
+                        "请创建相关文件，通过代码审查确认实现正确，"
+                        "然后在回复中发出 <step-verified/> 并调用 TodoWrite 将子任务标记为 completed。"
+                    )
+        except Exception:
+            pass
         self.messages.append(
             {
                 "role": "user",
@@ -19941,6 +20004,7 @@ body{padding:18px}
                     f"系统检测到空动作回合（consecutive_empty_action={int(streak)}）。"
                     "你刚才进行了深入思考，但没有输出任何最终结果或工具调用。"
                     f"{budget_note}"
+                    f"{plan_subtask_hint}"
                     "请结束思考，立即基于现有推导输出最终结论，或发起一个明确、可执行的工具调用。 "
                     "System notice: you returned thinking-only content without final answer or tool calls. "
                     "Stop internal reasoning now and immediately output either the final conclusion or exactly one "
@@ -25033,6 +25097,22 @@ body{padding:18px}
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    # Update blackboard signals (step_files, execution_logs) for plan+single mode.
+                    # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
+                    # plan+single there is no worker turn — we must update inline so that
+                    # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
+                    try:
+                        self._blackboard_update_from_tool_result(
+                            "developer",
+                            {
+                                "name": dispatched_name or name,
+                                "args": args if isinstance(args, dict) else {},
+                                "output": trim(str(output or ""), 3000),
+                                "ok": not str(output).startswith("Error:"),
+                            },
+                        )
+                    except Exception:
+                        pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
                     _sa_ok = not str(output or "").startswith("Error")

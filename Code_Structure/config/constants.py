@@ -161,6 +161,21 @@ MAX_RUN_TIMEOUT_SECONDS = 86_400
 
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 
+_SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
+    b"ok to proceed? (y)",
+    b"proceed? (y)",
+    b"? (y)",
+    b"[y/n]",
+    b"[y/n]:",
+    b"[yes/no]",
+    b"(y/n)",
+    b"(yes/no)",
+    b"continue? (y/n)",
+    b"do you want to continue",
+    b"press enter to continue",
+    b"enter to continue",
+)
+
 MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
 
 MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400

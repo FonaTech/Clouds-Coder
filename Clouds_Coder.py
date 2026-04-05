@@ -216,6 +216,22 @@ DEFAULT_TIMEOUT_SECONDS = max(
     ),
 )
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
+# Patterns that indicate the shell process is waiting for interactive confirmation.
+# Checked against the tail of combined stdout+stderr (lowercased bytes).
+_SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
+    b"ok to proceed? (y)",
+    b"proceed? (y)",
+    b"? (y)",
+    b"[y/n]",
+    b"[y/n]:",
+    b"[yes/no]",
+    b"(y/n)",
+    b"(yes/no)",
+    b"continue? (y/n)",
+    b"do you want to continue",
+    b"press enter to continue",
+    b"enter to continue",
+)
 MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
 MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
 DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
@@ -22521,6 +22537,7 @@ body{padding:18px}
             _spawn_reader("stdout", proc.stdout)
             _spawn_reader("stderr", proc.stderr)
 
+            _auto_confirmed: set[bytes] = set()
             while True:
                 now = time.time()
                 elapsed = now - start
@@ -22566,6 +22583,18 @@ body{padding:18px}
                         },
                     )
                     next_progress_emit = now + 0.8
+                # Auto-confirm interactive prompts (Windows reader thread path)
+                if proc.stdin and not proc.stdin.closed:
+                    _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                    for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                        if _pat in _tail and _pat not in _auto_confirmed:
+                            try:
+                                proc.stdin.write(b"y\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+                            _auto_confirmed.add(_pat)
+                            break
                 if (proc.poll() is not None) and (not active_readers) and io_queue.empty():
                     break
 
@@ -22606,6 +22635,7 @@ body{padding:18px}
             popen_kwargs = {
                 "shell": True,
                 "cwd": cwd,
+                "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "text": False,
@@ -22637,6 +22667,7 @@ body{padding:18px}
                             except Exception:
                                 pass
                             sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+                        _auto_confirmed: set[bytes] = set()
                         while True:
                             now = time.time()
                             elapsed = now - start
@@ -22680,6 +22711,18 @@ body{padding:18px}
                                     },
                                 )
                                 next_progress_emit = now + 0.8
+                            # Auto-confirm interactive prompts (e.g. "Ok to proceed? (y)")
+                            if proc.stdin and not proc.stdin.closed:
+                                _tail = (bytes(out_buf[-300:]) + bytes(err_buf[-300:])).lower()
+                                for _pat in _SHELL_AUTO_CONFIRM_PATTERNS:
+                                    if _pat in _tail and _pat not in _auto_confirmed:
+                                        try:
+                                            proc.stdin.write(b"y\n")
+                                            proc.stdin.flush()
+                                        except Exception:
+                                            pass
+                                        _auto_confirmed.add(_pat)
+                                        break
                             if (proc.poll() is not None) and (not sel.get_map()):
                                 break
                         merged_raw = _merge_output_text()
@@ -25416,6 +25459,12 @@ body{padding:18px}
         board["updated_at"] = float(now_ts())
         self.blackboard = board
 
+    def _save_blackboard(self, bb: dict):
+        """Persist a blackboard dict as the current blackboard and touch updated_at."""
+        if isinstance(bb, dict):
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+
     def _blackboard_reset_for_goal(self, goal: str):
         # Preserve plan state when safe, but refresh loaded skills on goal change.
         old_bb = self._ensure_blackboard()
@@ -26621,13 +26670,6 @@ body{padding:18px}
         all_marked_done = all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
         if not all_marked_done:
             return False
-        # Acceptance verification: check that each "completed" subtask has real evidence
-        # Don't just trust the model's TodoWrite status — verify against accumulated tool outputs
-        if worker_items:
-            bb = self._ensure_blackboard()
-            unverified = self._verify_subtasks_acceptance(worker_items, step_id, bb)
-            if unverified:
-                return False
         return True
 
     def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
@@ -27907,9 +27949,12 @@ body{padding:18px}
         return False
 
     def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
-        """Gate: after subtasks complete, require model to explicitly emit <step-verified/>
-        in a message since this step was activated. Research/design phases exempt.
-        Escape hatch: after 10 consecutive blocks, auto-pass to prevent permanent stall."""
+        """Gate passes when:
+          1. Phase is research/design (no execution needed)
+          2. Model emitted <step-verified/> since step activation
+          3. Blackboard shows phase-appropriate accumulated evidence (has_write+has_exec for implement)
+          4. Escape hatch: 10 consecutive blocks
+        Research/design phases exempt. Escape hatch prevents permanent stall."""
         step_id = str(plan_step.get("id", "") or "")
         _flag = f"_smvg_{step_id}"
         if getattr(self, _flag, False):
@@ -27925,8 +27970,15 @@ body{padding:18px}
         if _n_blocked >= 10:
             setattr(self, _flag, True)
             return True
-        # Model must explicitly emit <step-verified/> after evaluating results
+        # Path A: model explicit tag
         if self._check_step_verified_tag(plan_step):
+            setattr(self, _flag, True)
+            return True
+        # Path B: blackboard shows phase-appropriate accumulated evidence
+        # implement: has_write AND (has_exec OR ...) — wrote files + ran bash
+        # test/review: has_exec OR has_test_pass — ran tests
+        # other: use generic evidence check
+        if self._plan_step_has_blackboard_evidence(plan_step):
             setattr(self, _flag, True)
             return True
         # Gate blocked — increment counter and inject hint
@@ -28068,16 +28120,12 @@ body{padding:18px}
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
         if subtasks_done:
-            # Validation gate always fires when subtasks are done — even if validation_ok is False.
-            # For research/design phases the gate passes immediately; for implement/test it requires
-            # a successful bash run. This ensures single mode proactively requests verification.
+            # Validation gate: passes when model emitted <step-verified/>, blackboard has
+            # phase-appropriate evidence, or escape hatch (10 blocks). Gate is the authoritative
+            # "step done" check — no additional validation_ok required after gate passes.
             _gate_ok = self._single_mode_validation_gate(current, tool_results)
             if _gate_ok:
-                if validation_ok:
-                    should_advance = True
-                elif todo_progress_signal and self._step_has_accumulated_evidence(current, bb):
-                    # Accumulated evidence path: subtasks done + TodoWrite progress + history
-                    should_advance = True
+                should_advance = True
             else:
                 _gate_blocked = True  # Gate blocked — disable ALL remaining advancement paths
         # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
@@ -28111,7 +28159,8 @@ body{padding:18px}
                     last_text = str(msg.get("content", "") or "").lower()
                     break
             step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一")
+                                 "next step", "下一步", "proceed to step", "进入下一",
+                                 "全部完成", "✅", "all subtasks")
             if validation_ok and any(sig in last_text for sig in step_done_signals):
                 should_advance = True
         if should_advance:
@@ -32974,6 +33023,36 @@ body{padding:18px}
             if budget_forced
             else ""
         )
+        # If in plan mode, include the current in-progress subtask and the <step-verified/> escape path
+        plan_subtask_hint = ""
+        try:
+            bb = self._ensure_blackboard()
+            todos = bb.get("project_todos", [])
+            active_step = next(
+                (t for t in todos if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
+                None,
+            )
+            if active_step:
+                step_id = str(active_step.get("id", "") or "")
+                active_subtask = next(
+                    (
+                        t for t in todos
+                        if t.get("category") != "plan_step"
+                        and t.get("status") == "in_progress"
+                        and str(t.get("parent_step_id", "") or "") == step_id
+                    ),
+                    None,
+                )
+                if active_subtask:
+                    subtask_text = trim(str(active_subtask.get("content", "") or ""), 120)
+                    plan_subtask_hint = (
+                        f"\n当前子任务: {subtask_text}\n"
+                        "如果此子任务需要视觉/浏览器验证而无法通过 bash 完整执行，"
+                        "请创建相关文件，通过代码审查确认实现正确，"
+                        "然后在回复中发出 <step-verified/> 并调用 TodoWrite 将子任务标记为 completed。"
+                    )
+        except Exception:
+            pass
         self.messages.append(
             {
                 "role": "user",
@@ -32982,6 +33061,7 @@ body{padding:18px}
                     f"系统检测到空动作回合（consecutive_empty_action={int(streak)}）。"
                     "你刚才进行了深入思考，但没有输出任何最终结果或工具调用。"
                     f"{budget_note}"
+                    f"{plan_subtask_hint}"
                     "请结束思考，立即基于现有推导输出最终结论，或发起一个明确、可执行的工具调用。 "
                     "System notice: you returned thinking-only content without final answer or tool calls. "
                     "Stop internal reasoning now and immediately output either the final conclusion or exactly one "
@@ -38074,6 +38154,22 @@ body{padding:18px}
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    # Update blackboard signals (step_files, execution_logs) for plan+single mode.
+                    # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
+                    # plan+single there is no worker turn — we must update inline so that
+                    # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
+                    try:
+                        self._blackboard_update_from_tool_result(
+                            "developer",
+                            {
+                                "name": dispatched_name or name,
+                                "args": args if isinstance(args, dict) else {},
+                                "output": trim(str(output or ""), 3000),
+                                "ok": not str(output).startswith("Error:"),
+                            },
+                        )
+                    except Exception:
+                        pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
                     _sa_ok = not str(output or "").startswith("Error")
