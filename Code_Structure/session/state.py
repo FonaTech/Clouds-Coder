@@ -113,8 +113,8 @@ class SessionState:
         self.meta_path = self.root / "meta.json"
         self.state_path = self.root / "state.json"
         self.crypto = crypto
-        # Session methods can emit events while already holding this lock.
-        # Use re-entrant lock to avoid self-deadlock.
+        # Session methods may emit events while already holding this lock.
+        # Use a re-entrant lock to avoid self-deadlock during nested callbacks.
         self.lock = threading.RLock()
         self.owner_user_id = str(owner_user_id or "")
         self.upload_callback = upload_callback
@@ -1169,13 +1169,8 @@ class SessionState:
                     self.active_profile_id = self._sanitize_profile_id(active)
                 self.todo.items = raw.get("todos", [])
                 self.thinking = False
-                self.context_token_upper_bound = int(
-                    raw.get("context_token_upper_bound", self.context_token_upper_bound)
-                )
-                self.context_token_upper_bound = max(
-                    MIN_CONTEXT_TOKEN_LIMIT,
-                    min(self.max_context_token_limit, self.context_token_upper_bound),
-                )
+                # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
+                # It will be reset to max after load (see below). Only exception: context_limit_locked.
                 self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
                 self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
                 ids = raw.get("truncation_rescue_task_ids", [])
@@ -1374,6 +1369,13 @@ class SessionState:
                         if isinstance(row, dict):
                             clean_am.append(dict(row))
                     self.agent_messages = clean_am[-800:]
+                # Align agent_messages to initial tier limit immediately after load.
+                # Prevents a stale 800-row list from inflating the first token estimate
+                # and triggering unnecessary Tier2/3 compression on reconnect.
+                _init_tier = self._context_compression_tier()
+                _init_am_limit = self._tier_agent_context_limits(_init_tier)["agent_messages"]
+                if len(self.agent_messages) > _init_am_limit:
+                    self.agent_messages = self.agent_messages[-_init_am_limit:]
                 raw_blackboard = raw.get("blackboard", {})
                 self.blackboard = self._normalize_blackboard(raw_blackboard)
                 raw_bus = raw.get("agent_bus_messages", [])
@@ -1412,6 +1414,10 @@ class SessionState:
         if not self.model_profiles:
             self._init_llm_profiles({})
         if self.context_limit_locked:
+            self.context_token_upper_bound = self.max_context_token_limit
+        else:
+            # Always reset to max on load — upper_bound is a runtime probe, not a persisted config.
+            # Stale compressed values from a previous session cause spurious high-tier compression on reconnect.
             self.context_token_upper_bound = self.max_context_token_limit
         # Ensure previous-run volatile state and control-hint artifacts are cleared on load.
         self._reset_runtime_state_locked(purge_runtime_hints=True)
@@ -1455,7 +1461,6 @@ class SessionState:
             "skill_load_cache": self.skill_load_cache,
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
-            "context_token_upper_bound": self.context_token_upper_bound,
             "context_limit_locked": bool(self.context_limit_locked),
             "truncation_count": self.truncation_count,
             "last_truncation_ts": self.last_truncation_ts,
@@ -2900,6 +2905,30 @@ class SessionState:
             f"Skills:\n{self.skills.descriptions()}"
         )
 
+    def _char_token_divisor(self, text: str) -> float:
+        """Return chars-per-token divisor adjusted for CJK character density.
+
+        ASCII  : ~4 chars/token  (divisor 4.0)
+        Mixed  : ~3 chars/token  (divisor 3.0, >20% CJK)
+        CJK-heavy: ~2.5 chars/token (divisor 2.5, >50% CJK)
+        Using // 4 for CJK-heavy content underestimates tokens by 30-50%.
+        """
+        if not text:
+            return 4.0
+        sample = text[:2000]
+        cjk = sum(
+            1 for c in sample
+            if "\u4e00" <= c <= "\u9fff"
+            or "\u3040" <= c <= "\u30ff"
+            or "\uac00" <= c <= "\ud7af"
+        )
+        ratio = cjk / max(1, len(sample))
+        if ratio > 0.5:
+            return 2.5
+        if ratio > 0.2:
+            return 3.0
+        return 4.0
+
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
         if self._is_multi_agent_mode():
@@ -2910,18 +2939,22 @@ class SessionState:
             for role in (self.runtime_participants or AGENT_ROLES):
                 ctx = self._agent_context(role)
                 if ctx:
-                    cost = len(json_dumps(ctx)) // 4
+                    raw = json_dumps(ctx)
+                    cost = int(len(raw) / self._char_token_divisor(raw))
                     if cost > agent_max:
                         agent_max = cost
-            msg_tokens = max(agent_max, len(json_dumps(self.messages)) // 4)
+            msg_raw = json_dumps(self.messages)
+            msg_tokens = max(agent_max, int(len(msg_raw) / self._char_token_divisor(msg_raw)))
         else:
-            msg_tokens = len(json_dumps(self.messages)) // 4
+            msg_raw = json_dumps(self.messages)
+            msg_tokens = int(len(msg_raw) / self._char_token_divisor(msg_raw))
         # Overhead: system prompt + tools (always present in API calls)
         try:
-            sys_tokens = len(self._system_prompt()) // 4
+            sys_text = self._system_prompt()
+            sys_tokens = int(len(sys_text) / self._char_token_divisor(sys_text))
         except Exception:
             sys_tokens = 300
-        tools_tokens = len(json_dumps(TOOLS)) // 4 if TOOLS else 0
+        tools_tokens = int(len(json_dumps(TOOLS)) / 4) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
@@ -3874,11 +3907,13 @@ class SessionState:
 
     def _estimate_messages_tokens(self, rows: list[dict]) -> int:
         try:
-            return len(json_dumps(rows)) // 4
+            raw = json_dumps(rows)
+            return int(len(raw) / self._char_token_divisor(raw))
         except Exception:
             total = 0
             for row in rows:
-                total += len(str(row.get("content", ""))) // 4
+                c = str(row.get("content", ""))
+                total += int(len(c) / self._char_token_divisor(c))
             return total
 
     def _select_compact_tail(self, token_budget: int, min_count: int = 4, max_count: int = 48) -> list[dict]:
@@ -3934,7 +3969,7 @@ class SessionState:
         self.context_archives = self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
         return seg
 
-    # --- File buffer methods (修改 7) ---
+    # --- File buffer methods: offload oversized outputs into stable session files ---
 
     def _write_file_buffer_entry(self, content: str, label: str = "") -> dict:
         """Write large content to disk and return entry metadata."""
@@ -4401,7 +4436,7 @@ class SessionState:
         current_tokens = 0
         for priority, idx, msg in scored:
             content = str(msg.get("content", "") or "")
-            msg_tokens = max(1, len(content) // 4)
+            msg_tokens = max(1, int(len(content) / self._char_token_divisor(content)))
             if priority >= 7:
                 # High priority: keep intact
                 kept.append((idx, dict(msg)))
@@ -4413,7 +4448,8 @@ class SessionState:
                     role = msg.get("role", "tool")
                     compressed["content"] = trim(content, 500) + " [compressed]"
                 kept.append((idx, compressed))
-                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+                cc = str(compressed.get("content", ""))
+                current_tokens += max(1, int(len(cc) / self._char_token_divisor(cc)))
             else:
                 # Low priority: one-liner summary if over budget
                 if current_tokens > target_tokens * 0.8:
@@ -4426,7 +4462,8 @@ class SessionState:
                 elif len(content) > 200:
                     compressed["content"] = trim(content, 200) + " [truncated]"
                 kept.append((idx, compressed))
-                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+                cc = str(compressed.get("content", ""))
+                current_tokens += max(1, int(len(cc) / self._char_token_divisor(cc)))
             if current_tokens > target_tokens:
                 break
         # Re-sort by original index to maintain conversation order
@@ -4495,7 +4532,11 @@ class SessionState:
         if self._estimate_messages_tokens(tail) > target_tokens:
             compact_note_msg = tail[-1]  # preserve the compact-resume note
             tail_without_note = tail[:-1]
-            compressed_tail = self._priority_compress_messages(tail_without_note, target_tokens, tier)
+            # Reserve budget for the compact-resume note itself (STATE_HANDOFF + summary can be large)
+            note_content = str(compact_note_msg.get("content", "") or "")
+            note_token_reserve = max(200, int(len(note_content) / self._char_token_divisor(note_content)) + 100)
+            effective_target = max(2000, target_tokens - note_token_reserve)
+            compressed_tail = self._priority_compress_messages(tail_without_note, effective_target, tier)
             compressed_tail.append(compact_note_msg)
             tail = compressed_tail
         # Final safety: if still over budget, trim from front
@@ -6648,8 +6689,8 @@ body{padding:18px}
         raw = Path(str(filename or "upload.bin")).name
         # Only remove characters that are genuinely illegal or dangerous on
         # filesystems (path separators, null byte, control chars, Windows
-        # reserved chars). Unicode letters/CJK/etc. are left untouched so
-        # filenames like "我的数据.xlsx" remain readable.
+        # reserved chars). Unicode letters are left untouched so localized
+        # filenames remain readable.
         safe = re.sub(r'[/\\\x00-\x1f\x7f:*?"<>|]', "_", raw)
         safe = safe.strip(". ")  # avoid hidden files (leading dot) and trailing issues
         # Enforce a byte-length ceiling safe across all filesystems (255 bytes max).
@@ -6673,7 +6714,7 @@ body{padding:18px}
         return data.decode("latin-1", errors="ignore")
 
     def _extract_pdf_text(self, pdf_path: Path) -> str:
-        # 优先使用 pdfminer.six（纯 Python，无外部依赖）
+        # Prefer pdfminer.six first because it is pure Python and self-contained.
         try:
             from pdfminer.high_level import extract_text
             text = extract_text(str(pdf_path))
@@ -6683,7 +6724,7 @@ body{padding:18px}
             pass
         except Exception:
             pass
-        # 降级：pdftotext CLI
+        # Fallback to the pdftotext CLI when available.
         tool = shutil.which("pdftotext")
         if tool:
             try:
@@ -6697,7 +6738,7 @@ body{padding:18px}
                     return r.stdout.strip()
             except Exception:
                 pass
-        # 最终降级：regex 提取
+        # Final fallback: approximate text recovery from PDF string literals.
         try:
             raw = pdf_path.read_bytes()
             text = raw.decode("latin-1", errors="ignore")
@@ -7135,7 +7176,7 @@ body{padding:18px}
             ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
             # Fortran
             ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
-            # 更多语言
+            # Additional text-like source formats
             ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
             ".asm", ".s",
             ".bas", ".vb", ".vbs", ".vba",
@@ -7521,7 +7562,7 @@ body{padding:18px}
             "修正完了",
             "以上です",
             "作成しました",
-            # 明确表示拒绝/无法完成也应视为终结
+            # Explicit refusal or inability to proceed also counts as terminal wording.
             "抱歉",
             "sorry",
             "无法",
@@ -7650,7 +7691,7 @@ body{padding:18px}
             "以上です",
             "作成しました",
             "準備できました",
-            # 明确表示无法完成的标记
+            # Explicit inability markers: treat these as "cannot complete" signals.
             "抱歉，我无法",
             "无法直接获取",
             "无法完成",
@@ -8414,25 +8455,25 @@ body{padding:18px}
         if len(t) >= 120:
             return True
         markers = [
-            # 工程/开发
+            # Engineering / development
             "实现", "修复", "重构", "设计", "构建", "架构", "内核", "框架",
             "死循环", "状态机", "调度", "后端", "前端", "自动化",
             "agentbus", "watchdog", "decomposition", "workflow",
             "architecture", "build", "implement", "refactor", "fix", "debug",
             "multi-step",
-            # 文档/演示/设计制作
+            # Documents / presentations / design deliverables
             "ppt", "pptx", "演示文稿", "幻灯片", "presentation",
             "生成报告", "制作", "做一个",
             "excel", "xlsx", "电子表格", "docx", "word",
             "pdf", "可视化", "visualization", "dashboard",
             "svg", "canvas", "动画", "animation",
-            # 全栈/部署
+            # Full-stack / deployment
             "api", "server", "数据库", "database", "部署", "deploy",
             "docker", "mcp", "agent", "bot", "爬虫", "crawler",
             "测试", "test", "playwright",
-            # 品牌/内容
+            # Brand / content
             "品牌", "brand", "theme", "gif",
-            # 通用复杂任务动词
+            # Generic high-complexity task verbs
             "分析并", "总结并", "对比", "深度",
         ]
         return any(x in t for x in markers)
@@ -8506,29 +8547,29 @@ body{padding:18px}
         nontrivial = self._looks_nontrivial_request(clean) or task_complexity_at_least(llm_complexity, "moderate")
         direct_question = self._looks_like_direct_question_request(clean) and (not task_complexity_at_least(llm_complexity, "moderate"))
         code_markers = [
-            # 代码/编程
+            # Coding / programming
             "代码", "寫代碼", "写代码", "脚本", "模块", "函数", "class", "bug",
             "修复", "实现", "重构", "app.py", "crawler.py",
             ".py", ".js", ".ts", ".html", ".css", ".vue", ".jsx", ".tsx",
             "python", "javascript", "bash", "terminal", "tool", "patch", "edit",
             "write_file", "read_file", "build", "implement", "fix", "refactor", "debug",
-            # 文档/演示生成（需要 skill 支撑）
+            # Document / presentation generation, usually skill-backed
             "ppt", "pptx", "演示文稿", "幻灯片", "presentation", "slide",
             "生成ppt", "制作ppt", "做ppt", "做一个ppt",
             "excel", "xlsx", "电子表格", "spreadsheet", "表格",
             "docx", "word", "文档", "document", "报告", "report",
             "pdf", "生成pdf", "制作pdf",
-            # 设计/前端/可视化
+            # Design / frontend / visualization
             "html报告", "可视化", "visualization", "图表", "chart", "dashboard",
             "前端", "frontend", "ui", "界面", "landing page", "网页", "页面",
             "svg", "canvas", "动画", "animation", "设计",
-            # 工程/架构
+            # Systems / architecture
             "api", "server", "服务", "数据库", "database", "部署", "deploy",
             "docker", "容器", "微服务", "microservice", "架构",
             "mcp", "agent", "bot", "爬虫", "crawler", "scraper",
-            # 测试
+            # Testing
             "测试", "test", "单元测试", "集成测试", "playwright", "selenium",
-            # 品牌/内容
+            # Brand / content
             "品牌", "brand", "logo", "主题", "theme",
             "gif", "图片", "image", "插画",
         ]
@@ -10141,7 +10182,7 @@ body{padding:18px}
         first_line = old_text.strip().splitlines()[0].strip() if old_text.strip() else ""
         if not first_line:
             return "The old_text is empty or whitespace-only."
-        # 搜索 old_text 的第一行在文件中的位置
+        # Locate the first line of old_text inside the current file content.
         matches = []
         for i, line in enumerate(lines, 1):
             if first_line in line:
@@ -10154,7 +10195,7 @@ body{padding:18px}
                 f"Likely cause: whitespace or indentation mismatch. "
                 f"Tip: use read_file to get the exact content, then copy it precisely."
             )
-        # 尝试空白规范化匹配
+        # Retry with whitespace-normalized matching before failing the edit.
         norm_first = " ".join(first_line.split())
         for i, line in enumerate(lines, 1):
             norm_line = " ".join(line.split())
@@ -11330,7 +11371,7 @@ body{padding:18px}
         return True
 
     def _watchdog_escalate_to_single_developer(self, board: dict, *, reason: str = ""):
-        """Watchdog 连续 stall 升级：强制降级到 Single+Developer 模式。"""
+        """Escalate repeated watchdog stalls by forcing Single+Developer mode."""
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         self.runtime_execution_mode = EXECUTION_MODE_SINGLE
         self.runtime_participants = ["developer"]
@@ -12117,7 +12158,7 @@ body{padding:18px}
             return ""
         return "FAILURE CONTEXT (from previous attempt):\n" + "\n".join(lines) + "\n"
 
-    # --- Unified error detection helpers (修改 3) ---
+    # --- Unified error detection helpers ---
 
     def _detect_error_category(self, cmd_str: str) -> str | None:
         """Match a command string against ERROR_CATEGORY_DEFS, return first matching category name."""
@@ -12149,7 +12190,7 @@ body{padding:18px}
                     break
         return results
 
-    # --- Unified error record / clear / sync (修改 4) ---
+    # --- Unified error ledger record / clear / sync helpers ---
 
     def _ledger_record_error(self, category: str, file: str, error_msg: str):
         """Record an error into fl['errors'] with category field. Dedup by fingerprint."""
@@ -12215,7 +12256,7 @@ body{padding:18px}
         bb["failure_ledger"] = fl
         self.blackboard = bb
 
-    # --- Thin wrappers for backward compatibility (修改 4d, 4e) ---
+    # --- Thin wrappers kept for backward compatibility ---
 
     def _ledger_record_compile_error(self, file: str, error_msg: str):
         self._ledger_record_error("compilation", file, error_msg)
@@ -12223,11 +12264,12 @@ body{padding:18px}
     def _ledger_clear_compile_errors(self):
         self._ledger_clear_errors("compilation")
 
-    # --- Unified tool result error processing (修改 5) ---
+    # --- Unified tool-result error processing ---
 
     def _process_tool_result_errors(self, name: str, args: dict, output: str, ok: bool, role_key: str):
         """Detect and record errors from tool results, or clear on success."""
-        # --- edit_file 错误处理 ---
+        # Handle edit_file mismatch failures separately because they often need
+        # targeted recovery rather than generic command classification.
         if name == "edit_file" and isinstance(args, dict):
             edit_path = str(args.get("path", "") or "").strip()
             if not ok and "text not found" in str(output or "").lower():
@@ -12245,7 +12287,7 @@ body{padding:18px}
                 self._ledger_update_fix_attempt_status(edit_path, "applied")
             return
 
-        # --- 原有 bash 处理逻辑 ---
+        # For bash results, classify the command and update the shared error ledger.
         if name != "bash" or not isinstance(args, dict):
             return
         cmd_str = str(args.get("command", "") or "").lower()
@@ -12268,7 +12310,7 @@ body{padding:18px}
                     self._deactivate_reviewer_debug_mode("errors resolved")
                 self._ledger_verify_fix_attempts_on_success(category)
 
-    # --- Generalized error context (修改 6) ---
+    # --- Consolidated error-context assembly for recovery prompts ---
 
     def _recent_error_context(self, max_chars: int = 800) -> str:
         """Build context string from all error categories in fl['errors']."""
@@ -12758,7 +12800,7 @@ body{padding:18px}
                 row["activeForm"] = self._ui_text("todo_pending_owner", owner=label, content=text)
         return rows
 
-    # ── Project-based todo generation & status tracking ──────────────
+    # --- Project-level todo generation and status tracking ---
 
     def _generate_project_todos_from_profile(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -12813,7 +12855,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if bb.get("project_todos"):
             return
-        # 如果有已审批的 plan steps，优先用 plan steps 生成 todos
+        # When an approved plan already exists, derive project todos from plan steps first.
         plan = bb.get("plan", {})
         if isinstance(plan, dict) and plan.get("phase") == "executing" and plan.get("steps"):
             plan_todos = self._build_plan_todos_from_steps(plan.get("steps", []), limit=40)
@@ -13197,8 +13239,8 @@ body{padding:18px}
                     evidence=self._ui_text("evidence_review_passed"),
                 )
             elif cat == "plan_step":
-                # Plan steps 不自动完成，由 _advance_plan_step 显式推进
-                # 但如果当前步骤之前的所有步骤都完成了，标记当前步骤为 in_progress
+                # Plan steps are never auto-completed here; only _advance_plan_step
+                # may close them. This block only activates the next eligible step.
                 if todo.get("status") == "pending":
                     step_idx = int(todo.get("plan_step_index", 0) or 0)
                     all_prior_done = all(
@@ -13226,6 +13268,9 @@ body{padding:18px}
         bb["project_todos"] = todos
         self.blackboard = bb
 
+    # --- Step advancement inference ------------------------------------------
+    # Decide whether manager/developer text is valid evidence that the current
+    # plan step has already finished, rather than a forward-looking dispatch.
     def _instruction_implies_step_advance(self, instruction: str, reason: str = "") -> bool:
         """Detect if manager instruction semantically implies current plan step is done."""
         bb = self._ensure_blackboard()
@@ -13241,8 +13286,8 @@ body{padding:18px}
         if not current:
             return False
         text = (str(instruction or "") + " " + str(reason or "")).lower()
-        # Patterns that indicate step completion — only BACKWARD-looking signals
-        # (agent/manager explicitly says a step is done, NOT forward-looking dispatch instructions)
+        # Completion evidence must be backward-looking: the text must state that
+        # the current step already passed or finished.
         step_done_patterns = (
             "审查通过", "通过审查", "已通过", "已完成", "完成了",
             "step completed", "step done", "step passed",
@@ -13250,14 +13295,13 @@ body{padding:18px}
             "步骤 1.1 已完成", "步骤 1.2 已完成", "步骤 1.3 已完成",
             "步骤 1.4 已完成", "步骤 1.5 已完成",
         )
-        # NOTE: intentionally excluded forward-looking dispatch patterns:
-        #   "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "进入下一步", "next step",
-        #   "proceed to step", "进入 step", "开始 step" — these are manager dispatch
-        #   instructions, NOT evidence that the current step was completed.
+        # Forward-looking dispatch phrases are intentionally excluded here.
+        # "start/proceed to step ..." only routes work; it does not prove that
+        # the current step completed successfully.
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
-        # Only advance when an agent explicitly says "进入 Step N" where N > current+1
-        # (skipping ahead), NOT when manager dispatches the very next step.
+        # Only treat "move to step N" as advancement evidence when it skips
+        # beyond the immediate next step; otherwise it is likely normal routing.
         next_step_pattern = re.search(
             r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
@@ -13266,7 +13310,8 @@ body{padding:18px}
             mentioned_step = int(next_step_pattern.group(1))
             if mentioned_step > current_idx + 2:  # must skip at least 2 ahead to be meaningful
                 return True
-        # "完成步骤 1.1，开始 1.2" — only if explicitly marking current step done
+        # Mixed phrases such as "finished current step, start next step" only
+        # count when the completed step index matches the active step exactly.
         step_ref = re.search(r'(?:完成|finished|done)\s*步骤\s*1\.(\d+)', text)
         if step_ref:
             ref_sub = int(step_ref.group(1))
@@ -13305,7 +13350,7 @@ body{padding:18px}
                     pass
         except Exception:
             pass
-        # 推进 cursor，激活下一步
+        # Advance the plan-step cursor and activate the next pending step.
         cursor = int(bb.get("plan_step_cursor", 0) or 0)
         bb["plan_step_cursor"] = cursor + 1
         next_step = None
@@ -13333,8 +13378,8 @@ body{padding:18px}
             self._update_plan_file_step_status()
         except Exception:
             pass  # Plan file update is best-effort
-        # 步骤推进时按 parent_step_id 清除对应步骤的 worker 子任务
-        # 保留 completed 的 worker 项和不属于当前步骤的 worker 项
+        # Clear worker subtasks linked to the completed plan step by parent_step_id.
+        # Keep completed rows and rows that belong to other plan steps.
         completed_step_id = str(current.get("id", "") or "")
         try:
             _snap = self.todo.snapshot()
@@ -14375,6 +14420,9 @@ body{padding:18px}
             merged_rows.append(merged)
         return self.todo.update(preserved_system + passthrough_rows + merged_rows)
 
+    # --- Active-step worker todo reconciliation -------------------------------
+    # Merge worker-submitted subtasks into the active plan step while
+    # preserving canonical identities and preventing duplicate rewrites.
     def _merge_plan_worker_todo_items(self, items: list[dict], role: str = "") -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
@@ -14418,7 +14466,22 @@ body{padding:18px}
                 merged_by_identity[identity] = dict(row)
                 ordered_identities.append(identity)
 
-        incoming_normalized: list[dict] = []
+        # Build a reverse map from normalized core content to canonical
+        # identity so free-text restatements collapse onto existing subtasks.
+        import re as _re_todo
+        _core_to_identity: dict[str, str] = {}
+        for row in target_rows:
+            identity = self._plan_worker_todo_identity(row)
+            if not identity:
+                continue
+            raw_c = normalize_work_text(str(row.get("content", "") or ""))
+            core_c = _re_todo.sub(r"^\d+\.\d+\s+", "", raw_c)  # strip "N.M " prefix
+            core_c = _re_todo.sub(r"\s*\([^)]{0,120}\)\s*$", "", core_c)  # strip " (...)" suffix
+            core_c = _re_todo.sub(r"\s+", " ", core_c.strip().lower())
+            if core_c and len(core_c) >= 4:
+                _core_to_identity.setdefault(core_c, identity)
+
+
         for idx, item in enumerate(items):
             if isinstance(item, str):
                 raw = {"content": item, "status": "pending"}
@@ -14445,6 +14508,16 @@ body{padding:18px}
             identity = self._plan_worker_todo_identity(row)
             if not identity:
                 identity = f"ad-hoc:{len(ordered_identities)}:{trim(str(row.get('content', '') or ''), 80)}"
+            # Allow free-text items to resolve onto numbered substeps when the
+            # normalized core content already exists under a canonical identity.
+            if identity.startswith("text:") and identity not in merged_by_identity:
+                text_core = identity[5:]
+                # Also try without a leading "N.M " numbering prefix
+                stripped_core = _re_todo.sub(r"^\d+\.\d+\s+", "", text_core).strip()
+                for check_core in [text_core, stripped_core]:
+                    if check_core in _core_to_identity:
+                        identity = _core_to_identity[check_core]
+                        break
             merged = dict(merged_by_identity.get(identity, {}))
             if "activeForm" not in row and "active_form" not in row:
                 merged.pop("activeForm", None)
@@ -14678,6 +14751,7 @@ body{padding:18px}
                 f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
                 f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
             )
+            subtasks_exist_ban = ""
         else:
             state_parts: list[str] = []
             if current:
@@ -14692,10 +14766,16 @@ body{padding:18px}
                 f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
             )
             todo_state = "".join(state_parts)
+            # Hard prohibition: model must NOT re-create subtasks when they already exist
+            subtasks_exist_ban = (
+                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
+                "to create new subtasks. Directly execute the in_progress subtask above. "
+            )
         if for_manager:
             return (
                 f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is the authoritative execution path. "
                 f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
+                f"{subtasks_exist_ban}"
                 f"{todo_state}"
                 "Treat existing worker subtasks as live execution state, not optional notes. "
                 "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
@@ -14706,8 +14786,8 @@ body{padding:18px}
         return (
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is authoritative. "
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
+            f"{subtasks_exist_ban}"
             f"{todo_state}"
-            "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
             "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
             "Do not wait until the end of the step to update todos. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
@@ -15209,7 +15289,8 @@ body{padding:18px}
                     first_line = pc.split("\n")[0].strip()
                     if first_line:
                         plan_content_set.add(first_line)
-            # Build stripped-prefix set for fuzzy matching ("步骤 1：XXX" → "XXX")
+            # Remove numbering prefixes before fuzzy comparison so step titles
+            # still match when one side includes "Step N:" and the other does not.
             _num_prefix_re = _re_dedup.compile(r"^(?:步骤\s*\d+[：:]\s*|\d+\.\s*|step\s*\d+[：:]\s*)", _re_dedup.IGNORECASE)
             plan_stripped_set = set()
             for sr in trimmed_system:
@@ -16102,14 +16183,15 @@ body{padding:18px}
         self.runtime_direct_objective = objective
         self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
         self.runtime_reclassify_required = False
-        # Plan mode 判定（用户偏好 > 规则兜底 > LLM 语义）
+        # Decide plan mode with a strict precedence chain:
+        # user preference > policy defaults > LLM semantic hint.
         raw_requires_plan = bool(decision.get("requires_plan", False))
         user_pref = str(self.plan_mode_user_preference or "auto").lower()
         if user_pref == "off":
             requires_plan = False
         elif user_pref == "on":
             requires_plan = True
-        else:  # auto — 保持原逻辑
+        else:  # auto: follow the normal policy/LLM decision path
             if level in PLAN_MODE_FORCED_LEVELS:
                 requires_plan = True
             elif level in PLAN_MODE_ENABLED_LEVELS:
@@ -16195,7 +16277,7 @@ body{padding:18px}
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
-        # ── Build skills context ──
+        # Build the current skills context for the manager prompt.
         skills_ctx = ""
         try:
             loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
@@ -16213,7 +16295,7 @@ body{padding:18px}
                 )
         except Exception:
             pass
-        # ── Build dimension hint from pre-screen ──
+        # Build the dimension-hint block from the cached complexity pre-screen.
         dims_ctx = ""
         try:
             dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
@@ -16624,7 +16706,7 @@ body{padding:18px}
         todos = bb.get("project_todos", [])
         if not todos:
             return ""
-        # plan step 模式
+        # Plan-step mode: the manager reasons over ordered plan steps instead of generic todos.
         has_plan_steps = any(t.get("category") == "plan_step" for t in todos)
         if has_plan_steps:
             completed = [t for t in todos if t.get("category") == "plan_step" and t.get("status") == "completed"]
@@ -16635,11 +16717,11 @@ body{padding:18px}
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
             step_content_low = str(cur.get("content", "") or "").lower()
-            # ── Build blackboard evidence for step completion detection ──
+            # Summarize blackboard evidence that may justify step completion.
             research_count = len(bb.get("research_notes", []) or [])
             code_count = len(bb.get("code_artifacts", {}) or {})
             exec_count = len(bb.get("execution_logs", []) or [])
-            # ── Worker todo snapshot: show manager what workers wrote ──
+            # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
                 worker_todos = [
@@ -16676,7 +16758,7 @@ body{padding:18px}
                         )
             except Exception:
                 pass
-            # ── Blackboard-evidence-based completion hint ──
+            # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
             is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "提取", "read", "analyze", "extract", "research", "summarize", "总结"))
             is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
@@ -16711,7 +16793,7 @@ body{padding:18px}
                 f"{worker_hint}"
                 f"{bb_evidence_hint}"
             )
-        # 原有逻辑
+        # Generic project-todo mode when no plan-step structure is active.
         pending = [t for t in todos if t.get("status") != "completed"]
         if not pending:
             return "All project tasks completed. Route to finish. "
@@ -17106,7 +17188,7 @@ body{padding:18px}
                 "reason": "simple-qa-direct-answer",
                 "source": "fallback",
             }
-        # ── 通用 endpoint 检测：非 simple_qa 的 developer 结论性回复也能触发 finish ──
+        # General endpoint detection: non-simple_qa developer conclusions may also finish the run.
         if task_type != "simple_qa":
             dev_text = self._latest_agent_assistant_text("developer")
             if dev_text:
@@ -17118,7 +17200,7 @@ body{padding:18px}
                         "reason": "general-endpoint-detected",
                         "source": "fallback",
                     }
-        # 通用检查：如果最近的 assistant 消息是结论性回复，且没有待办事项，直接 finish
+        # General guard: if the latest agent reply is conclusive and no todos remain, finish immediately.
         if not has_error_log:
             for _role in ("developer", "explorer", "reviewer"):
                 _last = self._latest_agent_assistant_text(_role)
@@ -17429,7 +17511,7 @@ body{padding:18px}
                     participants[-1] = target
             else:
                 target = participants[0]
-        # ── Single 模式硬约束：无论 executor_mode_flag 如何，只允许 assigned_expert ──
+        # Single-mode hard rule: regardless of executor_mode_flag, only assigned_expert may act.
         if mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
             if target in AGENT_ROLES and target != assigned_expert:
@@ -17488,7 +17570,7 @@ body{padding:18px}
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
-        # ── 结论性回复截断：当 Agent 已回复结论且无待办/无错误时，强制 finish ──
+        # Conclusive-reply cut-off: if the agent already concluded with no open work or errors, force finish.
         if target in AGENT_ROLES and target != "finish":
             for _check_role in ("developer", "explorer", "reviewer"):
                 _last_text = self._latest_agent_assistant_text(_check_role)
@@ -19184,6 +19266,15 @@ body{padding:18px}
         if "ts" not in row:
             row["ts"] = now_ts()
         # Write to unified agent_messages with tier-aware trim
+        # Skip exact duplicates from the last 6 same-role messages (e.g. user re-submits after interrupt)
+        content = str(row.get("content", "") or "")
+        if content and len(content) > 30:
+            same_role_recent = [
+                m for m in self.agent_messages[-6:]
+                if m.get("role") == row.get("role") and m.get("agent_role") == row.get("agent_role")
+            ]
+            if any(str(m.get("content", "") or "") == content for m in same_role_recent):
+                return row  # skip exact duplicate
         self.agent_messages.append(row)
         tier = self._context_compression_tier()
         am_limit = self._tier_agent_context_limits(tier)["agent_messages"]
@@ -20409,6 +20500,16 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
+            raw_content = args.get("content", "")
+            if not isinstance(raw_content, str):
+                import json as _json
+                try:
+                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
+                except Exception:
+                    raw_content = str(raw_content)
+            args = dict(args)
+            args["content"] = raw_content
             existed = fp.exists()
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
@@ -22001,7 +22102,8 @@ body{padding:18px}
                             target_roles=(role,),
                             summary=f"plan+sync todo reminder injected ({role})",
                         )
-            # ── Agent turn 结束后的终止检测：结论性回复 + 无待办 + 无错误 → 自动 finish ──
+            # End-of-turn finish guard:
+            # conclusive reply + no open todos + no known errors => auto-finish.
             agent_text = self._latest_agent_assistant_text(role)
             if (
                 agent_text
@@ -22267,11 +22369,11 @@ body{padding:18px}
             self._mark_all_done_silently(f"budget exhausted: {summary}")
             self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
 
-    # ── Plan Mode Methods ──
+    # --- Plan-mode orchestration methods ---
 
     def _plan_mode_worker(self, pinned_selection: str):
-        """Plan mode: explorer 调研 → manager 综合 → emit 方案 → 等待用户选择"""
-        # Phase 1: Explorer 调研
+        """Plan mode pipeline: explorer research -> manager synthesis -> proposal -> user choice."""
+        # Phase 1: explorer-led research and evidence gathering
         self._emit("status", {"summary": "plan-mode: research phase started"})
         bb = self._ensure_blackboard()
         bb["status"] = "PLANNING"
@@ -22296,7 +22398,7 @@ body{padding:18px}
                 break
             self._plan_mode_update_findings(step)
 
-        # Phase 2: Manager 综合分析
+        # Phase 2: manager synthesis of structured executable options
         # Inject pending user inputs before synthesis
         self._inject_pending_user_inputs()
         # Check if user sent a substantive goal change during research
@@ -22332,7 +22434,7 @@ body{padding:18px}
             self.runtime_plan_approved = True
             return
 
-        # Synthesis Step 1: 立即写 plan.md（与 synthesis 思维连续，避免信息丢失）
+        # Synthesis step 1: write plan.md immediately so proposal structure is persisted.
         self.runtime_plan_proposal = proposal
         try:
             self._write_plan_file(self._format_plan_file_preselection(proposal))
@@ -22340,7 +22442,7 @@ body{padding:18px}
             pass
         self._emit("status", {"summary": "plan-mode: plan.md written"})
 
-        # Synthesis Step 2: 更新 blackboard + 生成精简 bubble
+        # Synthesis step 2: update blackboard state and prepare the compact proposal bubble.
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
             bb["plan"] = {"phase": "awaiting_choice", "findings": []}
@@ -22348,7 +22450,7 @@ body{padding:18px}
         bb["plan"]["proposal"] = proposal
         self.blackboard = bb
 
-        # Phase 3: Emit bubble 到前端（纯输出，不做额外思考）
+        # Phase 3: emit the proposal bubble to the frontend without extra reasoning.
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -23827,6 +23929,9 @@ body{padding:18px}
             return best_reverse_id
         return ""
 
+    # --- Plan choice parsing --------------------------------------------------
+    # Resolve user replies against proposal options using explicit IDs, ordinal
+    # picks, title aliases, and soft confirmation language.
     def _parse_plan_choice(self, text: str, proposal: dict) -> str:
         if not text or not proposal:
             return ""
@@ -23839,14 +23944,14 @@ body{padding:18px}
         # Direct ID match: "A", "B", "C"
         if low.upper() in option_ids:
             return low.upper()
-        # "方案A", "方案 A", "option A"
+        # Match localized "plan/option X" style replies.
         import re
         m = re.search(r'(?:方案|選項|选项|option|案|プラン)\s*([a-zA-Z0-9])', low, re.IGNORECASE)
         if m:
             candidate = m.group(1).upper()
             if candidate in option_ids:
                 return candidate
-        # "选1", "第1个", "第一个"
+        # Match localized ordinal replies such as "choose 1" or "the first one".
         num_map = {"一": "1", "二": "2", "三": "3", "1": "1", "2": "2", "3": "3"}
         m2 = re.search(r'(?:选|選|第|choose|pick)\s*([一二三1-3])', low, re.IGNORECASE)
         if m2:
@@ -23859,7 +23964,8 @@ body{padding:18px}
         semantic = self._match_plan_choice_by_title(text, [o for o in options if isinstance(o, dict)])
         if semantic:
             return semantic
-        # "继续"/"确认"/"推荐" → pick recommended
+        # Soft confirmation without an explicit option falls back to the
+        # proposal's recommended choice when present.
         recommended = str(proposal.get("recommended", "") or "").strip()
         confirm_tokens = (
             "继续", "繼續", "确认", "確認", "推荐", "推薦", "推荐方案", "推薦方案",
@@ -24072,8 +24178,8 @@ body{padding:18px}
                 bb["plan_step_total"] = len(plan_todos)
                 self.blackboard = bb
                 self._blackboard_touch()
-                # 同步到 UI todo — 使用 bb:proj: 键，与 _todo_project_rows_from_blackboard 保持一致
-                # 避免后续 _sync_todos_from_blackboard 把这些 items 误认为 worker_rows 造成重复
+                # Sync plan todos into the UI using bb:proj: keys so later todo-sync
+                # passes do not misclassify them as worker rows and duplicate them.
                 try:
                     self.todo.update([
                         {
@@ -24217,7 +24323,7 @@ body{padding:18px}
                     raise
             except Exception:
                 pass
-            # ── Plan Mode 检查 ──
+            # Plan-mode check before entering the main execution loop.
             if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
                 self._plan_mode_worker(pinned_selection=pinned_selection)
                 return
@@ -24787,7 +24893,7 @@ body{padding:18px}
                                 },
                             )
                             continue
-                    # 对简单查询（非工程任务）限制自动继续预算
+                    # Cap auto-continue budget for lightweight non-engineering questions.
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (

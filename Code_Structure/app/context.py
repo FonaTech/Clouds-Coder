@@ -12,12 +12,12 @@ from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
+from ..config.constants import AGENT_MAX_OUTPUT_TOKENS, APP_CSS, APP_JS, APP_TS, ARBITER_DEFAULT_MAX_TOKENS, ARBITER_DEFAULT_TEMPERATURE, ARBITER_DEFAULT_TIMEOUT_SECONDS, CODE_ADMIN_CSS, CODE_ADMIN_INDEX_HTML, CODE_ADMIN_JS, CODE_IMPORT_WORKER_COUNT, CODE_LIBRARY_DIRNAME, CODE_PARSE_TIMEOUT_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, DEFAULT_UI_LANGUAGE, DEFAULT_UI_STYLE, DEFAULT_WEB_UI_DIR, EXECUTION_MODE_SYNC, INDEX_HTML, MAX_AGENT_ROUNDS, MAX_AGENT_ROUNDS_CAP, MAX_RUN_SECONDS, MAX_RUN_TIMEOUT_SECONDS, MAX_SHELL_COMMAND_TIMEOUT_SECONDS, MIN_AGENT_ROUNDS, MIN_CONTEXT_TOKEN_LIMIT, MIN_RUN_TIMEOUT_SECONDS, MIN_SHELL_COMMAND_TIMEOUT_SECONDS, RAG_ADMIN_CSS, RAG_ADMIN_INDEX_HTML, RAG_ADMIN_JS, RAG_GRAPH_MAX_NODES, RAG_IMPORT_WORKER_COUNT, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_LIBRARY_DIRNAME, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_IMPORT_BATCH_BYTES, RAG_MAX_IMPORT_BATCH_ITEMS, RAG_MAX_IMPORT_FILES, RAG_MAX_QUERY_RESULTS, RAG_MIN_SYNTHESIS_SCORE, RAG_NO_EVIDENCE_THRESHOLD, RAG_PARSE_TIMEOUT_SECONDS, RAG_QUERY_CONTEXT_CHARS, SKILLS_APP_JS, SKILLS_EXTRA_CSS, SKILLS_INDEX_HTML, SKILL_REFRESH_MIN_INTERVAL_SECONDS, TOKEN_THRESHOLD, WEB_UI_OPTIONAL_FILES, WEB_UI_REQUIRED_FILES
 from ..config.paths import LLM_CONFIG_PATH, REPO_ROOT, _migrate_legacy_runtime_roots
 from ..config.settings import default_multimodal_capabilities, infer_model_multimodal_capabilities, merge_multimodal_capabilities, model_language_instruction, normalize_execution_mode, normalize_ui_language, normalize_ui_style, parse_capability_overrides, parse_llm_config_profiles, resolve_optional_file_path, resolve_web_ui_dir_path
 from ..llm.client import OllamaClient
-from ..llm.utils import extract_base_url
-from ..rag.ingestion import CodeIngestionService, RAGIngestionService
+from ..llm.utils import extract_base_url, list_ollama_models_cached
+from ..rag.ingestion import CodeIngestionService, RAGIngestionService, _rag_embed_batch, _rag_embed_text
 from ..rag.parsers import CodeContentParser, RAGContentParser
 from ..rag.store import CodeLibraryStore, RAGLibraryStore
 from ..session.manager import SessionCreationLimitExceeded, SessionManager
@@ -477,7 +477,7 @@ class AppContext:
             return mgr.get(sid)
         return self._latest_session_for_user(user_id)
 
-    # --- File classification constants for auto-routing ---
+    # File classification constants used by upload auto-routing.
     _CODE_EXTS = frozenset({
         ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c", ".cpp",
         ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".scala", ".lua",
@@ -604,7 +604,26 @@ class AppContext:
                 "strict_local_import": True,
                 "filename_entities": bool(self.rag_include_filename_entities),
             },
+            "embedding_models": self._get_embedding_models(session),
+            "default_embed_model": self._get_default_embed_model(session),
         }
+
+    def _get_embedding_models(self, session: object) -> list[str]:
+        """Return list of available ollama models for use as embedding models."""
+        try:
+            ollama_obj = getattr(session, "ollama", None) if session else None
+            base_url = str(getattr(ollama_obj, "base_url", "") or "http://127.0.0.1:11434").rstrip("/")
+            return list_ollama_models_cached(base_url, ttl_seconds=60)
+        except Exception:
+            return []
+
+    def _get_default_embed_model(self, session: object) -> str:
+        """Return the current default embedding model for the session."""
+        try:
+            ollama_obj = getattr(session, "ollama", None) if session else None
+            return str(getattr(ollama_obj, "embed_model", "") or "").strip()
+        except Exception:
+            return ""
 
     def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
         return self.rag_store.library_payload(limit=limit, offset=offset)
@@ -662,6 +681,62 @@ class AppContext:
             "session_id": str(getattr(session, "id", "") or ""),
         }
 
+    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+        """Embed up to max_chunks RAG chunks that don't yet have embeddings.
+
+        Called lazily on the first query when an embedding model is available.
+        Returns the number of embeddings successfully generated.
+        """
+        with self.rag_store.lock:
+            all_chunks = dict(self.rag_store.chunks)
+        already_embedded = set(self.rag_store.index.chunk_embeddings.keys())
+        to_embed = [cid for cid in all_chunks if cid not in already_embedded]
+        if not to_embed:
+            return 0
+        # Prioritise most recently added chunks; embed up to max_chunks
+        to_embed = to_embed[-max_chunks:]
+        texts = [str(all_chunks[cid].get("text", "") or "")[:2048] for cid in to_embed]
+        vecs = _rag_embed_batch(texts, session)
+        count = 0
+        for cid, vec in zip(to_embed, vecs):
+            if vec:
+                self.rag_store.index.set_chunk_embedding(cid, vec)
+                count += 1
+        if count:
+            try:
+                self.rag_store._persist_embeddings()
+            except Exception:
+                pass
+        return count
+
+    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+        """Embed up to max_chunks Code Library chunks that don't yet have embeddings."""
+        with self.code_store.lock:
+            all_chunks = dict(self.code_store.chunks)
+        already_embedded = set(self.code_store.index.chunk_embeddings.keys())
+        to_embed = [cid for cid in all_chunks if cid not in already_embedded]
+        if not to_embed:
+            return 0
+        to_embed = to_embed[-max_chunks:]
+        anchor_text = lambda cid: (
+            str(all_chunks[cid].get("anchor", "") or "")
+            + "\n"
+            + str(all_chunks[cid].get("text", "") or "")
+        )[:2048]
+        texts = [anchor_text(cid) for cid in to_embed]
+        vecs = _rag_embed_batch(texts, session)
+        count = 0
+        for cid, vec in zip(to_embed, vecs):
+            if vec:
+                self.code_store.index.set_chunk_embedding(cid, vec)
+                count += 1
+        if count:
+            try:
+                self.code_store._persist_embeddings()
+            except Exception:
+                pass
+        return count
+
     def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
         if not isinstance(session, SessionState) or not rows:
             return ""
@@ -672,16 +747,30 @@ class AppContext:
         ]
         if not evidence_rows:
             evidence_rows = list(rows)
+
+        # Confidence filtering — drop weak evidence before LLM synthesis
+        best_score = max((float(r.get("score", 0.0) or 0.0) for r in evidence_rows), default=0.0)
+        if best_score < RAG_NO_EVIDENCE_THRESHOLD:
+            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+        qualified = [r for r in evidence_rows if float(r.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE]
+        if not qualified:
+            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+
         evidence = []
-        for idx, row in enumerate(evidence_rows[:5], 1):
+        for idx, row in enumerate(qualified[:5], 1):
+            score_pct = int(min(99, float(row.get("score", 0.0) or 0.0) * 100))
             evidence.append(
-                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')}\n"
+                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
                 f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
             )
         prompt = (
-            "Use the retrieved evidence to answer the query. "
-            "Cite with the provided citation strings exactly as given. "
-            "If evidence is insufficient, say so explicitly.\n\n"
+            "You are a precise knowledge retrieval assistant.\n"
+            "STRICT GROUNDING RULE: ONLY use information explicitly stated in the numbered evidence blocks below. "
+            "For any information NOT present in the evidence, output the word UNKNOWN. "
+            "Do NOT infer, extrapolate, hallucinate, or draw on prior knowledge beyond what is given. "
+            "Cite every factual claim using the provided citation strings exactly as given.\n"
+            "If the evidence is insufficient to answer the query, state exactly: "
+            "'知识库中暂无足够证据回答此问题'\n\n"
             f"Query:\n{query}\n\nEvidence:\n" + "\n\n".join(evidence)
         )
         try:
@@ -706,9 +795,24 @@ class AppContext:
             body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
             or "auto"
         ).strip().lower()
-        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route)
-        synthesize = bool(body.get("synthesize", False))
+        embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Generate query embedding for hybrid dense+sparse retrieval when model is available
+        qvec: list[float] | None = None
+        if isinstance(session, SessionState):
+            # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
+            if not self.rag_store.index.has_dense_index() and self.rag_store.chunks:
+                try:
+                    self._build_rag_embeddings_batch(session, max_chunks=300)
+                except Exception:
+                    pass
+            if self.rag_store.index.has_dense_index():
+                try:
+                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                except Exception:
+                    qvec = None
+        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route, qvec=qvec)
+        synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
@@ -899,6 +1003,8 @@ class AppContext:
                 "strict_local_import": True,
                 "repo_import": True,
             },
+            "embedding_models": self._get_embedding_models(session),
+            "default_embed_model": self._get_default_embed_model(session),
         }
 
     def code_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
@@ -919,7 +1025,22 @@ class AppContext:
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
         route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
         language_filter = str(body.get("language", "") or "").strip().lower()
-        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route)
+        embed_model_override = str(body.get("embed_model", "") or "").strip()
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Dense embedding for code query when available
+        qvec: list[float] | None = None
+        if isinstance(session, SessionState):
+            if not self.code_store.index.has_dense_index() and self.code_store.chunks:
+                try:
+                    self._build_code_embeddings_batch(session, max_chunks=300)
+                except Exception:
+                    pass
+            if self.code_store.index.has_dense_index():
+                try:
+                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                except Exception:
+                    qvec = None
+        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route, qvec=qvec)
         if language_filter:
             filtered = [
                 dict(row)

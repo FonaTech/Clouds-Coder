@@ -27,6 +27,7 @@ class RAGLibraryStore:
         self.chunks_path = self.root / "chunks.json"
         self.tasks_path = self.root / "tasks.json"
         self.index_snapshot_path = self.root / "index_snapshot.json"
+        self.embeddings_path = self.root / "embeddings.json"
         self.backup_root = self.root / "backup"
         self.parsed_root = self.root / "parsed"
         self.assets_root = self.root / "assets"
@@ -49,6 +50,7 @@ class RAGLibraryStore:
         self._load()
         if not self._restore_index_snapshot():
             self.rebuild_index(persist_snapshot=True)
+        self._restore_embeddings()  # Load pre-built dense embeddings if available
 
     def _rel(self, path: Path) -> str:
         target = path.resolve()
@@ -147,6 +149,31 @@ class RAGLibraryStore:
             return self.index.restore(raw.get("index", {}) if isinstance(raw.get("index", {}), dict) else {})
         except Exception:
             return False
+
+    def _persist_embeddings(self) -> None:
+        """Save chunk embeddings to embeddings.json alongside the index snapshot."""
+        if not self.index.chunk_embeddings:
+            return
+        payload = {str(cid): [float(x) for x in vec] for cid, vec in self.index.chunk_embeddings.items()}
+        _write_json_file(self.embeddings_path, payload)
+
+    def _restore_embeddings(self) -> None:
+        """Load pre-built chunk embeddings from embeddings.json if it exists."""
+        if not self.embeddings_path.exists():
+            return
+        try:
+            raw = _read_json_file(self.embeddings_path, {})
+            if not isinstance(raw, dict):
+                return
+            loaded = 0
+            with self.lock:
+                valid_chunk_ids = set(self.chunks.keys())
+            for cid, vec in raw.items():
+                if str(cid) in valid_chunk_ids and isinstance(vec, list) and vec:
+                    self.index.set_chunk_embedding(str(cid), vec)
+                    loaded += 1
+        except Exception:
+            pass
 
     def _find_doc_by_sha_locked(self, sha256: str) -> str:
         target = str(sha256 or "").strip()

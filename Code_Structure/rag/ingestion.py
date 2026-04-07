@@ -23,6 +23,37 @@ from ..utils.media import guess_mime_from_name
 from ..utils.misc import make_id, now_ts
 from ..utils.text import trim
 
+def _rag_embed_text(text: str, session: object, *, model: str = "") -> list[float] | None:
+    """Get a dense embedding vector for *text* using the session's ollama connection.
+
+    Returns None on any error so callers can gracefully fall back to TF-IDF-only mode.
+    """
+    try:
+        ollama = getattr(session, "ollama", None)
+        if ollama is None:
+            return None
+        embed_model = str(model or getattr(ollama, "embed_model", "") or "nomic-embed-text").strip()
+        if not embed_model:
+            return None
+        result = ollama.embed(model=embed_model, input=str(text or "")[:4096])
+        if isinstance(result, dict):
+            vecs = result.get("embeddings") or result.get("embedding")
+            if isinstance(vecs, list) and vecs:
+                first = vecs[0] if isinstance(vecs[0], list) else vecs
+                if isinstance(first, list) and first:
+                    return [float(x) for x in first]
+        return None
+    except Exception:
+        return None
+
+def _rag_embed_batch(texts: list[str], session: object, *, model: str = "") -> list[list[float] | None]:
+    """Embed a batch of texts sequentially, returning None for any that fail."""
+    results: list[list[float] | None] = []
+    for text in texts:
+        vec = _rag_embed_text(text, session, model=model)
+        results.append(vec)
+    return results
+
 def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
     try:
         parser = RAGContentParser(include_filename_entities=include_filename_entities)

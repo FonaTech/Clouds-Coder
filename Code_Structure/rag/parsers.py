@@ -419,24 +419,65 @@ def _rag_choose_community(category: object, language: object, entities: list[obj
     lang = str(language or "unknown").strip() or "unknown"
     raw = str(raw_community or "").strip()
     if ":" in raw:
-        prefix, suffix = raw.split(":", 1)
-        if prefix.strip():
-            cat = prefix.strip()
-        suffix = suffix.strip()
-        if _rag_entity_allowed(suffix):
-            return f"{cat}:{suffix}"
+        parts = raw.split(":", 2)
+        if parts[0].strip():
+            cat = parts[0].strip()
+        if len(parts) >= 3:
+            # Already three-level format: validate and return
+            s1, s2 = parts[1].strip(), parts[2].strip()
+            if _rag_entity_allowed(s1) and _rag_entity_allowed(s2):
+                return f"{cat}:{s1}:{s2}"
+            if _rag_entity_allowed(s1):
+                return f"{cat}:{s1}"
+        elif len(parts) >= 2:
+            suffix = parts[1].strip()
+            if _rag_entity_allowed(suffix):
+                # Try to enrich with a second entity from the entities list
+                filtered = _rag_filter_entities(list(entities or []), limit=4)
+                second = next((e for e in filtered if e.lower() != suffix.lower()), "")
+                if second:
+                    return f"{cat}:{suffix}:{second}"
+                return f"{cat}:{suffix}"
     elif raw and not _rag_is_noise_token(raw):
+        filtered = _rag_filter_entities(list(entities or []), limit=4)
+        second = next((e for e in filtered if e.lower() != raw.lower()), "")
+        if second:
+            return f"{cat}:{raw}:{second}"
         return f"{cat}:{raw}"
-    if cat == "research":
-        filtered = _rag_filter_entities(list(entities or []), limit=1)
-        if filtered:
-            return f"{cat}:{filtered[0]}"
+    # Auto-assign from top entities; use two for research/code categories
+    filtered = _rag_filter_entities(list(entities or []), limit=4)
+    if filtered:
+        first = filtered[0]
+        if len(filtered) > 1:
+            return f"{cat}:{first}:{filtered[1]}"
+        return f"{cat}:{first}"
     return f"{cat}:{lang}"
 
 def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
     raw = html.unescape(str(text or ""))
     lowered = raw.lower()
     out: list[str] = []
+    # CamelCase decomposition: UserRepository → user, repository (plus userrepository)
+    for camel_token in re.findall(r"\b[A-Z][a-zA-Z0-9]{2,40}\b", raw):
+        # Split on case transitions: UserRepo → User, Repo; XMLParser → XML, Parser
+        split1 = re.sub(r"([a-z])([A-Z])", r"\1 \2", camel_token)
+        split2 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", split1)
+        for part in split2.split():
+            lp = part.lower()
+            if len(lp) >= 2 and not _rag_is_noise_token(lp):
+                out.append(lp)
+        full_lower = camel_token.lower()
+        if not _rag_is_noise_token(full_lower):
+            out.append(full_lower)
+        if len(out) >= max_terms:
+            return out
+    # snake_case decomposition: get_max_value → get, max, value
+    for snake_token in re.findall(r"\b[a-z][a-z0-9]{1,}(?:_[a-z0-9]{1,}){1,}\b", lowered):
+        for part in snake_token.split("_"):
+            if len(part) >= 2 and not _rag_is_noise_token(part):
+                out.append(part)
+        if len(out) >= max_terms:
+            return out
     for token in re.findall(r"[a-z][a-z0-9_./+-]{1,40}", lowered):
         if _rag_is_noise_token(token):
             continue
@@ -535,36 +576,147 @@ def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
         labels.append("office")
     return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
 
+def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
+    """Split document text into structural segments: (type, depth, heading, body).
+
+    type values:
+      "heading"    — Markdown H1-H4 boundary marker (triggers section flush)
+      "code_block" — fenced code block or table row group (kept atomic)
+      "text"       — ordinary paragraph text
+    """
+    out: list[tuple[str, int, str, str]] = []
+    lines = content.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # Markdown heading (H1-H4)
+        hm = re.match(r"^(#{1,4})\s+(.*)", line)
+        if hm:
+            depth = len(hm.group(1))
+            heading = hm.group(2).strip()
+            out.append(("heading", depth, heading, ""))
+            i += 1
+            continue
+        # Code fence (``` or ~~~)
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith(fence):
+                j += 1
+            code_body = "\n".join(lines[i : j + 1])
+            out.append(("code_block", 0, "", code_body))
+            i = j + 1
+            continue
+        # Markdown table (lines starting with |)
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            j = i
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                j += 1
+            table_body = "\n".join(lines[i:j])
+            if table_body.strip():
+                out.append(("code_block", 0, "", table_body))
+            i = j
+            continue
+        # Regular text — collect until next structural boundary or two consecutive blank lines
+        text_lines: list[str] = []
+        consecutive_blank = 0
+        while i < len(lines):
+            l = lines[i]
+            ls = l.strip()
+            if re.match(r"^#{1,4}\s", l) or ls.startswith("```") or ls.startswith("~~~"):
+                break
+            if ls.startswith("|") and "|" in ls[1:]:
+                break
+            text_lines.append(l)
+            consecutive_blank = 0 if ls else consecutive_blank + 1
+            i += 1
+            if consecutive_blank >= 2:
+                break
+        body = "\n".join(text_lines).strip()
+        if body:
+            out.append(("text", 0, "", body))
+    return out
+
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
+    """Semantic-boundary-aware text chunking.
+
+    Respects Markdown structure (H1-H4 headers as hard section boundaries, code fences
+    and tables kept atomic).  Each chunk carries parent_heading, is_code_block, and
+    section_depth metadata for downstream filtering and context enrichment.
+    """
     content = re.sub(r"\r\n?", "\n", str(text or "")).strip()
     if not content:
         return []
-    blocks = [x.strip() for x in re.split(r"\n\s*\n+", content) if x.strip()]
+    segments = _rag_parse_segments(content)
     chunks: list[dict] = []
-    current = ""
-    for block in blocks:
-        if len(block) > max_chars:
-            pieces = [block[i : i + max_chars] for i in range(0, len(block), max(200, max_chars - overlap))]
-        else:
-            pieces = [block]
-        for piece in pieces:
-            if not current:
-                current = piece
-                continue
-            if len(current) + 2 + len(piece) <= max_chars:
-                current = current + "\n\n" + piece
-                continue
-            preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
-            chunks.append({"text": current.strip(), "anchor": preview})
-            tail = current[-overlap:].strip()
-            current = (tail + "\n\n" + piece).strip() if tail else piece
-            if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
-                break
+    current_text = ""
+    current_heading = ""
+    current_depth = 0
+
+    def _flush(txt: str, heading: str, depth: int, is_code: bool = False) -> None:
+        txt = txt.strip()
+        if not txt or len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+            return
+        first_line = next((ln for ln in txt.splitlines() if ln.strip()), txt)
+        preview = trim(first_line, 120)
+        if heading:
+            preview = f"[{heading}] {preview}"
+        chunks.append({
+            "text": txt,
+            "anchor": preview,
+            "parent_heading": heading,
+            "is_code_block": is_code,
+            "section_depth": depth,
+        })
+
+    for seg_type, seg_depth, seg_heading, seg_body in segments:
         if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
             break
-    if current and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
-        preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
-        chunks.append({"text": current.strip(), "anchor": preview})
+        if seg_type == "heading":
+            # Hard section boundary — flush accumulated text
+            if current_text:
+                _flush(current_text, current_heading, current_depth)
+                current_text = ""
+            current_heading = seg_heading
+            current_depth = seg_depth
+        elif seg_type == "code_block":
+            # Flush prose buffer, then emit code/table atomically (up to 2500 chars)
+            if current_text:
+                _flush(current_text, current_heading, current_depth)
+                current_text = ""
+            max_code = max(max_chars, 2500)
+            if len(seg_body) <= max_code:
+                _flush(seg_body, current_heading, current_depth, is_code=True)
+            else:
+                # Very large block — split by line-count chunks rather than mid-character
+                step = max(200, max_chars - overlap)
+                for ci in range(0, len(seg_body), step):
+                    _flush(seg_body[ci : ci + max_chars], current_heading, current_depth, is_code=True)
+                    if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                        break
+        else:
+            # Ordinary text paragraph
+            if len(current_text) + 2 + len(seg_body) <= max_chars:
+                current_text = (current_text + "\n\n" + seg_body).strip() if current_text else seg_body
+            else:
+                if current_text:
+                    _flush(current_text, current_heading, current_depth)
+                    tail = current_text[-overlap:].strip() if overlap else ""
+                    current_text = (tail + "\n\n" + seg_body).strip() if tail else seg_body
+                else:
+                    # Single oversized paragraph — split by step with overlap
+                    step = max(200, max_chars - overlap)
+                    pieces = [seg_body[ci : ci + max_chars] for ci in range(0, len(seg_body), step)]
+                    for piece in pieces[:-1]:
+                        _flush(piece, current_heading, current_depth)
+                        if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                            break
+                    if pieces:
+                        current_text = pieces[-1]
+
+    if current_text and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
+        _flush(current_text, current_heading, current_depth)
     return chunks[:RAG_MAX_CHUNKS_PER_DOC]
 
 def _code_language_from_name(name: str, text: str = "") -> str:
@@ -588,6 +740,53 @@ def _code_language_from_name(name: str, text: str = "") -> str:
 def _code_is_test_path(rel_path: str) -> bool:
     low = str(rel_path or "").strip().lower()
     return any(token in low for token in ("/tests/", "/test/", "_test.", ".spec.", ".test.", "/__tests__/"))
+
+class _CallCollector(ast.NodeVisitor):
+    """AST visitor that collects names of all functions/methods called within a node."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.attr, str):
+            self.calls.append(func.attr)
+        elif isinstance(func, ast.Name) and isinstance(func.id, str):
+            self.calls.append(func.id)
+        self.generic_visit(node)
+
+_ALGO_COMPLEXITY_RE = re.compile(r"O\s*\(\s*(?:n|log|1|n\^2|n²|n\s*\*)", re.IGNORECASE)
+
+_ALGO_STEP_RE = re.compile(r"#\s*(?:step|phase|algorithm|算法|步骤)\s*\d*[:：\s]", re.IGNORECASE)
+
+_ALGO_MATH_VARS = frozenset(["alpha", "beta", "gamma", "epsilon", "theta", "delta", "lambda", "mu", "sigma", "omega"])
+
+_ALGO_DOC_KEYWORDS = frozenset(["algorithm", "complexity", "iterate", "convergence", "converge", "算法", "复杂度", "迭代"])
+
+def _detect_algo_chunk(text: str) -> bool:
+    """Heuristically detect whether a code chunk implements or describes an algorithm.
+
+    Returns True when at least 2 of the following signals are present:
+    1. Big-O complexity annotation
+    2. Step/Phase/Algorithm comment marker
+    3. Algorithm-related keywords in docstring or comments
+    4. Mathematical variable names (alpha, beta, gamma …)
+    5. Loop + condition + return structure (rough proxy for algorithmic body)
+    """
+    t = str(text or "")
+    score = 0
+    if _ALGO_COMPLEXITY_RE.search(t):
+        score += 1
+    if _ALGO_STEP_RE.search(t):
+        score += 1
+    lower = t.lower()
+    if any(kw in lower for kw in _ALGO_DOC_KEYWORDS):
+        score += 1
+    if any(re.search(r"\b" + re.escape(v) + r"\b", lower) for v in _ALGO_MATH_VARS):
+        score += 1
+    if re.search(r"\bfor\b.*\bif\b.*\breturn\b", t, re.DOTALL):
+        score += 1
+    return score >= 2
 
 class CodeContentParser:
     def _decode_text_bytes(self, data: bytes) -> str:
@@ -762,25 +961,55 @@ class CodeContentParser:
             chunk_lines = lines[start - 1 : end]
             if not chunk_lines:
                 return
+            # Extract docstring for richer anchor text
+            doc = ""
+            try:
+                doc = ast.get_docstring(node) or ""  # type: ignore[arg-type]
+            except Exception:
+                pass
+            doc_first = ""
+            if doc:
+                doc_first = re.sub(r"\s+", " ", doc.splitlines()[0]).strip()[:140]
+            # Build anchor: prefer docstring first line, fall back to code signature
+            sig = trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180)
+            anchor = f"{kind} {symbol} — {doc_first}" if doc_first else f"{kind} {symbol} L{start}-{end}".strip()
             symbols.append(
                 {
                     "name": symbol,
                     "kind": kind,
                     "line_start": start,
                     "line_end": end,
-                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180),
+                    "signature": sig,
                 }
             )
             text_chunk = "\n".join(chunk_lines).strip()
+            # Extract function/method calls for call graph
+            calls: list[str] = []
+            try:
+                collector = _CallCollector()
+                collector.visit(node)
+                seen_calls: set[str] = set()
+                for c in collector.calls:
+                    if c and c not in seen_calls and not _rag_is_noise_token(c.lower()):
+                        seen_calls.add(c)
+                        calls.append(c)
+                calls = calls[:20]
+            except Exception:
+                pass
+            # Detect algorithmic chunks for boosted retrieval
+            is_algo = _detect_algo_chunk(text_chunk)
             if len(text_chunk) <= CODE_CHUNK_CHARS:
                 out.append(
                     {
                         "text": text_chunk,
-                        "anchor": f"{kind} {symbol} L{start}-{end}".strip(),
+                        "anchor": anchor,
                         "line_start": start,
                         "line_end": end,
                         "symbol": symbol,
                         "symbol_kind": kind,
+                        "calls": calls,
+                        "algo": is_algo,
+                        "docstring": trim(doc, 400) if doc else "",
                     }
                 )
             else:

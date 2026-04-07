@@ -51,7 +51,7 @@ def _html_esc(text: str) -> str:
     return html.escape(str(text or ""))
 
 def _text_to_minimal_pdf(text: str) -> bytes:
-    """纯 Python 最小 PDF 生成器，支持 CJK（中日韩）字符。"""
+    """Minimal pure-Python PDF generator with CJK-safe text output."""
     raw = str(text or "")
     lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     font_size = 9
@@ -80,7 +80,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
     usable_h = page_h - margin_top - margin_bottom
     lines_per_page = max(1, int(usable_h / leading))
 
-    # 折行
+    # Wrap lines to the effective page width.
     wrapped: list[str] = []
     for line in lines:
         if not line:
@@ -91,7 +91,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
             line = line[max_chars_per_line:]
         wrapped.append(line)
 
-    # 分页
+    # Split wrapped lines into page-sized groups.
     pages_list: list[list[str]] = []
     for i in range(0, len(wrapped), lines_per_page):
         pages_list.append(wrapped[i:i + lines_per_page])

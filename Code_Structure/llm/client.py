@@ -54,6 +54,7 @@ class OllamaClient:
         self.thinking_stream = bool(thinking_stream)
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
+        self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
 
     def apply_profile(self, profile: dict):
         self.provider = str(profile.get("provider", "ollama") or "ollama")
@@ -78,6 +79,48 @@ class OllamaClient:
             declared_caps,
         )
         self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
+        if "embed_model" in profile:
+            self.embed_model = str(profile.get("embed_model") or "").strip()
+
+    def embed(self, *, model: str, input: "str | list") -> dict:
+        """Get embedding vector(s) from the model.
+
+        Returns {"embeddings": [[float, ...]]} regardless of backend.
+        Raises on failure — _rag_embed_text catches and falls back to TF-IDF.
+        """
+        m = str(model or self.embed_model or "nomic-embed-text").strip()
+        texts = input if isinstance(input, list) else [str(input)]
+
+        if self.provider == "ollama":
+            raw = self._post_json(
+                "/api/embed",
+                {"model": m, "input": texts[0] if len(texts) == 1 else texts},
+            )
+            vecs = raw.get("embeddings") or raw.get("embedding")
+            if isinstance(vecs, list) and vecs:
+                if isinstance(vecs[0], list):
+                    return {"embeddings": vecs}
+                return {"embeddings": [vecs]}
+            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
+        else:
+            payload: dict = {"model": m, "input": texts}
+            if self.payload_template:
+                payload.update(
+                    {k: v for k, v in self.payload_template.items() if k not in payload}
+                )
+            headers = self._render_headers()
+            base = str(self.base_url or "").rstrip("/")
+            raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
+            data = raw.get("data") or []
+            if data and isinstance(data[0], dict):
+                vecs = [
+                    item["embedding"]
+                    for item in data
+                    if isinstance(item.get("embedding"), list)
+                ]
+                if vecs:
+                    return {"embeddings": vecs}
+            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
 
     def _probe_cache_key(self) -> str:
         endpoint = self.endpoint.strip() if self.endpoint else ""

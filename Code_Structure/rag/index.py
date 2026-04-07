@@ -10,11 +10,76 @@ import re
 from pathlib import Path, PurePosixPath
 
 # ── cross-module imports ─────────────────────────────────────────────────
-from ..config.constants import RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO, RAG_DYNAMIC_NOISE_HARD_DOC_RATIO, RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ, RAG_DYNAMIC_NOISE_MIN_DOC_FREQ, RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO, RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO, RAG_EN_STOPWORDS, RAG_GRAPH_MAX_NODES, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_MAX_COMMUNITY_MAP_SUPPORT, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_QUERY_RESULTS
+from ..config.constants import RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO, RAG_DYNAMIC_NOISE_HARD_DOC_RATIO, RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ, RAG_DYNAMIC_NOISE_MIN_DOC_FREQ, RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO, RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO, RAG_EN_STOPWORDS, RAG_GRAPH_MAX_NODES, RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT, RAG_MAX_COMMUNITY_MAP_SUPPORT, RAG_MAX_GLOBAL_COMMUNITIES, RAG_MAX_QUERY_RESULTS, RAG_SYNTHESIS_MAX_PER_DOC
 from .parsers import _code_is_test_path, _rag_apply_filename_entity_policy, _rag_choose_community, _rag_classify_document, _rag_expand_tokens, _rag_extract_entities, _rag_filter_entities, _rag_tokenize
 from ..utils.json_utils import json_dumps
 from ..utils.misc import now_ts
 from ..utils.text import trim
+
+def _rag_trigram_set(text: str) -> frozenset[str]:
+    """Extract character-level trigrams for Jaccard-based content overlap detection."""
+    t = " ".join(str(text or "").lower().split())
+    if len(t) < 3:
+        return frozenset()
+    return frozenset(t[i : i + 3] for i in range(len(t) - 2))
+
+def _rag_jaccard_sim(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard similarity between two trigram sets. Returns 0.0 if both empty."""
+    if not a and not b:
+        return 0.0
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return len(a & b) / union
+
+def _rag_mmr_select(
+    rows: list[dict],
+    top_k: int,
+    *,
+    lambda_param: float = 0.6,
+    overlap_hard_threshold: float = 0.55,
+    overlap_soft_threshold: float = 0.30,
+    max_per_doc: int = RAG_SYNTHESIS_MAX_PER_DOC,
+) -> list[dict]:
+    """Maximum Marginal Relevance selection with per-document capping.
+
+    Selects top_k results that balance relevance (score) and diversity (low overlap
+    with already-selected results). Near-duplicate content (Jaccard > overlap_hard_threshold)
+    is skipped outright; partial overlaps are penalised.
+    """
+    if not rows:
+        return []
+    selected: list[dict] = []
+    selected_trigrams: list[frozenset[str]] = []
+    doc_counts: dict[str, int] = {}
+
+    for row in rows:
+        if len(selected) >= top_k:
+            break
+        doc_id = str(row.get("doc_id", "") or "")
+        if doc_id and doc_counts.get(doc_id, 0) >= max_per_doc:
+            continue
+        row_tg = _rag_trigram_set(str(row.get("text", "") or ""))
+        # Check overlap against already-selected results
+        max_overlap = 0.0
+        for sel_tg in selected_trigrams:
+            sim = _rag_jaccard_sim(row_tg, sel_tg)
+            if sim > max_overlap:
+                max_overlap = sim
+        if max_overlap >= overlap_hard_threshold:
+            # Near-duplicate — skip entirely
+            continue
+        if max_overlap >= overlap_soft_threshold:
+            # Partial overlap — penalise by folding in diversity penalty
+            diversity = 1.0 - max_overlap
+            orig_score = float(row.get("score", 0.0) or 0.0)
+            row = dict(row)
+            row["score"] = round(orig_score * lambda_param + orig_score * (1.0 - lambda_param) * diversity, 6)
+        selected.append(row)
+        selected_trigrams.append(row_tg)
+        if doc_id:
+            doc_counts[doc_id] = doc_counts.get(doc_id, 0) + 1
+    return selected
 
 def _code_module_name(rel_path: str, language: str = "") -> str:
     raw = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
@@ -79,6 +144,66 @@ class TFGraphIDFIndex:
         self.dynamic_noise_hard_tokens: set[str] = set()
         self.dynamic_noise_penalties: dict[str, float] = {}
         self.dynamic_noise_meta: dict[str, dict] = {}
+        # Dense embedding index (optional — populated by _embed_chunks when an embedding model is available)
+        self.chunk_embeddings: dict[str, list[float]] = {}
+        self.embed_dim: int = 0
+
+    # ------------------------------------------------------------------
+    # Dense embedding helpers
+    # ------------------------------------------------------------------
+
+    def has_dense_index(self) -> bool:
+        """True if chunk embeddings have been loaded for at least some chunks."""
+        return bool(self.chunk_embeddings)
+
+    def set_chunk_embedding(self, chunk_id: str, vec: list[float]) -> None:
+        """Store a dense embedding vector for a chunk."""
+        if not vec:
+            return
+        self.chunk_embeddings[str(chunk_id)] = [float(x) for x in vec]
+        if not self.embed_dim:
+            self.embed_dim = len(vec)
+
+    def _dense_query(self, qvec: list[float], top_k: int = 50) -> dict[str, float]:
+        """Compute cosine similarity between query vector and all chunk embeddings.
+
+        Returns {chunk_id: cosine_similarity} for top_k candidates.
+        Falls back gracefully to empty dict when embeddings are unavailable.
+        Uses numpy if available for speed, otherwise pure Python.
+        """
+        if not qvec or not self.chunk_embeddings:
+            return {}
+        try:
+            import numpy as _np  # type: ignore
+            qarr = _np.array(qvec, dtype=_np.float32)
+            qnorm = float(_np.linalg.norm(qarr)) or 1.0
+            qarr = qarr / qnorm
+            chunk_ids = list(self.chunk_embeddings.keys())
+            matrix = _np.array([self.chunk_embeddings[cid] for cid in chunk_ids], dtype=_np.float32)
+            norms = _np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            matrix = matrix / norms
+            sims = matrix @ qarr
+            if len(chunk_ids) <= top_k:
+                return {chunk_ids[i]: float(sims[i]) for i in range(len(chunk_ids))}
+            idx = _np.argpartition(sims, -top_k)[-top_k:]
+            return {chunk_ids[i]: float(sims[i]) for i in idx}
+        except ImportError:
+            pass
+        except Exception:
+            return {}
+        # Pure-Python fallback
+        def _dot(a: list[float], b: list[float]) -> float:
+            return sum(x * y for x, y in zip(a, b))
+        def _norm(a: list[float]) -> float:
+            return math.sqrt(sum(x * x for x in a)) or 1.0
+        qnorm = _norm(qvec)
+        scored: list[tuple[float, str]] = []
+        for chunk_id, cvec in self.chunk_embeddings.items():
+            sim = _dot(qvec, cvec) / (qnorm * (_norm(cvec)))
+            scored.append((sim, chunk_id))
+        scored.sort(reverse=True)
+        return {cid: s for s, cid in scored[:top_k]}
 
     def snapshot(self) -> dict:
         return {
@@ -523,6 +648,82 @@ class TFGraphIDFIndex:
             }
         doc_total = max(1, len(self.doc_meta))
         community_total = max(1, len(community_reports))
+        # ── Large community auto-splitting ──────────────────────────────────────
+        # When a community exceeds 15 docs, synthesize sub-community reports by
+        # grouping documents on their secondary entity. This gives _global_query
+        # finer-grained candidates without changing existing doc_meta fields.
+        _COMMUNITY_SPLIT_THRESHOLD = 15
+        sub_community_reports: dict[str, dict] = {}
+        for parent_com, report in community_reports.items():
+            if int(report.get("doc_count", 0) or 0) <= _COMMUNITY_SPLIT_THRESHOLD:
+                continue
+            # Group docs by their most frequent non-shared entity (the "secondary entity")
+            shared_top = {str(e).lower() for e in (report.get("top_entities", []) or [])[:2]}
+            sub_groups: dict[str, list[str]] = defaultdict(list)
+            for doc_id in (report.get("doc_ids", []) or []):
+                doc_row = self.doc_meta.get(doc_id, {})
+                doc_ents = [str(e).strip() for e in (doc_row.get("entities", []) or []) if str(e).strip()]
+                # Pick the first entity that differs from the shared top-2
+                sub_key = next((e for e in doc_ents if e.lower() not in shared_top), "")
+                if not sub_key:
+                    sub_key = "_other"
+                sub_groups[sub_key].append(doc_id)
+            for sub_ent, sub_doc_ids in sub_groups.items():
+                if len(sub_doc_ids) < 2:
+                    continue  # singleton sub-group — not useful
+                # Build a three-level sub-community key
+                parent_parts = parent_com.split(":", 1)
+                parent_prefix = parent_parts[0] if parent_parts else parent_com
+                sub_com = f"{parent_prefix}:{sub_ent}:sub"
+                if sub_com in community_reports or sub_com in sub_community_reports:
+                    continue
+                sub_ent_counter: Counter[str] = Counter()
+                for doc_id in sub_doc_ids:
+                    doc_row = self.doc_meta.get(doc_id, {})
+                    sub_ent_counter.update([str(e).strip() for e in (doc_row.get("entities", []) or []) if str(e).strip()][:8])
+                sub_top_entities = [e for e, _ in sub_ent_counter.most_common(8)]
+                sub_top_docs = [self.doc_meta.get(d, {}) for d in sub_doc_ids[:4] if self.doc_meta.get(d)]
+                sub_report_lines = [
+                    f"Community: {sub_com}",
+                    f"Parent community: {parent_com}",
+                    f"Documents: {len(sub_doc_ids)}",
+                    f"Sub-group entity: {sub_ent}",
+                ]
+                if sub_top_entities:
+                    sub_report_lines.append("Top entities: " + ", ".join(sub_top_entities[:8]))
+                for idx, row in enumerate(sub_top_docs[:3], 1):
+                    sub_report_lines.append(
+                        f"Document {idx}: {row.get('title', '')} [{row.get('id', '')}]"
+                    )
+                    if str(row.get("summary", "")).strip():
+                        sub_report_lines.append(trim(str(row.get("summary", "") or ""), 200))
+                sub_community_reports[sub_com] = {
+                    "community": sub_com,
+                    "parent_community": parent_com,
+                    "doc_ids": list(sub_doc_ids),
+                    "doc_count": len(sub_doc_ids),
+                    "top_entities": sub_top_entities,
+                    "top_categories": report.get("top_categories", []),
+                    "top_languages": report.get("top_languages", []),
+                    "top_kinds": report.get("top_kinds", []),
+                    "representative_docs": [
+                        {"id": str(r.get("id", "")), "title": str(r.get("title", "")),
+                         "summary": trim(str(r.get("summary", "") or ""), 180)}
+                        for r in sub_top_docs
+                    ],
+                    "links": [],
+                    "report": trim("\n".join(sub_report_lines), 3000),
+                }
+        # Merge sub-community reports into community_reports for indexing
+        community_reports.update(sub_community_reports)
+        community_total = max(1, len(community_reports))
+        # Re-tokenize sub-community reports
+        for sub_com, sub_report in sub_community_reports.items():
+            counts = Counter(_rag_expand_tokens(_rag_tokenize(sub_report.get("report", ""))))
+            if counts:
+                community_df.update(counts.keys())
+            community_token_rows[sub_com] = counts
+        # ── End large community auto-splitting ─────────────────────────────────
         hard_tokens, penalties, meta = self._derive_dynamic_noise_controls(
             doc_df,
             doc_total,
@@ -642,7 +843,8 @@ class TFGraphIDFIndex:
             ),
             reverse=True,
         )
-        top_rows = deduped[: max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))]
+        # MMR content-level deduplication — removes near-duplicate chunks and caps per-doc results
+        top_rows = _rag_mmr_select(deduped, max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS)))
         community_counter: Counter[str] = Counter(str(x.get("community", "")) for x in top_rows if str(x.get("community", "")).strip())
         community_cards = []
         for community, freq in community_counter.most_common(5):
@@ -680,6 +882,7 @@ class TFGraphIDFIndex:
         kind: str = "",
         allowed_communities: set[str] | None = None,
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -698,6 +901,15 @@ class TFGraphIDFIndex:
         for token, qweight in qweights.items():
             for chunk_id, cweight in self.inverted.get(token, []):
                 scores[chunk_id] += qweight * cweight
+        # Dense retrieval — expand candidate pool with high-similarity embedding matches
+        dense_scores: dict[str, float] = {}
+        use_dense = self.has_dense_index() and qvec is not None
+        if use_dense:
+            dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
+            # Ensure dense-only hits are included as candidates even with zero TF-IDF
+            for cid in dense_scores:
+                if cid not in scores:
+                    scores[cid] = 0.0
         rows: list[dict] = []
         for chunk_id, dot in scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
@@ -710,7 +922,8 @@ class TFGraphIDFIndex:
                 continue
             if allowed and str(doc.get("community", "") or "") not in allowed:
                 continue
-            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            chunk_norm = self.chunk_norms.get(chunk_id, 1.0) or 1.0
+            lexical = dot / (chunk_norm * qnorm) if dot > 0 else 0.0
             chunk_entities = set(str(x) for x in (chunk.get("entities", []) or []))
             doc_entities = set(str(x) for x in (doc.get("entities", []) or []))
             ent_overlap = len(qentities.intersection(chunk_entities))
@@ -721,7 +934,12 @@ class TFGraphIDFIndex:
                 graph_bonus += 0.08
             if str(doc.get("community", "")) in self.community_counts:
                 graph_bonus += min(0.08, math.log1p(self.community_counts.get(str(doc.get("community", "")), 0)) / 16.0)
-            final_score = lexical * 0.82 + graph_bonus
+            if use_dense:
+                dense_sim = dense_scores.get(chunk_id, 0.0)
+                # Hybrid: 40% TF-IDF + 60% dense when embeddings available
+                final_score = lexical * 0.40 + dense_sim * 0.60 + graph_bonus * 0.60
+            else:
+                final_score = lexical * 0.82 + graph_bonus
             rows.append(
                 {
                     "score": round(final_score, 6),
@@ -878,6 +1096,13 @@ class TFGraphIDFIndex:
             lexical = dot / ((self.community_norms.get(community, 1.0) or 1.0) * qnorm)
             report_entities = {str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()}
             ent_overlap = len(qentities.intersection(report_entities))
+            # Community relevance gate: skip communities with essentially no entity overlap
+            # when the query has known entities to match against
+            if qentities and report_entities and ent_overlap == 0:
+                entity_jaccard = len(qentities & report_entities) / max(1, len(qentities | report_entities))
+                if entity_jaccard < 0.1 and dot <= 0.0:
+                    # No lexical signal and no entity overlap — very likely irrelevant
+                    continue
             cross_links = sum(int(x.get("weight", 0) or 0) for x in (report.get("links", []) or [])[:3])
             graph_bonus = (0.22 * ent_overlap) + min(0.18, math.log1p(cross_links) / 9.5) + min(
                 0.12, math.log1p(int(report.get("doc_count", 0) or 0)) / 8.0
@@ -1132,6 +1357,12 @@ class TFGraphIDFIndex:
             reduce_lines.append("Evidence anchors: " + "; ".join(evidence_anchors[:6]))
         text = trim("\n".join(reduce_lines), 3200)
         score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
+        # Only give sort_bias boost if underlying support evidence is sufficiently strong
+        max_support_score = max(
+            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8]),
+            default=0.0,
+        )
+        synthesis_sort_bias = 0.38 if max_support_score >= 0.25 else 0.05
         return {
             "score": round(score, 6),
             "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
@@ -1149,7 +1380,7 @@ class TFGraphIDFIndex:
             "entities": [name for name, _ in entity_counter.most_common(12) if name],
             "citation": "[global-synthesis]",
             "route_evidence": "community_reduce",
-            "sort_bias": 0.38,
+            "sort_bias": synthesis_sort_bias,
         }
 
     def _global_query(
@@ -1258,6 +1489,7 @@ class TFGraphIDFIndex:
         kind: str = "",
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
         route_meta: dict | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -1271,7 +1503,7 @@ class TFGraphIDFIndex:
                 "route_meta": {"mode": "hybrid"},
             }
         qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
-        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat), qvec=qvec)
         global_out = self._global_query(query, top_k=max(4, min(top_k, 6)), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
         fast_rows = list(fast.get("results", []) or [])
         global_rows = list(global_out.get("results", []) or [])
@@ -1319,6 +1551,7 @@ class TFGraphIDFIndex:
         category: str = "",
         kind: str = "",
         route: str = "auto",
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -1348,8 +1581,8 @@ class TFGraphIDFIndex:
         if decided == "global":
             return self._global_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
         if decided == "hybrid":
-            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
-        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle)
+            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta, qvec=qvec)
+        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, qvec=qvec)
 
     def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
         docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
@@ -1422,6 +1655,10 @@ class CodeGraphIndex(TFGraphIDFIndex):
         self.symbol_to_docs: dict[str, list[str]] = {}
         self.path_to_doc: dict[str, str] = {}
         self.module_to_docs: dict[str, list[str]] = {}
+        # Function call graph: caller_symbol → [callee_names]
+        self.call_graph: dict[str, list[str]] = {}
+        # Reverse call graph: callee_name → [chunk_ids that call it]
+        self.callee_graph: dict[str, list[str]] = {}
 
     def snapshot(self) -> dict:
         payload = super().snapshot()
@@ -1520,6 +1757,8 @@ class CodeGraphIndex(TFGraphIDFIndex):
         self.symbol_to_docs = {}
         self.path_to_doc = {}
         self.module_to_docs = {}
+        self.call_graph = {}
+        self.callee_graph = {}
         docs_by_id = {
             str(row.get("id", "") or "").strip(): dict(row)
             for row in documents
@@ -1597,6 +1836,22 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     self.related_docs[doc_id][target_id] = int(self.related_docs[doc_id].get(target_id, 0) or 0) + 1
                     self.related_docs[target_id][doc_id] = int(self.related_docs[target_id].get(doc_id, 0) or 0) + 1
         self.import_edges = {tuple(k): int(v or 0) for k, v in import_edges.items()}
+        # Build function call graph from chunk "calls" field (populated by _python_chunks)
+        call_graph: dict[str, list[str]] = {}
+        callee_graph: dict[str, list[str]] = {}
+        for chunk_id, row in self.chunk_meta.items():
+            src = chunks_by_id.get(chunk_id, {})
+            calls = [str(c) for c in (src.get("calls", []) or []) if str(c).strip()]
+            if calls:
+                symbol = str(src.get("symbol", "") or chunk_id)
+                call_graph[symbol] = calls
+                for callee in calls:
+                    callee_graph.setdefault(callee, []).append(chunk_id)
+            # Persist algo flag in chunk_meta for query-time boosting
+            if src.get("algo"):
+                row["algo"] = True
+        self.call_graph = call_graph
+        self.callee_graph = {k: list(set(v)) for k, v in callee_graph.items()}
         for doc_id, row in self.doc_meta.items():
             row["graph_degree"] = (
                 len(self.doc_to_chunks.get(doc_id, []) or [])
@@ -1614,6 +1869,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
         kind: str = "",
         allowed_communities: set[str] | None = None,
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -1629,11 +1885,29 @@ class CodeGraphIndex(TFGraphIDFIndex):
         qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
         qsymbols = _code_query_terms(query)
         query_low = query.lower()
+        # Detect "who calls X" intent for call graph routing
+        who_calls_intent = bool(re.search(r"who\s+calls?|callers?\s+of|调用了|哪些.*调用", query_low))
+        # Detect algorithm intent for boosting algo-tagged chunks
+        algo_intent = bool(re.search(r"algorithm|implement|how.*work|原理|实现|如何|怎么|步骤|算法|复杂度", query_low))
         allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
         scores: dict[str, float] = defaultdict(float)
         for token, qweight in qweights.items():
             for chunk_id, cweight in self.inverted.get(token, []):
                 scores[chunk_id] += qweight * cweight
+        # "Who calls X" routing: inject callee_graph hits as extra candidates
+        if who_calls_intent:
+            for sym in list(qsymbols) + [str(e) for e in qentities]:
+                for caller_chunk_id in self.callee_graph.get(sym.lower(), []):
+                    if caller_chunk_id not in scores:
+                        scores[caller_chunk_id] = 0.0
+        # Dense retrieval — expand candidate pool with embedding matches
+        dense_scores: dict[str, float] = {}
+        use_dense = self.has_dense_index() and qvec is not None
+        if use_dense:
+            dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
+            for cid in dense_scores:
+                if cid not in scores:
+                    scores[cid] = 0.0
         rows: list[dict] = []
         for chunk_id, dot in scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
@@ -1671,7 +1945,16 @@ class CodeGraphIndex(TFGraphIDFIndex):
                 elif module_low and module_low in query_low:
                     graph_bonus += 0.14
             graph_bonus += min(0.12, math.log1p(len(self.related_docs.get(str(doc.get("id", "")), {}) or {})) / 9.0)
-            final_score = lexical * 0.78 + graph_bonus
+            # Algo chunk boost — reward algorithm-tagged chunks for algorithm intent queries
+            chunk_is_algo = bool(chunk.get("algo", False))
+            if algo_intent and chunk_is_algo:
+                graph_bonus += 0.15
+            # Hybrid dense+lexical scoring
+            if use_dense and qvec is not None:
+                dense_sim = dense_scores.get(chunk_id, 0.0)
+                final_score = lexical * 0.40 + dense_sim * 0.38 + graph_bonus * 0.60
+            else:
+                final_score = lexical * 0.78 + graph_bonus
             line_start = int(chunk.get("line_start", 0) or 0)
             line_end = int(chunk.get("line_end", 0) or 0)
             if rel_path and line_start > 0:
@@ -1702,6 +1985,8 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "citation": citation,
                     "route_evidence": "chunk",
                     "sort_bias": 0.18 if rel_path and rel_path.lower() in query_low else 0.0,
+                    "algo": chunk_is_algo,
+                    "calls": list(chunk.get("calls", []) or [])[:20],
                 }
             )
         if not rows:
