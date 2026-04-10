@@ -11881,7 +11881,9 @@ class OllamaClient:
         Returns {"embeddings": [[float, ...]]} regardless of backend.
         Raises on failure — _rag_embed_text catches and falls back to TF-IDF.
         """
-        m = str(model or self.embed_model or "nomic-embed-text").strip()
+        m = str(model or self.embed_model or "").strip()
+        if not m:
+            raise ValueError("OllamaClient.embed() called with no model configured")
         texts = input if isinstance(input, list) else [str(input)]
 
         if self.provider == "ollama":
@@ -22717,12 +22719,14 @@ body{padding:18px}
                     else:
                         _append_capture(out_buf, chunk)
                 if now >= next_progress_emit:
+                    _idle_secs = int(now - last_activity_ts[0])
+                    _idle_str = f", idle={_idle_secs}s" if _idle_secs > 5 else ""
                     self._emit_transient(
                         "status",
                         {
                             "summary": (
                                 f"bash running ({int(elapsed)}s, "
-                                f"captured={len(out_buf) + len(err_buf)}B)"
+                                f"captured={len(out_buf) + len(err_buf)}B{_idle_str})"
                             )
                         },
                     )
@@ -22853,12 +22857,14 @@ body{padding:18px}
                                 else:
                                     _append_capture(out_buf, chunk)
                             if now >= next_progress_emit:
+                                _idle_secs = int(now - last_activity_ts[0])
+                                _idle_str = f", idle={_idle_secs}s" if _idle_secs > 5 else ""
                                 self._emit_transient(
                                     "status",
                                     {
                                         "summary": (
                                             f"bash running ({int(elapsed)}s, "
-                                            f"captured={len(out_buf) + len(err_buf)}B)"
+                                            f"captured={len(out_buf) + len(err_buf)}B{_idle_str})"
                                         )
                                     },
                                 )
@@ -49683,7 +49689,7 @@ def _rag_window_for_query(query: str) -> int:
     return 1200      # Broad query: full chunk
 
 
-def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 800) -> str:
+def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 800, dense_match: bool = False) -> str:
     """Extract a focused excerpt from *text* centred on the highest query-token density region.
 
     Scans the text in small steps to find where query tokens appear most densely, then
@@ -49697,6 +49703,12 @@ def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 80
         return text
     tokens = [t.lower() for t in (query_tokens or []) if len(t) > 2]
     if not tokens:
+        if dense_match:
+            mid = len(text) // 2
+            s = max(0, mid - window // 2)
+            e = min(len(text), s + window)
+            s = max(0, e - window)
+            return ("…" if s > 0 else "") + text[s:e] + ("…" if e < len(text) else "")
         return text[:window] + ("…" if len(text) > window else "")
     half = window // 2
     step = max(40, window // 15)
@@ -49709,6 +49721,8 @@ def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 80
         if count > best_count:
             best_count = count
             best_center = center
+    if best_count == 0 and dense_match:
+        best_center = len(text) // 2
     start = max(0, best_center - half)
     end = min(len(text), start + window)
     start = max(0, end - window)
@@ -51891,6 +51905,7 @@ class TFGraphIDFIndex:
                         str(chunk.get("text", "")),
                         list(qweights.keys()),
                         window=_rag_window_for_query(query),
+                        dense_match=(use_dense and scores.get(chunk_id, 0.0) == 0.0),
                     ),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "citation": f"[{doc.get('id', '')}:{chunk_id}]",
@@ -57180,7 +57195,16 @@ class AppContext:
             return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
 
         evidence = []
-        for idx, row in enumerate(qualified[:5], 1):
+        _syn_doc_counts: dict[str, int] = {}
+        for row in qualified:
+            if len(evidence) >= 5:
+                break
+            _doc_id = str(row.get("doc_id", "") or "")
+            if _doc_id and _syn_doc_counts.get(_doc_id, 0) >= RAG_SYNTHESIS_MAX_PER_DOC:
+                continue
+            if _doc_id:
+                _syn_doc_counts[_doc_id] = _syn_doc_counts.get(_doc_id, 0) + 1
+            idx = len(evidence) + 1
             score_pct = int(min(99, float(row.get("score", 0.0) or 0.0) * 100))
             evidence.append(
                 f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
@@ -57224,7 +57248,11 @@ class AppContext:
         qvec: list[float] | None = None
         if isinstance(session, SessionState):
             # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
-            if not self.rag_store.index.has_dense_index() and self.rag_store.chunks:
+            if (
+                not self.rag_store.index.has_dense_index()
+                and self.rag_store.chunks
+                and self._get_default_embed_model(session)
+            ):
                 try:
                     self._build_rag_embeddings_batch(session, max_chunks=300)
                 except Exception:
@@ -57453,7 +57481,11 @@ class AppContext:
         # Dense embedding for code query when available
         qvec: list[float] | None = None
         if isinstance(session, SessionState):
-            if not self.code_store.index.has_dense_index() and self.code_store.chunks:
+            if (
+                not self.code_store.index.has_dense_index()
+                and self.code_store.chunks
+                and self._get_default_embed_model(session)
+            ):
                 try:
                     self._build_code_embeddings_batch(session, max_chunks=300)
                 except Exception:
