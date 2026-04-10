@@ -22569,6 +22569,10 @@ body{padding:18px}
         out_buf = bytearray()
         err_buf = bytearray()
         next_progress_emit = start + 0.8
+        # Idle-timeout tracking: reset whenever output is captured.
+        # Timeout fires only when no output has arrived for `timeout` seconds;
+        # a hard cap of MAX_SHELL_COMMAND_TIMEOUT_SECONDS prevents infinite runs.
+        last_activity_ts = [start]
 
         def _stop_process(p: subprocess.Popen):
             # shell=True may spawn child processes; stop the whole process group on POSIX.
@@ -22597,6 +22601,7 @@ body{padding:18px}
             if not piece:
                 return
             target.extend(piece)
+            last_activity_ts[0] = time.time()  # Reset idle timer on any output
             overflow = len(target) - capture_limit
             if overflow > 0:
                 del target[:overflow]
@@ -22677,9 +22682,17 @@ body{padding:18px}
                     meta["error"] = "Error: interrupted by user"
                     meta["exit_code"] = -130
                     break
-                elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
+                elif (not meta.get("error")) and timeout > 0 and (
+                    (now - last_activity_ts[0]) >= timeout
+                    or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
+                ):
+                    idle_secs = int(now - last_activity_ts[0])
+                    meta["error"] = (
+                        f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
+                        if (now - last_activity_ts[0]) >= timeout
+                        else f"Error: hard cap reached ({int(elapsed)}s)"
+                    )
                     _stop_process(proc)
-                    meta["error"] = f"Error: timeout ({timeout}s)"
                     meta["exit_code"] = -1
                     break
                 try:
@@ -22807,9 +22820,17 @@ body{padding:18px}
                                 meta["error"] = "Error: interrupted by user"
                                 meta["exit_code"] = -130
                                 break
-                            elif timeout > 0 and elapsed >= timeout:
+                            elif timeout > 0 and (
+                                (now - last_activity_ts[0]) >= timeout
+                                or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
+                            ):
+                                idle_secs = int(now - last_activity_ts[0])
+                                meta["error"] = (
+                                    f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
+                                    if (now - last_activity_ts[0]) >= timeout
+                                    else f"Error: hard cap reached ({int(elapsed)}s)"
+                                )
                                 _stop_process(proc)
-                                meta["error"] = f"Error: timeout ({timeout}s)"
                                 meta["exit_code"] = -1
                                 break
                             events = sel.select(timeout=0.12)
@@ -49623,7 +49644,7 @@ def _rag_embed_text(text: str, session: object, *, model: str = "") -> list[floa
         ollama = getattr(session, "ollama", None)
         if ollama is None:
             return None
-        embed_model = str(model or getattr(ollama, "embed_model", "") or "nomic-embed-text").strip()
+        embed_model = str(model or getattr(ollama, "embed_model", "") or "").strip()
         if not embed_model:
             return None
         result = ollama.embed(model=embed_model, input=str(text or "")[:4096])
@@ -49645,6 +49666,56 @@ def _rag_embed_batch(texts: list[str], session: object, *, model: str = "") -> l
         vec = _rag_embed_text(text, session, model=model)
         results.append(vec)
     return results
+
+
+def _rag_window_for_query(query: str) -> int:
+    """Return focused-excerpt window size based on query specificity.
+
+    Shorter / more targeted queries benefit from a tighter window so the
+    model receives only the most relevant snippet; broader queries can use
+    the full chunk size.
+    """
+    q = str(query or "").strip()
+    if len(q) < 30:
+        return 450   # Very specific: tight window
+    if len(q) < 80:
+        return 750   # Medium specificity
+    return 1200      # Broad query: full chunk
+
+
+def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 800) -> str:
+    """Extract a focused excerpt from *text* centred on the highest query-token density region.
+
+    Scans the text in small steps to find where query tokens appear most densely, then
+    returns a *window*-character slice around that centre.  Falls back to a leading excerpt
+    when no tokens match.  Ellipsis markers are added when text is trimmed.
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+    if len(text) <= window:
+        return text
+    tokens = [t.lower() for t in (query_tokens or []) if len(t) > 2]
+    if not tokens:
+        return text[:window] + ("…" if len(text) > window else "")
+    half = window // 2
+    step = max(40, window // 15)
+    best_center = half
+    best_count = 0
+    lo = text.lower()
+    for center in range(half, len(text) - half + 1, step):
+        segment = lo[max(0, center - half) : center + half]
+        count = sum(segment.count(t) for t in tokens)
+        if count > best_count:
+            best_count = count
+            best_center = center
+    start = max(0, best_center - half)
+    end = min(len(text), start + window)
+    start = max(0, end - window)
+    excerpt = text[start:end]
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + excerpt + suffix
 
 
 def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
@@ -51816,7 +51887,11 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
-                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "text": _rag_focused_excerpt(
+                        str(chunk.get("text", "")),
+                        list(qweights.keys()),
+                        window=_rag_window_for_query(query),
+                    ),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "citation": f"[{doc.get('id', '')}:{chunk_id}]",
                     "route_evidence": "chunk",
@@ -52447,6 +52522,22 @@ class TFGraphIDFIndex:
         return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, qvec=qvec)
 
     def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        _FILE_EXTS = {
+            ".pdf", ".md", ".txt", ".docx", ".doc", ".xlsx", ".xls",
+            ".csv", ".pptx", ".ppt", ".html", ".htm", ".json", ".xml",
+            ".epub", ".rtf", ".odt", ".ods",
+        }
+
+        def _clean_doc_label(raw: str) -> str:
+            s = str(raw or "").strip()
+            if not s:
+                return s
+            base, ext = os.path.splitext(s)
+            if ext.lower() in _FILE_EXTS and base:
+                s = base
+            s = re.sub(r"[_\-]+", " ", s).strip()
+            return s
+
         docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
         nodes: list[dict] = []
         edges: list[dict] = []
@@ -52465,7 +52556,7 @@ class TFGraphIDFIndex:
             nodes.append(
                 {
                     "id": doc_node,
-                    "label": str(doc.get("title", doc_id)),
+                    "label": _clean_doc_label(str(doc.get("title", doc_id))),
                     "type": "document",
                     "category": str(doc.get("category", "")),
                     "community": str(doc.get("community", "")),
