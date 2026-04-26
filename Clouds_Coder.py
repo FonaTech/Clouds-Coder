@@ -152,7 +152,10 @@ RAG_MAX_CHUNKS_PER_DOC = 500
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
-RAG_MAX_QUERY_RESULTS = 12
+RAG_MAX_QUERY_RESULTS = 64
+RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
+RAG_HIGH_RECALL_MIN_POOL = 64
+RAG_RETRIEVAL_MAX_PER_DOC = 5
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -172,7 +175,16 @@ RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
 RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
 RAG_MIN_SYNTHESIS_SCORE = 0.12       # chunks below this score are filtered before LLM synthesis
 RAG_NO_EVIDENCE_THRESHOLD = 0.18     # if best chunk score < this, skip LLM entirely and return no-evidence message
+RAG_WEAK_MATCH_SCORE_CAP = 0.095     # fuzzy fallback candidates stay visible but cannot trigger grounded synthesis
 RAG_SYNTHESIS_MAX_PER_DOC = 2        # max chunks from the same document in synthesis evidence
+RAG_WORKFLOW_ACCEPT_SCORE = 0.72
+RAG_NO_EVIDENCE_MESSAGE = "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+RAG_CONTEXT_BUDGETS = {
+    "tight": {"top_k": 6, "pool": 24, "chars": 3600, "evidence": 4},
+    "standard": {"top_k": 10, "pool": 48, "chars": 7200, "evidence": 6},
+    "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
+}
+RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
@@ -3602,6 +3614,8 @@ def split_thinking_content(text: str) -> tuple[str, str]:
     body = "".join(body_parts)
     body = re.sub(r"(?is)```(?:thinking|reasoning)\s*([\s\S]*?)```", _repl_block, body)
     body = re.sub(r"(?is)<\|start_of_thought\|>(.*?)<\|end_of_thought\|>", _repl_block, body)
+    # Strip orphaned closing tags left by providers that pre-extract thinking content
+    body = re.sub(r"(?is)</think\s*>", "", body)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     thinking = "\n\n".join(part for part in thinking_parts if part).strip()
     return body, trim(thinking, 24_000) if thinking else ""
@@ -10012,9 +10026,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "# Finish Protocol\n"
             "- Call finish_current_task when all required work is complete.\n"
             "- If an approved plan still has pending or in_progress steps, do NOT call finish_current_task yet.\n"
-            "- **REQUIRED before calling finish_current_task:** First output a conclusion as regular text (not a tool call). "
-            "This conclusion must include: (1) what was accomplished, (2) key files created/modified or key outcomes, "
-            "(3) any remaining work or next steps. Minimum 3 sentences. Do NOT skip this step.\n"
+            "- Include a concise summary of what was done.\n"
             "- For multi-agent mode: finish triggers auto-summary from blackboard state.\n"
             "- Do not finish if there are known failing tests or unresolved blockers.\n"
             "- If todos have stale pending items but work is done, finish anyway—stale items are cleared automatically.\n"
@@ -12530,6 +12542,23 @@ class OllamaClient:
             "raw": parsed,
         }
 
+    @staticmethod
+    def _collapse_tool_role_messages(messages: list[dict]) -> list[dict]:
+        """Convert role=tool messages to role=user for providers that don't support the tool role."""
+        out = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                out.append(msg)
+                continue
+            if str(msg.get("role", "")).strip() == "tool":
+                name = str(msg.get("name", "") or "").strip()
+                content = str(msg.get("content", "") or "").strip()
+                label = f"[Tool result: {name}]\n{content}" if name else f"[Tool result]\n{content}"
+                out.append({"role": "user", "content": label})
+            else:
+                out.append(msg)
+        return out
+
     def _chat_openai_compat(
         self,
         req_messages: list[dict],
@@ -12549,7 +12578,21 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        except OllamaError as exc:
+            # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
+            # Retry once with tool messages collapsed into user messages.
+            err_text = str(exc).lower()
+            if int(getattr(exc, "status", 0) or 0) == 400 and (
+                "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
+            ):
+                fallback_msgs = self._collapse_tool_role_messages(req_messages)
+                fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
+                fallback_payload.pop("tools", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+            else:
+                raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12625,6 +12668,25 @@ class OllamaClient:
             content = m.get("content", "") or ""
             if role == "system":
                 system_parts.append(str(content))
+            elif role == "tool":
+                # Convert OpenAI-style tool result (role=tool) to Anthropic tool_result block
+                tool_call_id = str(m.get("tool_call_id", "") or "").strip()
+                tool_content = str(content) if not isinstance(content, str) else content
+                if tool_call_id:
+                    block = {"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}
+                else:
+                    name = str(m.get("name", "") or "").strip()
+                    label = f"[Tool result: {name}]\n{tool_content}" if name else f"[Tool result]\n{tool_content}"
+                    block = {"type": "text", "text": label}
+                # Merge into previous user message if possible, else append new one
+                if messages and messages[-1].get("role") == "user":
+                    prev = messages[-1]["content"]
+                    if isinstance(prev, list):
+                        prev.append(block)
+                    else:
+                        messages[-1]["content"] = [{"type": "text", "text": str(prev)}, block]
+                else:
+                    messages.append({"role": "user", "content": [block]})
             else:
                 # Convert OpenAI-style image_url parts to Anthropic image format
                 if isinstance(content, list):
@@ -12663,6 +12725,11 @@ class OllamaClient:
             "content-type": "application/json",
         }
         raw = self._post_json_url(endpoint, payload, headers=headers)
+        # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
+        # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
+        if isinstance(raw.get("choices"), list) and tools:
+            payload["tools"] = tools  # original OpenAI-format tools
+            raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12996,7 +13063,8 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "workflow", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "language": {"type": "string"},
         },
         ["query"],
@@ -13012,7 +13080,8 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "category": {"type": "string"},
             "kind": {"type": "string"},
         },
@@ -13329,6 +13398,8 @@ class SessionState:
         self.uploads: list[dict] = []
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
         self.cancel_requested = False
@@ -14821,6 +14892,8 @@ class SessionState:
         self.runtime_plan_mode_needed = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta = {}
         return removed_hints
 
     def _restore_runtime_policy_from_blackboard_locked(self) -> None:
@@ -15837,6 +15910,9 @@ class SessionState:
         self.runtime_code_reference_text = trim(str(payload.get("code_text", payload.get("text", "")) or ""), 8000)
         meta = payload.get("code_meta", payload.get("meta", {}))
         self.runtime_code_reference_meta = dict(meta) if isinstance(meta, dict) else {}
+        self.runtime_knowledge_reference_text = trim(str(payload.get("knowledge_text", "") or ""), 8000)
+        knowledge_meta = payload.get("knowledge_meta", {})
+        self.runtime_knowledge_reference_meta = dict(knowledge_meta) if isinstance(knowledge_meta, dict) else {}
 
     def _runtime_code_reference_prompt_block(self, max_chars: int = 4200) -> str:
         text = trim(str(getattr(self, "runtime_code_reference_text", "") or ""), max_chars)
@@ -15856,7 +15932,31 @@ class SessionState:
         return (
             f"{header}:\n"
             "Prioritize these code-library references for code implementation/review tasks before generic reasoning. "
+            "If evidence_status=miss, say the code library has no sufficient matching evidence instead of inventing library facts. "
             "If a reference conflicts with the current workspace file, trust the current workspace after verification.\n"
+            f"{text}"
+        )
+
+    def _runtime_knowledge_reference_prompt_block(self, max_chars: int = 3600) -> str:
+        text = trim(str(getattr(self, "runtime_knowledge_reference_text", "") or ""), max_chars)
+        if not text:
+            return ""
+        meta = dict(getattr(self, "runtime_knowledge_reference_meta", {}) or {})
+        tags: list[str] = []
+        route = str(meta.get("route", meta.get("requested_route", "")) or "").strip()
+        if route:
+            tags.append(f"route={route}")
+        result_count = int(meta.get("result_count", meta.get("top_results", 0)) or 0)
+        tags.append(f"evidence_status={str(meta.get('evidence_status', 'miss') or 'miss')}")
+        if result_count > 0:
+            tags.append(f"results={result_count}")
+        header = "Knowledge Library Context"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "Use these knowledge-library references only for claims directly supported by the cited evidence. "
+            "If evidence_status=miss or the snippets do not contain the needed fact, state that the library has no sufficient evidence.\n"
             f"{text}"
         )
 
@@ -15889,7 +15989,8 @@ class SessionState:
             "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
             "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
             "to retrieve grounded references BEFORE generating your answer. "
-            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Use route='auto' with budget='standard' by default; use budget='tight' for brief context and budget='deep' only when the user asks for exhaustive retrieval. "
+            "If query results report evidence_status=miss or weak evidence, say the library has no sufficient evidence instead of inventing facts. "
             "Do not infer readiness from session/files or uploads — query the library directly."
         )
 
@@ -15962,7 +16063,8 @@ class SessionState:
             "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`."
             f"{source_hint} "
             "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
+            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library. "
+            "Use route='auto' with budget='standard' by default; use route='workflow' for process patterns and route='wiki' for accumulated code summaries."
         )
 
     def _engineering_execution_boost_instruction(self) -> str:
@@ -15997,6 +16099,7 @@ class SessionState:
         code_hint = self._code_library_prompt_block()
         engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
+        knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -16005,6 +16108,7 @@ class SessionState:
         knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
+        knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
@@ -16050,6 +16154,7 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{knowledge_ref_block_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
@@ -21311,9 +21416,7 @@ body{padding:18px}
         # Guard: approved-plan execution uses its own plan/todo progress UI; avoid redundant completion bubble
         if self.runtime_plan_approved or plan_phase == "executing":
             return
-        # Guard: in single-agent mode, skip only if the last worker assistant message
-        # is already substantial (≥800 chars) — a short or absent reply means we
-        # still want to generate the completion bubble.
+        # Guard: in single-agent mode the developer already replied directly — no redundant summary
         _exec_mode = self._effective_execution_mode()
         if _exec_mode == EXECUTION_MODE_SINGLE:
             for _m in reversed(self.messages[-20:]):
@@ -21322,10 +21425,7 @@ body{padding:18px}
                 _r = str(_m.get("role", "") or "")
                 _ar = str(_m.get("agent_role", "") or "")
                 if _r == "assistant" and _ar not in ("manager", "planner", ""):
-                    _last_content = str(_m.get("content", "") or "")
-                    if len(_last_content) >= 800:
-                        return
-                    break
+                    return
         _summary_role = "developer"
         try:
             board_md = self._blackboard_read_state_markdown(max_items=10)
@@ -21421,7 +21521,7 @@ body{padding:18px}
             })
             self._emit("message", {
                 "role": "assistant",
-                "text": trim(summary_text, 8000),
+                "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
                 "summary": "run completion summary",
                 "agent_role": _summary_role,
             })
@@ -21441,7 +21541,7 @@ body{padding:18px}
                 })
                 self._emit("message", {
                     "role": "assistant",
-                    "text": trim(summary_text, 8000),
+                    "text": trim(summary_text, int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS)),
                     "summary": "run completion summary (static)",
                     "agent_role": _summary_role,
                 })
@@ -33828,7 +33928,7 @@ body{padding:18px}
                 pass
             return result
         if name in {"finish_task", "finish_current_task", "mark_done"}:
-            summary = trim(str(args.get("summary", "") or "").strip(), 2000)
+            summary = trim(str(args.get("summary", "") or "").strip(), 400)
             bb_finish = self._ensure_blackboard()
             plan_steps = [
                 t for t in bb_finish.get("project_todos", [])
@@ -49478,7 +49578,7 @@ def _rag_mmr_select(
     lambda_param: float = 0.6,
     overlap_hard_threshold: float = 0.55,
     overlap_soft_threshold: float = 0.30,
-    max_per_doc: int = RAG_SYNTHESIS_MAX_PER_DOC,
+    max_per_doc: int = RAG_RETRIEVAL_MAX_PER_DOC,
 ) -> list[dict]:
     """Maximum Marginal Relevance selection with per-document capping.
 
@@ -49589,6 +49689,13 @@ def _rag_expand_tokens(tokens: list[str]) -> list[str]:
                 if token not in seen and not _rag_is_noise_token(token):
                     seen.add(token)
                     out.append(token)
+    phrase_tokens = [token for token in seen if " " in token]
+    for token in phrase_tokens:
+        for part in re.split(r"\s+", token):
+            part = part.strip().lower()
+            if len(part) >= 3 and part not in seen and not _rag_is_noise_token(part):
+                seen.add(part)
+                out.append(part)
     return out
 
 
@@ -49737,6 +49844,46 @@ def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 80
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(text) else ""
     return prefix + excerpt + suffix
+
+
+def _rag_query_variants(query: str, *, max_variants: int = 4) -> list[str]:
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = []
+
+    def _add(value: str) -> None:
+        value = trim(" ".join(str(value or "").split()), 360)
+        if not value:
+            return
+        low = value.lower()
+        if low not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    _add(raw)
+    entities = _rag_extract_entities(raw, limit=10)
+    if entities:
+        _add(" ".join(entities[:8]))
+    tokens = _rag_expand_tokens(_rag_tokenize(raw, max_terms=80))
+    important = []
+    seen: set[str] = set()
+    for token in tokens:
+        token = str(token).strip()
+        low = token.lower()
+        if not token or low in seen or _rag_is_noise_token(low):
+            continue
+        if len(low) < 3 and not re.search(r"[\u4e00-\u9fff]", low):
+            continue
+        seen.add(low)
+        important.append(token)
+        if len(important) >= 14:
+            break
+    if important:
+        _add(" ".join(important[:10]))
+    path_terms = re.findall(r"\b[\w./-]{2,}\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|toml|css|html|sql|go|rs|java|cpp|c|h)\b", raw, flags=re.IGNORECASE)
+    if path_terms:
+        _add(" ".join(path_terms[:8]))
+    return variants[: max(1, int(max_variants or 4))]
 
 
 def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
@@ -51784,7 +51931,7 @@ class TFGraphIDFIndex:
                 ]
             ).strip("|")
             if not key:
-                key = trim(json_dumps(row, sort_keys=True), 240)
+                key = trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 240)
             if key in seen:
                 continue
             seen.add(key)
@@ -51933,7 +52080,7 @@ class TFGraphIDFIndex:
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -51949,6 +52096,7 @@ class TFGraphIDFIndex:
                         "entities": list(doc.get("entities", []) or [])[:12],
                         "citation": f"[{doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -52069,12 +52217,14 @@ class TFGraphIDFIndex:
             if qcat and str(qcat) in [str(x) for x in (report.get("top_categories", []) or [])]:
                 graph_bonus += 0.08
             final_score = lexical * 0.72 + graph_bonus
+            weak_match = False
             if final_score <= 0.0:
                 ratio = difflib.SequenceMatcher(None, query.lower()[:280], str(report.get("report", "")).lower()[:1200]).ratio()
                 if ratio < 0.18:
                     continue
                 lexical = ratio
-                final_score = ratio * 0.62 + graph_bonus
+                final_score = min(ratio * 0.62 + graph_bonus, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
             community_rows.append(
                 {
                     "score": round(final_score, 6),
@@ -52094,6 +52244,7 @@ class TFGraphIDFIndex:
                     "citation": f"[community:{community}]",
                     "route_evidence": "community_report",
                     "sort_bias": 0.18,
+                    "weak_match": weak_match,
                 }
             )
         community_rows.sort(
@@ -52173,6 +52324,10 @@ class TFGraphIDFIndex:
             qbundle=(qweights, qnorm, qentities, qcat),
         )
         support_rows = list(support.get("results", []) or [])
+        strong_support_rows = [
+            row for row in support_rows
+            if (not bool(row.get("weak_match", False))) and float(row.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE
+        ]
         support_entities: Counter[str] = Counter()
         support_titles: list[str] = []
         evidence_lines: list[str] = []
@@ -52229,11 +52384,14 @@ class TFGraphIDFIndex:
         map_text = trim("\n".join(map_lines), 2600)
         map_score = max(
             float(community_row.get("score", 0.0) or 0.0),
-            0.34
-            + min(0.20, 0.05 * len(support_rows))
+            (0.34 if strong_support_rows or float(community_row.get("lexical_score", 0.0) or 0.0) >= 0.04 else RAG_WEAK_MATCH_SCORE_CAP)
+            + min(0.20, 0.05 * len(strong_support_rows))
             + min(0.14, 0.04 * len(overlap_entities))
             + (0.05 if links else 0.0),
         )
+        weak_map = not strong_support_rows and float(community_row.get("lexical_score", 0.0) or 0.0) < 0.04
+        if weak_map:
+            map_score = min(map_score, RAG_WEAK_MATCH_SCORE_CAP)
         return (
             {
                 "score": round(map_score, 6),
@@ -52254,6 +52412,7 @@ class TFGraphIDFIndex:
                 "route_evidence": "community_map",
                 "sort_bias": 0.28,
                 "evidence_citations": support_citations[:6],
+                "weak_match": weak_map,
             },
             support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT],
         )
@@ -52318,10 +52477,14 @@ class TFGraphIDFIndex:
         score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
         # Only give sort_bias boost if underlying support evidence is sufficiently strong
         max_support_score = max(
-            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8]),
+            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8] if not bool(r.get("weak_match", False))),
             default=0.0,
         )
         synthesis_sort_bias = 0.38 if max_support_score >= 0.25 else 0.05
+        weak_reduce = max_support_score < RAG_MIN_SYNTHESIS_SCORE
+        if weak_reduce:
+            score = min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            synthesis_sort_bias = 0.0
         return {
             "score": round(score, 6),
             "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
@@ -52340,6 +52503,8 @@ class TFGraphIDFIndex:
             "citation": "[global-synthesis]",
             "route_evidence": "community_reduce",
             "sort_bias": synthesis_sort_bias,
+            "evidence_citations": evidence_anchors[:6],
+            "weak_match": weak_reduce,
         }
 
     def _global_query(
@@ -52488,6 +52653,7 @@ class TFGraphIDFIndex:
                 "mode": "hybrid",
                 "fast_count": len(fast_rows),
                 "global_count": len(global_rows),
+                "hybrid_high_recall": True,
                 "selected_communities": list(global_out.get("route_meta", {}).get("selected_communities", []) or [])[:6],
                 "map_count": int(global_out.get("route_meta", {}).get("map_count", 0) or 0),
                 "reduce_mode": str(global_out.get("route_meta", {}).get("reduce_mode", "") or ""),
@@ -53210,6 +53376,939 @@ class RAGLibraryStore:
         }
 
 
+class WikiStore:
+    """Persistent Markdown wiki layer built from library documents and chunks.
+
+    The wiki is deliberately file-first: Markdown pages are the durable artifact,
+    while query-time scoring builds a lightweight high-recall index over those
+    pages. Raw chunk retrieval remains available as fallback evidence.
+    """
+
+    def __init__(self, library_root: Path, *, kind: str = "knowledge"):
+        self.library_root = Path(library_root).resolve()
+        self.kind = str(kind or "knowledge").strip().lower() or "knowledge"
+        self.root = self.library_root / "wiki"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.sources_root = self.root / "sources"
+        self.entities_root = self.root / "entities"
+        self.concepts_root = self.root / "concepts"
+        self.synthesis_root = self.root / "synthesis"
+        self.workflows_root = self.root / "workflows"
+        for path in (
+            self.sources_root,
+            self.entities_root,
+            self.concepts_root,
+            self.synthesis_root,
+            self.workflows_root,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.root / "index.md"
+        self.log_path = self.root / "log.md"
+        self.schema_path = self.root / "schema.md"
+        self.state_path = self.root / "wiki_state.json"
+        self.lock = threading.RLock()
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self._write_schema()
+        self.thread = threading.Thread(target=self._worker_loop, name=f"{self.kind}-wiki-compiler", daemon=True)
+        self.thread.start()
+
+    def _write_schema(self):
+        title = "Knowledge Wiki" if self.kind == "knowledge" else "Code Wiki"
+        body = (
+            f"# {title} Schema\n\n"
+            "This directory is generated and maintained by Clouds_Coder.\n\n"
+            "## Layers\n\n"
+            "- `sources/`: one page per imported source document or source file.\n"
+            "- `entities/`: pages grouped by recurring entities, symbols, or domain terms.\n"
+            "- `concepts/`: community and synthesis pages derived from graph structure.\n"
+            "- `synthesis/overview.md`: compact library-wide map.\n"
+            "- `index.md`: content catalog used as the first retrieval hop.\n"
+            "- `log.md`: chronological append-only maintenance log.\n\n"
+            "## Query Policy\n\n"
+            "Use Wiki pages first for accumulated synthesis, then fall back to raw chunks "
+            "when exact evidence or line-level details are needed.\n"
+        )
+        _write_text_if_changed(self.schema_path, body)
+
+    def shutdown(self, timeout: float = 1.0):
+        self.stop_event.set()
+        try:
+            self.queue.put_nowait({"type": "__stop__"})
+        except Exception:
+            pass
+        try:
+            self.thread.join(timeout=max(0.1, float(timeout or 0.1)))
+        except Exception:
+            pass
+
+    def enqueue_compile(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "ingest"):
+        ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        self.queue.put({"type": "compile", "store": store, "doc_ids": ids, "reason": str(reason or "ingest")})
+
+    def enqueue_rebuild(self, store: RAGLibraryStore, *, reason: str = "rebuild"):
+        self.queue.put({"type": "compile", "store": store, "doc_ids": [], "reason": str(reason or "rebuild")})
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            try:
+                if not isinstance(job, dict):
+                    continue
+                if str(job.get("type", "")) == "__stop__":
+                    break
+                store = job.get("store")
+                if isinstance(store, RAGLibraryStore):
+                    self.compile_from_store(
+                        store,
+                        doc_ids=[str(x) for x in (job.get("doc_ids", []) or []) if str(x).strip()],
+                        reason=str(job.get("reason", "ingest") or "ingest"),
+                    )
+            except Exception as exc:
+                self._append_log("compile-error", f"{type(exc).__name__}: {trim(str(exc), 220)}")
+            finally:
+                try:
+                    self.queue.task_done()
+                except Exception:
+                    pass
+
+    def _slug(self, raw: object, fallback: str = "page") -> str:
+        text = str(raw or "").strip()
+        if not text:
+            text = fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 80).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        clean: dict[str, object] = {}
+        for key, value in meta.items():
+            if isinstance(value, (str, int, float, bool)):
+                clean[str(key)] = value
+            elif isinstance(value, list):
+                clean[str(key)] = [str(x) for x in value[:80] if str(x).strip()]
+        lines = ["---"]
+        for key, value in clean.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            else:
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _append_log(self, action: str, detail: str):
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        line = f"## [{stamp}] {str(action or 'update')} | {trim(detail, 180)}\n\n"
+        with self.lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+
+    def _source_page_path(self, doc_id: str) -> Path:
+        return self.sources_root / f"{self._slug(doc_id, 'source')}.md"
+
+    def _write_source_page(self, doc: dict, chunks: list[dict]) -> str:
+        doc_id = str(doc.get("id", "") or "").strip()
+        title = str(doc.get("title", doc.get("filename", doc_id)) or doc_id).strip()
+        entities = [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()]
+        source_rel = str(doc.get("source_rel_path", "") or doc.get("filename", "") or "").strip()
+        summary = trim(str(doc.get("summary", "") or ""), 1800)
+        parts = [
+            self._frontmatter(
+                {
+                    "id": f"wiki-source-{doc_id}",
+                    "type": "source",
+                    "title": title,
+                    "source_doc_ids": [doc_id],
+                    "category": str(doc.get("category", "") or ""),
+                    "kind": str(doc.get("kind", "") or ""),
+                    "language": str(doc.get("language", "") or ""),
+                    "updated_at": float(doc.get("updated_at", now_ts()) or now_ts()),
+                    "tags": list(doc.get("labels", []) or [])[:24],
+                    "entities": entities[:24],
+                }
+            ),
+            f"# {title}\n\n",
+        ]
+        if source_rel:
+            parts.append(f"- Source path: `{source_rel}`\n")
+        if str(doc.get("sha256", "") or "").strip():
+            parts.append(f"- SHA256: `{str(doc.get('sha256', '') or '')}`\n")
+        if entities:
+            parts.append("- Entities: " + ", ".join(f"[[entities/{self._slug(ent, 'entity')}|{ent}]]" for ent in entities[:18]) + "\n")
+        if summary:
+            parts.append("\n## Summary\n\n" + summary + "\n")
+        if chunks:
+            parts.append("\n## Evidence Excerpts\n\n")
+            for chunk in chunks[:10]:
+                anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
+                text = trim(str(chunk.get("text", "") or ""), 900)
+                if text:
+                    parts.append(f"### {anchor}\n\n{text}\n\n")
+        path = self._source_page_path(doc_id)
+        _write_text_if_changed(path, "".join(parts).rstrip() + "\n")
+        return self._rel(path)
+
+    def _write_entity_pages(self, docs: dict[str, dict]) -> list[str]:
+        entity_docs: dict[str, list[dict]] = defaultdict(list)
+        for doc in docs.values():
+            for ent in [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()][:32]:
+                entity_docs[ent].append(doc)
+        written: list[str] = []
+        for ent, rows in sorted(entity_docs.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))[:420]:
+            slug = self._slug(ent, "entity")
+            path = self.entities_root / f"{slug}.md"
+            doc_ids = [str(row.get("id", "") or "") for row in rows if str(row.get("id", "") or "").strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-entity-{slug}",
+                        "type": "entity",
+                        "title": ent,
+                        "source_doc_ids": doc_ids[:80],
+                        "updated_at": now_ts(),
+                        "tags": ["entity", self.kind],
+                    }
+                ),
+                f"# {ent}\n\n",
+                f"Appears in {len(doc_ids)} source(s).\n\n",
+                "## Sources\n\n",
+            ]
+            for row in rows[:24]:
+                title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+                summary = trim(str(row.get("summary", "") or ""), 260)
+                body.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]")
+                if summary:
+                    body.append(f": {summary}")
+                body.append("\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_concept_pages(self, store: RAGLibraryStore) -> list[str]:
+        reports = getattr(store.index, "community_reports", {}) or {}
+        written: list[str] = []
+        for community, report in sorted(reports.items(), key=lambda kv: int((kv[1] or {}).get("doc_count", 0) or 0), reverse=True)[:240]:
+            if not isinstance(report, dict):
+                continue
+            title = str(community or "concept")
+            slug = self._slug(title, "concept")
+            path = self.concepts_root / f"{slug}.md"
+            doc_ids = [str(x) for x in (report.get("doc_ids", []) or []) if str(x).strip()]
+            top_entities = [str(x) for x in (report.get("top_entities", []) or []) if str(x).strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-concept-{slug}",
+                        "type": "concept",
+                        "title": title,
+                        "source_doc_ids": doc_ids[:100],
+                        "updated_at": now_ts(),
+                        "tags": ["concept", self.kind],
+                        "entities": top_entities[:24],
+                    }
+                ),
+                f"# {title}\n\n",
+                trim(str(report.get("report", "") or ""), 5000),
+                "\n\n## Representative Sources\n\n",
+            ]
+            for row in (report.get("representative_docs", []) or [])[:12]:
+                if not isinstance(row, dict):
+                    continue
+                doc_id = str(row.get("id", "") or "")
+                label = str(row.get("title", doc_id) or doc_id)
+                body.append(f"- [[sources/{self._slug(doc_id, 'source')}|{label}]]\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_overview_and_index(self, docs: dict[str, dict], page_rows: list[dict]):
+        overview = [
+            self._frontmatter(
+                {
+                    "id": f"{self.kind}-wiki-overview",
+                    "type": "overview",
+                    "title": f"{self.kind.title()} Wiki Overview",
+                    "updated_at": now_ts(),
+                    "tags": ["overview", self.kind],
+                }
+            ),
+            f"# {self.kind.title()} Wiki Overview\n\n",
+            f"- Sources: {len(docs)}\n",
+            f"- Pages: {len(page_rows)}\n",
+            f"- Generated at: {datetime.now().astimezone().isoformat()}\n\n",
+            "## Recent Sources\n\n",
+        ]
+        for row in sorted(docs.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)[:16]:
+            title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+            overview.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]\n")
+        _write_text_if_changed(self.synthesis_root / "overview.md", "".join(overview).rstrip() + "\n")
+        by_type: dict[str, list[dict]] = defaultdict(list)
+        for row in page_rows:
+            by_type[str(row.get("type", "page") or "page")].append(row)
+        index = [
+            f"# {self.kind.title()} Wiki Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            "Read `schema.md` for maintenance conventions. Query uses this index first, then drills into pages.\n\n",
+        ]
+        for typ in ("overview", "source", "entity", "concept", "workflow"):
+            rows = by_type.get(typ, [])
+            if not rows:
+                continue
+            index.append(f"## {typ.title()} Pages\n\n")
+            for row in rows[:500]:
+                path = str(row.get("path", "") or "")
+                title = str(row.get("title", Path(path).stem) or Path(path).stem)
+                summary = trim(str(row.get("summary", "") or ""), 160)
+                index.append(f"- [[{path}|{title}]]")
+                if summary:
+                    index.append(f" - {summary}")
+                index.append("\n")
+            index.append("\n")
+        _write_text_if_changed(self.index_path, "".join(index).rstrip() + "\n")
+
+    def _page_meta_from_text(self, text: str) -> dict:
+        raw = str(text or "")
+        if not raw.startswith("---"):
+            return {}
+        end = raw.find("\n---", 3)
+        if end < 0:
+            return {}
+        block = raw[3:end].strip()
+        if not block:
+            return {}
+        if _yaml is not None:
+            try:
+                obj = _yaml.safe_load(block)
+                return dict(obj) if isinstance(obj, dict) else {}
+            except Exception:
+                pass
+        meta: dict[str, object] = {}
+        current_key = ""
+        for line in block.splitlines():
+            if line.startswith("  - ") and current_key:
+                meta.setdefault(current_key, [])
+                if isinstance(meta[current_key], list):
+                    meta[current_key].append(line[4:].strip().strip("\"'"))
+                continue
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            current_key = key.strip()
+            val = val.strip()
+            if not val:
+                meta[current_key] = []
+                continue
+            try:
+                meta[current_key] = json.loads(val)
+            except Exception:
+                meta[current_key] = val.strip("\"'")
+        return meta
+
+    def _scan_pages(self) -> list[dict]:
+        pages: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name in {"schema.md", "log.md"}:
+                continue
+            if self.kind == "code":
+                try:
+                    rel_probe = path.resolve().relative_to(self.root.resolve()).as_posix()
+                    if rel_probe.startswith("workflows/"):
+                        continue
+                except Exception:
+                    pass
+            text = try_read_text(path, max_bytes=260_000) or ""
+            if not text.strip():
+                continue
+            meta = self._page_meta_from_text(text)
+            rel = self._rel(path)
+            title = str(meta.get("title", "") or path.stem).strip()
+            typ = str(meta.get("type", "") or ("overview" if rel == "synthesis/overview.md" else "page"))
+            body = re.sub(r"(?s)^---.*?---\s*", "", text).strip()
+            pages.append(
+                {
+                    "path": rel,
+                    "title": title,
+                    "type": typ,
+                    "summary": trim(body.replace("\n", " "), 420),
+                    "text": body,
+                    "meta": meta,
+                }
+            )
+        return pages
+
+    def compile_from_store(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "rebuild") -> dict:
+        with store.lock:
+            docs = {str(k): dict(v) for k, v in store.documents.items()}
+            chunks = {str(k): dict(v) for k, v in store.chunks.items()}
+        target_ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        if not target_ids:
+            target_ids = list(docs.keys())
+        written_sources: list[str] = []
+        for doc_id in target_ids:
+            doc = docs.get(doc_id)
+            if not doc:
+                continue
+            doc_chunks = [chunks[cid] for cid in (doc.get("chunk_ids", []) or []) if cid in chunks]
+            written_sources.append(self._write_source_page(doc, doc_chunks))
+        entity_pages = self._write_entity_pages(docs)
+        concept_pages = self._write_concept_pages(store)
+        page_rows = self._scan_pages()
+        self._write_overview_and_index(docs, page_rows)
+        payload = {
+            "kind": self.kind,
+            "updated_at": now_ts(),
+            "documents": len(docs),
+            "pages": len(page_rows),
+            "last_reason": str(reason or "rebuild"),
+            "last_doc_ids": target_ids[-80:],
+        }
+        _write_json_file(self.state_path, payload)
+        self._append_log(str(reason or "compile"), f"sources={len(written_sources)} entities={len(entity_pages)} concepts={len(concept_pages)}")
+        return {"ok": True, **payload}
+
+    def payload(self, limit: int = 240) -> dict:
+        pages = self._scan_pages()
+        state = _read_json_file(self.state_path, {})
+        return {
+            "root": str(self.root),
+            "kind": self.kind,
+            "state": state if isinstance(state, dict) else {},
+            "page_count": len(pages),
+            "pages": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "type": str(row.get("type", "")),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in pages[: max(0, int(limit or 240))]
+            ],
+        }
+
+    def lint(self) -> dict:
+        pages = self._scan_pages()
+        links: Counter[str] = Counter()
+        existing = {str(row.get("path", "")) for row in pages}
+        orphan_pages: list[str] = []
+        missing_links: list[str] = []
+        for row in pages:
+            for target in re.findall(r"\[\[([^\]|#]+)", str(row.get("text", "") or "")):
+                target_norm = target.strip().lstrip("/")
+                links[target_norm] += 1
+                if not any(p == target_norm or p.startswith(target_norm + ".") or p.startswith(target_norm + "/") for p in existing):
+                    missing_links.append(target_norm)
+        for row in pages:
+            path = str(row.get("path", "") or "")
+            if path in {"index.md", "synthesis/overview.md"}:
+                continue
+            stem = path[:-3] if path.endswith(".md") else path
+            if links.get(path, 0) <= 0 and links.get(stem, 0) <= 0:
+                orphan_pages.append(path)
+        return {
+            "ok": True,
+            "page_count": len(pages),
+            "orphan_pages": orphan_pages[:120],
+            "missing_links": sorted(set(missing_links))[:120],
+            "pending_jobs": int(self.queue.qsize()),
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, category: str = "", kind: str = "") -> dict:
+        query = str(query_text or "").strip()
+        pages = self._scan_pages()
+        if not query or not pages:
+            return {"query": query, "results": [], "summary": "", "route": "wiki", "route_meta": {"mode": "wiki"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qentities = set(_rag_filter_entities(_rag_extract_entities(query), limit=24))
+        qlow = query.lower()
+        rows: list[dict] = []
+        for page in pages:
+            meta = page.get("meta", {}) if isinstance(page.get("meta"), dict) else {}
+            page_type = str(page.get("type", "") or "")
+            if page_type == "workflow":
+                continue
+            if category and page_type == "source" and str(meta.get("category", "") or "") != category:
+                continue
+            if kind and page_type == "source" and str(meta.get("kind", "") or "") != kind:
+                continue
+            title = str(page.get("title", "") or "")
+            text = str(page.get("text", "") or "")
+            hay_title = title.lower()
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in hay_title)
+            meta_entities = {str(x).strip() for x in (meta.get("entities", []) or []) if str(x).strip()} if isinstance(meta.get("entities", []), list) else set()
+            ent_overlap = len(qentities.intersection(meta_entities))
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1400]).ratio()
+            score = lexical * 0.72 + min(0.24, 0.08 * title_hits) + min(0.24, 0.08 * ent_overlap)
+            weak_match = False
+            if score <= 0.0 and fuzzy >= 0.10:
+                score = min(fuzzy * 0.55, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            source_doc_ids = [str(x) for x in (meta.get("source_doc_ids", []) or []) if str(x).strip()] if isinstance(meta.get("source_doc_ids", []), list) else []
+            window = _rag_window_for_query(query)
+            excerpt = _rag_focused_excerpt(text, tokens, window=max(700, window), dense_match=fuzzy > 0.18)
+            rows.append(
+                {
+                    "score": round(float(score), 6),
+                    "lexical_score": round(float(lexical), 6),
+                    "graph_score": round(float(min(0.4, 0.08 * ent_overlap + 0.04 * title_hits)), 6),
+                    "doc_id": source_doc_ids[0] if source_doc_ids else "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(page.get("path", ""))).name,
+                    "kind": page_type or "wiki_page",
+                    "category": "wiki",
+                    "language": "markdown",
+                    "community": str(meta.get("community", "") or ""),
+                    "anchor": str(page.get("path", "") or ""),
+                    "text": trim(excerpt, 1800),
+                    "entities": list(meta_entities)[:12],
+                    "citation": f"[wiki:{str(page.get('path', '') or '')}]",
+                    "route_evidence": "wiki_page",
+                    "evidence_layer": "wiki",
+                    "wiki_page": str(page.get("path", "") or ""),
+                    "source_doc_ids": source_doc_ids[:24],
+                    "sort_bias": 0.18 if page_type in {"overview", "concept", "entity"} else 0.10,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "wiki",
+            "route_meta": {"mode": "wiki", "page_count": len(pages), "candidate_count": len(rows)},
+            "query_entities": sorted(qentities),
+        }
+
+
+class WorkflowMemoryStore:
+    """Accepted programming workflow patterns captured from finished sessions."""
+
+    def __init__(self, code_root: Path):
+        self.code_root = Path(code_root).resolve()
+        self.root = self.code_root / "wiki" / "workflows"
+        self.accepted_root = self.root / "accepted"
+        self.candidates_root = self.root / "candidates"
+        self.rejected_root = self.root / "rejected"
+        for path in (self.accepted_root, self.candidates_root, self.rejected_root):
+            path.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "workflow_state.json"
+        self.index_path = self.root / "index.md"
+        self.lock = threading.RLock()
+        self.state = _read_json_file(self.state_path, {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0})
+        if not isinstance(self.state, dict):
+            self.state = {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0}
+        self._write_index()
+
+    def shutdown(self, timeout: float = 0.0):
+        return
+
+    def _slug(self, raw: object, fallback: str = "workflow") -> str:
+        text = str(raw or "").strip() or fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 96).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        lines = ["---"]
+        for key, value in meta.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value[:80]:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            elif isinstance(value, (str, int, float, bool)):
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _extract_operation_rows(self, sess: object) -> list[dict]:
+        rows = []
+        try:
+            raw_rows = list(getattr(sess, "operations", []) or [])[-220:]
+        except Exception:
+            raw_rows = []
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                continue
+            tool = str(raw.get("tool", raw.get("name", raw.get("type", ""))) or "").strip()
+            status = str(raw.get("status", raw.get("result", "")) or "").strip()
+            summary = trim(str(raw.get("summary", raw.get("content", raw.get("text", ""))) or ""), 220)
+            args = raw.get("args", raw.get("input", {}))
+            if isinstance(args, dict) and not summary:
+                summary = trim(json_dumps({k: args.get(k) for k in list(args.keys())[:6]}, indent=None), 220)
+            rows.append(
+                {
+                    "tool": tool,
+                    "status": status,
+                    "summary": summary,
+                    "time": float(raw.get("time", raw.get("ts", raw.get("created_at", 0.0))) or 0.0),
+                }
+            )
+        return rows
+
+    def _extract_text_tail(self, value: object, limit: int = 10, chars: int = 360) -> list[str]:
+        out: list[str] = []
+        if isinstance(value, dict):
+            rows = list(value.values())
+        elif isinstance(value, list):
+            rows = list(value)
+        else:
+            rows = []
+        for row in rows[-limit:]:
+            if isinstance(row, dict):
+                text = str(row.get("content", row.get("summary", row.get("text", row.get("message", "")))) or "")
+            else:
+                text = str(row or "")
+            text = trim(text.replace("\n", " "), chars)
+            if text:
+                out.append(text)
+        return out
+
+    def _score_capture(self, capture: dict) -> tuple[float, list[str]]:
+        text = "\n".join(
+            [
+                str(capture.get("objective", "") or ""),
+                "\n".join(str(x) for x in (capture.get("operation_summaries", []) or [])),
+                "\n".join(str(x) for x in (capture.get("message_tail", []) or [])),
+                "\n".join(str(x) for x in (capture.get("blackboard_tail", []) or [])),
+            ]
+        ).lower()
+        tools = [str(row.get("tool", "") or "").lower() for row in (capture.get("operations", []) or []) if isinstance(row, dict)]
+        todo_rows = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        score = 0.18
+        reasons: list[str] = ["base-session-fingerprint"]
+        if any(term in text for term in ("finish", "completed", "完成", "done", "success")):
+            score += 0.18
+            reasons.append("explicit-completion-signal")
+        if any(tool in {"file_patch", "apply_patch", "write_file", "edit_file"} or "patch" in tool or "write" in tool for tool in tools):
+            score += 0.16
+            reasons.append("code-edit-operation")
+        if any(tool in {"run_shell", "bash", "shell", "exec"} or "test" in tool for tool in tools) or any(term in text for term in ("pytest", "unittest", "npm test", "py_compile", "build succeeded", "tests passed", "验证", "测试")):
+            score += 0.16
+            reasons.append("validation-or-test-step")
+        if todo_rows:
+            completed = sum(1 for row in todo_rows if str(row.get("status", "") or "").lower() == "completed")
+            if completed >= max(1, len(todo_rows) // 2):
+                score += 0.12
+                reasons.append("todo-progress")
+        if any(term in text for term in ("plan", "checklist", "步骤", "计划", "in_progress", "pending")):
+            score += 0.08
+            reasons.append("structured-planning")
+        if any(term in text for term in ("blackboard", "delegate", "agent", "explorer", "worker", "reviewer", "handoff", "交接", "节点")):
+            score += 0.08
+            reasons.append("multi-node-coordination")
+        if any(term in text for term in ("traceback", "failed", "error", "exception", "失败", "报错")):
+            score -= 0.06
+            reasons.append("contains-failure-signal")
+        if any(term in text for term in ("fixed", "resolved", "pass", "ok", "修复", "通过")):
+            score += 0.08
+            reasons.append("recovery-or-pass-signal")
+        return max(0.0, min(1.0, round(score, 4))), reasons[:12]
+
+    def _capture_from_session(self, sess: object) -> dict:
+        sid = str(getattr(sess, "id", "") or "").strip()
+        title = trim(str(getattr(sess, "title", "") or sid or "workflow"), 160)
+        operations = self._extract_operation_rows(sess)
+        op_summaries = []
+        for row in operations[-48:]:
+            label = str(row.get("tool", "") or "operation")
+            summary = str(row.get("summary", "") or str(row.get("status", "") or ""))
+            if summary:
+                op_summaries.append(f"{label}: {summary}")
+            else:
+                op_summaries.append(label)
+        try:
+            todos = getattr(getattr(sess, "todo", None), "snapshot")()
+        except Exception:
+            todos = []
+        if not isinstance(todos, list):
+            todos = []
+        try:
+            blackboard = getattr(sess, "blackboard", {}) or {}
+        except Exception:
+            blackboard = {}
+        capture = {
+            "session_id": sid,
+            "title": title,
+            "objective": trim(str(getattr(sess, "runtime_direct_objective", "") or title), 800),
+            "created_at": now_ts(),
+            "operations": operations,
+            "operation_summaries": op_summaries[-48:],
+            "todos": [dict(x) for x in todos[-40:] if isinstance(x, dict)],
+            "message_tail": self._extract_text_tail(getattr(sess, "agent_messages", []), limit=12, chars=420),
+            "blackboard_tail": self._extract_text_tail(blackboard, limit=16, chars=420),
+            "code_preview_paths": sorted(list((getattr(sess, "code_preview_index", {}) or {}).keys()))[:40]
+            if isinstance(getattr(sess, "code_preview_index", {}), dict)
+            else [],
+        }
+        score, reasons = self._score_capture(capture)
+        capture["score"] = score
+        capture["score_reasons"] = reasons
+        capture["accepted"] = bool(score >= RAG_WORKFLOW_ACCEPT_SCORE)
+        return capture
+
+    def _write_capture_card(self, capture: dict) -> Path:
+        sid = str(capture.get("session_id", "") or make_id("workflow"))
+        score = float(capture.get("score", 0.0) or 0.0)
+        accepted = bool(capture.get("accepted", False))
+        target_root = self.accepted_root if accepted else self.candidates_root
+        filename = f"{self._slug(sid, 'workflow')}-{int(score * 100):02d}.md"
+        path = target_root / filename
+        body = [
+            self._frontmatter(
+                {
+                    "id": f"workflow-{sid}",
+                    "type": "workflow",
+                    "title": str(capture.get("title", "") or sid),
+                    "session_id": sid,
+                    "score": score,
+                    "accepted": accepted,
+                    "updated_at": float(capture.get("created_at", now_ts()) or now_ts()),
+                    "tags": ["workflow", "code", "accepted" if accepted else "candidate"],
+                }
+            ),
+            f"# {str(capture.get('title', '') or sid)}\n\n",
+            f"- Score: `{score:.2f}`\n",
+            f"- Accepted: `{str(accepted).lower()}`\n",
+            "- Reasons: " + ", ".join(str(x) for x in (capture.get("score_reasons", []) or [])) + "\n\n",
+            "## Objective\n\n",
+            trim(str(capture.get("objective", "") or ""), 1200) + "\n\n",
+            "## Workflow Steps\n\n",
+        ]
+        for line in (capture.get("operation_summaries", []) or [])[:48]:
+            body.append(f"- {trim(str(line), 260)}\n")
+        todos = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        if todos:
+            body.append("\n## Todo Pattern\n\n")
+            for row in todos[:24]:
+                body.append(f"- `{str(row.get('status', '') or 'pending')}` {trim(str(row.get('content', '') or ''), 220)}\n")
+        if capture.get("code_preview_paths"):
+            body.append("\n## Code Artifacts\n\n")
+            for item in (capture.get("code_preview_paths", []) or [])[:32]:
+                body.append(f"- `{str(item)}`\n")
+        tail = list(capture.get("blackboard_tail", []) or []) + list(capture.get("message_tail", []) or [])
+        if tail:
+            body.append("\n## Context Signals\n\n")
+            for line in tail[:20]:
+                body.append(f"- {trim(str(line), 360)}\n")
+        _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+        return path
+
+    def _scan_cards(self) -> list[dict]:
+        cards: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name == "index.md":
+                continue
+            text = try_read_text(path, max_bytes=180_000) or ""
+            if not text.strip():
+                continue
+            meta: dict = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end > 0:
+                    raw_meta = text[3:end].strip()
+                    if _yaml is not None:
+                        try:
+                            obj = _yaml.safe_load(raw_meta)
+                            meta = dict(obj) if isinstance(obj, dict) else {}
+                        except Exception:
+                            meta = {}
+                    body = text[end + 4 :].strip()
+                else:
+                    body = text
+            else:
+                body = text
+            cards.append(
+                {
+                    "path": self._rel(path),
+                    "title": str(meta.get("title", path.stem) or path.stem),
+                    "score": float(meta.get("score", 0.0) or 0.0),
+                    "accepted": bool(meta.get("accepted", "accepted" in path.parts)),
+                    "text": body,
+                    "summary": trim(body.replace("\n", " "), 320),
+                    "meta": meta,
+                }
+            )
+        return cards
+
+    def _write_index(self):
+        cards = self._scan_cards()
+        accepted = [row for row in cards if bool(row.get("accepted", False))]
+        candidates = [row for row in cards if not bool(row.get("accepted", False))]
+        body = [
+            "# Code Workflow Memory Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            f"- Accepted: {len(accepted)}\n",
+            f"- Candidates: {len(candidates)}\n\n",
+        ]
+        for heading, rows in (("Accepted", accepted), ("Candidates", candidates)):
+            if not rows:
+                continue
+            body.append(f"## {heading}\n\n")
+            for row in sorted(rows, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[:200]:
+                body.append(f"- [[{row.get('path')}|{row.get('title')}]] score={float(row.get('score', 0.0) or 0.0):.2f}")
+                summary = trim(str(row.get("summary", "") or ""), 140)
+                if summary:
+                    body.append(f" - {summary}")
+                body.append("\n")
+            body.append("\n")
+        _write_text_if_changed(self.index_path, "".join(body).rstrip() + "\n")
+
+    def capture_session(self, sess: object) -> dict:
+        capture = self._capture_from_session(sess)
+        sid = str(capture.get("session_id", "") or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id missing"}
+        with self.lock:
+            captures = self.state.get("captures", {})
+            if not isinstance(captures, dict):
+                captures = {}
+            previous = captures.get(sid)
+            if isinstance(previous, dict) and float(previous.get("score", 0.0) or 0.0) >= float(capture.get("score", 0.0) or 0.0):
+                return {"ok": True, "skipped": True, "reason": "existing_capture_has_equal_or_higher_score", "score": float(previous.get("score", 0.0) or 0.0)}
+            path = self._write_capture_card(capture)
+            captures[sid] = {
+                "path": self._rel(path),
+                "score": float(capture.get("score", 0.0) or 0.0),
+                "accepted": bool(capture.get("accepted", False)),
+                "updated_at": now_ts(),
+                "title": str(capture.get("title", "") or sid),
+            }
+            self.state["captures"] = captures
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            self._write_index()
+            return {"ok": True, "accepted": bool(capture.get("accepted", False)), "score": float(capture.get("score", 0.0) or 0.0), "path": self._rel(path)}
+
+    def rebuild(self) -> dict:
+        with self.lock:
+            self._write_index()
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            return {"ok": True, "accepted": int(self.state.get("accepted", 0) or 0), "candidates": int(self.state.get("candidates", 0) or 0)}
+
+    def payload(self, limit: int = 120) -> dict:
+        cards = self._scan_cards()
+        state = _read_json_file(self.state_path, self.state)
+        return {
+            "root": str(self.root),
+            "state": state if isinstance(state, dict) else {},
+            "card_count": len(cards),
+            "cards": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "score": float(row.get("score", 0.0) or 0.0),
+                    "accepted": bool(row.get("accepted", False)),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in sorted(cards, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[: max(0, int(limit or 120))]
+            ],
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, accepted_only: bool = True) -> dict:
+        query = str(query_text or "").strip()
+        cards = self._scan_cards()
+        if accepted_only:
+            cards = [row for row in cards if bool(row.get("accepted", False))]
+        if not query or not cards:
+            return {"query": query, "results": [], "summary": "", "route": "workflow", "route_meta": {"mode": "workflow"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qlow = query.lower()
+        rows: list[dict] = []
+        for card in cards:
+            title = str(card.get("title", "") or "")
+            text = str(card.get("text", "") or "")
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in title.lower())
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1600]).ratio()
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            base = float(card.get("score", 0.0) or 0.0)
+            score = lexical * 0.64 + min(0.20, 0.06 * title_hits) + base * 0.22
+            weak_match = False
+            if score <= 0.03 and fuzzy >= 0.12:
+                score = min(fuzzy * 0.50 + base * 0.12, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            rows.append(
+                {
+                    "score": round(score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(base, 6),
+                    "doc_id": "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(card.get("path", ""))).name,
+                    "relative_path": str(card.get("path", "")),
+                    "kind": "workflow",
+                    "category": "code",
+                    "language": "markdown",
+                    "anchor": str(card.get("path", "")),
+                    "text": trim(_rag_focused_excerpt(text, tokens, window=1200, dense_match=fuzzy > 0.18), 1800),
+                    "entities": [],
+                    "citation": f"[workflow:{str(card.get('path', '') or '')}]",
+                    "route_evidence": "workflow",
+                    "evidence_layer": "workflow",
+                    "workflow_score": base,
+                    "sort_bias": 0.16 if bool(card.get("accepted", False)) else 0.04,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(key=lambda x: (float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0), float(x.get("graph_score", 0.0) or 0.0)), reverse=True)
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "workflow",
+            "route_meta": {"mode": "workflow", "card_count": len(cards), "candidate_count": len(rows), "accepted_only": bool(accepted_only)},
+        }
+
+
 def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
     try:
         parser = RAGContentParser(include_filename_entities=include_filename_entities)
@@ -53228,10 +54327,11 @@ def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override
 
 
 class RAGIngestionService:
-    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None):
+    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(RAG_IMPORT_WORKER_COUNT)
@@ -53854,6 +54954,7 @@ class RAGIngestionService:
             self.store.update_task(task_id, status="running", started_at=now_ts())
             try:
                 result_rows: list[dict] = []
+                all_result_rows: list[dict] = []
                 item_errors: list[str] = []
                 pending_flushes = 0
                 pending_rebuild = False
@@ -53908,6 +55009,7 @@ class RAGIngestionService:
                             **kwargs,
                         )
                         result_rows.append(row)
+                        all_result_rows.append(row)
                         pending_flushes += 1
                         if bool(row.get("ok", False)) and not bool(row.get("duplicate", False)):
                             pending_rebuild = True
@@ -54066,11 +55168,17 @@ class RAGIngestionService:
                                 strict_local_only=strict_local_only,
                             )
                 _flush_ingest_state()
-                ok_count = sum(1 for row in result_rows if bool(row.get("ok", False)))
-                duplicate_count = sum(1 for row in result_rows if bool(row.get("duplicate", False)))
+                ok_count = sum(1 for row in all_result_rows if bool(row.get("ok", False)))
+                duplicate_count = sum(1 for row in all_result_rows if bool(row.get("duplicate", False)))
                 failed_count = len(item_errors)
                 if failed_count and ok_count <= 0:
                     raise ValueError("\n".join(item_errors[:12]))
+                doc_ids = [str(x.get("doc_id", "")) for x in all_result_rows if str(x.get("doc_id", "")).strip()]
+                if self.wiki_store is not None and doc_ids:
+                    try:
+                        self.wiki_store.enqueue_compile(self.store, doc_ids=doc_ids, reason=f"ingest:{source_mode}")
+                    except Exception:
+                        pass
                 self.store.update_task(
                     task_id,
                     status="completed_with_errors" if failed_count else "completed",
@@ -54079,7 +55187,7 @@ class RAGIngestionService:
                     duplicate_count=duplicate_count,
                     failed_count=failed_count,
                     error="\n".join(item_errors[:12]),
-                    doc_ids=[str(x.get("doc_id", "")) for x in result_rows if str(x.get("doc_id", "")).strip()],
+                    doc_ids=doc_ids,
                 )
             except Exception as exc:
                 self.store.update_task(
@@ -54464,7 +55572,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -54485,6 +55593,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                         ],
                         "citation": f"[{rel_path or doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -54831,10 +55940,11 @@ class CodeLibraryStore(RAGLibraryStore):
 
 
 class CodeIngestionService(RAGIngestionService):
-    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None):
+    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
@@ -55007,6 +56117,8 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
             <label for="queryRouteInput">Route</label>
             <select id="queryRouteInput">
               <option value="auto" selected>Auto</option>
+              <option value="wiki">Wiki</option>
+              <option value="raw">Raw Hybrid</option>
               <option value="fast">Fast</option>
               <option value="global">Global</option>
               <option value="hybrid">Hybrid</option>
@@ -55014,7 +56126,15 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
           </div>
           <div class="field grow">
             <label for="topKInput">Top K</label>
-            <input id="topKInput" type="number" min="1" max="12" value="8">
+            <input id="topKInput" type="number" min="1" max="64" value="10">
+          </div>
+          <div class="field grow">
+            <label for="queryBudgetInput">Budget</label>
+            <select id="queryBudgetInput">
+              <option value="standard" selected>Standard</option>
+              <option value="tight">Tight</option>
+              <option value="deep">Deep</option>
+            </select>
           </div>
           <label class="check top-gap"><input id="querySynthesize" type="checkbox" checked> synthesize answer</label>
         </div>
@@ -55180,6 +56300,19 @@ const G={
   layout:null,
   layouts:{},
   hoverId:'',
+  selectedNodeId:'',
+  focusMode:false,
+  viewport:{x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1},
+  animation:{active:false,started:0,duration:420,from:null,to:null,reason:''},
+  dragging2d:false,
+  dragStartX:0,
+  dragStartY:0,
+  dragOriginX:0,
+  dragOriginY:0,
+  pointerDownX:0,
+  pointerDownY:0,
+  pointerMoved:false,
+  lastLayoutView:'static',
   screenNodes:[],
   bound:false,
   renderKey:'',
@@ -55201,6 +56334,13 @@ const G={
     fitDistance:360,
     minDistance:96,
     maxDistance:4200,
+    targetDistance:360,
+    targetAzimuth:0.72,
+    targetElevation:0.56,
+    focusCenter:{x:0,y:0,z:0},
+    clickStartX:0,
+    clickStartY:0,
+    moved:false,
     pending:false,
     graphKey:'',
     activeHoverId:'',
@@ -55210,6 +56350,12 @@ const G={
 const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
 const GRAPH_STATIC_NODE_LIMIT=300;
 const GRAPH_STATIC_HERO_COUNT=30;
+const GRAPH_STATIC_EDGE_LIMIT=520;
+const GRAPH_FOCUS_NODE_LIMIT=96;
+const GRAPH_FOCUS_SECOND_HOP_LIMIT=34;
+const GRAPH_FOCUS_EDGE_LIMIT=260;
+const GRAPH_ZOOM_MIN_FACTOR=0.22;
+const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
 async function api(path,init){
   const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
@@ -55231,6 +56377,7 @@ function parseTags(){return String(E('tagInput')?.value||'').split(',').map(x=>x
 function strictLocalOnlyImport(){return Boolean(E('importLocalOnly')?.checked)}
 function selectedQueryRoute(){return String(E('queryRouteInput')?.value||'auto').trim().toLowerCase()||'auto'}
 function selectedEmbedModel(){return String(E('embedModelSelect')?.value||'').trim()}
+function selectedQueryBudget(){return String(E('queryBudgetInput')?.value||'standard').trim().toLowerCase()||'standard'}
 function renderEmbedModelSelect(){
   const sel=E('embedModelSelect');
   if(!sel)return;
@@ -55386,20 +56533,23 @@ function graphSignature(graph){
   const edges=Array.isArray(graph?.edges)?graph.edges:[];
   return JSON.stringify({
     built_at:Number(graph?.built_at||0),
-    node_count:Number(graph?.node_count||0),
-    edge_count:Number(graph?.edge_count||0),
-    nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
-    edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]),
+      node_count:Number(graph?.node_count||0),
+      edge_count:Number(graph?.edge_count||0),
+      rev:Number(graph?.rev||graph?.revision||0),
+      nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
+      edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]).slice(0,3000),
   })
 }
 function normalizeGraphType(v){
   const t=String(v||'').trim().toLowerCase();
   if(t==='community'||t==='document'||t==='entity')return t;
+  if(['file','source','doc','page','module'].includes(t))return 'document';
+  if(['symbol','function','class','method','concept','tag','keyword'].includes(t))return 'entity';
   return 'document';
 }
 function communityHex(key){return hslToHex(hashText(key)%360,72,58)}
-function nodeRadius2D(type){if(type==='community')return 11.5;if(type==='entity')return 2.7;return 4.5}
-function nodeRadius3D(type){if(type==='community')return 8.4;if(type==='entity')return 1.9;return 3.4}
+function nodeRadius2D(type){if(type==='community')return 13.5;if(type==='entity')return 4.1;return 6.2}
+function nodeRadius3D(type){if(type==='community')return 9.4;if(type==='entity')return 2.8;return 4.6}
 function nodeCommunityKey(node){
   const type=normalizeGraphType(node?.type);
   if(type==='community')return String(node?.label||node?.community||node?.id||'community').trim()||'community';
@@ -55459,6 +56609,77 @@ function computeGraphBounds(items){
     spanY:maxY-minY,
     spanZ:maxZ-minZ,
     radius:Math.max(24,Math.sqrt(halfX*halfX+halfY*halfY+halfZ*halfZ)),
+  };
+}
+function edgeRank(edge,itemById){
+  const source=itemById?.get?.(String(edge?.source||''))||null;
+  const target=itemById?.get?.(String(edge?.target||''))||null;
+  const type=String(edge?.type||'related');
+  const base=type==='related'?3.2:(type==='belongs_to'?2.4:(type==='mentions'?1.8:1.2));
+  const weight=Math.log1p(Math.max(0,Number(edge?.weight||0)))*0.85;
+  const nodeScore=Math.log1p(Math.max(0,Number(source?.score||0)))+Math.log1p(Math.max(0,Number(target?.score||0)));
+  const degreePenalty=Math.log1p(Math.max(0,Number(source?.degree||0)+Number(target?.degree||0)))*0.18;
+  return base+weight+nodeScore*0.42-degreePenalty;
+}
+function pruneGraphEdges(edges,itemById,limit=GRAPH_STATIC_EDGE_LIMIT,perNodeLimit=18,focusId=''){
+  const rows=(edges||[])
+    .filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||'')))
+    .map(edge=>({...edge,_rank:edgeRank(edge,itemById)}))
+    .sort((a,b)=>Number(b._rank||0)-Number(a._rank||0));
+  const selected=[];
+  const degree=new Map();
+  const focus=String(focusId||'');
+  for(const edge of rows){
+    if(selected.length>=Math.max(1,Number(limit||GRAPH_STATIC_EDGE_LIMIT)))break;
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const nearFocus=focus&&(s===focus||t===focus);
+    const cap=nearFocus?Math.max(perNodeLimit*2,28):perNodeLimit;
+    if(!nearFocus&&(Number(degree.get(s)||0)>=cap||Number(degree.get(t)||0)>=cap))continue;
+    degree.set(s,Number(degree.get(s)||0)+1);
+    degree.set(t,Number(degree.get(t)||0)+1);
+    const clean={...edge};
+    delete clean._rank;
+    selected.push(clean);
+  }
+  return selected;
+}
+function cloneLayoutItems(items,transform){
+  return (items||[]).map((item,idx)=>{
+    const next={...item};
+    if(typeof transform==='function')Object.assign(next,transform(item,idx)||{});
+    return next;
+  });
+}
+function layoutFromItems(base,items,edges,signature,extra={}){
+  const itemById=new Map((items||[]).map(item=>[String(item.id),item]));
+  const geometry=computeGraphBounds(items||[]);
+  const counts={community:0,document:0,entity:0};
+  (items||[]).forEach(item=>{
+    const type=String(item?.type||'document');
+    if(type==='community'||type==='document'||type==='entity')counts[type]+=1;
+  });
+  return {
+    signature,
+    items:items||[],
+    itemById,
+    edges:edges||[],
+    allEdges:Array.isArray(extra?.allEdges)?extra.allEdges:(edges||[]),
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts,
+    communities:Array.isArray(base?.communities)?base.communities:[],
+    totalNodeCount:Number(base?.totalNodeCount||base?.items?.length||0),
+    totalEdgeCount:Number(base?.totalEdgeCount||base?.edges?.length||0),
+    visibleNodeCount:(items||[]).length,
+    visibleEdgeCount:(edges||[]).length,
+    heroCount:0,
+    sampled:false,
+    labelIds:new Set(),
+    ...extra,
   };
 }
 function buildGraphLayout(graph){
@@ -55647,12 +56868,23 @@ function buildGraphLayout(graph){
     }
     return {...edge,colorHex,alpha,width}
   });
+  const communityItemByKey=new Map(items.filter(item=>String(item.type||'')==='community').map(item=>[String(item.communityKey||item.label||''),item]));
+  for(const item of items){
+    if(String(item.type||'')==='document'){
+      const communityItem=communityItemByKey.get(String(item.communityKey||''));
+      if(communityItem){
+        layoutEdges.push({source:String(item.id),target:String(communityItem.id),type:'belongs_to',weight:1,colorHex:mixHex(Number(item.colorHex||0x607565),Number(communityItem.colorHex||0x607565),0.5),alpha:0.12,width:0.85});
+      }
+    }
+  }
+  const prunedEdges=pruneGraphEdges(layoutEdges,itemById,Math.max(GRAPH_STATIC_EDGE_LIMIT*2,900),34);
   const geometry=computeGraphBounds(items);
   return {
     signature:graphSignature(graph),
     items,
     itemById,
-    edges:layoutEdges,
+    edges:prunedEdges,
+    allEdges:layoutEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -55664,7 +56896,7 @@ function buildGraphLayout(graph){
     totalNodeCount:items.length,
     totalEdgeCount:layoutEdges.length,
     visibleNodeCount:items.length,
-    visibleEdgeCount:layoutEdges.length,
+    visibleEdgeCount:prunedEdges.length,
     heroCount:0,
     sampled:false,
   }
@@ -55687,7 +56919,7 @@ function buildStaticGraphLayout(fullLayout){
       counts:{community:0,document:0,entity:0},
       communities:Array.isArray(base?.communities)?base.communities:[],
       totalNodeCount:totalNodes,
-      totalEdgeCount:Number(base?.edges?.length||0),
+      totalEdgeCount:Number(base?.totalEdgeCount||base?.allEdges?.length||base?.edges?.length||0),
       visibleNodeCount:0,
       visibleEdgeCount:0,
       heroCount:0,
@@ -55745,7 +56977,8 @@ function buildStaticGraphLayout(fullLayout){
     return next;
   });
   const itemById=new Map(items.map(item=>[String(item.id),item]));
-  const edges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const rawEdges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_STATIC_EDGE_LIMIT,16);
   const geometry=computeGraphBounds(items);
   const counts={community:0,document:0,entity:0};
   items.forEach(item=>{
@@ -55757,6 +56990,7 @@ function buildStaticGraphLayout(fullLayout){
     items,
     itemById,
     edges,
+    allEdges:rawEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -55766,7 +57000,7 @@ function buildStaticGraphLayout(fullLayout){
     counts,
     communities:Array.isArray(base.communities)?base.communities:[],
     totalNodeCount:totalNodes,
-    totalEdgeCount:Number(base.edges?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
     visibleNodeCount:items.length,
     visibleEdgeCount:edges.length,
     heroCount,
@@ -55774,20 +57008,155 @@ function buildStaticGraphLayout(fullLayout){
     labelIds,
   };
 }
+function graphAdjacency(layout){
+  const adjacency=new Map();
+  for(const item of layout?.items||[])adjacency.set(String(item.id||''),[]);
+  for(const edge of layout?.allEdges||layout?.edges||[]){
+    const s=String(edge?.source||''),t=String(edge?.target||'');
+    if(!adjacency.has(s)||!adjacency.has(t))continue;
+    adjacency.get(s).push({id:t,edge});
+    adjacency.get(t).push({id:s,edge});
+  }
+  for(const [id,list] of adjacency.entries()){
+    list.sort((a,b)=>edgeRank(b.edge,layout.itemById)-edgeRank(a.edge,layout.itemById));
+  }
+  return adjacency;
+}
+function buildFocusGraphLayout(fullLayout,focusId){
+  const base=fullLayout&&typeof fullLayout==='object'?fullLayout:null;
+  const selected=String(focusId||'').trim();
+  if(!base||!selected||!base.itemById?.has(selected))return null;
+  const focus=base.itemById.get(selected);
+  const adjacency=graphAdjacency(base);
+  const selectedIds=new Set([selected]);
+  const distance=new Map([[selected,0]]);
+  const firstHop=(adjacency.get(selected)||[]).slice(0,Math.max(18,Math.min(58,GRAPH_FOCUS_NODE_LIMIT-1)));
+  for(const row of firstHop){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    selectedIds.add(String(row.id));
+    distance.set(String(row.id),1);
+  }
+  const secondCandidates=[];
+  for(const row of firstHop){
+    for(const next of adjacency.get(String(row.id))||[]){
+      const id=String(next.id||'');
+      if(!id||selectedIds.has(id))continue;
+      secondCandidates.push({id,rank:edgeRank(next.edge,base.itemById)+(Number(base.itemById.get(id)?.score||0)*0.12)});
+    }
+  }
+  secondCandidates.sort((a,b)=>Number(b.rank||0)-Number(a.rank||0));
+  for(const row of secondCandidates){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    if(distance.get(row.id)!==undefined)continue;
+    selectedIds.add(row.id);
+    distance.set(row.id,2);
+    if([...distance.values()].filter(v=>Number(v)===2).length>=GRAPH_FOCUS_SECOND_HOP_LIMIT)break;
+  }
+  const selectedItems=(base.items||[]).filter(item=>selectedIds.has(String(item.id||'')));
+  const focusX=Number(focus.x||0),focusY=Number(focus.y||0),focusZ=Number(focus.z||0);
+  const ringCounts={1:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===1).length),2:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===2).length)};
+  const ringIndex={1:0,2:0};
+  const items=cloneLayoutItems(selectedItems,item=>{
+    const id=String(item.id||'');
+    const d=Number(distance.get(id)||0);
+    if(d===0){
+      return {
+        x:0,y:0,z:0,
+        focusDistance:0,
+        radius2d:Number(item.radius2d||4)*1.86,
+        radius3d:Number(item.radius3d||3)*1.65,
+        hero:true,
+        focusPrimary:true,
+      };
+    }
+    const idx=ringIndex[d]++;
+    const count=ringCounts[d]||1;
+    const angle=(Math.PI*2*idx/count)+GOLDEN_ANGLE*(hashText(id)%17)*0.08;
+    const baseRadius=d===1?86:158;
+    const scoreLift=Math.min(24,Math.log1p(Math.max(0,Number(item.score||0)))*6);
+    const spread=baseRadius+scoreLift+(signedHashUnit(id)*13);
+    const pullX=(Number(item.x||0)-focusX)*0.10;
+    const pullY=(Number(item.y||0)-focusY)*0.10;
+    const pullZ=(Number(item.z||0)-focusZ)*0.12;
+    return {
+      x:Math.cos(angle)*spread+pullX,
+      y:Math.sin(angle)*spread*0.82+pullY,
+      z:Math.sin(angle*1.7)*spread*0.35+pullZ,
+      focusDistance:d,
+      radius2d:Number(item.radius2d||3)*(d===1?1.28:0.96),
+      radius3d:Number(item.radius3d||2)*(d===1?1.20:0.92),
+      hero:d===1&&Number(item.score||0)>=Number(focus.score||0)*0.45,
+      focusPrimary:false,
+    };
+  });
+  const itemById=new Map(items.map(item=>[String(item.id),item]));
+  const rawEdges=(base.allEdges||base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>{
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const near=s===selected||t===selected;
+    return {
+      ...edge,
+      alpha:near?Math.max(0.22,Number(edge.alpha||0.16)):Math.min(0.18,Number(edge.alpha||0.12)),
+      width:near?Math.max(1.25,Number(edge.width||1)+0.45):Math.max(0.65,Number(edge.width||1)*0.82),
+    };
+  });
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_FOCUS_EDGE_LIMIT,24,selected);
+  const labelIds=new Set([selected]);
+  items
+    .filter(item=>Number(item.focusDistance||0)<=1)
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+    .slice(0,24)
+    .forEach(item=>labelIds.add(String(item.id||'')));
+  return layoutFromItems(base,items,edges,`${String(base.signature||'graph')}::focus::${selected}::${items.length}/${edges.length}`,{
+    totalNodeCount:Number(base.totalNodeCount||base.items?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
+    visibleNodeCount:items.length,
+    visibleEdgeCount:edges.length,
+    heroCount:Math.max(1,labelIds.size),
+    sampled:items.length<Number(base.items?.length||0),
+    labelIds,
+    focusId:selected,
+    focusLabel:String(focus.label||selected),
+  });
+}
 function getGraphLayout(force=false,view='auto'){
-  const target=(view==='3d'||view==='json'||view==='full')?'full':'static';
+  const target=(view==='3d'||view==='focus3d'||view==='json'||view==='full')?'full':(view==='focus'?'focus':'static');
   const sig=graphSignature(S.graph||{});
   if(force||!G.layouts||G.layouts.signature!==sig){
-    G.layouts={signature:sig,full:null,static:null};
+    G.layouts={signature:sig,full:null,static:null,focusKey:'',focus:null};
     G.layout=null;
     G.renderKey=sig;
     G.screenNodes=[];
     G.hoverId='';
+    G.selectedNodeId='';
+    G.focusMode=false;
     G.three.graphKey='';
+    resetGraphViewport();
   }
   if(!G.layouts.full)G.layouts.full=buildGraphLayout(S.graph||{});
   if(!G.layouts.static)G.layouts.static=buildStaticGraphLayout(G.layouts.full);
-  G.layout=G.layouts[target]||G.layouts.full;
+  if(target==='focus'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.static;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.static;
+    }
+  }else if(view==='focus3d'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.full;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.full;
+    }
+  }else G.layout=G.layouts[target]||G.layouts.full;
   return G.layout;
 }
 function setGraphRuntime(text,bad=false){
@@ -55796,16 +57165,23 @@ function setGraphRuntime(text,bad=false){
   setChip('graphRuntimeTag',label,bad);
 }
 function setGraphOverlay(){
-  const layout=getGraphLayout(false,G.mode==='3d'||G.mode==='json'?'full':'static');
+  const layout=G.mode==='3d'
+    ? activeGraphLayoutFor3D()
+    : (G.mode==='static'?activeGraphLayoutFor2D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const active=layout.itemById.get(String(G.hoverId||''))||null;
   let text='';
   if(G.mode==='static'){
-    text='Static 2D: simplified top-frequency layout.';
+    text=G.focusMode?'Static 2D: focused neighborhood.':'Static 2D: global overview.';
     if(layout.sampled)text+=` sample ${Number(layout.visibleNodeCount||0)}/${Number(layout.totalNodeCount||0)} nodes, top ${Number(layout.heroCount||0)} highlighted.`;
-  }else if(G.mode==='3d')text='3D View: local three.js, render-on-demand only, camera auto-fits graph span.';
+    text+=' Click node to focus. Drag to pan. Wheel to zoom. Click blank to return.';
+  }else if(G.mode==='3d')text=G.focusMode?'3D View: focused neighborhood, render-on-demand.':'3D View: global overview, render-on-demand.';
   else text='JSON: raw graph payload for audit and debugging.';
-  text+=` nodes=${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  text+=` nodes=${Number(layout.visibleNodeCount||0)}/${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(layout.visibleEdgeCount||0)}/${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  if(G.focusMode&&String(G.selectedNodeId||'')){
+    const focus=fullLayout.itemById.get(String(G.selectedNodeId||''))||layout.itemById.get(String(G.selectedNodeId||''));
+    if(focus)text+=`\\nFocus: ${String(focus.label||focus.id||'')}`;
+  }
   if(active){
     const node=active.node||{};
     const extra=[active.type,active.label];
@@ -55814,7 +57190,7 @@ function setGraphOverlay(){
     if(String(node.kind||'').trim())extra.push(`kind=${String(node.kind)}`);
     text+=`\\n${extra.join(' • ')}`
   }else if(G.mode==='3d'){
-    text+='\\nDrag to orbit. Wheel to zoom. Static frame does not keep rendering.'
+    text+='\\nClick node to focus. Click blank to return. Drag to orbit. Wheel to zoom.'
   }
   const el=E('graphOverlay');
   if(el)el.textContent=text;
@@ -55836,13 +57212,14 @@ function applyGraphModeAvailability(){
   if(G.mode==='3d'&&!available)G.mode='static';
 }
 function renderGraphLegend(){
-  const layout=getGraphLayout(false,G.mode==='static'?'static':'full');
+  const layout=G.mode==='static'?activeGraphLayoutFor2D():(G.mode==='3d'?activeGraphLayoutFor3D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const communities=Object.entries(S.graph?.communities||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
   const chips=[
     {label:G.mode==='static'&&layout.sampled?`Communities ${layout.counts.community}/${fullLayout.counts.community}`:`Communities ${fullLayout.counts.community}`,color:communityHex('community')},
     {label:G.mode==='static'&&layout.sampled?`Documents ${layout.counts.document}/${fullLayout.counts.document}`:`Documents ${fullLayout.counts.document}`,color:mixHex(communityHex('document'),0x13231d,0.18)},
     {label:G.mode==='static'&&layout.sampled?`Entities ${layout.counts.entity}/${fullLayout.counts.entity}`:`Entities ${fullLayout.counts.entity}`,color:mixHex(communityHex('entity'),0xffffff,0.26)},
+    ...(G.focusMode?[{label:`Focus ${Number(layout.visibleNodeCount||0)} nodes`,color:0x173122}]:[]),
     ...communities.map(([name,count])=>({label:`${name} ${count}`,color:communityHex(name)})),
   ];
   const legend=E('graphLegend');
@@ -55886,47 +57263,228 @@ function ensureCanvasMetrics(){
   }
   return {canvas,ctx:canvas.getContext('2d'),width,height,dpr}
 }
-function projectGraphTo2D(layout,width,height){
-  const pad=48;
+function resetGraphViewport(){
+  G.viewport={x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1,minScale:0.1,maxScale:8};
+  G.animation={active:false,started:0,duration:420,from:null,to:null,reason:''};
+}
+function computeGraphFitViewport(layout,width,height,pad=56){
   const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
   const dy=Math.max(1,Number(layout.bounds.maxY||0)-Number(layout.bounds.minY||0));
-  const scale=Math.max(0.1,Math.min((width-pad*2)/dx,(height-pad*2)/dy));
+  const usableW=Math.max(80,width-pad*2);
+  const usableH=Math.max(80,height-pad*2);
+  const fitScale=Math.max(0.08,Math.min(usableW/dx,usableH/dy));
   const cx=(Number(layout.bounds.minX||0)+Number(layout.bounds.maxX||0))/2;
   const cy=(Number(layout.bounds.minY||0)+Number(layout.bounds.maxY||0))/2;
+  return {
+    x:width/2-cx*fitScale,
+    y:height/2-cy*fitScale,
+    scale:fitScale,
+    fitScale,
+    minScale:fitScale*GRAPH_ZOOM_MIN_FACTOR,
+    maxScale:Math.max(fitScale*GRAPH_ZOOM_MAX_FACTOR,fitScale+0.1),
+  };
+}
+function graphWorldToScreen(item,viewport){
+  const vp=viewport||G.viewport||{x:0,y:0,scale:1};
+  return {
+    sx:Number(vp.x||0)+Number(item.x||0)*Number(vp.scale||1),
+    sy:Number(vp.y||0)+Number(item.y||0)*Number(vp.scale||1),
+  };
+}
+function beginGraphViewportAnimation(to,reason='view',duration=420){
+  const current=G.viewport||{x:0,y:0,scale:1};
+  const next={
+    ...current,
+    ...to,
+    targetX:Number(to.x??to.targetX??current.x??0),
+    targetY:Number(to.y??to.targetY??current.y??0),
+    targetScale:Number(to.scale??to.targetScale??current.scale??1),
+  };
+  G.animation={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(80,Number(duration||420)),
+    from:{x:Number(current.x||0),y:Number(current.y||0),scale:Number(current.scale||1)},
+    to:{x:Number(next.targetX||0),y:Number(next.targetY||0),scale:Number(next.targetScale||1)},
+    reason,
+  };
+  Object.assign(G.viewport,next);
+  requestAnimationFrame(()=>drawGraph2D(reason));
+}
+function easeGraph(t){
+  const x=clamp(t,0,1);
+  return x<0.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+}
+function currentGraphViewport(){
+  const vp=G.viewport||{x:0,y:0,scale:1};
+  if(!G.animation?.active)return vp;
+  const t=(performance.now()-Number(G.animation.started||0))/Math.max(1,Number(G.animation.duration||1));
+  if(t>=1){
+    vp.x=Number(G.animation.to?.x||vp.x||0);
+    vp.y=Number(G.animation.to?.y||vp.y||0);
+    vp.scale=Number(G.animation.to?.scale||vp.scale||1);
+    G.animation.active=false;
+    return vp;
+  }
+  const k=easeGraph(t);
+  const from=G.animation.from||vp;
+  const to=G.animation.to||vp;
+  return {
+    ...vp,
+    x:Number(from.x||0)+(Number(to.x||0)-Number(from.x||0))*k,
+    y:Number(from.y||0)+(Number(to.y||0)-Number(from.y||0))*k,
+    scale:Number(from.scale||1)+(Number(to.scale||1)-Number(from.scale||1))*k,
+  };
+}
+function fitGraphViewport(layout,width,height,reason='fit',animated=true){
+  const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+  const current=G.viewport||{};
+  const to={
+    ...current,
+    x:fit.x,
+    y:fit.y,
+    scale:fit.scale,
+    fitScale:fit.fitScale,
+    minScale:fit.minScale,
+    maxScale:fit.maxScale,
+  };
+  if(animated)beginGraphViewportAnimation(to,reason,G.focusMode?480:420);
+  else{
+    G.viewport={...to,targetX:to.x,targetY:to.y,targetScale:to.scale};
+    if(G.animation)G.animation.active=false;
+  }
+}
+function syncGraphViewportForLayout(layout,width,height,reason='draw'){
+  const key=`${String(layout.signature||'')}::${width}x${height}`;
+  if(G.lastLayoutView!==key){
+    const animated=Boolean(G.lastLayoutView)&&String(reason||'')!=='resize';
+    G.lastLayoutView=key;
+    fitGraphViewport(layout,width,height,reason,animated);
+  }else{
+    const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+    G.viewport.fitScale=fit.fitScale;
+    G.viewport.minScale=fit.minScale;
+    G.viewport.maxScale=fit.maxScale;
+    G.viewport.scale=clamp(Number(G.viewport.scale||fit.scale),fit.minScale,fit.maxScale);
+  }
+}
+function activeGraphLayoutFor2D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus'):getGraphLayout(false,'static');
+}
+function activeGraphLayoutFor3D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus3d'):getGraphLayout(false,'full');
+}
+function projectGraphTo2D(layout,width,height,viewport){
+  const vp=viewport||G.viewport||computeGraphFitViewport(layout,width,height);
   return layout.items.map(item=>({
     ...item,
-    sx:width/2+(Number(item.x||0)-cx)*scale,
-    sy:height/2+(Number(item.y||0)-cy)*scale,
-    sr:Number(item.radius2d||3),
+    ...graphWorldToScreen(item,vp),
+    sr:Math.max(2.6,Number(item.radius2d||3)*Math.sqrt(Math.max(0.32,Number(vp.scale||1)/Math.max(0.001,Number(vp.fitScale||vp.scale||1))))),
   }))
+}
+function graphCanvasPoint(clientX,clientY){
+  const canvas=E('graphCanvas2d');
+  if(!canvas)return {x:0,y:0};
+  const rect=canvas.getBoundingClientRect();
+  return {x:Number(clientX||0)-rect.left,y:Number(clientY||0)-rect.top};
+}
+function zoomGraph2DAt(clientX,clientY,deltaY){
+  const layout=activeGraphLayoutFor2D();
+  const metrics=ensureCanvasMetrics();
+  if(!metrics||!layout)return;
+  syncGraphViewportForLayout(layout,metrics.width,metrics.height,'zoom');
+  const point=graphCanvasPoint(clientX,clientY);
+  const vp=G.viewport;
+  const oldScale=Math.max(0.001,Number(vp.scale||1));
+  const factor=Number(deltaY||0)>0?0.88:1.14;
+  const nextScale=clamp(oldScale*factor,Number(vp.minScale||oldScale*0.2),Number(vp.maxScale||oldScale*8));
+  const wx=(point.x-Number(vp.x||0))/oldScale;
+  const wy=(point.y-Number(vp.y||0))/oldScale;
+  vp.scale=nextScale;
+  vp.x=point.x-wx*nextScale;
+  vp.y=point.y-wy*nextScale;
+  vp.targetX=vp.x;vp.targetY=vp.y;vp.targetScale=vp.scale;
+  if(G.animation)G.animation.active=false;
+  drawGraph2D('zoom');
+}
+function focusGraphNode(id){
+  const next=String(id||'').trim();
+  const full=getGraphLayout(false,'full');
+  if(!next||!full.itemById.has(next)){
+    return clearGraphFocus();
+  }
+  if(String(G.selectedNodeId||'')===next&&G.focusMode)return;
+  G.selectedNodeId=next;
+  G.focusMode=true;
+  G.hoverId=next;
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D('focus');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D('focus').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
+}
+function clearGraphFocus(){
+  const had=Boolean(G.focusMode||String(G.selectedNodeId||''));
+  G.focusMode=false;
+  G.selectedNodeId='';
+  G.hoverId='';
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D(had?'return':'idle');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D(had?'return':'idle').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
 }
 function drawGraph2D(reason='draw'){
   const metrics=ensureCanvasMetrics();
   if(!metrics||G.mode!=='static')return;
   const {ctx,width,height,dpr}=metrics;
-  const layout=getGraphLayout(false,'static');
-  const nodes=projectGraphTo2D(layout,width,height);
+  const layout=activeGraphLayoutFor2D();
+  syncGraphViewportForLayout(layout,width,height,reason);
+  const viewport=currentGraphViewport();
+  const nodes=projectGraphTo2D(layout,width,height,viewport);
   G.screenNodes=nodes;
   const byId=new Map(nodes.map(row=>[row.id,row]));
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,metrics.canvas.width,metrics.canvas.height);
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.lineCap='round';
+  ctx.lineJoin='round';
   for(const edge of layout.edges){
     const a=byId.get(edge.source),b=byId.get(edge.target);
     if(!a||!b)continue;
+    const selected=String(G.selectedNodeId||'');
     const hot=String(G.hoverId||'')&&(G.hoverId===edge.source||G.hoverId===edge.target);
+    const selectedEdge=selected&&(selected===edge.source||selected===edge.target);
     ctx.beginPath();
     ctx.moveTo(a.sx,a.sy);
-    ctx.lineTo(b.sx,b.sy);
-    ctx.strokeStyle=rgbaFromHex(edge.colorHex,hot?Math.min(0.42,Number(edge.alpha||0.16)+0.14):Number(edge.alpha||0.16));
-    ctx.lineWidth=hot?Number(edge.width||1)+0.7:Number(edge.width||1);
+    const mx=(a.sx+b.sx)/2;
+    const my=(a.sy+b.sy)/2;
+    const bend=G.focusMode?0.04:0.025;
+    ctx.quadraticCurveTo(mx+(b.sy-a.sy)*bend,my-(b.sx-a.sx)*bend,b.sx,b.sy);
+    const alphaBase=Number(edge.alpha||0.12);
+    const alpha=selectedEdge?Math.min(0.44,alphaBase+0.16):(hot?Math.min(0.36,alphaBase+0.10):Math.min(0.18,alphaBase));
+    ctx.strokeStyle=rgbaFromHex(edge.colorHex,alpha);
+    ctx.lineWidth=Math.max(0.45,(hot||selectedEdge)?Number(edge.width||1)+0.65:Number(edge.width||1)*0.72);
     ctx.stroke();
   }
   const order={entity:0,document:1,community:2};
   nodes.sort((a,b)=>(Number(order[a.type]||0)-Number(order[b.type]||0))||(Number(a.sr||0)-Number(b.sr||0)));
   for(const node of nodes){
     const hot=String(G.hoverId||'')===String(node.id);
+    const selected=String(G.selectedNodeId||'')===String(node.id);
+    const focusDist=Number(node.focusDistance ?? 3);
+    const dim=G.focusMode&&!selected&&focusDist>1;
+    const aura=selected?10:(hot?6:0);
+    if(aura){
+      ctx.beginPath();
+      ctx.arc(node.sx,node.sy,node.sr+aura,0,Math.PI*2);
+      ctx.fillStyle=rgbaFromHex(node.colorHex,selected?0.22:0.14);
+      ctx.fill();
+    }
     if(hot){
       ctx.beginPath();
       ctx.arc(node.sx,node.sy,node.sr+5,0,Math.PI*2);
@@ -55934,11 +57492,11 @@ function drawGraph2D(reason='draw'){
       ctx.fill();
     }
     ctx.beginPath();
-    ctx.arc(node.sx,node.sy,node.sr+(hot?1.5:0),0,Math.PI*2);
-    ctx.fillStyle=rgbaFromHex(node.colorHex,node.type==='entity'?0.82:0.94);
+    ctx.arc(node.sx,node.sy,node.sr+(selected?2.7:(hot?1.7:0)),0,Math.PI*2);
+    ctx.fillStyle=rgbaFromHex(node.colorHex,dim?0.55:(node.type==='entity'?0.88:0.97));
     ctx.fill();
-    ctx.strokeStyle=hot?'rgba(21,35,28,0.92)':'rgba(255,255,255,0.74)';
-    ctx.lineWidth=hot?2.2:(node.type==='community'?1.4:0.75);
+    ctx.strokeStyle=selected?'rgba(21,35,28,0.96)':(hot?'rgba(21,35,28,0.88)':'rgba(255,255,255,0.82)');
+    ctx.lineWidth=selected?2.8:(hot?2.0:(node.type==='community'?1.5:0.9));
     ctx.stroke();
   }
   ctx.font='12px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -55948,8 +57506,13 @@ function drawGraph2D(reason='draw'){
   nodes
     .filter(node=>labelIds.has(String(node.id||'')))
     .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
-    .slice(0,Math.max(16,Number(layout.heroCount||0)))
-    .forEach(node=>ctx.fillText(node.label,node.sx+node.sr+6,node.sy-node.sr-6));
+    .slice(0,Math.max(G.focusMode?24:16,Number(layout.heroCount||0)))
+    .forEach(node=>{
+      const label=String(node.label||'');
+      const maxChars=G.focusMode?34:26;
+      ctx.fillStyle=String(G.selectedNodeId||'')===String(node.id)?'rgba(21,35,28,0.96)':'rgba(23,49,34,0.74)';
+      ctx.fillText(label.length>maxChars?`${label.slice(0,maxChars-1)}...`:label,node.sx+node.sr+7,node.sy-node.sr-7);
+    });
   const active=byId.get(String(G.hoverId||''))||null;
   if(active){
     ctx.font='13px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -55959,6 +57522,7 @@ function drawGraph2D(reason='draw'){
   setChip('graphPerfTag','zero-idle');
   setGraphRuntime(`2d ${reason}`);
   setGraphOverlay();
+  if(G.animation?.active)requestAnimationFrame(()=>drawGraph2D(String(G.animation.reason||reason||'animate')));
 }
 function findGraphNodeAt(clientX,clientY){
   const canvas=E('graphCanvas2d');
@@ -56024,7 +57588,7 @@ function disposeThreeObject(obj){
 }
 function updateThreeCamera(){
   if(!G.three.camera)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const cx=Number(layout.center?.x||0);
   const cy=Number(layout.center?.y||0);
   const cz=Number(layout.center?.z||0);
@@ -56052,14 +57616,14 @@ function fitThreeCameraToLayout(resetDistance=false){
   const host=E('graph3dHost');
   const rect=host?host.getBoundingClientRect():{width:1,height:1};
   const aspect=Math.max(0.75,Number(rect.width||1)/Math.max(1,Number(rect.height||1)));
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const fitDistance=computeThreeFitDistance(layout,aspect);
   const radius=Math.max(24,Number(layout.radius||24));
   G.three.fitDistance=fitDistance;
   G.three.minDistance=Math.max(92,fitDistance*0.16);
   G.three.maxDistance=Math.max(3200,fitDistance*8.8);
   if(resetDistance||!Number.isFinite(G.three.distance)||G.three.distance<G.three.minDistance||G.three.distance>G.three.maxDistance){
-    G.three.distance=fitDistance;
+    G.three.distance=resetDistance&&Number.isFinite(G.three.distance)?G.three.distance+(fitDistance-G.three.distance)*0.72:fitDistance;
   }else{
     G.three.distance=clamp(G.three.distance,G.three.minDistance,G.three.maxDistance);
   }
@@ -56101,6 +57665,18 @@ function applyThreeHover(id){
   }
   scheduleThreeRender('hover');
 }
+function applyThreeFocusStyles(){
+  const selected=String(G.selectedNodeId||'');
+  for(const [id,mesh] of G.three.meshes.entries()){
+    const baseScale=Number(mesh.userData?.baseScale||1);
+    const baseColor=Number(mesh.userData?.baseColor||0x607565);
+    const baseOpacity=Number(mesh.userData?.baseOpacity||0.95);
+    const active=selected&&String(id)===selected;
+    mesh.scale.setScalar(baseScale*(active?1.38:1));
+    mesh.material.opacity=active?1:baseOpacity;
+    mesh.material.color.setHex(active?mixHex(baseColor,0xffffff,0.16):baseColor);
+  }
+}
 function pickThreeNode(ev){
   if(!G.three.renderer||!G.three.camera||!G.three.raycaster||!G.three.meshes.size)return '';
   const rect=G.three.renderer.domElement.getBoundingClientRect();
@@ -56126,7 +57702,7 @@ function resizeThreeRenderer(){
 function buildThreeSceneGraph(){
   const THREE=G.three.lib;
   if(!THREE||!G.three.root)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   while(G.three.root.children.length){
     const child=G.three.root.children.pop();
     disposeThreeObject(child);
@@ -56152,12 +57728,12 @@ function buildThreeSceneGraph(){
     const geometry=new THREE.BufferGeometry();
     geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
     geometry.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
-    const opacity=kind==='related'?0.32:(kind==='mentions'?0.18:0.14);
+    const opacity=kind==='related'?(G.focusMode?0.26:0.22):(kind==='mentions'?(G.focusMode?0.16:0.12):0.10);
     const material=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity,depthWrite:false});
     G.three.root.add(new THREE.LineSegments(geometry,material));
   });
   layout.items.forEach(item=>{
-    const opacity=item.type==='entity'?0.86:0.95;
+    const opacity=item.type==='entity'?0.90:0.97;
     const material=new THREE.MeshBasicMaterial({color:Number(item.colorHex||0x607565),transparent:true,opacity});
     const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
     mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
@@ -56167,6 +57743,7 @@ function buildThreeSceneGraph(){
     G.three.meshes.set(String(item.id),mesh);
   });
   fitThreeCameraToLayout(true);
+  applyThreeFocusStyles();
   G.three.graphKey=layout.signature;
 }
 async function ensureThreeRenderer(){
@@ -56184,7 +57761,7 @@ async function ensureThreeRenderer(){
     host.innerHTML='';
     host.appendChild(G.three.renderer.domElement);
   }
-  if(G.three.graphKey!==getGraphLayout(false,'full').signature)buildThreeSceneGraph();
+  if(G.three.graphKey!==activeGraphLayoutFor3D().signature)buildThreeSceneGraph();
   resizeThreeRenderer();
 }
 function bindThreeEvents(){
@@ -56196,6 +57773,9 @@ function bindThreeEvents(){
     G.three.dragging=true;
     G.three.lastX=Number(ev.clientX||0);
     G.three.lastY=Number(ev.clientY||0);
+    G.three.clickStartX=G.three.lastX;
+    G.three.clickStartY=G.three.lastY;
+    G.three.moved=false;
     host.classList.add('dragging');
     try{host.setPointerCapture(ev.pointerId)}catch{}
   });
@@ -56206,6 +57786,7 @@ function bindThreeEvents(){
       const dy=Number(ev.clientY||0)-G.three.lastY;
       G.three.lastX=Number(ev.clientX||0);
       G.three.lastY=Number(ev.clientY||0);
+      if(Math.abs(Number(ev.clientX||0)-Number(G.three.clickStartX||0))+Math.abs(Number(ev.clientY||0)-Number(G.three.clickStartY||0))>5)G.three.moved=true;
       G.three.azimuth+=dx*0.01;
       G.three.elevation=clamp(G.three.elevation-dy*0.008,-1.2,1.2);
       scheduleThreeRender('drag');
@@ -56214,10 +57795,17 @@ function bindThreeEvents(){
     const hit=pickThreeNode(ev);
     if(String(hit||'')!==String(G.hoverId||''))applyThreeHover(hit);
   });
-  const finishDrag=()=>{
+  const finishDrag=ev=>{
     if(!G.three.dragging)return;
+    const wasClick=!G.three.moved;
     G.three.dragging=false;
     host.classList.remove('dragging');
+    if(wasClick&&ev){
+      const hit=pickThreeNode(ev);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
+      return;
+    }
     scheduleThreeRender('idle');
   };
   host.addEventListener('pointerup',finishDrag);
@@ -56264,25 +57852,76 @@ function setGraphMode(mode){
     return;
   }
   G.mode=target;
+  if(G.animation)G.animation.active=false;
   syncGraphStage();
   if(target==='json')renderGraphJson();
-  else if(target==='3d')renderGraph3D('mode-switch').catch(err=>{
+  else if(target==='3d'){renderGraphLegend();renderGraph3D('mode-switch').catch(err=>{
     G.mode='static';
     syncGraphStage();
     drawGraph2D('fallback');
     setGraphRuntime(err.message,true);
-  });
-  else drawGraph2D('mode-switch');
+  });}
+  else {renderGraphLegend();drawGraph2D('mode-switch');}
 }
 function initGraphUi(){
   if(G.bound)return;
   G.bound=true;
   const canvas=E('graphCanvas2d');
   if(canvas){
-    canvas.addEventListener('mousemove',ev=>{
+    canvas.addEventListener('pointerdown',ev=>{
       if(G.mode!=='static')return;
+      const point=graphCanvasPoint(ev.clientX,ev.clientY);
+      G.dragging2d=true;
+      G.pointerMoved=false;
+      G.pointerDownX=point.x;
+      G.pointerDownY=point.y;
+      G.dragStartX=Number(ev.clientX||0);
+      G.dragStartY=Number(ev.clientY||0);
+      G.dragOriginX=Number(G.viewport?.x||0);
+      G.dragOriginY=Number(G.viewport?.y||0);
+      if(G.animation)G.animation.active=false;
+      try{canvas.setPointerCapture(ev.pointerId)}catch{}
+    });
+    canvas.addEventListener('pointermove',ev=>{
+      if(G.mode!=='static')return;
+      if(G.dragging2d){
+        const dx=Number(ev.clientX||0)-Number(G.dragStartX||0);
+        const dy=Number(ev.clientY||0)-Number(G.dragStartY||0);
+        if(Math.abs(dx)+Math.abs(dy)>4)G.pointerMoved=true;
+        G.viewport.x=Number(G.dragOriginX||0)+dx;
+        G.viewport.y=Number(G.dragOriginY||0)+dy;
+        G.viewport.targetX=G.viewport.x;
+        G.viewport.targetY=G.viewport.y;
+        drawGraph2D('pan');
+        return;
+      }
       const hit=findGraphNodeAt(ev.clientX,ev.clientY);
       if(String(hit||'')!==String(G.hoverId||'')){G.hoverId=String(hit||'');drawGraph2D('hover')}
+    });
+    const finishPointer=ev=>{
+      if(G.mode!=='static'||!G.dragging2d)return;
+      G.dragging2d=false;
+      if(!G.pointerMoved){
+        const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+        if(hit)focusGraphNode(hit);
+        else clearGraphFocus();
+      }else{
+        drawGraph2D('idle');
+      }
+    };
+    canvas.addEventListener('pointerup',finishPointer);
+    canvas.addEventListener('pointercancel',()=>{G.dragging2d=false;drawGraph2D('idle')});
+    canvas.addEventListener('wheel',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      zoomGraph2DAt(ev.clientX,ev.clientY,ev.deltaY);
+    },{passive:false});
+    canvas.addEventListener('dblclick',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
     });
     canvas.addEventListener('mouseleave',()=>{if(G.mode==='static')clearGraphHover()});
   }
@@ -56308,9 +57947,9 @@ function renderGraph(force=false){
   if(view)view.textContent=JSON.stringify(graph,null,2);
   getGraphLayout(force,'full');
   getGraphLayout(force,'static');
-  renderGraphLegend();
   applyGraphModeAvailability();
   syncGraphStage();
+  renderGraphLegend();
   if(G.mode==='json')renderGraphJson();
   else if(G.mode==='3d')renderGraph3D(force?'refresh':'data').catch(err=>{
     G.mode='static';
@@ -56319,6 +57958,7 @@ function renderGraph(force=false){
     setGraphRuntime(err.message,true);
   });
   else drawGraph2D(force?'refresh':'data');
+  renderGraphLegend();
 }
 function renderFilesystem(){
   E('fsView').textContent=JSON.stringify(S.filesystem||{},null,2);
@@ -56329,6 +57969,7 @@ function renderQuery(){
   const routeMeta=S.query?.route_meta||{};
   const routeParts=[];
   if(route)routeParts.push(`Route: ${route}${requested&&requested!==route?` (requested ${requested})`:''}`);
+  if(S.query?.evidence_status)routeParts.push(`Evidence: ${S.query.evidence_status} · confidence=${Number(S.query.confidence||0).toFixed(2)} · budget=${S.query?.context_budget?.mode||routeMeta?.context_budget||''}`);
   if(Array.isArray(routeMeta?.selected_communities)&&routeMeta.selected_communities.length)routeParts.push(`Communities: ${routeMeta.selected_communities.join(', ')}`);
   if(routeMeta?.reduce_mode)routeParts.push(`Global path: ${routeMeta.reduce_mode}`);
   if(Array.isArray(routeMeta?.reasons)&&routeMeta.reasons.length)routeParts.push(`Signals: ${routeMeta.reasons.join(', ')}`);
@@ -56396,7 +58037,7 @@ async function runImportText(){
 }
 async function runQuery(){
   setChip('queryStatus','running');
-  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||8),route:selectedQueryRoute(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
   S.query=out; renderQuery(); setChip('queryStatus','done');
 }
 async function rebuildIndex(){
@@ -56423,6 +58064,8 @@ CODE_ADMIN_INDEX_HTML = (
     .replace("Clouds Coder RAG Admin", "Clouds Coder Code Library Admin")
     .replace("/assets/rag-admin.js", "/assets/code-admin.js")
     .replace("TF-Graph_IDF RAG Admin", "Code Graph Library Admin")
+    .replace('<option value="raw">Raw Hybrid</option>', '<option value="workflow">Workflow</option>\n              <option value="raw">Raw Hybrid</option>')
+    .replace('<option value="wiki">Wiki</option>', '<option value="wiki">Code Wiki</option>')
     .replace(
         "Global knowledge library, graph view, batch import, backup, and retrieval control.",
         "Independent code library, repository graph view, batch import, backup, and developer retrieval control.",
@@ -56647,11 +58290,24 @@ class AppContext:
             self.rag_root,
             include_filename_entities=self.rag_include_filename_entities,
         )
-        self.rag_service = RAGIngestionService(self.rag_store, self.rag_parser, session_resolver=self._resolve_session_for_user)
+        self.rag_wiki = WikiStore(self.rag_root, kind="knowledge")
+        self.rag_service = RAGIngestionService(
+            self.rag_store,
+            self.rag_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.rag_wiki,
+        )
         self.code_parser = CodeContentParser()
         self.code_root = self.workspace / CODE_LIBRARY_DIRNAME
         self.code_store = CodeLibraryStore(self.code_root)
-        self.code_service = CodeIngestionService(self.code_store, self.code_parser, session_resolver=self._resolve_session_for_user)
+        self.code_wiki = WikiStore(self.code_root, kind="code")
+        self.workflow_memory = WorkflowMemoryStore(self.code_root)
+        self.code_service = CodeIngestionService(
+            self.code_store,
+            self.code_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.code_wiki,
+        )
         self.code_source_roots = self._discover_external_code_source_roots()
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
@@ -57032,6 +58688,7 @@ class AppContext:
             "default_session_id": str(getattr(session, "id", "") or ""),
             "active_capabilities": caps,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": self.rag_wiki.payload(limit=24),
             "agent_port": int(getattr(self, "agent_port", 0) or 0),
             "skills_port": int(getattr(self, "skills_port", 0) or 0),
             "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
@@ -57048,6 +58705,8 @@ class AppContext:
             "features": {
                 "strict_local_import": True,
                 "filename_entities": bool(self.rag_include_filename_entities),
+                "wiki_first_rag": True,
+                "high_recall_fusion": True,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -57081,6 +58740,12 @@ class AppContext:
 
     def rag_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.rag_store.filesystem_payload(max_nodes=max_nodes)
+
+    def rag_wiki_payload(self, limit: int = 240) -> dict:
+        return self.rag_wiki.payload(limit=limit)
+
+    def rag_wiki_lint(self) -> dict:
+        return self.rag_wiki.lint()
 
     def _knowledge_library_status_for_session(self, session: SessionState | None = None) -> dict:
         payload = self.rag_store.library_payload(limit=0)
@@ -57182,24 +58847,307 @@ class AppContext:
                 pass
         return count
 
+    def _merge_retrieval_results(
+        self,
+        query: str,
+        result_sets: list[dict],
+        *,
+        top_k: int,
+        route: str,
+        route_meta: dict | None = None,
+    ) -> dict:
+        rows: list[dict] = []
+        query_entities: set[str] = set()
+        summaries: list[str] = []
+        for result in result_sets:
+            if not isinstance(result, dict):
+                continue
+            query_entities.update(str(x) for x in (result.get("query_entities", []) or []) if str(x).strip())
+            summary = trim(str(result.get("summary", "") or ""), 700)
+            if summary:
+                summaries.append(summary)
+            source_route = str(result.get("route", "") or "")
+            for row in (result.get("results", []) or []):
+                if not isinstance(row, dict):
+                    continue
+                patched = dict(row)
+                if source_route and not str(patched.get("source_route", "") or "").strip():
+                    patched["source_route"] = source_route
+                rows.append(patched)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            key_parts = [
+                str(row.get("citation", "") or ""),
+                str(row.get("doc_id", "") or ""),
+                str(row.get("chunk_id", "") or ""),
+                str(row.get("wiki_page", "") or ""),
+                str(row.get("relative_path", "") or ""),
+                str(row.get("route_evidence", "") or ""),
+            ]
+            key = "|".join(key_parts).strip("|") or trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 260)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        layer_bias = {
+            "workflow": 0.20,
+            "wiki": 0.18,
+            "wiki_page": 0.18,
+            "community_reduce": 0.14,
+            "community_map": 0.12,
+            "chunk": 0.08,
+            "document": 0.04,
+        }
+        for row in deduped:
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            bonus = layer_bias.get(evidence, layer_bias.get(str(row.get("route_evidence", "") or ""), 0.0))
+            if str(row.get("source_route", "") or "") == "hybrid":
+                bonus += 0.04
+            if bool(row.get("weak_match", False)):
+                bonus = min(bonus, 0.015)
+            row["fusion_score"] = round(float(row.get("score", 0.0) or 0.0) + float(row.get("sort_bias", 0.0) or 0.0) + bonus, 6)
+        deduped.sort(
+            key=lambda x: (
+                float(x.get("fusion_score", 0.0) or 0.0),
+                float(x.get("score", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+                float(x.get("graph_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        selected = _rag_mmr_select(deduped, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        evidence_counts = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in selected)
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": route,
+                "candidate_count": len(deduped),
+                "result_set_count": len([x for x in result_sets if isinstance(x, dict)]),
+                "evidence_counts": dict(evidence_counts),
+                "high_recall_pool_multiplier": RAG_HIGH_RECALL_POOL_MULTIPLIER,
+                "high_recall_min_pool": RAG_HIGH_RECALL_MIN_POOL,
+            }
+        )
+        return {
+            "query": query,
+            "results": selected,
+            "summary": "\n".join(summaries[:3]) or "\n".join(f"{r.get('citation')} {r.get('title','')}: {trim(r.get('text',''), 160)}" for r in selected[:4]),
+            "community_cards": [],
+            "query_entities": sorted(query_entities),
+            "route": route,
+            "route_meta": meta,
+        }
+
+    def _expand_retrieval_with_variants(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        payload: dict,
+        code: bool = False,
+        top_k: int,
+        pool_k: int,
+        category: str = "",
+        kind: str = "",
+        raw_route: str = "hybrid",
+        qvec: list[float] | None = None,
+        accepted_only: bool = True,
+    ) -> list[dict]:
+        variants = [v for v in _rag_query_variants(query, max_variants=4) if v and v.strip().lower() != str(query or "").strip().lower()]
+        if not variants:
+            return []
+        variant_top_k = max(top_k, min(pool_k, 18))
+        out: list[dict] = []
+        for variant in variants[:3]:
+            try:
+                if code:
+                    out.append(self.workflow_memory.query(variant, top_k=min(variant_top_k, 16), accepted_only=accepted_only))
+                    out.append(self.code_wiki.query(variant, top_k=variant_top_k, category="code", kind=""))
+                    out.append(self.code_store.index.query(variant, top_k=variant_top_k, category="code", route=raw_route, qvec=qvec))
+                else:
+                    out.append(self.rag_wiki.query(variant, top_k=variant_top_k, category=category, kind=kind))
+                    out.append(self.rag_store.index.query(variant, top_k=variant_top_k, category=category, kind=kind, route=raw_route, qvec=qvec))
+            except Exception:
+                continue
+        for result in out:
+            if isinstance(result, dict):
+                meta = result.get("route_meta", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["variant_expansion"] = True
+                result["route_meta"] = meta
+        return out
+
+    def _rag_budget(self, value: object, *, default: str = "standard") -> tuple[str, dict]:
+        key = str(value or default or "standard").strip().lower()
+        if key not in RAG_CONTEXT_BUDGETS:
+            key = default if default in RAG_CONTEXT_BUDGETS else "standard"
+        return key, dict(RAG_CONTEXT_BUDGETS.get(key, RAG_CONTEXT_BUDGETS["standard"]))
+
+    def _rag_has_global_intent(self, query: str) -> bool:
+        low = str(query or "").lower()
+        terms = (
+            "overview", "summarize", "summary", "compare", "comparison", "relationship", "relationships",
+            "across", "trend", "synthesis", "global", "整体", "全局", "综述", "概览", "总结",
+            "对比", "比较", "关系", "联系", "趋势", "汇总", "跨",
+        )
+        return any(term in low for term in terms)
+
+    def _rag_evidence_metrics(self, result: dict) -> dict:
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        def _row_score(row: dict) -> float:
+            if bool(row.get("weak_match", False)):
+                return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            try:
+                score = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            try:
+                fusion = float(row.get("fusion_score", 0.0) or 0.0)
+            except Exception:
+                fusion = 0.0
+            try:
+                lexical = float(row.get("lexical_score", 0.0) or 0.0)
+            except Exception:
+                lexical = 0.0
+            try:
+                graph = float(row.get("graph_score", 0.0) or 0.0)
+            except Exception:
+                graph = 0.0
+            if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+                supporting = row.get("evidence_citations", [])
+                if not isinstance(supporting, list):
+                    supporting = []
+                if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                    return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
+        best = max((_row_score(row) for row in rows), default=0.0)
+        strong = sum(1 for row in rows if _row_score(row) >= RAG_MIN_SYNTHESIS_SCORE)
+        doc_ids = {
+            str(row.get("doc_id", "") or "").strip()
+            for row in rows
+            if str(row.get("doc_id", "") or "").strip()
+        }
+        layers = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in rows)
+        status = "miss"
+        if rows and best >= RAG_NO_EVIDENCE_THRESHOLD and strong > 0:
+            status = "hit"
+        elif rows:
+            status = "weak"
+        confidence = min(1.0, max(0.0, best + min(0.24, 0.04 * max(0, strong - 1)) + min(0.12, 0.03 * max(0, len(doc_ids) - 1))))
+        return {
+            "evidence_status": status,
+            "confidence": round(confidence, 4),
+            "best_score": round(best, 6),
+            "strong_evidence_count": int(strong),
+            "source_count": len(doc_ids),
+            "evidence_counts": dict(layers),
+        }
+
+    def _annotate_rag_result(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        metrics = self._rag_evidence_metrics(out)
+        out.update(metrics)
+        out["context_budget"] = {
+            "mode": budget_key,
+            "max_chars": int(budget.get("chars", 0) or 0),
+            "max_evidence": int(budget.get("evidence", 0) or 0),
+        }
+        if metrics.get("evidence_status") == "miss":
+            out["no_evidence_message"] = RAG_NO_EVIDENCE_MESSAGE
+            out.setdefault("summary", RAG_NO_EVIDENCE_MESSAGE)
+        elif metrics.get("evidence_status") == "weak":
+            out["weak_evidence_message"] = RAG_WEAK_EVIDENCE_MESSAGE
+            if not str(out.get("answer", "") or "").strip():
+                current_summary = str(out.get("summary", "") or "").strip()
+                out["summary"] = (RAG_WEAK_EVIDENCE_MESSAGE + ("\n\n" + current_summary if current_summary else "")).strip()
+        meta = out.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "evidence_status": metrics.get("evidence_status", "miss"),
+                "confidence": metrics.get("confidence", 0.0),
+                "context_budget": budget_key,
+            }
+        )
+        out["route_meta"] = meta
+        return out
+
+    def _trim_rag_result_to_budget(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        rows = [dict(x) for x in (out.get("results", []) or []) if isinstance(x, dict)]
+        max_chars = max(1200, int(budget.get("chars", 7200) or 7200))
+        max_rows = max(1, int(budget.get("evidence", 6) or 6))
+        used = 0
+        kept: list[dict] = []
+        for row in rows:
+            if len(kept) >= max_rows:
+                break
+            text = str(row.get("text", "") or "")
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                row["text"] = trim(text, max(420, remaining))
+            used += len(str(row.get("text", "") or ""))
+            kept.append(row)
+        out["results"] = kept
+        out = self._annotate_rag_result(out, budget_key=budget_key, budget=budget)
+        if out.get("evidence_status") == "miss":
+            out["results"] = []
+        return out
+
+    def _row_synthesis_score(self, row: dict) -> float:
+        if bool(row.get("weak_match", False)):
+            return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+        evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+        try:
+            score = float(row.get("score", 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        try:
+            fusion = float(row.get("fusion_score", 0.0) or 0.0)
+        except Exception:
+            fusion = 0.0
+        try:
+            lexical = float(row.get("lexical_score", 0.0) or 0.0)
+        except Exception:
+            lexical = 0.0
+        try:
+            graph = float(row.get("graph_score", 0.0) or 0.0)
+        except Exception:
+            graph = 0.0
+        if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+            supporting = row.get("evidence_citations", [])
+            if not isinstance(supporting, list):
+                supporting = []
+            if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+        return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
     def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
         if not isinstance(session, SessionState) or not rows:
             return ""
         evidence_rows = [
             row
             for row in rows
-            if str(row.get("route_evidence", "") or "") in {"chunk", "document"}
+            if str(row.get("route_evidence", "") or "") in {"chunk", "document", "wiki_page", "workflow", "community_reduce", "community_map", "community_bridge"}
         ]
         if not evidence_rows:
             evidence_rows = list(rows)
 
         # Confidence filtering — drop weak evidence before LLM synthesis
-        best_score = max((float(r.get("score", 0.0) or 0.0) for r in evidence_rows), default=0.0)
+        best_score = max((self._row_synthesis_score(r) for r in evidence_rows), default=0.0)
         if best_score < RAG_NO_EVIDENCE_THRESHOLD:
-            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
-        qualified = [r for r in evidence_rows if float(r.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE]
+            return RAG_NO_EVIDENCE_MESSAGE
+        qualified = [r for r in evidence_rows if self._row_synthesis_score(r) >= RAG_MIN_SYNTHESIS_SCORE]
         if not qualified:
-            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+            return RAG_NO_EVIDENCE_MESSAGE
 
         evidence = []
         _syn_doc_counts: dict[str, int] = {}
@@ -57212,7 +59160,7 @@ class AppContext:
             if _doc_id:
                 _syn_doc_counts[_doc_id] = _syn_doc_counts.get(_doc_id, 0) + 1
             idx = len(evidence) + 1
-            score_pct = int(min(99, float(row.get("score", 0.0) or 0.0) * 100))
+            score_pct = int(min(99, self._row_synthesis_score(row) * 100))
             evidence.append(
                 f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
                 f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
@@ -57242,13 +59190,14 @@ class AppContext:
     def rag_query(self, user_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
-        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
         category = str(body.get("category", "") or "").strip()
         kind = str(body.get("kind", "") or "").strip()
         route = str(
             body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
             or "auto"
         ).strip().lower()
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         # Generate query embedding for hybrid dense+sparse retrieval when model is available
@@ -57269,13 +59218,87 @@ class AppContext:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
                 except Exception:
                     qvec = None
-        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route, qvec=qvec)
+        requested_route = route if route in {"auto", "wiki", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.rag_wiki.query(query, top_k=top_k, category=category, kind=kind)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            wiki_result = self.rag_wiki.query(query, top_k=wide_top_k, category=category, kind=kind)
+            stage_results.append(wiki_result)
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.rag_store.index.query(query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
+            stage_results.append(raw_light)
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.rag_store.index.query(query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.rag_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=False,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category=category,
+                            kind=kind,
+                            raw_route=raw_route,
+                            qvec=qvec,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_route": raw_route,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def rag_import_request(self, user_id: str, payload: dict) -> dict:
@@ -57411,10 +59434,12 @@ class AppContext:
 
     def rag_rebuild(self) -> dict:
         self.rag_store.rebuild_index()
+        wiki = self.rag_wiki.compile_from_store(self.rag_store, reason="manual-rebuild")
         return {
             "ok": True,
             "built_at": self.rag_store.index.built_at,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
         }
 
     def code_config(self, user_id: str) -> dict:
@@ -57439,6 +59464,8 @@ class AppContext:
             "code_root": str(self.code_root),
             "code_source_roots": list(self.code_source_roots or []),
             "status": self._code_library_status_for_session(session),
+            "wiki": self.code_wiki.payload(limit=24),
+            "workflows": self.workflow_memory.payload(limit=24),
             "sessions": sessions,
             "default_session_id": str(getattr(session, "id", "") or ""),
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
@@ -57460,6 +59487,9 @@ class AppContext:
                 "llm_enrichment": False,
                 "strict_local_import": True,
                 "repo_import": True,
+                "wiki_first_code_rag": True,
+                "workflow_memory": True,
+                "high_recall_fusion": True,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -57477,11 +59507,28 @@ class AppContext:
     def code_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.code_store.filesystem_payload(max_nodes=max_nodes)
 
-    def code_query(self, user_id: str, payload: dict) -> dict:
+    def code_wiki_payload(self, limit: int = 240) -> dict:
+        return self.code_wiki.payload(limit=limit)
+
+    def code_wiki_lint(self) -> dict:
+        return self.code_wiki.lint()
+
+    def code_workflows_payload(self, limit: int = 120) -> dict:
+        return self.workflow_memory.payload(limit=limit)
+
+    def code_workflows_query(self, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        accepted_only = bool(body.get("accepted_only", True))
+        return self.workflow_memory.query(query, top_k=top_k, accepted_only=accepted_only)
+
+    def code_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
         route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         language_filter = str(body.get("language", "") or "").strip().lower()
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
@@ -57502,22 +59549,105 @@ class AppContext:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
                 except Exception:
                     qvec = None
-        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route, qvec=qvec)
+        requested_route = route if route in {"auto", "wiki", "workflow", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "workflow", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.code_wiki.query(query, top_k=top_k, category="code", kind="")
+        elif requested_route == "workflow":
+            result = self.workflow_memory.query(query, top_k=top_k, accepted_only=True)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.code_store.index.query(query, top_k=top_k, category="code", route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            workflow_result = self.workflow_memory.query(query, top_k=wide_top_k, accepted_only=True)
+            wiki_result = self.code_wiki.query(query, top_k=wide_top_k, category="code", kind="")
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.code_store.index.query(query, top_k=wide_top_k, category="code", route=light_route, qvec=qvec)
+            stage_results.extend([workflow_result, wiki_result, raw_light])
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "workflow_first": True, "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.code_store.index.query(query, top_k=pool_k, category="code", route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.code_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category="code", route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=True,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category="code",
+                            kind="",
+                            raw_route=raw_route,
+                            qvec=qvec,
+                            accepted_only=True,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "workflow_candidate_count": int((workflow_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(workflow_result.get("route_meta", {}), dict)
+                    else 0,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_route": raw_route,
+                    "workflow_first": True,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
         if language_filter:
-            filtered = [
-                dict(row)
-                for row in (result.get("results", []) or [])
-                if str(row.get("language", "") or "").strip().lower() == language_filter
-            ]
+            filtered = []
+            for row in (result.get("results", []) or []):
+                row_lang = str(row.get("language", "") or "").strip().lower()
+                if row_lang in {"", "markdown"} and str(row.get("route_evidence", "") or "") in {"workflow", "wiki_page"}:
+                    filtered.append(dict(row))
+                elif row_lang == language_filter:
+                    filtered.append(dict(row))
             result = dict(result)
             result["results"] = filtered[:top_k]
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
         synthesize = bool(body.get("synthesize", False))
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def code_import_request(self, user_id: str, payload: dict) -> dict:
@@ -57651,10 +59781,14 @@ class AppContext:
 
     def code_rebuild(self) -> dict:
         self.code_store.rebuild_index()
+        wiki = self.code_wiki.compile_from_store(self.code_store, reason="manual-rebuild")
+        workflows = self.workflow_memory.rebuild()
         return {
             "ok": True,
             "built_at": self.code_store.index.built_at,
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
+            "workflows": workflows,
         }
 
     def _looks_like_code_task(self, text: str) -> bool:
@@ -57671,17 +59805,44 @@ class AppContext:
         ]
         return any(term in low for term in code_terms)
 
-    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+    def _looks_like_knowledge_task(self, text: str) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        knowledge_terms = [
+            "research", "analyze", "analysis", "compare", "summarize", "explain", "fact", "evidence",
+            "paper", "document", "report", "knowledge", "source", "citation", "background",
+            "研究", "分析", "对比", "比较", "总结", "解释", "事实", "证据", "论文", "文档", "报告", "知识", "资料", "引用", "背景",
+        ]
+        if any(term in low for term in knowledge_terms):
+            return True
+        return bool(re.search(r"\b(why|how|what are|what is|pros and cons|tradeoffs?)\b", low))
+
+    def _format_reference_payload(self, result: dict, *, prefix: str, limit: int = 6, snippet_chars: int = 420) -> dict:
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        status = str(result.get("evidence_status", "") or "miss")
+        confidence = float(result.get("confidence", 0.0) or 0.0)
         if not rows:
-            return {}
+            return {
+                f"{prefix}_text": (
+                    f"{prefix.title()} Library Context [status={status}, confidence={confidence:.2f}]:\n"
+                    f"{str(result.get('no_evidence_message', RAG_NO_EVIDENCE_MESSAGE) or RAG_NO_EVIDENCE_MESSAGE)}"
+                ),
+                f"{prefix}_meta": {
+                    "route": str(result.get("route", "") or ""),
+                    "requested_route": str(result.get("requested_route", "") or ""),
+                    "result_count": 0,
+                    "evidence_status": status,
+                    "confidence": confidence,
+                },
+            }
         lines = []
+        lines.append(f"evidence_status={status} confidence={confidence:.2f} route={str(result.get('route', '') or '')}")
         for idx, row in enumerate(rows[:limit], 1):
             citation = str(row.get("citation", "") or "").strip()
             title = str(row.get("title", "") or "").strip()
             symbol = str(row.get("symbol", "") or "").strip()
             anchor = str(row.get("anchor", "") or "").strip()
-            snippet = trim(str(row.get("text", "") or ""), 420)
+            snippet = trim(str(row.get("text", "") or ""), snippet_chars)
             header = f"{idx}. {citation} {title}".strip()
             if symbol:
                 header += f" | symbol={symbol}"
@@ -57691,34 +59852,59 @@ class AppContext:
             if snippet:
                 lines.append(snippet)
         return {
-            "code_text": "\n".join(lines),
-            "code_meta": {
+            f"{prefix}_text": "\n".join(lines),
+            f"{prefix}_meta": {
                 "route": str(result.get("route", "") or ""),
                 "requested_route": str(result.get("requested_route", "") or ""),
                 "result_count": len(rows[:limit]),
+                "evidence_status": status,
+                "confidence": confidence,
                 "summary": trim(str(result.get("summary", "") or ""), 600),
             },
         }
 
+    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+        return self._format_reference_payload(result, prefix="code", limit=limit, snippet_chars=420)
+
+    def _format_knowledge_reference_payload(self, result: dict, limit: int = 4) -> dict:
+        return self._format_reference_payload(result, prefix="knowledge", limit=limit, snippet_chars=620)
+
     def _prepare_runtime_references(self, session: SessionState, text: str) -> dict:
         query = trim(str(text or "").strip(), 4000)
-        if not query or not self._looks_like_code_task(query):
+        if not query:
             return {}
-        if not self.code_store.documents:
-            return {}
+        payload: dict = {}
         try:
-            result = self.code_query(
-                str(getattr(session, "owner_user_id", "") or ""),
-                {
-                    "query": query,
-                    "top_k": 6,
-                    "route": "auto",
-                    "session_id": str(getattr(session, "id", "") or ""),
-                },
-            )
+            if self._looks_like_code_task(query) and self.code_store.documents:
+                result = self.code_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 6,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_code_reference_payload(result, limit=6))
         except Exception:
-            return {}
-        return self._format_code_reference_payload(result, limit=6)
+            pass
+        try:
+            if self._looks_like_knowledge_task(query) and self.rag_store.documents:
+                result = self.rag_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 5,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_knowledge_reference_payload(result, limit=4))
+        except Exception:
+            pass
+        return payload
 
     def _query_code_library_tool(self, session: SessionState, args: dict) -> str:
         status = self._code_library_status_for_session(session)
@@ -57745,6 +59931,7 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "language": str((args or {}).get("language", "") or ""),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
@@ -57764,9 +59951,14 @@ class AppContext:
         source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
         if source_roots:
             lines.append("source_roots=" + " | ".join(source_roots[:8]))
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No code library results.")
+            lines.append(str(result.get("no_evidence_message", "No code library results.") or "No code library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -57802,15 +59994,21 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "category": str((args or {}).get("category", "") or ""),
                 "kind": str((args or {}).get("kind", "") or ""),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No knowledge library results.")
+            lines.append(str(result.get("no_evidence_message", "No knowledge library results.") or "No knowledge library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -57830,6 +60028,18 @@ class AppContext:
             pass
         try:
             self.code_service.shutdown()
+        except Exception:
+            pass
+        try:
+            self.rag_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.code_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.workflow_memory.shutdown()
         except Exception:
             pass
 
@@ -58010,6 +60220,7 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        sess = None
         try:
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
@@ -58018,6 +60229,11 @@ class AppContext:
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
+        if sess is not None:
+            try:
+                self.workflow_memory.capture_session(sess)
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -60279,6 +62495,14 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.rag_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/rag/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.rag_wiki_payload(limit=limit))
+        if path == "/api/rag/wiki/lint":
+            return self._send_json(self.app.rag_wiki_lint())
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -60298,6 +62522,12 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/api/rag/rebuild":
             try:
                 out = self.app.rag_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/wiki/rebuild":
+            try:
+                out = self.app.rag_wiki.compile_from_store(self.app.rag_store, reason="manual-wiki-rebuild")
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -60436,6 +62666,20 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.code_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/code/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.code_wiki_payload(limit=limit))
+        if path == "/api/code/wiki/lint":
+            return self._send_json(self.app.code_wiki_lint())
+        if path == "/api/code/workflows":
+            try:
+                limit = int((query.get("limit", ["120"]) or ["120"])[0] or 120)
+            except Exception:
+                limit = 120
+            return self._send_json(self.app.code_workflows_payload(limit=limit))
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -60455,6 +62699,24 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         if path == "/api/code/rebuild":
             try:
                 out = self.app.code_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/wiki/rebuild":
+            try:
+                out = self.app.code_wiki.compile_from_store(self.app.code_store, reason="manual-wiki-rebuild")
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/query":
+            try:
+                out = self.app.code_workflows_query(self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/rebuild":
+            try:
+                out = self.app.workflow_memory.rebuild()
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
