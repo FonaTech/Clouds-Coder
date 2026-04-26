@@ -212,6 +212,14 @@ CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
     1.0,
     min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
 )
+CONTEXT_USAGE_CALIBRATION_MAX = max(
+    CONTEXT_ESTIMATE_SAFETY_MULTIPLIER,
+    min(2.5, float(str(os.getenv("AGENT_CONTEXT_USAGE_CALIBRATION_MAX", "2.20") or "2.20"))),
+)
+CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
+    60,
+    min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
+)
 LARGE_FILE_AUTO_PAGE_BYTES = max(
     32 * 1024,
     int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
@@ -12836,6 +12844,7 @@ class OllamaClient:
         full_thinking: list[str] = []
         tool_calls: list[dict] = []
         done_reason = ""
+        final_raw: dict = {}
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 while True:
@@ -12875,6 +12884,7 @@ class OllamaClient:
                     if tcs:
                         tool_calls = self._normalize_tool_calls(tcs)
                     if part.get("done"):
+                        final_raw = dict(part)
                         done_reason = str(part.get("done_reason") or "").strip().lower()
                         break
         except HTTPError as exc:
@@ -12888,7 +12898,16 @@ class OllamaClient:
             "content": content,
             "thinking": thinking_content,
             "tool_calls": tool_calls,
-            "raw": {"streamed": True, "done_reason": done_reason},
+            "raw": {
+                "streamed": True,
+                "done_reason": done_reason,
+                "prompt_eval_count": final_raw.get("prompt_eval_count"),
+                "eval_count": final_raw.get("eval_count"),
+                "total_duration": final_raw.get("total_duration"),
+                "load_duration": final_raw.get("load_duration"),
+                "prompt_eval_duration": final_raw.get("prompt_eval_duration"),
+                "eval_duration": final_raw.get("eval_duration"),
+            },
         }
 
     def chat(
@@ -13526,6 +13545,14 @@ class SessionState:
         )
         self.context_limit_locked = bool(context_limit_locked)
         self.context_token_upper_bound = self.max_context_token_limit
+        self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+        self.last_context_actual_prompt_tokens = 0
+        self.last_context_actual_completion_tokens = 0
+        self.last_context_actual_total_tokens = 0
+        self.last_context_actual_source = ""
+        self.last_context_actual_context_label = ""
+        self.last_context_actual_ts = 0.0
+        self.last_context_estimated_prompt_tokens = 0
         self.max_agent_rounds = max(
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
@@ -14423,6 +14450,21 @@ class SessionState:
                 self.thinking = False
                 # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
                 # It will be reset to max after load (see below). Only exception: context_limit_locked.
+                usage_calibration = raw.get("context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                try:
+                    self.context_estimate_calibration = max(
+                        float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                        min(float(CONTEXT_USAGE_CALIBRATION_MAX), float(usage_calibration or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                    )
+                except Exception:
+                    self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                self.last_context_actual_prompt_tokens = max(0, int(raw.get("last_context_actual_prompt_tokens", 0) or 0))
+                self.last_context_actual_completion_tokens = max(0, int(raw.get("last_context_actual_completion_tokens", 0) or 0))
+                self.last_context_actual_total_tokens = max(0, int(raw.get("last_context_actual_total_tokens", 0) or 0))
+                self.last_context_actual_source = trim(str(raw.get("last_context_actual_source", "") or ""), 80)
+                self.last_context_actual_context_label = trim(str(raw.get("last_context_actual_context_label", "") or ""), 80)
+                self.last_context_actual_ts = max(0.0, float(raw.get("last_context_actual_ts", 0.0) or 0.0))
+                self.last_context_estimated_prompt_tokens = max(0, int(raw.get("last_context_estimated_prompt_tokens", 0) or 0))
                 self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
                 self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
                 ids = raw.get("truncation_rescue_task_ids", [])
@@ -14714,6 +14756,14 @@ class SessionState:
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
+            "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
+            "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_context_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_context_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_context_actual_ts": float(getattr(self, "last_context_actual_ts", 0.0) or 0.0),
+            "last_context_estimated_prompt_tokens": int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0),
             "truncation_count": self.truncation_count,
             "last_truncation_ts": self.last_truncation_ts,
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
@@ -16221,7 +16271,108 @@ class SessionState:
         if not raw:
             return max(0, int(minimum or 0))
         base = int(math.ceil(len(raw) / max(1.0, self._char_token_divisor(raw))))
-        return max(int(minimum or 0), int(math.ceil(base * CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)))
+        multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        return max(int(minimum or 0), int(math.ceil(base * multiplier)))
+
+    def _extract_model_usage_tokens(self, response: dict | None) -> dict:
+        """Extract provider-reported token counts when a backend returns them."""
+        if not isinstance(response, dict):
+            return {}
+        raw = response.get("raw")
+        if not isinstance(raw, dict):
+            raw = {}
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+
+        def _as_int(value: object) -> int:
+            try:
+                if value is None or value == "":
+                    return 0
+                return max(0, int(float(value)))
+            except Exception:
+                return 0
+
+        prompt = _as_int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or raw.get("prompt_eval_count")
+            or raw.get("input_tokens")
+        )
+        completion = _as_int(
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or raw.get("eval_count")
+            or raw.get("output_tokens")
+        )
+        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
+        if total <= 0 and (prompt or completion):
+            total = prompt + completion
+        if prompt <= 0 and total > completion:
+            prompt = total - completion
+        if not (prompt or completion or total):
+            return {}
+        source = "model-usage"
+        if usage:
+            if "input_tokens" in usage or "output_tokens" in usage:
+                source = "anthropic-usage"
+            else:
+                source = "openai-usage"
+        elif "prompt_eval_count" in raw or "eval_count" in raw:
+            source = "ollama-usage"
+        return {
+            "prompt_tokens": int(prompt),
+            "completion_tokens": int(completion),
+            "total_tokens": int(total),
+            "source": source,
+        }
+
+    def _record_model_usage(
+        self,
+        response: dict | None,
+        *,
+        estimated_prompt_tokens: int | None = None,
+        context_label: str = "",
+    ) -> dict:
+        usage = self._extract_model_usage_tokens(response)
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        if prompt <= 0:
+            return usage
+        estimated = max(1, int(estimated_prompt_tokens or 0))
+        ratio = float(prompt) / float(estimated)
+        old_multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        # Only raise the calibration when reality exceeds the current estimate.
+        # A smaller provider count should not make future auto-compact optimistic.
+        new_multiplier = old_multiplier
+        if ratio > 1.02:
+            new_multiplier = min(float(CONTEXT_USAGE_CALIBRATION_MAX), max(old_multiplier, ratio * old_multiplier))
+        self.context_estimate_calibration = float(new_multiplier)
+        self.last_context_actual_prompt_tokens = prompt
+        self.last_context_actual_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_context_actual_total_tokens = int(usage.get("total_tokens", 0) or 0)
+        self.last_context_actual_source = str(usage.get("source", "model-usage") or "model-usage")
+        self.last_context_actual_context_label = trim(str(context_label or ""), 80)
+        self.last_context_actual_ts = now_ts()
+        self.last_context_estimated_prompt_tokens = estimated
+        if isinstance(response, dict):
+            response["usage_calibration"] = {
+                "estimated_prompt_tokens": estimated,
+                "actual_prompt_tokens": prompt,
+                "actual_total_tokens": self.last_context_actual_total_tokens,
+                "source": self.last_context_actual_source,
+                "calibration": round(float(self.context_estimate_calibration), 4),
+            }
+        return usage
 
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
@@ -16251,11 +16402,53 @@ class SessionState:
         tools_tokens = self._estimate_text_tokens_conservative(json_dumps(TOOLS)) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
 
+    def _estimate_model_call_prompt_tokens(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        media_inputs: list[dict] | None = None,
+    ) -> int:
+        payload = {
+            "system": str(system or ""),
+            "messages": messages if isinstance(messages, list) else [],
+            "tools": tools or [],
+        }
+        if media_inputs:
+            media_rows = []
+            for item in media_inputs[:16]:
+                if not isinstance(item, dict):
+                    continue
+                media_rows.append(
+                    {
+                        "name": item.get("name") or item.get("filename") or "",
+                        "mime": item.get("mime") or item.get("content_type") or "",
+                        "size": item.get("size") or item.get("bytes") or 0,
+                    }
+                )
+            payload["media_inputs"] = media_rows
+        return self._estimate_text_tokens_conservative(json_dumps(payload), minimum=1)
+
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
         limit = max(1, int(self.context_token_upper_bound or 0))
         reserve = max(1, int(math.ceil(limit * CONTEXT_AUTO_COMPACT_RESERVE_RATIO)))
         effective_limit = max(1, limit - reserve)
-        used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
+        estimate_used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
+        used = estimate_used
+        actual_floor_applied = False
+        actual_age = max(0.0, now_ts() - float(getattr(self, "last_context_actual_ts", 0.0) or 0.0))
+        actual_prompt = max(0, int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0))
+        actual_estimate_at_call = max(0, int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0))
+        if (
+            token_estimate is None
+            and actual_prompt > 0
+            and actual_estimate_at_call > 0
+            and actual_age <= CONTEXT_ACTUAL_USAGE_RECENT_SECONDS
+            and estimate_used >= int(actual_estimate_at_call * 0.85)
+        ):
+            used = max(used, actual_prompt)
+            actual_floor_applied = used == actual_prompt or actual_prompt >= estimate_used
         left = max(0, effective_limit - used)
         raw_left = max(0, limit - used)
         left_pct = max(0.0, min(100.0, (left * 100.0) / effective_limit))
@@ -16272,8 +16465,26 @@ class SessionState:
             "left_percent": left_pct,
             "used_percent": used_pct,
             "raw_left_percent": raw_left_pct,
-            "estimator": "char-cjk-conservative-v2",
-            "safety_multiplier": float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "estimator": "char-cjk-conservative-v3-usage-calibrated",
+            "safety_multiplier": float(
+                max(
+                    float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    min(
+                        float(CONTEXT_USAGE_CALIBRATION_MAX),
+                        float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    ),
+                )
+            ),
+            "base_safety_multiplier": float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "actual_floor_applied": bool(actual_floor_applied),
+            "last_actual_prompt_tokens": int(actual_prompt),
+            "last_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_actual_age_seconds": round(float(actual_age), 3) if getattr(self, "last_context_actual_ts", 0.0) else None,
+            "last_estimated_prompt_tokens": int(actual_estimate_at_call),
+            "calibration_max": float(CONTEXT_USAGE_CALIBRATION_MAX),
         }
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
@@ -22438,9 +22649,15 @@ body{padding:18px}
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
         wake_attempted = False
+        estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+            messages,
+            tools=tools,
+            system=system,
+            media_inputs=media_inputs,
+        )
         for attempt in range(1, retry_budget + 2):
             try:
-                return self._call_interruptible(
+                response = self._call_interruptible(
                     lambda: self.ollama.chat(
                         messages,
                         tools=tools,
@@ -22453,6 +22670,12 @@ body{padding:18px}
                     ),
                     progress_label=f"{context_label} model call",
                 )
+                self._record_model_usage(
+                    response,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    context_label=context_label,
+                )
+                return response
             except OllamaError as exc:
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
@@ -22484,9 +22707,16 @@ body{padding:18px}
                         ),
                     }
                     try:
-                        return self._call_interruptible(
+                        fallback_messages = list(messages) + [fallback_note]
+                        fallback_estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+                            fallback_messages,
+                            tools=tools,
+                            system=system,
+                            media_inputs=None,
+                        )
+                        response = self._call_interruptible(
                             lambda: self.ollama.chat(
-                                list(messages) + [fallback_note],
+                                fallback_messages,
                                 tools=tools,
                                 system=system,
                                 max_tokens=max_tokens,
@@ -22497,6 +22727,12 @@ body{padding:18px}
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
+                        self._record_model_usage(
+                            response,
+                            estimated_prompt_tokens=fallback_estimated_prompt_tokens,
+                            context_label=f"{context_label}:no-media",
+                        )
+                        return response
                     except OllamaError:
                         pass  # fallback also failed, continue normal retry
                 wake_note = ""
@@ -39414,6 +39650,16 @@ body{padding:18px}
                 "context_token_limit_locked": bool(self.context_limit_locked),
                 "context_estimator": str(ctx.get("estimator", "")),
                 "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_actual_floor_applied": bool(ctx.get("actual_floor_applied", False)),
+                "context_last_actual_prompt_tokens": int(ctx.get("last_actual_prompt_tokens", 0) or 0),
+                "context_last_actual_completion_tokens": int(ctx.get("last_actual_completion_tokens", 0) or 0),
+                "context_last_actual_total_tokens": int(ctx.get("last_actual_total_tokens", 0) or 0),
+                "context_last_actual_source": str(ctx.get("last_actual_source", "") or ""),
+                "context_last_actual_context_label": str(ctx.get("last_actual_context_label", "") or ""),
+                "context_last_actual_age_seconds": ctx.get("last_actual_age_seconds"),
+                "context_last_estimated_prompt_tokens": int(ctx.get("last_estimated_prompt_tokens", 0) or 0),
+                "context_usage_calibration_max": float(ctx.get("calibration_max", CONTEXT_USAGE_CALIBRATION_MAX)),
                 "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
                 "user_task_level": int(self.user_task_level_override or 0),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
@@ -43814,7 +44060,7 @@ function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
