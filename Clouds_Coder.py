@@ -185,6 +185,8 @@ RAG_CONTEXT_BUDGETS = {
     "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
 }
 RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
+RAG_DENSE_DEFAULT_ENABLED = str(os.getenv("AGENT_RAG_DENSE_DEFAULT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+RAG_EMBEDDING_MODE_VALUES = {"off", "sparse", "tfidf", "dense", "hybrid"}
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
@@ -202,6 +204,30 @@ CODE_PARSE_TIMEOUT_SECONDS = max(
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
 TOKEN_THRESHOLD = 1_000_000
+CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
+    0.01,
+    min(0.20, float(str(os.getenv("AGENT_CONTEXT_RESERVE_RATIO", "0.05") or "0.05"))),
+)
+CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
+    1.0,
+    min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
+)
+LARGE_FILE_AUTO_PAGE_BYTES = max(
+    32 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
+)
+LARGE_FILE_AUTO_PAGE_LINES = max(
+    1000,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
+)
+LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
+    1200,
+    int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
+)
+SESSION_LIST_DEFAULT_LIMIT = max(
+    50,
+    min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
+)
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
@@ -13066,6 +13092,8 @@ TOOLS = [
             "route": {"type": "string", "enum": ["auto", "workflow", "wiki", "raw", "fast", "global", "hybrid"]},
             "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "language": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
         ["query"],
     ),
@@ -13084,6 +13112,8 @@ TOOLS = [
             "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "category": {"type": "string"},
             "kind": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
     ),
     tool_def(
@@ -16141,7 +16171,8 @@ class SessionState:
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases inside final exported HTML. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
-            f"Context limit ~{self.context_token_upper_bound} tokens. "
+            f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
+            f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task only when the overall user task is done. "
@@ -16185,6 +16216,13 @@ class SessionState:
             return 3.0
         return 4.0
 
+    def _estimate_text_tokens_conservative(self, text: object, *, minimum: int = 0) -> int:
+        raw = str(text or "")
+        if not raw:
+            return max(0, int(minimum or 0))
+        base = int(math.ceil(len(raw) / max(1.0, self._char_token_divisor(raw))))
+        return max(int(minimum or 0), int(math.ceil(base * CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)))
+
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
         if self._is_multi_agent_mode():
@@ -16196,35 +16234,46 @@ class SessionState:
                 ctx = self._agent_context(role)
                 if ctx:
                     raw = json_dumps(ctx)
-                    cost = int(len(raw) / self._char_token_divisor(raw))
+                    cost = self._estimate_text_tokens_conservative(raw)
                     if cost > agent_max:
                         agent_max = cost
             msg_raw = json_dumps(self.messages)
-            msg_tokens = max(agent_max, int(len(msg_raw) / self._char_token_divisor(msg_raw)))
+            msg_tokens = max(agent_max, self._estimate_text_tokens_conservative(msg_raw))
         else:
             msg_raw = json_dumps(self.messages)
-            msg_tokens = int(len(msg_raw) / self._char_token_divisor(msg_raw))
+            msg_tokens = self._estimate_text_tokens_conservative(msg_raw)
         # Overhead: system prompt + tools (always present in API calls)
         try:
             sys_text = self._system_prompt()
-            sys_tokens = int(len(sys_text) / self._char_token_divisor(sys_text))
+            sys_tokens = self._estimate_text_tokens_conservative(sys_text)
         except Exception:
             sys_tokens = 300
-        tools_tokens = int(len(json_dumps(TOOLS)) / 4) if TOOLS else 0
+        tools_tokens = self._estimate_text_tokens_conservative(json_dumps(TOOLS)) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
         limit = max(1, int(self.context_token_upper_bound or 0))
+        reserve = max(1, int(math.ceil(limit * CONTEXT_AUTO_COMPACT_RESERVE_RATIO)))
+        effective_limit = max(1, limit - reserve)
         used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
-        left = max(0, limit - used)
-        left_pct = max(0.0, min(100.0, (left * 100.0) / limit))
-        used_pct = max(0.0, min(100.0, (used * 100.0) / limit))
+        left = max(0, effective_limit - used)
+        raw_left = max(0, limit - used)
+        left_pct = max(0.0, min(100.0, (left * 100.0) / effective_limit))
+        used_pct = max(0.0, min(100.0, (used * 100.0) / effective_limit))
+        raw_left_pct = max(0.0, min(100.0, (raw_left * 100.0) / limit))
         return {
             "limit": limit,
+            "effective_limit": effective_limit,
+            "reserved": reserve,
+            "reserve_percent": round(float(CONTEXT_AUTO_COMPACT_RESERVE_RATIO * 100.0), 3),
             "used": used,
             "left": left,
+            "raw_left": raw_left,
             "left_percent": left_pct,
             "used_percent": used_pct,
+            "raw_left_percent": raw_left_pct,
+            "estimator": "char-cjk-conservative-v2",
+            "safety_multiplier": float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
         }
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
@@ -16372,11 +16421,12 @@ class SessionState:
         # Tier 2+: compact agent contexts proactively
         if tier >= 2:
             self._compact_agent_contexts(tier)
-        # Re-check after tier-based compression
+        # Re-check after tier-based compression. The effective limit keeps a
+        # small hard reserve so auto-compact still has room to run.
         metrics = self._context_budget_metrics()
         used = int(metrics.get("used", 0) or 0)
-        limit = max(1, int(metrics.get("limit", 0) or 0))
-        if used < limit:
+        effective_limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0))
+        if used < effective_limit:
             return False
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
@@ -20417,6 +20467,48 @@ body{padding:18px}
             body = "\n".join(lines[:line_cap])
         return trim(body, max_chars)
 
+    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+        total_lines = len(lines)
+        try:
+            size = int(fp.stat().st_size)
+        except Exception:
+            size = 0
+        ext = fp.suffix.lower()
+        head = "\n".join(lines[:80])
+        symbols: list[str] = []
+        if ext in {".py", ".pyi"}:
+            for idx, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith(("class ", "def ", "async def ")):
+                    symbols.append(f"{idx}: {trim(stripped, 180)}")
+                if len(symbols) >= 80:
+                    break
+        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")
+            for idx, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    symbols.append(f"{idx}: {trim(line.strip(), 180)}")
+                if len(symbols) >= 80:
+                    break
+        next_limit = LONG_OUTPUT_READ_PAGE_LINES
+        out = [
+            (
+                f"[large_file_overview path={rel} bytes={size} lines={total_lines} "
+                f"auto_paged=true]"
+            ),
+            "This file is too large to inject fully into model context. Use paged read_file calls or RAG/code-library search for focused retrieval.",
+            f"First page: read_file path=\"{rel}\" offset=0 limit={next_limit}",
+        ]
+        if symbols:
+            out.append("\nSymbols:")
+            out.extend(symbols)
+        if head:
+            out.append("\nHead preview:")
+            out.append(head)
+        if total_lines > 80:
+            out.append(f"\n[next_page read_file path=\"{rel}\" offset=80 limit={next_limit}]")
+        return "\n".join(out)
+
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
         upload_id = make_id("upload")
@@ -20487,7 +20579,9 @@ body{padding:18px}
         parsed_excerpt = ""
         needs_async_parse = False
         if kind == "text":
-            excerpt_cap = 8_000 if self._upload_is_code_like(filename=safe_name, kind=kind) else 12_000
+            is_code_upload = self._upload_is_code_like(filename=safe_name, kind=kind)
+            large_text = len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES
+            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or large_text) else 12_000
             parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
         elif kind in ("pdf", "csv", "excel", "presentation", "document"):
             needs_async_parse = True
@@ -23201,6 +23295,16 @@ body{padding:18px}
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
+            try:
+                file_size = int(fp.stat().st_size)
+            except Exception:
+                file_size = 0
+            if (
+                limit is None
+                and int(offset or 0) <= 0
+                and (file_size >= LARGE_FILE_AUTO_PAGE_BYTES or total_lines >= LARGE_FILE_AUTO_PAGE_LINES)
+            ):
+                return self._large_text_file_overview(fp, rel, lines)
             offset_val = max(0, int(offset or 0))
             requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
             if offset_val >= total_lines:
@@ -24467,10 +24571,12 @@ body{padding:18px}
         return float(difflib.SequenceMatcher(None, left, right).ratio())
 
     def _watchdog_context_near_limit(self) -> bool:
-        limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
         try:
-            used = int(self._estimate_tokens())
+            metrics = self._context_budget_metrics()
+            limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", TOKEN_THRESHOLD)) or TOKEN_THRESHOLD))
+            used = int(metrics.get("used", self._estimate_tokens()) or 0)
         except Exception:
+            limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
             used = 0
         return bool(used >= int(limit * WATCHDOG_CONTEXT_NEAR_RATIO))
 
@@ -26642,6 +26748,10 @@ body{padding:18px}
         if next_step:
             next_step["status"] = "in_progress"
             next_step["activated_at"] = float(now_ts())
+            try:
+                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
+            except Exception:
+                pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -28006,8 +28116,8 @@ body{padding:18px}
         if missing_subtasks:
             return (
                 "<reminder>"
-                "Please call TodoWrite now to update the current subtask before continuing. "
-                "If it fails/repeats, switch to TodoWriteRescue."
+                "Current plan-step subtasks were missing or invalid. The runtime will bootstrap them when possible. "
+                "Continue with one concrete action for the active plan step; use TodoWriteRescue only if progress state is still wrong."
                 "</reminder>"
             )
         return (
@@ -28024,13 +28134,19 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 220)
         rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        if not rows:
+            try:
+                if self._ensure_worker_todos_for_plan_step(step, force_refresh=False, owner=self._current_plan_worker_owner()):
+                    rows = self._active_plan_worker_todo_rows(step_id, role=role)
+            except Exception:
+                rows = []
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
-                f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
+                f"No worker subtasks are available yet for this step. Continue the current plan step; the runtime will try to bootstrap subtasks automatically. "
+                f"Use TodoWrite only if you need to correct or refine progress state for parent_step_id='{step_id}'. "
             )
             subtasks_exist_ban = ""
         else:
@@ -28384,6 +28500,16 @@ body{padding:18px}
         _cur_step_id = str(current.get("id", "") or "")
         if _cur_step_id:
             _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+            if not _existing_subs:
+                try:
+                    if self._ensure_worker_todos_for_plan_step(current, force_refresh=False, owner=self._current_plan_worker_owner()):
+                        self._emit(
+                            "status",
+                            {"summary": "plan subtasks auto-created by runtime bootstrap"},
+                        )
+                        _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+                except Exception as exc:
+                    self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
             if not _existing_subs:
                 _step_label_s = trim(str(current.get("content", "") or ""), 60)
                 _force_tw_msg = (
@@ -32832,10 +32958,11 @@ body{padding:18px}
             "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
-            "TODO TRACKING (mandatory): "
-            "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
-            "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
-            "Prefer TodoWrite items as objects with explicit fields: "
+                "TODO TRACKING: "
+                "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
+                "After completing ONE subtask, call TodoWrite when possible to mark that subtask as 'completed' and move the next one to 'in_progress'. "
+                "If TodoWrite fails, repeats unchanged, or is unavailable, do not loop on it; continue one concrete action or report the blocker with exact evidence. "
+                "Prefer TodoWrite items as objects with explicit fields: "
             "{content, status, owner?, parent_step_id?}. "
             "If you must use strings, use ONLY canonical prefixes: '[ ]', '[>]', '[x]'. "
             "Do not use emoji markers or free-form localized status labels in TodoWrite payloads. "
@@ -33765,7 +33892,16 @@ body{padding:18px}
                 )
             self._emit(
                 "file_read",
-                {"path": rel, "offset": offset_val, "limit": limit_val, "summary": summary},
+                {
+                    "path": rel,
+                    "offset": offset_val,
+                    "limit": limit_val,
+                    "summary": summary,
+                    "large_file_guard": bool(
+                        limit_val <= 0
+                        and str(out).startswith("[large_file_overview")
+                    ),
+                },
             )
             return out
         if name == "write_file":
@@ -38856,12 +38992,24 @@ body{padding:18px}
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        self._append_plan_guidance_bubble(
-                            "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
-                            summary="todo reminder",
-                        )
-                        self.last_todo_reminder_ts = now_tick
-                        self.todo_reminder_count += 1
+                        bootstrapped = False
+                        try:
+                            bootstrapped = self._ensure_worker_todos_for_plan_step(
+                                self._get_active_plan_step(),
+                                force_refresh=False,
+                                owner=single_role,
+                            )
+                        except Exception:
+                            bootstrapped = False
+                        if bootstrapped:
+                            self._emit("status", {"summary": "todo subtasks auto-bootstrapped after missing-progress detection"})
+                        else:
+                            self._append_plan_guidance_bubble(
+                                "<reminder>Plan subtasks are still unavailable. Continue with one concrete action for the active plan step, or report the blocker with exact evidence.</reminder>",
+                                summary="todo reminder",
+                            )
+                            self.last_todo_reminder_ts = now_tick
+                            self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
                         self._append_plan_guidance_bubble(
                             "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
@@ -39259,14 +39407,21 @@ body{padding:18px}
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
+                "context_effective_token_limit": int(ctx.get("effective_limit", ctx.get("limit", 0))),
+                "context_reserved_tokens": int(ctx.get("reserved", 0)),
+                "context_reserve_percent": float(ctx.get("reserve_percent", 0.0)),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_estimator": str(ctx.get("estimator", "")),
+                "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
                 "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
                 "user_task_level": int(self.user_task_level_override or 0),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
                 "context_left_tokens": int(ctx.get("left", 0)),
+                "context_raw_left_tokens": int(ctx.get("raw_left", 0)),
                 "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
                 "context_used_percent": round(float(ctx.get("used_percent", 0.0)), 2),
+                "context_raw_left_percent": round(float(ctx.get("raw_left_percent", 0.0)), 2),
                 "truncation_count": int(self.truncation_count),
                 "compact_segments_count": len(self.context_archives),
                 "last_compact_reason": self.last_compact_reason,
@@ -40273,27 +40428,51 @@ class SessionManager:
             raise FileNotFoundError(f"missing or invalid config: {LLM_CONFIG_PATH}")
         return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
 
-    def list(self) -> list[dict]:
+    def list(self, *, limit: int | None = None, offset: int = 0, search: str = "", status: str = "") -> list[dict] | dict:
         with self.lock:
-            items = []
-            for sess in self.sessions.values():
-                with sess.lock:
-                    message_count = 0
-                    for row in sess.messages:
-                        if str(row.get("role", "")).strip() == "tool":
-                            continue
-                        message_count += 1
-                items.append(
-                    {
-                        "id": sess.id,
-                        "title": sess.title,
-                        "running": bool(sess.running),
-                        "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                        "updated_at": float(sess.updated_at),
-                        "message_count": int(message_count),
-                    }
+            sessions = list(self.sessions.values())
+        rows: list[dict] = []
+        needle = str(search or "").strip().lower()
+        status_key = str(status or "").strip().lower()
+        for sess in sessions:
+            title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+            sid = str(getattr(sess, "id", "") or "")
+            running = bool(getattr(sess, "running", False))
+            if needle and needle not in title.lower() and needle not in sid.lower():
+                continue
+            if status_key in {"running", "active"} and not running:
+                continue
+            if status_key in {"idle", "stopped"} and running:
+                continue
+            try:
+                message_count = sum(
+                    1 for row in getattr(sess, "messages", [])
+                    if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
                 )
-            return sorted(items, key=lambda x: x["updated_at"], reverse=True)
+            except Exception:
+                message_count = 0
+            rows.append(
+                {
+                    "id": sid,
+                    "title": title,
+                    "running": running,
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
+                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
+                    "message_count": int(message_count),
+                }
+            )
+        rows.sort(key=lambda x: x["updated_at"], reverse=True)
+        if limit is None:
+            return rows
+        off = max(0, int(offset or 0))
+        lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT)))
+        return {
+            "sessions": rows[off: off + lim],
+            "total": len(rows),
+            "offset": off,
+            "limit": lim,
+            "has_more": off + lim < len(rows),
+        }
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -41498,7 +41677,35 @@ function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const si
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;E('topStats').innerHTML=`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`}
-function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
+function renderSessions(){
+  const host=E('sessionList');
+  if(!host)return;
+  const rows=Array.isArray(S.sessions)?S.sessions:[];
+  if(!rows.length){
+    setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
+    return;
+  }
+  const itemH=58;
+  const viewportH=Math.max(240,Number(host.clientHeight||420));
+  const scrollTop=Math.max(0,Number(host.scrollTop||0));
+  const start=Math.max(0,Math.floor(scrollTop/itemH)-8);
+  const count=Math.min(rows.length-start,Math.ceil(viewportH/itemH)+18);
+  const visible=rows.slice(start,start+count);
+  const padTop=start*itemH;
+  const padBottom=Math.max(0,(rows.length-start-count)*itemH);
+  const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
+    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"min-height:${itemH-8}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
+    `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
+  setPanelHtml('sessionList',html);
+  for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
+  if(!host._sessionVirtBound){
+    host._sessionVirtBound=true;
+    host.addEventListener('scroll',()=>{
+      if(host._sessionVirtRaf)return;
+      host._sessionVirtRaf=requestAnimationFrame(()=>{host._sessionVirtRaf=0;renderSessions()});
+    },{passive:true});
+  }
+}
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
 function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
@@ -43648,9 +43855,9 @@ async function refreshSessions(opt={}){
   const useProvidedRows=Object.prototype.hasOwnProperty.call(opt,'sessions');
   const autoSelect=opt.autoSelect!==false;
   const cfgPromise=useProvidedCfg?Promise.resolve(opt.statsConfig):api('/api/config?stats=1').catch(()=>null);
-  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions');
+  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions?limit=500');
   const [cfg,rowsRaw]=await Promise.all([cfgPromise,rowsPromise]);
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   applyRuntimeConfigStats(cfg);
   S.sessions=rows;
   const sig=sessionsSignature(rows);
@@ -43963,7 +44170,7 @@ async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
   const [cfg,rowsRaw,mc]=await Promise.all([
     api('/api/config'),
-    api('/api/sessions'),
+    api('/api/sessions?limit=500'),
     loadModelCatalog(forceProbe).catch(()=>null),
   ]);
   S.config=(cfg&&typeof cfg==='object')?cfg:{};
@@ -43973,7 +44180,7 @@ async function refreshAll(forceProbe=false){
   applyMainI18n();
   renderUploadList();
   renderSkillsEntryLink();
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   const sessState=await refreshSessions({statsConfig:S.config,sessions:rows,autoSelect:true});
   if(!applyModelCatalog(mc)){renderModelControls()}
   refreshDeferredCatalogs().catch(()=>{});
@@ -56390,9 +56597,7 @@ function renderEmbedModelSelect(){
     op.textContent=String(m);
     sel.appendChild(op);
   }
-  const dflt=String(S.config?.default_embed_model||'').trim();
-  if(dflt&&!prev){sel.value=dflt}
-  else if(prev){sel.value=prev}
+  if(prev){sel.value=prev}
 }
 function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
 async function submitImportItems(items,batchIndex,batchCount){
@@ -58037,7 +58242,8 @@ async function runImportText(){
 }
 async function runQuery(){
   setChip('queryStatus','running');
-  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
+  const embedModel=selectedEmbedModel();
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:embedModel,embedding_mode:embedModel?'hybrid':'sparse'})});
   S.query=out; renderQuery(); setChip('queryStatus','done');
 }
 async function rebuildIndex(){
@@ -58707,6 +58913,8 @@ class AppContext:
                 "filename_entities": bool(self.rag_include_filename_entities),
                 "wiki_first_rag": True,
                 "high_recall_fusion": True,
+                "dense_default_enabled": bool(RAG_DENSE_DEFAULT_ENABLED),
+                "default_embedding_calls": False,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -58728,6 +58936,34 @@ class AppContext:
             return str(getattr(ollama_obj, "embed_model", "") or "").strip()
         except Exception:
             return ""
+
+    def _embedding_request_mode(self, body: dict, embed_model_override: str) -> tuple[bool, str, str]:
+        raw_mode = str(
+            body.get(
+                "embedding_mode",
+                body.get("dense_mode", body.get("retrieval_embedding_mode", "")),
+            )
+            or ""
+        ).strip().lower()
+        if raw_mode not in RAG_EMBEDDING_MODE_VALUES:
+            raw_mode = ""
+        explicit_embed_model = bool(str(embed_model_override or "").strip())
+        explicit_dense_flag = any(
+            _to_bool_like(body.get(key), default=False)
+            for key in ("use_embeddings", "use_dense", "dense", "hybrid_dense")
+            if key in body
+        )
+        if raw_mode in {"off", "sparse", "tfidf"}:
+            return False, "sparse", "explicit-off"
+        if raw_mode in {"dense", "hybrid"}:
+            if explicit_embed_model:
+                return True, raw_mode, "explicit-mode"
+            return False, "sparse", "embedding-model-required"
+        if explicit_embed_model and explicit_dense_flag:
+            return True, "hybrid", "explicit-flag"
+        if RAG_DENSE_DEFAULT_ENABLED and explicit_embed_model:
+            return True, "hybrid", "env-default"
+        return False, "sparse", "default-no-embedding"
 
     def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
         return self.rag_store.library_payload(limit=limit, offset=offset)
@@ -58791,7 +59027,7 @@ class AppContext:
             "session_id": str(getattr(session, "id", "") or ""),
         }
 
-    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks RAG chunks that don't yet have embeddings.
 
         Called lazily on the first query when an embedding model is available.
@@ -58806,7 +59042,7 @@ class AppContext:
         # Prioritise most recently added chunks; embed up to max_chunks
         to_embed = to_embed[-max_chunks:]
         texts = [str(all_chunks[cid].get("text", "") or "")[:2048] for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -58819,7 +59055,7 @@ class AppContext:
                 pass
         return count
 
-    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks Code Library chunks that don't yet have embeddings."""
         with self.code_store.lock:
             all_chunks = dict(self.code_store.chunks)
@@ -58834,7 +59070,7 @@ class AppContext:
             + str(all_chunks[cid].get("text", "") or "")
         )[:2048]
         texts = [anchor_text(cid) for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -59200,22 +59436,25 @@ class AppContext:
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Generate query embedding for hybrid dense+sparse retrieval when model is available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Generate query embedding only when explicitly requested. Default RAG stays sparse.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
-            # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.rag_store.index.has_dense_index()
                 and self.rag_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_rag_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_rag_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.rag_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
         requested_route = route if route in {"auto", "wiki", "raw", "fast", "global", "hybrid"} else "auto"
@@ -59293,6 +59532,20 @@ class AppContext:
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
@@ -59532,21 +59785,25 @@ class AppContext:
         language_filter = str(body.get("language", "") or "").strip().lower()
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Dense embedding for code query when available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Dense embedding for code query only when explicitly requested.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.code_store.index.has_dense_index()
                 and self.code_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_code_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_code_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.code_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
         requested_route = route if route in {"auto", "wiki", "workflow", "raw", "fast", "global", "hybrid"} else "auto"
@@ -59641,6 +59898,20 @@ class AppContext:
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         if synthesize:
@@ -59933,6 +60204,8 @@ class AppContext:
                 "route": str((args or {}).get("route", "auto") or "auto"),
                 "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "language": str((args or {}).get("language", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
@@ -59955,6 +60228,8 @@ class AppContext:
             f"route={str(result.get('route', '') or '')} "
             f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
             f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
             f"results={len(rows)}"
         )
         if not rows:
@@ -59997,6 +60272,8 @@ class AppContext:
                 "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "category": str((args or {}).get("category", "") or ""),
                 "kind": str((args or {}).get("kind", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
@@ -60005,6 +60282,8 @@ class AppContext:
             f"route={str(result.get('route', '') or '')} "
             f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
             f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
             f"results={len(rows)}"
         )
         if not rows:
@@ -61658,6 +61937,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/skills/protocol-examples":
             return self._send_json(self.app.skill_protocol_examples())
         if path == "/api/sessions":
+            page_like = any(k in query for k in ("limit", "offset", "page", "page_size", "search", "status", "paged"))
+            if page_like:
+                try:
+                    page_size = int((query.get("page_size", query.get("limit", [str(SESSION_LIST_DEFAULT_LIMIT)])) or [str(SESSION_LIST_DEFAULT_LIMIT)])[0] or SESSION_LIST_DEFAULT_LIMIT)
+                except Exception:
+                    page_size = SESSION_LIST_DEFAULT_LIMIT
+                try:
+                    page = int((query.get("page", ["1"]) or ["1"])[0] or 1)
+                except Exception:
+                    page = 1
+                try:
+                    offset = int((query.get("offset", [str(max(0, page - 1) * page_size)]) or [str(max(0, page - 1) * page_size)])[0] or 0)
+                except Exception:
+                    offset = max(0, page - 1) * page_size
+                search = str((query.get("search", [""]) or [""])[0] or "")
+                status = str((query.get("status", [""]) or [""])[0] or "")
+                return self._send_json(mgr.list(limit=page_size, offset=offset, search=search, status=status))
             return self._send_json(mgr.list())
         if path == "/api/export/source.zip":
             return self._send_json({"error": "Use /api/sessions/{id}/export.zip for current user session export."}, status=400)
