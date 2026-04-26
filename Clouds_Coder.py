@@ -60,6 +60,13 @@ DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 1: Process bootstrap, shared runtime defaults, and global policy.
+# 第一层：进程启动、共享运行时默认值与全局策略。
+# 第1層：プロセス起動、共有ランタイム既定値、全体ポリシー。
+# ============================================================================
+
 def _shared_http_ssl_context():
     global _HTTP_SSL_CONTEXT
     if _HTTP_SSL_CONTEXT is not None:
@@ -145,7 +152,10 @@ RAG_MAX_CHUNKS_PER_DOC = 500
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
-RAG_MAX_QUERY_RESULTS = 12
+RAG_MAX_QUERY_RESULTS = 64
+RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
+RAG_HIGH_RECALL_MIN_POOL = 64
+RAG_RETRIEVAL_MAX_PER_DOC = 5
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -154,7 +164,7 @@ RAG_MAX_IMPORT_BATCH_ITEMS = 500
 RAG_MAX_IMPORT_BATCH_BYTES = 48 * 1024 * 1024
 RAG_PDF_IMAGE_LIMIT = 8
 RAG_QUERY_CONTEXT_CHARS = 1600
-RAG_MAX_GLOBAL_COMMUNITIES = 5
+RAG_MAX_GLOBAL_COMMUNITIES = 3
 RAG_MAX_COMMUNITY_MAP_SUPPORT = 4
 RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT = False
 RAG_DYNAMIC_NOISE_MIN_DOC_FREQ = 6
@@ -163,6 +173,18 @@ RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO = 0.18
 RAG_DYNAMIC_NOISE_HARD_DOC_RATIO = 0.42
 RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
 RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
+RAG_MIN_SYNTHESIS_SCORE = 0.12       # chunks below this score are filtered before LLM synthesis
+RAG_NO_EVIDENCE_THRESHOLD = 0.18     # if best chunk score < this, skip LLM entirely and return no-evidence message
+RAG_WEAK_MATCH_SCORE_CAP = 0.095     # fuzzy fallback candidates stay visible but cannot trigger grounded synthesis
+RAG_SYNTHESIS_MAX_PER_DOC = 2        # max chunks from the same document in synthesis evidence
+RAG_WORKFLOW_ACCEPT_SCORE = 0.72
+RAG_NO_EVIDENCE_MESSAGE = "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+RAG_CONTEXT_BUDGETS = {
+    "tight": {"top_k": 6, "pool": 24, "chars": 3600, "evidence": 4},
+    "standard": {"top_k": 10, "pool": 48, "chars": 7200, "evidence": 6},
+    "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
+}
+RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
@@ -2955,7 +2977,7 @@ def _html_esc(text: str) -> str:
 
 
 def _text_to_minimal_pdf(text: str) -> bytes:
-    """纯 Python 最小 PDF 生成器，支持 CJK（中日韩）字符。"""
+    """Minimal pure-Python PDF generator with CJK-safe text output."""
     raw = str(text or "")
     lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     font_size = 9
@@ -2984,7 +3006,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
     usable_h = page_h - margin_top - margin_bottom
     lines_per_page = max(1, int(usable_h / leading))
 
-    # 折行
+    # Wrap lines to the effective page width.
     wrapped: list[str] = []
     for line in lines:
         if not line:
@@ -2995,7 +3017,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
             line = line[max_chars_per_line:]
         wrapped.append(line)
 
-    # 分页
+    # Split wrapped lines into page-sized groups.
     pages_list: list[list[str]] = []
     for i in range(0, len(wrapped), lines_per_page):
         pages_list.append(wrapped[i:i + lines_per_page])
@@ -3592,6 +3614,8 @@ def split_thinking_content(text: str) -> tuple[str, str]:
     body = "".join(body_parts)
     body = re.sub(r"(?is)```(?:thinking|reasoning)\s*([\s\S]*?)```", _repl_block, body)
     body = re.sub(r"(?is)<\|start_of_thought\|>(.*?)<\|end_of_thought\|>", _repl_block, body)
+    # Strip orphaned closing tags left by providers that pre-extract thinking content
+    body = re.sub(r"(?is)</think\s*>", "", body)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     thinking = "\n\n".join(part for part in thinking_parts if part).strip()
     return body, trim(thinking, 24_000) if thinking else ""
@@ -3963,6 +3987,13 @@ def extract_openai_compat_model_ids(payload: object) -> list[str]:
             _add(node)
     _walk(payload, 0)
     return out
+
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 2: Model/provider profile loading and normalization.
+# 第二层：模型与提供方配置加载及规范化。
+# 第2層：モデル/プロバイダ設定の読み込みと正規化。
+# ============================================================================
 
 def _is_http_url(text: str) -> bool:
     try:
@@ -9811,6 +9842,13 @@ dWIvYnVpbHRpbi9jbGF1ZGUtY29kZS11c2FnZS9TS0lMTC5tZFBLAQIUAxQAAAAIADIDYlwWqY2QzAEA
 L2J1aWx0aW4vZ2l0aHViLWludGVncmF0aW9uL1NLSUxMLm1kUEsFBgAAAAAHAAcASAIAAKRTAAAAAA=="""
 
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 3: Runtime skill provisioning and protocol adaptation.
+# 第三层：运行时 skill 供给与协议适配。
+# 第3層：ランタイム skill 提供とプロトコル適合。
+# ============================================================================
+
 def ensure_embedded_clawhub_skills(skills_root: Path):
     builtin_root = skills_root / "clawhub" / "builtin"
     manifest_path = builtin_root / "_builtin_manifest.json"
@@ -9905,7 +9943,7 @@ SKILL_PROTOCOL_SPECS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Built-in skill guides (injected into SkillStore on reload)
+# Built-in skill guides injected into SkillStore on reload.
 # ---------------------------------------------------------------------------
 _BUILTIN_SKILLS: dict[str, dict] = {
     "workspace-paths": {
@@ -9996,6 +10034,13 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         ),
     },
 }
+
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Shared runtime services: skill discovery, provider bridging, and local guides.
+# 共享运行时服务：skill 发现、provider 桥接与本地指南。
+# 共通ランタイムサービス：skill 発見、provider ブリッジ、ローカルガイド。
+# ============================================================================
 
 class SkillStore:
     def __init__(self, skills_root: Path):
@@ -11293,6 +11338,13 @@ class SkillStore:
                 lines.append("</skill_attachments>")
         return "\n".join(lines)
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Shared coordination primitives: tasks, background jobs, inboxes, and worktrees.
+# 共享协作原语：任务、后台作业、收件箱与 worktree。
+# 共通協調プリミティブ：タスク、バックグラウンドジョブ、受信箱、worktree。
+# ============================================================================
+
 class TaskManager:
     def __init__(self, task_dir: Path, crypto: CryptoBox):
         self.dir = task_dir
@@ -11809,6 +11861,7 @@ class OllamaClient:
         self.thinking_stream = bool(thinking_stream)
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
+        self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
 
     def apply_profile(self, profile: dict):
         self.provider = str(profile.get("provider", "ollama") or "ollama")
@@ -11833,6 +11886,50 @@ class OllamaClient:
             declared_caps,
         )
         self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
+        if "embed_model" in profile:
+            self.embed_model = str(profile.get("embed_model") or "").strip()
+
+    def embed(self, *, model: str, input: "str | list") -> dict:
+        """Get embedding vector(s) from the model.
+
+        Returns {"embeddings": [[float, ...]]} regardless of backend.
+        Raises on failure — _rag_embed_text catches and falls back to TF-IDF.
+        """
+        m = str(model or self.embed_model or "").strip()
+        if not m:
+            raise ValueError("OllamaClient.embed() called with no model configured")
+        texts = input if isinstance(input, list) else [str(input)]
+
+        if self.provider == "ollama":
+            raw = self._post_json(
+                "/api/embed",
+                {"model": m, "input": texts[0] if len(texts) == 1 else texts},
+            )
+            vecs = raw.get("embeddings") or raw.get("embedding")
+            if isinstance(vecs, list) and vecs:
+                if isinstance(vecs[0], list):
+                    return {"embeddings": vecs}
+                return {"embeddings": [vecs]}
+            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
+        else:
+            payload: dict = {"model": m, "input": texts}
+            if self.payload_template:
+                payload.update(
+                    {k: v for k, v in self.payload_template.items() if k not in payload}
+                )
+            headers = self._render_headers()
+            base = str(self.base_url or "").rstrip("/")
+            raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
+            data = raw.get("data") or []
+            if data and isinstance(data[0], dict):
+                vecs = [
+                    item["embedding"]
+                    for item in data
+                    if isinstance(item.get("embedding"), list)
+                ]
+                if vecs:
+                    return {"embeddings": vecs}
+            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
 
     def _probe_cache_key(self) -> str:
         endpoint = self.endpoint.strip() if self.endpoint else ""
@@ -12445,6 +12542,23 @@ class OllamaClient:
             "raw": parsed,
         }
 
+    @staticmethod
+    def _collapse_tool_role_messages(messages: list[dict]) -> list[dict]:
+        """Convert role=tool messages to role=user for providers that don't support the tool role."""
+        out = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                out.append(msg)
+                continue
+            if str(msg.get("role", "")).strip() == "tool":
+                name = str(msg.get("name", "") or "").strip()
+                content = str(msg.get("content", "") or "").strip()
+                label = f"[Tool result: {name}]\n{content}" if name else f"[Tool result]\n{content}"
+                out.append({"role": "user", "content": label})
+            else:
+                out.append(msg)
+        return out
+
     def _chat_openai_compat(
         self,
         req_messages: list[dict],
@@ -12464,7 +12578,21 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        except OllamaError as exc:
+            # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
+            # Retry once with tool messages collapsed into user messages.
+            err_text = str(exc).lower()
+            if int(getattr(exc, "status", 0) or 0) == 400 and (
+                "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
+            ):
+                fallback_msgs = self._collapse_tool_role_messages(req_messages)
+                fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
+                fallback_payload.pop("tools", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+            else:
+                raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12540,6 +12668,25 @@ class OllamaClient:
             content = m.get("content", "") or ""
             if role == "system":
                 system_parts.append(str(content))
+            elif role == "tool":
+                # Convert OpenAI-style tool result (role=tool) to Anthropic tool_result block
+                tool_call_id = str(m.get("tool_call_id", "") or "").strip()
+                tool_content = str(content) if not isinstance(content, str) else content
+                if tool_call_id:
+                    block = {"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}
+                else:
+                    name = str(m.get("name", "") or "").strip()
+                    label = f"[Tool result: {name}]\n{tool_content}" if name else f"[Tool result]\n{tool_content}"
+                    block = {"type": "text", "text": label}
+                # Merge into previous user message if possible, else append new one
+                if messages and messages[-1].get("role") == "user":
+                    prev = messages[-1]["content"]
+                    if isinstance(prev, list):
+                        prev.append(block)
+                    else:
+                        messages[-1]["content"] = [{"type": "text", "text": str(prev)}, block]
+                else:
+                    messages.append({"role": "user", "content": [block]})
             else:
                 # Convert OpenAI-style image_url parts to Anthropic image format
                 if isinstance(content, list):
@@ -12578,6 +12725,11 @@ class OllamaClient:
             "content-type": "application/json",
         }
         raw = self._post_json_url(endpoint, payload, headers=headers)
+        # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
+        # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
+        if isinstance(raw.get("choices"), list) and tools:
+            payload["tools"] = tools  # original OpenAI-format tools
+            raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12911,7 +13063,8 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "workflow", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "language": {"type": "string"},
         },
         ["query"],
@@ -12927,7 +13080,8 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "category": {"type": "string"},
             "kind": {"type": "string"},
         },
@@ -13112,6 +13266,15 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     },
 }
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 4: Session execution chain and agent-facing runtime state.
+# 第四层：会话执行链与面向 agent 的运行时状态。
+# 第4層：セッション実行チェーンと agent 向けランタイム状態。
+# ============================================================================
+
+# Per-session orchestrator: maintains conversation state, plan state, tool
+# routing, todo synchronization, completion checks, and agent coordination.
 class SessionState:
     def __init__(
         self,
@@ -13170,8 +13333,8 @@ class SessionState:
         self.meta_path = self.root / "meta.json"
         self.state_path = self.root / "state.json"
         self.crypto = crypto
-        # Session methods can emit events while already holding this lock.
-        # Use re-entrant lock to avoid self-deadlock.
+        # Session methods may emit events while already holding this lock.
+        # Use a re-entrant lock to avoid self-deadlock during nested callbacks.
         self.lock = threading.RLock()
         self.owner_user_id = str(owner_user_id or "")
         self.upload_callback = upload_callback
@@ -13235,6 +13398,8 @@ class SessionState:
         self.uploads: list[dict] = []
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
         self.cancel_requested = False
@@ -14226,13 +14391,8 @@ class SessionState:
                     self.active_profile_id = self._sanitize_profile_id(active)
                 self.todo.items = raw.get("todos", [])
                 self.thinking = False
-                self.context_token_upper_bound = int(
-                    raw.get("context_token_upper_bound", self.context_token_upper_bound)
-                )
-                self.context_token_upper_bound = max(
-                    MIN_CONTEXT_TOKEN_LIMIT,
-                    min(self.max_context_token_limit, self.context_token_upper_bound),
-                )
+                # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
+                # It will be reset to max after load (see below). Only exception: context_limit_locked.
                 self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
                 self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
                 ids = raw.get("truncation_rescue_task_ids", [])
@@ -14431,6 +14591,13 @@ class SessionState:
                         if isinstance(row, dict):
                             clean_am.append(dict(row))
                     self.agent_messages = clean_am[-800:]
+                # Align agent_messages to initial tier limit immediately after load.
+                # Prevents a stale 800-row list from inflating the first token estimate
+                # and triggering unnecessary Tier2/3 compression on reconnect.
+                _init_tier = self._context_compression_tier()
+                _init_am_limit = self._tier_agent_context_limits(_init_tier)["agent_messages"]
+                if len(self.agent_messages) > _init_am_limit:
+                    self.agent_messages = self.agent_messages[-_init_am_limit:]
                 raw_blackboard = raw.get("blackboard", {})
                 self.blackboard = self._normalize_blackboard(raw_blackboard)
                 raw_bus = raw.get("agent_bus_messages", [])
@@ -14469,6 +14636,10 @@ class SessionState:
         if not self.model_profiles:
             self._init_llm_profiles({})
         if self.context_limit_locked:
+            self.context_token_upper_bound = self.max_context_token_limit
+        else:
+            # Always reset to max on load — upper_bound is a runtime probe, not a persisted config.
+            # Stale compressed values from a previous session cause spurious high-tier compression on reconnect.
             self.context_token_upper_bound = self.max_context_token_limit
         # Ensure previous-run volatile state and control-hint artifacts are cleared on load.
         self._reset_runtime_state_locked(purge_runtime_hints=True)
@@ -14512,7 +14683,6 @@ class SessionState:
             "skill_load_cache": self.skill_load_cache,
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
-            "context_token_upper_bound": self.context_token_upper_bound,
             "context_limit_locked": bool(self.context_limit_locked),
             "truncation_count": self.truncation_count,
             "last_truncation_ts": self.last_truncation_ts,
@@ -14722,6 +14892,8 @@ class SessionState:
         self.runtime_plan_mode_needed = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta = {}
         return removed_hints
 
     def _restore_runtime_policy_from_blackboard_locked(self) -> None:
@@ -15738,6 +15910,9 @@ class SessionState:
         self.runtime_code_reference_text = trim(str(payload.get("code_text", payload.get("text", "")) or ""), 8000)
         meta = payload.get("code_meta", payload.get("meta", {}))
         self.runtime_code_reference_meta = dict(meta) if isinstance(meta, dict) else {}
+        self.runtime_knowledge_reference_text = trim(str(payload.get("knowledge_text", "") or ""), 8000)
+        knowledge_meta = payload.get("knowledge_meta", {})
+        self.runtime_knowledge_reference_meta = dict(knowledge_meta) if isinstance(knowledge_meta, dict) else {}
 
     def _runtime_code_reference_prompt_block(self, max_chars: int = 4200) -> str:
         text = trim(str(getattr(self, "runtime_code_reference_text", "") or ""), max_chars)
@@ -15757,7 +15932,31 @@ class SessionState:
         return (
             f"{header}:\n"
             "Prioritize these code-library references for code implementation/review tasks before generic reasoning. "
+            "If evidence_status=miss, say the code library has no sufficient matching evidence instead of inventing library facts. "
             "If a reference conflicts with the current workspace file, trust the current workspace after verification.\n"
+            f"{text}"
+        )
+
+    def _runtime_knowledge_reference_prompt_block(self, max_chars: int = 3600) -> str:
+        text = trim(str(getattr(self, "runtime_knowledge_reference_text", "") or ""), max_chars)
+        if not text:
+            return ""
+        meta = dict(getattr(self, "runtime_knowledge_reference_meta", {}) or {})
+        tags: list[str] = []
+        route = str(meta.get("route", meta.get("requested_route", "")) or "").strip()
+        if route:
+            tags.append(f"route={route}")
+        result_count = int(meta.get("result_count", meta.get("top_results", 0)) or 0)
+        tags.append(f"evidence_status={str(meta.get('evidence_status', 'miss') or 'miss')}")
+        if result_count > 0:
+            tags.append(f"results={result_count}")
+        header = "Knowledge Library Context"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "Use these knowledge-library references only for claims directly supported by the cited evidence. "
+            "If evidence_status=miss or the snippets do not contain the needed fact, state that the library has no sufficient evidence.\n"
             f"{text}"
         )
 
@@ -15790,7 +15989,8 @@ class SessionState:
             "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
             "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
             "to retrieve grounded references BEFORE generating your answer. "
-            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Use route='auto' with budget='standard' by default; use budget='tight' for brief context and budget='deep' only when the user asks for exhaustive retrieval. "
+            "If query results report evidence_status=miss or weak evidence, say the library has no sufficient evidence instead of inventing facts. "
             "Do not infer readiness from session/files or uploads — query the library directly."
         )
 
@@ -15863,7 +16063,8 @@ class SessionState:
             "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`."
             f"{source_hint} "
             "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
+            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library. "
+            "Use route='auto' with budget='standard' by default; use route='workflow' for process patterns and route='wiki' for accumulated code summaries."
         )
 
     def _engineering_execution_boost_instruction(self) -> str:
@@ -15898,6 +16099,7 @@ class SessionState:
         code_hint = self._code_library_prompt_block()
         engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
+        knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -15906,6 +16108,7 @@ class SessionState:
         knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
+        knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
@@ -15951,11 +16154,36 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{knowledge_ref_block_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
             f"Skills:\n{self.skills.descriptions()}"
         )
+
+    def _char_token_divisor(self, text: str) -> float:
+        """Return chars-per-token divisor adjusted for CJK character density.
+
+        ASCII  : ~4 chars/token  (divisor 4.0)
+        Mixed  : ~3 chars/token  (divisor 3.0, >20% CJK)
+        CJK-heavy: ~2.5 chars/token (divisor 2.5, >50% CJK)
+        Using // 4 for CJK-heavy content underestimates tokens by 30-50%.
+        """
+        if not text:
+            return 4.0
+        sample = text[:2000]
+        cjk = sum(
+            1 for c in sample
+            if "\u4e00" <= c <= "\u9fff"
+            or "\u3040" <= c <= "\u30ff"
+            or "\uac00" <= c <= "\ud7af"
+        )
+        ratio = cjk / max(1, len(sample))
+        if ratio > 0.5:
+            return 2.5
+        if ratio > 0.2:
+            return 3.0
+        return 4.0
 
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
@@ -15967,18 +16195,22 @@ class SessionState:
             for role in (self.runtime_participants or AGENT_ROLES):
                 ctx = self._agent_context(role)
                 if ctx:
-                    cost = len(json_dumps(ctx)) // 4
+                    raw = json_dumps(ctx)
+                    cost = int(len(raw) / self._char_token_divisor(raw))
                     if cost > agent_max:
                         agent_max = cost
-            msg_tokens = max(agent_max, len(json_dumps(self.messages)) // 4)
+            msg_raw = json_dumps(self.messages)
+            msg_tokens = max(agent_max, int(len(msg_raw) / self._char_token_divisor(msg_raw)))
         else:
-            msg_tokens = len(json_dumps(self.messages)) // 4
+            msg_raw = json_dumps(self.messages)
+            msg_tokens = int(len(msg_raw) / self._char_token_divisor(msg_raw))
         # Overhead: system prompt + tools (always present in API calls)
         try:
-            sys_tokens = len(self._system_prompt()) // 4
+            sys_text = self._system_prompt()
+            sys_tokens = int(len(sys_text) / self._char_token_divisor(sys_text))
         except Exception:
             sys_tokens = 300
-        tools_tokens = len(json_dumps(TOOLS)) // 4 if TOOLS else 0
+        tools_tokens = int(len(json_dumps(TOOLS)) / 4) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
@@ -16931,11 +17163,13 @@ class SessionState:
 
     def _estimate_messages_tokens(self, rows: list[dict]) -> int:
         try:
-            return len(json_dumps(rows)) // 4
+            raw = json_dumps(rows)
+            return int(len(raw) / self._char_token_divisor(raw))
         except Exception:
             total = 0
             for row in rows:
-                total += len(str(row.get("content", ""))) // 4
+                c = str(row.get("content", ""))
+                total += int(len(c) / self._char_token_divisor(c))
             return total
 
     def _select_compact_tail(self, token_budget: int, min_count: int = 4, max_count: int = 48) -> list[dict]:
@@ -16991,7 +17225,7 @@ class SessionState:
         self.context_archives = self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:]
         return seg
 
-    # --- File buffer methods (修改 7) ---
+    # --- File buffer methods: offload oversized outputs into stable session files ---
 
     def _write_file_buffer_entry(self, content: str, label: str = "") -> dict:
         """Write large content to disk and return entry metadata."""
@@ -17458,7 +17692,7 @@ class SessionState:
         current_tokens = 0
         for priority, idx, msg in scored:
             content = str(msg.get("content", "") or "")
-            msg_tokens = max(1, len(content) // 4)
+            msg_tokens = max(1, int(len(content) / self._char_token_divisor(content)))
             if priority >= 7:
                 # High priority: keep intact
                 kept.append((idx, dict(msg)))
@@ -17470,7 +17704,8 @@ class SessionState:
                     role = msg.get("role", "tool")
                     compressed["content"] = trim(content, 500) + " [compressed]"
                 kept.append((idx, compressed))
-                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+                cc = str(compressed.get("content", ""))
+                current_tokens += max(1, int(len(cc) / self._char_token_divisor(cc)))
             else:
                 # Low priority: one-liner summary if over budget
                 if current_tokens > target_tokens * 0.8:
@@ -17483,7 +17718,8 @@ class SessionState:
                 elif len(content) > 200:
                     compressed["content"] = trim(content, 200) + " [truncated]"
                 kept.append((idx, compressed))
-                current_tokens += max(1, len(str(compressed.get("content", ""))) // 4)
+                cc = str(compressed.get("content", ""))
+                current_tokens += max(1, int(len(cc) / self._char_token_divisor(cc)))
             if current_tokens > target_tokens:
                 break
         # Re-sort by original index to maintain conversation order
@@ -17552,7 +17788,11 @@ class SessionState:
         if self._estimate_messages_tokens(tail) > target_tokens:
             compact_note_msg = tail[-1]  # preserve the compact-resume note
             tail_without_note = tail[:-1]
-            compressed_tail = self._priority_compress_messages(tail_without_note, target_tokens, tier)
+            # Reserve budget for the compact-resume note itself (STATE_HANDOFF + summary can be large)
+            note_content = str(compact_note_msg.get("content", "") or "")
+            note_token_reserve = max(200, int(len(note_content) / self._char_token_divisor(note_content)) + 100)
+            effective_target = max(2000, target_tokens - note_token_reserve)
+            compressed_tail = self._priority_compress_messages(tail_without_note, effective_target, tier)
             compressed_tail.append(compact_note_msg)
             tail = compressed_tail
         # Final safety: if still over budget, trim from front
@@ -19705,8 +19945,8 @@ body{padding:18px}
         raw = Path(str(filename or "upload.bin")).name
         # Only remove characters that are genuinely illegal or dangerous on
         # filesystems (path separators, null byte, control chars, Windows
-        # reserved chars). Unicode letters/CJK/etc. are left untouched so
-        # filenames like "我的数据.xlsx" remain readable.
+        # reserved chars). Unicode letters are left untouched so localized
+        # filenames remain readable.
         safe = re.sub(r'[/\\\x00-\x1f\x7f:*?"<>|]', "_", raw)
         safe = safe.strip(". ")  # avoid hidden files (leading dot) and trailing issues
         # Enforce a byte-length ceiling safe across all filesystems (255 bytes max).
@@ -19730,7 +19970,7 @@ body{padding:18px}
         return data.decode("latin-1", errors="ignore")
 
     def _extract_pdf_text(self, pdf_path: Path) -> str:
-        # 优先使用 pdfminer.six（纯 Python，无外部依赖）
+        # Prefer pdfminer.six first because it is pure Python and self-contained.
         try:
             from pdfminer.high_level import extract_text
             text = extract_text(str(pdf_path))
@@ -19740,7 +19980,7 @@ body{padding:18px}
             pass
         except Exception:
             pass
-        # 降级：pdftotext CLI
+        # Fallback to the pdftotext CLI when available.
         tool = shutil.which("pdftotext")
         if tool:
             try:
@@ -19754,7 +19994,7 @@ body{padding:18px}
                     return r.stdout.strip()
             except Exception:
                 pass
-        # 最终降级：regex 提取
+        # Final fallback: approximate text recovery from PDF string literals.
         try:
             raw = pdf_path.read_bytes()
             text = raw.decode("latin-1", errors="ignore")
@@ -20192,7 +20432,7 @@ body{padding:18px}
             ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
             # Fortran
             ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
-            # 更多语言
+            # Additional text-like source formats
             ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
             ".asm", ".s",
             ".bas", ".vb", ".vbs", ".vba",
@@ -20578,7 +20818,7 @@ body{padding:18px}
             "修正完了",
             "以上です",
             "作成しました",
-            # 明确表示拒绝/无法完成也应视为终结
+            # Explicit refusal or inability to proceed also counts as terminal wording.
             "抱歉",
             "sorry",
             "无法",
@@ -20707,7 +20947,7 @@ body{padding:18px}
             "以上です",
             "作成しました",
             "準備できました",
-            # 明确表示无法完成的标记
+            # Explicit inability markers: treat these as "cannot complete" signals.
             "抱歉，我无法",
             "无法直接获取",
             "无法完成",
@@ -21471,25 +21711,25 @@ body{padding:18px}
         if len(t) >= 120:
             return True
         markers = [
-            # 工程/开发
+            # Engineering / development
             "实现", "修复", "重构", "设计", "构建", "架构", "内核", "框架",
             "死循环", "状态机", "调度", "后端", "前端", "自动化",
             "agentbus", "watchdog", "decomposition", "workflow",
             "architecture", "build", "implement", "refactor", "fix", "debug",
             "multi-step",
-            # 文档/演示/设计制作
+            # Documents / presentations / design deliverables
             "ppt", "pptx", "演示文稿", "幻灯片", "presentation",
             "生成报告", "制作", "做一个",
             "excel", "xlsx", "电子表格", "docx", "word",
             "pdf", "可视化", "visualization", "dashboard",
             "svg", "canvas", "动画", "animation",
-            # 全栈/部署
+            # Full-stack / deployment
             "api", "server", "数据库", "database", "部署", "deploy",
             "docker", "mcp", "agent", "bot", "爬虫", "crawler",
             "测试", "test", "playwright",
-            # 品牌/内容
+            # Brand / content
             "品牌", "brand", "theme", "gif",
-            # 通用复杂任务动词
+            # Generic high-complexity task verbs
             "分析并", "总结并", "对比", "深度",
         ]
         return any(x in t for x in markers)
@@ -21563,29 +21803,29 @@ body{padding:18px}
         nontrivial = self._looks_nontrivial_request(clean) or task_complexity_at_least(llm_complexity, "moderate")
         direct_question = self._looks_like_direct_question_request(clean) and (not task_complexity_at_least(llm_complexity, "moderate"))
         code_markers = [
-            # 代码/编程
+            # Coding / programming
             "代码", "寫代碼", "写代码", "脚本", "模块", "函数", "class", "bug",
             "修复", "实现", "重构", "app.py", "crawler.py",
             ".py", ".js", ".ts", ".html", ".css", ".vue", ".jsx", ".tsx",
             "python", "javascript", "bash", "terminal", "tool", "patch", "edit",
             "write_file", "read_file", "build", "implement", "fix", "refactor", "debug",
-            # 文档/演示生成（需要 skill 支撑）
+            # Document / presentation generation, usually skill-backed
             "ppt", "pptx", "演示文稿", "幻灯片", "presentation", "slide",
             "生成ppt", "制作ppt", "做ppt", "做一个ppt",
             "excel", "xlsx", "电子表格", "spreadsheet", "表格",
             "docx", "word", "文档", "document", "报告", "report",
             "pdf", "生成pdf", "制作pdf",
-            # 设计/前端/可视化
+            # Design / frontend / visualization
             "html报告", "可视化", "visualization", "图表", "chart", "dashboard",
             "前端", "frontend", "ui", "界面", "landing page", "网页", "页面",
             "svg", "canvas", "动画", "animation", "设计",
-            # 工程/架构
+            # Systems / architecture
             "api", "server", "服务", "数据库", "database", "部署", "deploy",
             "docker", "容器", "微服务", "microservice", "架构",
             "mcp", "agent", "bot", "爬虫", "crawler", "scraper",
-            # 测试
+            # Testing
             "测试", "test", "单元测试", "集成测试", "playwright", "selenium",
-            # 品牌/内容
+            # Brand / content
             "品牌", "brand", "logo", "主题", "theme",
             "gif", "图片", "image", "插画",
         ]
@@ -22438,6 +22678,10 @@ body{padding:18px}
         out_buf = bytearray()
         err_buf = bytearray()
         next_progress_emit = start + 0.8
+        # Idle-timeout tracking: reset whenever output is captured.
+        # Timeout fires only when no output has arrived for `timeout` seconds;
+        # a hard cap of MAX_SHELL_COMMAND_TIMEOUT_SECONDS prevents infinite runs.
+        last_activity_ts = [start]
 
         def _stop_process(p: subprocess.Popen):
             # shell=True may spawn child processes; stop the whole process group on POSIX.
@@ -22466,6 +22710,7 @@ body{padding:18px}
             if not piece:
                 return
             target.extend(piece)
+            last_activity_ts[0] = time.time()  # Reset idle timer on any output
             overflow = len(target) - capture_limit
             if overflow > 0:
                 del target[:overflow]
@@ -22546,9 +22791,17 @@ body{padding:18px}
                     meta["error"] = "Error: interrupted by user"
                     meta["exit_code"] = -130
                     break
-                elif (not meta.get("error")) and timeout > 0 and elapsed >= timeout:
+                elif (not meta.get("error")) and timeout > 0 and (
+                    (now - last_activity_ts[0]) >= timeout
+                    or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
+                ):
+                    idle_secs = int(now - last_activity_ts[0])
+                    meta["error"] = (
+                        f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
+                        if (now - last_activity_ts[0]) >= timeout
+                        else f"Error: hard cap reached ({int(elapsed)}s)"
+                    )
                     _stop_process(proc)
-                    meta["error"] = f"Error: timeout ({timeout}s)"
                     meta["exit_code"] = -1
                     break
                 try:
@@ -22573,12 +22826,14 @@ body{padding:18px}
                     else:
                         _append_capture(out_buf, chunk)
                 if now >= next_progress_emit:
+                    _idle_secs = int(now - last_activity_ts[0])
+                    _idle_str = f", idle={_idle_secs}s" if _idle_secs > 5 else ""
                     self._emit_transient(
                         "status",
                         {
                             "summary": (
                                 f"bash running ({int(elapsed)}s, "
-                                f"captured={len(out_buf) + len(err_buf)}B)"
+                                f"captured={len(out_buf) + len(err_buf)}B{_idle_str})"
                             )
                         },
                     )
@@ -22676,9 +22931,17 @@ body{padding:18px}
                                 meta["error"] = "Error: interrupted by user"
                                 meta["exit_code"] = -130
                                 break
-                            elif timeout > 0 and elapsed >= timeout:
+                            elif timeout > 0 and (
+                                (now - last_activity_ts[0]) >= timeout
+                                or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
+                            ):
+                                idle_secs = int(now - last_activity_ts[0])
+                                meta["error"] = (
+                                    f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
+                                    if (now - last_activity_ts[0]) >= timeout
+                                    else f"Error: hard cap reached ({int(elapsed)}s)"
+                                )
                                 _stop_process(proc)
-                                meta["error"] = f"Error: timeout ({timeout}s)"
                                 meta["exit_code"] = -1
                                 break
                             events = sel.select(timeout=0.12)
@@ -22701,12 +22964,14 @@ body{padding:18px}
                                 else:
                                     _append_capture(out_buf, chunk)
                             if now >= next_progress_emit:
+                                _idle_secs = int(now - last_activity_ts[0])
+                                _idle_str = f", idle={_idle_secs}s" if _idle_secs > 5 else ""
                                 self._emit_transient(
                                     "status",
                                     {
                                         "summary": (
                                             f"bash running ({int(elapsed)}s, "
-                                            f"captured={len(out_buf) + len(err_buf)}B)"
+                                            f"captured={len(out_buf) + len(err_buf)}B{_idle_str})"
                                         )
                                     },
                                 )
@@ -23198,7 +23463,7 @@ body{padding:18px}
         first_line = old_text.strip().splitlines()[0].strip() if old_text.strip() else ""
         if not first_line:
             return "The old_text is empty or whitespace-only."
-        # 搜索 old_text 的第一行在文件中的位置
+        # Locate the first line of old_text inside the current file content.
         matches = []
         for i, line in enumerate(lines, 1):
             if first_line in line:
@@ -23211,7 +23476,7 @@ body{padding:18px}
                 f"Likely cause: whitespace or indentation mismatch. "
                 f"Tip: use read_file to get the exact content, then copy it precisely."
             )
-        # 尝试空白规范化匹配
+        # Retry with whitespace-normalized matching before failing the edit.
         norm_first = " ".join(first_line.split())
         for i, line in enumerate(lines, 1):
             norm_line = " ".join(line.split())
@@ -24387,7 +24652,7 @@ body{padding:18px}
         return True
 
     def _watchdog_escalate_to_single_developer(self, board: dict, *, reason: str = ""):
-        """Watchdog 连续 stall 升级：强制降级到 Single+Developer 模式。"""
+        """Escalate repeated watchdog stalls by forcing Single+Developer mode."""
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         self.runtime_execution_mode = EXECUTION_MODE_SINGLE
         self.runtime_participants = ["developer"]
@@ -25174,7 +25439,7 @@ body{padding:18px}
             return ""
         return "FAILURE CONTEXT (from previous attempt):\n" + "\n".join(lines) + "\n"
 
-    # --- Unified error detection helpers (修改 3) ---
+    # --- Unified error detection helpers ---
 
     def _detect_error_category(self, cmd_str: str) -> str | None:
         """Match a command string against ERROR_CATEGORY_DEFS, return first matching category name."""
@@ -25206,7 +25471,7 @@ body{padding:18px}
                     break
         return results
 
-    # --- Unified error record / clear / sync (修改 4) ---
+    # --- Unified error ledger record / clear / sync helpers ---
 
     def _ledger_record_error(self, category: str, file: str, error_msg: str):
         """Record an error into fl['errors'] with category field. Dedup by fingerprint."""
@@ -25272,7 +25537,7 @@ body{padding:18px}
         bb["failure_ledger"] = fl
         self.blackboard = bb
 
-    # --- Thin wrappers for backward compatibility (修改 4d, 4e) ---
+    # --- Thin wrappers kept for backward compatibility ---
 
     def _ledger_record_compile_error(self, file: str, error_msg: str):
         self._ledger_record_error("compilation", file, error_msg)
@@ -25280,11 +25545,12 @@ body{padding:18px}
     def _ledger_clear_compile_errors(self):
         self._ledger_clear_errors("compilation")
 
-    # --- Unified tool result error processing (修改 5) ---
+    # --- Unified tool-result error processing ---
 
     def _process_tool_result_errors(self, name: str, args: dict, output: str, ok: bool, role_key: str):
         """Detect and record errors from tool results, or clear on success."""
-        # --- edit_file 错误处理 ---
+        # Handle edit_file mismatch failures separately because they often need
+        # targeted recovery rather than generic command classification.
         if name == "edit_file" and isinstance(args, dict):
             edit_path = str(args.get("path", "") or "").strip()
             if not ok and "text not found" in str(output or "").lower():
@@ -25302,7 +25568,7 @@ body{padding:18px}
                 self._ledger_update_fix_attempt_status(edit_path, "applied")
             return
 
-        # --- 原有 bash 处理逻辑 ---
+        # For bash results, classify the command and update the shared error ledger.
         if name != "bash" or not isinstance(args, dict):
             return
         cmd_str = str(args.get("command", "") or "").lower()
@@ -25325,7 +25591,7 @@ body{padding:18px}
                     self._deactivate_reviewer_debug_mode("errors resolved")
                 self._ledger_verify_fix_attempts_on_success(category)
 
-    # --- Generalized error context (修改 6) ---
+    # --- Consolidated error-context assembly for recovery prompts ---
 
     def _recent_error_context(self, max_chars: int = 800) -> str:
         """Build context string from all error categories in fl['errors']."""
@@ -25458,6 +25724,12 @@ body{padding:18px}
         board = self._ensure_blackboard()
         board["updated_at"] = float(now_ts())
         self.blackboard = board
+
+    def _save_blackboard(self, bb: dict):
+        """Persist a blackboard dict as the current blackboard and touch updated_at."""
+        if isinstance(bb, dict):
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
 
     def _blackboard_reset_for_goal(self, goal: str):
         # Preserve plan state when safe, but refresh loaded skills on goal change.
@@ -25809,7 +26081,7 @@ body{padding:18px}
                 row["activeForm"] = self._ui_text("todo_pending_owner", owner=label, content=text)
         return rows
 
-    # ── Project-based todo generation & status tracking ──────────────
+    # --- Project-level todo generation and status tracking ---
 
     def _generate_project_todos_from_profile(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -25864,7 +26136,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if bb.get("project_todos"):
             return
-        # 如果有已审批的 plan steps，优先用 plan steps 生成 todos
+        # When an approved plan already exists, derive project todos from plan steps first.
         plan = bb.get("plan", {})
         if isinstance(plan, dict) and plan.get("phase") == "executing" and plan.get("steps"):
             plan_todos = self._build_plan_todos_from_steps(plan.get("steps", []), limit=40)
@@ -26248,8 +26520,8 @@ body{padding:18px}
                     evidence=self._ui_text("evidence_review_passed"),
                 )
             elif cat == "plan_step":
-                # Plan steps 不自动完成，由 _advance_plan_step 显式推进
-                # 但如果当前步骤之前的所有步骤都完成了，标记当前步骤为 in_progress
+                # Plan steps are never auto-completed here; only _advance_plan_step
+                # may close them. This block only activates the next eligible step.
                 if todo.get("status") == "pending":
                     step_idx = int(todo.get("plan_step_index", 0) or 0)
                     all_prior_done = all(
@@ -26277,6 +26549,9 @@ body{padding:18px}
         bb["project_todos"] = todos
         self.blackboard = bb
 
+    # --- Step advancement inference ------------------------------------------
+    # Decide whether manager/developer text is valid evidence that the current
+    # plan step has already finished, rather than a forward-looking dispatch.
     def _instruction_implies_step_advance(self, instruction: str, reason: str = "") -> bool:
         """Detect if manager instruction semantically implies current plan step is done."""
         bb = self._ensure_blackboard()
@@ -26292,8 +26567,8 @@ body{padding:18px}
         if not current:
             return False
         text = (str(instruction or "") + " " + str(reason or "")).lower()
-        # Patterns that indicate step completion — only BACKWARD-looking signals
-        # (agent/manager explicitly says a step is done, NOT forward-looking dispatch instructions)
+        # Completion evidence must be backward-looking: the text must state that
+        # the current step already passed or finished.
         step_done_patterns = (
             "审查通过", "通过审查", "已通过", "已完成", "完成了",
             "step completed", "step done", "step passed",
@@ -26301,14 +26576,13 @@ body{padding:18px}
             "步骤 1.1 已完成", "步骤 1.2 已完成", "步骤 1.3 已完成",
             "步骤 1.4 已完成", "步骤 1.5 已完成",
         )
-        # NOTE: intentionally excluded forward-looking dispatch patterns:
-        #   "现在执行步骤", "执行步骤 1.2", "执行步骤 1.3", "进入下一步", "next step",
-        #   "proceed to step", "进入 step", "开始 step" — these are manager dispatch
-        #   instructions, NOT evidence that the current step was completed.
+        # Forward-looking dispatch phrases are intentionally excluded here.
+        # "start/proceed to step ..." only routes work; it does not prove that
+        # the current step completed successfully.
         import re
         current_idx = int(current.get("plan_step_index", 0) or 0)
-        # Only advance when an agent explicitly says "进入 Step N" where N > current+1
-        # (skipping ahead), NOT when manager dispatches the very next step.
+        # Only treat "move to step N" as advancement evidence when it skips
+        # beyond the immediate next step; otherwise it is likely normal routing.
         next_step_pattern = re.search(
             r'(?:进入|enter|move\s+to|start|proceed\s+to)\s*(?:step\s*)?(\d+)',
             text, re.IGNORECASE
@@ -26317,7 +26591,8 @@ body{padding:18px}
             mentioned_step = int(next_step_pattern.group(1))
             if mentioned_step > current_idx + 2:  # must skip at least 2 ahead to be meaningful
                 return True
-        # "完成步骤 1.1，开始 1.2" — only if explicitly marking current step done
+        # Mixed phrases such as "finished current step, start next step" only
+        # count when the completed step index matches the active step exactly.
         step_ref = re.search(r'(?:完成|finished|done)\s*步骤\s*1\.(\d+)', text)
         if step_ref:
             ref_sub = int(step_ref.group(1))
@@ -26356,7 +26631,7 @@ body{padding:18px}
                     pass
         except Exception:
             pass
-        # 推进 cursor，激活下一步
+        # Advance the plan-step cursor and activate the next pending step.
         cursor = int(bb.get("plan_step_cursor", 0) or 0)
         bb["plan_step_cursor"] = cursor + 1
         next_step = None
@@ -26384,8 +26659,8 @@ body{padding:18px}
             self._update_plan_file_step_status()
         except Exception:
             pass  # Plan file update is best-effort
-        # 步骤推进时按 parent_step_id 清除对应步骤的 worker 子任务
-        # 保留 completed 的 worker 项和不属于当前步骤的 worker 项
+        # Clear worker subtasks linked to the completed plan step by parent_step_id.
+        # Keep completed rows and rows that belong to other plan steps.
         completed_step_id = str(current.get("id", "") or "")
         try:
             _snap = self.todo.snapshot()
@@ -26664,13 +26939,6 @@ body{padding:18px}
         all_marked_done = all(str(r.get("status", "")).lower() == "completed" for r in worker_items)
         if not all_marked_done:
             return False
-        # Acceptance verification: check that each "completed" subtask has real evidence
-        # Don't just trust the model's TodoWrite status — verify against accumulated tool outputs
-        if worker_items:
-            bb = self._ensure_blackboard()
-            unverified = self._verify_subtasks_acceptance(worker_items, step_id, bb)
-            if unverified:
-                return False
         return True
 
     def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
@@ -27433,6 +27701,9 @@ body{padding:18px}
             merged_rows.append(merged)
         return self.todo.update(preserved_system + passthrough_rows + merged_rows)
 
+    # --- Active-step worker todo reconciliation -------------------------------
+    # Merge worker-submitted subtasks into the active plan step while
+    # preserving canonical identities and preventing duplicate rewrites.
     def _merge_plan_worker_todo_items(self, items: list[dict], role: str = "") -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
@@ -27476,7 +27747,22 @@ body{padding:18px}
                 merged_by_identity[identity] = dict(row)
                 ordered_identities.append(identity)
 
-        incoming_normalized: list[dict] = []
+        # Build a reverse map from normalized core content to canonical
+        # identity so free-text restatements collapse onto existing subtasks.
+        import re as _re_todo
+        _core_to_identity: dict[str, str] = {}
+        for row in target_rows:
+            identity = self._plan_worker_todo_identity(row)
+            if not identity:
+                continue
+            raw_c = normalize_work_text(str(row.get("content", "") or ""))
+            core_c = _re_todo.sub(r"^\d+\.\d+\s+", "", raw_c)  # strip "N.M " prefix
+            core_c = _re_todo.sub(r"\s*\([^)]{0,120}\)\s*$", "", core_c)  # strip " (...)" suffix
+            core_c = _re_todo.sub(r"\s+", " ", core_c.strip().lower())
+            if core_c and len(core_c) >= 4:
+                _core_to_identity.setdefault(core_c, identity)
+
+
         for idx, item in enumerate(items):
             if isinstance(item, str):
                 raw = {"content": item, "status": "pending"}
@@ -27503,6 +27789,16 @@ body{padding:18px}
             identity = self._plan_worker_todo_identity(row)
             if not identity:
                 identity = f"ad-hoc:{len(ordered_identities)}:{trim(str(row.get('content', '') or ''), 80)}"
+            # Allow free-text items to resolve onto numbered substeps when the
+            # normalized core content already exists under a canonical identity.
+            if identity.startswith("text:") and identity not in merged_by_identity:
+                text_core = identity[5:]
+                # Also try without a leading "N.M " numbering prefix
+                stripped_core = _re_todo.sub(r"^\d+\.\d+\s+", "", text_core).strip()
+                for check_core in [text_core, stripped_core]:
+                    if check_core in _core_to_identity:
+                        identity = _core_to_identity[check_core]
+                        break
             merged = dict(merged_by_identity.get(identity, {}))
             if "activeForm" not in row and "active_form" not in row:
                 merged.pop("activeForm", None)
@@ -27736,6 +28032,7 @@ body{padding:18px}
                 f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
                 f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
             )
+            subtasks_exist_ban = ""
         else:
             state_parts: list[str] = []
             if current:
@@ -27750,10 +28047,16 @@ body{padding:18px}
                 f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
             )
             todo_state = "".join(state_parts)
+            # Hard prohibition: model must NOT re-create subtasks when they already exist
+            subtasks_exist_ban = (
+                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
+                "to create new subtasks. Directly execute the in_progress subtask above. "
+            )
         if for_manager:
             return (
                 f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is the authoritative execution path. "
                 f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
+                f"{subtasks_exist_ban}"
                 f"{todo_state}"
                 "Treat existing worker subtasks as live execution state, not optional notes. "
                 "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
@@ -27764,8 +28067,8 @@ body{padding:18px}
         return (
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is authoritative. "
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
+            f"{subtasks_exist_ban}"
             f"{todo_state}"
-            "If step subtasks already exist, continue the current in_progress subtask first instead of inventing a parallel path. "
             "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
             "Do not wait until the end of the step to update todos. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
@@ -27950,9 +28253,12 @@ body{padding:18px}
         return False
 
     def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
-        """Gate: after subtasks complete, require model to explicitly emit <step-verified/>
-        in a message since this step was activated. Research/design phases exempt.
-        Escape hatch: after 10 consecutive blocks, auto-pass to prevent permanent stall."""
+        """Gate passes when:
+          1. Phase is research/design (no execution needed)
+          2. Model emitted <step-verified/> since step activation
+          3. Blackboard shows phase-appropriate accumulated evidence (has_write+has_exec for implement)
+          4. Escape hatch: 10 consecutive blocks
+        Research/design phases exempt. Escape hatch prevents permanent stall."""
         step_id = str(plan_step.get("id", "") or "")
         _flag = f"_smvg_{step_id}"
         if getattr(self, _flag, False):
@@ -27968,8 +28274,15 @@ body{padding:18px}
         if _n_blocked >= 10:
             setattr(self, _flag, True)
             return True
-        # Model must explicitly emit <step-verified/> after evaluating results
+        # Path A: model explicit tag
         if self._check_step_verified_tag(plan_step):
+            setattr(self, _flag, True)
+            return True
+        # Path B: blackboard shows phase-appropriate accumulated evidence
+        # implement: has_write AND (has_exec OR ...) — wrote files + ran bash
+        # test/review: has_exec OR has_test_pass — ran tests
+        # other: use generic evidence check
+        if self._plan_step_has_blackboard_evidence(plan_step):
             setattr(self, _flag, True)
             return True
         # Gate blocked — increment counter and inject hint
@@ -28111,16 +28424,12 @@ body{padding:18px}
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
         if subtasks_done:
-            # Validation gate always fires when subtasks are done — even if validation_ok is False.
-            # For research/design phases the gate passes immediately; for implement/test it requires
-            # a successful bash run. This ensures single mode proactively requests verification.
+            # Validation gate: passes when model emitted <step-verified/>, blackboard has
+            # phase-appropriate evidence, or escape hatch (10 blocks). Gate is the authoritative
+            # "step done" check — no additional validation_ok required after gate passes.
             _gate_ok = self._single_mode_validation_gate(current, tool_results)
             if _gate_ok:
-                if validation_ok:
-                    should_advance = True
-                elif todo_progress_signal and self._step_has_accumulated_evidence(current, bb):
-                    # Accumulated evidence path: subtasks done + TodoWrite progress + history
-                    should_advance = True
+                should_advance = True
             else:
                 _gate_blocked = True  # Gate blocked — disable ALL remaining advancement paths
         # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
@@ -28154,7 +28463,8 @@ body{padding:18px}
                     last_text = str(msg.get("content", "") or "").lower()
                     break
             step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一")
+                                 "next step", "下一步", "proceed to step", "进入下一",
+                                 "全部完成", "✅", "all subtasks")
             if validation_ok and any(sig in last_text for sig in step_done_signals):
                 should_advance = True
         if should_advance:
@@ -28260,7 +28570,8 @@ body{padding:18px}
                     first_line = pc.split("\n")[0].strip()
                     if first_line:
                         plan_content_set.add(first_line)
-            # Build stripped-prefix set for fuzzy matching ("步骤 1：XXX" → "XXX")
+            # Remove numbering prefixes before fuzzy comparison so step titles
+            # still match when one side includes "Step N:" and the other does not.
             _num_prefix_re = _re_dedup.compile(r"^(?:步骤\s*\d+[：:]\s*|\d+\.\s*|step\s*\d+[：:]\s*)", _re_dedup.IGNORECASE)
             plan_stripped_set = set()
             for sr in trimmed_system:
@@ -29153,14 +29464,15 @@ body{padding:18px}
         self.runtime_direct_objective = objective
         self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
         self.runtime_reclassify_required = False
-        # Plan mode 判定（用户偏好 > 规则兜底 > LLM 语义）
+        # Decide plan mode with a strict precedence chain:
+        # user preference > policy defaults > LLM semantic hint.
         raw_requires_plan = bool(decision.get("requires_plan", False))
         user_pref = str(self.plan_mode_user_preference or "auto").lower()
         if user_pref == "off":
             requires_plan = False
         elif user_pref == "on":
             requires_plan = True
-        else:  # auto — 保持原逻辑
+        else:  # auto: follow the normal policy/LLM decision path
             if level in PLAN_MODE_FORCED_LEVELS:
                 requires_plan = True
             elif level in PLAN_MODE_ENABLED_LEVELS:
@@ -29246,7 +29558,7 @@ body{padding:18px}
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
-        # ── Build skills context ──
+        # Build the current skills context for the manager prompt.
         skills_ctx = ""
         try:
             loaded_skills = dict(self._ensure_blackboard().get("loaded_skills", {}) or {})
@@ -29264,7 +29576,7 @@ body{padding:18px}
                 )
         except Exception:
             pass
-        # ── Build dimension hint from pre-screen ──
+        # Build the dimension-hint block from the cached complexity pre-screen.
         dims_ctx = ""
         try:
             dims = dict(getattr(self, "_cached_complexity_dimensions", {}) or {})
@@ -29675,7 +29987,7 @@ body{padding:18px}
         todos = bb.get("project_todos", [])
         if not todos:
             return ""
-        # plan step 模式
+        # Plan-step mode: the manager reasons over ordered plan steps instead of generic todos.
         has_plan_steps = any(t.get("category") == "plan_step" for t in todos)
         if has_plan_steps:
             completed = [t for t in todos if t.get("category") == "plan_step" and t.get("status") == "completed"]
@@ -29686,11 +29998,11 @@ body{padding:18px}
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
             step_content_low = str(cur.get("content", "") or "").lower()
-            # ── Build blackboard evidence for step completion detection ──
+            # Summarize blackboard evidence that may justify step completion.
             research_count = len(bb.get("research_notes", []) or [])
             code_count = len(bb.get("code_artifacts", {}) or {})
             exec_count = len(bb.get("execution_logs", []) or [])
-            # ── Worker todo snapshot: show manager what workers wrote ──
+            # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
                 worker_todos = [
@@ -29727,7 +30039,7 @@ body{padding:18px}
                         )
             except Exception:
                 pass
-            # ── Blackboard-evidence-based completion hint ──
+            # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
             is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "提取", "read", "analyze", "extract", "research", "summarize", "总结"))
             is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
@@ -29762,7 +30074,7 @@ body{padding:18px}
                 f"{worker_hint}"
                 f"{bb_evidence_hint}"
             )
-        # 原有逻辑
+        # Generic project-todo mode when no plan-step structure is active.
         pending = [t for t in todos if t.get("status") != "completed"]
         if not pending:
             return "All project tasks completed. Route to finish. "
@@ -30157,7 +30469,7 @@ body{padding:18px}
                 "reason": "simple-qa-direct-answer",
                 "source": "fallback",
             }
-        # ── 通用 endpoint 检测：非 simple_qa 的 developer 结论性回复也能触发 finish ──
+        # General endpoint detection: non-simple_qa developer conclusions may also finish the run.
         if task_type != "simple_qa":
             dev_text = self._latest_agent_assistant_text("developer")
             if dev_text:
@@ -30169,7 +30481,7 @@ body{padding:18px}
                         "reason": "general-endpoint-detected",
                         "source": "fallback",
                     }
-        # 通用检查：如果最近的 assistant 消息是结论性回复，且没有待办事项，直接 finish
+        # General guard: if the latest agent reply is conclusive and no todos remain, finish immediately.
         if not has_error_log:
             for _role in ("developer", "explorer", "reviewer"):
                 _last = self._latest_agent_assistant_text(_role)
@@ -30480,7 +30792,7 @@ body{padding:18px}
                     participants[-1] = target
             else:
                 target = participants[0]
-        # ── Single 模式硬约束：无论 executor_mode_flag 如何，只允许 assigned_expert ──
+        # Single-mode hard rule: regardless of executor_mode_flag, only assigned_expert may act.
         if mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
             if target in AGENT_ROLES and target != assigned_expert:
@@ -30539,7 +30851,7 @@ body{padding:18px}
         feedback_pass = self._manager_feedback_passed_from_blackboard(board)
         summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
         force_finish_override = False
-        # ── 结论性回复截断：当 Agent 已回复结论且无待办/无错误时，强制 finish ──
+        # Conclusive-reply cut-off: if the agent already concluded with no open work or errors, force finish.
         if target in AGENT_ROLES and target != "finish":
             for _check_role in ("developer", "explorer", "reviewer"):
                 _last_text = self._latest_agent_assistant_text(_check_role)
@@ -32235,6 +32547,15 @@ body{padding:18px}
         if "ts" not in row:
             row["ts"] = now_ts()
         # Write to unified agent_messages with tier-aware trim
+        # Skip exact duplicates from the last 6 same-role messages (e.g. user re-submits after interrupt)
+        content = str(row.get("content", "") or "")
+        if content and len(content) > 30:
+            same_role_recent = [
+                m for m in self.agent_messages[-6:]
+                if m.get("role") == row.get("role") and m.get("agent_role") == row.get("agent_role")
+            ]
+            if any(str(m.get("content", "") or "") == content for m in same_role_recent):
+                return row  # skip exact duplicate
         self.agent_messages.append(row)
         tier = self._context_compression_tier()
         am_limit = self._tier_agent_context_limits(tier)["agent_messages"]
@@ -33460,6 +33781,16 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
+            raw_content = args.get("content", "")
+            if not isinstance(raw_content, str):
+                import json as _json
+                try:
+                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
+                except Exception:
+                    raw_content = str(raw_content)
+            args = dict(args)
+            args["content"] = raw_content
             existed = fp.exists()
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
@@ -35052,7 +35383,8 @@ body{padding:18px}
                             target_roles=(role,),
                             summary=f"plan+sync todo reminder injected ({role})",
                         )
-            # ── Agent turn 结束后的终止检测：结论性回复 + 无待办 + 无错误 → 自动 finish ──
+            # End-of-turn finish guard:
+            # conclusive reply + no open todos + no known errors => auto-finish.
             agent_text = self._latest_agent_assistant_text(role)
             if (
                 agent_text
@@ -35318,11 +35650,11 @@ body{padding:18px}
             self._mark_all_done_silently(f"budget exhausted: {summary}")
             self._emit("status", {"summary": f"Budget exhausted ({self.max_agent_rounds} rounds). {trim(summary, 300)}"})
 
-    # ── Plan Mode Methods ──
+    # --- Plan-mode orchestration methods ---
 
     def _plan_mode_worker(self, pinned_selection: str):
-        """Plan mode: explorer 调研 → manager 综合 → emit 方案 → 等待用户选择"""
-        # Phase 1: Explorer 调研
+        """Plan mode pipeline: explorer research -> manager synthesis -> proposal -> user choice."""
+        # Phase 1: explorer-led research and evidence gathering
         self._emit("status", {"summary": "plan-mode: research phase started"})
         bb = self._ensure_blackboard()
         bb["status"] = "PLANNING"
@@ -35347,7 +35679,7 @@ body{padding:18px}
                 break
             self._plan_mode_update_findings(step)
 
-        # Phase 2: Manager 综合分析
+        # Phase 2: manager synthesis of structured executable options
         # Inject pending user inputs before synthesis
         self._inject_pending_user_inputs()
         # Check if user sent a substantive goal change during research
@@ -35383,7 +35715,7 @@ body{padding:18px}
             self.runtime_plan_approved = True
             return
 
-        # Synthesis Step 1: 立即写 plan.md（与 synthesis 思维连续，避免信息丢失）
+        # Synthesis step 1: write plan.md immediately so proposal structure is persisted.
         self.runtime_plan_proposal = proposal
         try:
             self._write_plan_file(self._format_plan_file_preselection(proposal))
@@ -35391,7 +35723,7 @@ body{padding:18px}
             pass
         self._emit("status", {"summary": "plan-mode: plan.md written"})
 
-        # Synthesis Step 2: 更新 blackboard + 生成精简 bubble
+        # Synthesis step 2: update blackboard state and prepare the compact proposal bubble.
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
             bb["plan"] = {"phase": "awaiting_choice", "findings": []}
@@ -35399,7 +35731,7 @@ body{padding:18px}
         bb["plan"]["proposal"] = proposal
         self.blackboard = bb
 
-        # Phase 3: Emit bubble 到前端（纯输出，不做额外思考）
+        # Phase 3: emit the proposal bubble to the frontend without extra reasoning.
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -36878,6 +37210,9 @@ body{padding:18px}
             return best_reverse_id
         return ""
 
+    # --- Plan choice parsing --------------------------------------------------
+    # Resolve user replies against proposal options using explicit IDs, ordinal
+    # picks, title aliases, and soft confirmation language.
     def _parse_plan_choice(self, text: str, proposal: dict) -> str:
         if not text or not proposal:
             return ""
@@ -36890,14 +37225,14 @@ body{padding:18px}
         # Direct ID match: "A", "B", "C"
         if low.upper() in option_ids:
             return low.upper()
-        # "方案A", "方案 A", "option A"
+        # Match localized "plan/option X" style replies.
         import re
         m = re.search(r'(?:方案|選項|选项|option|案|プラン)\s*([a-zA-Z0-9])', low, re.IGNORECASE)
         if m:
             candidate = m.group(1).upper()
             if candidate in option_ids:
                 return candidate
-        # "选1", "第1个", "第一个"
+        # Match localized ordinal replies such as "choose 1" or "the first one".
         num_map = {"一": "1", "二": "2", "三": "3", "1": "1", "2": "2", "3": "3"}
         m2 = re.search(r'(?:选|選|第|choose|pick)\s*([一二三1-3])', low, re.IGNORECASE)
         if m2:
@@ -36910,7 +37245,8 @@ body{padding:18px}
         semantic = self._match_plan_choice_by_title(text, [o for o in options if isinstance(o, dict)])
         if semantic:
             return semantic
-        # "继续"/"确认"/"推荐" → pick recommended
+        # Soft confirmation without an explicit option falls back to the
+        # proposal's recommended choice when present.
         recommended = str(proposal.get("recommended", "") or "").strip()
         confirm_tokens = (
             "继续", "繼續", "确认", "確認", "推荐", "推薦", "推荐方案", "推薦方案",
@@ -37123,8 +37459,8 @@ body{padding:18px}
                 bb["plan_step_total"] = len(plan_todos)
                 self.blackboard = bb
                 self._blackboard_touch()
-                # 同步到 UI todo — 使用 bb:proj: 键，与 _todo_project_rows_from_blackboard 保持一致
-                # 避免后续 _sync_todos_from_blackboard 把这些 items 误认为 worker_rows 造成重复
+                # Sync plan todos into the UI using bb:proj: keys so later todo-sync
+                # passes do not misclassify them as worker rows and duplicate them.
                 try:
                     self.todo.update([
                         {
@@ -37268,7 +37604,7 @@ body{padding:18px}
                     raise
             except Exception:
                 pass
-            # ── Plan Mode 检查 ──
+            # Plan-mode check before entering the main execution loop.
             if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
                 self._plan_mode_worker(pinned_selection=pinned_selection)
                 return
@@ -37838,7 +38174,7 @@ body{padding:18px}
                                 },
                             )
                             continue
-                    # 对简单查询（非工程任务）限制自动继续预算
+                    # Cap auto-continue budget for lightweight non-engineering questions.
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
@@ -38148,6 +38484,22 @@ body{padding:18px}
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    # Update blackboard signals (step_files, execution_logs) for plan+single mode.
+                    # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
+                    # plan+single there is no worker turn — we must update inline so that
+                    # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
+                    try:
+                        self._blackboard_update_from_tool_result(
+                            "developer",
+                            {
+                                "name": dispatched_name or name,
+                                "args": args if isinstance(args, dict) else {},
+                                "output": trim(str(output or ""), 3000),
+                                "ok": not str(output).startswith("Error:"),
+                            },
+                        )
+                    except Exception:
+                        pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
                     _sa_ok = not str(output or "").startswith("Error")
@@ -40531,13 +40883,13 @@ const SNAPSHOT_DELAY_HIDDEN_MS=2400;
 const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const PANEL_SCROLL_ACTIVE_MS=1100;
-const CHAT_SCROLL_ACTIVE_MS=420;
-const CHAT_SCROLL_LOCK_MS=1200;
-const CHAT_SCROLL_INPUT_LOCK_MS=1400;
-const CHAT_TOUCH_SCROLL_LOCK_MS=1800;
-const CHAT_SCROLL_RENDER_THROTTLE_MS=70;
-const CHAT_SCROLL_SYNC_DEBOUNCE_MS=260;
-const CHAT_SCROLL_SETTLE_MS=620;
+const CHAT_SCROLL_ACTIVE_MS=180;
+const CHAT_SCROLL_LOCK_MS=500;
+const CHAT_SCROLL_INPUT_LOCK_MS=600;
+const CHAT_TOUCH_SCROLL_LOCK_MS=800;
+const CHAT_SCROLL_RENDER_THROTTLE_MS=32;
+const CHAT_SCROLL_SYNC_DEBOUNCE_MS=180;
+const CHAT_SCROLL_SETTLE_MS=280;
 const CHAT_SCROLL_SETTLE_EPS_PX=1;
 const DELTA_MAX_FEED=300;
 const DELTA_MAX_MESSAGES=300;
@@ -41209,7 +41561,7 @@ function _bindNestedScrollGuards(root){
         ev.stopPropagation();
         markChatUserScrolling();
       }
-    },{passive:false});
+    },{passive:true});
     node.addEventListener('mousedown',()=>{markManualCenterOff(node);markChatUserScrolling();},{passive:true});
     node.addEventListener('touchstart',ev=>{
       markManualCenterOff(node);
@@ -41233,7 +41585,7 @@ function _bindNestedScrollGuards(root){
         ev.stopPropagation();
       }
       markChatUserScrolling();
-    },{passive:false});
+    },{passive:true});
   }
 }
 function _centerDiffShellToHotspot(root){
@@ -43009,13 +43361,9 @@ function renderChat(reason='snapshot'){
     if(c._virtRaf){cancelAnimationFrame(c._virtRaf);c._virtRaf=0;}
   }
   const first=!c._chatHasRendered;
-  const atBottomNow=nearBottom(c,6);
-  if((!S.snap?.running)&&atBottomNow){
-    c._virtAutoFollowPaused=false;
-  }
-  const keep=first||Boolean(S.follow.chat)||atBottomNow;
-  const oldScrollTop=Number(c.scrollTop||0);
-  const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
+  // Collect rows and compute render window FIRST — before any layout queries.
+  // This allows the rangeKey early exit to fire before _chatVirtCaptureAnchor,
+  // avoiding getBoundingClientRect() x N nodes on every scroll throttle tick.
   const feedSig=String(S.lastFeedSig||feedSignature(S.snap||{}));
   let rows=[];
   if(reason==='scroll'&&Array.isArray(c._virtRowsCacheRows)&&String(c._virtRowsCacheSig||'')===feedSig){
@@ -43044,10 +43392,19 @@ function renderChat(reason='snapshot'){
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
+  // Early exit BEFORE any layout queries (_chatVirtCaptureAnchor uses getBoundingClientRect).
   if(reason==='scroll'&&c._virtRangeKey===rangeKey){
     return;
   }
   c._virtRangeKey=rangeKey;
+  // Layout reads below — only reached when DOM will actually change.
+  const atBottomNow=nearBottom(c,6);
+  if((!S.snap?.running)&&atBottomNow){
+    c._virtAutoFollowPaused=false;
+  }
+  const keep=first||Boolean(S.follow.chat)||atBottomNow;
+  const oldScrollTop=Number(c.scrollTop||0);
+  const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
   c._virtRendering=true;
   const rendered=[];
   let usedIncrementalPatch=false;
@@ -43370,7 +43727,7 @@ function _chatVirtDebounceWhileScrolling(chatEl,timerField,fn,delayMs=CHAT_SCROL
   const rafField=`${timerField}_raf`;
   const settleNeed=Math.max(CHAT_SCROLL_SETTLE_MS,delay+120);
   const startedAt=Date.now();
-  const maxWait=Math.max(settleNeed*3,1800);
+  const maxWait=Math.max(settleNeed*2,600);
   _chatVirtCancelDebounce(chatEl,timerField);
   const done=()=>{
     _chatVirtCancelDebounce(chatEl,timerField);
@@ -44052,15 +44409,4637 @@ window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=add
 """
 
 RAG_TERM_GROUPS = (
-    ("rag", "retrieval", "retriever", "检索", "检索增强"),
-    ("graph", "graphrag", "graph_idf", "知识图谱", "图谱"),
-    ("research", "paper", "论文", "科研", "literature"),
-    ("experiment", "benchmark", "evaluation", "实验", "评测"),
-    ("equation", "formula", "theorem", "公式", "定理"),
-    ("dataset", "csv", "excel", "表格", "数据集"),
+    # ── Batch 1 / 10 : 检索 · 研究 · CS基础 · 编程语言 ──────────────────────
+    # Retrieval / RAG / Knowledge Base
+    ("rag", "retrieval", "retriever", "检索", "检索增强", "知识库", "召回"),
+    ("graph", "graphrag", "graph_idf", "知识图谱", "图谱", "knowledge graph"),
+    ("inverted index", "倒排索引", "postings", "index shard", "索引分片"),
+    ("chunking", "chunk", "text chunk", "分块", "切片", "段落切分"),
+    ("dense retrieval", "sparse retrieval", "hybrid retrieval", "稠密检索", "稀疏检索", "混合检索"),
+    ("passage ranking", "reranking", "rerank", "段落排序", "重排序", "cross-encoder"),
+    ("vector store", "vector database", "向量库", "向量数据库", "faiss", "milvus", "weaviate"),
+    ("knowledge base", "knowledge graph", "ontology", "知识图", "知识库", "本体"),
+    ("mmr", "maximum marginal relevance", "diversity", "多样性去重", "召回多样化"),
+    ("query expansion", "synonym expansion", "查询扩展", "同义词扩展", "检索增强"),
+    # Research / Literature
+    ("research", "paper", "论文", "科研", "literature", "publication", "study", "文献"),
+    ("experiment", "benchmark", "evaluation", "实验", "评测", "ablation", "baseline"),
+    ("equation", "formula", "theorem", "公式", "定理", "lemma", "proof", "证明"),
+    ("dataset", "csv", "excel", "表格", "数据集", "corpus", "数据"),
     ("presentation", "ppt", "slides", "演示", "幻灯片"),
-    ("citation", "reference", "引用", "参考文献"),
-    ("pdf", "document", "文档"),
+    ("citation", "reference", "引用", "参考文献", "bibliography"),
+    ("pdf", "document", "文档", "doc"),
+    ("abstract", "摘要", "executive summary", "overview", "概述"),
+    ("conclusion", "结论", "finding", "发现", "contribution", "贡献"),
+    ("related work", "相关工作", "prior work", "previous work", "背景"),
+    ("hypothesis", "假设", "conjecture", "理论假设", "null hypothesis"),
+    ("meta-analysis", "systematic review", "meta分析", "系统综述", "文献综述"),
+    ("peer review", "同行评审", "double-blind", "journal", "conference", "期刊", "会议"),
+    # Programming Fundamentals
+    ("variable", "constant", "变量", "常量", "declaration", "assignment", "赋值"),
+    ("function", "method", "procedure", "subroutine", "函数", "方法", "子程序"),
+    ("class", "object", "instance", "类", "对象", "实例", "oop"),
+    ("inheritance", "polymorphism", "encapsulation", "继承", "多态", "封装"),
+    ("interface", "abstract class", "trait", "接口", "抽象类", "特质"),
+    ("lambda", "closure", "higher-order function", "匿名函数", "闭包", "高阶函数"),
+    ("recursion", "recursive", "递归", "base case", "stack overflow", "尾递归"),
+    ("iteration", "loop", "for loop", "while loop", "迭代", "循环", "遍历"),
+    ("conditional", "if else", "switch", "条件分支", "判断", "分支"),
+    ("exception", "try catch", "error handling", "异常处理", "错误捕获", "finally"),
+    ("import", "module", "package", "library", "导入", "模块", "包", "库"),
+    ("namespace", "scope", "命名空间", "作用域", "visibility"),
+    ("type", "typing", "type hint", "类型", "类型注解", "static typing", "duck typing"),
+    ("generics", "template", "泛型", "模板", "parameterized type"),
+    # Python
+    ("python", "py", "cpython", "pypy", "python3"),
+    ("pip", "conda", "venv", "virtualenv", "pyenv", "python package", "包管理"),
+    ("list comprehension", "generator", "列表推导式", "生成器", "yield", "iterator"),
+    ("decorator", "装饰器", "functools", "wraps", "class decorator"),
+    ("dataclass", "namedtuple", "pydantic", "attrs", "数据类"),
+    ("asyncio", "aiohttp", "async await", "异步IO", "事件循环", "event loop"),
+    ("numpy", "scipy", "pandas", "matplotlib", "seaborn", "数据分析库"),
+    ("pytest", "unittest", "mock", "fixture", "parametrize", "python测试"),
+    ("mypy", "pyright", "type checking", "类型检查", "静态分析"),
+    # JavaScript / TypeScript
+    ("javascript", "js", "ecmascript", "es6", "node.js", "nodejs"),
+    ("typescript", "ts", "tsc", "type annotation", "interface", "enum"),
+    ("promise", "async await", "callback", "异步", "then", "catch"),
+    ("npm", "yarn", "pnpm", "package.json", "node_modules", "bundler"),
+    ("webpack", "vite", "rollup", "esbuild", "bundling", "打包"),
+    ("react", "vue", "angular", "svelte", "前端框架", "component"),
+    ("jsx", "tsx", "template", "virtual dom", "组件", "渲染"),
+    ("eslint", "prettier", "jest", "vitest", "mocha", "js测试"),
+    ("deno", "bun", "runtime", "v8", "js运行时"),
+    # Go
+    ("golang", "go", "goroutine", "channel", "并发", "go routine"),
+    ("go module", "go.mod", "go.sum", "go package", "go import"),
+    ("interface go", "struct", "method set", "embedding", "go接口"),
+    ("defer", "panic", "recover", "go错误处理"),
+    # Rust
+    ("rust", "cargo", "crate", "borrowing", "ownership", "lifetime"),
+    ("borrow checker", "所有权", "借用", "生命周期", "memory safety"),
+    ("trait", "impl", "generics rust", "where clause", "rust泛型"),
+    ("tokio", "async rust", "future", "pin", "rust异步"),
+    # Java / JVM
+    ("java", "jvm", "jre", "jdk", "bytecode"),
+    ("spring", "spring boot", "hibernate", "maven", "gradle", "java框架"),
+    ("garbage collection java", "gc", "jit", "hotspot", "java内存"),
+    ("kotlin", "coroutine", "android", "jetpack", "kotlin语言"),
+    ("scala", "akka", "spark scala", "functional java", "jvm语言"),
+    # C / C++
+    ("c language", "c programming", "pointer", "指针", "memory management c"),
+    ("cpp", "c++", "stl", "template c++", "raii", "c++模板"),
+    ("cmake", "makefile", "linker", "compiler", "gcc", "clang", "编译"),
+    ("memory leak", "buffer overflow", "segfault", "内存泄漏", "缓冲区溢出"),
+    ("std::vector", "std::map", "std::string", "standard library", "标准库"),
+    # Other Languages
+    ("swift", "ios", "xcode", "objective-c", "swiftui", "swift语言"),
+    ("php", "laravel", "symfony", "composer", "php框架"),
+    ("ruby", "rails", "gem", "rake", "ruby语言"),
+    ("r language", "ggplot2", "tidyverse", "rstudio", "cran", "r统计"),
+    ("julia", "flux.jl", "differentialequations", "julia语言"),
+    ("haskell", "functional programming", "monad", "functor", "haskell"),
+    ("erlang", "elixir", "phoenix", "otp", "actor model", "erlang"),
+    ("lua", "luajit", "scripting", "lua语言"),
+    ("dart", "flutter", "mobile dev", "dart语言"),
+    ("sql", "select", "join", "where", "group by", "having", "sql查询"),
+    ("bash", "shell script", "zsh", "fish", "shell", "bash脚本"),
+    ("powershell", "cmd", "windows scripting", "bat", "ps1"),
+    # ── Batch 1 end ──────────────────────────────────────────────────────────
+    # ── Batch 2 / 10 : 算法 · 数据结构 · 操作系统 ──────────────────────────
+    # Algorithm fundamentals
+    ("algorithm", "complexity", "big-o", "算法", "复杂度", "时间复杂度", "空间复杂度"),
+    ("divide and conquer", "分治", "merge", "combine", "subproblem"),
+    ("greedy algorithm", "贪心算法", "greedy", "optimal substructure", "局部最优"),
+    ("dynamic programming", "dp", "memoization", "动态规划", "记忆化", "状态转移"),
+    ("backtracking", "回溯", "pruning", "剪枝", "state space", "exhaustive search"),
+    ("brute force", "暴力搜索", "enumeration", "枚举", "exhaustive"),
+    ("two pointers", "sliding window", "双指针", "滑动窗口", "prefix sum", "前缀和"),
+    ("bit manipulation", "bitwise", "位运算", "bitmask", "xor", "位掩码"),
+    ("math algorithm", "number theory", "数论", "prime", "gcd", "lcm", "素数"),
+    ("randomized algorithm", "monte carlo", "las vegas", "随机算法", "概率算法"),
+    # Sorting
+    ("sort", "sorting", "排序", "ordered", "比较排序"),
+    ("quicksort", "quick sort", "快速排序", "partition", "pivot"),
+    ("merge sort", "归并排序", "stable sort", "稳定排序"),
+    ("heap sort", "堆排序", "priority queue", "优先队列"),
+    ("radix sort", "counting sort", "bucket sort", "基数排序", "计数排序", "桶排序"),
+    ("bubble sort", "insertion sort", "selection sort", "冒泡排序", "插入排序", "选择排序"),
+    # Searching
+    ("search", "搜索", "find", "查找", "lookup"),
+    ("binary search", "二分查找", "bisect", "log n search", "折半查找"),
+    ("linear search", "sequential search", "线性搜索", "顺序查找"),
+    ("bfs", "breadth first search", "广度优先", "level order", "层次遍历"),
+    ("dfs", "depth first search", "深度优先", "backtrack dfs", "pre-order"),
+    ("a star", "a*", "heuristic search", "启发式搜索", "dijkstra", "最短路"),
+    # Data Structures — Linear
+    ("array", "list", "数组", "列表", "sequential storage"),
+    ("linked list", "链表", "singly linked", "doubly linked", "单链表", "双链表"),
+    ("stack", "栈", "lifo", "push pop", "call stack"),
+    ("queue", "队列", "fifo", "enqueue dequeue", "circular queue", "循环队列"),
+    ("deque", "double-ended queue", "双端队列", "monotone queue", "单调队列"),
+    ("hash map", "hash table", "hashmap", "哈希表", "字典", "dict", "map"),
+    ("hash set", "set", "集合", "哈希集合", "unordered set"),
+    # Data Structures — Tree
+    ("tree", "树", "node", "root", "leaf", "parent", "child"),
+    ("binary tree", "二叉树", "complete binary tree", "full binary tree"),
+    ("bst", "binary search tree", "二叉搜索树", "avl tree", "red-black tree", "红黑树"),
+    ("heap", "min heap", "max heap", "堆", "最小堆", "最大堆", "二叉堆"),
+    ("trie", "prefix tree", "字典树", "前缀树", "radix tree"),
+    ("segment tree", "线段树", "fenwick tree", "binary indexed tree", "树状数组"),
+    ("b-tree", "b+ tree", "b树", "b+树", "balanced tree", "平衡树"),
+    ("n-ary tree", "multiway tree", "多叉树", "k-ary tree"),
+    # Data Structures — Graph
+    ("graph", "图", "vertex", "edge", "node", "adjacency"),
+    ("adjacency matrix", "adjacency list", "邻接矩阵", "邻接表"),
+    ("directed graph", "undirected graph", "有向图", "无向图", "dag", "有向无环图"),
+    ("weighted graph", "带权图", "network flow", "网络流"),
+    ("spanning tree", "生成树", "minimum spanning tree", "mst", "kruskal", "prim"),
+    ("topological sort", "拓扑排序", "dag traversal", "依赖排序"),
+    ("strongly connected component", "scc", "强连通分量", "tarjan", "kosaraju"),
+    ("union find", "disjoint set", "并查集", "uf", "path compression"),
+    # String Algorithms
+    ("string", "字符串", "substring", "子串", "character", "字符"),
+    ("kmp", "knuth-morris-pratt", "string matching", "字符串匹配", "pattern matching"),
+    ("rabin-karp", "rolling hash", "字符串哈希", "多项式哈希"),
+    ("suffix array", "suffix tree", "后缀数组", "后缀树", "lcp"),
+    ("manacher", "palindrome", "回文串", "最长回文子串"),
+    ("edit distance", "levenshtein", "编辑距离", "字符串相似度"),
+    ("regular expression", "regex", "regexp", "正则表达式", "pattern"),
+    # Computational Geometry
+    ("convex hull", "凸包", "graham scan", "jarvis march", "点集凸包"),
+    ("line intersection", "直线交点", "cross product", "叉积", "向量叉乘"),
+    ("polygon", "多边形", "area", "perimeter", "面积", "周长"),
+    # Number Theory
+    ("prime", "素数", "sieve of eratosthenes", "埃氏筛", "欧拉筛"),
+    ("gcd", "greatest common divisor", "最大公约数", "lcm", "最小公倍数"),
+    ("modular arithmetic", "取模运算", "modular inverse", "模逆元", "fast power", "快速幂"),
+    ("euler phi", "欧拉函数", "totient", "fermat's little theorem", "费马小定理"),
+    # OS — Processes and Scheduling
+    ("process", "进程", "process state", "进程状态", "pcb"),
+    ("thread", "线程", "multithreading", "多线程", "lightweight process"),
+    ("scheduling", "调度", "cpu scheduling", "cpu调度", "scheduler"),
+    ("round robin", "fcfs", "sjf", "priority scheduling", "调度算法"),
+    ("context switch", "上下文切换", "preemptive", "non-preemptive", "抢占"),
+    ("process creation", "fork", "exec", "进程创建", "spawn"),
+    ("signal", "信号", "kill", "sigterm", "sigkill", "ipc signal"),
+    # OS — Synchronization
+    ("mutex", "互斥锁", "semaphore", "信号量", "lock", "锁"),
+    ("deadlock", "死锁", "deadlock prevention", "deadlock avoidance", "银行家算法"),
+    ("race condition", "竞态条件", "critical section", "临界区", "atomicity"),
+    ("spinlock", "自旋锁", "read-write lock", "读写锁", "rwlock"),
+    ("monitor", "condition variable", "条件变量", "wait notify", "pthread"),
+    # OS — Memory Management
+    ("virtual memory", "虚拟内存", "paging", "分页", "page table"),
+    ("page fault", "缺页", "tlb", "translation lookaside buffer", "内存映射"),
+    ("segmentation", "内存分段", "segment", "memory segment"),
+    ("heap allocation", "stack allocation", "堆分配", "栈分配", "malloc free"),
+    ("garbage collection", "gc", "垃圾回收", "reference counting", "引用计数", "mark and sweep"),
+    ("memory leak", "内存泄漏", "dangling pointer", "野指针", "use after free"),
+    # OS — File Systems
+    ("file system", "文件系统", "inode", "directory", "目录"),
+    ("ext4", "ntfs", "fat32", "apfs", "btrfs", "文件系统类型"),
+    ("file descriptor", "文件描述符", "open read write close", "posix"),
+    ("block device", "character device", "块设备", "字符设备", "device driver"),
+    ("journaling", "日志文件系统", "fsck", "文件系统一致性", "crash recovery"),
+    # OS — I/O
+    ("io", "input output", "i/o", "读写", "磁盘io"),
+    ("blocking io", "non-blocking io", "同步io", "异步io", "阻塞", "非阻塞"),
+    ("epoll", "kqueue", "select", "poll", "io multiplexing", "io多路复用"),
+    ("zero copy", "零拷贝", "sendfile", "mmap", "直接io"),
+    ("buffer", "缓冲", "page cache", "页缓存", "writeback"),
+    # OS — Kernel
+    ("kernel", "内核", "system call", "syscall", "系统调用"),
+    ("user space", "kernel space", "用户态", "内核态", "ring0", "ring3"),
+    ("interrupt", "中断", "hardware interrupt", "software interrupt", "trap"),
+    ("device driver", "设备驱动", "driver", "驱动程序", "kernel module"),
+    ("linux kernel", "linux", "posix", "unix", "内核版本"),
+    # ── Batch 2 end ──────────────────────────────────────────────────────────
+    # ── Batch 3 / 10 : 网络 · 数据库 · 分布式系统 ───────────────────────────
+    # Network — Fundamentals
+    ("network", "网络", "networking", "computer network", "计算机网络"),
+    ("tcp", "transmission control protocol", "tcp/ip", "可靠传输", "三次握手"),
+    ("udp", "user datagram protocol", "不可靠传输", "无连接", "低延迟"),
+    ("ip", "internet protocol", "ipv4", "ipv6", "ip address", "ip地址"),
+    ("dns", "domain name system", "域名解析", "domain", "hostname"),
+    ("http", "http/1.1", "http/2", "http/3", "quic", "hypertext transfer protocol"),
+    ("https", "tls", "ssl", "加密传输", "证书", "certificate"),
+    ("websocket", "ws", "long polling", "server-sent events", "实时通信"),
+    ("grpc", "protocol buffers", "protobuf", "rpc", "远程调用"),
+    ("rest", "restful", "http api", "资源", "无状态"),
+    ("graphql", "schema", "mutation", "query language", "introspection"),
+    ("socket", "套接字", "bind listen accept", "tcp socket", "udp socket"),
+    ("port", "端口", "port number", "well-known port", "ephemeral port"),
+    ("routing", "路由", "routing table", "bgp", "ospf", "路由协议"),
+    ("subnet", "子网", "cidr", "mask", "网段"),
+    ("nat", "network address translation", "网络地址转换", "snat", "dnat"),
+    ("cdn", "content delivery network", "内容分发网络", "edge node", "边缘节点"),
+    ("load balancer", "负载均衡", "nginx", "haproxy", "round-robin lb", "upstream"),
+    ("proxy", "代理", "reverse proxy", "反向代理", "forward proxy"),
+    ("vpn", "虚拟私网", "tunnel", "隧道", "ipsec", "wireguard"),
+    ("firewall", "防火墙", "iptables", "nftables", "acl", "access control"),
+    ("bandwidth", "latency", "throughput", "带宽", "延迟", "吞吐量"),
+    ("packet", "数据包", "frame", "帧", "header", "payload"),
+    ("ethernet", "以太网", "mac address", "arp", "switch", "交换机"),
+    ("wifi", "802.11", "wireless", "无线网络", "ssid", "wpa"),
+    # Database — Relational
+    ("database", "数据库", "rdbms", "relational database", "关系型数据库"),
+    ("sql", "select", "insert", "update", "delete", "ddl", "dml"),
+    ("table", "表", "row", "column", "primary key", "外键", "foreign key"),
+    ("index", "索引", "btree index", "hash index", "composite index", "联合索引"),
+    ("join", "inner join", "left join", "right join", "连接", "关联查询"),
+    ("transaction", "事务", "acid", "commit", "rollback", "savepoint"),
+    ("isolation level", "隔离级别", "read committed", "repeatable read", "serializable"),
+    ("lock", "行锁", "表锁", "row lock", "table lock", "gap lock", "间隙锁"),
+    ("stored procedure", "存储过程", "trigger", "触发器", "function sql"),
+    ("view", "视图", "materialized view", "物化视图"),
+    ("normalization", "范式", "1nf", "2nf", "3nf", "bcnf", "数据库范式"),
+    ("query optimization", "查询优化", "explain plan", "执行计划", "query planner"),
+    ("partition", "分区", "horizontal partition", "vertical partition", "表分区"),
+    ("mysql", "postgresql", "postgres", "sqlite", "关系型数据库产品"),
+    ("oracle", "sql server", "db2", "企业数据库"),
+    # Database — NoSQL
+    ("nosql", "non-relational", "非关系型数据库", "document store", "key-value"),
+    ("mongodb", "document database", "bson", "collection", "文档数据库"),
+    ("redis", "key-value store", "键值存储", "in-memory database", "内存数据库"),
+    ("cassandra", "wide column", "宽列数据库", "column family"),
+    ("elasticsearch", "全文搜索", "inverted index elastic", "kibana", "lucene"),
+    ("hbase", "bigtable", "column-oriented", "列式数据库"),
+    ("neo4j", "graph database", "图数据库", "cypher", "nodes and edges"),
+    ("influxdb", "time series database", "时序数据库", "metrics", "tsdb"),
+    ("dynamodb", "cosmosdb", "cloud nosql", "云数据库"),
+    # Database — Advanced
+    ("olap", "oltp", "analytical", "transactional", "数仓", "联机分析"),
+    ("data warehouse", "数据仓库", "star schema", "snowflake schema", "etl"),
+    ("sharding", "分片", "horizontal scaling", "shard key", "consistent hashing"),
+    ("replication", "主从复制", "master slave", "read replica", "binlog"),
+    ("backup", "备份", "restore", "恢复", "point in time recovery", "pitr"),
+    ("connection pool", "连接池", "pg bouncer", "hikari", "数据库连接池"),
+    ("orm", "object relational mapping", "sqlalchemy", "hibernate orm", "sequelize"),
+    # Distributed Systems — Fundamentals
+    ("distributed system", "分布式系统", "distributed computing", "分布式计算"),
+    ("cap theorem", "cap定理", "consistency availability partition", "一致性可用性"),
+    ("eventual consistency", "最终一致性", "strong consistency", "强一致性"),
+    ("consensus", "共识", "raft", "paxos", "leader election", "领导选举"),
+    ("raft consensus", "raft协议", "log replication", "日志复制", "leader follower"),
+    ("zookeeper", "etcd", "distributed coordination", "分布式协调", "distributed lock"),
+    ("two-phase commit", "2pc", "两阶段提交", "distributed transaction", "分布式事务"),
+    ("saga pattern", "saga模式", "compensating transaction", "补偿事务"),
+    ("idempotency", "幂等性", "at-least-once", "at-most-once", "exactly-once"),
+    ("distributed lock", "分布式锁", "redlock", "setnx", "fencing token"),
+    # Message Queue / Event Streaming
+    ("message queue", "消息队列", "mq", "pub/sub", "发布订阅"),
+    ("kafka", "topic", "partition", "consumer group", "offset", "kafka流处理"),
+    ("rabbitmq", "amqp", "exchange", "binding", "routing key"),
+    ("rocketmq", "阿里消息队列", "message broker", "broker"),
+    ("event driven", "事件驱动", "event sourcing", "cqrs", "command query"),
+    ("stream processing", "流处理", "real-time processing", "实时计算"),
+    # Distributed Compute
+    ("mapreduce", "map reduce", "hadoop", "hdfs", "yarn", "大数据"),
+    ("spark", "rdd", "dataframe spark", "spark streaming", "apache spark"),
+    ("flink", "apache flink", "stateful stream", "checkpointing", "exactly-once flink"),
+    ("microservices", "微服务", "service oriented", "soa", "service mesh"),
+    ("service mesh", "istio", "envoy", "sidecars", "mTLS", "服务网格"),
+    ("api gateway", "api网关", "kong", "nginx gateway", "bff"),
+    ("circuit breaker", "熔断", "rate limiting", "限流", "retry", "重试"),
+    ("service discovery", "服务发现", "consul", "eureka", "nacos"),
+    # Cloud Computing
+    ("cloud", "云计算", "iaas", "paas", "saas", "cloud native"),
+    ("aws", "amazon web services", "ec2", "s3", "lambda aws", "rds aws"),
+    ("gcp", "google cloud", "bigquery", "gke", "cloud run"),
+    ("azure", "microsoft azure", "aks", "azure functions", "cosmos db"),
+    ("serverless", "无服务器", "function as a service", "faas", "event trigger"),
+    ("docker", "container", "容器", "dockerfile", "image", "registry"),
+    ("kubernetes", "k8s", "pod", "deployment", "service k8s", "ingress"),
+    ("helm", "kustomize", "operator", "kubernetes deployment", "k8s管理"),
+    ("terraform", "iac", "infrastructure as code", "基础设施即代码", "pulumi"),
+    ("ansible", "chef", "puppet", "configuration management", "配置管理"),
+    ("auto scaling", "自动扩缩容", "horizontal pod autoscaler", "hpa", "elasticity"),
+    ("vpc", "virtual private cloud", "subnet cloud", "security group", "网络隔离"),
+    ("object storage", "对象存储", "s3 compatible", "blob storage", "minio"),
+    # ── Batch 3 end ──────────────────────────────────────────────────────────
+    # ── Batch 4 / 10 : AI/ML · 深度学习 · 计算机视觉 · NLP ──────────────────
+    # Deep Learning / Neural Networks
+    ("neural network", "神经网络", "deep learning", "深度学习", "ann", "mlp"),
+    ("transformer", "attention", "self-attention", "bert", "gpt", "llm", "注意力机制"),
+    ("embedding", "vector", "representation", "向量", "嵌入", "dense vector", "latent"),
+    ("fine-tune", "finetune", "pretrain", "pretraining", "微调", "预训练"),
+    ("inference", "generate", "generation", "推理", "生成", "decode", "decoding"),
+    ("token", "tokenize", "tokenizer", "分词", "词元", "vocab", "vocabulary"),
+    ("batch normalization", "layer normalization", "归一化", "normalization layer"),
+    ("dropout", "regularization", "正则化", "overfitting", "过拟合", "underfitting"),
+    ("activation function", "激活函数", "relu", "sigmoid", "tanh", "gelu", "silu"),
+    ("convolution", "卷积", "kernel", "feature map", "receptive field", "感受野"),
+    ("pooling", "max pooling", "average pooling", "池化层", "downsampling"),
+    ("residual", "skip connection", "残差连接", "resnet", "highway network"),
+    ("attention mechanism", "注意力机制", "multi-head attention", "cross-attention"),
+    ("positional encoding", "位置编码", "rotary embedding", "rope", "alibi"),
+    ("knowledge distillation", "知识蒸馏", "teacher student", "model compression", "模型压缩"),
+    ("quantization", "量化", "int8", "fp16", "bfloat16", "qlora", "gguf"),
+    ("pruning", "剪枝", "sparse model", "稀疏化", "weight pruning"),
+    ("model parallelism", "tensor parallelism", "模型并行", "数据并行", "pipeline parallel"),
+    # Optimization / Training
+    ("gradient", "descent", "sgd", "adam", "optimizer", "梯度", "反向传播"),
+    ("loss function", "损失函数", "cross entropy", "交叉熵", "mse", "focal loss"),
+    ("learning rate", "lr", "scheduler", "warmup", "学习率", "cosine annealing"),
+    ("batch size", "gradient accumulation", "批大小", "梯度累积", "micro batch"),
+    ("regularization", "l1 l2", "weight decay", "正则化", "dropout regularization"),
+    ("early stopping", "validation loss", "早停", "验证集损失", "checkpoint"),
+    ("mixed precision", "fp16 training", "混合精度", "amp", "autocast"),
+    # LLM Specific
+    ("large language model", "llm", "gpt", "claude", "gemini", "大语言模型"),
+    ("prompt", "prompt engineering", "提示词", "system prompt", "few-shot"),
+    ("rlhf", "reinforcement learning from human feedback", "人类反馈强化", "reward model"),
+    ("dpo", "direct preference optimization", "ppo", "grpo", "偏好优化"),
+    ("rag", "retrieval augmented generation", "检索增强生成", "in-context learning"),
+    ("chain of thought", "cot", "思维链", "step by step", "reasoning"),
+    ("context window", "上下文窗口", "long context", "长文本", "context length"),
+    ("hallucination", "幻觉", "factuality", "groundedness", "grounding"),
+    ("instruction tuning", "指令微调", "chat template", "sft", "supervised fine-tuning"),
+    ("lora", "qlora", "adapter", "parameter efficient", "参数高效微调", "peft"),
+    ("temperature", "top-p", "top-k", "sampling", "beam search", "解码策略"),
+    ("tokenizer", "bpe", "wordpiece", "sentencepiece", "subword", "词元化"),
+    # Reinforcement Learning
+    ("reinforcement learning", "强化学习", "rl", "agent", "environment", "智能体"),
+    ("reward", "奖励", "policy", "策略", "value function", "值函数"),
+    ("q-learning", "dqn", "deep q-network", "q值学习", "temporal difference"),
+    ("policy gradient", "策略梯度", "actor critic", "a3c", "ppo rl"),
+    ("markov decision process", "mdp", "马尔可夫决策过程", "状态转移"),
+    ("exploration exploitation", "探索利用", "epsilon greedy", "ucb"),
+    ("model based rl", "model free rl", "有模型", "无模型", "world model"),
+    # Generative Models
+    ("gan", "generative adversarial network", "生成对抗网络", "generator discriminator"),
+    ("vae", "variational autoencoder", "变分自编码器", "latent space", "reparameterization"),
+    ("diffusion model", "扩散模型", "ddpm", "stable diffusion", "noise schedule"),
+    ("flow matching", "normalizing flow", "flow模型", "生成流"),
+    ("autoregressive", "自回归", "next token prediction", "causal lm"),
+    # Computer Vision
+    ("computer vision", "计算机视觉", "cv", "image processing", "图像处理"),
+    ("object detection", "目标检测", "yolo", "rcnn", "fcos", "ssd"),
+    ("image classification", "图像分类", "imagenet", "top-1 accuracy", "softmax classification"),
+    ("semantic segmentation", "语义分割", "instance segmentation", "unet", "maskrcnn"),
+    ("keypoint detection", "pose estimation", "关键点检测", "人体姿态估计"),
+    ("optical flow", "光流", "motion estimation", "视频理解", "temporal"),
+    ("image augmentation", "数据增强", "random crop", "flip", "mixup", "cutmix"),
+    ("feature pyramid", "fpn", "特征金字塔", "multi-scale", "neck"),
+    ("anchor", "bounding box", "anchor box", "iou", "nms", "非极大抑制"),
+    ("depth estimation", "3d reconstruction", "深度估计", "三维重建", "sfm"),
+    ("point cloud", "lidar", "3d object detection", "点云", "voxel"),
+    ("ocr", "optical character recognition", "文字识别", "scene text", "tesseract"),
+    ("super resolution", "image restoration", "超分辨率", "图像修复", "inpainting"),
+    ("face recognition", "人脸识别", "face detection", "facenet", "arcface"),
+    ("vit", "vision transformer", "视觉transformer", "swin transformer", "deit"),
+    ("clip", "contrastive learning", "对比学习", "multimodal", "zero-shot vision"),
+    # NLP Fundamentals
+    ("natural language processing", "nlp", "自然语言处理", "text", "语言"),
+    ("tokenization", "分词", "word segmentation", "jieba", "spacy"),
+    ("pos tagging", "词性标注", "part of speech", "ner", "named entity recognition"),
+    ("dependency parsing", "句法分析", "constituency parsing", "parse tree"),
+    ("sentiment analysis", "情感分析", "opinion mining", "极性分类", "opinion"),
+    ("text classification", "文本分类", "document classification", "intent detection"),
+    ("machine translation", "机器翻译", "nmt", "seq2seq", "翻译"),
+    ("text summarization", "文本摘要", "abstractive", "extractive", "摘要生成"),
+    ("question answering", "问答", "qa", "reading comprehension", "机器阅读理解"),
+    ("information extraction", "信息抽取", "relation extraction", "event extraction"),
+    ("coreference resolution", "指代消解", "entity linking", "实体链接"),
+    ("language model", "语言模型", "perplexity", "next word prediction", "困惑度"),
+    ("word embedding", "word2vec", "glove", "fasttext", "词向量"),
+    ("sentence embedding", "sentence-transformers", "sts", "semantic similarity", "语义相似"),
+    ("dialogue", "对话", "chatbot", "conversational ai", "multi-turn"),
+    # Speech / Audio
+    ("speech recognition", "语音识别", "asr", "automatic speech recognition", "stt"),
+    ("text to speech", "tts", "语音合成", "speech synthesis", "声码器"),
+    ("speaker diarization", "说话人分离", "speaker identification", "voiceprint"),
+    ("acoustic model", "声学模型", "language model asr", "ctc", "attention asr"),
+    ("spectrogram", "mel spectrogram", "mfcc", "频谱图", "声学特征"),
+    ("audio codec", "opus", "aac", "mp3", "音频编码", "vocoder"),
+    ("noise reduction", "降噪", "speech enhancement", "语音增强", "audio denoising"),
+    # ML Evaluation
+    ("accuracy", "precision", "recall", "f1", "auc", "roc", "准确率", "精确率"),
+    ("perplexity", "bleu", "rouge", "meteor", "困惑度", "机器翻译评估"),
+    ("map", "mean average precision", "目标检测评估", "ndcg", "排序评估"),
+    ("confusion matrix", "混淆矩阵", "tp fp tn fn", "false positive rate"),
+    ("cross validation", "交叉验证", "k-fold", "stratified", "train test split"),
+    ("overfitting detection", "learning curve", "bias variance", "validation metric"),
+    # ── Batch 4 end ──────────────────────────────────────────────────────────
+    # ── Batch 5 / 10 : 数学 · 统计 · 物理 · 化学 · 生物 ──────────────────────
+    # Arithmetic & Algebra
+    ("arithmetic", "算术", "addition", "subtraction", "multiplication", "division", "加减乘除"),
+    ("algebra", "代数", "polynomial", "多项式", "equation solving", "方程求解"),
+    ("exponent", "指数", "logarithm", "对数", "power", "幂", "log base"),
+    ("absolute value", "绝对值", "modulus", "complex modulus", "取模"),
+    ("factorial", "阶乘", "permutation", "arrangement", "combination", "排列组合"),
+    ("fibonacci", "斐波那契", "recurrence relation", "递推关系", "golden ratio"),
+    # Geometry
+    ("geometry", "几何", "euclidean geometry", "欧氏几何", "non-euclidean"),
+    ("triangle", "三角形", "circle", "圆", "polygon", "多边形", "area formula"),
+    ("angle", "角度", "degree radian", "弧度", "trigonometry", "三角函数"),
+    ("sine cosine tangent", "sin cos tan", "正弦余弦正切", "inverse trig"),
+    ("pythagorean theorem", "勾股定理", "pythagoras", "right triangle", "直角三角形"),
+    ("coordinate", "坐标", "cartesian", "polar coordinates", "极坐标", "origin"),
+    ("vector math", "向量", "dot product", "inner product", "cross product", "叉积"),
+    ("matrix", "矩阵", "determinant", "行列式", "transpose", "转置", "inverse matrix"),
+    ("eigenvalue", "特征值", "eigenvector", "特征向量", "diagonalization", "对角化"),
+    # Calculus
+    ("calculus", "微积分", "differential calculus", "integral calculus", "微分积分"),
+    ("limit", "极限", "continuity", "连续性", "epsilon delta", "ε-δ"),
+    ("derivative", "导数", "differentiation", "求导", "chain rule", "链式法则"),
+    ("integral", "积分", "definite integral", "indefinite integral", "定积分", "不定积分"),
+    ("partial derivative", "偏导数", "gradient math", "梯度", "jacobian", "hessian"),
+    ("taylor series", "泰勒展开", "fourier series", "傅里叶级数", "maclaurin"),
+    ("differential equation", "微分方程", "ode", "pde", "initial value problem"),
+    ("laplace transform", "拉普拉斯变换", "z-transform", "fourier transform", "频域"),
+    # Linear Algebra
+    ("linear algebra", "线性代数", "vector space", "向量空间", "basis"),
+    ("span", "张成", "linear independence", "线性无关", "rank", "秩"),
+    ("svd", "singular value decomposition", "奇异值分解", "eigendecomposition"),
+    ("lu decomposition", "qr decomposition", "cholesky", "矩阵分解"),
+    ("least squares", "最小二乘", "pseudoinverse", "moore-penrose", "regression linear"),
+    ("pca", "principal component analysis", "主成分分析", "dimensionality reduction"),
+    # Probability & Statistics
+    ("probability", "概率", "probability theory", "随机事件", "sample space"),
+    ("conditional probability", "条件概率", "bayes theorem", "贝叶斯定理", "prior posterior"),
+    ("random variable", "随机变量", "discrete", "continuous", "pmf", "pdf", "cdf"),
+    ("normal distribution", "正态分布", "gaussian", "bell curve", "standard deviation"),
+    ("binomial distribution", "二项分布", "bernoulli", "multinomial", "poisson"),
+    ("expectation", "期望", "variance", "方差", "covariance", "协方差", "standard deviation"),
+    ("central limit theorem", "中心极限定理", "law of large numbers", "大数定律"),
+    ("hypothesis testing", "假设检验", "p-value", "significance level", "type i error"),
+    ("confidence interval", "置信区间", "margin of error", "bootstrap confidence"),
+    ("t-test", "chi-square test", "anova", "f-test", "统计检验"),
+    ("regression", "回归", "linear regression", "logistic regression", "多元回归"),
+    ("correlation", "相关性", "pearson", "spearman", "kendall", "相关系数"),
+    ("bayesian inference", "贝叶斯推断", "mcmc", "markov chain", "gibbs sampling"),
+    ("maximum likelihood", "最大似然估计", "mle", "map", "最大后验"),
+    ("information theory", "信息论", "entropy", "熵", "mutual information", "kl divergence"),
+    # Discrete Mathematics
+    ("set theory", "集合论", "union", "intersection", "complement", "并集", "交集"),
+    ("logic", "逻辑", "proposition", "predicate", "quantifier", "命题逻辑"),
+    ("graph theory math", "图论", "chromatic number", "planar graph", "四色定理"),
+    ("combinatorics", "组合数学", "pigeonhole principle", "鸽巢原理", "inclusion-exclusion"),
+    ("boolean algebra", "布尔代数", "truth table", "logical gate", "karnaugh map"),
+    # Physics — Mechanics
+    ("mechanics", "力学", "newton's law", "牛顿定律", "force", "momentum"),
+    ("kinematics", "运动学", "velocity", "acceleration", "displacement", "trajectory"),
+    ("dynamics", "动力学", "torque", "angular momentum", "惯量", "moment of inertia"),
+    ("energy", "能量", "work", "power", "kinetic energy", "potential energy", "动能", "势能"),
+    ("thermodynamics", "热力学", "entropy thermodynamics", "temperature", "heat", "焓"),
+    ("fluid dynamics", "流体力学", "bernoulli", "navier-stokes", "viscosity", "reynolds number"),
+    # Physics — Electromagnetism
+    ("electromagnetism", "电磁学", "electric field", "magnetic field", "电场", "磁场"),
+    ("maxwell equations", "麦克斯韦方程", "faraday's law", "ampere's law", "电磁感应"),
+    ("electric circuit", "电路", "voltage", "current", "resistance", "ohm's law", "欧姆定律"),
+    ("capacitor", "inductor", "电容", "电感", "ac dc", "alternating current"),
+    ("electromagnetic wave", "电磁波", "radio wave", "infrared", "ultraviolet", "spectrum"),
+    ("optics", "光学", "reflection", "refraction", "diffraction", "interference", "折射"),
+    ("laser", "激光", "photon", "光子", "coherent light", "stimulated emission"),
+    # Physics — Quantum & Modern
+    ("quantum mechanics", "量子力学", "wave function", "schrödinger equation", "superposition"),
+    ("quantum entanglement", "量子纠缠", "uncertainty principle", "不确定原理", "quantum state"),
+    ("special relativity", "狭义相对论", "general relativity", "广义相对论", "spacetime"),
+    ("nuclear physics", "核物理", "fission", "fusion", "radioactivity", "裂变", "聚变"),
+    ("particle physics", "粒子物理", "standard model", "quark", "lepton", "boson"),
+    ("cosmology", "宇宙学", "big bang", "dark matter", "dark energy", "宇宙起源"),
+    # Chemistry
+    ("chemistry", "化学", "element", "compound", "molecule", "元素", "化合物"),
+    ("organic chemistry", "有机化学", "carbon chain", "functional group", "官能团"),
+    ("inorganic chemistry", "无机化学", "ionic bond", "covalent bond", "metal", "金属"),
+    ("chemical reaction", "化学反应", "reactant", "product", "catalyst", "催化剂"),
+    ("acid base", "酸碱", "ph", "buffer chemistry", "neutralization", "中和"),
+    ("oxidation reduction", "氧化还原", "redox", "electrochemistry", "电化学"),
+    ("thermochemistry", "热化学", "enthalpy", "gibbs free energy", "熵化学"),
+    ("chemical equilibrium", "化学平衡", "le chatelier", "equilibrium constant", "Kp Kc"),
+    ("spectroscopy", "光谱学", "nmr", "ir spectroscopy", "mass spectrometry", "质谱"),
+    ("chromatography", "色谱", "hplc", "gc", "液相色谱", "气相色谱"),
+    ("polymer", "聚合物", "monomer", "polymerization", "plastic", "rubber", "高分子"),
+    ("biochemistry", "生物化学", "enzyme", "substrate", "metabolism", "代谢"),
+    # Biology
+    ("cell", "细胞", "cell membrane", "nucleus", "mitochondria", "organelle"),
+    ("dna", "rna", "gene", "genome", "基因", "基因组", "nucleotide"),
+    ("protein", "蛋白质", "amino acid", "polypeptide", "fold", "结构", "氨基酸"),
+    ("genetics", "遗传学", "heredity", "allele", "genotype", "phenotype", "基因型"),
+    ("evolution", "进化", "natural selection", "自然选择", "mutation", "突变"),
+    ("ecology", "生态学", "ecosystem", "food chain", "biodiversity", "生物多样性"),
+    ("microbiology", "微生物学", "bacteria", "virus", "细菌", "病毒", "pathogen"),
+    ("neuroscience", "神经科学", "neuron", "synapse", "neurotransmitter", "神经元"),
+    ("immunology", "免疫学", "antibody", "antigen", "immune response", "疫苗"),
+    ("genomics", "基因组学", "sequencing", "bioinformatics", "blast", "测序"),
+    ("proteomics", "蛋白质组学", "mass spec proteomics", "2d gel", "protein interaction"),
+    ("stem cell", "干细胞", "differentiation", "embryo", "regenerative medicine", "再生医学"),
+    # ── Batch 5 end ──────────────────────────────────────────────────────────
+    # ── Batch 6 / 10 : 经济 · 金融 · 医学 · 法律 · 商业管理 ───────────────────
+    # Economics — Micro
+    ("microeconomics", "微观经济学", "supply demand", "供需", "market equilibrium"),
+    ("price", "价格", "elasticity", "弹性", "price elasticity of demand", "需求弹性"),
+    ("consumer", "消费者", "utility", "效用", "indifference curve", "无差异曲线"),
+    ("producer", "生产者", "cost", "成本", "marginal cost", "边际成本"),
+    ("market structure", "市场结构", "monopoly", "oligopoly", "perfect competition", "垄断"),
+    ("game theory", "博弈论", "nash equilibrium", "纳什均衡", "prisoner's dilemma"),
+    ("externality", "外部性", "public good", "公共品", "market failure", "市场失灵"),
+    ("information asymmetry", "信息不对称", "adverse selection", "moral hazard", "逆向选择"),
+    # Economics — Macro
+    ("macroeconomics", "宏观经济学", "gdp", "gnp", "national income", "国民收入"),
+    ("inflation", "通货膨胀", "deflation", "cpi", "ppi", "price level"),
+    ("monetary policy", "货币政策", "interest rate", "利率", "central bank", "央行"),
+    ("fiscal policy", "财政政策", "government spending", "tax", "budget deficit", "财政赤字"),
+    ("exchange rate", "汇率", "currency", "foreign exchange", "forex", "purchasing power"),
+    ("business cycle", "商业周期", "recession", "depression", "recovery", "economic growth"),
+    ("unemployment", "失业", "labor market", "劳动力市场", "wage", "工资"),
+    ("trade", "贸易", "export import", "进出口", "trade balance", "trade deficit"),
+    ("international trade", "国际贸易", "comparative advantage", "比较优势", "tariff"),
+    # Finance
+    ("finance", "金融", "financial market", "金融市场", "asset", "资产"),
+    ("stock", "股票", "equity", "股权", "share", "市值", "market cap"),
+    ("bond", "债券", "yield", "收益率", "coupon", "fixed income", "固定收益"),
+    ("derivative", "衍生品", "option", "期权", "futures", "期货", "swap", "掉期"),
+    ("portfolio", "投资组合", "diversification", "分散化", "risk return", "风险收益"),
+    ("risk management", "风险管理", "var", "value at risk", "hedging", "对冲"),
+    ("valuation", "估值", "dcf", "discounted cash flow", "npv", "net present value"),
+    ("ipo", "首次公开募股", "listing", "underwriting", "secondary market", "二级市场"),
+    ("private equity", "私募股权", "venture capital", "vc", "angel investor", "融资"),
+    ("hedge fund", "对冲基金", "mutual fund", "公募基金", "etf", "index fund"),
+    ("credit rating", "信用评级", "moody's", "standard and poor", "default risk"),
+    ("financial statement", "财务报表", "balance sheet", "income statement", "cash flow"),
+    ("accounting", "会计", "assets liabilities equity", "depreciation", "amortization"),
+    ("cryptocurrency", "加密货币", "bitcoin", "ethereum", "blockchain finance", "defi"),
+    ("blockchain", "区块链", "smart contract", "consensus blockchain", "ledger"),
+    ("nft", "non-fungible token", "digital asset", "mint", "marketplace nft"),
+    # Medicine / Healthcare
+    ("medicine", "医学", "clinical", "临床", "patient", "患者", "diagnosis", "诊断"),
+    ("symptom", "症状", "sign", "体征", "chief complaint", "主诉", "history"),
+    ("treatment", "治疗", "therapy", "疗法", "surgery", "手术", "procedure"),
+    ("drug", "药物", "medication", "pharmacology", "dosage", "剂量", "prescription"),
+    ("disease", "疾病", "disorder", "syndrome", "pathology", "病理"),
+    ("infection", "感染", "bacteria infection", "viral infection", "antibiotic", "抗生素"),
+    ("cancer", "肿瘤", "tumor", "oncology", "chemotherapy", "radiation therapy", "放化疗"),
+    ("cardiovascular", "心血管", "heart disease", "hypertension", "coronary artery"),
+    ("diabetes", "糖尿病", "insulin", "blood glucose", "type 1 type 2 diabetes"),
+    ("mental health", "心理健康", "depression", "anxiety", "psychiatry", "精神科"),
+    ("neurology", "神经内科", "stroke", "脑卒中", "alzheimer's", "parkinson's"),
+    ("imaging", "影像学", "mri", "ct scan", "x-ray", "ultrasound", "超声"),
+    ("lab test", "实验室检查", "blood test", "urinalysis", "biopsy", "活检"),
+    ("vaccine", "疫苗", "immunization", "herd immunity", "booster", "接种"),
+    ("clinical trial", "临床试验", "randomized controlled trial", "rct", "phase i ii iii"),
+    ("ehr", "electronic health record", "电子病历", "emr", "telemedicine", "远程医疗"),
+    ("public health", "公共卫生", "epidemiology", "流行病学", "incidence", "prevalence"),
+    ("first aid", "急救", "cpr", "cardiopulmonary resuscitation", "defibrillator"),
+    # Law / Legal
+    ("law", "法律", "legal", "legislation", "statute", "法规", "法令"),
+    ("contract", "合同", "agreement", "consideration", "offer acceptance", "要约承诺"),
+    ("intellectual property", "知识产权", "ip", "copyright", "版权", "patent", "专利"),
+    ("trademark", "商标", "trade secret", "商业秘密", "infringement", "侵权"),
+    ("privacy law", "隐私法", "gdpr", "personal data", "data protection", "个人信息"),
+    ("compliance", "合规", "regulation", "监管", "regulatory compliance", "法规遵从"),
+    ("litigation", "诉讼", "lawsuit", "plaintiff", "defendant", "原告", "被告"),
+    ("criminal law", "刑法", "crime", "犯罪", "prosecution", "conviction", "判决"),
+    ("civil law", "民法", "tort", "侵权", "negligence", "过失", "liability"),
+    ("antitrust", "反垄断", "competition law", "monopoly law", "merger clearance"),
+    ("labor law", "劳动法", "employment law", "worker rights", "minimum wage", "劳动合同"),
+    ("real estate law", "房地产法", "property rights", "ownership", "lease", "租约"),
+    ("international law", "国际法", "treaty", "条约", "jurisdiction", "管辖权"),
+    # Business & Management
+    ("management", "管理", "organization", "组织", "leadership", "领导力"),
+    ("strategy", "战略", "competitive advantage", "竞争优势", "porter's five forces"),
+    ("marketing", "市场营销", "brand", "品牌", "customer", "客户", "segmentation"),
+    ("sales", "销售", "revenue", "营收", "conversion", "转化率", "funnel"),
+    ("supply chain", "供应链", "logistics", "物流", "inventory", "库存", "procurement"),
+    ("project management", "项目管理", "gantt", "wbs", "milestone", "里程碑"),
+    ("agile", "scrum", "sprint", "kanban", "product backlog", "敏捷开发"),
+    ("kpi", "okr", "performance indicator", "绩效指标", "goal setting", "目标管理"),
+    ("human resources", "人力资源", "hr", "recruitment", "onboarding", "talent"),
+    ("entrepreneurship", "创业", "startup", "venture", "business model", "商业模式"),
+    ("operations", "运营", "process optimization", "流程优化", "lean", "six sigma"),
+    ("accounting business", "财务会计", "budgeting", "预算", "cost control", "成本控制"),
+    # ── Batch 6 end ──────────────────────────────────────────────────────────
+    # ── Batch 7 / 10 : 安全 · DevOps · 前端 · 后端 · 工程实践 ────────────────
+    # Security — Cryptography
+    ("cryptography", "密码学", "encryption", "decryption", "加密", "解密"),
+    ("symmetric encryption", "对称加密", "aes", "des", "block cipher", "stream cipher"),
+    ("asymmetric encryption", "非对称加密", "rsa", "ecc", "public key", "private key"),
+    ("hash function", "哈希函数", "sha256", "sha3", "md5", "collision resistance"),
+    ("digital signature", "数字签名", "ecdsa", "rsa signature", "verification"),
+    ("pki", "public key infrastructure", "certificate", "ca", "证书颁发机构", "x509"),
+    ("tls", "ssl", "handshake", "cipher suite", "certificate pinning"),
+    ("key exchange", "diffie-hellman", "ecdh", "密钥协商", "forward secrecy"),
+    ("zero knowledge proof", "零知识证明", "zkp", "zk-snark", "zk-stark"),
+    # Security — AppSec
+    ("vulnerability", "漏洞", "cve", "security bug", "exploit"),
+    ("sql injection", "sql注入", "injection attack", "owasp", "防注入"),
+    ("xss", "cross-site scripting", "跨站脚本", "reflected xss", "stored xss"),
+    ("csrf", "cross-site request forgery", "跨站请求伪造", "token protection"),
+    ("authentication security", "auth bypass", "认证绕过", "session hijacking", "cookie theft"),
+    ("buffer overflow", "堆栈溢出", "stack smashing", "return oriented programming", "rop"),
+    ("privilege escalation", "提权", "local privilege escalation", "kernel exploit"),
+    ("penetration testing", "渗透测试", "pentest", "ethical hacking", "red team"),
+    ("sast", "dast", "static analysis security", "dynamic analysis", "code scanning"),
+    ("owasp top 10", "web漏洞top10", "injection", "broken auth", "sensitive data"),
+    ("firewall security", "waf", "web application firewall", "intrusion detection", "ids"),
+    ("malware", "恶意软件", "virus", "ransomware", "trojan", "spyware", "勒索软件"),
+    ("phishing", "钓鱼", "social engineering", "spear phishing", "pretexting"),
+    # DevOps / SRE
+    ("devops", "ci/cd", "continuous integration", "continuous deployment", "持续集成"),
+    ("pipeline", "流水线", "github actions", "jenkins", "gitlab ci", "circleci"),
+    ("deployment", "部署", "blue green deployment", "canary release", "rolling update"),
+    ("monitoring", "监控", "prometheus", "grafana", "alertmanager", "metrics"),
+    ("logging", "日志", "elk stack", "elasticsearch kibana", "loki", "log aggregation"),
+    ("tracing", "链路追踪", "distributed tracing", "jaeger", "zipkin", "opentelemetry"),
+    ("observability", "可观测性", "metrics logs traces", "sre", "site reliability"),
+    ("slo", "sla", "sli", "service level objective", "error budget", "可用性指标"),
+    ("incident", "事故", "postmortem", "on-call", "runbook", "故障处理"),
+    ("chaos engineering", "混沌工程", "fault injection", "chaos monkey", "resilience"),
+    ("performance testing", "性能测试", "load testing", "stress test", "jmeter"),
+    ("profiling", "性能分析", "flame graph", "cpu profiling", "memory profiling"),
+    # Frontend
+    ("frontend", "前端", "html", "css", "javascript frontend", "web development"),
+    ("dom", "document object model", "dom manipulation", "event listener", "浏览器"),
+    ("css", "stylesheet", "selector", "flexbox", "grid", "responsive design", "响应式"),
+    ("sass", "less", "scss", "css preprocessor", "css变量", "css module"),
+    ("react hooks", "useState", "useEffect", "custom hook", "state management"),
+    ("redux", "zustand", "mobx", "state management", "flux", "global state"),
+    ("next.js", "nuxt", "gatsby", "ssr", "ssg", "静态生成", "服务端渲染"),
+    ("web component", "shadow dom", "custom element", "web标准"),
+    ("browser storage", "cookie", "localstorage", "sessionstorage", "indexeddb"),
+    ("web performance", "lighthouse", "core web vitals", "lcp", "fcp", "ttfb", "首屏"),
+    ("accessibility", "a11y", "aria", "screen reader", "wcag", "可访问性"),
+    ("pwa", "progressive web app", "service worker", "web manifest", "offline first"),
+    ("animation", "transition", "css animation", "keyframe", "web animation api"),
+    # Backend
+    ("backend", "后端", "server side", "server", "服务端"),
+    ("api", "rest api", "http api", "接口", "endpoint", "restful"),
+    ("http", "request response", "status code", "请求响应", "header", "body"),
+    ("middleware", "中间件", "interceptor", "拦截器", "filter", "过滤器"),
+    ("authentication", "authorization", "jwt", "session", "认证鉴权", "oauth2"),
+    ("rate limiting", "限流", "throttling", "quota", "api rate limit", "令牌桶"),
+    ("caching backend", "redis cache", "memcached", "cache invalidation", "缓存策略"),
+    ("orm backend", "database access", "query builder", "active record", "数据访问"),
+    ("express", "fastapi", "gin", "spring mvc", "django", "flask", "后端框架"),
+    ("graphql server", "resolver", "schema definition", "type system", "mutation"),
+    ("websocket server", "real-time", "socket.io", "sse", "push notification"),
+    ("file upload", "multipart form", "s3 upload", "cdn upload", "binary upload"),
+    ("background job", "task queue", "celery", "sidekiq", "worker", "定时任务"),
+    ("email", "smtp", "sendgrid", "mailgun", "html email", "邮件发送"),
+    # Software Engineering Practices
+    ("design pattern", "设计模式", "gof", "creational", "structural", "behavioral"),
+    ("singleton", "factory", "observer", "strategy", "command pattern", "单例工厂"),
+    ("solid principles", "solid原则", "single responsibility", "open closed", "liskov"),
+    ("clean architecture", "hexagonal", "ddd", "domain driven design", "领域驱动"),
+    ("tdd", "test driven development", "bdd", "behavior driven", "测试驱动"),
+    ("code review", "pull request", "代码审查", "pr", "merge request"),
+    ("version control", "git", "svn", "版本控制", "branching strategy"),
+    ("git flow", "trunk based", "feature branch", "gitops", "git工作流"),
+    ("semantic versioning", "semver", "changelog", "release", "tag", "版本号"),
+    ("documentation", "文档", "api doc", "swagger", "openapi", "readthedoc"),
+    ("refactoring", "重构", "code smell", "technical debt", "技术债"),
+    ("lint", "linting", "code style", "formatter", "eslint prettier", "代码风格"),
+    # Testing
+    ("testing", "测试", "test case", "测试用例", "test plan"),
+    ("unit test", "单元测试", "assertion", "mock object", "stub", "spy"),
+    ("integration test", "集成测试", "end to end test", "e2e", "selenium"),
+    ("test coverage", "代码覆盖率", "branch coverage", "line coverage", "istanbul"),
+    ("property based testing", "fuzz testing", "generative testing", "模糊测试"),
+    ("regression test", "回归测试", "smoke test", "sanity check", "快速验证"),
+    # ── Batch 7 end ──────────────────────────────────────────────────────────
+    # ── Batch 8 / 10 : 社会科学 · 人文 · 教育 · 哲学 · 语言学 · 环境 ──────────
+    # Psychology & Cognitive Science
+    ("psychology", "心理学", "cognition", "认知", "behavior", "行为"),
+    ("perception", "感知", "sensation", "感觉", "attention cognitive", "注意力"),
+    ("memory", "记忆", "short term memory", "long term memory", "working memory", "工作记忆"),
+    ("emotion", "情绪", "affect", "mood", "feeling", "情感调节"),
+    ("motivation", "动机", "intrinsic motivation", "内在动机", "extrinsic", "外在"),
+    ("learning psychology", "学习心理", "conditioning", "operant conditioning", "reinforcement"),
+    ("cognitive bias", "认知偏差", "confirmation bias", "heuristic", "启发法"),
+    ("decision making", "决策", "rational choice", "bounded rationality", "有限理性"),
+    ("social psychology", "社会心理学", "group dynamics", "conformity", "从众"),
+    ("personality", "人格", "big five", "mbti", "trait theory", "性格特征"),
+    ("developmental psychology", "发展心理学", "piaget", "vygotsky", "stages"),
+    ("clinical psychology", "临床心理", "therapy", "cbt", "cognitive behavioral", "psychotherapy"),
+    ("neuroscience psychology", "认知神经科学", "brain imaging", "fmri", "eeg"),
+    # Sociology & Anthropology
+    ("sociology", "社会学", "social structure", "社会结构", "institution"),
+    ("culture", "文化", "cultural norms", "cultural values", "cross-cultural"),
+    ("society", "社会", "community", "social cohesion", "collective"),
+    ("social stratification", "社会分层", "class", "inequality", "mobility"),
+    ("race", "ethnicity", "族裔", "discrimination", "prejudice", "偏见"),
+    ("gender", "性别", "gender roles", "feminism", "patriarchy", "平等"),
+    ("family", "家庭", "kinship", "marriage", "parenting", "socialization"),
+    ("religion", "宗教", "ritual", "belief", "faith", "secularization"),
+    ("globalization", "全球化", "cultural exchange", "cosmopolitan", "transnational"),
+    ("ethnography", "民族志", "fieldwork", "qualitative sociology", "participant observation"),
+    # Education
+    ("education", "教育", "pedagogy", "teaching", "学习", "curriculum"),
+    ("curriculum", "课程", "syllabus", "learning objective", "教学目标"),
+    ("assessment", "评估", "formative assessment", "summative", "rubric", "评分"),
+    ("e-learning", "在线教育", "mooc", "lms", "learning management system"),
+    ("instructional design", "教学设计", "bloom taxonomy", "学习目标分类"),
+    ("metacognition", "元认知", "self-regulated learning", "自主学习"),
+    ("classroom", "课堂", "student teacher ratio", "active learning", "主动学习"),
+    ("higher education", "高等教育", "university", "bachelor master phd", "学位"),
+    ("special education", "特殊教育", "learning disability", "inclusion", "适应"),
+    # Philosophy
+    ("philosophy", "哲学", "philosophical", "reasoning", "argument", "论证"),
+    ("epistemology", "认识论", "knowledge", "belief", "justification", "truth"),
+    ("metaphysics", "形而上学", "ontology", "existence", "being", "存在"),
+    ("ethics", "伦理学", "moral", "morality", "virtue", "duty", "consequentialism"),
+    ("logic philosophy", "逻辑学", "deduction", "induction", "syllogism", "演绎归纳"),
+    ("philosophy of mind", "心灵哲学", "consciousness", "qualia", "turing test"),
+    ("political philosophy", "政治哲学", "justice", "liberty", "democracy", "equality"),
+    ("aesthetics", "美学", "beauty", "art theory", "sublime", "艺术批评"),
+    ("existentialism", "存在主义", "sartre", "heidegger", "absurdism", "nietzsche"),
+    ("pragmatism", "实用主义", "dewey", "peirce", "utility", "truth pragmatic"),
+    # Linguistics
+    ("linguistics", "语言学", "language", "grammar", "syntax", "phonology"),
+    ("syntax linguistics", "句法", "sentence structure", "parse", "grammar rule"),
+    ("semantics", "语义学", "meaning", "reference", "sense", "词义"),
+    ("pragmatics", "语用学", "speech act", "implicature", "context use"),
+    ("phonology", "音韵学", "phoneme", "allophone", "sound system", "pronunciation"),
+    ("morphology", "形态学", "morpheme", "inflection", "derivation", "词形变化"),
+    ("second language acquisition", "二语习得", "sla", "bilingualism", "immersion"),
+    ("sociolinguistics", "社会语言学", "dialect", "register", "code switching"),
+    ("corpus linguistics", "语料库语言学", "frequency", "collocation", "concordance"),
+    ("computational linguistics", "计算语言学", "nlp linguistics", "parsing", "grammar formalism"),
+    # History & Politics
+    ("history", "历史", "historical", "ancient", "modern", "contemporary"),
+    ("ancient history", "古代史", "civilization", "empire", "mesopotamia", "egypt"),
+    ("world war", "世界大战", "ww1", "ww2", "cold war", "冷战"),
+    ("colonial", "殖民", "imperialism", "decolonization", "independence"),
+    ("revolution", "革命", "french revolution", "industrial revolution", "social change"),
+    ("democracy", "民主", "republic", "elections", "voting", "political system"),
+    ("authoritarianism", "威权主义", "totalitarianism", "dictatorship", "censorship"),
+    ("geopolitics", "地缘政治", "international relations", "国际关系", "power"),
+    ("diplomacy", "外交", "treaty history", "foreign policy", "summit", "alliance"),
+    ("human rights", "人权", "civil liberties", "rule of law", "constitution"),
+    # Environment & Sustainability
+    ("climate change", "气候变化", "global warming", "greenhouse gas", "温室效应"),
+    ("carbon emission", "碳排放", "co2", "carbon footprint", "net zero", "碳中和"),
+    ("renewable energy", "可再生能源", "solar energy", "wind energy", "太阳能"),
+    ("fossil fuel", "化石燃料", "coal", "oil", "natural gas", "petroleum"),
+    ("nuclear energy", "核能", "reactor", "fission energy", "nuclear power"),
+    ("sustainability", "可持续发展", "sdg", "sustainable development", "triple bottom line"),
+    ("biodiversity", "生物多样性", "species", "extinction", "conservation"),
+    ("pollution", "污染", "air pollution", "water pollution", "pm2.5", "环境"),
+    ("waste management", "废物管理", "recycling", "circular economy", "垃圾分类"),
+    ("water", "水", "water scarcity", "desalination", "irrigation", "水资源"),
+    ("deforestation", "森林砍伐", "reforestation", "carbon sink", "amazon"),
+    # Art & Media
+    ("art", "艺术", "visual art", "painting", "sculpture", "installation"),
+    ("music", "音乐", "melody", "harmony", "rhythm", "instrument", "composition"),
+    ("film", "电影", "cinematography", "director", "screenplay", "editing"),
+    ("literature", "文学", "novel", "poetry", "prose", "narrative", "metaphor"),
+    ("graphic design", "平面设计", "typography", "layout", "color theory", "brand design"),
+    ("photography", "摄影", "composition photo", "lighting", "exposure", "aperture"),
+    ("animation", "动画", "2d animation", "3d animation", "motion graphics", "keyframe"),
+    ("video production", "视频制作", "editing", "post production", "color grading"),
+    ("podcast", "播客", "audio content", "rss feed", "distribution"),
+    # ── Batch 8 end ──────────────────────────────────────────────────────────
+    # ── Batch 9 / 10 : 工程 · 嵌入式 · 游戏 · 信息论 · 人机交互 · 运筹 ─────────
+    # Materials Science & Engineering
+    ("material", "材料", "material science", "材料科学", "mechanical property"),
+    ("metal", "金属", "alloy", "合金", "steel", "aluminum", "titanium"),
+    ("semiconductor", "半导体", "silicon", "silicon wafer", "doping", "集成电路"),
+    ("conductor", "insulator", "导体", "绝缘体", "resistivity", "电阻率"),
+    ("composite material", "复合材料", "fiber", "carbon fiber", "碳纤维", "matrix"),
+    ("nanotechnology", "纳米技术", "nanoparticle", "quantum dot", "nanotube"),
+    ("3d printing", "三维打印", "additive manufacturing", "fdm", "sla", "sintering"),
+    ("crystal", "晶体", "crystal lattice", "x-ray diffraction", "xrd", "晶格"),
+    ("fatigue", "疲劳", "fracture", "crack propagation", "stress strain", "应力应变"),
+    ("corrosion", "腐蚀", "rust", "oxidation", "electrochemical corrosion"),
+    ("polymer chemistry", "高分子化学", "thermoplastic", "thermoset", "elastomer"),
+    ("ceramic", "陶瓷", "glass", "amorphous", "piezoelectric", "压电"),
+    # Mechanical & Aerospace Engineering
+    ("mechanical engineering", "机械工程", "cad", "cam", "solidworks", "autocad"),
+    ("thermodynamics engineering", "工程热力学", "carnot cycle", "rankine", "brayton"),
+    ("fluid mechanics", "流体力学", "reynolds number", "turbulence", "laminar"),
+    ("aerodynamics", "空气动力学", "lift", "drag", "thrust", "bernoulli"),
+    ("robotics", "机器人", "actuator", "sensor", "servo", "inverse kinematics"),
+    ("automation", "自动化", "plc", "cnc", "pid controller", "控制系统"),
+    ("finite element analysis", "有限元分析", "fea", "ansys", "abaqus", "mesh"),
+    ("vibration", "振动", "natural frequency", "resonance", "damping", "阻尼"),
+    ("heat transfer", "传热", "conduction", "convection", "radiation", "thermal"),
+    ("manufacturing", "制造", "machining", "casting", "forging", "welding", "焊接"),
+    # Electronics & Embedded Systems
+    ("electronics", "电子", "circuit design", "电路设计", "pcb layout"),
+    ("transistor", "晶体管", "mosfet", "bjt", "amplifier", "放大器"),
+    ("operational amplifier", "运算放大器", "op-amp", "comparator", "filter"),
+    ("adc", "analog to digital", "dac", "digital to analog", "sampling", "nyquist"),
+    ("fpga", "field programmable gate array", "vhdl", "verilog", "rtl", "hdl"),
+    ("microcontroller", "单片机", "mcu", "arduino", "stm32", "esp32", "pic"),
+    ("microprocessor", "微处理器", "arm", "risc-v", "x86", "cpu architecture"),
+    ("embedded system", "嵌入式系统", "rtos", "bare metal", "firmware", "固件"),
+    ("uart", "spi", "i2c", "serial communication", "串行通信", "总线协议"),
+    ("gpio", "pwm", "interrupt embedded", "embedded io", "引脚"),
+    ("power electronics", "电力电子", "inverter", "converter", "switching regulator"),
+    ("signal processing", "信号处理", "fft", "dsp", "filter design", "sampling theorem"),
+    ("iot", "internet of things", "物联网", "mqtt", "sensor network", "边缘计算"),
+    # Game Development
+    ("game development", "游戏开发", "game engine", "unity", "unreal engine", "godot"),
+    ("rendering", "渲染", "rasterization", "ray tracing", "shader", "graphics pipeline"),
+    ("vertex", "fragment shader", "glsl", "hlsl", "gpu programming", "opengl"),
+    ("physics engine", "物理引擎", "rigidbody", "collision detection", "碰撞检测"),
+    ("animation game", "skeletal animation", "ik", "inverse kinematics game", "blend tree"),
+    ("level design", "关卡设计", "game map", "tilemap", "procedural generation"),
+    ("game ai", "pathfinding", "a* game", "navmesh", "behavior tree", "fsm"),
+    ("texture", "uv mapping", "material game", "pbr", "physically based rendering"),
+    ("particle system", "粒子系统", "vfx", "visual effects", "post processing"),
+    ("multiplayer", "网络游戏", "latency compensation", "lag compensation", "netcode"),
+    ("game loop", "game tick", "固定帧率", "delta time", "vsync"),
+    # Information Theory & Coding
+    ("compression", "压缩", "lossless compression", "lossy", "无损压缩"),
+    ("huffman coding", "霍夫曼编码", "arithmetic coding", "entropy coding"),
+    ("lz77", "lz78", "lzma", "deflate", "zip", "gzip", "压缩算法"),
+    ("error correction", "纠错码", "hamming code", "reed-solomon", "turbo code"),
+    ("channel capacity", "信道容量", "shannon limit", "nyquist rate", "噪声"),
+    ("image compression", "jpeg", "png", "webp", "avif", "图像压缩"),
+    ("video compression", "h264", "h265", "av1", "hevc", "视频编码"),
+    # Operations Research & Optimization
+    ("linear programming", "线性规划", "simplex method", "单纯形法", "lp"),
+    ("integer programming", "整数规划", "mixed integer", "branch and bound", "切割平面"),
+    ("constraint satisfaction", "约束满足", "csp", "backtracking csp", "arc consistency"),
+    ("genetic algorithm", "遗传算法", "evolutionary", "crossover", "mutation ga", "种群"),
+    ("simulated annealing", "模拟退火", "local search", "hill climbing", "局部最优"),
+    ("particle swarm", "粒子群优化", "pso", "swarm intelligence", "群体智能"),
+    ("convex optimization", "凸优化", "lagrangian", "kkt conditions", "duality"),
+    ("scheduling optimization", "调度优化", "job scheduling", "resource allocation", "排班"),
+    # HCI & UX
+    ("user interface", "ui design", "界面设计", "wireframe", "prototype"),
+    ("user experience", "ux", "用户体验", "usability", "user research"),
+    ("interaction design", "交互设计", "affordance", "feedback", "信息架构"),
+    ("a/b testing ux", "用户测试", "heuristic evaluation", "think aloud", "眼动追踪"),
+    ("accessibility design", "无障碍设计", "wcag", "contrast ratio", "keyboard navigation"),
+    ("design system", "设计系统", "component library", "figma", "sketch", "zeplin"),
+    ("information architecture", "信息架构", "card sorting", "tree testing", "navigation"),
+    # Formal Methods
+    ("formal verification", "形式化验证", "model checking", "theorem proving", "correctness"),
+    ("type theory", "类型理论", "dependent types", "coq", "agda", "isabelle"),
+    ("program logic", "霍尔逻辑", "hoare triple", "precondition", "postcondition"),
+    ("finite state machine", "有限状态机", "fsm", "automata", "regular language"),
+    ("petri net", "petri网", "concurrent model", "token", "transition firing"),
+    ("tla+", "temporal logic", "ltl", "ctl", "model checker", "spin"),
+    # ── Batch 9 end ──────────────────────────────────────────────────────────
+    # ── Batch 10 / 10 : 编译原理 · 并发 · 数据工程 · 跨领域补充 ────────────────
+    # Compiler Theory
+    ("compiler", "编译器", "compilation", "编译", "source code", "object code"),
+    ("lexer", "lexical analysis", "词法分析", "token stream", "scanner"),
+    ("parser", "parsing", "语法分析", "parse tree", "abstract syntax tree", "ast"),
+    ("semantic analysis", "语义分析", "type checking", "symbol table", "scope analysis"),
+    ("code generation", "代码生成", "ir", "intermediate representation", "three-address code"),
+    ("optimization compiler", "编译优化", "dead code elimination", "constant folding", "inlining"),
+    ("llvm", "gcc backend", "clang compiler", "jit compiler", "bytecode"),
+    ("grammar", "文法", "cfg", "context free grammar", "bnf", "ebnf"),
+    ("LL parsing", "LR parsing", "recursive descent", "LL1", "LALR"),
+    ("register allocation", "寄存器分配", "liveness analysis", "coloring", "spilling"),
+    ("linking", "链接", "linker", "static linking", "dynamic linking", "shared library"),
+    # Concurrent & Parallel Programming
+    ("concurrency", "并发", "parallel", "并行", "multithreading concurrent", "多核"),
+    ("race condition concurrent", "data race", "数据竞争", "thread safety", "线程安全"),
+    ("lock free", "无锁", "compare and swap", "cas", "atomic operation", "原子操作"),
+    ("actor model", "actor模型", "message passing", "erlang actor", "akka actor"),
+    ("coroutine", "协程", "greenlet", "fiber", "stackful", "stackless"),
+    ("future promise concurrent", "async concurrent", "执行器", "executor"),
+    ("pipeline concurrent", "producer consumer", "生产者消费者", "bounded buffer"),
+    ("barrier", "barrier synchronization", "gather scatter", "reduction", "并行规约"),
+    ("openmp", "mpi", "cuda", "gpu computing", "并行编程模型"),
+    ("simd", "avx", "vectorization", "向量化", "auto-vectorization"),
+    # Data Engineering
+    ("data pipeline", "数据管道", "etl pipeline", "elt", "data flow", "数据流"),
+    ("data lake", "数据湖", "data lakehouse", "delta lake", "iceberg", "hudi"),
+    ("data catalog", "数据目录", "metadata management", "data lineage", "数据血缘"),
+    ("batch processing", "批处理", "scheduled job", "cron data", "airflow"),
+    ("stream processing data", "流数据", "event time", "watermark", "window"),
+    ("feature engineering", "特征工程", "feature extraction", "feature selection", "特征选择"),
+    ("feature store", "特征仓库", "feast", "tecton", "real-time feature"),
+    ("data quality", "数据质量", "data validation", "great expectations", "dq"),
+    ("schema evolution", "模式演化", "schema registry", "avro", "parquet", "orc"),
+    ("data governance", "数据治理", "master data management", "mdm", "data steward"),
+    ("dbt", "data build tool", "data transformation", "sql transformation", "analytics engineering"),
+    ("mlops", "ml pipeline", "model registry", "model serving", "model monitoring"),
+    ("feature drift", "data drift", "模型漂移", "concept drift", "监控ml"),
+    # Specific Algorithm Topics
+    ("divide conquer", "分治算法", "karatsuba", "fft algorithm", "快速傅里叶"),
+    ("amortized analysis", "摊销分析", "potential method", "aggregate method"),
+    ("np complete", "np hard", "np completeness", "computational complexity", "p vs np"),
+    ("approximation algorithm", "近似算法", "vertex cover", "set cover", "greedy approx"),
+    ("online algorithm", "在线算法", "competitive ratio", "adversarial input"),
+    ("streaming algorithm", "流式算法", "count min sketch", "bloom filter", "频率估计"),
+    ("skip list", "跳表", "probabilistic data structure", "treap", "splay tree"),
+    ("lru cache", "lfu cache", "缓存淘汰", "cache eviction", "clock algorithm"),
+    ("segment tree lazy", "线段树懒惰标记", "range update", "range query", "区间查询"),
+    # Networking Advanced
+    ("tcp congestion", "tcp拥塞控制", "slow start", "cubic bbr", "congestion window"),
+    ("http caching", "cache-control", "etag", "conditional request", "缓存头"),
+    ("cors", "cross origin resource sharing", "preflight", "same-origin policy"),
+    ("oauth2", "openid connect", "oidc", "authorization code flow", "pkce"),
+    ("content negotiation", "内容协商", "accept header", "mime type", "媒体类型"),
+    ("service discovery", "健康检查", "health check", "heartbeat", "readiness probe"),
+    # Cloud Native Patterns
+    ("sidecar pattern", "sidecar", "ambassador pattern", "adapter pattern cloud"),
+    ("saga microservices", "event sourcing microservices", "cqrs microservices"),
+    ("bulkhead", "circuit breaker cloud", "retry policy", "timeout policy", "resilience"),
+    ("blue green", "蓝绿部署", "canary deployment", "feature flag", "功能开关"),
+    ("gitops", "argocd", "flux", "kubernetes gitops", "declarative"),
+    ("service catalog", "api management", "developer portal", "开发者门户"),
+    # Additional Cross-Domain
+    ("open source", "开源", "license", "mit license", "apache license", "gpl"),
+    ("agile methods", "agile", "lean", "extreme programming", "xp", "pair programming"),
+    ("monolith", "monolithic", "单体架构", "modular monolith", "strangler pattern"),
+    ("event loop", "event-driven architecture", "事件循环", "reactive", "rx"),
+    ("proxy pattern", "interceptor pattern", "decorator pattern", "facade", "代理"),
+    ("dependency injection", "依赖注入", "ioc", "inversion of control", "container"),
+    ("caching strategy", "write through", "write back", "缓存策略", "read through"),
+    ("configuration", "配置管理", "environment variable", "config map", "secret"),
+    ("observability telemetry", "otel", "opentelemetry", "span trace", "baggage"),
+    ("time zone", "utc", "timestamp", "unix epoch", "datetime", "时区"),
+    ("encoding", "character encoding", "utf-8", "unicode", "ascii", "base64"),
+    ("internationalization", "i18n", "l10n", "localization", "locale", "国际化"),
+    ("accessibility testing", "automated a11y", "axe", "pa11y", "voice over"),
+    ("low code no code", "低代码", "no-code platform", "citizen developer", "visual builder"),
+    ("api versioning", "api版本管理", "backward compatibility", "deprecation", "breaking change"),
+    ("webhook", "event webhook", "callback url", "http callback", "消息推送"),
+    ("feature toggle", "feature flag", "launchdarkly", "功能开关", "canary feature"),
+    ("scalability", "可扩展性", "vertical scaling", "horizontal scaling", "弹性扩展"),
+    ("reliability", "可靠性", "availability", "fault tolerance", "容错", "resilient"),
+    ("latency optimization", "延迟优化", "throughput optimization", "响应时间", "性能"),
+    ("dark launch", "shadow mode", "shadow traffic", "暗流量", "production testing"),
+    ("graceful degradation", "优雅降级", "fallback", "circuit open", "失败策略"),
+    ("chaos testing", "混沌测试", "fault injection chaos", "kill pod", "network partition"),
+    ("tracing distributed", "分布式追踪", "trace id", "span", "w3c trace context"),
+    ("semantic versioning", "api contract", "contract testing", "pact", "consumer driven"),
+    ("service level", "服务等级", "p99", "p95", "percentile latency", "tail latency"),
+    ("capacity planning", "容量规划", "load forecasting", "scaling plan", "资源规划"),
+    ("dr", "disaster recovery", "灾难恢复", "rpo rto", "backup strategy", "容灾"),
+    ("edge computing", "边缘计算", "fog computing", "cloudlet", "latency edge"),
+    ("immutable infrastructure", "不可变基础设施", "image baking", "golden image"),
+    ("platform engineering", "平台工程", "internal developer platform", "idp", "portal"),
+    ("cost optimization", "云成本优化", "reserved instance", "spot instance", "rightsizing"),
+    # ── Batch 10 end ─────────────────────────────────────────────────────────
+    # ── Batch A / F : 细粒度编程 · 框架 · 工具 ──────────────────────────────
+    # Python ecosystem
+    ("flask", "django", "fastapi python", "web framework python", "wsgi asgi"),
+    ("sqlalchemy", "alembic", "database migration", "orm python", "peewee"),
+    ("celery", "dramatiq", "rq", "task queue python", "background task python"),
+    ("pydantic", "marshmallow", "serialization", "deserialization", "schema validation"),
+    ("poetry", "pipenv", "uv python", "pyproject.toml", "python packaging"),
+    ("typing python", "protocol python", "generic python", "overload", "typevar"),
+    ("contextmanager", "with statement", "context manager", "enter exit", "cleanup"),
+    ("multiprocessing", "concurrent futures", "pool", "subprocess python", "ipc python"),
+    ("logging python", "structlog", "loguru", "log level", "handler formatter"),
+    ("pathlib", "os.path", "file handling python", "read write file", "glob python"),
+    ("dataframe", "pandas series", "groupby", "merge pandas", "pivot table"),
+    ("matplotlib axes", "subplot", "figure", "plot style", "legend title"),
+    ("scikit-learn", "sklearn", "pipeline sklearn", "transformer sklearn", "estimator"),
+    ("pytorch", "torch", "tensor", "autograd", "backward", "optimizer torch"),
+    ("tensorflow", "keras", "tf.function", "eager mode", "graph mode"),
+    ("huggingface", "transformers library", "datasets library", "accelerate", "tokenizers"),
+    ("langchain", "llamaindex", "llm framework", "chain", "agent framework"),
+    # JavaScript ecosystem
+    ("promise chain", "then catch", "async generator", "for await", "promise all"),
+    ("node event emitter", "stream node", "buffer node", "readable writable"),
+    ("express middleware", "router express", "body parser", "cors middleware"),
+    ("nextjs app router", "server component", "client component", "layout next"),
+    ("react state management", "context api", "useReducer", "zustand react"),
+    ("tailwindcss", "utility first css", "postcss", "tw class", "design token"),
+    ("testing library", "cypress", "playwright", "end-to-end js", "headless browser"),
+    ("monorepo", "turborepo", "nx workspace", "lerna", "workspace npm"),
+    ("web worker", "service worker js", "shared worker", "postmessage"),
+    ("webassembly", "wasm", "emscripten", "wasm module", "linear memory"),
+    ("module bundler", "tree shaking", "code splitting", "lazy load", "dynamic import"),
+    ("eslint plugin", "typescript config", "tsconfig", "path alias", "module resolution"),
+    # Go ecosystem
+    ("go context", "context cancelation", "context timeout", "context value"),
+    ("go testing", "go test", "testify", "mock go", "table driven test"),
+    ("go http", "http handler", "serve mux", "middleware go", "http client go"),
+    ("go generics", "type constraint", "comparable", "any go", "union type go"),
+    ("go build", "go vet", "golangci-lint", "staticcheck", "go toolchain"),
+    ("grpc go", "protobuf go", "grpc server", "grpc client", "streaming grpc"),
+    ("go embed", "go generate", "cgo", "go build tag", "cross compile go"),
+    # Rust ecosystem
+    ("serde", "json rust", "toml rust", "serialization rust", "derive macro"),
+    ("actix", "axum", "warp", "rust web framework", "hyper"),
+    ("sqlx", "diesel", "database rust", "async rust db", "query macro"),
+    ("clap", "structopt", "cli rust", "command line parser", "arg parse"),
+    ("rayon", "parallel iterator", "parallel rust", "scoped thread", "join handle"),
+    ("unsafe rust", "raw pointer", "transmute", "ub", "undefined behavior"),
+    ("proc macro", "derive macro", "attribute macro", "function-like macro", "rust macro"),
+    ("wasm rust", "wasm-bindgen", "web-sys", "js-sys", "wasm pack"),
+    # Java / Kotlin ecosystem
+    ("spring bean", "spring ioc", "spring aop", "spring transaction", "dependency injection java"),
+    ("spring security", "jwt spring", "oauth2 spring", "filter chain", "authentication manager"),
+    ("spring data", "spring jpa", "repository pattern", "crud repository", "custom query"),
+    ("reactor", "project reactor", "mono flux", "reactive spring", "webflux"),
+    ("gradle build", "maven lifecycle", "java module", "jar war", "java build tool"),
+    ("kotlin coroutine", "suspend function", "flow kotlin", "channel kotlin", "scope kotlin"),
+    ("android activity", "fragment", "lifecycle android", "viewmodel", "livedata"),
+    ("jetpack compose", "composable", "state compose", "side effect", "recomposition"),
+    # C++ ecosystem
+    ("stl algorithm", "std::sort", "std::find", "std::transform", "range algorithm"),
+    ("smart pointer", "unique_ptr", "shared_ptr", "weak_ptr", "ownership cpp"),
+    ("move semantics", "rvalue reference", "std::move", "perfect forwarding"),
+    ("template metaprogramming", "sfinae", "constexpr", "if constexpr", "concept cpp"),
+    ("boost library", "boost asio", "boost filesystem", "boost spirit"),
+    ("cmake target", "cmake find_package", "cmake install", "modern cmake"),
+    ("multithreading cpp", "std::thread", "std::mutex cpp", "std::condition_variable"),
+    ("memory model cpp", "std::atomic", "memory order", "acquire release", "sequential consistency"),
+    # Database specific
+    ("postgresql feature", "jsonb", "pg array", "listen notify", "pg extension"),
+    ("mysql innodb", "buffer pool", "redo log", "undo log", "mvcc mysql"),
+    ("redis data type", "list redis", "sorted set", "zset", "hash redis", "bitmap"),
+    ("redis cluster", "redis sentinel", "failover", "slot", "gossip protocol redis"),
+    ("mongodb aggregation", "pipeline aggregation", "lookup", "unwind", "project mongo"),
+    ("elasticsearch query", "match phrase", "term query", "bool query", "aggregation es"),
+    ("cassandra wide", "partition key", "clustering key", "compaction", "tombstone"),
+    ("clickhouse", "columnar store", "olap clickhouse", "mergetree", "materialized view ch"),
+    ("time series query", "prometheus query", "promql", "influxql", "flux query"),
+    # System Design Patterns
+    ("caching pattern", "cache aside", "read through cache", "write through cache"),
+    ("database per service", "shared database", "microservices data", "polyglot persistence"),
+    ("strangler fig", "strangler pattern", "legacy migration", "incremental rewrite"),
+    ("anti-corruption layer", "acl", "adapter pattern ddd", "context mapping"),
+    ("outbox pattern", "transactional outbox", "change data capture", "cdc", "debezium"),
+    ("eventual consistency pattern", "sagas", "process manager", "workflow"),
+    ("bulkhead pattern", "thread pool isolation", "circuit open state", "half open"),
+    ("ambassador pattern", "sidecar service", "envoy proxy", "network proxy"),
+    # Monitoring & Observability
+    ("prometheus metric", "counter gauge histogram summary", "label", "cardinality"),
+    ("grafana dashboard", "panel", "datasource", "alert grafana", "variable"),
+    ("alertmanager", "silencing", "routing", "receiver", "inhibition"),
+    ("elk stack", "logstash pipeline", "filebeat", "beats", "index pattern"),
+    ("opentelemetry sdk", "trace exporter", "metric exporter", "context propagation"),
+    ("apm", "application performance monitoring", "new relic", "datadog", "dynatrace"),
+    ("sentry", "error tracking", "breadcrumb", "issue sentry", "sourcemap"),
+    ("uptime monitoring", "synthetic monitoring", "ping", "http check", "blackbox"),
+    # ── Batch A end ──────────────────────────────────────────────────────────
+    # ── Batch B / F : 数学细粒度 · 统计细粒度 · 物理细粒度 ──────────────────
+    # Math — Number Theory detail
+    ("modular exponentiation", "快速幂取模", "discrete logarithm", "elliptic curve math"),
+    ("congruence", "same residue", "modular congruence", "同余", "chinese remainder theorem", "中国剩余定理"),
+    ("continued fraction", "连分数", "diophantine equation", "丢番图方程"),
+    ("prime factorization", "质因数分解", "pollard rho", "miller-rabin", "素性测试"),
+    ("catalan number", "卡特兰数", "bell number", "stirling number", "组合计数"),
+    ("burnside lemma", "polya enumeration", "burnside定理", "置换群计数"),
+    # Math — Discrete / Combinatorics
+    ("graph coloring", "图着色", "chromatic polynomial", "vertex coloring", "edge coloring"),
+    ("latin square", "拉丁方", "sudoku math", "orthogonal arrays"),
+    ("ramsey theory", "ramsey数", "extremal graph theory", "极值图论"),
+    ("probabilistic method", "概率方法", "random graph", "erdos renyi", "threshold"),
+    ("generating function", "生成函数", "ordinary generating function", "ogf", "egf"),
+    ("inclusion exclusion", "容斥原理", "derangement", "错排", "möbius inversion"),
+    # Math — Real Analysis
+    ("real analysis", "实分析", "metric space", "度量空间", "completeness"),
+    ("cauchy sequence", "柯西列", "convergence analysis", "收敛分析", "limit point"),
+    ("compactness", "紧致性", "heine-borel", "bolzano-weierstrass"),
+    ("uniform continuity", "一致连续", "lipschitz condition", "holder continuity"),
+    ("lebesgue measure", "勒贝格测度", "measure theory", "测度论", "sigma algebra"),
+    ("fourier analysis", "调和分析", "fourier coefficient", "parseval", "convolution theorem"),
+    # Math — Complex Analysis
+    ("complex analysis", "复分析", "holomorphic", "analytic function", "解析函数"),
+    ("cauchy integral", "柯西积分定理", "residue theorem", "留数定理", "pole"),
+    ("riemann surface", "黎曼曲面", "conformal mapping", "共形映射", "möbius transform"),
+    ("analytic continuation", "解析延拓", "branch cut", "branch point"),
+    # Math — Abstract Algebra
+    ("group", "群", "subgroup", "cyclic group", "normal subgroup", "quotient group"),
+    ("ring", "环", "ideal", "field", "galois theory", "伽罗瓦理论"),
+    ("homomorphism", "同态", "isomorphism", "同构", "automorphism"),
+    ("vector space algebra", "线性映射", "kernel image", "rank nullity"),
+    # Statistics — Advanced
+    ("bayesian network", "贝叶斯网络", "directed acyclic graph stats", "conditional independence"),
+    ("hidden markov model", "hmm", "隐马尔可夫模型", "viterbi", "forward backward"),
+    ("expectation maximization", "em algorithm", "em算法", "latent variable"),
+    ("variational inference", "变分推断", "elbo", "mean field", "kl minimization"),
+    ("survival analysis", "生存分析", "kaplan-meier", "cox model", "hazard function"),
+    ("time series", "时间序列", "arima", "sarima", "autocorrelation", "stationarity"),
+    ("spatial statistics", "空间统计", "kriging", "variogram", "geostatistics"),
+    ("multilevel model", "mixed effects", "random effects", "hierarchical model", "混合模型"),
+    ("causal inference", "因果推断", "counterfactual", "potential outcome", "average treatment effect"),
+    ("instrumental variable", "工具变量", "two-stage least squares", "2sls", "endogeneity"),
+    # Physics — Thermodynamics detail
+    ("first law thermodynamics", "热力学第一定律", "internal energy", "heat work"),
+    ("second law thermodynamics", "热力学第二定律", "entropy increase", "irreversibility"),
+    ("carnot cycle", "卡诺循环", "efficiency", "热效率", "refrigerator coefficient"),
+    ("phase transition", "相变", "latent heat", "latent heat fusion", "sublimation"),
+    ("equation of state", "状态方程", "ideal gas law", "van der waals", "理想气体"),
+    # Physics — Quantum detail
+    ("wave-particle duality", "波粒二象性", "de broglie", "matter wave", "de broglie wavelength"),
+    ("pauli exclusion", "泡利不相容原理", "fermion", "boson", "spin statistics"),
+    ("quantum harmonic oscillator", "量子谐振子", "ladder operator", "energy level"),
+    ("perturbation theory", "微扰论", "first-order perturbation", "time-dependent"),
+    ("hydrogen atom", "氢原子", "orbital", "quantum number", "radial wave function"),
+    ("quantum field theory", "量子场论", "feynman diagram", "qed", "qcd"),
+    # Physics — Condensed Matter
+    ("condensed matter", "凝聚态物理", "band theory", "energy band", "fermi level"),
+    ("superconductor", "超导", "bcs theory", "cooper pair", "meissner effect"),
+    ("semiconductor physics", "半导体物理", "hole electron", "band gap", "doping physics"),
+    ("magnetism", "磁性", "ferromagnetism", "paramagnetism", "spin wave", "magnon"),
+    ("topological insulator", "拓扑绝缘体", "topological matter", "berry phase"),
+    # Chemistry detail
+    ("reaction mechanism", "反应机理", "nucleophilic substitution", "sn1 sn2", "carbocation"),
+    ("aromatic chemistry", "芳香族", "benzene", "aromaticity", "electrophilic aromatic"),
+    ("stereochemistry", "立体化学", "chirality", "enantiomer", "diastereomer", "r s configuration"),
+    ("polymerization type", "加聚", "缩聚", "chain growth", "step growth"),
+    ("coordination chemistry", "配位化学", "ligand", "complex", "crystal field theory"),
+    ("electrochemistry detail", "electrode", "half cell", "nernst equation", "nerst", "emf"),
+    ("colligative properties", "依数性", "osmotic pressure", "boiling point elevation", "van't hoff"),
+    # Biology detail
+    ("cell division", "细胞分裂", "mitosis", "meiosis", "有丝分裂", "减数分裂"),
+    ("cell signaling", "细胞信号", "receptor", "second messenger", "phosphorylation"),
+    ("transcription", "转录", "translation", "翻译", "mrna", "trna", "ribosome"),
+    ("dna replication", "dna复制", "polymerase", "primer", "okazaki fragment"),
+    ("epigenetics", "表观遗传", "methylation", "histone modification", "chromatin"),
+    ("crispr", "crispr-cas9", "gene editing", "基因编辑", "guide rna"),
+    ("photosynthesis", "光合作用", "chloroplast", "light reaction", "calvin cycle"),
+    ("cellular respiration", "细胞呼吸", "glycolysis", "krebs cycle", "oxidative phosphorylation"),
+    ("neurotransmitter", "递质", "dopamine", "serotonin", "acetylcholine", "synapse"),
+    ("hormone", "激素", "endocrine", "内分泌", "receptor hormone", "feedback loop"),
+    ("immune system", "免疫系统", "innate immunity", "adaptive immunity", "b cell t cell"),
+    ("cancer biology", "cancer cell", "oncogene", "tumor suppressor", "metastasis", "转移"),
+    # ── Batch B end ──────────────────────────────────────────────────────────
+    # ── Batch C / F : 经济金融细粒度 · 法律 · 心理 · 教育 ──────────────────
+    # Economics detail
+    ("marginal analysis", "边际分析", "marginal utility", "marginal cost mc", "diminishing returns"),
+    ("consumer surplus", "消费者剩余", "producer surplus", "生产者剩余", "total surplus"),
+    ("demand curve", "需求曲线", "supply curve", "供给曲线", "shift", "movement"),
+    ("price ceiling", "价格上限", "price floor", "价格下限", "rent control"),
+    ("public choice", "公共选择", "rent seeking", "寻租", "government failure"),
+    ("auctions", "拍卖", "vickrey auction", "sealed bid", "english auction", "dutch auction"),
+    ("mechanism design", "机制设计", "revelation principle", "incentive compatible"),
+    ("econometrics", "计量经济学", "ols", "instrumental variables", "panel data"),
+    ("development economics", "发展经济学", "poverty trap", "poverty reduction", "gdp per capita"),
+    ("behavioral economics", "行为经济学", "nudge", "loss aversion", "prospect theory"),
+    ("environmental economics", "环境经济学", "externality tax", "carbon tax", "pigouvian"),
+    ("health economics", "健康经济学", "cost-effectiveness", "qaly", "insurance market"),
+    # Finance detail
+    ("time value of money", "货币时间价值", "present value", "future value", "discount rate"),
+    ("capital structure", "资本结构", "wacc", "leverage", "debt equity ratio"),
+    ("black-scholes", "black scholes model", "option pricing", "delta gamma vega theta"),
+    ("yield curve", "收益率曲线", "term structure", "duration", "convexity bond"),
+    ("credit default swap", "cds", "credit derivative", "credit risk"),
+    ("var risk", "expected shortfall", "tail risk", "stress testing finance"),
+    ("portfolio optimization", "markowitz", "efficient frontier", "sharpe ratio", "beta alpha"),
+    ("factor model", "fama french", "capm", "multi-factor", "alpha beta finance"),
+    ("behavioral finance", "市场异象", "momentum effect", "value premium", "anomaly"),
+    ("central banking", "monetary transmission", "quantitative easing", "qe", "reserve requirement"),
+    ("exchange rate mechanism", "purchasing power parity", "ppp", "covered interest parity"),
+    ("balance of payments", "国际收支", "current account", "capital account", "reserves"),
+    # Law detail
+    ("contract formation", "合同成立", "offer", "acceptance", "consideration law"),
+    ("breach of contract", "违约", "damages", "specific performance", "rescission"),
+    ("tort law", "侵权法", "negligence", "duty of care", "causation", "damages tort"),
+    ("product liability", "产品责任", "strict liability", "manufacturer liability"),
+    ("employment discrimination", "就业歧视", "title vii", "hostile work environment"),
+    ("data privacy", "数据隐私", "right to erasure", "data subject", "controller processor"),
+    ("antitrust merger", "反垄断并购", "horizontal merger", "vertical merger", "market concentration"),
+    ("securities law", "证券法", "sec", "disclosure requirement", "insider trading"),
+    ("bankruptcy", "破产", "chapter 7 11", "liquidation", "reorganization"),
+    ("property law", "物权法", "easement", "covenant", "land use", "zoning"),
+    ("constitutional law", "宪法", "due process", "equal protection", "fundamental rights"),
+    ("administrative law", "行政法", "regulatory agency", "judicial review", "rulemaking"),
+    # Psychology detail
+    ("psychoanalysis", "精神分析", "freud", "unconscious", "ego superego id"),
+    ("behavioral therapy", "行为疗法", "exposure therapy", "systematic desensitization"),
+    ("cbt therapy", "认知行为疗法", "cognitive restructuring", "dysfunctional thought"),
+    ("attachment theory", "依恋理论", "secure attachment", "avoidant anxious"),
+    ("stress", "压力", "cortisol", "fight or flight", "burnout", "工作倦怠"),
+    ("sleep", "睡眠", "circadian rhythm", "rem sleep", "sleep deprivation", "insomnia"),
+    ("addiction", "成瘾", "substance use disorder", "withdrawal", "tolerance"),
+    ("autism", "自闭症", "asd", "spectrum", "theory of mind", "social cognition"),
+    ("adhd", "注意力缺陷", "executive function", "working memory adhd"),
+    ("positive psychology", "积极心理学", "wellbeing", "resilience", "flourishing"),
+    ("intelligence", "智力", "iq", "general intelligence", "multiple intelligences", "fluid crystallized"),
+    # Education detail
+    ("constructivism", "建构主义", "piaget learning", "vygotsky zpd", "zone of proximal development"),
+    ("problem-based learning", "问题导向学习", "pbl", "inquiry-based", "project-based learning"),
+    ("flipped classroom", "翻转课堂", "pre-class", "in-class activity", "blended learning"),
+    ("gamification", "游戏化", "badge", "leaderboard", "points", "motivation learning"),
+    ("learning analytics", "学习分析", "student data", "engagement", "dropout prediction"),
+    ("adaptive learning", "自适应学习", "personalized learning", "mastery learning"),
+    ("stem education", "stem教育", "science technology engineering math", "steam"),
+    ("teacher training", "教师培训", "professional development", "pedagogy training"),
+    ("special needs", "特殊需求", "individualized education plan", "iep", "accommodation"),
+    # Sociology detail
+    ("social capital", "社会资本", "network ties", "trust", "reciprocity"),
+    ("social movement", "社会运动", "protest", "collective action", "civil society"),
+    ("urbanization", "城市化", "migration", "rural urban", "gentrification"),
+    ("media sociology", "媒体社会学", "framing", "agenda setting", "gatekeeping"),
+    ("consumption", "消费", "consumer culture", "commodity", "materialism"),
+    ("surveillance", "监控", "foucault panopticon", "social control", "privacy sociology"),
+    ("immigration", "移民", "assimilation", "integration", "multicultural"),
+    ("poverty", "贫困", "absolute poverty", "relative poverty", "poverty line"),
+    # Communication & Rhetoric
+    ("communication", "传播", "communication theory", "encoding decoding", "medium message"),
+    ("rhetoric", "修辞", "ethos pathos logos", "persuasion", "argument"),
+    ("journalism", "新闻学", "reporting", "editorial", "news value", "press freedom"),
+    ("public relations", "公关", "pr", "crisis communication", "media relations"),
+    ("advertising", "广告", "brand communication", "creative brief", "copy"),
+    # ── Batch C end ──────────────────────────────────────────────────────────
+    # ── Batch D / F : 农业 · 建筑 · 地理 · 航天 · 能源工程 ─────────────────
+    # Agriculture
+    ("agriculture", "农业", "farming", "cultivation", "crop", "作物"),
+    ("crop science", "作物学", "agronomy", "plant breeding", "seed variety", "育种"),
+    ("soil science", "土壤学", "soil fertility", "humus", "ph soil", "erosion"),
+    ("irrigation", "灌溉", "drip irrigation", "sprinkler", "water use efficiency"),
+    ("fertilizer", "肥料", "nitrogen fertilizer", "phosphorus", "potassium", "npk"),
+    ("pesticide", "农药", "herbicide", "insecticide", "fungicide", "integrated pest management"),
+    ("organic farming", "有机农业", "compost", "biofertilizer", "no tillage"),
+    ("precision agriculture", "精准农业", "gps farming", "drone agriculture", "remote sensing agri"),
+    ("livestock", "牲畜", "animal husbandry", "poultry", "dairy", "animal nutrition"),
+    ("aquaculture", "水产养殖", "fish farming", "shrimp farming", "hatchery"),
+    ("forestry", "林业", "timber", "reforestation forestry", "agroforestry"),
+    ("food science", "食品科学", "food safety", "haccp", "food processing", "preservation"),
+    ("food nutrition", "食品营养", "macronutrient", "micronutrient", "calorie", "diet"),
+    ("agricultural economics", "农业经济", "farm income", "subsidy", "food price"),
+    ("greenhouse", "温室", "controlled environment", "hydroponics", "vertical farming"),
+    # Civil Engineering & Architecture
+    ("civil engineering", "土木工程", "structural engineering", "建筑结构", "load bearing"),
+    ("architecture", "建筑学", "architectural design", "建筑设计", "plan elevation section"),
+    ("building structure", "建筑结构", "beam column slab", "梁柱板", "foundation"),
+    ("concrete", "混凝土", "reinforced concrete", "钢筋混凝土", "compressive strength"),
+    ("steel structure", "钢结构", "i-beam", "weld", "connection", "bolted"),
+    ("earthquake engineering", "抗震工程", "seismic design", "base isolation", "damper"),
+    ("bridge engineering", "桥梁工程", "suspension bridge", "cable-stayed", "truss bridge"),
+    ("tunnel", "隧道", "underground construction", "tbm", "shield tunneling"),
+    ("hydraulic engineering", "水利工程", "dam", "大坝", "reservoir", "flood control"),
+    ("road engineering", "道路工程", "pavement", "asphalt", "traffic design"),
+    ("geotechnical", "岩土工程", "soil mechanics", "foundation engineering", "slope stability"),
+    ("urban planning", "城市规划", "land use", "zoning plan", "master plan"),
+    ("transportation planning", "交通规划", "transit", "mobility", "traffic model"),
+    ("building information modeling", "bim", "revit", "mep", "clash detection"),
+    ("hvac", "暖通空调", "heating ventilation cooling", "chiller", "ahu"),
+    # Geography & Earth Science
+    ("geography", "地理", "physical geography", "human geography", "cartography"),
+    ("gis", "geographic information system", "地理信息系统", "spatial analysis", "arcgis"),
+    ("remote sensing", "遥感", "satellite image", "raster vector", "ndvi"),
+    ("geology", "地质学", "rock cycle", "plate tectonics", "earthquake seismology"),
+    ("plate tectonics", "板块构造", "subduction", "continental drift", "pangea"),
+    ("geomorphology", "地貌学", "erosion landform", "river delta", "glacier"),
+    ("hydrology", "水文学", "watershed", "runoff", "groundwater", "aquifer"),
+    ("oceanography", "海洋学", "ocean current", "salinity", "sea level", "tidal"),
+    ("meteorology", "气象学", "weather", "forecast", "precipitation", "cyclone"),
+    ("climatology", "气候学", "climate zone", "monsoon", "el nino", "drought"),
+    ("natural disaster", "自然灾害", "flood", "earthquake disaster", "volcanic", "landslide"),
+    # Space & Aerospace
+    ("aerospace", "航空航天", "spacecraft", "satellite", "orbit", "rocket"),
+    ("orbital mechanics", "轨道力学", "kepler", "elliptical orbit", "periapsis", "apoapsis"),
+    ("rocket propulsion", "火箭推进", "thrust", "specific impulse", "isp", "nozzle"),
+    ("satellite communication", "卫星通信", "geostationary", "leo", "ground station"),
+    ("space exploration", "太空探索", "mars mission", "moon landing", "space station"),
+    ("gnss", "gps", "glonass", "galileo", "beidou", "positioning system"),
+    ("re-entry", "大气再入", "heat shield", "ablative material", "ballistic reentry"),
+    ("space telescope", "太空望远镜", "hubble", "james webb", "exoplanet detection"),
+    # Energy Engineering
+    ("power system", "电力系统", "generation transmission distribution", "grid"),
+    ("photovoltaic", "光伏", "solar panel", "pv cell", "efficiency solar"),
+    ("wind turbine", "风机", "rotor", "blade", "wind speed", "capacity factor"),
+    ("battery", "电池", "lithium ion", "bms", "state of charge", "energy density"),
+    ("energy storage", "储能", "pumped hydro", "flywheel", "grid storage"),
+    ("power electronics", "电力电子器件", "igbt", "converter topology", "pwm control"),
+    ("smart grid", "智能电网", "demand response", "ami", "meter data"),
+    ("nuclear reactor", "核反应堆", "coolant", "moderator", "control rod", "fuel rod"),
+    ("hydrogen energy", "氢能", "electrolysis", "fuel cell", "green hydrogen"),
+    ("carbon capture", "碳捕集", "ccs", "direct air capture", "sequestration"),
+    # Environmental Engineering
+    ("wastewater treatment", "污水处理", "activated sludge", "biofilm", "effluent"),
+    ("drinking water", "饮用水", "purification", "chlorination", "reverse osmosis"),
+    ("air quality", "空气质量", "particulate matter", "nox sox", "aqi"),
+    ("solid waste", "固体废物", "landfill", "incineration", "recycling process"),
+    ("environmental impact assessment", "环境影响评价", "eia", "mitigation measures"),
+    ("remediation", "修复", "soil remediation", "groundwater remediation", "bioremediation"),
+    # Medical Engineering & Biotechnology
+    ("medical device", "医疗器械", "fda approval", "ce marking", "510k"),
+    ("biomedical engineering", "生物医学工程", "implant", "prosthetics", "biomechanics"),
+    ("drug delivery", "药物递送", "nanoparticle drug", "liposome", "controlled release"),
+    ("diagnostic imaging", "诊断成像", "mri machine", "ct scanner", "ultrasound machine"),
+    ("tissue engineering", "组织工程", "scaffold", "cell culture", "bioreactor"),
+    ("synthetic biology", "合成生物学", "genetic circuit", "chassis organism", "standardized parts"),
+    ("bioinformatics tools", "生物信息学工具", "blast sequence", "clustal", "phylogenetic tree"),
+    ("clinical informatics", "临床信息学", "hl7", "fhir", "clinical decision support"),
+    # ── Batch D end ──────────────────────────────────────────────────────────
+    # ── Batch E / F : 文学 · 历史 · 哲学细粒度 · 语言 · 文化 ─────────────────
+    # Literature
+    ("novel", "小说", "narrative", "plot", "protagonist", "antagonist", "character"),
+    ("poetry", "诗歌", "verse", "stanza", "rhyme", "meter", "imagery"),
+    ("drama", "戏剧", "tragedy", "comedy", "play", "act scene", "dialogue literature"),
+    ("literary theory", "文学理论", "structuralism", "poststructuralism", "deconstruction"),
+    ("modernism", "现代主义", "stream of consciousness", "fragmentation", "avant garde"),
+    ("postmodernism", "后现代主义", "metafiction", "intertextuality", "irony postmodern"),
+    ("realism literature", "现实主义", "naturalism literature", "romanticism", "classicism"),
+    ("genre", "文学体裁", "science fiction", "fantasy", "mystery", "biography"),
+    ("author style", "作者风格", "narrative voice", "point of view", "first person third person"),
+    ("translation literature", "文学翻译", "equivalence", "domestication foreignization", "译者"),
+    ("classical literature", "古典文学", "epic", "odyssey", "iliad", "mythology"),
+    ("chinese literature", "中国文学", "tang poetry", "唐诗", "宋词", "古文"),
+    ("world literature", "世界文学", "comparative literature", "universal themes", "canon"),
+    # History detail
+    ("ancient civilization", "古代文明", "mesopotamia civilization", "nile civilization", "indus"),
+    ("classical antiquity", "古典时代", "ancient greece", "ancient rome", "hellenism"),
+    ("medieval history", "中世纪", "feudalism", "crusades", "plague", "renaissance"),
+    ("early modern history", "早期现代史", "reformation", "scientific revolution", "exploration"),
+    ("industrial revolution", "工业革命", "steam engine", "factory system", "urbanization history"),
+    ("imperialism history", "帝国主义", "colonialism history", "scramble for africa", "british empire"),
+    ("world war one", "一战", "trench warfare", "treaty versailles", "western front"),
+    ("world war two", "二战", "holocaust", "d-day", "atomic bomb", "pacific theater"),
+    ("cold war history", "冷战历史", "iron curtain", "nuclear arms race", "cuban missile"),
+    ("decolonization history", "去殖民化", "independence movements", "partition india"),
+    ("chinese history", "中国历史", "dynasties", "qin han tang song", "modern china"),
+    ("history of science", "科学史", "copernicus", "newton history", "darwin", "scientific method"),
+    ("history of technology", "技术史", "invention", "innovation history", "telegraph telephone"),
+    ("oral history", "口述历史", "primary source", "secondary source", "archival research"),
+    # Philosophy detail
+    ("socrates", "plato", "aristotle", "古希腊哲学", "virtue ethics", "forms"),
+    ("kantian ethics", "kant", "categorical imperative", "deontology", "duty ethics"),
+    ("utilitarianism", "功利主义", "bentham mill", "greatest happiness", "utility ethics"),
+    ("social contract", "社会契约", "hobbes locke rousseau", "natural rights"),
+    ("marxism", "马克思主义", "historical materialism", "class struggle", "capitalism critique"),
+    ("phenomenology", "现象学", "husserl", "heidegger", "being and time", "dasein"),
+    ("analytic philosophy", "分析哲学", "logical positivism", "language games", "wittgenstein"),
+    ("continental philosophy", "大陆哲学", "critical theory", "frankfurt school", "habermas"),
+    ("philosophy of science", "科学哲学", "falsifiability", "popper", "paradigm", "kuhn"),
+    ("ethics of ai", "ai伦理", "algorithmic fairness", "bias ai", "responsible ai"),
+    ("philosophy of language", "语言哲学", "meaning use", "reference theory", "speech acts"),
+    # Linguistics detail
+    ("generative grammar", "生成语法", "chomsky", "universal grammar", "transformational"),
+    ("construction grammar", "构式语法", "cognitive linguistics", "frame semantics"),
+    ("discourse analysis", "话语分析", "coherence cohesion", "speech act theory"),
+    ("language acquisition", "语言习得", "critical period", "input hypothesis", "monitor model"),
+    ("sociolinguistic variable", "语言变体", "dialect continuum", "creole", "pidgin"),
+    ("lexicology", "词汇学", "lexeme", "polysemy", "synonymy", "antonymy", "semantic field"),
+    ("translation studies", "翻译研究", "equivalence translation", "nida", "domestication"),
+    ("applied linguistics", "应用语言学", "language teaching", "esl", "elt", "tefl"),
+    # Cultural Studies
+    ("cultural studies", "文化研究", "ideology", "hegemony", "cultural production"),
+    ("popular culture", "大众文化", "media culture", "fandom", "subculture"),
+    ("digital culture", "数字文化", "online community", "meme", "viral content"),
+    ("postcolonial studies", "后殖民研究", "othering", "hybridity", "subaltern"),
+    ("gender studies", "性别研究", "queer theory", "performativity", "intersectionality"),
+    ("memory studies", "记忆研究", "collective memory", "commemoration", "heritage"),
+    ("food culture", "饮食文化", "cuisine", "gastronomy", "food identity"),
+    ("fashion", "时尚", "clothing culture", "style", "fashion industry"),
+    ("religion comparative", "比较宗教", "christianity", "islam", "hinduism", "buddhism"),
+    ("mythology", "神话", "myth", "folklore", "legend", "oral tradition"),
+    # Language specific groups
+    ("chinese mandarin", "普通话", "standard chinese", "pinyin", "tones", "characters"),
+    ("cantonese", "粤语", "yue", "hongkong dialect", "tonal language"),
+    ("english language", "英语", "grammar english", "syntax english", "vocabulary"),
+    ("spanish language", "西班牙语", "romanic", "latin america spanish", "grammar spanish"),
+    ("french language", "法语", "francophone", "french grammar", "accent"),
+    ("german language", "德语", "german grammar", "declension", "compound words"),
+    ("japanese language", "日语", "hiragana katakana kanji", "jlpt", "japanese grammar"),
+    ("korean language", "韩语", "hangul", "honorifics", "agglutinative"),
+    ("arabic language", "阿拉伯语", "semitic", "right to left", "classical arabic"),
+    ("russian language", "俄语", "slavic", "cyrillic", "cases russian", "aspect"),
+    # ── Batch E end ──────────────────────────────────────────────────────────
+    # ── Batch F / F : 跨领域补全 · 技术细粒度 · 社会热点 ────────────────────
+    # More CS / Software topics
+    ("api design", "api设计", "idempotent api", "restful constraints", "hateoas"),
+    ("schema design", "模式设计", "normalization vs denormalization", "entity relationship"),
+    ("concurrency model", "并发模型", "actor model programming", "csp model", "communicating processes"),
+    ("lazy evaluation", "惰性求值", "strict evaluation", "thunk", "call by need"),
+    ("pure function", "纯函数", "side effect", "referential transparency", "immutability"),
+    ("monadic", "monad pattern", "maybe monad", "either monad", "io monad", "haskell monad"),
+    ("continuation", "continuation passing", "cps", "trampolining", "tail call optimization"),
+    ("memoize", "记忆化", "dynamic programming top down", "overlapping subproblems"),
+    ("garbage collector detail", "generational gc", "young generation", "old generation", "gc pause"),
+    ("jit compilation", "即时编译", "tiered compilation", "inline cache", "deoptimization"),
+    ("profiler", "性能剖析", "sampling profiler", "instrumentation profiler", "hotspot"),
+    ("dependency graph", "依赖图", "build graph", "task dependency", "topological build"),
+    ("plugin system", "插件系统", "extension point", "dynamic loading", "hook system"),
+    ("event bus", "事件总线", "pub-sub pattern", "mediator pattern", "observer event"),
+    ("dsl", "domain specific language", "领域特定语言", "internal dsl", "external dsl"),
+    ("code generation tool", "代码生成", "template engine", "scaffold", "boilerplate"),
+    # ML Systems & Infra
+    ("model serving", "模型服务", "inference server", "triton inference", "torchserve"),
+    ("feature pipeline", "特征流水线", "online feature", "offline feature", "feature consistency"),
+    ("experiment tracking", "实验追踪", "mlflow", "wandb", "weights and biases"),
+    ("model versioning", "模型版本", "dvc", "model registry", "artifact store"),
+    ("data versioning", "数据版本", "dvc data", "dataset versioning", "lineage"),
+    ("hyperparameter tuning", "超参数调优", "optuna", "ray tune", "bayesian optimization hp"),
+    ("distributed training", "分布式训练", "ddp", "fsdp", "horovod", "model sharding"),
+    ("gradient checkpointing", "梯度检查点", "memory efficient training", "activation recompute"),
+    ("speculative decoding", "投机解码", "draft model", "verification", "token generation speed"),
+    ("kv cache", "kv缓存", "attention cache", "prefix caching", "paged attention"),
+    ("rope", "rotary position embedding", "旋转位置编码", "alibi position", "yarn"),
+    ("mixture of experts", "moe", "sparse moe", "expert routing", "top-k routing"),
+    ("retrieval models", "检索模型", "bi-encoder", "cross-encoder", "dense passage retrieval", "dpr"),
+    ("sentence bert", "sbert", "mpnet", "simcse", "contrastive sentence", "pair sentence"),
+    # More Algorithms
+    ("a* search", "a*搜索", "f g h score", "open closed list", "admissible heuristic"),
+    ("beam search", "束搜索", "greedy decoding", "width beam", "best first"),
+    ("monte carlo tree search", "mcts", "蒙特卡罗树搜索", "uct", "playout"),
+    ("simulated annealing detail", "退火温度", "cooling schedule", "neighbor solution"),
+    ("ant colony", "蚁群算法", "pheromone", "aco", "stigmergy"),
+    ("differential evolution", "差分进化", "crossover de", "mutation de", "population"),
+    ("neuroevolution", "神经进化", "neat", "hyperparameter evolution", "neural architecture search"),
+    ("branch and bound detail", "分支定界法", "lower bound", "upper bound", "pruning bnb"),
+    ("flow network", "流网络", "max flow min cut", "ford fulkerson", "augmenting path"),
+    ("matching algorithm", "匹配算法", "bipartite matching", "hungarian algorithm", "stable matching"),
+    ("constraint propagation", "约束传播", "arc consistency ac3", "backjumping"),
+    # More Networking
+    ("nat traversal", "nat穿透", "hole punching", "stun turn", "ice protocol"),
+    ("http proxy", "正向代理", "squid", "transparent proxy", "cache proxy"),
+    ("traffic shaping", "流量整形", "qos", "priority queue network", "bandwidth management"),
+    ("anycast", "任播", "multicast", "unicast", "broadcast", "routing mode"),
+    ("bgp routing", "bgp协议", "as", "autonomous system", "path attributes", "prefix"),
+    ("mpls", "label switching", "virtual circuit", "te tunnel"),
+    ("sd-wan", "software defined wan", "overlay network", "underlay", "virtual link"),
+    ("5g", "5g network", "nr", "ran", "core network 5g", "network slicing"),
+    ("wifi 6", "802.11ax", "ofdma wifi", "mu-mimo", "wifi 6e"),
+    # More Databases
+    ("acid detail", "atomicity consistency isolation durability", "transaction property"),
+    ("mvcc", "multiversion concurrency control", "多版本并发控制", "snapshot isolation"),
+    ("two-phase locking", "两阶段锁定", "2pl", "strict 2pl", "optimistic locking"),
+    ("replication lag", "复制延迟", "replica lag", "read from replica", "consistency lag"),
+    ("write ahead log", "wal", "预写日志", "log-structured", "redo undo log"),
+    ("consistent hashing", "一致性哈希", "virtual node", "hash ring", "rendezvous hashing"),
+    ("database connection", "数据库连接", "connection lifetime", "pool size", "idle timeout"),
+    ("query cache", "查询缓存", "plan cache", "parameter sniffing", "cached plan"),
+    ("index design", "索引设计", "covering index", "index selectivity", "cardinality"),
+    # More Cloud
+    ("cloud cost", "云成本", "reserved instance", "savings plan", "spot capacity"),
+    ("multi-cloud", "多云", "hybrid cloud", "混合云", "cloud portability"),
+    ("cloud security", "云安全", "shared responsibility", "iam cloud", "zero trust"),
+    ("cloud native app", "云原生应用", "twelve-factor app", "stateless service", "health check cloud"),
+    ("function compute", "函数计算", "cold start", "warm start", "lambda runtime"),
+    ("container registry", "容器仓库", "docker hub", "ecr", "gcr", "image pull"),
+    ("service account", "服务账号", "workload identity", "iam role", "least privilege"),
+    ("object storage policy", "桶策略", "presigned url", "lifecycle policy", "versioning s3"),
+    # More Security
+    ("zero trust security", "零信任", "never trust always verify", "microsegmentation"),
+    ("supply chain security", "供应链安全", "sbom", "dependency vulnerability", "sca"),
+    ("identity federation", "身份联合", "sso", "saml", "idp", "sp"),
+    ("secrets management", "密钥管理", "vault", "hsm", "rotation", "key ceremony"),
+    ("log analysis security", "安全日志分析", "siem", "splunk", "security event"),
+    ("red team", "红队", "blue team", "purple team", "adversarial simulation"),
+    ("vulnerability management", "漏洞管理", "cvss score", "patch management", "remediation"),
+    # Medicine extra
+    ("pharmacokinetics", "药代动力学", "absorption distribution metabolism excretion", "adme"),
+    ("clinical pharmacology", "临床药理学", "drug interaction", "adverse effect", "therapeutic window"),
+    ("pain management", "疼痛管理", "analgesic", "opioid", "nonsteroidal anti-inflammatory"),
+    ("palliative care", "姑息治疗", "hospice", "end of life", "comfort care"),
+    ("genomic medicine", "基因组医学", "precision medicine", "pharmacogenomics", "targeted therapy"),
+    ("rehabilitation", "康复", "physical therapy", "occupational therapy", "motor recovery"),
+    ("preventive medicine", "预防医学", "screening", "risk factor", "primary prevention"),
+    ("epidemiological study", "流行病学研究", "cohort study", "case control", "cross-sectional"),
+    # Economics extra
+    ("cost benefit analysis", "成本效益分析", "social welfare", "pareto optimality"),
+    ("inequality metrics", "不平等指标", "gini coefficient", "lorenz curve", "wealth distribution"),
+    ("innovation economics", "创新经济学", "r&d", "technology transfer", "knowledge spillover"),
+    ("platform economics", "平台经济学", "two-sided market", "network effect", "winner takes all"),
+    ("gig economy", "零工经济", "platform labor", "freelance", "sharing economy"),
+    ("economic forecasting", "经济预测", "leading indicator", "coincident indicator", "lagging"),
+    # Human-Computer Interaction extra
+    ("cognitive load", "认知负荷", "mental model", "affordance hci", "signifier"),
+    ("ux research methods", "ux研究方法", "interview", "survey research", "diary study"),
+    ("usability heuristic", "可用性启发式", "nielsen heuristics", "error prevention", "feedback hci"),
+    ("eye tracking", "眼动追踪", "heatmap ux", "gaze fixation", "saccade"),
+    ("voice ui", "语音界面", "voice user interface", "vui", "conversational ui"),
+    ("gesture interaction", "手势交互", "touch gesture", "pinch zoom", "multitouch"),
+    ("vr interface", "虚拟现实界面", "ar interface", "spatial ui", "3d ui design"),
+    # More Cross-Domain
+    ("quantum computing", "量子计算", "qubit", "quantum gate", "superposition computing"),
+    ("quantum algorithm", "量子算法", "shor's algorithm", "grover's search", "quantum speedup"),
+    ("neuromorphic computing", "类脑计算", "spiking neural network", "intel loihi"),
+    ("edge ai", "边缘ai", "tinyml", "on-device inference", "model pruning edge"),
+    ("autonomous vehicle", "自动驾驶", "lidar av", "perception", "planning control"),
+    ("digital twin", "数字孪生", "simulation model", "real-time sync", "virtual replica"),
+    ("augmented reality", "增强现实", "ar markers", "spatial anchors", "hololens"),
+    ("metaverse", "元宇宙", "virtual world", "avatar", "digital economy"),
+    ("fintech", "金融科技", "payment", "neobank", "lending platform", "robo-advisor"),
+    ("healthtech", "医疗科技", "digital health", "wearable health", "remote monitoring"),
+    ("edtech", "教育科技", "learning platform", "adaptive edtech", "quiz engine"),
+    ("legaltech", "法律科技", "contract analysis", "e-discovery", "legal nlp"),
+    ("insurtech", "保险科技", "telematics", "usage-based insurance", "underwriting ai"),
+    ("proptech", "房地产科技", "property data", "virtual tour", "iBuyer"),
+    ("climate tech", "气候技术", "carbon accounting", "green software", "emissions tracking"),
+    # Soft skills & interdisciplinary
+    ("critical thinking", "批判性思维", "reasoning", "argument analysis", "evidence evaluation"),
+    ("systems thinking", "系统思维", "feedback loop", "leverage point", "emergence"),
+    ("design thinking", "设计思维", "empathy map", "ideation", "prototype design"),
+    ("scientific method", "科学方法", "observation hypothesis experiment", "peer review method"),
+    ("data literacy", "数据素养", "data interpretation", "graph reading", "statistical literacy"),
+    ("interdisciplinary", "跨学科", "convergence", "cross-disciplinary", "transdisciplinary"),
+    ("open science", "开放科学", "reproducibility", "open data", "open access"),
+    ("ethics interdisciplinary", "跨领域伦理", "research ethics", "dual use", "technology ethics"),
+    # ── Batch F end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 额外扩充 ══════════════════════════════════════════
+    # ── Batch G : 理学 — 数学各分支细粒度 ─────────────────────────────────────
+    # Topology
+    ("topology", "拓扑学", "topological space", "open set closed set", "neighborhood"),
+    ("homeomorphism", "同胚", "continuous map topology", "homeomorphic spaces"),
+    ("fundamental group", "基本群", "homotopy", "同伦", "path connected"),
+    ("manifold", "流形", "smooth manifold", "riemannian manifold", "differential geometry"),
+    ("fiber bundle", "纤维丛", "principal bundle", "tangent bundle", "section"),
+    ("algebraic topology", "代数拓扑", "homology", "cohomology", "euler characteristic"),
+    ("compactification", "紧化", "one-point compactification", "stone-cech"),
+    # Differential Geometry
+    ("differential geometry", "微分几何", "curvature", "曲率", "geodesic", "测地线"),
+    ("riemannian metric", "黎曼度量", "gaussian curvature", "高斯曲率", "sectional curvature"),
+    ("covariant derivative", "协变导数", "connection", "联络", "christoffel symbol"),
+    ("lie group", "李群", "lie algebra", "李代数", "exponential map lie"),
+    ("symplectic geometry", "辛几何", "symplectic manifold", "hamiltonian mechanics"),
+    # Number Theory Advanced
+    ("algebraic number theory", "代数数论", "number field", "algebraic integer", "ring of integers"),
+    ("analytic number theory", "解析数论", "riemann zeta", "riemann hypothesis", "prime distribution"),
+    ("l-function", "l函数", "dirichlet series", "automorphic form", "functional equation"),
+    ("elliptic curve", "椭圆曲线", "j-invariant", "weierstrass form", "rational point"),
+    ("p-adic numbers", "p进数", "p-adic analysis", "valuation", "ultrametric"),
+    ("class field theory", "类域论", "galois extension", "abelian extension"),
+    # Mathematical Logic
+    ("propositional logic", "命题逻辑", "truth value", "conjunction disjunction", "implication"),
+    ("predicate logic", "谓词逻辑", "first-order logic", "quantifier logic", "formula"),
+    ("model theory", "模型论", "structure", "interpretation", "satisfaction"),
+    ("proof theory", "证明论", "formal proof", "natural deduction", "sequent calculus"),
+    ("set theory", "集合论", "zfc", "axiom of choice", "cardinal ordinal", "well-order"),
+    ("computability", "可计算性", "turing machine", "halting problem", "recursive function"),
+    ("lambda calculus", "lambda演算", "church numeral", "beta reduction", "combinators"),
+    # Physics — Statistical Mechanics
+    ("statistical mechanics", "统计力学", "partition function", "配分函数", "ensemble"),
+    ("canonical ensemble", "正则系综", "microcanonical", "grand canonical", "boltzmann factor"),
+    ("phase space", "相空间", "liouville theorem", "ergodic hypothesis", "entropy statistical"),
+    ("ising model", "伊辛模型", "spin system", "mean field theory", "critical phenomena"),
+    ("monte carlo physics", "统计物理蒙特卡罗", "metropolis algorithm", "importance sampling"),
+    ("non-equilibrium", "非平衡态", "transport equation", "drift diffusion", "master equation"),
+    # Physics — Optics detail
+    ("geometric optics", "几何光学", "snell's law", "total internal reflection", "lens equation"),
+    ("wave optics", "波动光学", "interference fringe", "young double slit", "diffraction pattern"),
+    ("fourier optics", "傅里叶光学", "spatial frequency", "optical transfer function", "psf"),
+    ("nonlinear optics", "非线性光学", "second harmonic", "kerr effect", "optical bistability"),
+    ("fiber optics", "光纤", "single mode multi mode", "numerical aperture", "dispersion"),
+    ("spectroscopy detail", "光谱学详细", "emission absorption spectrum", "line width", "doppler"),
+    # Physics — Plasma
+    ("plasma physics", "等离子体物理", "ionized gas", "debye length", "plasma frequency"),
+    ("magnetohydrodynamics", "磁流体力学", "mhd", "alfven wave", "magnetic confinement"),
+    ("tokamak", "托卡马克", "fusion plasma", "confinement time", "q factor fusion"),
+    # Chemistry — Organic detail
+    ("aldehyde ketone", "醛酮", "carbonyl", "nucleophilic addition", "keto-enol"),
+    ("carboxylic acid", "羧酸", "ester", "酯", "amide", "酰胺", "acyl group"),
+    ("alcohol ether", "醇醚", "hydroxyl group", "ether synthesis", "williamson"),
+    ("amine", "胺", "nitrogen compound", "basicity amine", "amino group"),
+    ("halogen compound", "卤化物", "alkyl halide", "elimination substitution", "grignard"),
+    ("pericyclic reaction", "周环反应", "diels-alder", "electrocyclic", "sigmatropic"),
+    ("organometallic", "有机金属", "palladium catalysis", "cross coupling", "suzuki"),
+    ("protecting group", "保护基", "boc", "silyl ether", "pmb"),
+    ("natural product synthesis", "天然产物合成", "total synthesis", "retrosynthesis"),
+    ("enzyme catalysis", "酶催化", "michaelis-menten", "active site", "allosteric"),
+    # Chemistry — Physical detail
+    ("collision theory", "碰撞理论", "activated complex", "activation energy", "arrhenius"),
+    ("transition state theory", "过渡态理论", "eyring equation", "potential energy surface"),
+    ("chemical kinetics", "化学动力学", "rate constant", "rate law", "reaction order"),
+    ("molecular orbital", "分子轨道", "bonding antibonding", "homo lumo", "huckel"),
+    ("symmetry chemistry", "分子对称性", "point group", "character table", "infrared active"),
+    # Biology — Genetics detail
+    ("mendelian genetics", "孟德尔遗传", "dominant recessive", "segregation", "independent assortment"),
+    ("linkage mapping", "基因连锁", "recombination frequency", "genetic map", "lod score"),
+    ("quantitative genetics", "数量遗传学", "heritability", "polygenic trait", "qtl"),
+    ("population genetics", "群体遗传学", "hardy-weinberg", "genetic drift", "selection pressure"),
+    ("molecular genetics", "分子遗传学", "promoter enhancer", "transcription factor", "gene regulation"),
+    ("chromosome", "染色体", "karyotype", "ploidy", "aneuploidy", "chromosome aberration"),
+    ("mutation type", "突变类型", "point mutation", "frameshift", "missense nonsense"),
+    # Biology — Microbiology detail
+    ("bacteria structure", "细菌结构", "cell wall peptidoglycan", "gram positive negative"),
+    ("bacteriophage", "噬菌体", "phage lambda", "lytic lysogenic cycle", "transduction"),
+    ("antibiotic resistance", "抗生素耐药", "horizontal gene transfer", "resistance gene", "plasmid"),
+    ("biofilm bacteria", "生物膜", "quorum sensing", "matrix biofilm", "virulence"),
+    ("virus structure", "病毒结构", "capsid", "envelope", "genome rna dna virus"),
+    ("virus replication", "病毒复制", "attachment entry", "integration", "budding"),
+    ("prion", "朊病毒", "misfolded protein", "creutzfeldt-jakob", "mad cow"),
+    # ── Batch G end ──────────────────────────────────────────────────────────
+    # ── Batch H : 工学细粒度 ─────────────────────────────────────────────────
+    # Electrical Engineering
+    ("electrical engineering", "电气工程", "power system", "circuit theory", "电路"),
+    ("ac circuit", "交流电路", "phasor", "impedance", "reactive power", "功率因数"),
+    ("three-phase power", "三相电", "delta wye", "line voltage", "phase voltage"),
+    ("transformer", "变压器", "turns ratio", "efficiency transformer", "leakage inductance"),
+    ("motor", "电机", "induction motor", "synchronous motor", "torque speed", "转矩"),
+    ("generator", "发电机", "excitation", "rotor stator", "armature winding"),
+    ("control theory", "控制理论", "pid control", "feedback control", "stability"),
+    ("bode plot", "波特图", "frequency response", "gain margin phase margin"),
+    ("laplace control", "拉普拉斯控制", "transfer function", "pole zero", "nyquist"),
+    ("state space", "状态空间", "controllability", "observability", "state feedback"),
+    ("digital control", "数字控制", "z-transform control", "discrete pid", "sampling control"),
+    ("power electronics topology", "逆变器拓扑", "buck boost", "full bridge", "half bridge"),
+    # Chemical Engineering
+    ("chemical engineering", "化学工程", "process engineering", "unit operation", "单元操作"),
+    ("mass transfer", "传质", "distillation", "蒸馏", "absorption column", "extraction"),
+    ("heat exchanger", "换热器", "shell tube", "plate exchanger", "lmtd"),
+    ("reactor design", "反应器设计", "cstr", "pfr", "batch reactor", "residence time"),
+    ("fluid flow engineering", "流体工程", "pipe flow", "bernoulli engineering", "head loss"),
+    ("mass balance", "质量衡算", "energy balance", "atom balance", "degree of freedom"),
+    ("separation process", "分离过程", "flash drum", "column tray", "packing"),
+    ("process simulation", "过程模拟", "aspen", "hysys", "process flowsheet"),
+    ("process safety", "过程安全", "hazop", "fault tree", "layer of protection"),
+    ("catalytic process", "催化过程", "heterogeneous catalysis", "residence time distribution"),
+    ("polymer processing", "聚合物加工", "extrusion", "injection molding", "blow molding"),
+    # Materials — Advanced
+    ("composite manufacturing", "复合材料制造", "layup", "autoclave", "resin transfer"),
+    ("thin film", "薄膜", "cvd", "pvd", "sputtering", "ald atomic layer deposition"),
+    ("surface treatment", "表面处理", "coating", "anodizing", "plating", "passivation"),
+    ("failure analysis", "失效分析", "fractography", "sem analysis", "edx"),
+    ("tribology", "摩擦学", "friction", "wear", "lubrication", "contact mechanics"),
+    ("nondestructive testing", "无损检测", "ndt", "ultrasonic testing", "radiography"),
+    ("hardness", "硬度", "vickers", "brinell", "rockwell", "mohs scale"),
+    ("thermal analysis", "热分析", "dsc", "tga", "differential scanning calorimetry"),
+    # Computer Hardware
+    ("cpu design", "cpu设计", "pipeline cpu", "superscalar", "out-of-order execution"),
+    ("cache hierarchy", "缓存层次", "l1 l2 l3 cache", "cache line", "cache miss"),
+    ("branch predictor", "分支预测器", "btb", "tournament predictor", "gshare"),
+    ("memory bus", "内存总线", "ddr4 ddr5", "memory bandwidth", "latency dram"),
+    ("instruction set", "指令集", "risc cisc", "x86-64", "arm isa", "riscv isa"),
+    ("gpu architecture", "gpu架构", "shader core", "warp", "sm", "cuda core"),
+    ("pcie", "peripheral component interconnect", "nvlink", "bus bandwidth", "dma"),
+    ("storage hierarchy", "存储层次", "ssd nvme", "hdd", "seek time", "iops"),
+    ("network interface", "网卡", "nic", "offload", "rdma", "roce"),
+    ("fpga design", "fpga设计", "lookup table", "lut", "dsp block", "clock domain"),
+    # Mechanical — Detailed
+    ("stress analysis", "应力分析", "von mises", "stress concentration", "factor of safety"),
+    ("fatigue life", "疲劳寿命", "s-n curve", "crack growth", "paris law"),
+    ("impact dynamics", "冲击动力学", "collision mechanics", "coefficient of restitution"),
+    ("buckling", "屈曲", "euler buckling", "critical load", "slenderness ratio"),
+    ("creep", "蠕变", "stress relaxation", "viscoelastic", "creep rate"),
+    ("tribological coating", "摩擦涂层", "dlc", "hard chrome", "ceramic coating"),
+    ("gear", "齿轮", "spur gear", "helical", "bevel", "worm gear", "gear ratio"),
+    ("bearing", "轴承", "ball bearing", "roller bearing", "thrust bearing", "load rating"),
+    ("seal", "密封", "o-ring", "mechanical seal", "labyrinth seal"),
+    ("valve", "阀门", "gate valve", "ball valve", "control valve", "actuator"),
+    # Civil Engineering Advanced
+    ("prestressed concrete", "预应力混凝土", "post-tension", "pre-tension", "tendon"),
+    ("retaining wall", "挡土墙", "earth pressure", "rankine", "coulomb earth"),
+    ("pile foundation", "桩基础", "driven pile", "bored pile", "load test"),
+    ("dam engineering", "大坝工程", "gravity dam", "arch dam", "embankment dam"),
+    ("water treatment plant", "水处理厂", "coagulation flocculation", "sedimentation", "filtration"),
+    ("construction management", "施工管理", "critical path method", "cpm", "pert"),
+    ("quantity surveying", "工程量计算", "bill of quantities", "boq", "cost estimation"),
+    ("green building", "绿色建筑", "leed", "breeam", "energy efficiency building"),
+    ("structural dynamics", "结构动力学", "natural frequency structure", "mode shape", "dynamic load"),
+    # Aerospace Advanced
+    ("propulsion system", "推进系统", "turbofan", "turbojet", "ramjet", "scramjet"),
+    ("flight dynamics", "飞行动力学", "six dof", "pitch roll yaw", "stability derivatives"),
+    ("avionics", "航电", "fly by wire", "inertial navigation", "ins", "gps ins"),
+    ("aircraft structure", "飞机结构", "skin stringer", "frame", "rivet joint"),
+    ("satellite bus", "卫星平台", "adcs", "eps power satellite", "thermal control"),
+    ("launch vehicle", "运载火箭", "payload fairing", "staging", "delta-v"),
+    # ── Batch H end ──────────────────────────────────────────────────────────
+    # ── Batch I : 农学细粒度 · 商科细粒度 ──────────────────────────────────
+    # Agronomy detail
+    ("crop physiology", "作物生理学", "photosynthesis crop", "transpiration", "stomata"),
+    ("plant nutrition", "植物营养", "nitrogen cycle soil", "phosphorus uptake", "potassium"),
+    ("soil structure", "土壤结构", "clay silt sand", "soil texture", "permeability"),
+    ("crop rotation", "轮作", "cover crop", "fallow", "green manure"),
+    ("irrigation scheduling", "灌溉调度", "evapotranspiration", "soil moisture sensor", "tensiometer"),
+    ("plant disease", "植物病害", "fungal disease", "bacterial plant", "viral plant disease"),
+    ("weed control", "杂草防治", "herbicide resistance", "mechanical weeding", "integrated weed"),
+    ("breeding methods", "育种方法", "hybridization", "backcross", "marker assisted selection"),
+    ("seed quality", "种子质量", "germination rate", "seed vigor", "dormancy"),
+    ("harvest mechanization", "机械化收获", "combine harvester", "threshing", "grain moisture"),
+    ("post-harvest", "采后处理", "cold chain", "grain storage", "postharvest loss"),
+    ("organic certification", "有机认证", "inputs restriction", "conversion period", "audit"),
+    ("agroecology", "农业生态学", "ecosystem services", "biodiversity farm", "beneficial insects"),
+    ("smart farming iot", "智慧农业iot", "soil sensor", "weather station farm", "drone spray"),
+    # Horticulture
+    ("horticulture", "园艺", "vegetable", "fruit", "ornamental plant", "蔬菜水果"),
+    ("pruning", "修剪", "grafting", "嫁接", "cutting propagation", "扦插"),
+    ("greenhouse management", "温室管理", "humidity control", "co2 enrichment", "led grow"),
+    ("integrated pest", "综合防治", "ipm", "biological control", "natural enemy"),
+    # Animal Science
+    ("animal nutrition", "动物营养", "feed formulation", "ruminant", "monogastric"),
+    ("animal health", "动物健康", "veterinary medicine", "vaccination animal", "biosecurity"),
+    ("genetics livestock", "畜禽遗传", "estimated breeding value", "ebv", "blup"),
+    ("dairy production", "奶牛生产", "lactation", "somatic cell count", "milk quality"),
+    ("poultry science", "家禽科学", "broiler", "layer hen", "hatchery management"),
+    ("aquaculture detail", "水产养殖详细", "feed conversion ratio", "water quality aqua", "stocking density"),
+    # Business Strategy detail
+    ("porter five forces", "波特五力", "bargaining power", "entry barrier", "substitute"),
+    ("swot analysis", "swot分析", "strengths weaknesses opportunities threats"),
+    ("value chain", "价值链", "primary activity", "support activity", "margin"),
+    ("business model canvas", "商业模式画布", "value proposition", "revenue stream", "key resource"),
+    ("blue ocean strategy", "蓝海战略", "value innovation", "eliminate reduce raise create"),
+    ("growth strategy", "增长战略", "ansoff matrix", "market penetration", "diversification"),
+    ("corporate strategy", "公司战略", "sbu", "bcg matrix", "portfolio management"),
+    ("competitive intelligence", "竞争情报", "competitor analysis", "market research", "benchmarking"),
+    # Marketing detail
+    ("marketing mix", "营销组合", "4ps", "product price place promotion"),
+    ("digital marketing", "数字营销", "seo sem", "content marketing", "social media marketing"),
+    ("seo", "搜索引擎优化", "keyword research", "backlink", "on-page seo", "technical seo"),
+    ("sem paid search", "付费搜索", "google ads", "cpc", "quality score", "bidding"),
+    ("social media marketing", "社交媒体营销", "engagement rate", "reach", "impressions"),
+    ("influencer marketing", "网红营销", "kol", "ugc", "brand ambassador"),
+    ("email marketing", "邮件营销", "open rate", "click rate", "drip campaign"),
+    ("customer journey", "客户旅程", "touchpoint", "awareness consideration", "funnel marketing"),
+    ("brand equity", "品牌资产", "brand awareness", "loyalty", "perceived quality"),
+    ("market segmentation", "市场细分", "demographic", "psychographic", "behavioral segment"),
+    ("pricing strategy", "定价策略", "cost-plus", "value-based pricing", "dynamic pricing"),
+    ("product management", "产品管理", "roadmap", "mvp", "product market fit", "prd"),
+    # Finance detail
+    ("financial modeling", "财务建模", "excel finance", "sensitivity analysis", "scenario"),
+    ("investment banking", "投资银行", "m&a", "underwriting finance", "ipo advisory"),
+    ("private equity detail", "私募股权详细", "lbo", "leveraged buyout", "management buyout"),
+    ("venture capital detail", "风险投资详细", "series a b c", "term sheet", "due diligence"),
+    ("hedge fund strategy", "对冲基金策略", "long short equity", "arbitrage", "macro strategy"),
+    ("asset management", "资产管理", "aum", "fund performance", "attribution analysis"),
+    ("real estate finance", "房地产金融", "cap rate", "noi", "real estate irr", "reits"),
+    ("insurance detail", "保险详细", "premium", "underwriting insurance", "claims", "actuarial"),
+    ("central bank policy", "央行政策", "open market operation", "reserve ratio", "forward guidance"),
+    ("cryptocurrency trading", "加密货币交易", "spot trading", "derivatives crypto", "defi protocol"),
+    # Operations Management
+    ("operations management", "运营管理", "capacity planning", "queue theory", "bottleneck"),
+    ("lean manufacturing", "精益制造", "waste elimination", "value stream", "kaizen", "5s"),
+    ("six sigma", "六西格玛", "dmaic", "control chart", "process capability", "cpk"),
+    ("total quality management", "全面质量管理", "tqm", "quality circle", "ishikawa"),
+    ("supply chain management", "供应链管理", "jit", "just in time", "kanban supply", "vendor managed"),
+    ("logistics detail", "物流详细", "last mile", "warehouse management", "wms", "cross-docking"),
+    ("inventory management", "库存管理", "eoq", "safety stock", "abc analysis", "reorder point"),
+    ("procurement", "采购", "rfp rfq", "supplier evaluation", "sourcing strategy"),
+    ("enterprise resource planning", "erp", "sap", "oracle erp", "module integration"),
+    # HR detail
+    ("talent acquisition", "人才获取", "sourcing", "assessment", "interview", "offer"),
+    ("performance management", "绩效管理", "360 review", "ranking", "development plan"),
+    ("compensation benefits", "薪酬福利", "total rewards", "equity compensation", "benefits"),
+    ("learning development", "学习发展", "corporate training", "competency framework", "upskilling"),
+    ("employee engagement", "员工敬业度", "engagement survey", "pulse survey", "retention"),
+    ("organizational design", "组织设计", "structure", "span of control", "hierarchy flat"),
+    # ── Batch I end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 文科细粒度 ══════════════════════════════════════════
+    # ── Batch J: 文学 / 语言学 / 历史 / 哲学 / 艺术 ──────────────────────────────
+    # -- 文学基础 --
+    ("narrative", "叙事", "plot", "storyline", "story structure"),
+    ("protagonist", "主人公", "antagonist", "character arc", "hero journey"),
+    ("point of view", "叙述视角", "first person", "third person omniscient", "unreliable narrator"),
+    ("metaphor", "隐喻", "simile", "比喻", "figurative language", "imagery"),
+    ("symbolism", "象征", "allegory", "寓言", "motif"),
+    ("theme", "主题", "thematic analysis", "moral", "message"),
+    ("genre fiction", "类型小说", "literary fiction", "高雅文学", "popular fiction"),
+    ("lyric poem", "抒情诗", "epic poem", "史诗", "ballad", "sonnet"),
+    ("drama", "戏剧", "play script", "theatrical", "stage directions"),
+    ("tragedy", "悲剧", "comedy", "喜剧", "tragicomedy", "farce"),
+    ("short story", "短篇小说", "novella", "中篇小说", "novel form"),
+    ("stream of consciousness", "意识流", "interior monologue", "free indirect discourse"),
+    ("intertextuality", "互文性", "allusion", "典故", "parody", "pastiche"),
+    ("modernism literature", "现代主义文学", "postmodernism literature", "后现代主义文学"),
+    ("realism fiction", "现实主义小说", "naturalism literature", "自然主义"),
+    ("romanticism", "浪漫主义", "gothic literature", "哥特文学", "dark romanticism"),
+    ("magic realism", "魔幻现实主义", "surrealist literature", "超现实主义文学"),
+    ("literary criticism", "文学批评", "close reading", "细读", "textual analysis"),
+    ("feminist literary criticism", "女性主义文学批评", "gender studies literature", "queer theory"),
+    ("postcolonial literature", "后殖民文学", "diaspora writing", "流散文学"),
+    ("canon literary", "文学经典", "canonization", "world literature", "世界文学"),
+    ("narrative arc", "叙事弧", "rising action", "climax", "denouement resolution"),
+    ("setting atmosphere", "环境氛围", "tone mood", "tone literature", "narrative distance"),
+    # -- 语言学 --
+    ("syntax", "句法", "grammar rules", "sentence structure", "parse tree"),
+    ("psycholinguistics", "心理语言学", "language acquisition", "语言习得", "bilingualism"),
+    ("historical linguistics", "历史语言学", "etymology", "词源", "language change"),
+    ("language family", "语系", "proto-language", "原始语言", "Indo-European"),
+    ("computational linguistics", "计算语言学", "NLP pipeline", "linguistic annotation"),
+    ("translation theory", "翻译理论", "equivalence", "等值", "localization l10n"),
+    ("interpreting", "口译", "simultaneous interpreting", "同声传译", "consecutive interpreting"),
+    ("second language acquisition", "第二语言习得", "SLA", "interlanguage", "中介语"),
+    ("writing system", "书写系统", "orthography", "正字法", "logographic alphabetic"),
+    ("rhetoric", "修辞学", "persuasion", "说服", "argumentation", "style"),
+    # -- 历史学 --
+    ("historiography", "史学", "historical method", "历史方法", "primary source", "secondary source"),
+    ("ancient history", "古代史", "classical antiquity", "古典时代", "Bronze Age", "Iron Age"),
+    ("early modern history", "早期近代史", "renaissance", "文艺复兴", "reformation", "宗教改革"),
+    ("modern history", "近现代史", "industrial revolution", "工业革命", "colonialism", "殖民主义"),
+    ("contemporary history", "当代史", "cold war", "冷战", "decolonization", "非殖民化"),
+    ("social history", "社会史", "everyday life", "日常生活", "history from below"),
+    ("economic history", "经济史", "commercial revolution", "商业革命", "trade routes"),
+    ("political history", "政治史", "state formation", "国家形成", "sovereignty", "主权"),
+    ("cultural history", "文化史", "mentalities", "心态史", "symbolic history"),
+    ("military history", "军事史", "battle tactics", "战役战术", "warfare technology"),
+    ("intellectual history", "思想史", "history of ideas", "观念史", "Enlightenment"),
+    ("oral history", "口述历史", "witness testimony", "档案证词", "memory studies"),
+    ("global history", "全球史", "world systems theory", "世界体系论", "transnational history"),
+    ("Chinese history", "中国历史", "dynasty", "朝代", "imperial system", "帝制"),
+    ("archaeology", "考古学", "excavation", "发掘", "artifact", "文物 artefact"),
+    ("historical geography", "历史地理", "territory", "疆域", "migration patterns"),
+    # -- 哲学 --
+    ("ethics moral philosophy", "伦理学", "virtue ethics", "德性论", "consequentialism"),
+    ("philosophy of science", "科学哲学", "falsification", "证伪", "Popper Kuhn Lakatos"),
+    ("phenomenology", "现象学", "intentionality", "意向性", "Husserl Heidegger Merleau-Ponty"),
+    ("existentialism", "存在主义", "authenticity", "真实性", "Sartre Camus Heidegger"),
+    ("continental philosophy", "大陆哲学", "hermeneutics", "解释学", "structuralism"),
+    ("philosophy of religion", "宗教哲学", "theism", "有神论", "atheism", "free will"),
+    ("Eastern philosophy", "东方哲学", "Confucianism", "儒家", "Taoism", "道家", "Buddhism philosophy"),
+    # -- 艺术与艺术史 --
+    ("art history", "艺术史", "iconography", "图像志", "iconology", "style period"),
+    ("painting", "绘画", "oil painting", "油画", "watercolor", "水彩", "acrylic"),
+    ("sculpture", "雕塑", "bas-relief", "浮雕", "installation art", "装置艺术"),
+    ("printmaking", "版画", "etching", "蚀刻", "lithograph", "石版画"),
+    ("photography art", "艺术摄影", "documentary photography", "纪实摄影", "darkroom"),
+    ("architecture history", "建筑史", "gothic architecture", "哥特式建筑", "baroque", "modernist architecture"),
+    ("urban design", "城市设计", "planning", "规划", "public space", "公共空间"),
+    ("graphic design", "平面设计", "typography design", "排版设计", "branding visual identity"),
+    ("industrial design", "工业设计", "product design", "产品设计", "ergonomics"),
+    ("fashion design", "服装设计", "textile", "纺织", "haute couture", "高级定制"),
+    ("film studies", "电影研究", "cinematography", "摄影技法", "mise en scene", "montage"),
+    ("music theory", "乐理", "harmony", "和声", "counterpoint", "对位", "rhythm"),
+    ("music history", "音乐史", "baroque music", "巴洛克音乐", "classical period", "romantic period"),
+    ("opera", "歌剧", "aria", "咏叹调", "libretto", "脚本", "conductor orchestra"),
+    ("jazz", "爵士乐", "blues", "布鲁斯", "improvisation", "即兴", "swing bebop"),
+    ("folk music", "民间音乐", "traditional music", "传统音乐", "ethnomusicology", "民族音乐学"),
+    ("dance", "舞蹈", "choreography", "编舞", "ballet", "芭蕾", "contemporary dance"),
+    ("performance art", "表演艺术", "body art", "身体艺术", "happening", "行为艺术"),
+    ("museum studies", "博物馆学", "curation", "策展", "exhibition design", "collection"),
+    ("cultural heritage", "文化遗产", "intangible heritage", "非物质遗产", "preservation conservation"),
+    # -- 新闻传播 --
+    ("media studies", "媒体研究", "mass communication", "大众传播", "media literacy"),
+    ("broadcasting", "广播电视", "television production", "电视制作", "podcast"),
+    ("digital journalism", "数字新闻", "online media", "网络媒体", "citizen journalism"),
+    ("advertising communication", "广告传播", "copywriting", "文案", "creative brief"),
+    ("social media communication", "社交媒体传播", "viral content", "病毒式传播"),
+    ("intercultural communication", "跨文化传播", "cultural context", "cross-cultural"),
+    # -- 教育学 --
+    ("pedagogy", "教学法", "didactics", "教学论", "curriculum design", "课程设计"),
+    ("constructivism education", "建构主义教育", "Piaget Vygotsky", "scaffolding"),
+    ("Montessori", "蒙台梭利", "Waldorf education", "华德福", "progressive education"),
+    ("higher education", "高等教育", "university pedagogy", "academic culture", "research university"),
+    ("educational psychology", "教育心理学", "motivation learning", "学习动机", "assessment"),
+    # ── Batch J end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理科细粒度 ══════════════════════════════════════════
+    # ── Batch K: 数学 / 物理 / 化学 / 生物 / 地学 / 天文 ─────────────────────────
+    # -- 纯数学 --
+    ("real analysis", "实分析", "epsilon delta", "极限严格定义", "Cauchy sequence"),
+    ("abstract algebra", "抽象代数", "group ring field", "群环域", "homomorphism isomorphism"),
+    ("galois theory", "伽罗瓦理论", "field extension", "域扩张", "solvability by radicals"),
+    ("number theory", "数论", "prime factorization", "素因子分解", "modular arithmetic congruence"),
+    ("algebraic geometry", "代数几何", "variety scheme", "簇概形", "cohomology sheaf"),
+    ("algebraic topology", "代数拓扑", "homotopy homology", "同伦同调", "fundamental group"),
+    ("functional analysis", "泛函分析", "Banach space", "Hilbert space", "operator theory"),
+    ("combinatorics", "组合数学", "generating function", "生成函数", "inclusion exclusion"),
+    ("graph theory mathematics", "图论数学", "chromatic number", "着色数", "planarity"),
+    ("category theory", "范畴论", "functor morphism", "函子态射", "topos adjunction"),
+    ("differential equations", "微分方程", "ODE PDE", "ordinary partial", "boundary value"),
+    ("numerical analysis", "数值分析", "finite element", "有限元", "interpolation approximation"),
+    ("optimization mathematics", "数学优化", "convex optimization", "凸优化", "Lagrange multiplier"),
+    ("probability theory", "概率论", "random variable", "随机变量", "central limit theorem"),
+    ("stochastic process", "随机过程", "Markov chain", "马尔可夫链", "Brownian motion", "martingale"),
+    ("mathematical logic", "数理逻辑", "propositional logic", "命题逻辑", "predicate logic", "completeness"),
+    ("dynamical systems", "动力系统", "chaos theory", "混沌理论", "bifurcation attractor"),
+    # -- 物理学细粒度 --
+    ("classical mechanics", "经典力学", "Newton laws", "牛顿定律", "Lagrangian Hamiltonian"),
+    ("fluid mechanics", "流体力学", "Navier-Stokes", "N-S方程", "turbulence viscosity"),
+    ("thermodynamics", "热力学", "entropy enthalpy", "熵焓", "Carnot cycle", "Gibbs free energy"),
+    ("electromagnetism", "电磁学", "Maxwell equations", "麦克斯韦方程", "electric field magnetic field"),
+    ("optics", "光学", "refraction reflection", "折射反射", "diffraction interference", "polarization"),
+    ("quantum field theory", "量子场论", "Lagrangian field", "标准模型", "gauge symmetry"),
+    ("nuclear physics", "核物理", "radioactive decay", "放射衰变", "fission fusion", "nuclear force"),
+    ("condensed matter physics", "凝聚态物理", "solid state", "固体物理", "superconductor semiconductor"),
+    ("plasma physics", "等离子体物理", "fusion reactor", "托卡马克", "magnetohydrodynamics"),
+    ("astrophysics", "天体物理", "stellar evolution", "恒星演化", "black hole gravity waves"),
+    ("cosmology physics", "宇宙学物理", "Big Bang", "大爆炸", "inflation dark matter dark energy"),
+    ("acoustics", "声学", "sound wave", "声波", "resonance frequency", "ultrasound"),
+    ("biophysics", "生物物理", "membrane potential", "膜电位", "protein folding physics"),
+    # -- 化学细粒度 --
+    ("inorganic chemistry", "无机化学", "periodic table", "元素周期表", "coordination compound"),
+    ("physical chemistry", "物理化学", "thermodynamics chem", "electrochemistry", "spectroscopy"),
+    ("analytical chemistry", "分析化学", "quantitative analysis", "titration", "chromatography"),
+    ("biochemistry", "生物化学", "enzyme kinetics", "酶动力学", "metabolic pathway", "coenzyme"),
+    ("polymer chemistry", "高分子化学", "polymerization", "聚合反应", "molecular weight distribution"),
+    ("materials chemistry", "材料化学", "nanomaterials", "纳米材料", "thin film deposition"),
+    ("computational chemistry", "计算化学", "DFT density functional", "molecular dynamics sim"),
+    ("green chemistry", "绿色化学", "sustainability chemistry", "atom economy", "solvent-free"),
+    ("medicinal chemistry", "药物化学", "drug design", "药物设计", "pharmacophore", "ADMET"),
+    ("electrochemistry", "电化学", "electrode reaction", "电极反应", "corrosion galvanic cell"),
+    ("surface chemistry", "表面化学", "adsorption", "吸附", "catalytic surface", "heterogeneous"),
+    ("nuclear chemistry", "核化学", "isotope labeling", "同位素示踪", "radiochemistry"),
+    # -- 生物学细粒度 --
+    ("cell biology", "细胞生物学", "organelle", "细胞器", "cytoskeleton", "cell cycle"),
+    ("molecular biology", "分子生物学", "DNA replication", "DNA复制", "transcription translation"),
+    ("genetics", "遗传学", "Mendelian inheritance", "孟德尔遗传", "linkage mapping"),
+    ("genomics", "基因组学", "whole genome sequencing", "全基因组测序", "SNP variant"),
+    ("proteomics", "蛋白质组学", "mass spectrometry protein", "protein expression profiling"),
+    ("metabolomics", "代谢组学", "metabolite profiling", "NMR metabolomics", "metabolic flux"),
+    ("epigenetics", "表观遗传学", "DNA methylation", "histone modification", "chromatin remodeling"),
+    ("developmental biology", "发育生物学", "embryogenesis", "胚胎发育", "morphogen gradient"),
+    ("immunology", "免疫学", "innate adaptive immunity", "先天适应性免疫", "antibody T cell B cell"),
+    ("microbiology", "微生物学", "bacteria virus", "细菌病毒", "culture medium", "antibiotic resistance"),
+    ("virology", "病毒学", "viral replication", "病毒复制", "tropism", "zoonosis"),
+    ("evolutionary biology", "进化生物学", "natural selection", "自然选择", "phylogenetics", "speciation"),
+    ("botany", "植物学", "photosynthesis", "光合作用", "plant physiology", "vascular system"),
+    ("zoology", "动物学", "vertebrate invertebrate", "脊椎无脊椎", "ethology animal behavior"),
+    ("marine biology", "海洋生物学", "ocean ecosystem", "海洋生态", "coral reef plankton"),
+    ("systems biology", "系统生物学", "biological network", "生物网络", "regulatory circuit"),
+    # -- 地球科学 --
+    ("mineralogy", "矿物学", "crystal structure mineral", "矿物晶体结构", "gemology"),
+    ("petrology", "岩石学", "igneous metamorphic sedimentary", "岩浆变质沉积岩"),
+    ("oceanography", "海洋学", "ocean circulation", "海洋环流", "thermohaline", "ENSO"),
+    ("climatology", "气候学", "climate system", "气候系统", "paleoclimate", "古气候"),
+    ("meteorology", "气象学", "weather forecast", "天气预报", "atmospheric dynamics"),
+    ("seismology", "地震学", "seismic wave", "地震波", "fault rupture", "earthquake magnitude"),
+    ("volcanology", "火山学", "magma eruption", "岩浆喷发", "pyroclastic flow"),
+    ("environmental geoscience", "环境地学", "soil contamination", "土壤污染", "geochemistry"),
+    # -- 天文学 --
+    ("observational astronomy", "观测天文学", "telescope", "望远镜", "photometry spectroscopy"),
+    ("stellar astronomy", "恒星天文学", "Hertzsprung Russell diagram", "HR图", "main sequence"),
+    ("galactic astronomy", "星系天文学", "Milky Way structure", "银河系结构", "stellar population"),
+    ("extragalactic astronomy", "河外天文学", "galaxy cluster", "星系团", "gravitational lensing"),
+    ("radio astronomy", "射电天文学", "radio telescope", "射电望远镜", "pulsar quasar"),
+    ("X-ray gamma astronomy", "X射线伽马天文学", "neutron star accretion disk", "中子星吸积盘"),
+    ("solar physics", "太阳物理", "solar flare", "太阳耀斑", "coronal mass ejection", "sunspot"),
+    ("planetary science", "行星科学", "exoplanet", "系外行星", "habitability zone", "transit method"),
+    ("astrochemistry", "天体化学", "interstellar medium", "星际介质", "molecular cloud"),
+    # ── Batch K end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工科细粒度续 ══════════════════════════════════════════
+    # ── Batch L: 机械 / 电子 / 土木 / 化工 / 航空航天 / 能源 ──────────────────────
+    # -- 机械工程细粒度 --
+    ("kinematics", "运动学", "velocity acceleration", "速度加速度", "mechanism linkage"),
+    ("dynamics mechanics", "动力学机械", "rigid body", "刚体", "moment of inertia", "torque"),
+    ("strength of materials", "材料力学", "stress strain", "应力应变", "yield strength fatigue"),
+    ("fracture mechanics", "断裂力学", "crack propagation", "裂纹扩展", "stress intensity factor"),
+    ("tribology", "摩擦学", "friction wear lubrication", "摩擦磨损润滑", "surface contact"),
+    ("heat transfer", "传热学", "conduction convection radiation", "导热对流辐射", "Fourier law"),
+    ("thermodynamic cycle", "热力循环", "Rankine cycle", "朗肯循环", "Brayton cycle", "refrigeration"),
+    ("CNC machining", "数控加工", "G-code", "machine tool", "milling turning grinding"),
+    ("CAD CAM", "计算机辅助设计制造", "solid modeling", "实体建模", "toolpath simulation"),
+    ("finite element analysis FEA", "有限元分析", "meshing", "网格划分", "structural simulation"),
+    ("CFD computational fluid dynamics", "计算流体力学", "mesh solver", "turbulence model"),
+    ("mechatronics", "机电一体化", "actuator sensor controller", "执行器传感器控制器"),
+    ("robotics kinematics", "机器人运动学", "forward inverse kinematics", "正逆运动学", "DH parameters"),
+    ("MEMS microelectromechanical", "微机电系统", "microfabrication", "微加工", "accelerometer MEMS"),
+    ("additive manufacturing", "增材制造", "3D printing", "FDM SLA SLS", "powder bed fusion"),
+    ("welding engineering", "焊接工程", "arc welding", "电弧焊", "laser welding", "NDT inspection"),
+    ("HVAC", "暖通空调", "cooling load", "冷负荷", "ventilation ductwork", "refrigerant"),
+    # -- 电子电气工程细粒度 --
+    ("circuit analysis", "电路分析", "Kirchhoff law", "基尔霍夫定律", "Thevenin Norton"),
+    ("analog circuit", "模拟电路", "op-amp", "运算放大器", "filter amplifier", "oscillator"),
+    ("digital circuit", "数字电路", "logic gate", "逻辑门", "flip flop", "counter encoder"),
+    ("power electronics", "电力电子", "converter inverter", "变换器逆变器", "MOSFET IGBT"),
+    ("electric machine", "电机", "induction motor", "感应电机", "synchronous machine", "AC DC motor"),
+    ("power system", "电力系统", "transmission grid", "输电网", "load flow", "fault analysis"),
+    ("renewable energy electrical", "可再生能源电气", "solar PV grid", "光伏并网", "wind turbine electrical"),
+    ("control systems", "控制系统", "PID controller", "PID控制器", "state space", "Bode plot"),
+    ("communication engineering", "通信工程", "modulation demodulation", "调制解调", "channel coding"),
+    ("microwave engineering", "微波工程", "antenna design", "天线设计", "waveguide", "RF circuit"),
+    ("PCB design", "PCB设计", "schematic layout", "原理图布局", "signal integrity", "EMC"),
+    ("FPGA", "现场可编程门阵列", "VHDL Verilog", "hardware description language", "synthesis place route"),
+    ("embedded system hardware", "嵌入式硬件", "microcontroller", "单片机", "interrupt timer DMA"),
+    ("sensor instrumentation", "传感器仪器", "transducer", "换能器", "calibration measurement"),
+    # -- 土木工程细粒度 --
+    ("structural analysis", "结构分析", "beam column frame", "梁柱框架", "load combination"),
+    ("reinforced concrete", "钢筋混凝土", "RC design", "配筋设计", "crack deflection"),
+    ("steel structure", "钢结构", "bolted welded connection", "螺栓焊接节点", "buckling"),
+    ("geotechnical engineering", "岩土工程", "soil bearing capacity", "地基承载力", "pile foundation"),
+    ("foundation engineering", "基础工程", "shallow deep foundation", "浅深基础", "settlement"),
+    ("hydraulic engineering", "水利工程", "dam spillway", "大坝溢洪道", "open channel flow"),
+    ("bridge engineering", "桥梁工程", "suspension cable bridge", "悬索斜拉桥", "deck girder"),
+    ("road pavement", "道路路面", "asphalt concrete pavement", "沥青混凝土路面", "CBR"),
+    ("tunnel engineering", "隧道工程", "TBM boring", "盾构掘进", "lining support"),
+    ("environmental civil", "环境土木", "wastewater treatment", "污水处理", "stormwater management"),
+    ("building information modeling BIM", "建筑信息模型", "IFC standard", "Revit parametric"),
+    # -- 化学工程细粒度 --
+    ("unit operation", "单元操作", "distillation absorption", "蒸馏吸收", "extraction crystallization"),
+    ("mass transfer", "传质", "diffusion", "扩散", "absorption stripping", "packed column"),
+    ("chemical process simulation", "化工过程模拟", "Aspen HYSYS", "flowsheet", "phase equilibrium"),
+    ("process control chemical", "化工过程控制", "PID loop", "cascade control", "advanced process control"),
+    ("biochemical engineering", "生化工程", "bioreactor", "生物反应器", "fermentation scale-up"),
+    ("polymer processing", "高分子加工", "extrusion injection molding", "挤出注塑", "rheology"),
+    ("separation process", "分离过程", "membrane separation", "膜分离", "adsorption ion exchange"),
+    ("corrosion protection", "腐蚀防护", "cathodic protection", "阴极保护", "coating inhibitor"),
+    ("safety process hazard", "安全过程危险", "HAZOP", "hazard analysis", "pressure relief valve"),
+    # -- 航空航天工程 --
+    ("aerodynamics", "空气动力学", "lift drag", "升力阻力", "boundary layer", "subsonic supersonic"),
+    ("aircraft structures", "飞机结构", "fuselage wing spar", "机身机翼梁", "fatigue certification"),
+    ("propulsion system", "推进系统", "jet engine", "喷气发动机", "thrust specific impulse"),
+    ("flight mechanics", "飞行力学", "stability control", "稳定性操纵性", "autopilot"),
+    ("avionics", "航空电子", "fly by wire", "电传操纵", "navigation GPS INS"),
+    ("spacecraft design", "航天器设计", "orbit mechanics", "轨道力学", "attitude control"),
+    ("rocket propulsion", "火箭推进", "solid liquid propellant", "固液推进剂", "nozzle thrust chamber"),
+    ("satellite systems", "卫星系统", "LEO GEO", "link budget", "solar panel thermal"),
+    ("re-entry thermal protection", "再入热防护", "ablative TPS", "heat shield"),
+    # -- 能源工程细粒度 --
+    ("solar energy system", "太阳能系统", "photovoltaic", "光伏", "solar thermal collector"),
+    ("wind energy system", "风能系统", "wind turbine generator", "风力发电机", "blade pitch control"),
+    ("hydropower", "水力发电", "turbine runner", "水轮机", "penstock dam", "pumped storage"),
+    ("nuclear energy", "核能", "reactor design nuclear", "核反应堆设计", "PWR BWR"),
+    ("energy storage", "储能", "battery energy storage", "电池储能", "flywheel pumped hydro"),
+    ("natural gas", "天然气", "LNG", "液化天然气", "gas pipeline compression"),
+    ("coal technology", "煤炭技术", "coal gasification", "煤气化", "carbon capture CCS"),
+    ("smart grid energy", "智能电网", "demand response", "需求响应", "AMI meter data"),
+    # ── Batch L end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 农学细粒度续 + 商科细粒度续 ════════════════════════════
+    # ── Batch M: 农学深度 / 商科深度 ─────────────────────────────────────────────
+    # -- 农学深度：植物保护 --
+    ("plant pathology", "植物病理学", "fungal disease", "真菌病害", "bacterial blight", "virus mosaic"),
+    ("pesticide", "农药", "insecticide fungicide herbicide", "杀虫剂杀菌剂除草剂", "toxicology"),
+    ("integrated pest management IPM", "有害生物综合治理", "biocontrol", "生物防治", "threshold"),
+    ("nematology", "线虫学", "root knot nematode", "根结线虫", "soil nematode"),
+    ("weed science", "杂草学", "competitive ability", "竞争力", "allelopathy", "化感作用"),
+    ("quarantine plant", "植物检疫", "invasive species", "入侵物种", "phytosanitary"),
+    # -- 农学深度：土壤与资源 --
+    ("soil physics", "土壤物理", "texture structure", "质地结构", "water holding capacity"),
+    ("soil chemistry", "土壤化学", "pH buffering", "pH缓冲", "cation exchange", "阳离子交换"),
+    ("soil microbiology", "土壤微生物学", "rhizosphere", "根际", "mycorrhiza", "菌根"),
+    ("composting", "堆肥", "organic matter", "有机质", "vermicompost", "蚯蚓堆肥"),
+    ("irrigation scheduling", "灌溉计划", "evapotranspiration", "蒸散量", "deficit irrigation"),
+    ("drip irrigation", "滴灌", "sprinkler", "喷灌", "furrow irrigation", "沟灌"),
+    ("water use efficiency", "水分利用效率", "WUE", "drought tolerance", "耐旱性"),
+    ("land degradation", "土地退化", "desertification", "荒漠化", "soil erosion", "水土流失"),
+    ("reclamation", "土地复垦", "remediation contaminated", "污染修复", "phytoremediation"),
+    # -- 农学深度：作物与育种 --
+    ("plant breeding", "植物育种", "hybridization", "杂交", "selection pressure", "选择压力"),
+    ("marker assisted selection", "分子标记辅助选择", "MAS", "QTL mapping", "数量性状位点"),
+    ("CRISPR plant", "植物基因编辑", "genome editing crop", "作物基因组编辑", "transgenic"),
+    ("seed technology", "种子技术", "germination test", "发芽率测定", "seed priming coating"),
+    ("plant tissue culture", "植物组织培养", "micropropagation", "微繁殖", "callus regeneration"),
+    ("crop physiology", "作物生理", "source sink", "源库关系", "leaf area index", "LAI"),
+    ("phenotyping", "表型鉴定", "high throughput phenotyping", "高通量表型", "drone imaging"),
+    ("food security", "粮食安全", "yield gap", "产量差距", "climate adaptation crop"),
+    # -- 农学深度：畜牧与水产 --
+    ("animal nutrition", "动物营养", "amino acid", "氨基酸", "energy metabolism", "饲料配方"),
+    ("ruminant nutrition", "反刍动物营养", "rumen fermentation", "瘤胃发酵", "bypass protein"),
+    ("poultry science", "家禽学", "broiler layer", "肉鸡蛋鸡", "feed conversion ratio"),
+    ("swine production", "猪生产", "sow performance", "母猪性能", "weaning", "断奶"),
+    ("aquaculture species", "水产养殖品种", "shrimp salmon tilapia", "虾鲑鱼罗非鱼", "polyculture"),
+    ("fish nutrition", "鱼类营养", "fishmeal replacement", "鱼粉替代", "plant protein aquaculture"),
+    ("animal genetics breeding", "动物遗传育种", "estimated breeding value", "EBV", "genomic selection"),
+    ("veterinary medicine", "兽医学", "diagnosis treatment", "诊断治疗", "zoonosis prevention"),
+    ("animal welfare", "动物福利", "five freedoms", "五项自由", "stress indicators"),
+    # -- 商科深度：会计与审计 --
+    ("financial accounting", "财务会计", "GAAP IFRS", "会计准则", "balance sheet income statement"),
+    ("managerial accounting", "管理会计", "cost allocation", "成本分配", "variance analysis"),
+    ("cost accounting", "成本会计", "standard cost", "标准成本", "activity based costing ABC"),
+    ("auditing", "审计", "internal audit", "内部审计", "external audit", "opinion"),
+    ("forensic accounting", "法务会计", "fraud detection", "舞弊检测", "litigation support"),
+    ("tax accounting", "税务会计", "deferred tax", "递延税", "tax planning avoidance"),
+    ("consolidation accounting", "合并报表", "goodwill", "商誉", "minority interest", "intercompany"),
+    ("revenue recognition", "收入确认", "IFRS 15", "contract liability", "performance obligation"),
+    # -- 商科深度：金融细粒度 --
+    ("fixed income", "固定收益", "bond yield duration", "债券收益率久期", "credit spread"),
+    ("equity research", "股票研究", "DCF valuation", "现金流折现", "comparable company analysis"),
+    ("derivatives", "衍生品", "options futures swaps", "期权期货互换", "Black Scholes"),
+    ("risk management finance", "金融风险管理", "VaR CVaR", "value at risk", "stress testing"),
+    ("portfolio theory", "投资组合理论", "CAPM", "Sharpe ratio", "diversification efficient frontier"),
+    ("behavioral finance", "行为金融学", "cognitive bias", "认知偏差", "prospect theory"),
+    ("financial regulation", "金融监管", "Basel III", "资本充足率", "compliance KYC AML"),
+    ("microfinance", "小额金融", "financial inclusion", "普惠金融", "credit scoring SME"),
+    # -- 商科深度：经济学细粒度 --
+    ("microeconomics advanced", "高级微观经济学", "game theory", "博弈论", "auction mechanism"),
+    ("macroeconomics advanced", "高级宏观经济学", "DSGE model", "动态随机一般均衡", "monetary policy"),
+    ("international economics", "国际经济学", "comparative advantage", "比较优势", "trade policy"),
+    ("labor economics", "劳动经济学", "wage determination", "工资决定", "human capital education"),
+    ("health economics", "卫生经济学", "health insurance", "医疗保险", "moral hazard selection"),
+    ("environmental economics", "环境经济学", "externality", "外部性", "carbon tax cap trade"),
+    ("public finance", "公共财政", "fiscal policy", "财政政策", "public goods taxation"),
+    ("econometrics applied", "应用计量经济学", "panel data", "面板数据", "IV instrumental variable"),
+    # -- 商科深度：管理与战略 --
+    ("corporate governance", "公司治理", "board directors", "董事会", "shareholder rights"),
+    ("entrepreneurship", "创业学", "startup formation", "初创公司", "business model canvas"),
+    ("innovation management", "创新管理", "disruptive innovation", "颠覆性创新", "R&D pipeline"),
+    ("change management", "变革管理", "Kotter change model", "科特模型", "resistance adoption"),
+    ("knowledge management", "知识管理", "explicit tacit knowledge", "显性隐性知识", "community of practice"),
+    ("project management advanced", "高级项目管理", "earned value", "挣值管理", "critical chain"),
+    ("international business", "国际商务", "FDI foreign direct", "外商直接投资", "entry mode"),
+    ("cross cultural management", "跨文化管理", "Hofstede dimensions", "文化维度", "cultural intelligence"),
+    # ── Batch M end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 社会科学 / 法律 / 医学 / 环境 ══════════════════════════
+    # ── Batch N: 社会学 / 心理学 / 法学 / 医学 / 环境科学 ─────────────────────────
+    # -- 社会学 --
+    ("sociological theory", "社会学理论", "functionalism", "功能主义", "conflict theory", "symbolic interactionism"),
+    ("social stratification", "社会分层", "class inequality", "阶级不平等", "social mobility"),
+    ("race ethnicity", "种族族裔", "racism discrimination", "种族歧视", "intersectionality"),
+    ("family sociology", "家庭社会学", "marriage divorce", "婚姻离婚", "kinship structure"),
+    ("rural sociology", "农村社会学", "community development", "社区发展", "rural-urban migration"),
+    ("political sociology", "政治社会学", "power elite", "权力精英", "social movements", "collective action"),
+    ("religion sociology", "宗教社会学", "secularization", "世俗化", "religious institutions"),
+    ("deviance criminology", "偏差行为犯罪学", "crime theory", "犯罪理论", "labeling theory"),
+    ("social capital", "社会资本", "trust network", "信任网络", "Putnam Bourdieu"),
+    ("globalization society", "全球化社会", "transnationalism", "跨国主义", "cultural homogenization"),
+    ("welfare state", "福利国家", "social policy", "社会政策", "poverty relief redistribution"),
+    ("demographic transition", "人口转型", "fertility mortality", "生育率死亡率", "aging population"),
+    ("survey research", "调查研究", "sampling", "抽样", "questionnaire design", "response bias"),
+    # -- 心理学细粒度 --
+    ("clinical psychology", "临床心理学", "psychotherapy", "心理治疗", "diagnosis DSM ICD"),
+    ("cognitive psychology", "认知心理学", "memory attention perception", "记忆注意知觉"),
+    ("developmental psychology", "发展心理学", "Piaget stages", "皮亚杰阶段", "attachment theory"),
+    ("social psychology", "社会心理学", "conformity obedience", "从众服从", "attitude change"),
+    ("personality psychology", "人格心理学", "Big Five traits", "大五人格", "Myers-Briggs"),
+    ("neuropsychology", "神经心理学", "brain lesion", "脑损伤", "cognitive rehabilitation"),
+    ("health psychology", "健康心理学", "stress coping", "压力应对", "behavior change"),
+    ("organizational psychology", "组织心理学", "work motivation", "工作动机", "leadership style"),
+    ("forensic psychology", "法证心理学", "competency assessment", "能力评估", "criminal profiling"),
+    ("counseling", "咨询", "CBT cognitive behavioral", "认知行为疗法", "person-centered"),
+    ("abnormal psychology", "变态心理学", "anxiety disorder", "焦虑障碍", "depression bipolar"),
+    # -- 法学 --
+    ("criminal law", "刑法", "mens rea actus reus", "主观过错客观行为", "sentencing"),
+    ("civil procedure", "民事诉讼", "pleading discovery", "起诉证据发现", "trial appeal"),
+    ("contract law", "合同法", "offer acceptance", "要约承诺", "breach damages"),
+    ("tort law", "侵权法", "negligence liability", "过失责任", "damages compensation"),
+    ("property law", "物权法", "real property", "不动产", "intellectual property rights"),
+    ("company law", "公司法", "incorporation", "法人成立", "director duty", "shareholder"),
+    ("human rights law", "人权法", "UDHR convention", "世界人权宣言", "enforcement mechanism"),
+    ("environmental law", "环境法", "pollution liability", "污染责任", "environmental impact assessment"),
+    ("commercial law", "商法", "banking securities", "银行证券法", "bankruptcy insolvency"),
+    ("comparative law", "比较法学", "legal transplant", "法律移植", "common law civil law"),
+    # -- 医学细粒度 --
+    ("anatomy physiology", "解剖生理学", "organ system", "器官系统", "homeostasis"),
+    ("pathology", "病理学", "histopathology", "组织病理", "autopsy biopsy"),
+    ("pharmacology", "药理学", "receptor pharmacokinetics", "受体药代动力学", "dose response"),
+    ("internal medicine", "内科学", "cardiovascular", "心血管", "respiratory", "gastroenterology"),
+    ("surgery", "外科学", "operative technique", "手术技术", "laparoscopy minimally invasive"),
+    ("oncology", "肿瘤学", "chemotherapy radiation", "化疗放疗", "immunotherapy targeted therapy"),
+    ("pediatrics", "儿科学", "child development", "儿童发育", "vaccination schedule"),
+    ("obstetrics gynecology", "妇产科学", "prenatal care", "产前保健", "delivery complications"),
+    ("psychiatry", "精神病学", "schizophrenia", "精神分裂症", "antipsychotic", "ECT"),
+    ("neurology", "神经病学", "stroke epilepsy", "脑卒中癫痫", "dementia Parkinson"),
+    ("radiology imaging", "放射影像", "CT MRI ultrasound", "计算机断层磁共振超声", "interventional"),
+    ("infectious disease", "感染性疾病", "antibiotic antiviral", "抗生素抗病毒", "outbreak control"),
+    ("epidemiology", "流行病学", "incidence prevalence", "发病率患病率", "cohort case-control"),
+    ("public health", "公共卫生", "health promotion", "健康促进", "surveillance vaccination"),
+    ("traditional Chinese medicine", "中医学", "acupuncture herbal", "针灸中草药", "meridian theory"),
+    ("clinical trial", "临床试验", "RCT randomized", "随机对照试验", "phase I II III IV"),
+    # -- 环境科学细粒度 --
+    ("air pollution", "大气污染", "PM2.5 ozone", "细颗粒物臭氧", "emission source"),
+    ("water pollution", "水污染", "heavy metal", "重金属", "eutrophication", "BOD COD"),
+    ("soil pollution", "土壤污染", "remediation technique", "修复技术", "bioremediation"),
+    ("hazardous waste", "危险废物", "disposal treatment", "处置处理", "leachate management"),
+    ("climate change mitigation", "气候变化减缓", "NDC", "nationally determined contribution", "net zero"),
+    ("carbon accounting", "碳核算", "scope 1 2 3", "碳足迹", "life cycle assessment LCA"),
+    ("biodiversity", "生物多样性", "species richness", "物种丰富度", "habitat loss fragmentation"),
+    ("conservation biology", "保护生物学", "endangered species", "濒危物种", "protected area"),
+    ("urban ecology", "城市生态", "green infrastructure", "绿色基础设施", "urban heat island"),
+    ("industrial ecology", "产业生态学", "industrial symbiosis", "产业共生", "material flow analysis"),
+    ("environmental impact assessment EIA", "环境影响评价", "baseline study", "mitigation measure"),
+    ("ecological restoration", "生态修复", "reforestation", "植树造林", "wetland restoration"),
+    # ── Batch N end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 计算机科学细粒度续 ═══════════════════════════════════
+    # ── Batch O: CS理论 / 系统 / 安全 / 网络 / 数据库 / 软件工程深度 ─────────────
+    # -- CS理论细粒度 --
+    ("automata theory", "自动机理论", "finite automaton", "有限自动机", "regular language", "DFA NFA"),
+    ("formal language", "形式语言", "context free grammar", "上下文无关文法", "Chomsky hierarchy"),
+    ("computability theory", "可计算性理论", "Turing machine", "图灵机", "halting problem", "decidable"),
+    ("computational complexity", "计算复杂性", "NP complete", "NP完全", "reduction polytime"),
+    ("algorithm design", "算法设计", "divide conquer", "分治", "dynamic programming", "greedy"),
+    ("approximation algorithm", "近似算法", "ratio bound", "近似比", "PTAS FPTAS"),
+    ("randomized algorithm", "随机算法", "Monte Carlo Las Vegas", "蒙特卡洛", "probabilistic analysis"),
+    ("parallel algorithm", "并行算法", "PRAM model", "work depth", "MapReduce parallel"),
+    ("information theory", "信息论", "Shannon entropy", "香农熵", "channel capacity", "coding theorem"),
+    # -- 操作系统细粒度 --
+    ("process scheduling", "进程调度", "CFS scheduler", "完全公平调度", "priority preemption"),
+    ("memory management OS", "内存管理", "virtual memory", "虚拟内存", "page replacement LRU"),
+    ("kernel internals", "内核内部", "system call", "系统调用", "interrupt handler", "device driver"),
+    ("concurrency OS", "操作系统并发", "mutex semaphore", "互斥量信号量", "deadlock avoidance"),
+    ("container OS", "容器技术", "namespaces cgroups", "命名空间控制组", "seccomp", "overlay FS"),
+    ("real-time OS", "实时操作系统", "RTOS", "task preemption", "jitter latency"),
+    # -- 计算机网络细粒度 --
+    ("TCP IP stack", "TCP/IP协议栈", "packet fragmentation", "分片重组", "socket programming"),
+    ("HTTP protocol", "HTTP协议", "REST API", "stateless", "HTTP/2 HTTP/3 QUIC"),
+    ("DNS", "域名系统", "resolution caching", "递归迭代查询", "TTL record types"),
+    ("routing protocol", "路由协议", "BGP OSPF", "路由表", "autonomous system", "prefix aggregation"),
+    ("load balancing", "负载均衡", "round robin", "轮询", "consistent hashing", "health check"),
+    ("CDN content delivery", "内容分发网络", "edge cache", "边缘缓存", "origin pull"),
+    ("network security", "网络安全", "firewall rule", "防火墙规则", "IDS IPS", "zero trust"),
+    ("wireless network", "无线网络", "802.11 WiFi", "OFDM MIMO", "channel interference"),
+    ("SDN software defined", "软件定义网络", "OpenFlow", "control plane data plane", "NFV"),
+    ("5G network", "5G网络", "mmWave beamforming", "毫米波波束成形", "network slicing"),
+    # -- 数据库细粒度 --
+    ("relational database", "关系型数据库", "normalization", "规范化", "ACID transaction"),
+    ("B-tree index", "B树索引", "B+ tree", "clustered index", "covering index"),
+    ("replication database", "数据库复制", "master slave", "主从复制", "binlog CDC"),
+    ("sharding partitioning", "分片分区", "horizontal vertical", "水平垂直分片", "consistent hash"),
+    ("NoSQL database", "非关系数据库", "document store", "文档存储", "wide column KV graph"),
+    ("time series database", "时序数据库", "InfluxDB TimescaleDB", "retention policy", "downsampling"),
+    ("NewSQL", "新SQL数据库", "Spanner CockroachDB", "distributed ACID", "consensus Raft"),
+    # -- 安全细粒度 --
+    ("penetration testing", "渗透测试", "reconnaissance", "侦察", "exploitation post-exploitation"),
+    ("web vulnerability", "Web漏洞", "OWASP top 10", "SQL injection XSS CSRF", "SSRF RCE"),
+    ("binary exploitation", "二进制漏洞利用", "buffer overflow", "缓冲区溢出", "ROP gadget", "shellcode"),
+    ("malware analysis", "恶意软件分析", "static dynamic", "静态动态分析", "sandbox reverse engineering"),
+    ("cryptography applied", "应用密码学", "AES RSA", "symmetric asymmetric", "PKI certificate"),
+    ("side channel attack", "旁路攻击", "timing cache", "时序缓存侧信道", "power analysis"),
+    ("threat modeling", "威胁建模", "STRIDE PASTA", "attack surface", "data flow diagram"),
+    ("incident response", "事件响应", "forensics", "数字取证", "containment eradication"),
+    ("SOC security operations", "安全运营中心", "SIEM", "threat hunting", "playbook"),
+    # -- 软件工程深度 --
+    ("software architecture", "软件架构", "layered architecture", "分层架构", "hexagonal ports adapters"),
+    ("event driven architecture", "事件驱动架构", "event sourcing", "CQRS", "message broker"),
+    ("service mesh", "服务网格", "Istio Linkerd", "sidecar proxy", "traffic management"),
+    ("API design", "API设计", "versioning", "版本管理", "idempotency", "pagination cursor"),
+    ("testing strategy", "测试策略", "test pyramid", "测试金字塔", "contract testing", "chaos engineering"),
+    ("DevSecOps", "开发安全运维", "shift left security", "SAST DAST", "dependency scanning"),
+    ("observability", "可观测性", "metrics traces logs", "指标追踪日志", "OpenTelemetry"),
+    ("documentation engineering", "工程文档", "ADR architectural decision record", "runbook", "changelog"),
+    # ── Batch O end ──────────────────────────────────────────────────────────
+    # ══════════════════════ AI/ML深度 + 数据科学 + 跨学科 ════════════════════════
+    # ── Batch P: 深度学习架构 / 数据科学 / 生物信息 / 量子计算 / 跨学科 ─────────────
+    # -- 深度学习架构细粒度 --
+    ("vision transformer ViT", "视觉Transformer", "patch embedding", "图像块嵌入", "attention map"),
+    ("BERT language model", "BERT语言模型", "masked language modeling", "掩码语言建模", "fine-tuning"),
+    ("GPT autoregressive", "GPT自回归", "causal mask", "因果掩码", "in-context learning"),
+    ("diffusion model", "扩散模型", "denoising score matching", "去噪分数匹配", "DDPM DDIM"),
+    ("GAN generative adversarial", "生成对抗网络", "discriminator generator", "判别器生成器", "mode collapse"),
+    ("graph neural network GNN", "图神经网络", "message passing", "消息传递", "node edge classification"),
+    ("recurrent network LSTM GRU", "循环网络LSTM GRU", "gating mechanism", "门控机制", "sequence modeling"),
+    ("neural architecture search NAS", "神经架构搜索", "DARTS", "differentiable architecture", "hyperparameter"),
+    ("contrastive learning", "对比学习", "SimCLR CLIP", "positive negative pairs", "representation"),
+    ("federated learning", "联邦学习", "privacy preserving", "隐私保护", "gradient aggregation"),
+    ("continual learning", "持续学习", "catastrophic forgetting", "灾难性遗忘", "replay buffer"),
+    ("meta learning", "元学习", "few-shot learning", "小样本学习", "MAML prototypical network"),
+    ("multimodal learning", "多模态学习", "vision language", "视觉语言", "cross-modal alignment"),
+    ("RLHF", "基于人类反馈强化学习", "reward model", "奖励模型", "preference optimization DPO PPO"),
+    ("model alignment", "模型对齐", "AI safety training", "constitutional AI", "red teaming"),
+    # -- 数据科学细粒度 --
+    ("exploratory data analysis", "探索性数据分析", "distribution visualization", "分布可视化"),
+    ("feature selection", "特征选择", "mutual information", "互信息", "LASSO regularization"),
+    ("dimensionality reduction", "降维", "PCA t-SNE UMAP", "manifold learning", "autoencoders"),
+    ("imbalanced dataset", "不平衡数据集", "SMOTE oversampling", "class weight", "precision recall tradeoff"),
+    ("model interpretability", "模型可解释性", "SHAP LIME", "feature importance", "partial dependence"),
+    ("A/B testing", "A/B测试", "statistical significance", "统计显著性", "p-value power"),
+    ("causal inference", "因果推断", "propensity score", "倾向得分", "instrumental variable causal"),
+    ("data pipeline", "数据管道", "ETL orchestration", "Airflow Luigi", "data lineage"),
+    ("data quality", "数据质量", "anomaly detection", "异常检测", "data validation schema"),
+    ("stream processing", "流处理", "Flink Kafka Streams", "stateful window", "watermark"),
+    ("MLOps", "机器学习运维", "model registry", "模型注册", "drift monitoring", "retraining"),
+    ("AutoML", "自动机器学习", "hyperparameter tuning", "超参数调优", "Optuna Ray Tune"),
+    # -- 生物信息学 --
+    ("sequence alignment", "序列比对", "BLAST", "Smith-Waterman", "pairwise multiple alignment"),
+    ("genome assembly", "基因组拼接", "de novo assembly", "从头拼接", "contig scaffold N50"),
+    ("variant calling", "变异检测", "SNP indel", "单核苷酸多态性", "GATK pipeline"),
+    ("RNA-seq", "转录组测序", "differential expression", "差异表达", "DESeq2 edgeR"),
+    ("single cell sequencing", "单细胞测序", "scRNA-seq", "cell clustering", "trajectory"),
+    ("protein structure prediction", "蛋白质结构预测", "AlphaFold", "homology modeling", "docking"),
+    ("metagenomics", "宏基因组学", "microbiome", "微生物组", "16S rRNA", "taxonomic classification"),
+    ("phylogenetics bioinformatics", "生物信息系统发育", "maximum likelihood", "Bayesian phylogeny", "bootstrap"),
+    # -- 量子计算 --
+    ("qubit", "量子比特", "superposition entanglement", "叠加纠缠", "quantum gate"),
+    ("quantum circuit", "量子电路", "Hadamard CNOT", "量子门", "depth ancilla"),
+    ("quantum algorithm", "量子算法", "Shor Grover", "肖尔格罗弗算法", "speedup"),
+    ("quantum error correction", "量子纠错", "stabilizer code", "稳定子码", "surface code"),
+    ("variational quantum eigensolver VQE", "变分量子本征求解器", "QAOA", "hybrid quantum classical"),
+    ("quantum simulation", "量子模拟", "Hamiltonian simulation", "哈密顿模拟", "chemistry molecule"),
+    ("quantum cryptography", "量子密码", "QKD", "BB84 protocol", "quantum key distribution"),
+    # -- 跨学科新兴领域 --
+    ("digital twin", "数字孪生", "real-time simulation", "实时仿真", "IoT sensor sync"),
+    ("smart city", "智慧城市", "urban computing", "城市计算", "traffic prediction energy"),
+    ("precision agriculture tech", "精准农业技术", "remote sensing crop", "遥感作物监测", "variable rate"),
+    ("telemedicine", "远程医疗", "teleconsultation", "远程会诊", "wearable health monitoring"),
+    ("synthetic biology", "合成生物学", "gene circuit", "基因线路", "BioBricks iGEM"),
+    ("nanotechnology", "纳米技术", "nanoparticle synthesis", "纳米颗粒合成", "carbon nanotube"),
+    ("brain computer interface", "脑机接口", "EEG decoding", "脑电解码", "neural prosthetics"),
+    ("augmented reality", "增强现实", "AR overlay", "虚实融合", "SLAM anchoring"),
+    ("autonomous vehicle", "自动驾驶", "lidar perception", "激光雷达感知", "HD map localization"),
+    ("supply chain resilience", "供应链韧性", "nearshoring reshoring", "近岸回岸", "disruption risk"),
+    ("circular economy", "循环经济", "cradle to cradle", "从摇篮到摇篮", "product lifecycle"),
+    ("social entrepreneurship", "社会创业", "impact measurement", "影响力测量", "B corporation"),
+    ("open source", "开源", "license GPL MIT Apache", "contribution governance", "fork community"),
+    ("data governance", "数据治理", "data catalog", "数据目录", "master data management MDM"),
+    ("privacy engineering", "隐私工程", "GDPR compliance", "data minimization", "anonymization"),
+    ("responsible AI", "负责任AI", "fairness", "公平性", "bias mitigation", "explainability"),
+    ("digital humanities", "数字人文", "text mining", "文本挖掘", "GIS historical", "cultural analytics"),
+    ("computational social science", "计算社会科学", "big data social", "大数据社会研究", "agent-based model"),
+    # ── Batch P end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 材料 / 生医 / 制造 / 物流 ════════════════════════════
+    # ── Batch Q: 材料科学 / 生医工程 / 制造系统 / 物流自动化 ───────────────────────
+    # -- 材料科学细粒度 --
+    ("crystal structure", "晶体结构", "unit cell lattice", "晶胞晶格", "Bravais lattice"),
+    ("metallic alloy", "金属合金", "solid solution", "固溶体", "precipitation hardening", "时效强化"),
+    ("phase diagram", "相图", "eutectic eutectoid", "共晶共析", "lever rule", "杠杆定律"),
+    ("diffusion solid", "固体扩散", "Fick law", "菲克定律", "activation energy diffusion"),
+    ("mechanical testing", "力学测试", "tensile test", "拉伸试验", "hardness Brinell Rockwell Vickers"),
+    ("ceramic material", "陶瓷材料", "sintering", "烧结", "alumina zirconia SiC"),
+    ("composite material", "复合材料", "fiber reinforced", "纤维增强", "matrix interface"),
+    ("polymer material", "高分子材料", "glass transition Tg", "玻璃化转变", "viscoelastic"),
+    ("biomaterial", "生物材料", "biocompatibility", "生物相容性", "scaffold implant"),
+    ("semiconductor material", "半导体材料", "bandgap", "带隙", "doping p-n junction"),
+    ("superconductor material", "超导材料", "critical temperature", "临界温度", "Meissner effect"),
+    ("2D material", "二维材料", "graphene", "石墨烯", "MoS2 h-BN", "van der Waals"),
+    ("smart material", "智能材料", "shape memory alloy", "形状记忆合金", "piezoelectric actuator"),
+    ("coating surface treatment", "涂层表面处理", "PVD CVD", "物理化学气相沉积", "anodizing"),
+    ("failure analysis material", "材料失效分析", "fracture surface", "断口", "fatigue striation"),
+    # -- 生物医学工程 --
+    ("medical imaging system", "医学成像系统", "MRI scanner design", "CT scanner", "PET"),
+    ("biomedical signal", "生物医学信号", "ECG EEG EMG", "心电脑电肌电", "signal denoising"),
+    ("prosthetics orthotics", "假肢矫形器", "exoskeleton", "外骨骼", "socket fitting"),
+    ("drug delivery system", "药物递送系统", "nanoparticle carrier", "纳米载体", "controlled release"),
+    ("microfluidics", "微流控", "lab on chip", "芯片实验室", "droplet generation"),
+    ("biosensor", "生物传感器", "immunosensor", "免疫传感器", "electrochemical biosensor"),
+    ("regenerative medicine", "再生医学", "stem cell scaffold", "干细胞支架", "3D bioprinting"),
+    ("clinical engineering", "临床工程", "medical device regulation", "医疗器械法规", "FDA CE mark"),
+    ("rehabilitation engineering", "康复工程", "assistive technology", "辅助技术", "functional electrical stimulation"),
+    # -- 先进制造 --
+    ("lean manufacturing", "精益制造", "value stream mapping", "价值流图", "kanban pull system"),
+    ("six sigma manufacturing", "六西格玛制造", "DMAIC", "define measure analyze improve control", "DPMO"),
+    ("total productive maintenance TPM", "全面生产维护", "OEE", "设备综合效率", "predictive maintenance"),
+    ("digital factory", "数字工厂", "cyber physical system", "信息物理系统", "MES manufacturing execution"),
+    ("quality management system", "质量管理体系", "ISO 9001", "IATF 16949", "FMEA control plan"),
+    ("industrial automation", "工业自动化", "PLC SCADA", "可编程控制器监控", "HMI fieldbus"),
+    ("collaborative robot cobot", "协作机器人", "force torque sensor", "力矩传感器", "human robot safety"),
+    ("precision manufacturing", "精密制造", "tolerance stack", "公差叠加", "surface roughness Ra"),
+    ("casting forging", "铸造锻造", "die casting", "压铸", "hot cold forging", "热冷锻"),
+    ("injection molding", "注塑成型", "mold design", "模具设计", "cycle time gate"),
+    ("sheet metal forming", "钣金成形", "stamping bending", "冲压弯曲", "springback compensation"),
+    # -- 物流与供应链细粒度 --
+    ("warehouse management", "仓库管理", "WMS picking packing", "拣选打包", "slotting optimization"),
+    ("demand forecasting", "需求预测", "time series ARIMA", "时间序列ARIMA", "forecast accuracy MAPE"),
+    ("transportation optimization", "运输优化", "VRP vehicle routing", "车辆路径问题", "last mile delivery"),
+    ("cold chain", "冷链", "temperature controlled", "温控物流", "refrigerated transport"),
+    ("reverse logistics", "逆向物流", "returns management", "退货管理", "remanufacturing"),
+    ("port terminal", "港口码头", "container handling", "集装箱作业", "berth scheduling"),
+    ("freight forwarding", "货运代理", "incoterms", "贸易条款", "customs clearance"),
+    ("intermodal transport", "多式联运", "rail sea air", "铁海空联运", "transshipment"),
+    ("blockchain supply chain", "区块链供应链", "traceability", "可追溯性", "smart contract provenance"),
+    # ── Batch Q end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 统计 / 运筹 / 金融工程 / 信息系统 ═══════════════════════
+    # ── Batch R: 统计学 / 运筹学 / 金融工程 / 管理信息系统 ───────────────────────
+    # -- 统计学细粒度 --
+    ("Bayesian statistics", "贝叶斯统计", "prior posterior", "先验后验", "MCMC sampling"),
+    ("hypothesis testing", "假设检验", "Type I II error", "第一二类错误", "power sample size"),
+    ("regression analysis", "回归分析", "logistic regression", "逻辑回归", "GLM generalized linear"),
+    ("ANOVA", "方差分析", "F-test", "F检验", "factorial design", "interaction effect"),
+    ("nonparametric statistics", "非参数统计", "Wilcoxon Mann Whitney", "秩和检验", "bootstrap"),
+    ("multivariate statistics", "多元统计", "cluster analysis", "聚类分析", "discriminant analysis"),
+    ("time series statistics", "时间序列统计", "ARIMA seasonal", "季节性ARIMA", "GARCH volatility"),
+    ("structural equation modeling SEM", "结构方程模型", "path diagram", "路径图", "CFA EFA"),
+    ("missing data", "缺失数据", "multiple imputation", "多重填补", "MCAR MAR MNAR"),
+    ("statistical learning theory", "统计学习理论", "VC dimension", "bias-variance", "PAC learning"),
+    # -- 运筹学细粒度 --
+    ("stochastic programming", "随机规划", "scenario tree", "情景树", "recourse"),
+    ("network flow", "网络流", "max flow min cut", "最大流最小割", "assignment transportation"),
+    ("queuing theory", "排队论", "M/M/1 M/G/1", "服务台", "Little law", "waiting time"),
+    ("simulation operations", "运筹仿真", "discrete event simulation", "离散事件仿真", "Arena SimPy"),
+    ("heuristic metaheuristic", "启发式元启发式", "genetic algorithm", "遗传算法", "simulated annealing tabu"),
+    ("multi-objective optimization", "多目标优化", "Pareto front", "帕累托前沿", "NSGA-II"),
+    ("robust optimization", "鲁棒优化", "uncertainty set", "不确定集合", "minimax regret"),
+    ("supply chain optimization", "供应链优化", "facility location", "设施选址", "inventory routing"),
+    ("scheduling operations research", "生产调度", "job shop flow shop", "作业流水线调度", "makespan"),
+    # -- 金融工程细粒度 --
+    ("option pricing", "期权定价", "Black Scholes Merton", "BSM模型", "Greeks delta gamma vega"),
+    ("interest rate model", "利率模型", "Vasicek Hull-White", "利率均值回归", "yield curve fitting"),
+    ("credit risk model", "信用风险模型", "structural reduced form", "结构简约模型", "CDS CDO"),
+    ("Monte Carlo finance", "金融蒙特卡洛", "variance reduction", "方差减少", "quasi-random"),
+    ("algorithmic trading", "算法交易", "market microstructure", "市场微观结构", "order book"),
+    ("high frequency trading", "高频交易", "latency arbitrage", "延迟套利", "colocation"),
+    ("factor model", "因子模型", "Fama French", "因子暴露", "alpha generation"),
+    ("backtesting", "回测", "look-ahead bias", "未来函数", "transaction cost slippage"),
+    ("risk parity", "风险平价", "volatility targeting", "波动率目标", "drawdown management"),
+    ("structured product", "结构化产品", "principal protection", "保本", "knock-in barrier"),
+    # -- 管理信息系统 --
+    ("enterprise resource planning ERP", "企业资源计划", "SAP Oracle", "module integration", "go-live"),
+    ("customer relationship management CRM", "客户关系管理", "Salesforce", "lead pipeline", "churn"),
+    ("business intelligence BI", "商业智能", "dashboard KPI", "仪表盘关键指标", "self-service analytics"),
+    ("decision support system", "决策支持系统", "OLAP", "what-if analysis", "sensitivity"),
+    ("IT governance", "IT治理", "COBIT ITIL", "IT服务管理", "audit compliance"),
+    ("enterprise architecture", "企业架构", "TOGAF", "Zachman framework", "capability map"),
+    ("information security management", "信息安全管理", "ISO 27001", "ISMS", "risk treatment"),
+    ("digital transformation", "数字化转型", "change roadmap", "技术路线图", "legacy modernization IT"),
+    ("e-commerce platform", "电子商务平台", "marketplace", "市场平台", "payment gateway checkout"),
+    ("EHR electronic health records", "电子健康档案", "HL7 FHIR", "interoperability", "clinical workflow"),
+    # ── Batch R end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 人文地理 / 政治 / 国际关系 / 传统文化 ════════════════
+    # ── Batch S: 地理 / 政治学 / 国际关系 / 宗教 / 文化遗产 ──────────────────────
+    # -- 人文与经济地理 --
+    ("human geography", "人文地理", "population distribution", "人口分布", "migration push pull"),
+    ("economic geography", "经济地理", "agglomeration", "集聚", "industrial cluster", "location theory"),
+    ("regional development", "区域发展", "core periphery", "中心外围", "uneven development"),
+    ("GIS geographic information", "地理信息系统", "spatial analysis", "空间分析", "raster vector"),
+    ("remote sensing", "遥感", "satellite imagery", "卫星影像", "NDVI land cover classification"),
+    ("cartography", "制图学", "map projection", "地图投影", "thematic map choropleth"),
+    ("cultural landscape", "文化景观", "place identity", "地方认同", "heritage landscape"),
+    ("political geography", "政治地理学", "territory borders", "领土边界", "geopolitics"),
+    ("urban geography", "城市地理", "urban sprawl", "城市蔓延", "metropolitan area"),
+    ("transport geography", "交通地理", "accessibility network", "可达性网络", "mobility"),
+    # -- 政治学细粒度 --
+    ("comparative politics", "比较政治学", "regime type", "政体类型", "democracy authoritarianism"),
+    ("electoral systems", "选举制度", "proportional representation", "比例代表制", "majoritarian"),
+    ("public policy", "公共政策", "policy cycle", "政策周期", "agenda setting implementation"),
+    ("bureaucracy", "官僚机构", "public administration", "公共行政", "new public management"),
+    ("federalism", "联邦制", "devolution", "权力下放", "intergovernmental relations"),
+    ("political parties", "政党", "party system", "政党体系", "ideology spectrum"),
+    ("civil society", "公民社会", "NGO", "非政府组织", "social movement mobilization"),
+    ("democratic theory", "民主理论", "deliberative democracy", "协商民主", "participatory"),
+    ("authoritarianism", "威权主义", "hybrid regime", "混合政体", "resilient autocracy"),
+    ("political economy", "政治经济学", "state market", "国家市场关系", "varieties of capitalism"),
+    # -- 国际关系 --
+    ("international relations theory", "国际关系理论", "realism liberalism constructivism", "现实建构主义"),
+    ("diplomacy", "外交", "bilateral multilateral", "双边多边", "protocol negotiation"),
+    ("international security", "国际安全", "deterrence", "威慑", "arms control", "nuclear proliferation"),
+    ("regional integration", "区域一体化", "EU ASEAN", "欧盟东盟", "free trade area customs union"),
+    ("international organizations", "国际组织", "UN World Bank IMF", "联合国世界银行", "mandate"),
+    ("humanitarian intervention", "人道主义干预", "R2P responsibility to protect", "保护责任"),
+    ("foreign policy analysis", "外交政策分析", "decision making", "决策", "national interest"),
+    ("global governance", "全球治理", "multilateralism", "多边主义", "regime complex"),
+    ("conflict resolution", "冲突解决", "peacebuilding", "和平建设", "mediation negotiation"),
+    ("development aid", "发展援助", "ODA", "官方发展援助", "conditionality ownership"),
+    # -- 宗教与文化 --
+    ("Christianity", "基督教", "Protestant Catholic", "新教天主教", "theology liturgy"),
+    ("Islam", "伊斯兰教", "Quran Hadith", "古兰经圣训", "Sunni Shia", "Sharia"),
+    ("Buddhism", "佛教", "dharma karma", "法业", "Theravada Mahayana", "meditation"),
+    ("Hinduism", "印度教", "Vedas Upanishads", "吠陀", "karma dharma moksha"),
+    ("Judaism", "犹太教", "Torah Talmud", "摩西律法", "synagogue rabbi"),
+    ("Confucianism ethics", "儒家伦理", "ren yi li", "仁义礼", "filial piety", "five relationships"),
+    ("Taoism practice", "道家实践", "wu wei", "无为", "Tao Te Ching", "Zhuangzi"),
+    ("folk religion", "民间宗教", "ancestor worship", "祖先崇拜", "ritual ceremony"),
+    ("religious studies", "宗教学", "comparative religion", "比较宗教", "sacred profane"),
+    ("mythology", "神话学", "creation myth", "创世神话", "hero myth Campbell"),
+    # -- 传统文化 / 非遗 --
+    ("Chinese traditional arts", "中国传统艺术", "calligraphy", "书法", "seal carving", "篆刻"),
+    ("Chinese painting", "中国画", "ink wash", "水墨画", "landscape gongbi", "山水工笔"),
+    ("Chinese ceramics", "中国陶瓷", "porcelain", "瓷器", "glaze technique", "kiln"),
+    ("Chinese opera", "中国戏曲", "Peking opera", "京剧", "kunqu", "昆曲", "role types"),
+    ("tea culture", "茶文化", "tea ceremony", "茶道", "oolong green pu-erh", "brewing"),
+    ("traditional festival", "传统节日", "lunar new year", "春节", "Mid-Autumn", "Dragon Boat"),
+    ("martial arts", "武术", "tai chi", "太极", "kung fu", "功夫", "wushu forms"),
+    ("Chinese medicine herbs", "中药", "herbal formula", "方剂", "tonify nourish", "decoction"),
+    ("traditional textile", "传统纺织", "silk weaving", "丝织", "embroidery", "刺绣", "brocade"),
+    # ── Batch S end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工程管理 / 质量 / 职业 / 标准化 ══════════════════════
+    # ── Batch T: 项目管理 / 质量体系 / 职业发展 / 标准规范 ────────────────────────
+    # -- 项目管理细粒度 --
+    ("PMP project management professional", "项目管理专业人士", "PMBOK", "knowledge areas"),
+    ("agile scrum", "敏捷Scrum", "sprint planning", "冲刺计划", "backlog grooming", "velocity"),
+    ("kanban board", "看板", "WIP limit", "在制品限制", "flow metrics", "cycle time"),
+    ("SAFe scaled agile", "大规模敏捷", "PI planning", "项目增量计划", "train"),
+    ("risk register", "风险登记册", "risk matrix", "风险矩阵", "mitigation contingency"),
+    ("project charter", "项目章程", "scope statement", "范围说明书", "WBS breakdown"),
+    ("earned value management", "挣值管理", "SPI CPI", "进度成本绩效", "forecast EAC"),
+    ("stakeholder management", "干系人管理", "engagement matrix", "参与度矩阵", "communication plan"),
+    ("program portfolio management", "项目群组合管理", "strategic alignment", "资源优先级"),
+    ("project closure", "项目收尾", "lessons learned", "经验教训", "handover documentation"),
+    # -- 质量管理细粒度 --
+    ("statistical process control SPC", "统计过程控制", "control chart", "控制图", "Xbar R chart"),
+    ("measurement system analysis MSA", "测量系统分析", "gauge R&R", "量具重复性再现性", "bias linearity"),
+    ("design of experiments DOE", "实验设计", "factorial experiment", "因子实验", "response surface"),
+    ("quality function deployment QFD", "质量功能展开", "house of quality", "质量屋", "VOC"),
+    ("8D problem solving", "8D问题解决", "root cause corrective action", "纠正措施", "D1-D8"),
+    ("poka yoke mistake proofing", "防错法", "error proofing", "差错预防", "jidoka"),
+    ("product lifecycle management PLM", "产品生命周期管理", "design release", "设计发布", "ECO"),
+    ("supplier quality", "供应商质量", "PPAP", "生产件批准程序", "incoming inspection"),
+    ("calibration laboratory", "计量校准", "traceability", "溯源性", "uncertainty measurement"),
+    # -- 标准与规范 --
+    ("ISO standard", "ISO标准", "management system standard", "管理体系标准", "certification audit"),
+    ("IEC standard", "IEC标准", "electrical safety", "电气安全", "functional safety IEC 61508"),
+    ("IEEE standard", "IEEE标准", "technical specification", "技术规范", "interoperability"),
+    ("ASTM standard", "ASTM标准", "material testing standard", "材料测试标准", "specification"),
+    ("building code", "建筑规范", "fire safety", "消防安全", "accessibility ADA"),
+    ("food safety standard", "食品安全标准", "HACCP", "危害分析关键控制点", "GMP"),
+    ("GMP good manufacturing practice", "良好生产规范", "pharmaceutical manufacturing", "药品生产"),
+    ("cybersecurity framework", "网络安全框架", "NIST CSF", "CIS controls", "risk management"),
+    # -- 职业发展与软技能 --
+    ("leadership", "领导力", "transformational transactional", "变革型交易型领导", "servant leadership"),
+    ("negotiation", "谈判", "BATNA", "最佳替代方案", "win-win integrative"),
+    ("conflict management", "冲突管理", "mediation arbitration", "调解仲裁", "de-escalation"),
+    ("presentation skills", "演讲技能", "storytelling", "故事叙述", "audience engagement"),
+    ("critical thinking", "批判性思维", "logical fallacy", "逻辑谬误", "argument evaluation"),
+    ("creativity innovation", "创造力创新", "design thinking", "设计思维", "brainstorming ideation"),
+    ("emotional intelligence", "情绪智力", "EQ", "empathy", "self-regulation social skills"),
+    ("time management", "时间管理", "prioritization", "优先级", "GTD Pomodoro"),
+    ("networking professional", "职业网络", "mentoring", "导师制", "LinkedIn professional"),
+    ("technical writing", "技术写作", "documentation", "文档撰写", "user manual specification"),
+    ("career development", "职业发展", "competency framework", "能力框架", "performance review"),
+    # -- 工业安全与健康 --
+    ("occupational safety", "职业安全", "OSHA", "hazard identification", "PPE protective equipment"),
+    ("ergonomics workplace", "工作场所人体工程学", "repetitive strain", "重复性损伤", "workstation design"),
+    ("fire safety", "消防安全", "evacuation plan", "疏散计划", "sprinkler system"),
+    ("chemical safety", "化学品安全", "SDS safety data sheet", "MSDS", "GHS labeling"),
+    ("radiation safety", "辐射安全", "dosimetry", "剂量测定", "shielding ALARA"),
+    ("emergency management", "应急管理", "business continuity", "业务连续性", "disaster recovery"),
+    # ── Batch T end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 体育 / 营养 / 心理健康 / 教育技术 ═════════════════════
+    # ── Batch U: 体育科学 / 营养学 / 心理健康 / 教育技术 / 经典通识 ──────────────
+    # -- 体育与运动科学 --
+    ("exercise physiology", "运动生理学", "VO2 max", "最大摄氧量", "lactate threshold anaerobic"),
+    ("sports biomechanics", "运动生物力学", "gait analysis", "步态分析", "force plate kinematic"),
+    ("strength conditioning", "力量体能训练", "periodization", "周期化", "progressive overload"),
+    ("sports nutrition", "运动营养", "carbohydrate loading", "糖原填充", "protein recovery"),
+    ("injury prevention", "运动损伤预防", "prehabilitation", "预防性康复", "proprioception"),
+    ("sports psychology", "运动心理学", "mental toughness", "心理韧性", "visualization imagery"),
+    ("team sports tactics", "团队运动战术", "formation pressing", "阵型高压", "set piece"),
+    ("individual sports", "个人运动", "technique refinement", "技术精化", "periodized training"),
+    ("swimming technique", "游泳技术", "stroke mechanics", "划水技术", "turn start"),
+    ("track field athletics", "田径", "sprint endurance", "短跑耐力", "high jump technique"),
+    # -- 营养学细粒度 --
+    ("macronutrient", "宏量营养素", "carbohydrate protein fat", "碳水蛋白质脂肪", "energy balance"),
+    ("micronutrient", "微量营养素", "vitamin mineral", "维生素矿物质", "deficiency supplementation"),
+    ("dietary assessment", "膳食评估", "24h recall", "24小时回顾", "food frequency questionnaire"),
+    ("clinical nutrition", "临床营养", "enteral parenteral", "肠内肠外营养", "malnutrition screening"),
+    ("pediatric nutrition", "儿童营养", "breastfeeding", "母乳喂养", "complementary feeding"),
+    ("geriatric nutrition", "老年营养", "sarcopenia", "肌少症", "protein requirement elderly"),
+    ("weight management", "体重管理", "caloric deficit", "热量亏缺", "BMI body composition"),
+    ("functional food", "功能性食品", "probiotic prebiotic", "益生菌益生元", "bioactive compound"),
+    ("food safety nutrition", "食品安全营养", "food allergy intolerance", "食物过敏不耐受"),
+    # -- 心理健康细粒度 --
+    ("stress management", "压力管理", "mindfulness", "正念", "relaxation technique"),
+    ("burnout", "职业倦怠", "compassion fatigue", "同情疲劳", "recovery boundary"),
+    ("trauma PTSD", "创伤PTSD", "trauma informed care", "创伤知情照护", "EMDR therapy"),
+    ("grief bereavement", "悲痛丧亲", "stages of grief", "悲伤阶段", "complicated grief"),
+    ("eating disorder", "饮食障碍", "anorexia bulimia", "厌食贪食", "body image"),
+    ("sleep disorder", "睡眠障碍", "insomnia apnea", "失眠睡眠呼吸暂停", "CBT-I"),
+    ("ADHD", "注意缺陷多动障碍", "executive function", "执行功能", "attention regulation"),
+    ("autism spectrum", "自闭症谱系", "ASD", "social communication", "sensory processing"),
+    # -- 教育技术细粒度 --
+    ("instructional design", "教学设计", "ADDIE model", "分析设计开发实施评价", "Dick Carey"),
+    ("learning management system LMS", "学习管理系统", "Moodle Canvas Blackboard", "course delivery"),
+    ("gamification learning", "学习游戏化", "badge leaderboard", "徽章排行榜", "motivation"),
+    ("adaptive learning", "自适应学习", "intelligent tutoring system", "智能辅导系统", "mastery path"),
+    ("assessment technology", "技术支持评估", "formative summative", "形成性总结性评价", "rubric"),
+    ("virtual classroom", "虚拟课堂", "synchronous asynchronous", "同步异步学习", "engagement"),
+    ("open educational resources OER", "开放教育资源", "Creative Commons", "知识共享", "remix"),
+    ("learning analytics", "学习分析", "engagement prediction", "参与度预测", "at-risk student"),
+    # -- 经典通识与跨学科素养 --
+    ("design thinking process", "设计思维流程", "empathize define ideate prototype test", "同理心定义"),
+    ("scientific method", "科学方法", "observation hypothesis", "观察假设", "experiment replication"),
+    ("first principles thinking", "第一性原理思维", "fundamental assumption", "基本假设", "decompose"),
+    ("network science", "网络科学", "small world", "小世界", "scale free", "degree distribution"),
+    ("complexity science", "复杂性科学", "emergence self-organization", "涌现自组织", "adaptive"),
+    ("cognitive science", "认知科学", "mental model", "心智模型", "bounded rationality", "heuristic"),
+    ("science technology society STS", "科学技术社会", "sociotechnical", "社会技术", "expert knowledge"),
+    ("futures studies", "未来学", "scenario planning", "情景规划", "trend weak signal"),
+    ("interdisciplinary research", "跨学科研究", "transdisciplinary", "超学科", "boundary object"),
+    # ── Batch U end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 通信 / 芯片 / 嵌入式 / 物联网 ════════════════════════
+    # ── Batch V: 通信协议 / 芯片设计 / 嵌入式 / 物联网 / 边缘计算 ─────────────────
+    # -- 通信协议细粒度 --
+    ("OFDM", "正交频分复用", "subcarrier", "子载波", "cyclic prefix", "FFT IFFT"),
+    ("MIMO antenna", "多输入多输出天线", "spatial multiplexing", "空间复用", "beamforming precoding"),
+    ("channel estimation", "信道估计", "pilot sequence", "导频序列", "least squares MMSE"),
+    ("error correction coding", "纠错编码", "turbo code", "Turbo码", "LDPC polar code"),
+    ("spread spectrum", "扩频", "CDMA", "码分多址", "PN sequence", "DSSS FHSS"),
+    ("LTE 4G", "4G LTE", "eNodeB", "基站", "EPC core", "handover mobility"),
+    ("5G NR", "5G新空口", "gNB", "5G基站", "FR1 FR2", "numerology subcarrier spacing"),
+    ("optical fiber", "光纤", "SMF MMF", "单多模光纤", "WDM DWDM wavelength"),
+    ("satellite communication", "卫星通信", "Starlink LEO constellation", "低轨卫星", "latency coverage"),
+    ("software radio", "软件无线电", "SDR", "USRP", "GNU Radio", "flexible waveform"),
+    ("cognitive radio", "认知无线电", "spectrum sensing", "频谱感知", "dynamic access"),
+    ("visible light communication", "可见光通信", "LiFi", "LED modulation", "indoor positioning"),
+    # -- 芯片设计 --
+    ("RTL design", "RTL设计", "register transfer level", "寄存器传输级", "synthesis timing"),
+    ("VLSI layout", "VLSI版图", "standard cell", "标准单元", "place route sign-off"),
+    ("timing analysis", "时序分析", "setup hold", "建立保持时间", "slack violation"),
+    ("power analysis chip", "芯片功耗分析", "dynamic static power", "动静态功耗", "power gating"),
+    ("memory design", "存储器设计", "SRAM DRAM FLASH", "bitcell array", "sense amplifier"),
+    ("analog IC design", "模拟集成电路设计", "bias circuit", "偏置电路", "noise floor"),
+    ("mixed signal", "混合信号", "ADC DAC", "模数数模转换", "sigma-delta SAR"),
+    ("processor architecture", "处理器架构", "pipeline hazard", "流水线冒险", "out-of-order superscalar"),
+    ("cache hierarchy", "缓存层次", "L1 L2 L3", "cache coherence", "MESI protocol"),
+    ("SoC system on chip", "片上系统", "IP integration", "IP核集成", "bus AXI AHB"),
+    ("silicon photonics", "硅光子", "optical interconnect", "光互连", "modulator detector"),
+    ("chiplet", "小芯片", "heterogeneous integration", "异构集成", "UCIe die-to-die"),
+    # -- 嵌入式系统细粒度 --
+    ("bare metal programming", "裸机编程", "startup code", "启动代码", "linker script", "HAL"),
+    ("RTOS scheduling", "RTOS调度", "FreeRTOS Zephyr", "task priority", "preemptive"),
+    ("bootloader", "引导程序", "U-Boot", "firmware update", "OTA over the air"),
+    ("low power design embedded", "嵌入式低功耗设计", "sleep mode", "休眠模式", "wake-up source"),
+    ("memory map", "内存映射", "peripheral register", "外设寄存器", "DMA transfer"),
+    ("watchdog timer", "看门狗定时器", "reset recovery", "复位恢复", "safety monitor"),
+    ("communication interface", "通信接口", "UART SPI I2C", "CAN RS485", "protocol driver"),
+    ("functional safety embedded", "嵌入式功能安全", "IEC 61508 ISO 26262", "ASIL", "diagnostic coverage"),
+    # -- 物联网细粒度 --
+    ("IoT protocol", "物联网协议", "MQTT CoAP", "发布订阅", "Zigbee Z-Wave LoRa"),
+    ("IoT security", "物联网安全", "device authentication", "设备认证", "TLS certificate"),
+    ("edge computing", "边缘计算", "edge server", "边缘服务器", "latency offload"),
+    ("IoT platform", "物联网平台", "AWS IoT Azure IoT", "device twin shadow", "telemetry"),
+    ("industrial IoT IIoT", "工业物联网", "OPC-UA", "SCADA integration", "predictive maintenance"),
+    ("smart home", "智能家居", "home automation", "家庭自动化", "Matter protocol"),
+    ("wearable device", "可穿戴设备", "health sensor", "健康传感器", "BLE Bluetooth LE"),
+    ("asset tracking", "资产追踪", "RFID GPS beacon", "射频识别", "real-time location"),
+    # ── Batch V end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 林业 / 食品科学 / 生态农业 / 水产深化 ════════════════
+    # ── Batch W: 林业 / 食品科学 / 生态农业 / 渔业水产 ──────────────────────────
+    # -- 林业与森林科学 --
+    ("silviculture", "造林学", "reforestation planting", "植树造林", "stand management"),
+    ("forest ecology", "森林生态学", "canopy structure", "冠层结构", "succession climax"),
+    ("forest inventory", "森林调查", "tree diameter basal area", "胸径基面积", "stand volume"),
+    ("dendrometry", "树木测量学", "growth ring", "年轮", "increment borer", "biomass estimation"),
+    ("forest hydrology", "森林水文", "interception evapotranspiration", "截留蒸散", "watershed"),
+    ("forest fire management", "森林防火管理", "prescribed burn", "计划烧除", "fire behavior"),
+    ("timber harvesting", "木材采伐", "clearcut selective logging", "皆伐择伐", "skidder"),
+    ("wood science", "木材科学", "lumber grading", "木材分级", "moisture content shrinkage"),
+    ("agroforestry", "农林复合", "alley cropping", "间作", "windbreak shelterbelt"),
+    ("urban forestry", "城市林业", "street tree", "行道树", "ecosystem services urban"),
+    ("carbon sequestration forest", "森林碳汇", "REDD+", "减少毁林", "biomass carbon stock"),
+    ("forest certification", "森林认证", "FSC PEFC", "可持续林业认证", "chain of custody"),
+    # -- 食品科学细粒度 --
+    ("food chemistry", "食品化学", "Maillard reaction", "美拉德反应", "lipid oxidation"),
+    ("food microbiology", "食品微生物学", "spoilage pathogen", "腐败致病菌", "pasteurization"),
+    ("food processing technology", "食品加工技术", "extrusion", "挤压膨化", "spray drying"),
+    ("food preservation", "食品保藏", "modified atmosphere", "气调保鲜", "vacuum packaging"),
+    ("food sensory", "食品感官", "texture analysis", "质构分析", "flavor profile", "panel test"),
+    ("food packaging", "食品包装", "barrier property", "阻隔性", "active packaging"),
+    ("fermentation food", "食品发酵", "lactic acid bacteria", "乳酸菌", "yeast sourdough"),
+    ("plant based protein", "植物基蛋白", "meat analogue", "植物肉", "extrusion texturize"),
+    ("food allergy labeling", "食品过敏原标识", "Big 8 allergens", "八大过敏原", "cross contact"),
+    ("infant formula", "婴幼儿配方食品", "DHA ARA", "营养强化", "regulatory compliance"),
+    ("food authenticity", "食品真实性", "adulteration detection", "掺假检测", "DNA barcoding"),
+    # -- 生态农业与可持续农业 --
+    ("organic farming", "有机农业", "organic certification", "有机认证", "input restriction"),
+    ("permaculture", "朴门永续", "zone design", "功能区设计", "polyculture guild"),
+    ("regenerative agriculture", "再生农业", "soil health building", "土壤健康修复", "no-till"),
+    ("conservation agriculture", "保护性农业", "minimum tillage", "少耕", "crop residue"),
+    ("cover crop", "覆盖作物", "green manure", "绿肥", "nitrogen fixation legume"),
+    ("biodynamic farming", "生物动力农业", "lunar calendar", "月历", "preparation compost"),
+    ("food sovereignty", "粮食主权", "seed saving", "留种", "local variety"),
+    ("farmer field school", "农民田间学校", "participatory research", "参与式研究", "extension"),
+    ("climate smart agriculture", "气候智慧农业", "adaptation mitigation", "适应减缓", "resilient"),
+    # -- 渔业与水产细粒度 --
+    ("fisheries management", "渔业管理", "total allowable catch TAC", "总可捕量", "quota system"),
+    ("stock assessment", "种群评估", "catch per unit effort CPUE", "单位努力渔获量", "biomass model"),
+    ("fishing gear", "渔具", "trawl longline gillnet", "拖网延绳钓刺网", "bycatch reduction"),
+    ("mariculture", "海水养殖", "seaweed kelp", "海藻海带", "shellfish oyster mussel"),
+    ("freshwater aquaculture", "淡水养殖", "carp tilapia catfish", "鲤鱼罗非鱼鲶鱼", "pond management"),
+    ("recirculating aquaculture system RAS", "循环水养殖系统", "biofilter", "生物过滤", "water quality"),
+    ("fish health", "鱼类健康", "disease diagnosis", "病害诊断", "biosecurity", "vaccination"),
+    ("aquafeed", "水产饲料", "fishmeal reduction", "降低鱼粉用量", "novel protein insect algae"),
+    ("blue economy", "蓝色经济", "ocean resource", "海洋资源", "sustainable fisheries"),
+    # ── Batch W end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 保险 / 税务 / 房地产 / 审计深度 ═══════════════════════
+    # ── Batch X: 保险精算 / 税务规划 / 房地产 / 审计深度 ─────────────────────────
+    # -- 保险与精算 --
+    ("life insurance", "人寿保险", "whole term universal", "终身定期万能险", "policy reserve"),
+    ("health insurance", "健康保险", "premium deductible copay", "保费免赔额自付比", "claims adjudication"),
+    ("property casualty insurance", "财产意外险", "underwriting", "核保", "loss ratio combined ratio"),
+    ("reinsurance", "再保险", "treaty facultative", "合同临时再保", "cession retention"),
+    ("actuarial science", "精算学", "mortality table", "生命表", "reserve valuation"),
+    ("annuity", "年金", "deferred immediate", "延期即期年金", "present value life contingency"),
+    ("catastrophe modeling", "巨灾模型", "probable maximum loss PML", "自然灾害风险"),
+    ("insurance regulation", "保险监管", "solvency II", "偿付能力", "RBC risk based capital"),
+    ("insurtech", "保险科技", "parametric insurance", "参数保险", "telematics UBI"),
+    # -- 税务规划 --
+    ("corporate tax", "企业所得税", "effective tax rate", "实际税率", "deferred tax liability"),
+    ("value added tax VAT", "增值税", "input output tax", "进项销项税", "VAT return"),
+    ("transfer pricing", "转让定价", "arm's length principle", "独立交易原则", "documentation"),
+    ("tax treaty", "税收协定", "double taxation", "双重征税", "withholding tax relief"),
+    ("estate tax inheritance", "遗产税", "gift tax", "赠与税", "estate planning trust"),
+    ("tax planning strategy", "税务筹划策略", "tax deferral", "税款递延", "entity structure"),
+    ("customs duty", "关税", "tariff classification", "商品编号", "rules of origin"),
+    ("international tax BEPS", "国际税收BEPS", "base erosion profit shifting", "税基侵蚀利润转移"),
+    ("R&D tax credit", "研发税收优惠", "patent box", "专利盒", "innovation incentive"),
+    # -- 房地产细粒度 --
+    ("property valuation", "房产估值", "comparable sales", "可比交易法", "income capitalization"),
+    ("real estate investment trust REIT", "房地产投资信托", "NAV", "净资产价值", "distribution yield"),
+    ("commercial real estate", "商业地产", "office retail industrial", "办公零售工业", "NOI cap rate"),
+    ("residential real estate", "住宅地产", "mortgage origination", "按揭贷款", "LTV debt to income"),
+    ("property development", "房地产开发", "feasibility study", "可行性研究", "pro forma cash flow"),
+    ("real estate finance", "房地产金融", "CMBS", "商业抵押支持证券", "mezzanine debt"),
+    ("land use planning", "土地利用规划", "zoning", "分区规划", "density floor area ratio"),
+    ("property management", "物业管理", "tenant lease", "租户租约", "maintenance repair"),
+    ("green building", "绿色建筑", "LEED BREEAM", "能效认证", "net zero energy building"),
+    # -- 审计与治理深度 --
+    ("risk based audit", "风险导向审计", "inherent risk control risk", "固有风险控制风险", "materiality"),
+    ("IT audit", "IT审计", "access control review", "访问控制审查", "COBIT framework"),
+    ("internal control framework", "内部控制框架", "COSO", "control environment activity"),
+    ("audit evidence", "审计证据", "assertion", "认定", "sufficiency appropriateness"),
+    ("going concern", "持续经营", "doubt indicator", "疑虑迹象", "management response"),
+    ("fraud audit", "舞弊审计", "red flag", "红旗警示", "Benford law", "data analytics audit"),
+    ("public sector audit", "公共部门审计", "value for money", "物有所值", "performance audit"),
+    ("audit report", "审计报告", "opinion qualified adverse disclaimer", "保留否定无法表示意见"),
+    ("ESG audit", "ESG审计", "sustainability assurance", "可持续发展鉴证", "TCFD ISSB"),
+    # -- 电子商务细粒度 --
+    ("marketplace economics", "市场平台经济", "network effect", "网络效应", "two-sided platform"),
+    ("conversion rate optimization", "转化率优化", "landing page", "着陆页", "A/B funnel"),
+    ("customer acquisition cost", "获客成本", "CAC LTV ratio", "生命周期价值", "retention cohort"),
+    ("cross-border e-commerce", "跨境电商", "customs compliance", "清关合规", "localisation"),
+    ("dropshipping", "无货源模式", "fulfillment", "履单", "supplier relations"),
+    ("subscription commerce", "订阅制商业", "MRR ARR", "月经常性收入", "churn rate renewal"),
+    ("social commerce", "社交电商", "live streaming shopping", "直播带货", "KOL partnership"),
+    # ── Batch X end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 医学专科 / 药学 / 公卫深度 ═══════════════════════════
+    # ── Batch Y: 医学专科细分 / 药学 / 公共卫生 / 基础医学 ─────────────────────
+    # -- 心血管细粒度 --
+    ("cardiac electrophysiology", "心脏电生理", "arrhythmia ablation", "心律失常消融", "EP study"),
+    ("interventional cardiology", "介入心脏病学", "PCI angioplasty", "经皮冠脉介入", "stent"),
+    ("heart failure", "心力衰竭", "ejection fraction EF", "射血分数", "BNP NT-proBNP"),
+    ("hypertension management", "高血压管理", "antihypertensive", "降压药", "target organ damage"),
+    ("lipid management", "血脂管理", "statin", "他汀类药物", "LDL-C reduction"),
+    ("echocardiography", "超声心动图", "Doppler", "多普勒", "valvular disease"),
+    # -- 神经内外科细粒度 --
+    ("ischemic stroke", "缺血性卒中", "thrombolysis tPA", "溶栓", "thrombectomy"),
+    ("hemorrhagic stroke", "出血性卒中", "intracerebral hemorrhage", "脑内出血", "ICP management"),
+    ("neurodegenerative disease", "神经退行性疾病", "Alzheimer tau amyloid", "阿尔茨海默病"),
+    ("epilepsy treatment", "癫痫治疗", "AED antiepileptic drug", "抗癫痫药", "VNS DBS"),
+    ("spinal surgery", "脊柱外科", "disc herniation", "椎间盘突出", "fusion decompression"),
+    ("brain tumor", "脑肿瘤", "glioblastoma", "胶质母细胞瘤", "temozolomide radiation"),
+    # -- 肿瘤学细粒度 --
+    ("solid tumor oncology", "实体瘤肿瘤学", "staging TNM", "TNM分期", "resection margin"),
+    ("hematological malignancy", "血液恶性肿瘤", "leukemia lymphoma myeloma", "白血病淋巴瘤骨髓瘤"),
+    ("immunotherapy cancer", "肿瘤免疫治疗", "checkpoint inhibitor", "免疫检查点抑制剂", "PD-1 PD-L1"),
+    ("targeted therapy", "靶向治疗", "tyrosine kinase inhibitor TKI", "酪氨酸激酶抑制剂", "EGFR ALK"),
+    ("CAR-T therapy", "CAR-T细胞治疗", "chimeric antigen receptor", "嵌合抗原受体", "cytokine storm"),
+    ("cancer screening", "癌症筛查", "mammography colonoscopy", "乳腺钼靶肠镜", "biomarker"),
+    # -- 骨科 / 运动医学 --
+    ("orthopedic surgery", "骨科手术", "fracture fixation", "骨折固定", "arthroplasty replacement"),
+    ("joint replacement", "关节置换", "THA TKA", "全髋全膝关节置换", "implant biomechanics"),
+    ("sports medicine", "运动医学", "ligament reconstruction", "韧带重建", "ACL MCL repair"),
+    ("bone metabolism", "骨代谢", "osteoporosis", "骨质疏松", "DEXA scan", "bisphosphonate"),
+    # -- 药学细粒度 --
+    ("pharmacokinetics", "药代动力学", "absorption distribution metabolism excretion ADME", "药物代谢"),
+    ("pharmacodynamics", "药效学", "dose response curve", "剂量效应曲线", "EC50 IC50"),
+    ("drug interaction", "药物相互作用", "CYP450 enzyme", "细胞色素P450", "inhibitor inducer"),
+    ("drug formulation", "药物制剂", "tablet capsule injection", "片剂胶囊注射剂", "excipient"),
+    ("biopharmaceutics", "生物药剂学", "bioavailability", "生物利用度", "BCS classification"),
+    ("clinical pharmacology", "临床药理学", "therapeutic drug monitoring TDM", "血药浓度监测"),
+    ("oncology pharmacy", "肿瘤药学", "chemotherapy preparation", "化疗配制", "hazardous drug"),
+    ("hospital pharmacy", "医院药学", "formulary", "处方集", "medication reconciliation"),
+    ("drug regulatory", "药物法规", "NDA BLA IND", "新药申请", "FDA EMA NMPA"),
+    ("pharmacovigilance", "药物警戒", "adverse event reporting", "不良事件报告", "signal detection"),
+    # -- 公共卫生深度 --
+    ("global health", "全球卫生", "DALYs burden", "伤残调整生命年", "WHO SDG"),
+    ("infectious disease control", "传染病控制", "quarantine isolation", "检疫隔离", "ring vaccination"),
+    ("pandemic preparedness", "大流行病防备", "surveillance system", "监测系统", "one health"),
+    ("maternal child health", "妇幼卫生", "antenatal care", "产前检查", "child mortality MDG"),
+    ("nutrition public health", "公共卫生营养", "micronutrient deficiency", "微量营养素缺乏", "fortification"),
+    ("tobacco control", "烟草控制", "FCTC", "控烟框架公约", "cessation intervention"),
+    ("alcohol policy", "酒精政策", "minimum unit price", "最低单价", "screening AUDIT"),
+    ("mental health policy", "心理健康政策", "community based care", "社区照护", "stigma reduction"),
+    ("health system strengthening", "卫生体系加强", "primary health care PHC", "基本医疗卫生"),
+    # -- 基础医学细粒度 --
+    ("histology", "组织学", "epithelium connective tissue", "上皮结缔组织", "staining H&E"),
+    ("embryology", "胚胎学", "gastrulation", "原肠胚形成", "organogenesis", "teratology"),
+    ("neuropharmacology", "神经药理学", "receptor signaling", "受体信号", "neurotransmitter reuptake"),
+    ("endocrinology", "内分泌学", "hormone axis", "激素轴", "feedback regulation", "diabetes"),
+    ("hematology", "血液学", "coagulation cascade", "凝血瀑布", "anemia classification"),
+    ("renal physiology", "肾脏生理", "glomerular filtration GFR", "肾小球滤过率", "tubular reabsorption"),
+    # ── Batch Y end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 法学深化 / 哲学深化 / 文学细分 / 综合补充 ═════════════
+    # ── Batch Z: 法学深化 / 哲学细分 / 文学语言细分 / 综合补充 ──────────────────
+    # -- 法学深化 --
+    ("intellectual property law", "知识产权法", "patent trademark copyright", "专利商标著作权"),
+    ("patent prosecution", "专利代理", "claims drafting", "权利要求撰写", "prior art search"),
+    ("trademark registration", "商标注册", "likelihood of confusion", "混淆可能", "Madrid protocol"),
+    ("copyright fair use", "版权合理使用", "derivative work", "演绎作品", "DMCA takedown"),
+    ("data protection law", "数据保护法", "GDPR", "个人数据处理", "data subject rights"),
+    ("competition antitrust law", "竞争反垄断法", "merger control", "并购审查", "abuse dominance"),
+    ("arbitration", "仲裁", "ICC ICSID", "国际商事仲裁", "award enforcement"),
+    ("cyberlaw", "网络法", "jurisdiction online", "网络管辖权", "platform liability"),
+    ("climate law", "气候法", "emission trading scheme ETS", "碳排放交易", "litigation"),
+    ("space law", "太空法", "Outer Space Treaty", "外太空条约", "liability convention"),
+    # -- 哲学细分深化 --
+    ("philosophy of mathematics", "数学哲学", "platonism formalism", "柏拉图主义形式主义", "Gödel"),
+    ("philosophy of biology", "生物哲学", "teleology function", "目的论功能", "species concept"),
+    ("philosophy of economics", "经济哲学", "rationality", "理性", "welfare social choice"),
+    ("applied ethics", "应用伦理学", "bioethics", "生命伦理", "engineering ethics", "AI ethics"),
+    ("metaethics", "元伦理学", "moral realism anti-realism", "道德实在论", "naturalism"),
+    ("political philosophy liberty", "政治哲学自由", "negative positive freedom", "消极积极自由"),
+    ("philosophy of consciousness", "意识哲学", "hard problem", "难问题", "zombie thought experiment"),
+    ("logic formal", "形式逻辑", "modal logic", "模态逻辑", "deontic epistemic temporal"),
+    ("analytic continental divide", "分析大陆哲学分野", "Frege Russell Moore", "linguistic turn"),
+    # -- 文学语言细分 --
+    ("comparative literature", "比较文学", "influence study", "影响研究", "reception theory"),
+    ("translation studies", "翻译研究", "domestication foreignization", "归化异化", "equivalence"),
+    ("spoken language discourse", "口语话语", "conversation analysis", "会话分析", "turn taking"),
+    ("writing pedagogy", "写作教学", "process writing", "过程写作", "genre writing"),
+    ("children literature", "儿童文学", "picture book", "绘本", "fairy tale adaptation"),
+    ("science fiction", "科幻小说", "speculative fiction", "推测小说", "hard soft SF"),
+    ("detective fiction", "侦探小说", "mystery thriller", "悬疑惊悚", "whodunit"),
+    ("autobiography memoir", "自传回忆录", "life writing", "生命书写", "first person narrative"),
+    ("creative nonfiction", "创意非虚构", "literary journalism", "文学新闻", "narrative nonfiction"),
+    ("slam poetry spoken word", "诗歌表演", "performance poetry", "表演性诗歌", "open mic"),
+    # -- 新媒体与数字文化 --
+    ("platform studies", "平台研究", "algorithm curation", "算法推荐", "content moderation"),
+    ("fan culture", "粉丝文化", "fanfiction", "同人文", "community practice"),
+    ("game studies", "游戏研究", "ludology narratology", "游戏学叙事学", "player experience"),
+    ("virtual reality experience", "虚拟现实体验", "presence immersion", "临场感沉浸感", "VR content"),
+    ("open source culture", "开源文化", "hacker ethos", "黑客伦理", "gift economy"),
+    ("maker movement", "创客运动", "DIY fabrication", "自制制造", "hackerspace"),
+    # -- 跨学科社会议题 --
+    ("aging society", "老龄化社会", "silver economy", "银发经济", "long-term care"),
+    ("migration refugee", "移民难民", "asylum seeker", "寻求庇护者", "integration policy"),
+    ("urban housing", "城市住房", "affordable housing", "保障性住房", "gentrification"),
+    ("education inequality", "教育不平等", "achievement gap", "成绩差距", "access equity"),
+    ("digital divide", "数字鸿沟", "technology access", "技术可及性", "digital literacy"),
+    ("food system", "粮食体系", "food desert", "食品沙漠", "supply chain food"),
+    ("energy poverty", "能源贫困", "electrification", "电气化", "clean cooking"),
+    ("water scarcity", "水资源短缺", "water stress", "水压力", "transboundary water"),
+    ("gender equality", "性别平等", "pay gap", "薪酬差距", "leadership representation"),
+    ("disability studies", "残障研究", "accessibility universal design", "无障碍通用设计"),
+    # -- 综合多学科术语 --
+    ("transdisciplinary", "超学科", "wicked problem", "棘手问题", "co-production knowledge"),
+    ("action research", "行动研究", "participatory action", "参与式行动", "reflective practice"),
+    ("mixed methods research", "混合方法研究", "triangulation", "三角验证", "qualitative quantitative"),
+    ("grounded theory", "扎根理论", "theoretical sampling", "理论抽样", "saturation"),
+    ("case study research", "案例研究", "within case across case", "案例内跨案例分析"),
+    ("simulation modeling research", "模拟建模研究", "agent based ABM", "主体模型", "system dynamics"),
+    ("bibliometrics", "文献计量学", "citation analysis", "引文分析", "h-index impact factor"),
+    ("open science", "开放科学", "preprint", "预印本", "reproducibility replication"),
+    # ── Batch Z end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 云计算 / DevOps / Web开发 / 数据工程 ════════════════
+    # ── Batch AA: 云计算 / DevOps / Web开发全栈 / 大数据 ────────────────────────
+    # -- 云计算细粒度 --
+    ("AWS services", "AWS服务", "EC2 S3 RDS Lambda", "弹性计算存储数据库函数", "IAM VPC"),
+    ("Azure services", "Azure服务", "AKS Blob Functions", "容器存储函数", "Entra AD"),
+    ("GCP services", "谷歌云服务", "GKE BigQuery Pub/Sub", "容器大数据消息", "Vertex AI"),
+    ("cloud cost optimization", "云成本优化", "reserved instance spot", "预留竞价实例", "rightsizing"),
+    ("multi-cloud strategy", "多云策略", "cloud agnostic", "云无关性", "hybrid cloud"),
+    ("serverless architecture", "无服务器架构", "FaaS BaaS", "函数后端服务", "cold start"),
+    ("Kubernetes orchestration", "Kubernetes编排", "pod deployment service", "工作负载", "Helm chart"),
+    ("Docker container", "Docker容器", "image layer", "镜像层", "registry dockerfile"),
+    ("cloud storage object", "云对象存储", "bucket versioning", "存储桶版本控制", "lifecycle policy"),
+    ("cloud database managed", "云托管数据库", "Aurora DynamoDB Cosmos", "managed service"),
+    ("cloud networking", "云网络", "VPC subnet", "虚拟私有云子网", "transit gateway peering"),
+    # -- DevOps细粒度 --
+    ("CI/CD pipeline", "持续集成持续部署", "Jenkins GitHub Actions", "pipeline stages", "artifact"),
+    ("infrastructure as code", "基础设施即代码", "Terraform Ansible", "declarative state", "drift"),
+    ("GitOps", "Git运维", "ArgoCD Flux", "declarative config", "reconciliation loop"),
+    ("monitoring alerting", "监控告警", "Prometheus Grafana", "metrics scrape", "alert rule"),
+    ("log management", "日志管理", "ELK stack", "Elasticsearch Logstash Kibana", "log aggregation"),
+    ("deployment strategy", "部署策略", "blue green canary", "蓝绿金丝雀部署", "rollback"),
+    ("platform engineering", "平台工程", "internal developer platform IDP", "golden path"),
+    # -- 全栈Web开发 --
+    ("React ecosystem", "React生态", "hooks context", "useState useEffect", "Redux Zustand"),
+    ("Vue.js", "Vue框架", "composition API", "组合式API", "Pinia Vuex", "Nuxt"),
+    ("Angular framework", "Angular框架", "dependency injection", "依赖注入", "RxJS observable"),
+    ("Next.js", "Next.js框架", "SSR SSG ISR", "服务端渲染静态生成", "App Router"),
+    ("Node.js backend", "Node.js后端", "Express Fastify", "event loop", "npm ecosystem"),
+    ("GraphQL", "图查询语言", "schema resolver", "类型系统", "query mutation subscription"),
+    ("WebAssembly", "WebAssembly", "WASM runtime", "Rust to WASM", "performance critical"),
+    ("Progressive Web App", "渐进式Web应用", "service worker", "服务工作线程", "offline cache"),
+    ("web performance", "Web性能", "Core Web Vitals", "LCP FID CLS", "lighthouse audit"),
+    ("CSS modern", "现代CSS", "Tailwind flexbox grid", "utility class", "CSS variables"),
+    ("testing frontend", "前端测试", "Jest Cypress Playwright", "unit integration E2E", "coverage"),
+    ("TypeScript", "TypeScript", "type system", "类型系统", "interface generics", "strict mode"),
+    # -- 大数据平台 --
+    ("Hadoop ecosystem", "Hadoop生态", "HDFS MapReduce YARN", "分布式文件计算资源", "Hive"),
+    ("Apache Spark", "Apache Spark", "RDD DataFrame", "弹性分布式数据集", "Spark SQL MLlib"),
+    ("data lake", "数据湖", "Delta Lake Iceberg Hudi", "ACID lakehouse", "schema evolution"),
+    ("Apache Kafka", "Apache Kafka", "topic partition consumer group", "主题分区消费组", "offset"),
+    ("data mesh", "数据网格", "domain ownership", "领域所有权", "data product", "self-serve"),
+    ("data catalog tools", "数据目录工具", "Apache Atlas Amundsen", "metadata lineage"),
+    ("vector database", "向量数据库", "Pinecone Weaviate Chroma", "approximate nearest neighbor"),
+    ("feature store", "特征存储", "online offline store", "在线离线特征", "point in time"),
+    # ── Batch AA end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 凝聚态 / 化学深化 / 生物技术 / 数学应用 ════════════════
+    # ── Batch BB: 凝聚态物理 / 化学深化 / 生物技术 / 应用数学 ───────────────────
+    # -- 凝聚态物理深化 --
+    ("topological insulator", "拓扑绝缘体", "surface state", "表面态", "Dirac cone"),
+    ("quantum Hall effect", "量子霍尔效应", "Landau level", "朗道能级", "edge state"),
+    ("superconductivity BCS", "BCS超导理论", "Cooper pair", "库珀对", "gap equation"),
+    ("high temperature superconductor", "高温超导体", "cuprate", "铜氧化物", "d-wave pairing"),
+    ("Mott insulator", "莫特绝缘体", "strongly correlated", "强关联", "Hubbard model"),
+    ("spintronics", "自旋电子学", "spin Hall effect", "自旋霍尔效应", "GMR TMR"),
+    ("phase transition", "相变", "order parameter", "序参量", "critical exponent", "universality"),
+    ("soft matter", "软物质", "liquid crystal", "液晶", "polymer gel", "colloidal suspension"),
+    ("photonic crystal", "光子晶体", "bandgap photonic", "光子禁带", "waveguide mode"),
+    ("plasmonics", "等离激元", "surface plasmon resonance SPR", "局域场增强"),
+    ("quantum optics", "量子光学", "photon entanglement", "光子纠缠", "squeezed state"),
+    # -- 化学深化 --
+    ("organic synthesis total", "有机全合成", "retrosynthesis", "逆合成分析", "protecting group"),
+    ("asymmetric synthesis", "不对称合成", "chiral catalyst", "手性催化剂", "enantioselectivity"),
+    ("organocatalysis", "有机小分子催化", "proline catalyst", "脯氨酸催化", "HOMO LUMO activation"),
+    ("flow chemistry", "流动化学", "microreactor", "微反应器", "continuous flow synthesis"),
+    ("supramolecular chemistry", "超分子化学", "host guest", "主客体", "crown ether rotaxane"),
+    ("click chemistry", "点击化学", "CuAAC azide alkyne", "铜催化叠氮炔烃", "bioorthogonal"),
+    ("photochemistry", "光化学", "excitation state", "激发态", "photocatalysis Norrish"),
+    ("electroorganic synthesis", "有机电化学合成", "oxidative reductive", "氧化还原合成"),
+    ("natural product synthesis", "天然产物合成", "terpenoid alkaloid", "萜类生物碱", "cascade"),
+    ("polymer synthesis", "高分子合成", "RAFT ATRP", "可控自由基聚合", "living polymerization"),
+    ("solid phase synthesis", "固相合成", "Fmoc peptide", "Fmoc多肽合成", "resin linker"),
+    # -- 生物技术细粒度 --
+    ("genetic engineering", "基因工程", "recombinant DNA", "重组DNA", "cloning vector"),
+    ("protein engineering", "蛋白质工程", "directed evolution", "定向进化", "phage display"),
+    ("cell line development", "细胞系开发", "CHO HEK293", "中国仓鼠卵巢细胞", "transfection"),
+    ("monoclonal antibody", "单克隆抗体", "hybridoma", "杂交瘤", "humanization", "bispecific"),
+    ("vaccine development", "疫苗开发", "mRNA vaccine", "mRNA疫苗", "adjuvant formulation"),
+    ("gene therapy", "基因治疗", "AAV lentiviral vector", "腺相关病毒慢病毒载体", "delivery"),
+    ("CRISPR Cas9", "CRISPR Cas9基因编辑", "guide RNA", "向导RNA", "off-target", "base editing"),
+    ("flow cytometry", "流式细胞术", "cell sorting FACS", "荧光激活细胞分选", "antibody panel"),
+    ("ELISA immunoassay", "免疫吸附测定", "sandwich ELISA", "夹心ELISA", "sensitivity specificity"),
+    ("western blot", "蛋白质印迹", "SDS-PAGE", "抗体检测蛋白", "chemiluminescence"),
+    ("PCR quantitative", "定量PCR", "qPCR ddPCR", "荧光定量数字PCR", "primer design"),
+    ("microscopy", "显微镜技术", "confocal fluorescence", "共聚焦荧光", "super resolution STORM"),
+    # -- 应用数学 --
+    ("control theory", "控制理论", "controllability observability", "能控能观", "Lyapunov stability"),
+    ("signal processing math", "信号处理数学", "Laplace z-transform", "拉普拉斯Z变换", "filter poles zeros"),
+    ("numerical linear algebra", "数值线性代数", "LU QR SVD", "矩阵分解", "Krylov subspace"),
+    ("optimization convex", "凸优化应用", "SDP SOCP", "半正定二阶锥规划", "duality gap"),
+    ("mathematical biology", "数学生物学", "SIR epidemic model", "流行病SIR模型", "predator prey"),
+    ("financial mathematics", "金融数学", "Ito calculus", "伊藤积分", "stochastic control"),
+    ("cryptography mathematics", "密码学数学", "elliptic curve", "椭圆曲线", "discrete logarithm"),
+    ("coding theory", "编码理论", "Hamming distance", "汉明距离", "Reed Solomon", "LDPC math"),
+    ("game theory math", "博弈论数学", "Nash equilibrium", "纳什均衡", "mechanism design"),
+    ("topology applied", "应用拓扑", "persistent homology", "持久同调", "TDA data analysis"),
+    # ── Batch BB end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 专科医学 / 康复 / 老年医学 ════════════════════════════
+    # ── Batch CC: 专科医学细分 / 康复医学 / 老年医学 ────────────────────────────
+    # -- 皮肤科 --
+    ("dermatology", "皮肤科学", "skin lesion", "皮损", "biopsy dermatoscopy"),
+    ("eczema atopic dermatitis", "湿疹特应性皮炎", "Th2 response", "IgE sensitization", "emollient"),
+    ("psoriasis", "银屑病", "plaque type", "斑块型", "TNF inhibitor biologics"),
+    ("acne vulgaris", "寻常痤疮", "sebaceous gland", "皮脂腺", "retinoid antibiotic topical"),
+    ("melanoma", "黑色素瘤", "BRAF mutation", "sentinel node biopsy", "immunotherapy skin"),
+    ("wound healing", "创面愈合", "angiogenesis granulation tissue", "血管新生肉芽", "scar management"),
+    ("cosmetic dermatology", "美容皮肤学", "botulinum toxin filler", "肉毒素填充剂", "laser resurfacing"),
+    # -- 眼科 --
+    ("ophthalmology", "眼科学", "visual acuity chart", "视力表", "slit lamp fundoscopy"),
+    ("cataract surgery", "白内障手术", "phacoemulsification", "超声乳化", "IOL intraocular lens"),
+    ("glaucoma", "青光眼", "intraocular pressure IOP", "眼内压", "optic nerve cupping"),
+    ("macular degeneration AMD", "黄斑变性", "drusen", "玻璃膜疣", "anti-VEGF ranibizumab"),
+    ("refractive surgery LASIK", "LASIK屈光手术", "corneal flap ablation", "角膜瓣消融", "wavefront"),
+    ("diabetic retinopathy", "糖尿病视网膜病变", "laser photocoagulation", "激光光凝治疗"),
+    # -- 耳鼻喉科 --
+    ("otolaryngology ENT", "耳鼻喉科学", "hearing assessment", "听力评估", "tympanometry"),
+    ("cochlear implant", "人工耳蜗植入", "electrode array cochlea", "耳蜗电极", "auditory cortex"),
+    ("sinusitis endoscopic surgery", "鼻窦炎内镜手术", "FESS", "功能性鼻内镜手术", "polyp"),
+    ("laryngology voice", "喉科嗓音", "vocal cord pathology", "声带病变", "stroboscopy"),
+    ("obstructive sleep apnea", "阻塞性睡眠呼吸暂停", "polysomnography PSG", "多导睡眠图", "AHI"),
+    # -- 儿科专科 --
+    ("neonatology", "新生儿学", "premature infant care", "早产儿护理", "NICU surfactant"),
+    ("congenital heart disease pediatric", "先天性心脏病儿科", "VSD ASD", "室间隔房间隔缺损", "catheterization"),
+    ("pediatric oncology", "儿童肿瘤学", "Wilms tumor", "肾母细胞瘤", "neuroblastoma protocol"),
+    ("febrile seizure", "热性惊厥", "benign febrile", "良性热性", "recurrence risk"),
+    ("growth hormone deficiency", "生长激素缺乏", "IGF-1", "胰岛素样生长因子", "GH therapy"),
+    # -- 康复医学 --
+    ("physical therapy rehabilitation", "物理治疗康复", "therapeutic modality", "治疗模式", "manual"),
+    ("occupational therapy ADL", "职业治疗日常生活", "adaptive equipment", "辅助设备", "splint"),
+    ("speech language pathology", "言语语言病理学", "dysphagia swallowing", "吞咽困难"),
+    ("neurological rehabilitation stroke", "脑卒中神经康复", "plasticity", "可塑性", "constraint induced"),
+    ("cardiac rehabilitation program", "心脏康复项目", "exercise prescription cardiac", "有氧运动处方"),
+    # -- 老年医学 --
+    ("geriatric assessment", "老年综合评估", "frailty phenotype", "衰弱表型", "CGA multidisciplinary"),
+    ("polypharmacy management", "多重用药管理", "deprescribing criteria", "减药标准", "Beers Stopp"),
+    ("dementia cognitive decline", "痴呆认知下降", "MCI mild cognitive", "轻度认知障碍", "biomarker"),
+    ("falls risk elderly", "老年跌倒风险", "Timed Up Go TUG", "功能性步态测试", "vitamin D"),
+    ("end of life palliative", "临终姑息照护", "advance directive", "预先医疗指示", "hospice symptom"),
+    # ── Batch CC end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 航运/港口/物流/贸易/会展 ════════════════════════════
+    # ── Batch DD: 航运贸易 / 会展经济 / 旅游管理 / 体育管理 ──────────────────────
+    # -- 航运与贸易 --
+    ("maritime shipping", "海运", "vessel charter", "租船", "bill of lading", "freight rate"),
+    ("port logistics", "港口物流", "container terminal", "集装箱码头", "turnaround time"),
+    ("shipbuilding", "造船", "hull construction", "船体建造", "classification society", "Lloyd's"),
+    ("trade finance", "贸易融资", "letter of credit LC", "信用证", "documentary collection"),
+    ("export import procedure", "进出口流程", "customs declaration", "报关", "certificate origin"),
+    ("free trade zone", "自由贸易区", "bonded warehouse", "保税仓库", "duty exemption"),
+    ("commodity market", "大宗商品市场", "spot futures basis", "现货期货基差", "hedging"),
+    ("container shipping", "集装箱班轮", "liner alliance", "班轮联盟", "TEU slot"),
+    ("dangerous goods transport", "危险品运输", "IMDG code", "危规", "classification packing"),
+    # -- 会展经济 --
+    ("trade fair exhibition", "展览会贸易展", "exhibitor visitor", "参展商观众", "floor plan"),
+    ("congress convention", "会议会展", "PCO professional congress organizer", "DMC", "venue"),
+    ("event management", "活动管理", "event planning", "活动策划", "logistics crew AV"),
+    ("MICE industry", "商务会展产业", "meetings incentives conferences exhibitions", "经济贡献"),
+    ("virtual hybrid event", "线上线下混合活动", "webinar platform", "网络研讨会", "engagement"),
+    # -- 旅游与酒店管理 --
+    ("hospitality management", "酒店管理", "front office housekeeping", "前台客房", "PMS system"),
+    ("revenue management hotel", "酒店收益管理", "ADR RevPAR", "平均房价每间可用收益", "yield"),
+    ("tourism economics", "旅游经济学", "tourist arrival expenditure", "游客到访支出", "multiplier"),
+    ("destination management", "目的地管理", "DMO tourism board", "旅游局", "branding"),
+    ("ecotourism", "生态旅游", "sustainable tourism", "可持续旅游", "carrying capacity"),
+    ("heritage tourism", "遗产旅游", "dark tourism", "黑色旅游", "authenticity"),
+    ("cruise industry", "邮轮业", "port call itinerary", "靠港行程", "onboard revenue"),
+    ("food tourism gastronomy", "美食旅游", "culinary destination", "美食目的地", "Michelin"),
+    # -- 体育管理与产业 --
+    ("sports management", "体育管理", "franchise ownership", "特许经营权", "salary cap"),
+    ("sports marketing", "体育营销", "sponsorship activation", "赞助激活", "naming rights"),
+    ("sports broadcasting", "体育转播", "media rights deal", "媒体版权", "OTT streaming"),
+    ("stadium arena management", "场馆运营", "concession ticketing", "餐饮票务", "event day"),
+    ("esports management", "电竞管理", "tournament organizer", "赛事主办", "player contract"),
+    ("Olympic Games management", "奥运会管理", "IOC governance", "国际奥委会", "host city"),
+    ("grassroots sport development", "基层体育发展", "sport for all", "全民体育", "club community"),
+    # -- 文化创意产业 --
+    ("creative industries", "文化创意产业", "IP intellectual property creative", "版权变现", "content"),
+    ("animation film production", "动画影视制作", "storyboard rigging", "故事板绑定", "render pipeline"),
+    ("game development", "游戏开发", "game engine Unity Unreal", "关卡设计", "monetization"),
+    ("music industry", "音乐产业", "streaming royalty", "流媒体版税", "label distribution"),
+    ("publishing industry", "出版产业", "book rights", "版权授权", "print-on-demand", "ebook"),
+    ("fashion industry", "时尚产业", "trend forecasting", "趋势预测", "fast fashion sustainability"),
+    ("architecture practice", "建筑实践", "design brief", "设计任务书", "planning permission"),
+    # ── Batch DD end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 语言细分 / 文化研究 / 民俗 / 宗教深化 ════════════════
+    # ── Batch EE: 语言细分 / 文化研究 / 民俗学 / 宗教研究深化 ──────────────────
+    # -- 语言学细分 --
+    ("neurolinguistics", "神经语言学", "Broca Wernicke area", "布洛卡韦尼克区", "aphasia brain"),
+    ("language documentation", "语言记录", "endangered language", "濒危语言", "fieldwork transcription"),
+    ("sign language", "手语", "ASL BSL", "visual spatial grammar", "deaf culture"),
+    ("pidgin creole", "洋泾浜混合语", "language contact", "语言接触", "creolization"),
+    ("computational phonology", "计算音韵学", "phonological rules", "音系规则", "OT optimality theory"),
+    ("lexicography", "词典学", "dictionary compilation", "词典编纂", "headword definition"),
+    ("language policy planning", "语言政策规划", "official language", "官方语言", "language rights"),
+    ("forensic linguistics", "法庭语言学", "authorship attribution", "作者归因", "voice identification"),
+    ("clinical linguistics", "临床语言学", "language disorder", "语言障碍", "assessment therapy"),
+    # -- 文化研究细分 --
+    ("cultural studies", "文化研究", "hegemony Gramsci", "葛兰西霸权", "ideology representation"),
+    ("poststructuralism", "后结构主义", "Foucault Derrida", "话语解构", "power knowledge"),
+    ("subaltern studies", "属下研究", "colonial discourse", "殖民话语", "voice agency"),
+    ("Halbwachs Nora commemorative", "哈布瓦赫诺拉纪念", "lieux de memoire", "记忆之场", "anniversary"),
+    ("diaspora studies", "流散研究", "hybridity", "混杂性", "Bhabha third space"),
+    ("visual culture", "视觉文化", "gaze theory", "凝视理论", "image power"),
+    ("popular culture", "大众文化", "mass media consumption", "大众媒体消费", "celebrity"),
+    ("cultural economy", "文化经济学", "creative economy", "创意经济", "cultural capital"),
+    ("globalization culture", "文化全球化", "glocalization", "全球本土化", "cultural imperialism"),
+    # -- 民俗学 --
+    ("folklore", "民俗学", "folktale legend", "民间故事传说", "oral tradition"),
+    ("folk belief", "民间信仰", "ritual practice", "仪式实践", "taboo superstition"),
+    ("folk art craft", "民间艺术手工艺", "weaving pottery", "编织陶艺", "regional style"),
+    ("festival ritual", "节庆仪式", "rite of passage", "过渡仪式", "liminality Turner"),
+    ("traditional medicine folk", "民间传统医学", "herbalism", "草药学", "healing practice"),
+    ("mythology comparative", "比较神话学", "Campbell monomyth", "英雄旅程原型", "Levi-Strauss"),
+    # -- 宗教研究深化 --
+    ("mysticism", "神秘主义", "Sufism", "苏菲主义", "contemplative prayer", "enlightenment"),
+    ("religion economy", "宗教经济", "religious market", "宗教市场", "rational choice theory"),
+    ("secularism", "世俗主义", "separation church state", "政教分离", "laicite"),
+    ("new religious movements", "新兴宗教运动", "cult sect", "教派", "NRM sociology"),
+    ("Buddhist philosophy", "佛教哲学", "impermanence anatman", "无常无我", "dependent origination"),
+    ("Islamic jurisprudence", "伊斯兰法学", "fiqh", "教法", "ijtihad consensus"),
+    ("Jewish thought", "犹太思想", "Kabbalah", "卡巴拉", "Talmudic reasoning", "halakha"),
+    # -- 历史学深化 --
+    ("microhistory", "微观史学", "Ginzburg", "金茨堡", "local community record"),
+    ("Atlantic history", "大西洋史", "slavery trade", "奴隶贸易", "triangular trade"),
+    ("history of science", "科学史", "scientific revolution", "科学革命", "Copernicus Galileo"),
+    ("labor history", "劳工史", "working class", "工人阶级", "trade union movement"),
+    ("history of technology", "技术史", "invention diffusion", "发明扩散", "technological determinism"),
+    ("environmental history", "环境史", "nature human interaction", "自然人类互动", "ecology past"),
+    ("gender history", "性别史", "women history", "妇女史", "masculinity femininity"),
+    ("biography prosopography", "传记集体传记", "historical figure", "历史人物", "life writing"),
+    # ── Batch EE end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 政策/规划/社区发展/NGO/公益 ═════════════════════════
+    # ── Batch FF: 公共政策 / 社区发展 / NGO / 公益慈善 ──────────────────────────
+    # -- 公共政策深化 --
+    ("policy analysis", "政策分析", "cost benefit analysis", "成本收益分析", "policy evaluation"),
+    ("regulatory impact assessment", "监管影响评估", "RIA", "stakeholder consultation", "compliance cost"),
+    ("nudge behavioral policy", "行为政策助推", "choice architecture", "选择架构", "defaults"),
+    ("e-government", "电子政务", "digital service", "数字服务", "open data government"),
+    ("public procurement", "政府采购", "tender bid", "招投标", "value for money public"),
+    ("social welfare policy", "社会福利政策", "means-tested universal", "家计调查普惠", "benefit"),
+    ("immigration policy", "移民政策", "visa category", "签证类别", "integration pathway"),
+    ("decentralization", "权力下放", "local government capacity", "地方政府能力", "fiscal transfer"),
+    ("anti-corruption policy", "反腐政策", "transparency governance", "透明治理", "accountability"),
+    # -- 城乡规划深化 --
+    ("urban planning theory", "城市规划理论", "comprehensive plan", "综合规划", "master plan"),
+    ("zoning reform", "分区改革", "mixed use development", "混合用途开发", "upzoning"),
+    ("affordable housing policy", "保障房政策", "inclusionary zoning", "包容性分区", "subsidy"),
+    ("transport planning", "交通规划", "modal share", "交通方式分担率", "TOD transit oriented"),
+    ("smart city planning", "智慧城市规划", "digital infrastructure", "数字基础设施", "data platform"),
+    ("rural revitalization", "乡村振兴", "rural development policy", "农村发展政策", "village"),
+    ("spatial planning EU", "欧盟空间规划", "cohesion policy", "凝聚政策", "structural fund"),
+    # -- 社区发展与社会工作 --
+    ("community development", "社区发展", "asset based ABCD", "资产为本", "capacity building"),
+    ("social work practice", "社会工作实践", "casework", "个案工作", "group work community"),
+    ("poverty alleviation", "扶贫", "cash transfer", "现金转移支付", "livelihood program"),
+    ("microfinance social", "社会普惠小额贷款", "Grameen model", "格莱珉模式", "repayment"),
+    ("volunteer management", "志愿者管理", "recruitment retention", "招募留存", "motivation"),
+    ("cooperative enterprise", "合作社企业", "worker cooperative", "工人合作社", "member governance"),
+    # -- NGO/国际发展 --
+    ("international development organization", "国际发展组织", "USAID DfID", "官方援助机构"),
+    ("humanitarian aid", "人道主义援助", "SPHERE standards", "人道标准", "cluster system"),
+    ("disaster risk reduction", "减灾", "DRR Sendai framework", "仙台框架", "resilience building"),
+    ("capacity building international", "国际能力建设", "technical assistance", "技术援助", "knowledge"),
+    ("gender mainstreaming", "性别主流化", "gender responsive", "性别敏感", "CEDAW"),
+    ("development evaluation", "发展评估", "outcome harvesting", "成果收集", "theory of change"),
+    # -- 公益慈善 --
+    ("philanthropy", "慈善", "foundation endowment", "基金会捐赠", "grant making"),
+    ("impact investing", "影响力投资", "ESG social return SROI", "社会投资回报率"),
+    ("corporate social responsibility CSR", "企业社会责任", "community investment", "社区投资"),
+    ("crowdfunding nonprofit", "非营利众筹", "Kickstarter GoFundMe", "campaign goal"),
+    ("social enterprise", "社会企业", "hybrid organization", "混合组织", "mission lock"),
+    # -- 心理咨询与辅导细分 --
+    ("dialectical behavior therapy DBT", "辩证行为疗法", "distress tolerance", "痛苦耐受", "mindfulness DBT"),
+    ("acceptance commitment therapy ACT", "接受承诺疗法", "psychological flexibility", "心理灵活性"),
+    ("schema therapy", "图式疗法", "early maladaptive schema", "早期适应不良图式", "mode"),
+    ("couples therapy", "伴侣治疗", "Gottman method", "戈特曼方法", "communication pattern"),
+    ("group therapy", "团体治疗", "therapeutic factor", "治疗性因素", "cohesion feedback"),
+    ("trauma focused CBT", "创伤聚焦认知行为", "TFCBT", "trauma narrative", "gradual exposure"),
+    # ── Batch FF end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：电气工程深化 ════════════════════════════════════
+    # ── Batch GG: 电力系统 / 高压工程 / 电机传动 / 储能系统 ──────────────────────
+    # -- 电力系统深化 --
+    ("power flow analysis", "潮流分析", "Newton-Raphson Gauss-Seidel", "功率方程", "convergence"),
+    ("transient stability", "暂态稳定", "swing equation", "摇摆方程", "equal area criterion"),
+    ("voltage stability", "电压稳定", "P-V curve", "功率-电压曲线", "reactive power compensation"),
+    ("frequency regulation", "频率调节", "primary secondary tertiary", "一次二次三次调频", "droop control"),
+    ("power system protection", "电力系统保护", "relay coordination", "继电器配合", "overcurrent distance"),
+    ("SCADA energy management", "SCADA能量管理", "state estimation", "状态估计", "optimal power flow OPF"),
+    ("distributed generation", "分布式发电", "microgrid", "微电网", "islanding detection"),
+    ("HVDC high voltage direct", "高压直流输电", "VSC-HVDC", "多端直流", "LCC thyristor"),
+    ("power quality", "电能质量", "harmonic distortion THD", "谐波畸变率", "flicker sag swell"),
+    ("substation design", "变电站设计", "busbar configuration", "母线接线", "GIS AIS"),
+    # -- 高压工程 --
+    ("insulation coordination", "绝缘配合", "overvoltage protection", "过电压保护", "lightning surge"),
+    ("high voltage testing", "高压试验", "impulse voltage", "冲击电压", "withstand level"),
+    ("transformer design", "变压器设计", "core winding", "铁芯绕组", "leakage reactance"),
+    ("cable system", "电缆系统", "cross-linked polyethylene XLPE", "交联聚乙烯", "thermal rating"),
+    ("gas insulated switchgear GIS", "气体绝缘开关设备", "SF6", "六氟化硫", "partial discharge"),
+    ("corona discharge", "电晕放电", "corona onset voltage", "起始电压", "audible noise"),
+    # -- 电机与传动 --
+    ("variable frequency drive VFD", "变频驱动", "PWM inverter", "脉宽调制逆变器", "V/f control"),
+    ("field oriented control FOC", "磁场定向控制", "vector control", "矢量控制", "dq transform"),
+    ("direct torque control DTC", "直接转矩控制", "torque ripple", "转矩脉动", "hysteresis band"),
+    ("permanent magnet motor PMSM", "永磁同步电机", "back-EMF", "反电动势", "saliency ratio"),
+    ("switched reluctance motor SRM", "开关磁阻电机", "rotor position sensor", "转子位置", "torque profile"),
+    ("linear motor", "直线电机", "linear induction", "直线感应", "maglev propulsion"),
+    ("generator excitation", "发电机励磁", "automatic voltage regulator AVR", "功率因数控制"),
+    # -- 储能系统细粒度 --
+    ("lithium ion battery pack", "锂离子电池组", "BMS battery management", "电池管理系统", "SOC SOH"),
+    ("battery cell chemistry", "电池化学体系", "NMC LFP NCA", "三元磷酸铁锂", "cathode anode"),
+    ("battery thermal management", "电池热管理", "cooling plate", "冷却板", "thermal runaway"),
+    ("supercapacitor ultracapacitor", "超级电容器", "double layer EDLC", "双电层", "power density"),
+    ("flow battery", "液流电池", "vanadium redox", "全钒液流", "electrolyte membrane"),
+    ("grid scale storage", "电网级储能", "peak shaving", "削峰填谷", "frequency response"),
+    # ── Batch GG end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：机械工程深化 ════════════════════════════════════
+    # ── Batch HH: 振动噪声 / 热流体 / 制造工艺 / 精密仪器 ────────────────────────
+    # -- 振动与噪声 --
+    ("vibration analysis", "振动分析", "natural frequency mode shape", "固有频率振型", "FFT spectrum"),
+    ("modal analysis", "模态分析", "experimental modal", "实验模态", "frequency response function FRF"),
+    ("rotor dynamics", "转子动力学", "critical speed", "临界转速", "balancing unbalance"),
+    ("structural dynamics", "结构动力学", "damping ratio", "阻尼比", "response spectrum"),
+    ("noise vibration harshness NVH", "噪声振动粗糙度", "sound pressure level SPL", "acoustic"),
+    ("acoustic emission", "声发射", "AE sensor", "AE传感器", "crack detection passive"),
+    ("active noise control", "主动噪声控制", "feedforward feedback", "前馈反馈ANC", "secondary source"),
+    # -- 热流体深化 --
+    ("boundary layer theory", "边界层理论", "displacement momentum thickness", "位移动量厚度", "transition"),
+    ("compressible flow", "可压缩流", "shock wave expansion", "激波膨胀波", "Mach number"),
+    ("combustion", "燃烧", "premixed diffusion flame", "预混扩散燃烧", "equivalence ratio"),
+    ("heat exchanger design", "换热器设计", "LMTD NTU method", "对数平均温差效能单元法"),
+    ("boiling condensation", "沸腾冷凝", "nucleate film boiling", "核态膜态沸腾", "critical heat flux"),
+    ("microfluidics flow", "微流道流动", "Stokes flow", "斯托克斯流", "laminar Re<1"),
+    ("porous media flow", "多孔介质流", "Darcy law", "达西定律", "permeability porosity"),
+    ("multiphase flow", "多相流", "void fraction", "空泡率", "slug bubble annular flow"),
+    # -- 先进制造工艺 --
+    ("electrical discharge machining EDM", "电火花加工", "electrode wear", "电极损耗", "spark gap"),
+    ("electrochemical machining ECM", "电化学加工", "anodic dissolution", "阳极溶解", "mask"),
+    ("laser machining", "激光加工", "ablation threshold", "消融阈值", "kerf width"),
+    ("ultrasonic machining", "超声波加工", "abrasive slurry", "磨料悬浮液", "amplitude"),
+    ("chemical mechanical planarization CMP", "化学机械平坦化", "slurry pad", "抛光液垫", "dishing"),
+    ("micro machining", "微细加工", "burr formation", "毛刺形成", "size effect chip"),
+    ("surface integrity", "表面完整性", "residual stress", "残余应力", "white layer recast"),
+    ("gear manufacturing", "齿轮制造", "hobbing shaping grinding", "滚削成形磨削", "profile error"),
+    # -- 精密仪器与测量 --
+    ("coordinate measuring machine CMM", "坐标测量机", "probe stylus", "测头", "tolerance verification"),
+    ("optical measurement", "光学测量", "interferometer", "干涉仪", "white light interferometry"),
+    ("laser tracker", "激光跟踪仪", "6DOF measurement", "六自由度测量", "large volume metrology"),
+    ("surface roughness measurement", "表面粗糙度测量", "profilometer contact non-contact", "轮廓仪"),
+    ("force torque measurement", "力矩测量", "load cell strain gauge", "称重传感器应变片"),
+    ("vision inspection machine", "机器视觉检测", "defect detection", "缺陷检测", "pattern matching"),
+    ("dimensional metrology", "尺寸计量", "gauge block", "量块", "ring plug gauge"),
+    # ── Batch HH end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：土木结构深化 ════════════════════════════════════
+    # ── Batch II: 结构工程深化 / 岩土深化 / 水利水电 / 交通工程 ──────────────────
+    # -- 结构工程深化 --
+    ("prestressed concrete", "预应力混凝土", "post-tension pre-tension", "后张先张", "tendon duct"),
+    ("composite structure", "组合结构", "steel concrete composite beam", "钢混组合梁", "shear stud"),
+    ("timber structure", "木结构", "glulam cross-laminated timber CLT", "胶合板正交层积材"),
+    ("membrane structure", "膜结构", "tensile fabric", "张拉膜", "PTFE ETFE", "form finding"),
+    ("wind load design", "风荷载设计", "aerodynamic coefficient", "气动系数", "wind tunnel test"),
+    ("dynamic analysis structure", "结构动力分析", "time history analysis", "时程分析", "pushover"),
+    ("progressive collapse", "连续倒塌", "alternate load path", "备用传力路径", "robustness"),
+    ("structural health monitoring SHM", "结构健康监测", "accelerometer strain gauge SHM", "damage index"),
+    ("repair strengthening", "加固修缮", "carbon fiber CFRP", "碳纤维加固", "jacketing"),
+    # -- 岩土工程深化 --
+    ("soil consolidation", "土体固结", "Terzaghi consolidation", "太沙基固结理论", "excess pore pressure"),
+    ("slope stability", "边坡稳定", "limit equilibrium", "极限平衡法", "Bishop Spencer method"),
+    ("retaining wall", "挡土墙", "active passive earth pressure", "主动被动土压力", "Rankine Coulomb"),
+    ("deep excavation", "深基坑", "strut wale", "支撑腰梁", "dewatering groundwater lowering"),
+    ("ground improvement", "地基处理", "preloading surcharge", "预压排水", "vibro compaction"),
+    ("soil dynamics", "土动力学", "liquefaction", "液化", "shear wave velocity Vs30"),
+    ("offshore foundation", "海上基础", "monopile jacket", "单桩导管架", "scour protection"),
+    # -- 水利水电 --
+    ("dam safety", "大坝安全", "seepage monitoring", "渗流监测", "piping failure"),
+    ("flood routing", "洪水演进", "Muskingum method", "马斯京根法", "hydrograph"),
+    ("irrigation canal", "灌溉渠道", "lined unlined canal", "衬砌非衬砌渠道", "seepage loss"),
+    ("hydropower turbine", "水力发电机组", "Francis Pelton Kaplan", "混流冲击轴流转桨", "cavitation"),
+    ("sedimentation reservoir", "水库泥沙淤积", "trap efficiency", "拦沙率", "flushing sluicing"),
+    ("water treatment", "水处理", "coagulation flocculation", "混凝絮凝", "filtration disinfection"),
+    ("urban drainage", "城市排水", "sewer overflow", "溢流", "stormwater retention"),
+    # -- 交通工程 --
+    ("traffic flow theory", "交通流理论", "Greenshields model", "流量密度速度关系", "LOS level service"),
+    ("intersection design", "交叉口设计", "signal timing", "信号配时", "roundabout capacity"),
+    ("highway geometric design", "公路几何设计", "horizontal vertical alignment", "平纵曲线", "sight distance"),
+    ("pavement management", "路面管理", "PCI pavement condition index", "维修决策"),
+    ("rail track engineering", "铁路线路工程", "track geometry", "线路几何", "tamping ballast"),
+    ("high speed rail", "高速铁路", "aerodynamics tunnel", "气动效应隧道", "pantograph catenary"),
+    ("traffic safety", "交通安全", "collision type", "碰撞类型", "countermeasure effectiveness"),
+    ("pedestrian bicycle infrastructure", "步行自行车基础设施", "protected lane", "隔离车道", "crossing"),
+    # ── Batch II end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：化工/环工/核工/生医工程 ════════════════════════
+    # ── Batch JJ: 化工深化 / 环境工程 / 核工程 / 生医工程深化 ────────────────────
+    # -- 化工深化 --
+    ("distillation column", "蒸馏塔", "tray packing", "板式填料", "McCabe-Thiele method"),
+    ("absorption column", "吸收塔", "packing height", "填料高度", "mass transfer coefficient"),
+    ("liquid liquid extraction", "液液萃取", "distribution coefficient", "分配系数", "stagewise"),
+    ("drying operation", "干燥操作", "spray dryer", "喷雾干燥", "fluidized bed dryer"),
+    ("crystallization process", "结晶过程", "nucleation growth", "成核生长", "supersaturation"),
+    ("evaporation multiple effect", "多效蒸发", "economy steam", "蒸汽经济性", "falling film"),
+    ("membrane process", "膜过程", "reverse osmosis", "反渗透", "nanofiltration ultrafiltration"),
+    ("adsorption column", "吸附柱", "breakthrough curve", "穿透曲线", "regeneration cycle"),
+    ("gas absorption scrubber", "气体吸收洗涤器", "caustic scrubber", "碱洗塔", "SO2 HCl removal"),
+    ("piping instrumentation diagram P&ID", "管道仪表图", "process flow diagram PFD", "设备连接"),
+    # -- 环境工程深化 --
+    ("wastewater treatment biological", "生物污水处理", "activated sludge", "活性污泥法", "MLSS SRT"),
+    ("nutrient removal", "营养盐去除", "nitrification denitrification", "硝化反硝化", "BNR"),
+    ("anaerobic digestion", "厌氧消化", "biogas methane", "沼气甲烷", "COD removal"),
+    ("sludge treatment", "污泥处理", "dewatering centrifuge belt filter", "离心带滤脱水"),
+    ("air quality modeling", "空气质量模型", "Gaussian dispersion", "高斯扩散", "plume rise"),
+    ("VOC control", "挥发性有机物控制", "thermal oxidation catalytic", "热力催化氧化"),
+    ("soil vapor extraction", "土壤气相抽提", "SVE", "bioventing", "contaminated site"),
+    ("groundwater remediation", "地下水修复", "pump and treat", "抽出处理", "permeable reactive barrier"),
+    ("noise pollution engineering", "噪声污染工程", "sound barrier", "隔声屏障", "insertion loss dB"),
+    # -- 核工程 --
+    ("nuclear reactor physics", "核反应堆物理", "neutron flux", "中子通量", "criticality keff"),
+    ("reactor thermal hydraulics", "反应堆热工水力", "coolant flow", "冷却剂流动", "departure nucleate boiling"),
+    ("nuclear fuel cycle", "核燃料循环", "enrichment fabrication", "浓缩制造", "spent fuel reprocessing"),
+    ("radiation shielding", "辐射屏蔽", "attenuation coefficient", "衰减系数", "lead concrete shield"),
+    ("nuclear waste management", "核废物管理", "vitrification", "玻璃固化", "deep geological disposal"),
+    ("fusion energy", "核聚变能", "tokamak plasma", "托卡马克等离子体", "D-T fuel tritium"),
+    ("reactor safety system", "反应堆安全系统", "passive safety", "非能动安全", "ECCS cooling"),
+    ("nuclear instrumentation", "核仪表", "neutron detector", "中子探测器", "gamma spectroscopy"),
+    # -- 生医工程深化 --
+    ("hemodynamics", "血流动力学", "wall shear stress", "壁面剪切应力", "stenosis CFD"),
+    ("orthopedic biomechanics", "骨科生物力学", "bone remodeling Wolff", "骨重建", "trabecular"),
+    ("cartilage tissue engineering", "软骨组织工程", "chondrocyte", "软骨细胞", "scaffold hydrogel"),
+    ("neural interface design", "神经接口设计", "electrode impedance", "电极阻抗", "signal noise ratio"),
+    ("wearable biosensor design", "可穿戴生物传感器", "flexible substrate", "柔性基底", "skin contact"),
+    ("medical robot design", "医疗机器人设计", "da Vinci surgical", "手术机器人", "teleoperation force"),
+    ("ultrasound transducer", "超声换能器", "piezoelectric array", "压电阵列", "beam forming"),
+    ("MRI physics", "MRI物理", "gradient coil RF pulse", "梯度线圈射频脉冲", "T1 T2 relaxation"),
+    # ── Batch JJ end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：数学深化 ════════════════════════════════════════
+    # ── Batch KK: 数学分支深化（分析/代数/几何/拓扑/概率）──────────────────────
+    # -- 实分析深化 --
+    ("Riemann Lebesgue integration", "黎曼勒贝格积分", "improper integral", "反常积分", "convergence test"),
+    ("uniform convergence", "一致收敛", "Cauchy criterion uniform", "函数列", "interchange limit"),
+    ("metric space", "度量空间", "completeness compactness", "完备紧致性", "contraction mapping"),
+    ("Banach space theory", "巴拿赫空间理论", "norm bounded linear operator", "有界线性算子"),
+    ("Hilbert space", "希尔伯特空间", "inner product orthonormal basis", "内积正交基", "projection"),
+    ("Fourier series analysis", "傅里叶级数分析", "Dirichlet kernel", "狄利克雷核", "Gibbs phenomenon"),
+    ("distribution theory", "广义函数理论", "Dirac delta", "狄拉克δ函数", "weak derivative"),
+    ("Sobolev space", "索伯列夫空间", "weak formulation", "弱形式", "embedding theorem"),
+    # -- 复分析深化 --
+    ("Laurent series", "洛朗级数", "residue theorem", "留数定理", "contour integration"),
+    ("conformal mapping", "保角映射", "Riemann mapping theorem", "黎曼映射定理", "Möbius"),
+    ("analytic continuation", "解析延拓", "monodromy", "单值性", "Riemann surface"),
+    ("Nevanlinna theory", "奈万林纳理论", "value distribution", "值分布", "meromorphic"),
+    # -- 抽象代数深化 --
+    ("group theory", "群论", "Sylow theorem", "西罗定理", "normal subgroup quotient"),
+    ("ring theory", "环论", "ideal", "理想", "prime maximal ideal", "localization"),
+    ("module theory", "模论", "free projective injective", "自由投射内射模", "Tor Ext"),
+    ("representation theory", "表示论", "character table", "特征标表", "irreducible representation"),
+    ("Lie algebra", "李代数", "semisimple", "半单李代数", "root system Dynkin diagram"),
+    ("homological algebra", "同调代数", "chain complex", "链复形", "derived functor"),
+    # -- 几何深化 --
+    ("Riemannian geometry", "黎曼几何", "geodesic", "测地线", "sectional curvature"),
+    ("Lie group", "李群", "exponential map", "指数映射", "left invariant vector field"),
+    ("symplectic geometry", "辛几何", "symplectic form", "辛形式", "Hamiltonian flow"),
+    ("complex geometry", "复几何", "Kähler manifold", "凯勒流形", "Dolbeault cohomology"),
+    ("convex geometry", "凸几何", "convex body", "凸体", "support function", "polar dual"),
+    ("discrete geometry", "离散几何", "packing covering", "堆积覆盖", "Minkowski theorem"),
+    # -- 拓扑深化 --
+    ("point-set topology", "点集拓扑", "open closed set", "开闭集", "continuity homeomorphism"),
+    ("CW complex", "CW复形", "cell attachment", "胞腔附着", "cellular homology"),
+    ("fiber bundle", "纤维丛", "vector bundle", "向量丛", "connection curvature"),
+    ("spectral sequence", "谱序列", "Serre spectral sequence", "Leray-Serre", "convergence"),
+    ("K-theory", "K理论", "topological K", "向量丛等价类", "Bott periodicity"),
+    # -- 概率论深化 --
+    ("conditional expectation", "条件期望", "sigma algebra filtration", "σ代数域流", "tower property"),
+    ("weak convergence probability", "弱收敛", "characteristic function", "特征函数", "tightness"),
+    ("large deviations", "大偏差", "rate function", "速率函数", "Cramér theorem"),
+    ("ergodic theory", "遍历理论", "invariant measure", "不变测度", "mixing ergodicity"),
+    ("random graph", "随机图", "Erdos Renyi", "ER模型", "threshold phenomenon"),
+    ("percolation theory", "渗流理论", "critical probability", "临界概率", "cluster"),
+    # ── Batch KK end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：物理深化 ════════════════════════════════════════
+    # ── Batch LL: 量子力学深化 / 统计物理 / 光学深化 / 核物理深化 ─────────────────
+    # -- 量子力学深化 --
+    ("perturbation theory", "微扰理论", "time independent dependent", "定态非定态微扰", "selection rule"),
+    ("variational principle quantum", "量子变分原理", "Rayleigh-Ritz", "试探波函数", "ground state"),
+    ("WKB approximation", "WKB近似", "tunneling barrier", "势垒穿透", "semiclassical"),
+    ("spin angular momentum", "自旋角动量", "spin-orbit coupling", "自旋轨道耦合", "fine structure"),
+    ("identical particles", "全同粒子", "Fermi-Dirac Bose-Einstein", "费米狄拉克玻色爱因斯坦", "exchange"),
+    ("second quantization", "二次量子化", "creation annihilation operator", "产生湮灭算符", "Fock space"),
+    ("quantum electrodynamics QED", "量子电动力学", "Feynman diagram", "费曼图", "renormalization"),
+    ("quantum chromodynamics QCD", "量子色动力学", "asymptotic freedom", "渐近自由", "confinement"),
+    ("quantum information", "量子信息", "qubit gate", "量子门", "quantum teleportation"),
+    # -- 统计物理深化 --
+    ("canonical ensemble", "正则系综", "Helmholtz free energy", "亥姆霍兹自由能", "partition function"),
+    ("grand canonical ensemble", "巨正则系综", "chemical potential", "化学势", "Landau potential"),
+    ("Ising model", "伊辛模型", "spin interaction", "自旋相互作用", "mean field Onsager"),
+    ("renormalization group", "重整化群", "fixed point", "不动点", "scaling exponent"),
+    ("Monte Carlo simulation physics", "物理蒙特卡洛", "Metropolis algorithm", "Markov chain sampling"),
+    ("molecular dynamics simulation", "分子动力学模拟", "Lennard-Jones potential", "LJ势", "NVE NVT"),
+    ("kinetic theory", "动理论", "Boltzmann equation", "玻尔兹曼方程", "H-theorem"),
+    # -- 光学深化 --
+    ("laser physics", "激光物理", "population inversion", "粒子数反转", "gain medium cavity"),
+    ("nonlinear optics ultrafast", "超快非线性光学", "pump probe", "泵浦探测", "two-photon absorption"),
+    ("fiber optics", "光纤光学", "single mode multimode fiber", "单多模光纤", "dispersion attenuation"),
+    ("holography", "全息术", "coherent illumination", "相干照明", "hologram reconstruction"),
+    ("adaptive optics", "自适应光学", "wavefront sensor", "波前传感器", "deformable mirror"),
+    ("spectroscopy techniques", "光谱技术", "Raman FTIR UV-Vis NMR", "拉曼红外紫外可见核磁"),
+    ("photonic bandgap", "光子带隙", "photonic crystal fiber PCF", "光子晶体光纤", "mode confinement"),
+    # -- 核物理深化 --
+    ("nuclear shell model", "核壳层模型", "magic number", "幻数", "spin-orbit splitting"),
+    ("nuclear reaction cross section", "核反应截面", "barn unit", "靶恩单位", "compound nucleus"),
+    ("beta decay", "β衰变", "Fermi theory", "费米理论", "neutrino mass", "double beta"),
+    ("gamma spectroscopy nuclear", "γ谱学", "HPGe detector", "高纯锗探测器", "energy resolution"),
+    ("nuclear astrophysics", "核天体物理", "stellar nucleosynthesis", "恒星核合成", "r-process s-process"),
+    ("accelerator physics", "加速器物理", "synchrotron cyclotron", "同步加速器回旋加速器", "emittance"),
+    ("detector physics", "探测器物理", "ionization track", "电离径迹", "scintillator silicon"),
+    # ── Batch LL end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：化学深化续 ══════════════════════════════════════
+    # ── Batch MM: 无机化学深化 / 物理化学深化 / 分析化学深化 ─────────────────────
+    # -- 无机化学深化 --
+    ("transition metal chemistry", "过渡金属化学", "d-block complex", "d区配合物", "crystal field theory"),
+    ("ligand field theory", "配位场理论", "splitting energy", "分裂能", "high low spin"),
+    ("organometallic chemistry", "有机金属化学", "metal carbonyl", "金属羰基化合物", "Grignard"),
+    ("bioinorganic chemistry", "生物无机化学", "metalloenzyme", "金属酶", "hemoglobin iron"),
+    ("zeolite catalysis", "分子筛催化", "shape selective", "择形催化", "acid site framework"),
+    ("perovskite structure", "钙钛矿结构", "ABO3 oxide", "氧化物陶瓷", "ferroelectric"),
+    ("lanthanide actinide", "镧系锕系", "f-block chemistry", "f区元素", "luminescence"),
+    ("solid-state inorganic", "无机固体化学", "ionic bonding", "离子键", "defect structure"),
+    # -- 物理化学深化 --
+    ("kinetics rate constant temperature", "速率常数温度依赖", "Arrhenius pre-exponential factor", "频率因子"),
+    ("activated complex Evans Polanyi", "活化复合物埃文斯-波拉尼", "BEP linear free energy", "线性自由能关系"),
+    ("chemical equilibrium", "化学平衡", "Le Chatelier principle", "勒夏特列原理", "activity coefficient"),
+    ("electrochemical thermodynamics", "电化学热力学", "Nernst equation", "能斯特方程", "standard potential"),
+    ("statistical thermodynamics", "统计热力学", "partition function chemistry", "热力学函数"),
+    ("quantum chemistry", "量子化学", "Hartree-Fock", "HF方法", "DFT molecular orbital"),
+    ("molecular spectroscopy", "分子光谱学", "rotational vibrational", "转动振动光谱", "selection rule"),
+    ("photochemistry reaction", "光化学反应", "Jablonski diagram", "杰布隆斯基图", "quantum yield"),
+    # -- 分析化学深化 --
+    ("mass spectrometry", "质谱", "ionization technique", "电离方式", "ESI MALDI fragmentation"),
+    ("NMR spectroscopy", "核磁共振波谱", "chemical shift coupling", "化学位移耦合", "2D NMR"),
+    ("X-ray diffraction XRD", "X射线衍射", "Bragg law", "布拉格定律", "crystal structure determination"),
+    ("atomic absorption spectroscopy AAS", "原子吸收光谱", "flame graphite furnace", "火焰石墨炉"),
+    ("ICP-MS ICP-OES", "电感耦合等离子体质谱光谱", "trace element", "痕量元素", "interference"),
+    ("electroanalytical chemistry", "电分析化学", "cyclic voltammetry", "循环伏安法", "electrode reaction"),
+    ("chromatography GC HPLC", "色谱气相液相", "stationary mobile phase", "固定流动相", "resolution"),
+    ("sample preparation", "样品前处理", "solid phase extraction SPE", "液液萃取LLE", "digestion"),
+    # -- 理论与计算化学 --
+    ("molecular mechanics force field", "分子力学力场", "AMBER CHARMM OPLS", "bonded nonbonded"),
+    ("ab initio calculation", "从头计算", "basis set", "基组", "MP2 CCSD coupled cluster"),
+    ("TDDFT time dependent", "含时密度泛函", "excited state", "激发态", "absorption spectrum"),
+    ("QM/MM hybrid", "量子力学/分子力学", "enzyme active site", "酶活性位点", "ONIOM"),
+    ("molecular simulation GROMACS", "GROMACS分子模拟", "MD trajectory", "MD轨迹", "free energy"),
+    ("chemoinformatics", "化学信息学", "SMILES InChI", "化学结构表示", "fingerprint similarity"),
+    # ── Batch MM end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：生物学深化续 ════════════════════════════════════
+    # ── Batch NN: 分子生物深化 / 遗传学深化 / 生态学深化 / 进化深化 ──────────────
+    # -- 分子生物学深化 --
+    ("gene regulation", "基因调控", "transcription factor binding", "转录因子结合", "promoter enhancer"),
+    ("chromatin structure", "染色质结构", "nucleosome histone", "核小体组蛋白", "open closed chromatin"),
+    ("RNA processing", "RNA加工", "splicing spliceosome", "剪接体", "5 cap polyadenylation"),
+    ("post-translational modification", "翻译后修饰", "phosphorylation ubiquitination", "磷酸化泛素化"),
+    ("protein trafficking", "蛋白质运输", "secretory pathway", "分泌途径", "ER Golgi vesicle"),
+    ("autophagy", "自噬", "lysosome degradation", "溶酶体降解", "beclin ATG", "mTOR"),
+    ("apoptosis", "细胞凋亡", "caspase cascade", "半胱天冬酶级联", "mitochondrial pathway"),
+    ("cell signaling pathway", "细胞信号通路", "MAPK PI3K Wnt", "MAP激酶PI3K Wnt", "crosstalk"),
+    ("DNA damage repair", "DNA损伤修复", "base excision nucleotide excision", "碱基核苷酸切除修复"),
+    # -- 遗传学深化 --
+    ("linkage disequilibrium LD", "连锁不平衡", "haplotype block", "单倍型区块", "recombination"),
+    ("genome wide association GWAS", "全基因组关联研究", "SNP chip", "芯片基因分型", "Manhattan plot"),
+    ("copy number variation CNV", "拷贝数变异", "deletion duplication", "缺失重复", "dosage"),
+    ("structural variant", "结构变异", "inversion translocation", "倒位易位", "long read sequencing"),
+    ("population genetics", "群体遗传学", "allele frequency", "等位基因频率", "drift selection"),
+    ("quantitative genetics", "数量遗传学", "heritability narrow broad", "狭义广义遗传力", "BLUP"),
+    ("epigenomics", "表观基因组学", "WGBS ATAC-seq ChIP-seq", "亚硫酸盐测序", "open chromatin"),
+    # -- 生态学深化 --
+    ("population dynamics ecology", "种群动态", "logistic growth", "逻辑斯谛增长", "carrying capacity K"),
+    ("community ecology", "群落生态学", "species diversity", "物种多样性", "Shannon index"),
+    ("food web", "食物网", "trophic cascade", "营养级联", "keystone species"),
+    ("biogeography", "生物地理学", "island theory", "岛屿理论", "MacArthur Wilson", "dispersal"),
+    ("landscape ecology", "景观生态学", "patch corridor matrix", "斑块廊道基质", "connectivity"),
+    ("chemical ecology", "化学生态学", "pheromone volatile", "信息素挥发物", "plant defense"),
+    ("behavioral ecology", "行为生态学", "foraging theory", "觅食理论", "optimal foraging"),
+    ("reproductive ecology", "繁殖生态学", "mating system", "交配制度", "sexual selection"),
+    # -- 进化生物学深化 --
+    ("molecular evolution", "分子进化", "neutral theory", "中性理论", "synonymous substitution"),
+    ("comparative genomics", "比较基因组学", "synteny", "共线性", "gene family evolution"),
+    ("coevolution", "协同进化", "arms race", "进化军备竞赛", "host parasite"),
+    ("evo-devo", "进化发育生物学", "homeobox Hox", "同源异形盒", "developmental constraint"),
+    ("speciation mechanism", "物种形成机制", "allopatric sympatric", "异地同地物种形成", "hybrid zone"),
+    ("adaptation genetics", "遗传适应", "positive selection sweep", "正选择清扫", "FST differentiation"),
+    # -- 微生物学深化 --
+    ("bacterial genetics", "细菌遗传学", "conjugation transduction transformation", "接合转导转化"),
+    ("quorum sensing", "群体感应", "autoinducer signal", "自诱导信号", "biofilm formation"),
+    ("antibiotic resistance mechanism", "抗生素耐药机制", "beta-lactamase efflux pump", "β内酰胺酶"),
+    ("microbiome gut", "肠道微生物组", "16S amplicon", "16S扩增子", "diversity dysbiosis"),
+    ("phage biology", "噬菌体生物学", "lytic lysogenic cycle", "裂解原噬菌体循环", "CRISPR defense"),
+    # ── Batch NN end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：地球科学深化 ════════════════════════════════════
+    # ── Batch OO: 地质深化 / 地球物理 / 大气科学 / 海洋科学 ─────────────────────
+    # -- 地质学深化 --
+    ("sedimentary facies", "沉积相", "fluvial deltaic", "河流三角洲相", "sequence stratigraphy"),
+    ("carbonate geology", "碳酸盐岩地质", "reef limestone dolomite", "礁灰岩白云岩", "diagenesis"),
+    ("structural geology", "构造地质学", "fold fault thrust", "褶皱断层逆冲", "stress strain field"),
+    ("igneous petrology", "火成岩岩石学", "magmatic differentiation", "岩浆分异", "xenolith"),
+    ("metamorphic petrology", "变质岩岩石学", "pressure temperature path", "PT路径", "grade zone"),
+    ("geochronology", "地质年代学", "U-Pb zircon dating", "锆石铀铅定年", "40Ar/39Ar"),
+    ("basin analysis", "盆地分析", "subsidence thermal history", "沉降热历史", "petroleum system"),
+    ("geomorphology process", "地貌学过程", "weathering mass wasting", "风化崩塌", "stream incision"),
+    ("quaternary geology", "第四纪地质", "glacial interglacial", "冰期间冰期", "loess paleosol"),
+    # -- 地球物理深化 --
+    ("seismic reflection", "地震反射", "CDP stacking", "共深度点叠加", "migration velocity"),
+    ("seismic refraction", "地震折射", "first arrival", "初至波", "tomography inversion"),
+    ("gravity survey", "重力勘探", "Bouguer anomaly", "布格异常", "isostasy"),
+    ("magnetic survey", "磁力勘探", "total field anomaly", "全场异常", "aeromagnetic"),
+    ("electromagnetic survey", "电磁勘探", "magnetotelluric MT", "大地电磁", "CSEM"),
+    ("well logging", "测井", "gamma ray resistivity", "自然伽马电阻率", "petrophysics"),
+    ("geodesy GNSS", "大地测量GNSS", "GPS baseline", "GPS基线", "crustal deformation"),
+    # -- 大气科学深化 --
+    ("atmospheric dynamics", "大气动力学", "geostrophic wind", "地转风", "thermal wind balance"),
+    ("general circulation", "大气环流", "Hadley Ferrel polar cell", "哈德里费雷尔极区环流"),
+    ("extratropical cyclone", "温带气旋", "frontal system", "锋面系统", "warm cold occlusion front"),
+    ("tropical meteorology", "热带气象学", "ITCZ monsoon", "热带辐合带季风", "Madden-Julian"),
+    ("numerical weather prediction", "数值天气预报", "ensemble forecast", "集合预报", "data assimilation"),
+    ("cloud microphysics", "云微物理", "droplet nucleation growth", "液滴成核增长", "precipitation"),
+    ("atmospheric chemistry", "大气化学", "ozone stratosphere", "臭氧层", "radical NOx HOx"),
+    ("boundary layer meteorology", "边界层气象", "turbulent flux", "湍流通量", "Monin-Obukhov"),
+    # -- 海洋科学深化 --
+    ("physical oceanography", "物理海洋学", "geostrophic current", "地转流", "eddy kinetic energy"),
+    ("ocean heat transport", "海洋热输送", "thermohaline overturning", "热盐翻转环流", "AMOC"),
+    ("tidal dynamics", "潮汐动力学", "tidal constituent", "潮汐分量", "tidal forcing resonance"),
+    ("wave mechanics ocean", "海洋波浪力学", "significant wave height", "有效波高", "swell fetch"),
+    ("coastal geomorphology", "海岸地貌", "sediment transport", "泥沙输运", "longshore drift"),
+    ("marine biogeochemistry", "海洋生物地球化学", "carbon pump", "生物泵", "nutrient cycling"),
+    ("deep sea biology", "深海生物学", "hydrothermal vent", "热液喷口", "chemosynthesis"),
+    ("sea ice dynamics", "海冰动力学", "ice thickness albedo", "冰厚反照率", "melt pond"),
+    # ── Batch OO end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：计算机体系结构 / 编译器 / 形式化 ══════════════════
+    # ── Batch PP: 体系结构深化 / 编译原理 / 形式化方法 / 分布式系统 ──────────────
+    # -- 计算机体系结构深化 --
+    ("instruction set architecture ISA", "指令集架构", "RISC CISC", "精简复杂指令集", "opcode"),
+    ("branch prediction", "分支预测", "tournament predictor", "竞标预测器", "BTB ROB"),
+    ("memory hierarchy", "内存层次结构", "DRAM bandwidth latency", "内存带宽延迟", "prefetching"),
+    ("cache coherence protocol", "缓存一致性协议", "MESI MOESI", "invalid shared exclusive", "snoop"),
+    ("out-of-order execution", "乱序执行", "Tomasulo algorithm", "Tomasulo算法", "reservation station"),
+    ("SIMD vector processing", "SIMD向量处理", "AVX SSE NEON", "向量指令", "data parallelism"),
+    ("GPU compute architecture", "GPU计算架构", "warp divergence latency hiding", "延迟隐藏", "occupancy"),
+    ("memory consistency model", "内存一致性模型", "sequential consistency", "顺序一致性", "TSO relaxed"),
+    ("network on chip NoC", "片上网络", "mesh torus topology", "mesh环形拓扑", "routing"),
+    ("persistent memory NVRAM", "非易失内存", "Intel Optane PMDK", "byte-addressable", "wear leveling"),
+    # -- 编译原理深化 --
+    ("lexical analysis", "词法分析", "regular expression DFA", "正则表达式确定自动机", "token"),
+    ("parsing", "语法分析", "LL LR parser", "LL LR分析器", "parse tree AST"),
+    ("compiler semantic type system", "编译器类型系统", "type inference", "类型推断", "subtyping"),
+    ("intermediate representation IR", "中间表示", "three-address code", "三地址码", "SSA form"),
+    ("register allocation", "寄存器分配", "graph coloring", "图着色", "liveness interference"),
+    ("code optimization", "代码优化", "loop unrolling inlining", "循环展开内联", "dead code"),
+    ("just-in-time compilation JIT", "即时编译", "hot path optimization", "热路径优化", "deoptimize"),
+    ("program analysis static", "静态程序分析", "dataflow analysis", "数据流分析", "alias points-to"),
+    # -- 形式化方法 --
+    ("hardware formal verification", "硬件形式化验证", "property checking", "属性检验", "assertion coverage"),
+    ("theorem proving", "定理证明", "Coq Isabelle Lean", "证明助手", "interactive proof"),
+    ("temporal logic", "时序逻辑", "LTL CTL", "线性分支时序逻辑", "safety liveness"),
+    ("abstract interpretation", "抽象解释", "Galois connection", "伽罗瓦连接", "widening"),
+    ("type theory", "类型理论", "dependent type", "依赖类型", "Curry-Howard correspondence"),
+    ("process algebra", "进程代数", "CSP CCS pi-calculus", "并发进程演算", "bisimulation"),
+    # -- 分布式系统深化 --
+    ("consensus algorithm", "共识算法", "Paxos Raft", "日志复制状态机", "leader election"),
+    ("CAP distributed trade-off", "分布式CAP权衡", "strong eventual consistency", "最终一致性", "BASE"),
+    ("distributed transaction", "分布式事务", "2PC 3PC", "两阶段三阶段提交", "saga pattern"),
+    ("CRDTs", "无冲突复制数据类型", "conflict-free replicated", "merge function", "eventual"),
+    ("clock synchronization", "时钟同步", "vector clock", "向量时钟", "Lamport timestamp"),
+    ("distributed storage", "分布式存储", "erasure coding", "纠删码", "replication factor"),
+    ("gossip protocol", "流言协议", "epidemic dissemination", "消息传播", "SWIM membership"),
+    # ── Batch PP end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：材料科学深化 ════════════════════════════════════
+    # ── Batch QQ: 金属材料 / 陶瓷 / 聚合物 / 复合材料 / 表面工程深化 ──────────────
+    # -- 金属材料深化 --
+    ("iron carbon phase diagram", "铁碳相图", "austenite martensite", "奥氏体马氏体", "eutectoid"),
+    ("steel heat treatment", "钢铁热处理", "quenching tempering annealing", "淬火回火退火", "TTT CCT"),
+    ("cast iron", "铸铁", "gray white ductile", "灰口白口球墨", "graphite morphology"),
+    ("aluminum alloy", "铝合金", "wrought cast series", "变形铸造系列", "age hardening T6"),
+    ("titanium alloy", "钛合金", "alpha beta", "α β钛合金", "biomedical aerospace"),
+    ("superalloy", "高温合金", "nickel-base cobalt-base", "镍基钴基", "creep resistance"),
+    ("powder metallurgy", "粉末冶金", "sintering densification", "烧结致密化", "HIP CIP"),
+    ("welding metallurgy", "焊接冶金", "HAZ heat affected zone", "热影响区", "solidification"),
+    # -- 陶瓷材料深化 --
+    ("structural ceramics", "结构陶瓷", "toughening mechanism", "增韧机制", "R-curve"),
+    ("electronic ceramics", "电子陶瓷", "PZT BaTiO3", "铁电压电", "dielectric constant"),
+    ("glass ceramics", "微晶玻璃", "nucleation controlled", "受控成核", "Li2Si2O5"),
+    ("refractory ceramics", "耐火陶瓷", "high temperature service", "高温服役", "creep oxidation"),
+    ("ceramic forming", "陶瓷成形", "slip casting tape casting", "注浆流延成形", "green body"),
+    # -- 聚合物材料深化 --
+    ("thermoplastics", "热塑性塑料", "melting crystallization", "熔融结晶", "injection molding cycle"),
+    ("thermoset polymer", "热固性聚合物", "epoxy phenolic", "环氧酚醛", "crosslink density"),
+    ("elastomer rubber", "弹性体橡胶", "vulcanization sulfur", "硫化", "hysteresis loss"),
+    ("biopolymer", "生物聚合物", "PLA PHA", "聚乳酸聚羟基烷酸酯", "biodegradable"),
+    ("hydrogel", "水凝胶", "swelling ratio", "溶胀比", "stimuli responsive", "crosslink network"),
+    ("conducting polymer", "导电聚合物", "PEDOT polythiophene", "聚噻吩", "doping"),
+    # -- 复合材料深化 --
+    ("carbon fiber composite CFRP", "碳纤维复合材料", "lay-up sequence", "铺层顺序", "autoclave cure"),
+    ("glass fiber GFRP", "玻璃纤维复合材料", "chopped woven", "短切编织", "wet lay-up pultrusion"),
+    ("metal matrix composite MMC", "金属基复合材料", "SiC particle whisker", "颗粒晶须增强"),
+    ("ceramic matrix composite CMC", "陶瓷基复合材料", "SiC/SiC", "高温oxidation resistance"),
+    ("sandwich structure", "夹芯结构", "honeycomb foam core", "蜂窝泡沫芯", "face sheet"),
+    ("nanocomposite", "纳米复合材料", "graphene CNT reinforced", "石墨烯碳管增强", "percolation"),
+    # -- 表面工程深化 --
+    ("thermal spray coating", "热喷涂涂层", "plasma HVOF flame", "等离子超音速火焰喷涂", "porosity"),
+    ("electroplating", "电镀", "bath composition", "镀浴成分", "current efficiency thickness"),
+    ("physical vapor deposition PVD", "物理气相沉积", "sputtering evaporation", "溅射蒸发", "adhesion"),
+    ("chemical vapor deposition CVD", "化学气相沉积", "precursor gas", "前驱体气体", "epitaxial growth"),
+    ("ion implantation", "离子注入", "dopant profile", "掺杂分布", "SRIM range straggling"),
+    ("surface hardening", "表面硬化", "induction nitriding carburizing", "感应渗氮渗碳", "case depth"),
+    # ── Batch QQ end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：控制 / 机器人 / 仪器深化 ═══════════════════════
+    # ── Batch RR: 控制理论深化 / 机器人学深化 / 测控仪器 ─────────────────────────
+    # -- 控制理论深化 --
+    ("root locus method", "根轨迹法", "closed loop poles", "闭环极点", "gain margin phase margin"),
+    ("frequency domain design", "频域设计", "lead lag compensator", "超前滞后补偿器", "crossover"),
+    ("state feedback control", "状态反馈控制", "pole placement", "极点配置", "observer Luenberger"),
+    ("linear quadratic regulator LQR", "线性二次调节器", "optimal control", "最优控制", "Riccati"),
+    ("Kalman filter", "卡尔曼滤波", "state estimation noise", "状态估计噪声", "predict update"),
+    ("model predictive control MPC", "模型预测控制", "receding horizon", "滚动时域", "constraint handling"),
+    ("adaptive control", "自适应控制", "MRAC model reference", "模型参考自适应", "parameter estimation"),
+    ("robust control H-infinity", "鲁棒H无穷控制", "uncertainty weighting", "不确定权重", "mixed sensitivity"),
+    ("nonlinear control", "非线性控制", "feedback linearization", "反馈线性化", "sliding mode control"),
+    ("fuzzy logic control", "模糊逻辑控制", "fuzzy rule base", "模糊规则库", "defuzzification"),
+    # -- 机器人学深化 --
+    ("robot dynamics", "机器人动力学", "Newton-Euler Lagrange", "牛顿-欧拉拉格朗日", "inertia matrix"),
+    ("robot trajectory planning", "机器人轨迹规划", "joint Cartesian space", "关节笛卡尔空间", "jerk"),
+    ("robot grasping", "机器人抓取", "grasp planning", "抓取规划", "force closure", "friction cone"),
+    ("SLAM simultaneous localization", "同步定位与地图构建", "EKF-SLAM particle filter", "特征地图"),
+    ("path planning robot", "机器人路径规划", "A* RRT PRM", "A星快速随机树", "obstacle avoidance"),
+    ("robot learning", "机器人学习", "imitation learning", "模仿学习", "sim-to-real transfer"),
+    ("soft robot", "软体机器人", "pneumatic actuator", "气动执行器", "compliant mechanism"),
+    ("swarm robotics", "群体机器人", "decentralized coordination", "分散协调", "stigmergy"),
+    # -- 测控仪器深化 --
+    ("analog signal conditioning", "模拟信号调理", "instrumentation amplifier", "仪表放大器", "CMR"),
+    ("ADC design", "ADC设计", "resolution ENOB", "有效位数", "aperture jitter"),
+    ("frequency measurement", "频率测量", "frequency counter", "频率计数器", "reciprocal gating"),
+    ("lock-in amplifier", "锁相放大器", "phase sensitive detection", "相敏检波", "narrow bandwidth"),
+    ("signal averaging", "信号平均", "coherent boxcar", "相干平均", "noise floor improvement"),
+    ("digital signal processing DSP hardware", "DSP硬件", "fixed point overflow", "定点溢出", "pipeline"),
+    ("GPIB USB VXI PXI", "仪器总线", "instrument control", "仪器控制", "VISA driver"),
+    # ── Batch RR end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：天文深化 / 地球物理深化 / 交叉理科 ══════════════
+    # ── Batch SS: 天文深化 / 地球物理深化 / 交叉理科前沿 ─────────────────────────
+    # -- 天文深化 --
+    ("gravitational waves", "引力波", "LIGO Virgo LISA", "激光干涉仪", "strain sensitivity"),
+    ("neutron star", "中子星", "equation of state dense matter", "致密物质状态方程", "pulsar timing"),
+    ("active galactic nuclei AGN", "活动星系核", "accretion disk jet", "吸积盘射流", "quasar blazar"),
+    ("gamma ray burst GRB", "伽马射线暴", "short long duration", "短长持续时间", "afterglow"),
+    ("dark matter detection", "暗物质探测", "WIMP direct indirect", "弱相互作用大质量粒子", "axion"),
+    ("inflation cosmology", "暴胀宇宙学", "slow roll condition", "慢滚条件", "primordial perturbation"),
+    ("big bang nucleosynthesis BBN", "大爆炸核合成", "helium abundance", "氦丰度", "deuterium"),
+    ("cosmic microwave background CMB", "宇宙微波背景", "power spectrum", "功率谱", "Planck satellite"),
+    ("stellar population synthesis", "恒星族合成", "IMF initial mass function", "初始质量函数"),
+    ("interstellar dust", "星际尘埃", "extinction reddening", "消光红化", "grain size distribution"),
+    # -- 地球物理深化 --
+    ("earthquake source mechanism", "地震震源机制", "focal mechanism", "震源机制解", "moment tensor"),
+    ("seismic tomography", "地震层析成像", "P-wave velocity anomaly", "P波速度异常", "mantle plume"),
+    ("earth interior structure", "地球内部结构", "core mantle boundary", "核幔边界", "CMB D''"),
+    ("geodynamics", "地球动力学", "mantle convection", "地幔对流", "viscosity rheology"),
+    ("paleomagnetism", "古地磁学", "magnetic reversal", "磁极倒转", "virtual geomagnetic pole"),
+    ("geothermal gradient", "地温梯度", "heat flow", "热流值", "crustal thickness"),
+    ("geodetic satellite", "测地卫星", "InSAR", "合成孔径雷达干涉", "surface deformation"),
+    # -- 交叉理科前沿 --
+    ("biophysics membrane", "生物膜生物物理", "lipid bilayer", "脂质双层", "channel conductance"),
+    ("soft matter biophysics", "软物质生物物理", "actin cytoskeleton", "肌动蛋白骨架", "force generation"),
+    ("systems chemistry", "系统化学", "reaction network", "反应网络", "autocatalysis"),
+    ("origin of life chemistry", "生命起源化学", "RNA world", "RNA世界", "prebiotic synthesis"),
+    ("astrochemistry ISM", "星际介质天体化学", "interstellar molecule", "星际分子", "cold chemistry"),
+    ("atmospheric aerosol", "大气气溶胶", "nucleation growth", "成核生长", "CCN cloud nuclei"),
+    ("planetary interior", "行星内部", "core differentiation", "核心分异", "magnetic dynamo"),
+    ("space weather", "空间天气", "solar wind magnetosphere", "太阳风磁层", "geomagnetic storm"),
+    # ── Batch SS end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：航空航天深化 / 船舶 / 矿业 ═════════════════════
+    # ── Batch TT: 航空航天深化 / 船舶工程 / 矿业采矿 ──────────────────────────────
+    # -- 航空动力学深化 --
+    ("transonic aerodynamics", "跨声速空气动力学", "wave drag", "波阻", "critical Mach number"),
+    ("hypersonic flow", "超高声速流", "real gas effect", "真实气体效应", "stagnation enthalpy"),
+    ("rotary wing aerodynamics", "旋翼空气动力学", "blade element momentum BEM", "叶素动量"),
+    ("vortex dynamics", "涡动力学", "tip vortex wake", "翼尖涡尾迹", "induced drag reduction"),
+    ("aeroelasticity", "气动弹性", "flutter divergence", "颤振发散", "aeroelastic tailoring"),
+    ("turbomachinery", "叶轮机械", "axial centrifugal compressor", "轴流离心压气机", "pressure ratio"),
+    ("combustor design", "燃烧室设计", "dilution zone primary", "主燃稀释区", "pattern factor"),
+    ("noise aircraft", "飞机噪声", "fan jet airframe", "风扇喷气机体噪声", "EPNL certification"),
+    # -- 飞行器系统 --
+    ("fly by wire system", "电传飞控系统", "flight control law", "飞控律", "redundancy voting"),
+    ("aircraft landing gear", "飞机起落架", "retraction mechanism", "收放机构", "shimmy damper"),
+    ("fuel system aircraft", "飞机燃油系统", "fuel transfer pump", "燃油传输泵", "CG management"),
+    ("environmental control system ECS", "环控系统", "pressurization air conditioning", "座舱增压"),
+    ("satellite orbit determination", "卫星轨道确定", "two-line element TLE", "两行根数", "Kepler"),
+    ("reentry capsule", "返回舱", "ablation heat shield material", "烧蚀材料", "recovery parachute"),
+    # -- 船舶工程 --
+    ("ship resistance propulsion", "船舶阻力推进", "form resistance", "形状阻力", "Froude number"),
+    ("ship stability", "船舶稳性", "metacentric height GM", "稳心高度", "righting lever GZ"),
+    ("hull structural design", "船体结构设计", "section modulus", "剖面模数", "fatigue hotspot"),
+    ("marine propeller", "船用螺旋桨", "cavitation number", "空化数", "open water efficiency"),
+    ("ship vibration noise", "船舶振动噪声", "propeller excitation", "螺旋桨激振", "acoustic signature"),
+    ("offshore platform", "海洋平台", "jacket tension leg spar", "导管架张力腿单柱", "riser"),
+    ("ship maneuverability", "船舶操纵性", "turning circle", "回转圈", "stopping distance"),
+    # -- 矿业工程 --
+    ("mine planning open pit", "露天矿开采规划", "pit slope angle", "边坡角", "strip ratio"),
+    ("underground mining", "地下采矿", "room pillar longwall", "房柱法长壁法", "support design"),
+    ("rock mechanics", "岩石力学", "uniaxial compressive strength UCS", "单轴抗压强度", "RQD"),
+    ("blasting engineering", "爆破工程", "explosive initiation", "起爆", "fragmentation burden"),
+    ("ore processing mineral", "矿石加工", "crushing grinding flotation", "破碎磨矿浮选", "recovery"),
+    ("mine ventilation", "矿井通风", "airways resistance", "巷道阻力", "fan curve"),
+    ("tailings management", "尾矿管理", "tailings dam", "尾矿坝", "stability closure"),
+    # ── Batch TT end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：半导体 / 光电 / 微纳加工 ═══════════════════════
+    # ── Batch UU: 半导体器件 / 光电子 / 微纳加工 / 新型电子器件 ──────────────────
+    # -- 半导体器件深化 --
+    ("MOSFET operation", "MOSFET工作原理", "threshold voltage VT", "阈值电压", "subthreshold slope"),
+    ("short channel effect", "短沟道效应", "DIBL drain induced", "漏致势垒降低", "hot carrier"),
+    ("FinFET GAA", "鳍式全绕栅晶体管", "gate all around", "全环绕栅", "3nm node"),
+    ("CMOS circuit", "CMOS电路", "inverter NAND NOR", "反相器与非或非", "static power"),
+    ("bipolar transistor BJT", "双极型晶体管", "current gain beta", "电流增益", "Early effect"),
+    ("JFET depletion mode", "耗尽型JFET", "pinch off", "夹断", "transconductance gm"),
+    ("thyristor SCR", "晶闸管", "gate triggering", "门极触发", "commutation turn-off"),
+    ("semiconductor diode", "半导体二极管", "forward bias reverse", "正向反向偏置", "junction capacitance"),
+    ("power semiconductor", "功率半导体", "breakdown voltage", "击穿电压", "on-resistance RDS"),
+    # -- 光电子器件 --
+    ("LED structure", "LED结构", "double heterostructure", "双异质结", "internal quantum efficiency"),
+    ("laser diode", "激光二极管", "threshold current density", "阈值电流密度", "slope efficiency"),
+    ("photodetector", "光电探测器", "responsivity", "响应度", "NEP noise equivalent power"),
+    ("solar cell physics", "太阳电池物理", "fill factor Voc Jsc", "填充因子开路电压短路电流"),
+    ("avalanche photodiode APD", "雪崩光电二极管", "multiplication factor", "倍增因子", "excess noise"),
+    ("quantum dot device", "量子点器件", "size tunable emission", "尺寸可调发射", "confinement"),
+    ("vertical cavity surface emitting VCSEL", "垂直腔面发射激光器", "DBR mirror", "布拉格反射镜"),
+    ("optical modulator", "光调制器", "electro-optic Mach-Zehnder", "电光马赫-曾德尔", "bandwidth"),
+    # -- 微纳加工技术 --
+    ("photolithography", "光刻", "resist exposure development", "光刻胶曝光显影", "resolution k1"),
+    ("EUV lithography", "极紫外光刻", "13.5nm wavelength", "13.5nm波长", "reflective optics"),
+    ("etching dry wet", "干湿法刻蚀", "RIE ICP", "反应离子刻蚀感应耦合", "selectivity"),
+    ("ion beam lithography FIB", "聚焦离子束", "milling deposition", "铣削沉积", "nanoscale"),
+    ("e-beam lithography", "电子束光刻", "proximity effect", "邻近效应", "dose correction"),
+    ("clean room", "洁净室", "particle class ISO", "洁净度等级", "contamination control"),
+    ("wafer bonding", "晶圆键合", "fusion anodic", "熔融阳极键合", "SOI substrate"),
+    ("through silicon via TSV", "硅通孔", "3D IC integration", "三维集成", "aspect ratio"),
+    # -- 新型电子器件 --
+    ("2D material transistor", "二维材料晶体管", "MoS2 black phosphorus", "黑磷", "ambipolar"),
+    ("memristor", "忆阻器", "resistance switching", "阻变存储", "RRAM nonvolatile"),
+    ("spin torque MRAM", "自旋转矩磁存储", "magnetic tunnel junction MTJ", "隧穿磁阻", "write current"),
+    ("phase change memory PCM", "相变存储器", "GST amorphous crystalline", "非晶晶态", "reset set"),
+    ("organic electronics", "有机电子", "OFET OLED", "有机场效应晶体管", "mobility trap"),
+    ("flexible electronics", "柔性电子", "stretchable substrate", "可拉伸基底", "bending radius"),
+    ("neuromorphic device", "神经形态器件", "synaptic weight", "突触权重", "potentiation depression"),
+    # ── Batch UU end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学：应用数学 / 计算科学深化 ═════════════════════════
+    # ── Batch VV: 计算数学 / 应用力学 / 数值方法深化 / 数学物理 ──────────────────
+    # -- 计算数学深化 --
+    ("finite difference method", "有限差分法", "explicit implicit scheme", "显式隐式格式", "stability CFL"),
+    ("finite volume method", "有限体积法", "flux reconstruction", "通量重构", "Godunov scheme"),
+    ("spectral element method", "谱元法", "high order polynomial", "高阶多项式", "Gauss-Lobatto"),
+    ("boundary element method BEM", "边界元法", "Green function", "格林函数", "singular integral"),
+    ("meshfree method", "无网格法", "SPH MLS", "光滑粒子流体力学", "radial basis function"),
+    ("Runge-Kutta methods", "龙格-库塔方法", "explicit RK4", "四阶显式RK", "adaptive stepsize"),
+    ("stiff ODE solver", "刚性ODE求解", "Gear method BDF", "反向差分公式", "implicit method"),
+    ("eigenvalue problem", "特征值问题", "Lanczos Arnoldi", "兰乔斯阿诺尔迪", "shift invert"),
+    ("sparse linear system", "稀疏线性系统", "iterative solver", "迭代求解器", "preconditioner ILU"),
+    ("fast multipole method FMM", "快速多极子方法", "treecode", "树代码", "N-body problem"),
+    # -- 应用力学 --
+    ("continuum mechanics", "连续介质力学", "deformation gradient", "变形梯度", "strain tensor"),
+    ("constitutive model", "本构模型", "elastoplastic", "弹塑性", "yield criterion Drucker"),
+    ("viscoelasticity", "粘弹性", "creep relaxation", "蠕变松弛", "generalized Maxwell Kelvin"),
+    ("contact mechanics", "接触力学", "Hertz contact", "赫兹接触", "adhesion friction"),
+    ("wave propagation", "波传播", "dispersion relation", "色散关系", "group phase velocity"),
+    ("impact dynamics", "冲击动力学", "stress wave", "应力波", "Hugoniot equation"),
+    ("biomechanics tissue", "组织生物力学", "constitutive soft tissue", "软组织本构", "biphasic"),
+    ("geomechanics", "岩土力学", "effective stress principle", "有效应力原理", "consolidation"),
+    # -- 数学物理方法 --
+    ("Green function physics", "物理学格林函数", "boundary condition propagator", "传播子"),
+    ("variational method physics", "物理变分方法", "Euler-Lagrange equation", "欧拉-拉格朗日方程"),
+    ("integral transform", "积分变换", "Laplace Mellin Hankel", "拉普拉斯梅林汉克尔变换"),
+    ("asymptotic expansion", "渐近展开", "method of steepest descent", "最速下降法", "saddle point"),
+    ("singular perturbation", "奇摄动", "matched asymptotic", "匹配渐近展开", "boundary layer math"),
+    ("random walk", "随机游走", "diffusion limit", "扩散极限", "recurrence transience"),
+    ("quantum graph", "量子图", "Laplace operator", "图上拉普拉斯算子", "spectrum"),
+    # -- 统计学深化 --
+    ("Bayesian belief propagation", "贝叶斯信念传播", "sum product algorithm", "和积算法", "junction tree"),
+    ("Gaussian process", "高斯过程", "kernel covariance function", "核协方差函数", "regression GP"),
+    ("Dirichlet process", "狄利克雷过程", "Chinese restaurant", "中国餐馆过程", "nonparametric Bayes"),
+    ("expectation maximization EM", "期望最大化", "latent variable", "潜变量", "M-step E-step"),
+    ("variational inference", "变分推断", "ELBO mean field", "均场近似", "ADVI"),
+    ("sequential Monte Carlo", "序贯蒙特卡洛", "particle filter", "粒子滤波", "resampling"),
+    ("extreme value theory", "极值理论", "Gumbel Weibull Fréchet", "极值分布", "tail index"),
+    ("copula model", "联接函数模型", "dependence structure", "依赖结构", "tail dependence"),
+    # ── Batch VV end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 工学：制造新工艺 / 系统工程 / 工业AI ════════════════
+    # ── Batch WW: 先进制造新工艺 / 系统工程 / 工业AI / 工程伦理 ──────────────────
+    # -- 先进制造新工艺 --
+    ("directed energy deposition DED", "定向能沉积", "laser wire arc", "激光丝弧增材", "repair"),
+    ("binder jetting", "粘结剂喷射", "powder bed inkjet", "粉末床喷墨", "debind sinter"),
+    ("electron beam melting EBM", "电子束熔化", "vacuum chamber", "真空环境", "titanium aerospace"),
+    ("micro injection molding", "微注塑", "micro cavity", "微腔", "aspect ratio thin wall"),
+    ("ultrasonic consolidation", "超声波固结", "metal foil laminate", "金属箔层压", "room temperature"),
+    ("friction stir welding FSW", "搅拌摩擦焊", "tool shoulder pin", "肩部探针", "heat affected"),
+    ("electroforming", "电铸", "mandrel nickel copper", "芯模镍铜", "thin shell"),
+    ("chemical etching photochemical", "光化学蚀刻", "maskant resist", "掩蔽剂", "tolerance"),
+    ("water jet cutting", "水射流切割", "abrasive suspension", "磨料悬浮液", "kerf taper"),
+    # -- 系统工程 --
+    ("systems engineering SE", "系统工程", "requirements management", "需求管理", "V-model"),
+    ("model based systems engineering MBSE", "基于模型系统工程", "SysML", "系统建模语言", "diagram"),
+    ("reliability engineering", "可靠性工程", "FMEA FMECA", "故障模式影响分析", "RPN"),
+    ("hazard analysis STAMP", "STAMP危险分析", "STPA", "系统理论过程分析", "control loop"),
+    ("integration verification validation", "集成验证确认", "IV&V", "test coverage", "traceability"),
+    ("life cycle costing", "生命周期成本", "LCC total ownership", "全寿命期成本", "O&M"),
+    ("configuration management", "构型管理", "baseline change control", "基线变更控制", "versioning"),
+    ("human factors engineering", "人因工程", "situation awareness", "态势感知", "HMI workload"),
+    # -- 工业AI与智能制造 --
+    ("predictive maintenance ML", "机器学习预测维护", "remaining useful life RUL", "剩余寿命"),
+    ("anomaly detection industrial", "工业异常检测", "vibration signature", "振动特征", "autoencoder"),
+    ("digital twin manufacturing", "制造数字孪生", "real-time mirroring", "实时镜像", "calibration"),
+    ("quality inspection AI", "AI质量检测", "defect classification", "缺陷分类", "CNN inspection"),
+    ("generative design", "生成设计", "topology optimization AI", "AI拓扑优化", "lattice structure"),
+    ("process parameter optimization", "工艺参数优化", "Bayesian optimization", "贝叶斯优化", "DoE"),
+    ("cobotic assembly", "协作机器人装配", "force guided assembly", "力引导装配", "peg in hole"),
+    ("autonomous mobile robot AMR", "自主移动机器人", "warehouse navigation", "仓库导航", "fleet"),
+    # -- 理学：数学应用新领域 --
+    ("algebraic coding theory", "代数编码理论", "BCH Reed-Muller codes", "BCH里德-穆勒码", "decoding"),
+    ("cryptographic protocol", "密码协议", "zero knowledge interactive", "交互式零知识", "sigma"),
+    ("mathematical optimization landscape", "优化景观数学", "saddle point", "鞍点", "escaping local"),
+    ("information geometry", "信息几何", "Fisher metric", "费雪度量", "statistical manifold"),
+    ("optimal transport", "最优传输", "Wasserstein distance", "Wasserstein距离", "earth mover"),
+    ("compressed sensing", "压缩感知", "RIP restricted isometry", "受限等距性质", "sparse recovery"),
+    ("matrix completion", "矩阵补全", "nuclear norm", "核范数", "collaborative filtering math"),
+    ("tensor decomposition", "张量分解", "CP Tucker", "典型多线性分解", "multiway data"),
+    # -- 工程伦理与职业规范 --
+    ("engineering ethics", "工程伦理", "public safety welfare", "公众安全福祉", "whistleblowing"),
+    ("professional engineering PE", "注册工程师", "licensure exam", "执照考试", "continuing education"),
+    ("sustainable engineering", "可持续工程", "cradle to grave analysis", "从摇篮到坟墓分析"),
+    ("engineering for development", "发展工程", "appropriate technology", "适用技术", "low resource"),
+    ("intellectual property engineering", "工程知识产权", "patent claim", "专利权利要求", "trade secret"),
+    # ── Batch WW end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 农学深化续 ════════════════════════════════════════════
+    # ── Batch XX: 农学专项深化（作物/土壤/植保/园艺/畜牧/农机）──────────────────
+    # -- 作物栽培与生产 --
+    ("crop rotation", "作物轮作", "nitrogen fixation legume rotation", "豆科固氮轮作", "fallow"),
+    ("intercropping system", "间套种系统", "companion planting", "伴生种植", "yield advantage"),
+    ("paddy rice cultivation", "水稻栽培", "transplanting direct seeding", "插秧直播", "flooded field"),
+    ("wheat production", "小麦生产", "winter spring wheat", "冬春小麦", "vernalization"),
+    ("maize corn production", "玉米生产", "hybrid seed", "杂交种", "planting density"),
+    ("soybean production", "大豆生产", "nodulation rhizobium", "根瘤菌", "inoculant"),
+    ("cotton production", "棉花生产", "boll formation fiber", "棉铃纤维", "defoliation harvest"),
+    ("sugarcane production", "甘蔗生产", "ratoon crop", "宿根蔗", "juice extraction"),
+    ("greenhouse production", "温室生产", "controlled environment", "可控环境", "substrate culture"),
+    ("vertical farming", "垂直农业", "LED lighting spectrum", "LED光谱", "hydroponic tower"),
+    # -- 土壤管理与施肥 --
+    ("soil organic matter", "土壤有机质", "humus formation", "腐殖质形成", "carbon sequestration soil"),
+    ("nitrogen cycling soil", "土壤氮循环", "mineralization immobilization", "矿化固定", "denitrification"),
+    ("phosphorus management", "磷素管理", "P availability", "磷有效性", "mycorrhizal uptake"),
+    ("potassium nutrition", "钾素营养", "cation exchange", "阳离子交换", "luxury consumption"),
+    ("micronutrient deficiency crop", "作物微量元素缺乏", "iron zinc boron", "铁锌硼缺素", "chelate"),
+    ("soil pH management", "土壤pH管理", "liming acidification", "石灰化酸化", "buffering capacity"),
+    ("biochar application", "生物炭施用", "carbon stability", "碳稳定性", "soil amendment"),
+    ("fertigation", "水肥一体化", "drip fertigation", "滴灌施肥", "nutrient solution"),
+    # -- 植物保护深化 --
+    ("fungal pathogen", "真菌病原", "Fusarium Botrytis", "镰孢菌灰葡萄孢", "spore dispersal"),
+    ("bacterial pathogen plant", "植物细菌病原", "Pseudomonas Xanthomonas", "假单胞菌黄单胞菌"),
+    ("viral disease plant", "植物病毒病", "TMV CMV potyvirus", "烟草花叶病毒", "vector insect"),
+    ("insect pest management", "害虫管理", "threshold economic injury", "经济危害阈值", "scouting"),
+    ("biological control agent", "生物防治因子", "Trichoderma Bacillus", "木霉芽孢杆菌", "parasitoid"),
+    ("herbicide mode of action", "除草剂作用机制", "ACCase ALS inhibitor", "乙酰辅酶A羧化酶"),
+    ("resistance management", "抗药性管理", "rotation chemistry", "化学品轮换", "refugia"),
+    # -- 园艺细粒度 --
+    ("fruit tree management", "果树管理", "pruning training", "修剪整形", "thinning fruit load"),
+    ("vegetable production", "蔬菜生产", "seedling transplant", "育苗移植", "bolt bolting"),
+    ("flower ornamental", "花卉观赏", "cut flower postharvest", "切花采后", "vase life"),
+    ("grafting technique", "嫁接技术", "cleft tongue approach", "劈接靠接", "compatibility"),
+    ("protected horticulture", "保护地园艺", "cold frame tunnel house", "冷床小拱棚", "microclimate"),
+    # -- 畜牧深化 --
+    ("feed formulation", "饲料配方", "NRC requirements", "NRC营养需要量", "digestibility"),
+    ("rumen microbiology", "瘤胃微生物学", "methanogen protozoa fungi", "产甲烷菌原虫真菌"),
+    ("animal reproduction", "动物繁殖", "estrus detection", "发情鉴定", "AI embryo transfer"),
+    ("livestock housing design", "畜舍设计", "ventilation stocking density", "通风饲养密度"),
+    ("animal slaughter processing", "动物屠宰加工", "ante post mortem inspection", "宰前宰后检验"),
+    # -- 农业机械 --
+    ("tractor implement", "拖拉机农具", "three-point hitch", "三点悬挂", "PTO power takeoff"),
+    ("combine harvester", "联合收割机", "threshing separation cleaning", "脱粒分离清选"),
+    ("precision seeder", "精量播种机", "seed metering", "排种器", "singulation"),
+    ("sprayer calibration", "喷雾机校准", "nozzle flow rate", "喷头流量", "overlap pattern"),
+    ("irrigation pump system", "灌溉泵站系统", "head flow curve", "扬程流量曲线", "efficiency"),
+    # ── Batch XX end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 医学深化续 ════════════════════════════════════════════
+    # ── Batch YY: 医学专科深化（消化/内分泌/血液/呼吸/肾脏/感染）────────────────
+    # -- 消化内科 --
+    ("gastroenterology", "消化内科学", "endoscopy colonoscopy", "内镜肠镜", "mucosal biopsy"),
+    ("peptic ulcer disease", "消化性溃疡", "H. pylori eradication", "幽门螺杆菌根除", "triple therapy"),
+    ("inflammatory bowel disease IBD", "炎症性肠病", "Crohn's colitis", "克罗恩结肠炎", "biologic"),
+    ("liver disease hepatology", "肝脏病学", "cirrhosis fibrosis", "肝硬化纤维化", "MELD score"),
+    ("viral hepatitis", "病毒性肝炎", "HBV HCV", "乙肝丙肝", "antiviral direct acting"),
+    ("pancreatitis", "胰腺炎", "acute chronic", "急慢性胰腺炎", "Ranson score APACHE"),
+    ("gastrointestinal bleeding", "消化道出血", "upper lower GI", "上下消化道出血", "hemostasis"),
+    ("colorectal cancer screening", "结直肠癌筛查", "FIT colonoscopy", "粪便免疫化学检测"),
+    # -- 内分泌与代谢 --
+    ("diabetes mellitus type 1", "1型糖尿病", "insulin autoimmune", "胰岛素自身免疫", "DKA"),
+    ("diabetes mellitus type 2", "2型糖尿病", "insulin resistance secretion", "胰岛素抵抗分泌", "HbA1c"),
+    ("thyroid disorder", "甲状腺疾病", "hypothyroid hyperthyroid", "甲减甲亢", "TSH T3 T4"),
+    ("adrenal disorder", "肾上腺疾病", "Cushing Addison", "库欣阿狄森病", "cortisol aldosterone"),
+    ("pituitary disorder", "垂体疾病", "acromegaly prolactinoma", "肢端肥大泌乳素瘤", "GH IGF-1"),
+    ("metabolic syndrome", "代谢综合征", "visceral obesity", "中心性肥胖", "insulin resistance"),
+    ("calcium metabolism", "钙代谢", "hyper hypoparathyroid", "甲状旁腺功能亢低", "PTH vitamin D"),
+    # -- 血液内科 --
+    ("anemia classification", "贫血分类", "iron deficiency B12 folate", "缺铁B12叶酸性贫血"),
+    ("hemolytic anemia", "溶血性贫血", "autoimmune hereditary", "自身免疫遗传性", "DAT Coombs"),
+    ("thrombocytopenia", "血小板减少", "ITP TTP HUS", "免疫性血栓性", "bleeding risk"),
+    ("coagulopathy", "凝血病", "DIC disseminated intravascular", "弥散性血管内凝血", "factor"),
+    ("myeloproliferative neoplasm", "骨髓增殖性肿瘤", "polycythemia vera ET MF", "真红原发血小板"),
+    ("lymphoma staging", "淋巴瘤分期", "Ann Arbor staging", "Ann Arbor分期", "PET CT"),
+    ("stem cell transplant", "干细胞移植", "autologous allogeneic", "自体异体", "GVHD"),
+    # -- 呼吸内科 --
+    ("COPD management", "慢阻肺管理", "GOLD classification", "GOLD分级", "inhaler bronchodilator"),
+    ("asthma treatment", "哮喘治疗", "step-up therapy", "阶梯治疗", "ICS LABA biologic"),
+    ("pneumonia etiology", "肺炎病因", "CAP HAP VAP", "社区获得性医院获得性", "empiric antibiotic"),
+    ("pulmonary embolism PE", "肺栓塞", "Wells score", "Wells评分", "anticoagulation thrombolysis"),
+    ("interstitial lung disease ILD", "间质性肺疾病", "IPF UIP", "特发性肺纤维化", "antifibrotic"),
+    ("lung cancer staging", "肺癌分期", "NSCLC SCLC", "非小细胞小细胞", "EGFR ALK PD-L1"),
+    ("pulmonary function test", "肺功能检测", "spirometry FEV1 FVC", "用力肺活量", "diffusion DLCO"),
+    # -- 肾脏内科 --
+    ("acute kidney injury AKI", "急性肾损伤", "KDIGO staging", "KDIGO分期", "creatinine urine output"),
+    ("chronic kidney disease CKD", "慢性肾病", "GFR staging", "GFR分期", "proteinuria CKD-EPI"),
+    ("glomerulonephritis", "肾小球肾炎", "nephrotic nephritic syndrome", "肾病综合征肾炎综合征"),
+    ("renal replacement therapy", "肾脏替代治疗", "hemodialysis peritoneal", "血液腹膜透析"),
+    ("kidney transplant", "肾移植", "immunosuppression protocol", "免疫抑制方案", "rejection"),
+    ("renal tubular disease", "肾小管疾病", "Fanconi syndrome", "范可尼综合征", "RTA"),
+    # -- 感染内科深化 --
+    ("sepsis management", "脓毒症管理", "Surviving Sepsis Campaign", "拯救脓毒症运动", "qSOFA"),
+    ("HIV management", "HIV管理", "ART antiretroviral", "抗逆转录病毒", "CD4 viral load"),
+    ("fungal infection", "真菌感染", "Candida Aspergillus", "念珠菌曲霉菌", "azole echinocandin"),
+    ("tropical infection", "热带感染", "malaria dengue", "疟疾登革热", "antimalarial"),
+    ("hospital infection control", "医院感染控制", "bundle care", "集束化措施", "hand hygiene"),
+    # ── Batch YY end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 商学深化续 ════════════════════════════════════════════
+    # ── Batch ZZ: 商学专项深化（战略/营销/供应链/创业/金融工具）────────────────
+    # -- 战略管理深化 --
+    ("competitive strategy", "竞争战略", "cost leadership differentiation focus", "成本领先差异化聚焦"),
+    ("blue ocean strategy canvas", "蓝海战略画布", "strategy canvas", "战略布局图", "four actions framework"),
+    ("dynamic capabilities", "动态能力", "sensing seizing reconfiguring", "感知抓取重构", "Teece"),
+    ("resource based view RBV", "资源基础观", "VRIN framework", "价值稀缺不可模仿", "Barney"),
+    ("scenario planning strategy", "战略情景规划", "driving forces", "驱动力", "wind tunneling"),
+    ("M&A strategy", "并购战略", "synergy valuation", "协同价值", "due diligence integration"),
+    ("joint venture alliance", "合资战略联盟", "equity non-equity", "股权非股权", "partner selection"),
+    ("corporate diversification", "多元化战略", "related unrelated", "相关非相关多元化", "Ansoff"),
+    ("turnaround strategy", "扭转战略", "retrenchment recovery", "收缩恢复", "crisis management"),
+    # -- 市场营销深化 --
+    ("consumer behavior", "消费者行为", "purchase decision process", "购买决策过程", "ELM model"),
+    ("market segmentation targeting", "市场细分定位", "psychographic behavioral", "心理行为细分"),
+    ("brand management", "品牌管理", "brand equity Keller", "品牌资产", "brand extension"),
+    ("pricing strategy", "定价策略", "value based penetration skimming", "价值导向渗透撇脂"),
+    ("distribution channel", "分销渠道", "intensive selective exclusive", "密集选择性独家分销"),
+    ("integrated marketing communications IMC", "整合营销传播", "touchpoint consistency", "一致性"),
+    ("content marketing", "内容营销", "editorial calendar", "内容日历", "owned earned paid"),
+    ("customer lifetime value CLV", "客户终身价值", "acquisition retention", "获取留存", "churn model"),
+    ("neuromarketing", "神经营销学", "eye tracking fMRI", "眼动核磁共振", "implicit measure"),
+    # -- 供应链管理深化 --
+    ("bullwhip effect", "牛鞭效应", "demand amplification", "需求放大", "information sharing"),
+    ("global sourcing", "全球采购", "total cost ownership TCO", "总拥有成本", "supplier evaluation"),
+    ("make or buy decision", "自制外购决策", "transaction cost theory", "交易成本理论", "core competency"),
+    ("risk pooling", "风险集聚", "safety stock reduction", "安全库存减少", "centralization"),
+    ("humanitarian logistics", "人道主义物流", "last mile aid", "最后一公里援助", "prepositioning"),
+    ("green supply chain", "绿色供应链", "carbon footprint product", "产品碳足迹", "take-back"),
+    # -- 创业与创新管理深化 --
+    ("lean startup methodology", "精益创业方法论", "pivot", "转型", "build measure learn loop"),
+    ("venture capital stages", "风险资本阶段", "seed Series A B C", "种子轮A轮", "term sheet"),
+    ("product market fit", "产品市场契合", "PMF validation", "验证", "cohort retention"),
+    ("agile product development", "敏捷产品开发", "MVP minimum viable", "最小可行产品", "iteration"),
+    ("open innovation", "开放式创新", "outside-in inside-out", "外向内向式", "crowdsourcing"),
+    ("platform business model", "平台商业模式", "multi-sided platform", "多边平台", "cross-side network"),
+    ("ecosystem strategy", "生态系统战略", "orchestrator complementor", "协调者互补者", "keystone"),
+    # -- 金融工具与衍生品深化 --
+    ("interest rate swap IRS", "利率互换", "fixed floating leg", "固定浮动端", "notional principal"),
+    ("credit default swap CDS", "信用违约互换", "protection buyer seller", "保护买方卖方", "reference entity"),
+    ("collateralized loan obligation CLO", "担保贷款凭证", "waterfall structure", "瀑布式结构", "tranche"),
+    ("exchange traded fund ETF", "交易所交易基金", "tracking error", "跟踪误差", "creation redemption"),
+    ("commodity derivatives", "大宗商品衍生品", "futures roll", "期货展期", "basis risk"),
+    ("currency forward swap", "货币远期互换", "covered interest parity", "抛补利率平价", "cross currency"),
+    ("structured note", "结构性票据", "principal at risk", "本金风险", "autocallable barrier"),
+    # ── Batch ZZ end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 文学深化续 ════════════════════════════════════════════
+    # ── Batch AAA: 文学深化（叙事理论/修辞/文体/跨文化文学/数字文学）────────────
+    # -- 叙事学深化 --
+    ("narratology", "叙事学", "Genette Bal", "热奈特巴尔", "story discourse fabula"),
+    ("focalization", "聚焦", "internal external zero", "内外零聚焦", "focalizer"),
+    ("narrative time", "叙事时间", "anachrony flashback", "倒叙", "duration frequency"),
+    ("narrative voice", "叙述声音", "homodiegetic heterodiegetic", "同叙异叙", "narrator reliability"),
+    ("narrative space", "叙事空间", "chronotope Bakhtin", "时空体巴赫金", "place identity"),
+    ("metafiction", "元小说", "self-referential", "自我指涉", "postmodern narrative"),
+    ("auto-fiction", "自传小说", "blurred boundaries", "模糊边界", "life writing autofiction"),
+    ("graphic novel", "图像小说", "panel gutter", "格框沟槽", "closure McCloud"),
+    # -- 修辞学深化 --
+    ("classical rhetoric", "古典修辞学", "logos ethos pathos", "逻各斯伦理情感", "Aristotle"),
+    ("epideictic deliberative forensic", "颂扬审议法庭", "three genres rhetoric", "修辞三种体裁"),
+    ("trope scheme", "转义辞格", "metaphor metonymy synecdoche", "转喻提喻", "irony"),
+    ("argument scheme", "论证图式", "Toulmin model", "图尔明模型", "warrant claim backing"),
+    ("visual rhetoric", "视觉修辞", "image argument", "图像论证", "multimodal"),
+    # -- 文体学与风格 --
+    ("stylistics", "文体学", "foregrounding deviation", "前景化偏离", "cognitive poetics"),
+    ("register variation", "语域变体", "field tenor mode", "语域语旨语式", "Halliday"),
+    ("dialect sociolect", "方言社会方言", "vernacular standard", "白话标准语", "code prestige"),
+    ("genre analysis", "体裁分析", "move structure", "步骤结构", "Swales discourse community"),
+    ("corpus stylistics", "语料库文体学", "keyword frequency", "关键词频率", "collocation pattern"),
+    # -- 中国文学深化 --
+    ("pre-Qin literature", "先秦文学", "Shijing Chu Ci", "诗经楚辞", "historical narrative Zuozhuan"),
+    ("Han dynasty literature", "汉代文学", "fu rhapsody", "汉赋", "Sima Qian Shiji"),
+    ("Tang Song literature", "唐宋文学", "regulated verse lüshi", "律诗", "ci prose baguwen"),
+    ("Ming Qing fiction", "明清小说", "four great novels", "四大名著", "vernacular novel"),
+    ("May Fourth literature", "五四文学", "vernacular movement", "白话文运动", "Lu Xun"),
+    ("contemporary Chinese literature", "当代中国文学", "Nobel literature Mo Yan", "莫言诺贝尔"),
+    # -- 西方文学深化 --
+    ("ancient Greek literature", "古希腊文学", "Homer Iliad Odyssey", "荷马史诗", "tragedy chorus"),
+    ("Renaissance literature", "文艺复兴文学", "Shakespeare sonnets", "莎士比亚十四行诗", "humanism"),
+    ("Enlightenment novel", "启蒙小说", "epistolary novel", "书信体小说", "Defoe Swift Voltaire"),
+    ("Victorian novel", "维多利亚小说", "social realism", "社会现实主义", "Dickens Eliot Hardy"),
+    ("American literature", "美国文学", "transcendentalism", "超验主义", "Whitman Emerson Poe"),
+    ("Latin American boom", "拉美文学爆炸", "magical realism", "魔幻现实主义", "Borges Marquez"),
+    ("postcolonial fiction", "后殖民小说", "Achebe Rushdie", "阿切贝拉什迪", "subaltern voice"),
+    # -- 数字文学与新媒体 --
+    ("hypertext fiction", "超文本小说", "Storyspace Twine", "非线性叙事链接"),
+    ("interactive narrative", "互动叙事", "branching storyline", "分支故事", "agency player"),
+    ("e-literature electronic", "电子文学", "code poetry", "代码诗", "generative text"),
+    ("transmedia storytelling", "跨媒介叙事", "storyworld extension", "故事世界拓展", "Jenkins"),
+    # ── Batch AAA end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 法学深化续 ════════════════════════════════════════════
+    # ── Batch BBB: 法学专项深化（民法/刑法/国际贸易法/科技法/诉讼）────────────────
+    # -- 民法深化 --
+    ("civil law codification", "民法典化", "general provisions", "总则", "obligation property"),
+    ("contract formation", "合同成立", "offer acceptance consideration", "要约承诺对价", "void voidable"),
+    ("contract performance", "合同履行", "specific performance", "实际履行", "anticipatory breach"),
+    ("tort negligence", "过失侵权", "duty care breach causation damage", "注意义务违反因果损害"),
+    ("strict liability tort", "严格责任侵权", "product liability", "产品责任", "defect warning"),
+    ("unjust enrichment", "不当得利", "restitution", "返还", "quantum meruit"),
+    ("property rights types", "物权类型", "real property personal", "不动产动产", "easement"),
+    ("trust law", "信托法", "fiduciary duty", "受托义务", "beneficiary settlor"),
+    ("succession inheritance", "继承法", "testate intestate", "遗嘱法定继承", "forced share"),
+    # -- 刑法深化 --
+    ("criminal liability", "刑事责任", "actus reus mens rea", "犯罪行为犯罪意图", "concurrence"),
+    ("defenses criminal", "刑事辩护", "self defense insanity", "正当防卫精神失常", "necessity"),
+    ("inchoate offense", "未完成罪", "attempt conspiracy solicitation", "未遂共谋教唆"),
+    ("corporate criminal liability", "公司刑事责任", "respondeat superior", "代理责任", "compliance"),
+    ("sentencing principles", "量刑原则", "proportionality retribution", "相称性报应", "rehabilitation"),
+    ("criminal procedure", "刑事诉讼程序", "arraignment discovery", "开庭证据开示", "plea bargain"),
+    ("international criminal law", "国际刑法", "ICC Rome Statute", "国际刑事法院规约", "genocide"),
+    # -- 国际贸易法 --
+    ("WTO dispute settlement", "WTO争端解决", "DSB panel appellate", "争端解决机构上诉机构"),
+    ("anti-dumping law", "反倾销法", "dumping margin", "倾销幅度", "injury determination"),
+    ("trade remedy", "贸易救济", "countervailing safeguard", "反补贴保障措施", "investigation"),
+    ("customs classification", "海关分类", "HS nomenclature", "商品编码", "binding ruling"),
+    ("investment treaty", "投资条约", "BIT bilateral", "双边投资协定", "expropriation FET"),
+    ("free trade agreement FTA", "自由贸易协定", "rules of origin accumulation", "原产地累积规则"),
+    # -- 科技法 --
+    ("AI regulation law", "AI法律规制", "EU AI Act", "欧盟人工智能法", "risk classification"),
+    ("data privacy law GDPR", "数据隐私法GDPR", "lawful basis processing", "合法处理基础"),
+    ("platform regulation", "平台法律规制", "DSA DMA", "数字服务法数字市场法", "gatekeeper"),
+    ("biotech patent", "生物技术专利", "gene sequence patent", "基因序列专利", "Myriad decision"),
+    ("software patent", "软件专利", "patentable subject matter", "可专利主题", "Alice test"),
+    ("cybercrime law", "网络犯罪法", "unauthorized access", "未经授权访问", "CFAA convention"),
+    # -- 诉讼与证据 --
+    ("civil litigation procedure", "民事诉讼程序", "pleadings motions", "诉状动议", "summary judgment"),
+    ("evidence admissibility", "证据可采性", "hearsay exception", "传闻例外", "relevance"),
+    ("expert witness", "专家证人", "Daubert standard", "道伯特标准", "scientific evidence"),
+    ("class action", "集体诉讼", "certification predominance", "认证主导", "settlement fund"),
+    ("ADR arbitration mediation", "替代性纠纷解决", "finality enforcement", "终局性执行", "med-arb"),
+    # ── Batch BBB end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 理学工学综合补充 ══════════════════════════════════════
+    # ── Batch CCC: 理工综合补充（物理/化学/生物/工程各细分）────────────────────
+    # -- 物理补充 --
+    ("Hall effect", "霍尔效应", "Hall coefficient", "霍尔系数", "magnetic sensor"),
+    ("Josephson junction", "约瑟夫森结", "AC DC Josephson effect", "超导隧道结", "SQUID"),
+    ("phonon", "声子", "lattice vibration", "晶格振动", "thermal conductivity phonon"),
+    ("polaron", "极化子", "electron phonon coupling", "电声子耦合", "effective mass"),
+    ("Anderson localization", "安德森局域化", "disorder potential", "无序势", "metal insulator"),
+    ("Bose-Einstein condensate BEC", "玻色-爱因斯坦凝聚", "ultracold atom", "超冷原子", "superfluidity"),
+    ("quantum dot physics", "量子点物理", "size quantization", "尺寸量子化", "Coulomb blockade"),
+    ("scanning tunneling microscopy STM", "扫描隧道显微镜", "tunneling current", "隧穿电流", "atomic resolution"),
+    ("atomic force microscopy AFM", "原子力显微镜", "cantilever", "悬臂梁", "contact tapping"),
+    ("synchrotron radiation", "同步辐射", "undulator wiggler", "波荡器扭摆器", "brightness"),
+    # -- 化学补充 --
+    ("enzymatic catalysis", "酶催化", "Michaelis-Menten kinetics", "米氏动力学", "kcat Km"),
+    ("protein folding chemistry", "蛋白质折叠化学", "hydrophobic effect", "疏水效应", "chaperone"),
+    ("carbohydrate chemistry", "糖类化学", "anomeric effect", "异头效应", "glycosidic bond"),
+    ("lipid chemistry", "脂质化学", "fatty acid ester", "脂肪酸酯", "phospholipid membrane"),
+    ("nucleic acid chemistry", "核酸化学", "Watson-Crick pairing", "碱基配对", "melting temperature Tm"),
+    ("radical chemistry", "自由基化学", "chain reaction", "链式反应", "inhibitor antioxidant"),
+    ("electrocyclic sigmatropic reaction", "电环化σ迁移反应", "orbital symmetry", "轨道对称性", "conrotatory"),
+    ("retrosynthetic analysis", "逆合成分析", "synthon", "合成子", "disconnection approach"),
+    ("ionic liquid", "离子液体", "room temperature molten salt", "室温熔盐", "electrochemical window"),
+    ("metal organic framework MOF", "金属有机框架", "porous coordination polymer", "多孔配位聚合物"),
+    # -- 生物学补充 --
+    ("chromosome structure", "染色体结构", "telomere centromere", "端粒着丝粒", "heterochromatin"),
+    ("meiosis", "减数分裂", "crossing over", "交叉互换", "chiasmata", "haploid"),
+    ("signal transduction", "信号转导", "second messenger cAMP Ca2+", "第二信使", "kinase cascade"),
+    ("membrane transport", "膜转运", "active passive facilitated", "主动被动易化", "pump channel"),
+    ("photosynthesis light dark", "光合作用光暗反应", "Calvin cycle", "卡尔文循环", "RuBisCO"),
+    ("nitrogen fixation", "生物固氮", "nitrogenase", "固氮酶", "nif genes"),
+    ("hormone plant", "植物激素", "auxin gibberellin cytokinin", "生长素赤霉素细胞分裂素"),
+    ("immune tolerance", "免疫耐受", "central peripheral tolerance", "中枢外周耐受", "regulatory T"),
+    # -- 工程补充 --
+    ("injection molding defects", "注塑缺陷", "warpage sink mark", "翘曲缩痕", "gate blush"),
+    ("stamping press forming", "冲压成形", "blank holder force", "压边力", "springback compensation"),
+    ("heat pipe", "热管", "wick structure", "吸液芯", "evaporator condenser adiabatic"),
+    ("thermoelectric device", "热电器件", "Peltier Seebeck", "帕尔帖塞贝克效应", "ZT figure merit"),
+    ("acoustic metamaterial", "声学超材料", "negative mass density", "负质量密度", "phononic bandgap"),
+    ("electromagnetic metamaterial", "电磁超材料", "negative refractive index", "负折射率", "cloak"),
+    ("topological antenna", "拓扑天线", "fractal geometry", "分形几何", "miniaturization wideband"),
+    ("bioelectromagnetics", "生物电磁学", "SAR specific absorption", "比吸收率", "EMF health"),
+    ("plasma etching", "等离子体刻蚀", "ion bombardment", "离子轰击", "anisotropic selectivity"),
+    ("nanowire synthesis", "纳米线合成", "VLS growth", "气液固生长机制", "catalyst diameter"),
+    # ── Batch CCC end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 最终冲刺：各学科精选补充 ══════════════════════════════
+    # ── Batch DDD: 农/医/商/文/法/理/工最终补充（冲刺4000）────────────────────
+    # -- 农学最终补充 --
+    ("soil erosion control", "水土保持", "contour farming", "等高耕作", "terrace strip cropping"),
+    ("rainwater harvesting", "雨水收集", "runoff coefficient", "径流系数", "cistern storage"),
+    ("agroclimatology", "农业气候学", "growing degree day GDD", "积温", "frost free period"),
+    ("pasture management", "牧草管理", "stocking rate", "载畜量", "rotational grazing"),
+    ("apiculture beekeeping", "养蜂学", "colony management", "蜂群管理", "pollination service"),
+    ("sericulture silkworm", "蚕桑业", "mulberry cultivation", "桑树栽培", "silk spinning"),
+    ("rural extension service", "农业推广服务", "technology transfer", "技术转移", "adoption barrier"),
+    ("agricultural credit", "农业信贷", "smallholder finance", "小农融资", "crop insurance"),
+    # -- 医学最终补充 --
+    ("medical ethics", "医学伦理学", "informed consent", "知情同意", "autonomy beneficence"),
+    ("health informatics", "卫生信息学", "clinical decision support", "临床决策支持", "interoperability"),
+    ("emergency medicine", "急诊医学", "triage ABCDE", "检伤分类", "resuscitation"),
+    ("anesthesiology", "麻醉学", "general regional", "全身区域麻醉", "ASA score airway"),
+    ("intensive care ICU", "重症监护", "mechanical ventilation", "机械通气", "prone positioning"),
+    ("radiation oncology", "放射肿瘤学", "IMRT SBRT", "调强放射立体定向", "dose volume"),
+    ("sports medicine orthopedic", "运动创伤骨科", "meniscus rotator cuff", "半月板肩袖", "arthroscopy"),
+    ("allergy immunology clinical", "变态反应临床免疫", "anaphylaxis", "过敏反应", "desensitization"),
+    # -- 商学最终补充 --
+    ("negotiation skills tactics", "谈判技巧战术", "ZOPA zone possible agreement", "可能协议区"),
+    ("pricing analytics", "价格分析", "price elasticity", "价格弹性", "conjoint analysis willingness"),
+    ("customer analytics", "客户分析", "RFM recency frequency monetary", "近期频率货币价值"),
+    ("financial statement analysis", "财务报表分析", "DuPont analysis", "杜邦分析", "EBITDA ratio"),
+    ("capital structure", "资本结构", "Modigliani Miller theorem", "MM定理", "leverage tax shield"),
+    ("working capital management", "营运资本管理", "cash conversion cycle", "现金转换周期", "AR AP"),
+    ("corporate restructuring", "企业重组", "spinoff divestiture", "分拆剥离", "bankruptcy chapter"),
+    ("accounting standards IFRS US GAAP", "国际会计准则", "convergence differences", "差异协调"),
+    # -- 文学法学最终补充 --
+    ("ecocriticism", "生态批评", "nature writing", "自然写作", "environmental imagination"),
+    ("trauma literature", "创伤文学", "witness testimony", "证词见证", "unspeakable Holocaust"),
+    ("world literature circulation", "世界文学流通", "translation market", "翻译市场", "minor literature"),
+    ("legal interpretation", "法律解释", "textualism purposivism", "文本主义目的主义", "Scalia"),
+    ("constitutional interpretation", "宪法解释", "originalism living constitution", "原旨活宪法"),
+    ("comparative constitutional law", "比较宪法学", "rights catalogue", "权利清单", "judicial review"),
+    ("restorative justice", "恢复性司法", "victim offender mediation", "被害人罪犯调解"),
+    ("transitional justice", "转型司法", "truth commission", "真相委员会", "lustration"),
+    # -- 理学工学最终补充 --
+    ("reaction diffusion system", "反应扩散系统", "Turing pattern", "图灵斑图", "self organization"),
+    ("soliton", "孤子", "nonlinear wave", "非线性波", "Korteweg de Vries KdV"),
+    ("fractals dimension", "分形维数", "Hausdorff dimension", "豪斯多夫维数", "self similar"),
+    ("spin glass", "自旋玻璃", "frustration replica", "挫折复制方法", "Edwards-Anderson"),
+    ("bioinspired engineering", "仿生工程", "lotus effect", "荷叶效应", "gecko adhesion"),
+    ("microwave photonics", "微波光子学", "photonic RF filter", "光子射频滤波", "true time delay"),
+    ("cryogenics engineering", "低温工程", "liquid nitrogen helium", "液氮液氦", "superconducting magnet"),
+    ("vacuum technology", "真空技术", "turbomolecular pump", "涡轮分子泵", "outgassing pressure"),
+    ("tribocorrosion", "摩擦腐蚀", "combined mechanical electrochemical", "机械电化学协同"),
+    ("life prediction creep", "蠕变寿命预测", "Larson-Miller parameter", "L-M参数", "rupture time"),
+    ("laser powder bed fusion LPBF", "激光粉末床熔融", "melt pool dynamics", "熔池动力学", "porosity keyhole"),
+    ("wire arc additive WAAM", "电弧增材制造", "deposition rate", "沉积速率", "residual stress control"),
+    ("topology optimization", "拓扑优化", "SIMP method", "固体各向同性材料惩罚", "compliance"),
+    ("multi-physics simulation", "多物理场仿真", "coupled thermal structural", "热结构耦合", "COMSOL"),
+    ("photovoltaic efficiency", "光伏效率", "Shockley-Queisser limit", "S-Q极限", "tandem cell"),
+    ("thermoelectric efficiency", "热电效率", "Carnot efficiency", "卡诺效率", "ZT optimization"),
+    ("electrochemical impedance spectroscopy EIS", "电化学阻抗谱", "Nyquist Bode plot", "等效电路"),
+    ("fuel cell membrane electrode", "燃料电池膜电极", "proton exchange membrane PEM", "catalyst layer"),
+    # ── Batch DDD end ──────────────────────────────────────────────────────────
+    # ══════════════════════ 最终冲刺EEE：各学科精选（冲刺4000）══════════════════
+    # ── Batch EEE: 理工农医商文法全面补充 ────────────────────────────────────────
+    # -- 理学精选补充 --
+    ("Hamiltonian mechanics", "哈密顿力学", "canonical transformation", "正则变换", "action angle"),
+    ("Noether theorem", "诺特定理", "symmetry conservation law", "对称守恒律", "gauge invariance"),
+    ("path integral formulation", "路径积分方法", "functional integral", "泛函积分", "Feynman"),
+    ("spontaneous symmetry breaking", "自发对称破缺", "Goldstone boson", "戈德斯通玻色子", "Higgs"),
+    ("topological phase", "拓扑相", "Berry phase", "贝里相", "Chern number"),
+    ("many body physics", "多体物理", "mean field approximation", "平均场近似", "Hartree-Fock"),
+    ("chaos quantum", "量子混沌", "random matrix theory", "随机矩阵理论", "level spacing"),
+    ("reaction coordinate", "反应坐标", "free energy profile", "自由能曲线", "transition barrier"),
+    ("Marcus theory", "马库斯理论", "electron transfer", "电子转移", "reorganization energy"),
+    ("colloid science", "胶体科学", "DLVO theory", "DLVO理论", "zeta potential stability"),
+    ("surfactant micelle", "表面活性剂胶束", "CMC critical micelle", "临界胶束浓度", "HLB"),
+    ("X-ray absorption spectroscopy XANES EXAFS", "X射线吸收谱", "coordination number", "配位数"),
+    ("single molecule spectroscopy", "单分子光谱", "FRET", "荧光共振能量转移", "blinking"),
+    ("cryo-electron microscopy cryo-EM", "冷冻电镜", "single particle analysis", "单颗粒分析", "resolution"),
+    ("optogenetics", "光遗传学", "channelrhodopsin", "通道视紫红质", "neural circuit control"),
+    ("CRISPR interference CRISPRi", "CRISPR干扰", "dCas9 repressor", "无活性Cas9阻遏", "knockdown"),
+    ("spatial transcriptomics", "空间转录组学", "in situ sequencing", "原位测序", "tissue section"),
+    ("organoid model", "类器官模型", "stem cell derived", "干细胞衍生", "mini organ"),
+    ("synthetic circuit", "合成电路", "toggle switch oscillator", "触发器振荡器", "genetic logic"),
+    # -- 工学精选补充 --
+    ("turbine blade cooling", "涡轮叶片冷却", "film cooling", "气膜冷却", "internal channel"),
+    ("inlet distortion", "进气道畸变", "total pressure distortion", "总压畸变", "compressor stall"),
+    ("structural topology design", "结构拓扑设计", "ground structure method", "基础结构法"),
+    ("reliability based design", "基于可靠度的设计", "probability of failure", "失效概率", "FORM SORM"),
+    ("fatigue crack growth", "疲劳裂纹扩展", "Paris law", "帕里斯定律", "da/dN ΔK"),
+    ("acoustic fatigue", "声疲劳", "high cycle fatigue HCF", "高周疲劳", "jet noise excitation"),
+    ("thermal barrier coating TBC", "热障涂层", "YSZ yttria stabilized", "氧化钇稳定氧化锆"),
+    ("electrospinning nanofiber", "静电纺丝纳米纤维", "Taylor cone", "泰勒锥", "fiber diameter"),
+    ("roll to roll R2R processing", "卷对卷加工", "flexible electronics fabrication", "柔性器件制造"),
+    ("MEMS actuator", "MEMS执行器", "electrostatic thermal bimetal", "静电热双金属", "pull-in"),
+    ("quantum sensor", "量子传感器", "atomic clock", "原子钟", "gravimeter magnetometer"),
+    ("lidar sensor", "激光雷达", "time of flight", "飞行时间", "point cloud segmentation"),
+    ("radar signal processing", "雷达信号处理", "CFAR detection", "恒虚警率检测", "Doppler"),
+    ("satellite remote sensing", "卫星遥感", "multispectral hyperspectral", "多光谱高光谱", "classifier"),
+    ("GIS spatial analysis", "GIS空间分析", "network analysis", "网络分析", "proximity interpolation"),
+    # -- 农学精选补充 --
+    ("crop water stress", "作物水分胁迫", "stomatal conductance", "气孔导度", "turgor pressure"),
+    ("crop heat stress", "作物热胁迫", "membrane integrity", "膜完整性", "heat shock protein"),
+    ("soil salinization", "土壤盐碱化", "EC electrical conductivity", "电导率", "halophyte"),
+    ("mycotoxin contamination", "霉菌毒素污染", "aflatoxin ochratoxin", "黄曲霉素赭曲霉素", "regulation"),
+    ("postharvest physiology", "采后生理", "respiration ethylene", "呼吸作用乙烯", "cold storage CA"),
+    ("genetic resources conservation", "遗传资源保护", "seed bank", "种子库", "gene bank accession"),
+    ("plant phenomics", "植物表型组学", "high throughput imaging", "高通量成像", "trait extraction"),
+    ("aquatic weed management", "水生杂草管理", "biological mechanical control", "生物机械防除"),
+    # -- 医学精选补充 --
+    ("pharmacovigilance signal", "药物警戒信号", "disproportionality reporting", "比例失调报告"),
+    ("pharmacogenomics clinical", "临床药物基因组学", "CYP2D6 CYP2C19", "药物代谢基因", "genotype dose"),
+    ("cell therapy manufacturing", "细胞治疗制造", "GMP cell processing", "GMP细胞加工", "release"),
+    ("biomarker validation", "生物标志物验证", "analytical clinical validation", "分析临床验证"),
+    ("patient reported outcome PRO", "患者报告结局", "HRQOL questionnaire", "生活质量量表", "FDA"),
+    ("regulatory science medicine", "医药监管科学", "NDA approval pathway", "新药申请审批", "RWE"),
+    ("diagnostic imaging AI", "诊断影像AI", "deep learning radiology", "深度学习放射学", "DICOM"),
+    ("point of care testing POCT", "床旁检测", "lateral flow assay", "侧向流检测", "rapid diagnostic"),
+    # -- 商学精选补充 --
+    ("behavioral economics nudge", "行为经济学助推", "libertarian paternalism", "自由意志家长制"),
+    ("platform competition", "平台竞争", "multi-homing", "多归属", "winner take all"),
+    ("gig economy", "零工经济", "on-demand labor", "按需劳动", "classification contractor"),
+    ("sharing economy", "共享经济", "peer to peer", "点对点", "utilization rate"),
+    ("sustainability reporting ESG metric", "ESG指标报告", "materiality assessment", "重要性评估"),
+    ("supply chain finance", "供应链金融", "reverse factoring", "反向保理", "dynamic discounting"),
+    ("total rewards compensation", "薪酬全面回报", "base incentive benefits", "基本奖励福利"),
+    ("workforce analytics", "劳动力分析", "attrition prediction", "离职预测", "HR analytics"),
+    # -- 文学法学精选补充 --
+    ("adaptation studies", "改编研究", "fidelity debate", "忠实性争议", "medium specificity"),
+    ("sound studies", "声音研究", "soundscape", "声景", "acoustic ecology", "voice"),
+    ("affect theory", "情感理论", "embodied response", "身体化回应", "Massumi Berlant"),
+    ("animal studies", "动物研究", "human animal bond", "人与动物关系", "posthumanism"),
+    ("diasporic writing", "流散写作", "homeland nostalgia", "故土乡愁", "identity negotiation"),
+    ("law and economics", "法律经济学", "efficiency Coase theorem", "效率科斯定理", "Posner"),
+    ("human rights enforcement", "人权执法", "regional court ECHR IACtHR", "欧洲美洲人权法院"),
+    ("sports law", "体育法", "doping regulation CAS", "兴奋剂法规仲裁", "transfer rules"),
+    ("media law", "媒体法", "defamation privacy", "诽谤隐私", "prior restraint press freedom"),
+    # ── Batch EEE end ──────────────────────────────────────────────────────────
+
+    # ── Batch FFF — 农学深化 ─────────────────────────────────────────────────
+    ("agricultural water management", "农业水资源管理", "irrigation scheduling", "灌溉调度", "ET crop coefficient"),
+    ("soil organic carbon sequestration", "土壤有机碳固存", "carbon farming", "碳农业", "SOC stock"),
+    ("precision livestock farming", "精准畜牧业", "PLF sensors", "畜禽传感监测", "automated milking"),
+    ("animal welfare science", "动物福利科学", "five freedoms", "五大自由", "sentience scoring"),
+    ("ruminant nutrition", "反刍动物营养", "rumen microbiome", "瘤胃微生物组", "volatile fatty acids"),
+    ("monogastric nutrition", "单胃动物营养", "amino acid digestibility", "氨基酸消化率", "ideal protein"),
+    ("aquaculture genetics", "水产遗传育种", "selective breeding fish", "鱼类选择育种", "genomic selection aquaculture"),
+    ("fish immunology", "鱼类免疫学", "innate immunity teleost", "硬骨鱼先天免疫", "fish vaccine adjuvant"),
+    ("shrimp pathology", "对虾病理", "white spot syndrome", "白斑综合症", "EMS AHPND"),
+    ("seaweed cultivation", "海藻养殖", "macroalgae biorefinery", "大型藻生物精炼", "carrageenan agar"),
+    ("integrated pest management IPM", "综合病虫害防治IPM", "biological control agents", "生物防治制剂", "economic threshold"),
+    ("herbicide resistance mechanism", "除草剂抗性机制", "target site resistance", "靶标抗性", "metabolic resistance"),
+    ("fungicide resistance", "杀菌剂抗性", "fungicide mode of action", "杀菌剂作用机制", "sterol biosynthesis inhibitor"),
+    ("insecticide resistance", "杀虫剂抗性", "acetylcholinesterase inhibition", "乙酰胆碱酯酶抑制", "knockdown resistance kdr"),
+    ("soil microbiome agriculture", "农业土壤微生物组", "rhizosphere microbiome", "根际微生物组", "plant growth promoting bacteria"),
+    ("mycorrhizal symbiosis agri", "农业菌根共生", "AMF inoculant", "丛枝菌根真菌接种", "phosphorus solubilization"),
+    ("plant biostimulant", "植物生物刺激素", "humic acid biostimulant", "腐植酸生物刺激", "seaweed extract phytohormone"),
+    ("controlled environment agriculture", "设施农业环控", "vertical farm LED", "垂直农场LED", "hydroponic NFT"),
+    ("soilless culture", "无土栽培", "substrate cultivation", "基质栽培", "aeroponic system"),
+    ("crop model DSSAT APSIM", "作物模型DSSAT APSIM", "crop growth simulation", "作物生长模拟", "phenology calibration"),
+    ("agricultural remote sensing UAV", "农业遥感无人机", "NDVI crop monitoring", "NDVI作物监测", "multispectral imaging agri"),
+    ("food safety risk assessment agri", "农产品食品安全风险评估", "pesticide MRL", "农药最大残留限量", "HACCP farm"),
+    ("postharvest cold chain", "采后冷链", "modified atmosphere packaging", "气调包装", "ethylene scrubber"),
+    ("grain storage quality", "粮食储藏品质", "aflatoxin prevention", "黄曲霉毒素预防", "equilibrium moisture grain"),
+    ("agricultural policy subsidy", "农业政策补贴", "green box WTO agri", "WTO绿箱政策", "direct payment decoupled"),
+    ("land tenure rural", "土地权属乡村", "smallholder land rights", "小农土地权", "land certification"),
+    ("agricultural value chain", "农业价值链", "inclusive agri value chain", "包容性农业价值链", "contract farming"),
+    ("rural extension service", "农业技术推广服务", "farmer field school FFS", "农民田间学校", "participatory technology development"),
+    ("agroforestry carbon", "农林碳汇", "agroforestry system design", "农林复合设计", "shade grown coffee"),
+    ("landscape ecology agri", "农业景观生态", "field margin biodiversity", "田边生物多样性", "hedgerow bird habitat"),
+    ("climate smart agriculture", "气候智慧型农业", "CSA practice", "气候智慧农业实践", "triple win agriculture"),
+    ("seed system formal informal", "种子系统正式非正式", "community seed bank", "社区种子库", "variety release registration"),
+    ("plant variety protection", "植物新品种保护", "UPOV PVP", "UPOV植物育种者权", "essentially derived variety"),
+    ("gene editing crops regulation", "基因编辑作物监管", "SDN1 exemption", "SDN1豁免监管", "new genomic techniques NGT"),
+    ("organic farming certification", "有机农业认证", "third party certification organic", "有机第三方认证", "equivalence organic standard"),
+    ("agroecology transition", "农业生态转型", "agroecological intensification", "农业生态集约化", "food sovereignty"),
+    ("soil health indicator", "土壤健康指标", "soil health card", "土壤健康卡", "aggregate stability MWD"),
+    ("cover crop nitrogen", "覆盖作物氮素", "winter rye cover crop", "冬黑麦覆盖作物", "biological nitrogen fixation BNF"),
+    ("crop residue management", "作物残茬管理", "straw incorporation", "秸秆还田", "residue decomposition rate"),
+    ("irrigation efficiency technology", "灌溉效率技术", "drip irrigation deficit", "滴灌亏缺灌溉", "irrigation automation soil sensor"),
+
+    # ── Batch FFF — 医学深化 ─────────────────────────────────────────────────
+    ("cardiac surgery CABG", "心脏外科搭桥", "coronary artery bypass graft", "冠状动脉搭桥术", "off-pump CABG"),
+    ("valve surgery repair replacement", "瓣膜手术修复置换", "TAVR transcatheter aortic", "经导管主动脉瓣置换", "mitral valve repair"),
+    ("minimally invasive surgery MIS", "微创外科", "laparoscopic approach", "腹腔镜入路", "robotic surgical system"),
+    ("neurosurgery brain tumor", "神经外科脑肿瘤", "glioblastoma resection", "胶质母细胞瘤切除", "intraoperative MRI"),
+    ("spine surgery fusion", "脊柱外科融合", "lumbar interbody fusion TLIF", "腰椎椎间融合", "pedicle screw fixation"),
+    ("orthopedic arthroplasty", "骨科关节置换", "total hip knee replacement", "全髋全膝关节置换", "implant wear debris"),
+    ("trauma surgery damage control", "创伤外科损伤控制", "damage control resuscitation", "损伤控制复苏", "massive transfusion protocol"),
+    ("hepatobiliary surgery", "肝胆外科", "hepatectomy liver resection", "肝切除术", "ALPPS two stage hepatectomy"),
+    ("colorectal surgery", "结直肠外科", "low anterior resection", "低位前切除术", "total mesorectal excision TME"),
+    ("bariatric metabolic surgery", "减重代谢外科", "Roux-en-Y gastric bypass", "Roux-en-Y胃旁路术", "sleeve gastrectomy outcomes"),
+    ("urology endoscopy", "泌尿外科内镜", "TURP TURBT", "经尿道前列腺膀胱切除", "ureteroscopy lithotripsy"),
+    ("gynecologic oncology surgery", "妇科肿瘤手术", "radical hysterectomy", "根治性子宫切除", "cytoreductive surgery ovarian"),
+    ("obstetric emergency", "产科急症", "postpartum hemorrhage management", "产后出血处理", "shoulder dystocia maneuver"),
+    ("neonatal intensive care NICU", "新生儿重症监护", "respiratory distress syndrome surfactant", "新生儿呼吸窘迫综合征表面活性剂", "CPAP neonatal"),
+    ("pediatric surgery congenital", "小儿外科先天性畸形", "esophageal atresia repair", "食管闭锁修复", "Hirschsprung disease pull-through"),
+    ("anesthesia regional nerve block", "麻醉区域神经阻滞", "ultrasound guided nerve block", "超声引导神经阻滞", "spinal epidural anesthesia"),
+    ("critical care sepsis bundle", "危重症脓毒症集束化治疗", "hour-1 bundle", "1小时集束化", "vasopressor norepinephrine"),
+    ("mechanical ventilation ARDS", "机械通气ARDS", "lung protective ventilation", "肺保护性通气策略", "prone positioning ARDS"),
+    ("renal replacement therapy CRRT", "连续性肾脏替代治疗", "continuous hemofiltration", "连续性血液滤过", "citrate anticoagulation CRRT"),
+    ("echocardiography point of care", "即时超声心动图", "POCUS cardiac", "心脏床旁超声", "LV function assessment echo"),
+    ("interventional radiology procedure", "介入放射学手术", "TIPS transjugular portosystemic", "经颈静脉门体分流术", "embolization technique"),
+    ("nuclear medicine PET SPECT", "核医学PET SPECT", "FDG PET oncology", "FDG PET肿瘤学", "SPECT myocardial perfusion"),
+    ("radiation oncology IMRT SBRT", "放射肿瘤IMRT SBRT", "stereotactic body radiotherapy", "立体定向体部放射治疗", "dose volume histogram DVH"),
+    ("pathology molecular IHC", "病理学分子免疫组化", "immunohistochemistry biomarker", "免疫组化生物标志物", "FISH chromogenic ISH"),
+    ("clinical laboratory automation", "临床实验室自动化", "laboratory information system LIS", "实验室信息系统LIS", "delta check autoverification"),
+    ("transfusion medicine blood bank", "输血医学血库", "ABO crossmatch compatibility", "ABO交叉配血", "red cell antibody screen"),
+    ("infection control HAI", "感染控制医院获得性感染", "hand hygiene compliance", "手卫生依从性", "MDRO management"),
+    ("palliative care symptom management", "姑息治疗症状管理", "pain ladder WHO", "WHO疼痛阶梯", "existential suffering"),
+    ("rehabilitation stroke motor", "卒中运动康复", "constraint-induced movement therapy", "限制性运动疗法CIMT", "treadmill gait training"),
+    ("psychiatric emergency liaison", "精神科急诊联络", "psychiatric liaison consultation", "精神科联络会诊", "delirium assessment CAM"),
+    # ── Batch FFF end ──────────────────────────────────────────────────────────
+
+    # ── Batch GGG — 商学深化 ─────────────────────────────────────────────────
+    ("management accounting cost", "管理会计成本", "activity based costing ABC", "作业成本法ABC", "variance analysis standard cost"),
+    ("financial accounting IFRS GAAP", "财务会计IFRS GAAP", "revenue recognition ASC 606", "收入确认ASC606", "lease accounting IFRS 16"),
+    ("auditing assurance", "审计鉴证", "risk-based audit approach", "风险导向审计", "internal control material weakness"),
+    ("forensic accounting fraud", "法证会计欺诈", "earnings manipulation detection", "盈余操纵检测", "Benford law forensic"),
+    ("corporate governance ESG board", "公司治理ESG董事会", "board independence diversity", "董事会独立性多样化", "shareholder activism"),
+    ("mergers acquisitions due diligence", "并购尽职调查", "post-merger integration PMI", "并购后整合PMI", "synergy realization"),
+    ("private equity venture capital", "私募股权风险投资", "LBO leveraged buyout", "杠杆收购LBO", "VC term sheet"),
+    ("fixed income bond market", "固定收益债券市场", "yield curve duration convexity", "收益率曲线久期凸性", "credit default swap CDS"),
+    ("equity valuation models", "股权估值模型", "DCF Gordon growth model", "DCF戈登增长模型", "comparable company analysis comps"),
+    ("derivatives options pricing", "衍生品期权定价", "Black-Scholes Greeks", "Black-Scholes希腊字母", "delta hedging volatility smile"),
+    ("portfolio risk management VaR", "组合风险管理VaR", "expected shortfall CVaR", "预期损失CVaR", "stress testing scenario"),
+    ("central bank monetary policy transmission", "央行货币政策传导", "interest rate channel credit channel", "利率渠道信贷渠道", "forward guidance QE"),
+    ("microfinance financial inclusion", "微型金融普惠金融", "mobile money M-Pesa", "移动支付普惠", "credit scoring thin file"),
+    ("insurance underwriting actuarial", "保险承保精算", "loss ratio combined ratio", "赔付率综合成本率", "cat bond parametric insurance"),
+    ("real estate investment REIT", "房地产投资信托REIT", "cap rate NOI valuation", "资本化率净运营收入估值", "CMBS commercial mortgage"),
+    ("consumer behavior psychology marketing", "消费者行为心理营销", "cognitive bias anchoring", "认知偏差锚定效应", "priming effect purchase"),
+    ("brand equity brand management", "品牌资产品牌管理", "brand loyalty resonance", "品牌忠诚度共鸣", "Keller brand equity model"),
+    ("digital marketing SEO SEM", "数字营销SEO SEM", "search engine optimization", "搜索引擎优化", "conversion rate optimization CRO"),
+    ("social media marketing influencer", "社交媒体营销KOL", "influencer engagement rate", "网红互动率", "UGC user generated content"),
+    ("pricing strategy revenue management", "定价策略收益管理", "dynamic pricing yield management", "动态定价收益管理", "price elasticity segment"),
+    ("service marketing SERVQUAL", "服务营销SERVQUAL", "service quality gap model", "服务质量缺口模型", "customer effort score CES"),
+    ("operations research linear programming", "运筹学线性规划", "simplex method LP", "单纯形法线性规划", "integer programming branch bound"),
+    ("queuing theory service operations", "排队论服务运营", "M/M/1 queue waiting time", "M/M/1排队等待时间", "Erlang C formula"),
+    ("lean manufacturing waste elimination", "精益生产消除浪费", "value stream mapping kaizen", "价值流图改善", "SMED setup reduction"),
+    ("six sigma DMAIC quality", "六西格玛DMAIC质量", "process capability Cpk", "过程能力Cpk", "DPMO defect rate"),
+    ("project management PMO agile", "项目管理PMO敏捷", "earned value management EVM", "挣值管理EVM", "sprint velocity scrum"),
+    ("change management Kotter", "变革管理Kotter", "organizational resistance", "组织变革阻力", "prosci ADKAR model"),
+    ("knowledge management learning org", "知识管理学习型组织", "communities of practice CoP", "实践社区CoP", "tacit explicit knowledge"),
+    ("HR talent acquisition analytics", "人力资源人才获取分析", "competency-based interview", "胜任力面试", "pre-employment assessment validity"),
+    ("compensation total rewards benchmark", "薪酬全面激励基准", "job evaluation Hay system", "职位评估海氏系统", "pay equity analysis"),
+    ("organizational behavior OB", "组织行为学OB", "job satisfaction engagement OCB", "工作满意度敬业度公民行为", "organizational justice"),
+    ("entrepreneurship ecosystem", "创业生态系统", "startup accelerator incubator", "创业加速孵化器", "founder-market fit"),
+    ("business model innovation canvas", "商业模式创新画布", "value proposition design", "价值主张设计", "ecosystem orchestrator platform"),
+    ("corporate social responsibility CSR", "企业社会责任CSR", "stakeholder theory", "利益相关者理论", "shared value CSV Porter"),
+    ("international trade finance", "国际贸易金融", "letter of credit documentary", "信用证单据", "trade finance supply chain"),
+    ("customs compliance trade", "海关合规贸易", "tariff classification HS code", "关税分类HS编码", "anti-dumping countervailing"),
+    ("e-commerce marketplace platform", "电商平台市场", "marketplace two-sided network", "双边网络市场", "GMV take rate monetization"),
+    ("customer analytics CLV", "客户分析生命周期价值", "RFM analysis churn prediction", "RFM分析流失预测", "customer acquisition cost CAC"),
+    ("business analytics BI dashboard", "商业分析BI仪表盘", "KPI OKR performance management", "KPI OKR绩效管理", "balanced scorecard Kaplan Norton"),
+    ("negotiation strategy BATNA", "谈判策略BATNA", "principled negotiation interests", "原则性谈判利益导向", "integrative distributive negotiation"),
+
+    # ── Batch GGG — 文学深化 ─────────────────────────────────────────────────
+    ("translation studies equivalence", "翻译学等值", "dynamic equivalence Nida", "奈达动态对等", "foreignization domestication Venuti"),
+    ("interpreting conference simultaneous", "口译会议同传", "simultaneous consecutive interpreting", "同声传译交替传译", "interpreter stress working memory"),
+    ("lexicography dictionary making", "词典编纂学", "corpus-based lexicography", "语料库词典编纂", "lemma headword entry structure"),
+    ("stylistics literary language", "文体学文学语言", "foregrounding deviation norm", "前景化偏离规范", "literary pragmatics"),
+    ("narratology focalization voice", "叙事学聚焦叙述声音", "diegetic extradiegetic narrator", "故事内外叙述者", "free indirect discourse"),
+    ("cognitive poetics schema", "认知诗学图式", "text world theory", "文本世界理论", "conceptual blending literary"),
+    ("ecocriticism nature writing", "生态批评自然写作", "pastoral genre subversion", "田园体裁颠覆", "species imperialism Plumwood"),
+    ("postcolonial hybridity Bhabha", "后殖民混杂性Bhabha", "colonial discourse mimicry", "殖民话语模仿", "third space subaltern"),
+    ("feminist literary criticism", "女性主义文学批评", "gynocriticism Showalter", "女性批评Showalter", "writing the body écriture féminine"),
+    ("queer theory literature", "酷儿理论文学", "heteronormativity performativity", "异性恋规范性操演性", "camp sensibility Sontag"),
+    ("comparative mythology archetypes", "比较神话学原型", "monomyth hero journey Campbell", "英雄旅程Campbell神话", "trickster archetype folklore"),
+    ("oral tradition performance", "口头传统表演", "oral formulaic theory Lord Parry", "口头程式理论", "performance oral poetry"),
+    ("world literature circulation", "世界文学流通", "Pascale Casanova literary field", "Casanova文学场域", "translated world literature"),
+    ("modernism stream of consciousness", "现代主义意识流", "interior monologue Woolf Joyce", "意识流叙述Woolf Joyce", "epiphany Joycean"),
+    ("postmodernism metafiction", "后现代主义元小说", "historiographic metafiction Hutcheon", "历史元小说Hutcheon", "unreliable narrator postmodern"),
+    ("magical realism Latin America", "魔幻现实主义拉美", "Marquez One Hundred Years", "马尔克斯百年孤独", "hybridity real maravilloso"),
+    ("Chinese classical poetry Tang Song", "中国古典诗词唐宋", "Tang poetry Eight Masters", "唐诗八大家", "ci lyric genre tonal prosody"),
+    ("Chinese fiction novel Ming Qing", "中国古典小说明清", "Dream Red Chamber structure", "红楼梦结构叙事", "Water Margin narrative style"),
+    ("modern Chinese literature May Fourth", "五四现代中国文学", "Lu Xun critical realism", "鲁迅批判现实主义", "new culture movement literary"),
+    ("contemporary Chinese literature", "当代中国文学", "root-seeking literature xungen", "寻根文学", "avant-garde experimental fiction"),
+    ("drama theater performance studies", "戏剧表演研究", "Brechtian epic theater", "布莱希特史诗剧场", "postdramatic theatre"),
+    ("film studies cinematography", "电影研究摄影", "mise-en-scène auteur theory", "场面调度作者论", "psychoanalytic film theory"),
+    ("genre studies popular fiction", "类型研究通俗小说", "gothic uncanny sublime", "哥特式怪诞崇高", "detective fiction hard-boiled"),
+    ("children literature pedagogy", "儿童文学教育学", "picturebook multimodality", "图画书多模态", "YA young adult dystopia"),
+    ("life writing autobiography memoir", "生命书写自传回忆录", "autofiction self-representation", "自传虚构自我呈现", "testimonio witnessing"),
+    ("creative writing workshop pedagogy", "创意写作工坊教学法", "show don't tell craft", "展示不告知写作技艺", "revision drafting process"),
+    ("rhetoric composition writing", "修辞学写作构成", "classical rhetoric Cicero Quintilian", "西塞罗昆体良修辞学", "kairos exigence rhetorical situation"),
+    ("semiotics Saussure Peirce", "符号学索绪尔皮尔士", "signifier signified dyadic triadic", "能指所指二元三元", "sign systems cultural semiotics"),
+
+    # ── Batch GGG end ──────────────────────────────────────────────────────────
+
+    # ── Batch HHH — 法学深化 ─────────────────────────────────────────────────
+    ("constitutional law judicial review", "宪法司法审查", "proportionality strict scrutiny", "比例原则严格审查", "constitutional amendment procedure"),
+    ("administrative law rulemaking", "行政法规则制定", "notice and comment rulemaking APA", "通知评论行政程序法", "chevron deference judicial"),
+    ("tort law negligence duty", "侵权法过失义务", "duty of care reasonable person", "注意义务合理人标准", "product liability strict"),
+    ("contract law offer acceptance", "合同法要约承诺", "consideration bargain theory", "对价交易理论", "breach remedies expectation"),
+    ("property law real personal", "物权法动产不动产", "adverse possession easement", "时效取得地役权", "recording system title chain"),
+    ("criminal law mens rea actus reus", "刑法主观客观要件", "strict liability criminal", "严格责任刑事", "inchoate offense attempt conspiracy"),
+    ("evidence law hearsay exclusion", "证据法传闻排除", "Daubert expert testimony standard", "道伯特专家证词标准", "authentication chain of custody"),
+    ("civil procedure pleading discovery", "民事诉讼程序诉状证据开示", "motion to dismiss summary judgment", "驳回诉讼简易判决", "class action certification"),
+    ("criminal procedure Fourth Amendment", "刑事诉讼第四修正案", "exclusionary rule fruit of poisonous tree", "证据排除规则毒树之果", "Miranda rights custody"),
+    ("family law custody divorce", "家庭法监护离婚", "best interests of child standard", "儿童最佳利益标准", "equitable distribution marital property"),
+    ("trusts estates wills", "信托遗产遗嘱", "testamentary capacity undue influence", "立遗嘱能力不当影响", "intestate succession rules"),
+    ("business organizations corporation", "商事组织公司法", "piercing corporate veil", "刺破公司面纱", "fiduciary duty business judgment"),
+    ("securities regulation disclosure", "证券监管信息披露", "insider trading Reg FD", "内幕交易公平披露", "prospectus registration SEC"),
+    ("bankruptcy insolvency reorganization", "破产重组", "automatic stay discharge", "自动中止豁免", "Chapter 11 plan confirmation"),
+    ("antitrust competition law", "反垄断竞争法", "market definition dominance", "市场界定支配地位", "per se rule rule of reason"),
+    ("intellectual property trademark", "知识产权商标", "likelihood of confusion dilution", "混淆可能性淡化", "trademark registration Madrid"),
+    ("patent prosecution claims", "专利申请权利要求", "novelty non-obviousness enablement", "新颖性非显而易见性公开充分", "patent claim construction"),
+    ("copyright infringement fair use", "版权侵权合理使用", "DMCA safe harbor", "DMCA安全港", "derivative work transformation"),
+    ("international arbitration ICSID", "国际仲裁ICSID", "investor state dispute settlement ISDS", "投资者国家争端解决ISDS", "bilateral investment treaty BIT"),
+    ("WTO dispute settlement", "WTO争端解决", "panel appellate body report", "专家组上诉机构报告", "most favored nation national treatment"),
+    ("environmental law Endangered Species Act", "环境法濒危物种法", "NEPA EIS environmental review", "NEPA环境影响陈述", "clean air water act permit"),
+    ("immigration asylum refugee", "移民庇护难民法", "credible fear persecution", "合理恐惧迫害", "withholding removal CAT"),
+    ("labor employment discrimination", "劳动就业歧视法", "Title VII protected class", "第七章受保护类别", "disparate impact treatment"),
+    ("health law bioethics", "卫生法生命伦理", "informed consent capacity", "知情同意行为能力", "HIPAA privacy breach"),
+    ("cyber law data protection GDPR", "网络法数据保护GDPR", "data controller processor", "数据控制者处理者", "right to be forgotten erasure"),
+    ("space law liability convention", "空间法责任公约", "Outer Space Treaty OST", "外层空间条约OST", "national space legislation"),
+
+    # ── Batch HHH — 工学前沿深化 ──────────────────────────────────────────────
+    ("photonic integrated circuit PIC", "光子集成电路PIC", "silicon photonics waveguide", "硅基光子波导", "modulator ring resonator"),
+    ("terahertz technology THz", "太赫兹技术", "THz spectroscopy imaging", "太赫兹光谱成像", "THz generation detection"),
+    ("metamaterial negative refractive index", "超材料负折射率", "electromagnetic cloaking", "电磁隐身斗篷", "acoustic metamaterial phononic"),
+    ("quantum computing qubit", "量子计算量子比特", "superconducting qubit transmon", "超导量子比特transmon", "quantum error correction surface code"),
+    ("quantum communication QKD", "量子通信量子密钥分发", "BB84 protocol entanglement", "BB84协议纠缠", "quantum repeater memory"),
+    ("neuromorphic computing spike", "神经形态计算脉冲", "spiking neural network SNN", "脉冲神经网络SNN", "memristor synaptic weight"),
+    ("edge computing inference deployment", "边缘计算推理部署", "model compression pruning quantization", "模型压缩剪枝量化", "edge AI NPU TinyML"),
+    ("5G millimeter wave beamforming", "5G毫米波波束成形", "massive MIMO OFDM", "大规模MIMO OFDM", "NR FR2 mmWave channel"),
+    ("6G beyond 5G terahertz", "6G超5G太赫兹通信", "reconfigurable intelligent surface RIS", "可重构智能表面RIS", "joint communication sensing"),
+    ("blockchain distributed ledger", "区块链分布式账本", "consensus Nakamoto BFT", "中本聪BFT共识机制", "smart contract solidity"),
+    ("autonomous vehicle perception", "自动驾驶感知", "LiDAR radar fusion autonomous", "激光雷达雷达融合自驾", "HD map localization SLAM"),
+    ("UAV swarm coordination", "无人机集群协同", "multi-UAV path planning", "多无人机路径规划", "swarm intelligence flocking"),
+    ("soft robotics actuator", "软体机器人执行器", "pneumatic soft actuator", "气动软体执行器", "dielectric elastomer continuum robot"),
+    ("exoskeleton rehabilitation wearable", "外骨骼康复可穿戴", "upper lower limb exoskeleton", "上下肢外骨骼", "EMG control intent detection"),
+    ("advanced nuclear reactor SMR", "先进核反应堆SMR", "small modular reactor design", "小型模块化反应堆设计", "molten salt thorium reactor"),
+    ("fusion energy tokamak ITER", "核聚变托卡马克ITER", "plasma confinement stellarator", "等离子体约束仿星器", "D-T fuel cycle tritium breeding"),
+    ("hydrogen economy fuel cell stack", "氢经济燃料电池堆", "PEM fuel cell degradation", "质子交换膜燃料电池衰减", "green hydrogen electrolysis alkaline"),
+    ("carbon capture utilization CCUS", "碳捕集利用封存CCUS", "post-combustion MEA absorption", "MEA燃烧后捕集", "direct air capture DAC sorbent"),
+    ("offshore wind turbine foundation", "海上风机基础", "monopile jacket offshore", "单桩导管架海上", "floating wind FOWT mooring"),
+    ("solar cell perovskite tandem", "钙钛矿叠层太阳能电池", "two-terminal perovskite silicon", "两端钙钛矿硅叠层", "stability encapsulation perovskite"),
+    ("grid-scale energy storage BESS", "电网级储能BESS", "lithium iron phosphate cycle life", "磷酸铁锂循环寿命", "flow battery vanadium redox"),
+    ("smart grid demand response", "智能电网需求响应", "virtual power plant aggregation", "虚拟电厂聚合", "distribution system operator DSO"),
+    ("water treatment membrane desalination", "水处理膜脱盐", "reverse osmosis energy recovery", "反渗透能量回收", "forward osmosis draw solution"),
+    ("waste valorization circular economy", "废物增值循环经济", "industrial symbiosis eco-park", "工业共生生态园", "waste-to-energy pyrolysis gasification"),
+    ("construction digital twin BIM", "建筑数字孪生BIM", "4D 5D BIM scheduling cost", "BIM进度成本管理", "IFC open BIM interoperability"),
+    ("smart city infrastructure IoT", "智慧城市基础设施IoT", "urban sensing data platform", "城市感知数据平台", "digital city model CIM"),
+    ("geospatial analysis spatial data", "地理空间分析空间数据", "spatial autocorrelation Moran's I", "空间自相关Moran指数", "spatial interpolation kriging"),
+    ("human factors ergonomics cognitive", "人因工程认知工效", "situation awareness Endsley", "情景意识Endsley模型", "mental workload dual task"),
+
+    # ── Batch HHH — 理学前沿深化 ──────────────────────────────────────────────
+    ("dynamical systems chaos attractor", "动力系统混沌吸引子", "Lyapunov exponent bifurcation", "Lyapunov指数分岔", "strange attractor fractal dimension"),
+    ("algebraic topology homology cohomology", "代数拓扑同调上同调", "simplicial complex chain complex", "单纯复形链复形", "persistent homology TDA"),
+    ("differential geometry manifold", "微分几何流形", "Riemannian curvature tensor", "黎曼曲率张量", "geodesic connection parallel transport"),
+    ("number theory analytic", "解析数论", "Riemann zeta function prime distribution", "Riemann zeta函数素数分布", "Dirichlet series L-function"),
+    ("algebraic geometry scheme", "代数几何概形", "variety morphism sheaf", "代数簇态射层", "Grothendieck topos"),
+    ("functional analysis Banach Hilbert", "泛函分析Banach Hilbert空间", "spectral theory operator", "谱理论算子", "compact operator Fredholm"),
+    ("probability theory martingale", "概率论鞅论", "Ito calculus stochastic integral", "Ito随机积分", "Brownian motion Wiener process"),
+    ("combinatorics graph theory Ramsey", "组合数学图论Ramsey", "Ramsey theory extremal combinatorics", "Ramsey理论极值组合", "chromatic polynomial Tutte"),
+    ("quantum field theory renormalization", "量子场论重整化", "Feynman diagram loop integral", "费曼图圈积分", "renormalization group flow"),
+    ("general relativity black hole", "广义相对论黑洞", "Schwarzschild metric horizon", "史瓦西度规视界", "Hawking radiation entropy"),
+    ("cosmology inflation dark energy", "宇宙学暴胀暗能量", "CMB anisotropy power spectrum", "CMB各向异性功率谱", "dark energy equation of state w"),
+    ("condensed matter topological insulator", "凝聚态拓扑绝缘体", "Z2 invariant surface state Dirac", "Z2不变量表面态Dirac锥", "quantum anomalous Hall Chern number"),
+    ("strongly correlated electron Mott", "强关联电子Mott绝缘体", "Hubbard model Kondo effect", "Hubbard模型Kondo效应", "heavy fermion quantum criticality"),
+    ("plasma physics MHD instability", "等离子体物理MHD不稳定性", "Alfvén wave magnetohydrodynamics", "阿尔芬波磁流体动力学", "tearing mode reconnection"),
+    ("statistical mechanics entropy phase", "统计力学熵相变", "partition function free energy", "配分函数自由能", "Ising model Boltzmann factor"),
+    ("organic chemistry synthesis strategy", "有机化学合成策略", "retrosynthetic analysis disconnection", "逆合成分析断裂", "protecting group strategy"),
+    ("organocatalysis enantioselective", "有机催化对映选择性", "NHC proline organocatalyst", "NHC脯氨酸有机催化剂", "asymmetric Michael aldol organocatalysis"),
+    ("photocatalysis semiconductor band gap", "光催化半导体带隙", "heterogeneous photocatalysis TiO2", "TiO2异相光催化", "photosensitizer energy transfer"),
+    ("electrochemistry electrocatalysis", "电化学电催化", "Butler-Volmer overpotential exchange current", "Butler-Volmer过电位交换电流密度", "electrocatalyst TOF turnover"),
+    ("supramolecular chemistry host guest", "超分子化学主客体", "crown ether calixarene cucurbituril", "冠醚杯芳烃葫芦脲", "self-assembly molecular recognition"),
+    ("polymer synthesis radical living", "高分子合成自由基活性", "RAFT ATRP controlled polymerization", "RAFT ATRP可控聚合", "molecular weight distribution PDI"),
+    ("bioinformatics structural genomics", "生物信息学结构基因组", "protein structure prediction AlphaFold", "AlphaFold蛋白结构预测", "homology modeling threading"),
+    ("systems biology network analysis", "系统生物学网络分析", "protein interaction network hub", "蛋白质相互作用网络枢纽节点", "flux balance analysis metabolic"),
+    ("neuroscience neural circuit", "神经科学神经环路", "synaptic plasticity LTP LTD", "突触可塑性LTP LTD", "connectome mapping neural circuit"),
+    ("cell signaling kinase phosphatase", "细胞信号传导激酶磷酸酶", "receptor tyrosine kinase downstream", "受体酪氨酸激酶下游信号", "second messenger cAMP PKA"),
+    ("immunology T cell B cell", "免疫学T细胞B细胞", "antigen presentation MHC", "抗原呈递MHC", "adaptive immune memory clonal"),
+    ("microbiology biofilm quorum sensing", "微生物学生物膜群体感应", "quorum sensing autoinducer", "群体感应自诱导物", "biofilm formation virulence factor"),
+    ("ecology food web trophic", "生态学食物网营养级", "trophic cascade keystone species", "营养级联关键种", "energy flow efficiency pyramid"),
+    ("evolution phylogenomics molecular clock", "进化系统基因组分子时钟", "Bayesian divergence time estimation", "贝叶斯分歧时间估算", "molecular phylogenetics coalescent"),
+    ("geology petrology mineralogy", "地质学岩石矿物学", "igneous metamorphic sedimentary petrology", "火成变质沉积岩石学", "mineral crystallography XRD"),
+    # ── Batch HHH end ──────────────────────────────────────────────────────────
+
+    # ── Batch III — 农学医学收尾 ───────────────────────────────────────────────
+    ("plant hormone signaling ABA GA", "植物激素信号ABA GA", "abscisic acid drought response", "脱落酸干旱响应", "gibberellin DELLA signaling"),
+    ("nitrogen use efficiency NUE", "氮素利用效率NUE", "nitrate transporter root uptake", "硝酸盐转运体根系吸收", "denitrification leaching loss"),
+    ("phosphorus cycling mycorrhiza", "磷素循环菌根", "phosphorus solubilizing microorganism", "解磷微生物", "phytase soil enzyme"),
+    ("soil carbon nitrogen ratio decomposition", "土壤碳氮比分解", "litter decomposition cellulose lignin", "凋落物分解纤维素木质素", "microbial biomass carbon"),
+    ("agroecosystem service valuation", "农业生态系统服务价值", "provisioning regulating cultural services", "供给调节文化服务", "payment ecosystem services PES"),
+    ("food system sustainability", "食物系统可持续性", "dietary shift plant-based", "饮食转变植物性食品", "food environment access equity"),
+    ("post-harvest loss reduction", "采后损失减少", "cold storage modified atmosphere", "低温气调贮藏", "packaging delay ripening"),
+    ("animal disease surveillance", "动物疫病监测", "one health zoonosis wildlife", "同一健康人畜共患病野生动物", "epidemiological tracing stamping"),
+    ("veterinary pharmacology withdrawal", "兽医药理学休药期", "antimicrobial resistance veterinary", "兽医抗菌药耐药性", "residue monitoring food safety"),
+    ("aquaponic integrated system", "鱼菜共生综合系统", "aquaponics nutrient cycle", "鱼菜共生营养循环", "biofilter nitrification aquaponics"),
+    ("fisheries stock assessment", "渔业资源评估", "maximum sustainable yield MSY", "最大持续产量MSY", "virtual population analysis VPA"),
+    ("marine protected area MPA", "海洋保护区MPA", "no-take zone spillover effect", "禁捕区溢出效应", "blue carbon mangrove seagrass"),
+    ("forest certification FSC PEFC", "森林认证FSC PEFC", "sustainable forest management SFM", "可持续林业管理SFM", "chain of custody timber"),
+    ("wildfire management prescribed burn", "野火管理计划烧除", "fire behavior fuel moisture", "火行为燃料湿度", "community wildfire protection plan"),
+    ("tree physiology xylem hydraulics", "树木生理木质部水力", "stomatal regulation embolism", "气孔调控栓塞", "hydraulic failure carbon starvation"),
+    ("endocrinology thyroid adrenal", "内分泌学甲状腺肾上腺", "hypothyroidism levothyroxine TSH", "甲减左甲状腺素TSH", "adrenal insufficiency cortisol"),
+    ("hematology coagulation cascade", "血液学凝血瀑布", "anticoagulant warfarin DOAC", "抗凝华法林DOAC", "thrombosis DVT PE treatment"),
+    ("rheumatology autoimmune joint", "风湿病学自身免疫关节", "rheumatoid arthritis biologic", "类风湿关节炎生物制剂", "disease activity score DAS28"),
+    ("nephrology proteinuria GFR", "肾病学蛋白尿GFR", "chronic kidney disease staging", "慢性肾脏病分期", "RAAS inhibition nephroprotection"),
+    ("hepatology cirrhosis portal hypertension", "肝病学肝硬化门脉高压", "Child-Pugh MELD score", "Child-Pugh MELD评分", "varices prophylaxis beta blocker"),
+    ("gastroenterology IBD endoscopy", "消化内科IBD内镜", "Crohn disease ulcerative colitis biologic", "克罗恩病溃疡性结肠炎生物制剂", "colonoscopy polypectomy surveillance"),
+    ("pulmonology COPD spirometry", "呼吸内科COPD肺功能", "FEV1 FVC ratio airflow obstruction", "FEV1 FVC比值气流阻塞", "inhaler LABA LAMA step therapy"),
+    ("allergy immunotherapy desensitization", "过敏症免疫疗法脱敏", "subcutaneous sublingual SCIT SLIT", "皮下舌下特异性免疫治疗", "allergen extract dosing schedule"),
+    ("dermatology acne psoriasis biologic", "皮肤科痤疮银屑病生物制剂", "IL-17 IL-23 inhibitor psoriasis", "IL-17 IL-23抑制剂银屑病", "topical retinoid keratolytic"),
+    ("ophthalmology retina anti-VEGF", "眼科视网膜抗VEGF", "age-related macular degeneration AMD", "老年性黄斑变性AMD", "intravitreal injection ranibizumab"),
+    ("ENT otolaryngology hearing", "耳鼻喉科听力", "cochlear implant audiogram", "人工耳蜗听力图", "obstructive sleep apnea CPAP ENT"),
+    ("dentistry periodontal implant", "口腔科牙周种植", "osseointegration titanium implant", "骨结合钛种植体", "scaling root planing periodontitis"),
+    ("radiation therapy normal tissue toxicity", "放射治疗正常组织毒性", "radiation induced fibrosis", "放射性纤维化", "QUANTEC dose constraints"),
+    ("genomic medicine pharmacogenomics clinical", "基因组医学药物基因组临床", "CYP2D6 CYP2C19 phenotype", "CYP2D6 CYP2C19表型", "drug gene interaction label"),
+    ("rare disease orphan drug", "罕见病孤儿药", "newborn screening inborn error", "新生儿筛查先天代谢异常", "enzyme replacement therapy lysosomal"),
+
+    # ── Batch III — 工学理学收尾 ───────────────────────────────────────────────
+    ("embedded system RTOS firmware", "嵌入式系统RTOS固件", "FreeRTOS interrupt priority", "FreeRTOS中断优先级", "bare metal HAL driver"),
+    ("FPGA digital design HDL", "FPGA数字设计HDL", "VHDL Verilog synthesis timing", "VHDL Verilog综合时序", "place and route constraint"),
+    ("analog circuit design op-amp", "模拟电路设计运放", "feedback stability Bode plot", "反馈稳定性波特图", "noise figure dynamic range ADC"),
+    ("RF microwave circuit impedance", "射频微波电路阻抗", "S-parameter matching network", "S参数匹配网络", "transmission line standing wave"),
+    ("power electronics converter topology", "电力电子变换器拓扑", "DC-DC buck boost LLC", "DC-DC降压升压LLC", "PWM switching loss EMI filter"),
+    ("electric motor drive control", "电机驱动控制", "FOC vector control torque", "磁场定向控制力矩", "PMSM BLDC resolver encoder"),
+    ("structural analysis finite element", "结构分析有限元", "stress strain displacement FEA", "应力应变位移有限元", "nonlinear buckling contact FEA"),
+    ("fluid structure interaction FSI", "流固耦合FSI", "aeroelasticity flutter divergence", "气动弹性颤振发散", "coupled FSI solver partitioned"),
+    ("multibody dynamics simulation", "多体动力学仿真", "rigid flexible body dynamics", "刚柔体动力学", "joint constraint kinematics solver"),
+    ("manufacturing process optimization", "制造工艺优化", "design of experiments DOE Taguchi", "试验设计田口法", "response surface methodology RSM"),
+    ("quality engineering reliability", "质量工程可靠性", "failure mode effects analysis FMEA", "失效模式影响分析FMEA", "FMECA RPN severity occurrence"),
+    ("supply chain resilience disruption", "供应链韧性中断", "multi-sourcing inventory buffer", "多源采购安全库存缓冲", "supply chain risk mapping"),
+    ("lifecycle assessment LCA", "生命周期评价LCA", "functional unit system boundary", "功能单位系统边界", "ecoinvent database characterization"),
+    ("applied mathematics PDE numerical", "应用数学偏微分方程数值", "finite difference element volume", "有限差分元体积方法", "spectral method pseudospectral"),
+    ("stochastic differential equation", "随机微分方程", "Fokker-Planck drift diffusion", "Fokker-Planck漂移扩散", "mean field limit McKean-Vlasov"),
+    ("optimization convex duality", "优化凸对偶", "Lagrangian dual KKT conditions", "拉格朗日对偶KKT条件", "interior point primal dual"),
+    ("network science scale-free", "网络科学无标度", "Barabasi-Albert preferential attachment", "BA模型优先连接", "small world clustering path length"),
+    ("information theory capacity", "信息论信道容量", "Shannon entropy mutual information", "香农熵互信息", "channel coding rate distortion"),
+    ("cryptography elliptic curve", "密码学椭圆曲线", "ECDSA public key digital signature", "ECDSA公钥数字签名", "lattice-based post-quantum crypto"),
+    ("particle physics standard model", "粒子物理标准模型", "Higgs mechanism gauge boson", "希格斯机制规范玻色子", "LHC collider detector"),
+    ("nuclear physics decay fission", "核物理衰变裂变", "radioactive decay half-life", "放射性衰变半衰期", "nuclear binding energy shell model"),
+    ("atmospheric chemistry aerosol", "大气化学气溶胶", "secondary organic aerosol formation", "二次有机气溶胶生成", "photochemical smog ozone NOx"),
+    ("oceanography deep circulation", "海洋学深层环流", "thermohaline circulation AMOC", "温盐环流大西洋翻转环流", "upwelling productivity nutrient cycle"),
+    ("geodynamics plate tectonics", "地球动力学板块构造", "subduction slab pull ridge push", "俯冲板片拉力洋脊推力", "hotspot mantle plume volcanism"),
+    ("hydrology watershed runoff", "水文学流域径流", "rainfall runoff model SCS-CN", "降雨径流模型SCS-CN", "baseflow recession streamflow"),
+    ("remote sensing hyperspectral", "遥感高光谱", "hyperspectral imaging mineral mapping", "高光谱成像矿物填图", "radiometric correction atmospheric"),
+    ("evolutionary game theory ESS", "进化博弈论ESS", "evolutionarily stable strategy", "进化稳定策略", "replicator dynamics fitness landscape"),
+    ("complex adaptive systems emergence", "复杂自适应系统涌现", "agent-based model emergence", "基于主体模型涌现", "self-organization criticality"),
+    ("astrobiology habitability biosignature", "天体生物学宜居性生物印迹", "extremophile habitability zone", "极端微生物宜居带", "atmospheric biosignature oxygen methane"),
+    ("chronobiology circadian rhythm", "时间生物学昼夜节律", "CLOCK BMAL1 circadian oscillator", "CLOCK BMAL1昼夜振荡器", "jet lag shift work melatonin"),
+    # ── Batch III end ──────────────────────────────────────────────────────────
+
+    # ── Batch JJJ — 综合最终冲刺 4000 ─────────────────────────────────────────
+    # 商学补充
+    ("behavioral finance prospect theory", "行为金融前景理论", "loss aversion mental accounting", "损失厌恶心理账户", "disposition effect overconfidence"),
+    ("Islamic finance sukuk halal", "伊斯兰金融苏库克", "murabaha ijara profit sharing", "成本加成利润分享伊斯兰", "sharia compliance screening"),
+    ("impact investing ESG screening", "影响力投资ESG筛选", "UNPRI responsible investment", "联合国责任投资原则", "double bottom line social return"),
+    ("economic geography agglomeration", "经济地理集聚效应", "localization urbanization economies", "本地化城市化经济", "clusters industrial district Marshall"),
+    ("platform economics two-sided market", "平台经济双边市场", "network externality tipping point", "网络外部性临界点", "chicken-and-egg platform launch"),
+    ("behavioral nudge choice architecture", "行为助推选择架构", "default opt-out opt-in", "默认选项退出加入", "incentive salience framing effect"),
+    ("supply chain analytics demand sensing", "供应链分析需求感知", "S&OP demand forecasting CPFR", "销售运营计划协同预测补货", "bullwhip effect mitigation"),
+    ("human capital theory education return", "人力资本理论教育回报", "Mincer earnings equation", "明瑟收益方程", "on-the-job training general specific"),
+    ("innovation management open innovation", "创新管理开放式创新", "Chesbrough open innovation model", "Chesbrough开放创新模型", "absorptive capacity innovation ecosystem"),
+    ("retail analytics omnichannel", "零售分析全渠道", "merchandise planning assortment", "商品规划品类管理", "last mile logistics fulfillment"),
+    # 文学补充
+    ("discourse analysis critical CDA", "话语分析批评CDA", "Fairclough critical discourse", "费尔克劳夫批评话语", "hegemony ideology representation"),
+    ("sociolinguistics language variation", "社会语言学语言变异", "dialect vernacular codeswitching", "方言口语语码转换", "language prestige stigma"),
+    ("pragmatics speech act politeness", "语用学言语行为礼貌", "face threatening act Brown Levinson", "面子威胁行为布朗莱文森", "implicature relevance Grice"),
+    ("psycholinguistics language acquisition", "心理语言学语言习得", "critical period hypothesis Chomsky", "关键期假设乔姆斯基", "SLA second language acquisition"),
+    ("corpus linguistics frequency collocation", "语料库语言学频率搭配", "concordance collocation extraction", "语境词索引搭配提取", "keyword analysis BNC COCA"),
+    ("applied linguistics EFL ESP", "应用语言学英语教学", "communicative language teaching CLT", "交际语言教学法CLT", "task-based language teaching TBLT"),
+    ("media studies journalism framing", "媒体研究新闻框架", "agenda setting gatekeeping media", "议程设置把关媒体", "media representation stereotypes"),
+    ("cultural studies hegemony identity", "文化研究霸权身份认同", "Stuart Hall encoding decoding", "斯图尔特霍尔编码解码", "subculture resistance youth"),
+    ("memory studies trauma testimony", "记忆研究创伤证词", "collective memory Halbwachs", "集体记忆哈布瓦赫", "postmemory Hirsch transgenerational"),
+    ("archive history historiography", "档案历史编纂学", "microhistory Ginzburg Levi", "微观史学金兹堡莱维", "social history Annales school"),
+    # 法学补充
+    ("international criminal law ICC", "国际刑法国际刑事法院", "crimes against humanity genocide", "反人类罪种族灭绝", "complementarity Rome Statute"),
+    ("refugee law non-refoulement", "难民法不驱回原则", "1951 Refugee Convention status", "1951年难民公约身份", "temporary protection complementary"),
+    ("competition law dominance abuse", "竞争法支配地位滥用", "tying foreclosure leveraging", "搭售排斥杠杆化", "fining guidelines leniency"),
+    ("financial regulation prudential", "金融监管审慎监管", "Basel III capital adequacy", "巴塞尔III资本充足率", "macroprudential systemic risk"),
+    ("consumer protection unfair commercial", "消费者保护不公平商业行为", "misleading advertising recall", "误导性广告召回", "distance selling cooling-off period"),
+    ("privacy law surveillance Fourth", "隐私法监控第四修正案", "reasonable expectation privacy", "隐私合理期望", "third party doctrine digital data"),
+    ("legal theory jurisprudence Hart", "法学理论法理学哈特", "legal positivism natural law", "法律实证主义自然法", "rule of recognition Hart"),
+    ("comparative law legal transplant", "比较法律法律移植", "civil law common law convergence", "大陆法普通法趋同", "legal culture mentality"),
+    ("mediation ADR restorative justice", "调解ADR恢复性司法", "interest-based negotiation mediation", "利益导向调解", "victim-offender conferencing"),
+    ("regulation risk-based responsive", "监管风险本位回应性", "responsive regulation enforcement", "回应性监管执法", "better regulation RIA impact assessment"),
+    # 农学补充
+    ("plant epigenetics DNA methylation", "植物表观遗传DNA甲基化", "histone modification chromatin remodeling", "组蛋白修饰染色质重塑", "vernalization epigenetic memory"),
+    ("crop biofortification zinc iron", "作物生物强化锌铁", "QTL mapping grain mineral", "QTL定位谷物矿物", "hidden hunger micronutrient"),
+    ("livestock genomics GWAS selection", "畜禽基因组GWAS选择", "single nucleotide polymorphism SNP chip", "单核苷酸多态性SNP芯片", "estimated breeding value EBV"),
+    ("aquatic toxicology fish ecotox", "水生毒理学鱼类生态毒", "LC50 bioaccumulation factor", "半致死浓度生物累积因子", "endocrine disruptor fish"),
+    ("agroforestry silvopastoral", "农林牧复合系统", "alley cropping strip intercrop", "间作农林复合种植", "biomass carbon stock agroforestry"),
+    ("soil erosion conservation tillage", "土壤侵蚀保护性耕作", "RUSLE universal soil loss equation", "RUSLE通用土壤流失方程", "cover crop residue wind erosion"),
+    ("phytoremediation contaminated soil", "植物修复污染土壤", "hyperaccumulator cadmium lead", "超累积植物镉铅", "rhizofiltration phytoextraction"),
+    ("crop insurance index parametric agri", "农业保险指数参数型", "weather index crop insurance", "气象指数农业保险", "basis risk moral hazard agri insurance"),
+    ("agri-food chain traceability blockchain", "农食链溯源区块链", "GS1 traceability farm to fork", "GS1农场到餐桌溯源", "QR code label food authentication"),
+    ("digital agriculture platform data", "数字农业平台数据", "farm management information system FMIS", "农场管理信息系统FMIS", "precision agriculture decision support"),
+    # 医学补充
+    ("global health equity burden", "全球健康公平疾病负担", "DALY disability-adjusted life year", "伤残调整生命年DALY", "universal health coverage UHC"),
+    ("epidemiology cohort case-control", "流行病学队列病例对照", "odds ratio relative risk incidence", "比值比相对危险度发病率", "confounder selection bias"),
+    ("health economics cost-effectiveness", "卫生经济学成本效益", "QALY incremental cost-effectiveness", "质量调整生命年增量成本效益", "health technology assessment HTA"),
+    ("mental health stigma recovery", "精神健康污名化康复", "recovery-oriented care open dialogue", "康复导向开放对话治疗", "peer support mental health"),
+    ("substance use disorder addiction", "物质使用障碍成瘾", "dopamine reward circuit craving", "多巴胺奖励环路渴求", "motivational interviewing CBT addiction"),
+    ("clinical nutrition enteral parenteral", "临床营养肠内肠外", "malnutrition screening NRS 2002", "营养不良筛查NRS2002", "total parenteral nutrition TPN catheter"),
+    ("sleep medicine polysomnography", "睡眠医学多导睡眠图", "sleep staging REM NREM scoring", "睡眠分期REM NREM评分", "insomnia CBT-I stimulus control"),
+    ("medical ethics four principles", "医学伦理学四原则", "autonomy beneficence non-maleficence justice", "自主有利不伤害公平原则", "advance directive surrogate decision"),
+    ("telemedicine remote patient monitoring", "远程医疗患者监测", "RPM wearable chronic disease", "可穿戴慢病远程监测", "telestroke teledermatology"),
+    ("precision medicine biomarker stratification", "精准医学生物标志物分层", "companion diagnostic CDx enrichment", "伴随诊断富集设计", "basket umbrella platform trial"),
+    # 理工学综合
+    ("topological data analysis TDA", "拓扑数据分析TDA", "persistent homology barcode diagram", "持久同调条形图", "mapper algorithm clustering"),
+    ("mathematical biology reaction diffusion", "数学生物学反应扩散", "Turing pattern morphogenesis", "图灵模式形态发生", "predator prey Lotka-Volterra limit cycle"),
+    ("nonlinear optics high harmonic", "非线性光学高次谐波", "high harmonic generation attosecond", "高次谐波阿秒脉冲", "strong field ultrafast physics"),
+    ("ultrafast laser spectroscopy pump probe", "超快激光光谱泵浦探测", "transient absorption 2D spectroscopy", "瞬态吸收二维光谱", "coherent control wavepacket"),
+    ("spin physics spintronics", "自旋物理自旋电子学", "spin Hall magnetoresistance", "自旋霍尔磁电阻", "spin orbit torque STT-MRAM"),
+    ("van der Waals heterostructure 2D", "范德华异质结二维材料", "graphene hBN MoS2 stacking", "石墨烯hBN MoS2堆叠", "moiré superlattice flat band"),
+    ("laser cooling atomic physics BEC", "激光冷却原子物理BEC", "magneto optical trap evaporation", "磁光阱蒸发冷却", "Bose-Einstein condensate superfluidity"),
+    ("quantum simulation many-body", "量子模拟多体系统", "cold atom optical lattice Hubbard", "冷原子光晶格Hubbard模型", "analog quantum simulator Hamiltonian"),
+    ("electrochemical impedance spectroscopy", "电化学阻抗谱", "Nyquist plot Randles circuit", "奈奎斯特图Randles等效电路", "diffusion Warburg element"),
+    ("surface science adsorption TPD", "表面科学吸附TPD", "temperature programmed desorption STM", "程序升温脱附扫描隧道显微镜", "work function surface energy"),
+    ("biophysics membrane protein", "生物物理膜蛋白", "lipid bilayer patch clamp channel", "脂双层膜片钳离子通道", "single channel conductance gating"),
+    ("chemical engineering reactor design", "化学工程反应器设计", "CSTR PFR residence time distribution", "全混流平推流停留时间分布", "recycle ratio conversion selectivity"),
+    ("separation technology distillation extraction", "分离技术蒸馏萃取", "vapor liquid equilibrium McCabe Thiele", "气液平衡McCabe-Thiele图", "liquid-liquid extraction distribution coefficient"),
+    ("catalysis heterogeneous kinetics", "催化剂异相动力学", "Langmuir-Hinshelwood Eley-Rideal", "L-H E-R机理", "turnover frequency activation energy"),
+    ("green chemistry solvent atom economy", "绿色化学溶剂原子经济性", "twelve principles green chemistry", "绿色化学十二原则", "E-factor waste prevention"),
+    ("materials characterization XRD TEM SEM", "材料表征XRD TEM SEM", "Bragg equation lattice spacing", "布拉格方程晶格间距", "diffraction pattern phase identification"),
+    ("nanoparticle synthesis characterization", "纳米颗粒合成表征", "DLS zeta potential hydrodynamic size", "动态光散射Zeta电位", "TEM HRTEM lattice fringes"),
+    ("drug delivery nanocarrier", "药物递送纳米载体", "liposome nanoparticle encapsulation", "脂质体纳米颗粒包封", "EPR effect tumor accumulation"),
+    ("biosensor electrochemical optical", "生物传感器电化学光学", "aptamer antibody recognition layer", "适配体抗体识别层", "LOD sensitivity specificity biosensor"),
+    ("environmental monitoring pollutant", "环境监测污染物", "persistent organic pollutant POP bioaccumulation", "持久性有机污染物生物富集", "heavy metal speciation soil"),
+    ("climate change adaptation vulnerability", "气候变化适应脆弱性", "adaptive capacity exposure sensitivity", "适应能力暴露敏感性", "climate risk assessment mapping"),
+    ("ecosystem restoration rewilding", "生态系统修复再野化", "passive active restoration ecology", "被动主动修复生态学", "reference ecosystem trophic guild"),
+    ("urban ecology heat island green", "城市生态学热岛绿化", "urban green infrastructure cooling", "城市绿色基础设施降温", "bird diversity urban gradient"),
+    ("conservation genetics bottleneck", "保护遗传学瓶颈效应", "effective population size Ne", "有效种群大小Ne", "inbreeding depression genetic rescue"),
+    # ── Batch JJJ end ──────────────────────────────────────────────────────────
+
+    # ── Batch KKK — 最终100组达成4000 ─────────────────────────────────────────
+    # 商学最终
+    ("treasury management cash flow", "资金管理现金流", "cash pooling liquidity management", "资金池流动性管理", "FX hedging currency risk"),
+    ("lean startup MVP iteration", "精益创业MVP迭代", "build measure learn pivot", "构建测量学习转型", "product market fit traction"),
+    ("design thinking empathy prototype", "设计思维同理心原型", "double diamond HCD", "双钻石以人为中心设计", "journey map touchpoint"),
+    ("circular economy cradle to cradle", "循环经济摇篮到摇篮", "closed loop product design", "闭环产品设计", "industrial ecology metabolic"),
+    ("organizational learning double loop", "组织学习双环学习", "action learning Argyris Schon", "行动学习阿吉里斯舒恩", "organizational ambidexterity"),
+    ("public relations crisis communication", "公关危机传播", "issue management stakeholder response", "议题管理利益相关方回应", "reputation repair apologia"),
+    ("hospitality service quality", "酒店业服务质量", "hotel revenue management ADR RevPAR", "酒店收益管理ADR RevPAR", "guest satisfaction NPS hospitality"),
+    ("logistics transportation mode", "物流运输方式", "multimodal intermodal freight", "多式联运货运", "last mile urban delivery"),
+    ("global value chain offshoring", "全球价值链离岸外包", "nearshoring reshoring production", "近岸回流制造", "captive offshore shared service"),
+    ("entrepreneurial finance bootstrapping", "创业融资自力更生", "convertible note SAFE agreement", "可转换票据SAFE协议", "pre-money post-money valuation"),
+    # 文学最终
+    ("book history print culture", "书籍史印刷文化", "manuscript codex incunabula", "手稿抄本摇篮本", "reading practices reception history"),
+    ("theater directing mise en scene", "戏剧导演舞台调度", "blocking sight lines staging", "走位视线布景", "rehearsal devised theater"),
+    ("literary journalism creative nonfiction", "文学新闻创意非虚构", "immersion narrative reportage", "沉浸式叙事特稿", "lyric essay braided narrative"),
+    ("science fiction speculative futures", "科幻文学推测性未来", "dystopia utopia solarpunk", "反乌托邦乌托邦太阳朋克", "technocriticism posthuman SF"),
+    ("crime thriller noir detective", "犯罪惊悚黑色小说", "hardboiled Hammett Chandler", "硬汉派哈梅特钱德勒", "cozy mystery police procedural"),
+    ("travel writing geography imagination", "旅行写作地理想象", "travel narrative gaze other", "旅游叙事凝视他者", "imperialism travel discourse"),
+    ("biography life history method", "传记生命史方法", "oral history interview methodology", "口述史访谈方法论", "narrative inquiry autoethnography"),
+    ("literary prize Nobel Booker", "文学奖诺贝尔布克", "prize culture literary field", "奖项文化文学场", "prize shortlist winner effect"),
+    ("poetics verse form meter rhyme", "诗学格律韵律", "iambic pentameter sonnet villanelle", "抑扬格五步格十四行诗", "free verse prose poetry"),
+    ("Shakespeare Renaissance drama", "莎士比亚文艺复兴戏剧", "Elizabethan stage soliloquy", "伊丽莎白剧院独白", "tragedy comedy generic hybrid"),
+    # 法学最终
+    ("tax law income corporate", "税法所得税公司税", "transfer pricing arm's length", "转移定价独立交易原则", "thin capitalization BEPS"),
+    ("shipping maritime law admiralty", "海运海事法", "bill of lading charter party", "提单租船合同", "general average Hague Visby rules"),
+    ("aviation law liability Montreal", "航空法责任蒙特利尔", "Warsaw Montreal Convention", "华沙蒙特利尔公约", "air carrier liability limit"),
+    ("sports law doping arbitration CAS", "体育法兴奋剂仲裁", "WADA prohibited list TUE", "世界反兴奋剂机构治疗豁免", "athlete contract transfer window"),
+    ("natural resource law indigenous", "自然资源法原住民", "FPIC free prior informed consent", "自由事先知情同意FPIC", "UNDRIP indigenous land rights"),
+    ("humanitarian law IHL armed conflict", "人道法国际人道主义法武装冲突", "Geneva Conventions proportionality", "日内瓦公约比例原则", "distinction civilian combatant"),
+    ("anti-corruption FCPA UKBA", "反腐败FCPA英国贿赂法", "compliance program due diligence", "合规计划尽职调查", "deferred prosecution agreement DPA"),
+    ("public procurement tender", "政府采购招标", "open restricted negotiated procedure", "公开限制谈判程序", "abnormally low bid evaluation"),
+    ("food law Codex Alimentarius", "食品法典委员会食品法", "food additive GRAS Generally Recognized Safe", "食品添加剂GRAS", "Codex standard SPS agreement"),
+    ("pharmaceutical regulatory approval", "药品监管审批", "IND NDA BLA accelerated approval", "IND NDA BLA加速审批", "good manufacturing practice GMP"),
+    # 理学最终
+    ("group theory symmetry representation", "群论对称性表示", "Lie group Lie algebra representation", "李群李代数表示", "irreducible representation character"),
+    ("category theory functor natural", "范畴论函子自然变换", "adjunction universal property", "伴随万有性质", "topos sheaf category"),
+    ("model theory logic completeness", "模型论逻辑完备性", "Godel incompleteness theorem", "哥德尔不完备定理", "satisfiability decidability"),
+    ("set theory ZFC axiom", "集合论ZFC公理", "cardinality ordinal transfinite", "势序数超限", "continuum hypothesis forcing"),
+    ("harmonic analysis Fourier wavelet", "调和分析小波", "continuous wavelet transform CWT", "连续小波变换CWT", "multiresolution analysis scaling"),
+    ("numerical linear algebra eigenvalue", "数值线性代数特征值", "QR decomposition singular value SVD", "QR分解奇异值SVD", "Krylov subspace GMRES Lanczos"),
+    ("control theory Lyapunov stability", "控制理论Lyapunov稳定性", "input-output stability passivity", "输入输出稳定性无源性", "robust H-infinity control LMI"),
+    ("game theory mechanism design", "博弈论机制设计", "Nash equilibrium dominant strategy", "纳什均衡占优策略", "auction design revelation principle"),
+    ("statistical learning theory VC", "统计学习理论VC维", "PAC learning Rademacher complexity", "PAC学习Rademacher复杂度", "bias-variance tradeoff generalization"),
+    ("signal processing estimation filter", "信号处理估计滤波", "Kalman filter state estimation", "卡尔曼滤波状态估计", "Wiener filter MMSE estimation"),
+    # 工学最终
+    ("system identification parameter estimation", "系统辨识参数估计", "ARX ARMAX transfer function", "ARX ARMAX传递函数辨识", "recursive least squares adaptation"),
+    ("nonlinear control backstepping sliding mode", "非线性控制反步法滑模", "sliding mode variable structure", "滑模变结构控制", "Lyapunov backstepping CLF"),
+    ("model predictive control MPC NMPC", "模型预测控制MPC", "receding horizon optimization", "滚动时域优化", "constraint handling MPC stability"),
+    ("digital twin simulation fidelity", "数字孪生仿真保真度", "physics-based surrogate model", "物理模型代理模型", "HiL SiL digital twin validation"),
+    ("reliability engineering maintainability", "可靠性工程维修性", "MTBF MTTR availability", "平均无故障时间MTBF MTTR", "bathtub curve infant mortality"),
+    ("prognostics health management PHM", "预测性健康管理PHM", "condition monitoring vibration signature", "状态监测振动特征", "remaining useful life RUL prediction"),
+    ("additive manufacturing metal powder", "增材制造金属粉末", "selective laser melting SLM EBM", "选择性激光熔化EBM", "porosity residual stress AM"),
+    ("composite manufacturing autoclave", "复合材料制造热压罐", "prepreg layup curing cycle", "预浸料铺层固化曲线", "void content interlaminar shear"),
+    ("tribology wear lubrication", "摩擦学磨损润滑", "Hertz contact stress friction coefficient", "赫兹接触应力摩擦系数", "EHD elastohydrodynamic film"),
+    ("acoustic emission NDE inspection", "声发射无损检测", "ultrasonic phased array TOFD", "超声相控阵TOFD", "eddy current magnetic particle NDT"),
+    # 农学最终
+    ("rural sociology livelihood", "农村社会学生计", "sustainable livelihood framework SLF", "可持续生计框架SLF", "social capital rural community"),
+    ("food sovereignty agroecological", "粮食主权农业生态", "Via Campesina peasant rights", "坎佩西纳农民之路", "traditional knowledge biodiversity"),
+    ("urban agriculture rooftop garden", "城市农业屋顶花园", "community garden allotment", "社区菜园份地", "urban food production resilience"),
+    ("agricultural mechanization small farm", "农业机械化小农", "two-wheel tractor mechanization", "手扶拖拉机小型机械化", "custom hiring service mechanization"),
+    ("plant factory artificial light", "植物工厂人工光照", "LED spectrum photosynthetic photon", "LED光谱光合光量子", "DLI daily light integral controlled environment"),
+    ("crop wild relative genetic resource", "作物野生近缘种遗传资源", "ex situ in situ conservation", "离体就地保护遗传资源", "genebank accession characterization"),
+    ("soil food web nematode fauna", "土壤食物网线虫群落", "bacterivore fungivore nematode", "食菌食细菌线虫", "soil ecological function indicator"),
+    ("integrated soil fertility management", "综合土壤肥力管理ISFM", "organic inorganic fertilizer combine", "有机无机肥配施", "fertilizer use efficiency smallholder"),
+    ("disaster risk reduction agriculture", "农业灾害风险减少", "early warning crop loss forecast", "预警作物损失预报", "contingency plan drought flood"),
+    ("food loss waste SDG 12", "食物损失浪费SDG12", "consumer behavior food waste", "消费者食物浪费行为", "redistribution gleaning surplus food"),
+    # 医学最终
+    ("health informatics electronic record", "卫生信息学电子病历", "EHR interoperability HL7 FHIR", "电子健康档案互操作HL7 FHIR", "clinical decision support CDSS alert"),
+    ("public health surveillance outbreak", "公共卫生监测疫情", "syndromic surveillance event based", "症状监测事件监测", "epidemic curve attack rate"),
+    ("vaccination immunization program", "疫苗接种免疫规划", "herd immunity threshold coverage", "群体免疫阈值覆盖率", "vaccine cold chain rollout"),
+    ("maternal mortality morbidity", "孕产妇死亡率发病率", "skilled birth attendant obstetric", "专业助产士产科服务", "EmONC emergency obstetric care"),
+    ("child nutrition wasting stunting", "儿童营养消瘦发育迟缓", "MUAC Z-score malnutrition", "上臂围Z值营养不良", "CMAM community-based management"),
+    ("non-communicable disease NCD prevention", "非传染性疾病预防", "MPOWER tobacco control framework", "MPOWER烟草控制框架", "SHAKE salt reduction hypertension"),
+    ("antimicrobial stewardship program", "抗菌药物管理项目", "antibiogram local resistance pattern", "抗菌谱本地耐药模式", "de-escalation broad to narrow spectrum"),
+    ("hospital acquired infection prevention", "医院感染预防", "central line associated CLABSI", "中心静脉导管相关血流感染CLABSI", "surgical site infection SSI bundle"),
+    ("patient safety incident reporting", "患者安全事件报告", "root cause analysis Swiss cheese", "根本原因分析瑞士奶酪模型", "Just Culture no blame reporting"),
+    ("clinical guideline evidence synthesis", "临床指南证据综合", "GRADE evidence quality strength", "GRADE证据质量推荐强度", "Cochrane systematic review meta"),
+    # ── Batch KKK end — 4000 groups target ──────────────────────────────────
+
+    # ── Batch LLL — 补足4000 ──────────────────────────────────────────────────
+    ("social entrepreneurship hybrid", "社会企业家精神混合组织", "social enterprise hybrid model", "社会企业混合模式", "B Corp benefit corporation"),
+    ("actuarial science mortality table", "精算科学死亡率表", "life expectancy annuity pricing", "寿命年金定价", "longevity risk hedging"),
+    ("economic history institutional", "经济史制度变迁", "path dependence lock-in", "路径依赖锁定效应", "North institutional economics"),
+    ("ethnography fieldwork thick description", "民族志田野调查深描", "participant observation Geertz", "参与观察吉尔茨深描", "reflexivity positionality fieldwork"),
+    ("phenomenology hermeneutics lived", "现象学诠释学生活世界", "Heidegger Gadamer interpretation", "海德格尔伽达默尔诠释", "lifeworld intentionality Husserl"),
+    ("philosophy of science Kuhn Popper", "科学哲学库恩波普尔", "paradigm shift falsificationism", "范式转换证伪主义", "scientific revolution incommensurability"),
+    ("applied ethics bioethics principlism", "应用伦理学生命伦理原则主义", "Beauchamp Childress four principles", "比彻姆奇尔德瑞斯四原则", "virtue ethics care ethics"),
+    ("political philosophy Rawls Nozick", "政治哲学罗尔斯诺齐克", "veil of ignorance justice fairness", "无知之幕公正即公平", "libertarianism distributive justice"),
+    ("gender studies intersectionality", "性别研究交叉性", "Crenshaw intersectionality matrix", "克伦肖交叉性矩阵", "patriarchy gender performativity Butler"),
+    ("disability studies crip theory", "残障研究酷异理论", "social model disability ableism", "残障社会模式能力主义", "universal design access inclusion"),
+    ("science technology studies STS", "科学技术研究STS", "social construction technology SCOT", "技术社会建构SCOT", "actor network theory Latour"),
+    ("urban planning zoning housing", "城市规划分区住房", "mixed use transit oriented development TOD", "混合用地公交导向开发TOD", "inclusionary zoning affordable housing"),
+    ("architectural theory space syntax", "建筑理论空间句法", "space syntax axial map integration", "空间句法轴线图整合度", "phenomenology architecture Norberg-Schulz"),
+    ("landscape architecture green infrastructure", "景观建筑绿色基础设施", "stormwater bioswale rain garden", "雨水生物沟雨水花园", "LEED SITES landscape certification"),
+    ("heritage conservation UNESCO", "遗产保护UNESCO", "World Heritage outstanding universal value", "世界遗产突出普遍价值", "authenticity integrity Nara document"),
+    ("musicology ethnomusicology", "音乐学民族音乐学", "field recording transcription emic etic", "田野录音转写主位客位", "musical ontology performance practice"),
+    ("visual art aesthetics sublime", "视觉艺术美学崇高", "aesthetics Kant sublime beautiful", "康德崇高美丽美学", "institutional theory art Danto Dickie"),
+    ("photography theory index trace", "摄影理论指示符痕迹", "Barthes punctum studium", "巴特刺点知面", "documentary photography ethics"),
+    ("animation digital media platform", "动画数字媒体平台", "motion capture procedural animation", "动作捕捉程序动画", "game engine real-time rendering"),
+    ("museum studies curation audience", "博物馆学策展观众", "participatory museum Nina Simon", "参与式博物馆尼娜西蒙", "object biography provenance repatriation"),
+    ("diplomacy negotiation multilateral", "外交谈判多边", "multilateral negotiation UN diplomacy", "多边谈判联合国外交", "track two diplomacy backchannel"),
+    ("security studies deterrence nuclear", "安全研究威慑核", "nuclear deterrence second strike", "核威慑第二次打击", "arms control non-proliferation NPT"),
+    ("migration transnationalism diaspora", "移民跨国主义侨民社区", "transnational social field migration", "跨国社会场域移民", "remittance brain drain gain"),
+    ("development studies poverty capability", "发展研究贫困能力方法", "Sen capability approach Nussbaum", "森能力方法努斯鲍姆", "Amartya Sen development freedom"),
+    ("education research pedagogy curriculum", "教育研究教学法课程", "constructivism Vygotsky ZPD", "建构主义维果斯基最近发展区", "hidden curriculum critical pedagogy"),
+    ("cognitive science embodied cognition", "认知科学具身认知", "4E cognition enactive extended", "4E认知行动性延展性", "affordance Gibson ecological psychology"),
+    # ── Batch LLL end — 4000 groups reached ────────────────────────────────
 )
 RAG_RESEARCH_HINTS = (
     "abstract",
@@ -44364,6 +49343,15 @@ RAG_STRUCTURAL_ENTITY_PATTERNS = (
 )
 
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 5: RAG parsing, semantic chunking, and retrieval scoring.
+# 第五层：RAG 解析、语义分块与检索评分。
+# 第5層：RAG 解析、意味チャンク化、検索スコアリング。
+# ============================================================================
+
+# Core RAG helpers: normalize document names, extract structure, chunk content,
+# and score retrieval candidates before they are surfaced to the model.
 def _rag_safe_name(name: str, fallback: str = "document") -> str:
     raw = Path(str(name or fallback)).name
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
@@ -44530,25 +49518,134 @@ def _rag_choose_community(category: object, language: object, entities: list[obj
     lang = str(language or "unknown").strip() or "unknown"
     raw = str(raw_community or "").strip()
     if ":" in raw:
-        prefix, suffix = raw.split(":", 1)
-        if prefix.strip():
-            cat = prefix.strip()
-        suffix = suffix.strip()
-        if _rag_entity_allowed(suffix):
-            return f"{cat}:{suffix}"
+        parts = raw.split(":", 2)
+        if parts[0].strip():
+            cat = parts[0].strip()
+        if len(parts) >= 3:
+            # Already three-level format: validate and return
+            s1, s2 = parts[1].strip(), parts[2].strip()
+            if _rag_entity_allowed(s1) and _rag_entity_allowed(s2):
+                return f"{cat}:{s1}:{s2}"
+            if _rag_entity_allowed(s1):
+                return f"{cat}:{s1}"
+        elif len(parts) >= 2:
+            suffix = parts[1].strip()
+            if _rag_entity_allowed(suffix):
+                # Try to enrich with a second entity from the entities list
+                filtered = _rag_filter_entities(list(entities or []), limit=4)
+                second = next((e for e in filtered if e.lower() != suffix.lower()), "")
+                if second:
+                    return f"{cat}:{suffix}:{second}"
+                return f"{cat}:{suffix}"
     elif raw and not _rag_is_noise_token(raw):
+        filtered = _rag_filter_entities(list(entities or []), limit=4)
+        second = next((e for e in filtered if e.lower() != raw.lower()), "")
+        if second:
+            return f"{cat}:{raw}:{second}"
         return f"{cat}:{raw}"
-    if cat == "research":
-        filtered = _rag_filter_entities(list(entities or []), limit=1)
-        if filtered:
-            return f"{cat}:{filtered[0]}"
+    # Auto-assign from top entities; use two for research/code categories
+    filtered = _rag_filter_entities(list(entities or []), limit=4)
+    if filtered:
+        first = filtered[0]
+        if len(filtered) > 1:
+            return f"{cat}:{first}:{filtered[1]}"
+        return f"{cat}:{first}"
     return f"{cat}:{lang}"
+
+
+def _rag_trigram_set(text: str) -> frozenset[str]:
+    """Extract character-level trigrams for Jaccard-based content overlap detection."""
+    t = " ".join(str(text or "").lower().split())
+    if len(t) < 3:
+        return frozenset()
+    return frozenset(t[i : i + 3] for i in range(len(t) - 2))
+
+
+def _rag_jaccard_sim(a: frozenset[str], b: frozenset[str]) -> float:
+    """Jaccard similarity between two trigram sets. Returns 0.0 if both empty."""
+    if not a and not b:
+        return 0.0
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return len(a & b) / union
+
+
+def _rag_mmr_select(
+    rows: list[dict],
+    top_k: int,
+    *,
+    lambda_param: float = 0.6,
+    overlap_hard_threshold: float = 0.55,
+    overlap_soft_threshold: float = 0.30,
+    max_per_doc: int = RAG_RETRIEVAL_MAX_PER_DOC,
+) -> list[dict]:
+    """Maximum Marginal Relevance selection with per-document capping.
+
+    Selects top_k results that balance relevance (score) and diversity (low overlap
+    with already-selected results). Near-duplicate content (Jaccard > overlap_hard_threshold)
+    is skipped outright; partial overlaps are penalised.
+    """
+    if not rows:
+        return []
+    selected: list[dict] = []
+    selected_trigrams: list[frozenset[str]] = []
+    doc_counts: dict[str, int] = {}
+
+    for row in rows:
+        if len(selected) >= top_k:
+            break
+        doc_id = str(row.get("doc_id", "") or "")
+        if doc_id and doc_counts.get(doc_id, 0) >= max_per_doc:
+            continue
+        row_tg = _rag_trigram_set(str(row.get("text", "") or ""))
+        # Check overlap against already-selected results
+        max_overlap = 0.0
+        for sel_tg in selected_trigrams:
+            sim = _rag_jaccard_sim(row_tg, sel_tg)
+            if sim > max_overlap:
+                max_overlap = sim
+        if max_overlap >= overlap_hard_threshold:
+            # Near-duplicate — skip entirely
+            continue
+        if max_overlap >= overlap_soft_threshold:
+            # Partial overlap — penalise by folding in diversity penalty
+            diversity = 1.0 - max_overlap
+            orig_score = float(row.get("score", 0.0) or 0.0)
+            row = dict(row)
+            row["score"] = round(orig_score * lambda_param + orig_score * (1.0 - lambda_param) * diversity, 6)
+        selected.append(row)
+        selected_trigrams.append(row_tg)
+        if doc_id:
+            doc_counts[doc_id] = doc_counts.get(doc_id, 0) + 1
+    return selected
 
 
 def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
     raw = html.unescape(str(text or ""))
     lowered = raw.lower()
     out: list[str] = []
+    # CamelCase decomposition: UserRepository → user, repository (plus userrepository)
+    for camel_token in re.findall(r"\b[A-Z][a-zA-Z0-9]{2,40}\b", raw):
+        # Split on case transitions: UserRepo → User, Repo; XMLParser → XML, Parser
+        split1 = re.sub(r"([a-z])([A-Z])", r"\1 \2", camel_token)
+        split2 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", split1)
+        for part in split2.split():
+            lp = part.lower()
+            if len(lp) >= 2 and not _rag_is_noise_token(lp):
+                out.append(lp)
+        full_lower = camel_token.lower()
+        if not _rag_is_noise_token(full_lower):
+            out.append(full_lower)
+        if len(out) >= max_terms:
+            return out
+    # snake_case decomposition: get_max_value → get, max, value
+    for snake_token in re.findall(r"\b[a-z][a-z0-9]{1,}(?:_[a-z0-9]{1,}){1,}\b", lowered):
+        for part in snake_token.split("_"):
+            if len(part) >= 2 and not _rag_is_noise_token(part):
+                out.append(part)
+        if len(out) >= max_terms:
+            return out
     for token in re.findall(r"[a-z][a-z0-9_./+-]{1,40}", lowered):
         if _rag_is_noise_token(token):
             continue
@@ -44592,6 +49689,13 @@ def _rag_expand_tokens(tokens: list[str]) -> list[str]:
                 if token not in seen and not _rag_is_noise_token(token):
                     seen.add(token)
                     out.append(token)
+    phrase_tokens = [token for token in seen if " " in token]
+    for token in phrase_tokens:
+        for part in re.split(r"\s+", token):
+            part = part.strip().lower()
+            if len(part) >= 3 and part not in seen and not _rag_is_noise_token(part):
+                seen.add(part)
+                out.append(part)
     return out
 
 
@@ -44651,37 +49755,282 @@ def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
     return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
 
 
+def _rag_embed_text(text: str, session: object, *, model: str = "") -> list[float] | None:
+    """Get a dense embedding vector for *text* using the session's ollama connection.
+
+    Returns None on any error so callers can gracefully fall back to TF-IDF-only mode.
+    """
+    try:
+        ollama = getattr(session, "ollama", None)
+        if ollama is None:
+            return None
+        embed_model = str(model or getattr(ollama, "embed_model", "") or "").strip()
+        if not embed_model:
+            return None
+        result = ollama.embed(model=embed_model, input=str(text or "")[:4096])
+        if isinstance(result, dict):
+            vecs = result.get("embeddings") or result.get("embedding")
+            if isinstance(vecs, list) and vecs:
+                first = vecs[0] if isinstance(vecs[0], list) else vecs
+                if isinstance(first, list) and first:
+                    return [float(x) for x in first]
+        return None
+    except Exception:
+        return None
+
+
+def _rag_embed_batch(texts: list[str], session: object, *, model: str = "") -> list[list[float] | None]:
+    """Embed a batch of texts sequentially, returning None for any that fail."""
+    results: list[list[float] | None] = []
+    for text in texts:
+        vec = _rag_embed_text(text, session, model=model)
+        results.append(vec)
+    return results
+
+
+def _rag_window_for_query(query: str) -> int:
+    """Return focused-excerpt window size based on query specificity.
+
+    Shorter / more targeted queries benefit from a tighter window so the
+    model receives only the most relevant snippet; broader queries can use
+    the full chunk size.
+    """
+    q = str(query or "").strip()
+    if len(q) < 30:
+        return 450   # Very specific: tight window
+    if len(q) < 80:
+        return 750   # Medium specificity
+    return 1200      # Broad query: full chunk
+
+
+def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 800, dense_match: bool = False) -> str:
+    """Extract a focused excerpt from *text* centred on the highest query-token density region.
+
+    Scans the text in small steps to find where query tokens appear most densely, then
+    returns a *window*-character slice around that centre.  Falls back to a leading excerpt
+    when no tokens match.  Ellipsis markers are added when text is trimmed.
+    """
+    text = str(text or "")
+    if not text:
+        return ""
+    if len(text) <= window:
+        return text
+    tokens = [t.lower() for t in (query_tokens or []) if len(t) > 2]
+    if not tokens:
+        if dense_match:
+            mid = len(text) // 2
+            s = max(0, mid - window // 2)
+            e = min(len(text), s + window)
+            s = max(0, e - window)
+            return ("…" if s > 0 else "") + text[s:e] + ("…" if e < len(text) else "")
+        return text[:window] + ("…" if len(text) > window else "")
+    half = window // 2
+    step = max(40, window // 15)
+    best_center = half
+    best_count = 0
+    lo = text.lower()
+    for center in range(half, len(text) - half + 1, step):
+        segment = lo[max(0, center - half) : center + half]
+        count = sum(segment.count(t) for t in tokens)
+        if count > best_count:
+            best_count = count
+            best_center = center
+    if best_count == 0 and dense_match:
+        best_center = len(text) // 2
+    start = max(0, best_center - half)
+    end = min(len(text), start + window)
+    start = max(0, end - window)
+    excerpt = text[start:end]
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + excerpt + suffix
+
+
+def _rag_query_variants(query: str, *, max_variants: int = 4) -> list[str]:
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = []
+
+    def _add(value: str) -> None:
+        value = trim(" ".join(str(value or "").split()), 360)
+        if not value:
+            return
+        low = value.lower()
+        if low not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    _add(raw)
+    entities = _rag_extract_entities(raw, limit=10)
+    if entities:
+        _add(" ".join(entities[:8]))
+    tokens = _rag_expand_tokens(_rag_tokenize(raw, max_terms=80))
+    important = []
+    seen: set[str] = set()
+    for token in tokens:
+        token = str(token).strip()
+        low = token.lower()
+        if not token or low in seen or _rag_is_noise_token(low):
+            continue
+        if len(low) < 3 and not re.search(r"[\u4e00-\u9fff]", low):
+            continue
+        seen.add(low)
+        important.append(token)
+        if len(important) >= 14:
+            break
+    if important:
+        _add(" ".join(important[:10]))
+    path_terms = re.findall(r"\b[\w./-]{2,}\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|toml|css|html|sql|go|rs|java|cpp|c|h)\b", raw, flags=re.IGNORECASE)
+    if path_terms:
+        _add(" ".join(path_terms[:8]))
+    return variants[: max(1, int(max_variants or 4))]
+
+
+def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
+    """Split document text into structural segments: (type, depth, heading, body).
+
+    type values:
+      "heading"    — Markdown H1-H4 boundary marker (triggers section flush)
+      "code_block" — fenced code block or table row group (kept atomic)
+      "text"       — ordinary paragraph text
+    """
+    out: list[tuple[str, int, str, str]] = []
+    lines = content.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # Markdown heading (H1-H4)
+        hm = re.match(r"^(#{1,4})\s+(.*)", line)
+        if hm:
+            depth = len(hm.group(1))
+            heading = hm.group(2).strip()
+            out.append(("heading", depth, heading, ""))
+            i += 1
+            continue
+        # Code fence (``` or ~~~)
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence = stripped[:3]
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith(fence):
+                j += 1
+            code_body = "\n".join(lines[i : j + 1])
+            out.append(("code_block", 0, "", code_body))
+            i = j + 1
+            continue
+        # Markdown table (lines starting with |)
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            j = i
+            while j < len(lines) and lines[j].strip().startswith("|"):
+                j += 1
+            table_body = "\n".join(lines[i:j])
+            if table_body.strip():
+                out.append(("code_block", 0, "", table_body))
+            i = j
+            continue
+        # Regular text — collect until next structural boundary or two consecutive blank lines
+        text_lines: list[str] = []
+        consecutive_blank = 0
+        while i < len(lines):
+            l = lines[i]
+            ls = l.strip()
+            if re.match(r"^#{1,4}\s", l) or ls.startswith("```") or ls.startswith("~~~"):
+                break
+            if ls.startswith("|") and "|" in ls[1:]:
+                break
+            text_lines.append(l)
+            consecutive_blank = 0 if ls else consecutive_blank + 1
+            i += 1
+            if consecutive_blank >= 2:
+                break
+        body = "\n".join(text_lines).strip()
+        if body:
+            out.append(("text", 0, "", body))
+    return out
+
+
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
+    """Semantic-boundary-aware text chunking.
+
+    Respects Markdown structure (H1-H4 headers as hard section boundaries, code fences
+    and tables kept atomic).  Each chunk carries parent_heading, is_code_block, and
+    section_depth metadata for downstream filtering and context enrichment.
+    """
     content = re.sub(r"\r\n?", "\n", str(text or "")).strip()
     if not content:
         return []
-    blocks = [x.strip() for x in re.split(r"\n\s*\n+", content) if x.strip()]
+    segments = _rag_parse_segments(content)
     chunks: list[dict] = []
-    current = ""
-    for block in blocks:
-        if len(block) > max_chars:
-            pieces = [block[i : i + max_chars] for i in range(0, len(block), max(200, max_chars - overlap))]
-        else:
-            pieces = [block]
-        for piece in pieces:
-            if not current:
-                current = piece
-                continue
-            if len(current) + 2 + len(piece) <= max_chars:
-                current = current + "\n\n" + piece
-                continue
-            preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
-            chunks.append({"text": current.strip(), "anchor": preview})
-            tail = current[-overlap:].strip()
-            current = (tail + "\n\n" + piece).strip() if tail else piece
-            if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
-                break
+    current_text = ""
+    current_heading = ""
+    current_depth = 0
+
+    def _flush(txt: str, heading: str, depth: int, is_code: bool = False) -> None:
+        txt = txt.strip()
+        if not txt or len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+            return
+        first_line = next((ln for ln in txt.splitlines() if ln.strip()), txt)
+        preview = trim(first_line, 120)
+        if heading:
+            preview = f"[{heading}] {preview}"
+        chunks.append({
+            "text": txt,
+            "anchor": preview,
+            "parent_heading": heading,
+            "is_code_block": is_code,
+            "section_depth": depth,
+        })
+
+    for seg_type, seg_depth, seg_heading, seg_body in segments:
         if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
             break
-    if current and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
-        preview = trim(next((ln for ln in current.splitlines() if ln.strip()), current), 120)
-        chunks.append({"text": current.strip(), "anchor": preview})
+        if seg_type == "heading":
+            # Hard section boundary — flush accumulated text
+            if current_text:
+                _flush(current_text, current_heading, current_depth)
+                current_text = ""
+            current_heading = seg_heading
+            current_depth = seg_depth
+        elif seg_type == "code_block":
+            # Flush prose buffer, then emit code/table atomically (up to 2500 chars)
+            if current_text:
+                _flush(current_text, current_heading, current_depth)
+                current_text = ""
+            max_code = max(max_chars, 2500)
+            if len(seg_body) <= max_code:
+                _flush(seg_body, current_heading, current_depth, is_code=True)
+            else:
+                # Very large block — split by line-count chunks rather than mid-character
+                step = max(200, max_chars - overlap)
+                for ci in range(0, len(seg_body), step):
+                    _flush(seg_body[ci : ci + max_chars], current_heading, current_depth, is_code=True)
+                    if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                        break
+        else:
+            # Ordinary text paragraph
+            if len(current_text) + 2 + len(seg_body) <= max_chars:
+                current_text = (current_text + "\n\n" + seg_body).strip() if current_text else seg_body
+            else:
+                if current_text:
+                    _flush(current_text, current_heading, current_depth)
+                    tail = current_text[-overlap:].strip() if overlap else ""
+                    current_text = (tail + "\n\n" + seg_body).strip() if tail else seg_body
+                else:
+                    # Single oversized paragraph — split by step with overlap
+                    step = max(200, max_chars - overlap)
+                    pieces = [seg_body[ci : ci + max_chars] for ci in range(0, len(seg_body), step)]
+                    for piece in pieces[:-1]:
+                        _flush(piece, current_heading, current_depth)
+                        if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
+                            break
+                    if pieces:
+                        current_text = pieces[-1]
+
+    if current_text and len(chunks) < RAG_MAX_CHUNKS_PER_DOC:
+        _flush(current_text, current_heading, current_depth)
     return chunks[:RAG_MAX_CHUNKS_PER_DOC]
+
+
 
 
 CODE_LIBRARY_IGNORED_DIRS = {
@@ -44820,6 +50169,53 @@ def _code_query_terms(text: str, limit: int = 48) -> set[str]:
         if len(out) >= limit:
             break
     return set(out)
+
+
+class _CallCollector(ast.NodeVisitor):
+    """AST visitor that collects names of all functions/methods called within a node."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.attr, str):
+            self.calls.append(func.attr)
+        elif isinstance(func, ast.Name) and isinstance(func.id, str):
+            self.calls.append(func.id)
+        self.generic_visit(node)
+
+
+_ALGO_COMPLEXITY_RE = re.compile(r"O\s*\(\s*(?:n|log|1|n\^2|n²|n\s*\*)", re.IGNORECASE)
+_ALGO_STEP_RE = re.compile(r"#\s*(?:step|phase|algorithm|算法|步骤)\s*\d*[:：\s]", re.IGNORECASE)
+_ALGO_MATH_VARS = frozenset(["alpha", "beta", "gamma", "epsilon", "theta", "delta", "lambda", "mu", "sigma", "omega"])
+_ALGO_DOC_KEYWORDS = frozenset(["algorithm", "complexity", "iterate", "convergence", "converge", "算法", "复杂度", "迭代"])
+
+
+def _detect_algo_chunk(text: str) -> bool:
+    """Heuristically detect whether a code chunk implements or describes an algorithm.
+
+    Returns True when at least 2 of the following signals are present:
+    1. Big-O complexity annotation
+    2. Step/Phase/Algorithm comment marker
+    3. Algorithm-related keywords in docstring or comments
+    4. Mathematical variable names (alpha, beta, gamma …)
+    5. Loop + condition + return structure (rough proxy for algorithmic body)
+    """
+    t = str(text or "")
+    score = 0
+    if _ALGO_COMPLEXITY_RE.search(t):
+        score += 1
+    if _ALGO_STEP_RE.search(t):
+        score += 1
+    lower = t.lower()
+    if any(kw in lower for kw in _ALGO_DOC_KEYWORDS):
+        score += 1
+    if any(re.search(r"\b" + re.escape(v) + r"\b", lower) for v in _ALGO_MATH_VARS):
+        score += 1
+    if re.search(r"\bfor\b.*\bif\b.*\breturn\b", t, re.DOTALL):
+        score += 1
+    return score >= 2
 
 
 class CodeContentParser:
@@ -44995,25 +50391,55 @@ class CodeContentParser:
             chunk_lines = lines[start - 1 : end]
             if not chunk_lines:
                 return
+            # Extract docstring for richer anchor text
+            doc = ""
+            try:
+                doc = ast.get_docstring(node) or ""  # type: ignore[arg-type]
+            except Exception:
+                pass
+            doc_first = ""
+            if doc:
+                doc_first = re.sub(r"\s+", " ", doc.splitlines()[0]).strip()[:140]
+            # Build anchor: prefer docstring first line, fall back to code signature
+            sig = trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180)
+            anchor = f"{kind} {symbol} — {doc_first}" if doc_first else f"{kind} {symbol} L{start}-{end}".strip()
             symbols.append(
                 {
                     "name": symbol,
                     "kind": kind,
                     "line_start": start,
                     "line_end": end,
-                    "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), symbol), 180),
+                    "signature": sig,
                 }
             )
             text_chunk = "\n".join(chunk_lines).strip()
+            # Extract function/method calls for call graph
+            calls: list[str] = []
+            try:
+                collector = _CallCollector()
+                collector.visit(node)
+                seen_calls: set[str] = set()
+                for c in collector.calls:
+                    if c and c not in seen_calls and not _rag_is_noise_token(c.lower()):
+                        seen_calls.add(c)
+                        calls.append(c)
+                calls = calls[:20]
+            except Exception:
+                pass
+            # Detect algorithmic chunks for boosted retrieval
+            is_algo = _detect_algo_chunk(text_chunk)
             if len(text_chunk) <= CODE_CHUNK_CHARS:
                 out.append(
                     {
                         "text": text_chunk,
-                        "anchor": f"{kind} {symbol} L{start}-{end}".strip(),
+                        "anchor": anchor,
                         "line_start": start,
                         "line_end": end,
                         "symbol": symbol,
                         "symbol_kind": kind,
+                        "calls": calls,
+                        "algo": is_algo,
+                        "docstring": trim(doc, 400) if doc else "",
                     }
                 )
             else:
@@ -45819,6 +51245,66 @@ class TFGraphIDFIndex:
         self.dynamic_noise_hard_tokens: set[str] = set()
         self.dynamic_noise_penalties: dict[str, float] = {}
         self.dynamic_noise_meta: dict[str, dict] = {}
+        # Dense embedding index (optional — populated by _embed_chunks when an embedding model is available)
+        self.chunk_embeddings: dict[str, list[float]] = {}
+        self.embed_dim: int = 0
+
+    # ------------------------------------------------------------------
+    # Dense embedding helpers
+    # ------------------------------------------------------------------
+
+    def has_dense_index(self) -> bool:
+        """True if chunk embeddings have been loaded for at least some chunks."""
+        return bool(self.chunk_embeddings)
+
+    def set_chunk_embedding(self, chunk_id: str, vec: list[float]) -> None:
+        """Store a dense embedding vector for a chunk."""
+        if not vec:
+            return
+        self.chunk_embeddings[str(chunk_id)] = [float(x) for x in vec]
+        if not self.embed_dim:
+            self.embed_dim = len(vec)
+
+    def _dense_query(self, qvec: list[float], top_k: int = 50) -> dict[str, float]:
+        """Compute cosine similarity between query vector and all chunk embeddings.
+
+        Returns {chunk_id: cosine_similarity} for top_k candidates.
+        Falls back gracefully to empty dict when embeddings are unavailable.
+        Uses numpy if available for speed, otherwise pure Python.
+        """
+        if not qvec or not self.chunk_embeddings:
+            return {}
+        try:
+            import numpy as _np  # type: ignore
+            qarr = _np.array(qvec, dtype=_np.float32)
+            qnorm = float(_np.linalg.norm(qarr)) or 1.0
+            qarr = qarr / qnorm
+            chunk_ids = list(self.chunk_embeddings.keys())
+            matrix = _np.array([self.chunk_embeddings[cid] for cid in chunk_ids], dtype=_np.float32)
+            norms = _np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            matrix = matrix / norms
+            sims = matrix @ qarr
+            if len(chunk_ids) <= top_k:
+                return {chunk_ids[i]: float(sims[i]) for i in range(len(chunk_ids))}
+            idx = _np.argpartition(sims, -top_k)[-top_k:]
+            return {chunk_ids[i]: float(sims[i]) for i in idx}
+        except ImportError:
+            pass
+        except Exception:
+            return {}
+        # Pure-Python fallback
+        def _dot(a: list[float], b: list[float]) -> float:
+            return sum(x * y for x, y in zip(a, b))
+        def _norm(a: list[float]) -> float:
+            return math.sqrt(sum(x * x for x in a)) or 1.0
+        qnorm = _norm(qvec)
+        scored: list[tuple[float, str]] = []
+        for chunk_id, cvec in self.chunk_embeddings.items():
+            sim = _dot(qvec, cvec) / (qnorm * (_norm(cvec)))
+            scored.append((sim, chunk_id))
+        scored.sort(reverse=True)
+        return {cid: s for s, cid in scored[:top_k]}
 
     def snapshot(self) -> dict:
         return {
@@ -46263,6 +51749,82 @@ class TFGraphIDFIndex:
             }
         doc_total = max(1, len(self.doc_meta))
         community_total = max(1, len(community_reports))
+        # ── Large community auto-splitting ──────────────────────────────────────
+        # When a community exceeds 15 docs, synthesize sub-community reports by
+        # grouping documents on their secondary entity. This gives _global_query
+        # finer-grained candidates without changing existing doc_meta fields.
+        _COMMUNITY_SPLIT_THRESHOLD = 15
+        sub_community_reports: dict[str, dict] = {}
+        for parent_com, report in community_reports.items():
+            if int(report.get("doc_count", 0) or 0) <= _COMMUNITY_SPLIT_THRESHOLD:
+                continue
+            # Group docs by their most frequent non-shared entity (the "secondary entity")
+            shared_top = {str(e).lower() for e in (report.get("top_entities", []) or [])[:2]}
+            sub_groups: dict[str, list[str]] = defaultdict(list)
+            for doc_id in (report.get("doc_ids", []) or []):
+                doc_row = self.doc_meta.get(doc_id, {})
+                doc_ents = [str(e).strip() for e in (doc_row.get("entities", []) or []) if str(e).strip()]
+                # Pick the first entity that differs from the shared top-2
+                sub_key = next((e for e in doc_ents if e.lower() not in shared_top), "")
+                if not sub_key:
+                    sub_key = "_other"
+                sub_groups[sub_key].append(doc_id)
+            for sub_ent, sub_doc_ids in sub_groups.items():
+                if len(sub_doc_ids) < 2:
+                    continue  # singleton sub-group — not useful
+                # Build a three-level sub-community key
+                parent_parts = parent_com.split(":", 1)
+                parent_prefix = parent_parts[0] if parent_parts else parent_com
+                sub_com = f"{parent_prefix}:{sub_ent}:sub"
+                if sub_com in community_reports or sub_com in sub_community_reports:
+                    continue
+                sub_ent_counter: Counter[str] = Counter()
+                for doc_id in sub_doc_ids:
+                    doc_row = self.doc_meta.get(doc_id, {})
+                    sub_ent_counter.update([str(e).strip() for e in (doc_row.get("entities", []) or []) if str(e).strip()][:8])
+                sub_top_entities = [e for e, _ in sub_ent_counter.most_common(8)]
+                sub_top_docs = [self.doc_meta.get(d, {}) for d in sub_doc_ids[:4] if self.doc_meta.get(d)]
+                sub_report_lines = [
+                    f"Community: {sub_com}",
+                    f"Parent community: {parent_com}",
+                    f"Documents: {len(sub_doc_ids)}",
+                    f"Sub-group entity: {sub_ent}",
+                ]
+                if sub_top_entities:
+                    sub_report_lines.append("Top entities: " + ", ".join(sub_top_entities[:8]))
+                for idx, row in enumerate(sub_top_docs[:3], 1):
+                    sub_report_lines.append(
+                        f"Document {idx}: {row.get('title', '')} [{row.get('id', '')}]"
+                    )
+                    if str(row.get("summary", "")).strip():
+                        sub_report_lines.append(trim(str(row.get("summary", "") or ""), 200))
+                sub_community_reports[sub_com] = {
+                    "community": sub_com,
+                    "parent_community": parent_com,
+                    "doc_ids": list(sub_doc_ids),
+                    "doc_count": len(sub_doc_ids),
+                    "top_entities": sub_top_entities,
+                    "top_categories": report.get("top_categories", []),
+                    "top_languages": report.get("top_languages", []),
+                    "top_kinds": report.get("top_kinds", []),
+                    "representative_docs": [
+                        {"id": str(r.get("id", "")), "title": str(r.get("title", "")),
+                         "summary": trim(str(r.get("summary", "") or ""), 180)}
+                        for r in sub_top_docs
+                    ],
+                    "links": [],
+                    "report": trim("\n".join(sub_report_lines), 3000),
+                }
+        # Merge sub-community reports into community_reports for indexing
+        community_reports.update(sub_community_reports)
+        community_total = max(1, len(community_reports))
+        # Re-tokenize sub-community reports
+        for sub_com, sub_report in sub_community_reports.items():
+            counts = Counter(_rag_expand_tokens(_rag_tokenize(sub_report.get("report", ""))))
+            if counts:
+                community_df.update(counts.keys())
+            community_token_rows[sub_com] = counts
+        # ── End large community auto-splitting ─────────────────────────────────
         hard_tokens, penalties, meta = self._derive_dynamic_noise_controls(
             doc_df,
             doc_total,
@@ -46369,7 +51931,7 @@ class TFGraphIDFIndex:
                 ]
             ).strip("|")
             if not key:
-                key = trim(json_dumps(row, sort_keys=True), 240)
+                key = trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 240)
             if key in seen:
                 continue
             seen.add(key)
@@ -46382,7 +51944,8 @@ class TFGraphIDFIndex:
             ),
             reverse=True,
         )
-        top_rows = deduped[: max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))]
+        # MMR content-level deduplication — removes near-duplicate chunks and caps per-doc results
+        top_rows = _rag_mmr_select(deduped, max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS)))
         community_counter: Counter[str] = Counter(str(x.get("community", "")) for x in top_rows if str(x.get("community", "")).strip())
         community_cards = []
         for community, freq in community_counter.most_common(5):
@@ -46420,6 +51983,7 @@ class TFGraphIDFIndex:
         kind: str = "",
         allowed_communities: set[str] | None = None,
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -46438,6 +52002,15 @@ class TFGraphIDFIndex:
         for token, qweight in qweights.items():
             for chunk_id, cweight in self.inverted.get(token, []):
                 scores[chunk_id] += qweight * cweight
+        # Dense retrieval — expand candidate pool with high-similarity embedding matches
+        dense_scores: dict[str, float] = {}
+        use_dense = self.has_dense_index() and qvec is not None
+        if use_dense:
+            dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
+            # Ensure dense-only hits are included as candidates even with zero TF-IDF
+            for cid in dense_scores:
+                if cid not in scores:
+                    scores[cid] = 0.0
         rows: list[dict] = []
         for chunk_id, dot in scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
@@ -46450,7 +52023,8 @@ class TFGraphIDFIndex:
                 continue
             if allowed and str(doc.get("community", "") or "") not in allowed:
                 continue
-            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            chunk_norm = self.chunk_norms.get(chunk_id, 1.0) or 1.0
+            lexical = dot / (chunk_norm * qnorm) if dot > 0 else 0.0
             chunk_entities = set(str(x) for x in (chunk.get("entities", []) or []))
             doc_entities = set(str(x) for x in (doc.get("entities", []) or []))
             ent_overlap = len(qentities.intersection(chunk_entities))
@@ -46461,7 +52035,12 @@ class TFGraphIDFIndex:
                 graph_bonus += 0.08
             if str(doc.get("community", "")) in self.community_counts:
                 graph_bonus += min(0.08, math.log1p(self.community_counts.get(str(doc.get("community", "")), 0)) / 16.0)
-            final_score = lexical * 0.82 + graph_bonus
+            if use_dense:
+                dense_sim = dense_scores.get(chunk_id, 0.0)
+                # Hybrid: 40% TF-IDF + 60% dense when embeddings available
+                final_score = lexical * 0.40 + dense_sim * 0.60 + graph_bonus * 0.60
+            else:
+                final_score = lexical * 0.82 + graph_bonus
             rows.append(
                 {
                     "score": round(final_score, 6),
@@ -46476,7 +52055,12 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
-                    "text": trim(str(chunk.get("text", "")), 1800),
+                    "text": _rag_focused_excerpt(
+                        str(chunk.get("text", "")),
+                        list(qweights.keys()),
+                        window=_rag_window_for_query(query),
+                        dense_match=(use_dense and scores.get(chunk_id, 0.0) == 0.0),
+                    ),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "citation": f"[{doc.get('id', '')}:{chunk_id}]",
                     "route_evidence": "chunk",
@@ -46496,7 +52080,7 @@ class TFGraphIDFIndex:
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -46512,6 +52096,7 @@ class TFGraphIDFIndex:
                         "entities": list(doc.get("entities", []) or [])[:12],
                         "citation": f"[{doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -46618,6 +52203,13 @@ class TFGraphIDFIndex:
             lexical = dot / ((self.community_norms.get(community, 1.0) or 1.0) * qnorm)
             report_entities = {str(x).strip() for x in (report.get("top_entities", []) or []) if str(x).strip()}
             ent_overlap = len(qentities.intersection(report_entities))
+            # Community relevance gate: skip communities with essentially no entity overlap
+            # when the query has known entities to match against
+            if qentities and report_entities and ent_overlap == 0:
+                entity_jaccard = len(qentities & report_entities) / max(1, len(qentities | report_entities))
+                if entity_jaccard < 0.1 and dot <= 0.0:
+                    # No lexical signal and no entity overlap — very likely irrelevant
+                    continue
             cross_links = sum(int(x.get("weight", 0) or 0) for x in (report.get("links", []) or [])[:3])
             graph_bonus = (0.22 * ent_overlap) + min(0.18, math.log1p(cross_links) / 9.5) + min(
                 0.12, math.log1p(int(report.get("doc_count", 0) or 0)) / 8.0
@@ -46625,12 +52217,14 @@ class TFGraphIDFIndex:
             if qcat and str(qcat) in [str(x) for x in (report.get("top_categories", []) or [])]:
                 graph_bonus += 0.08
             final_score = lexical * 0.72 + graph_bonus
+            weak_match = False
             if final_score <= 0.0:
                 ratio = difflib.SequenceMatcher(None, query.lower()[:280], str(report.get("report", "")).lower()[:1200]).ratio()
                 if ratio < 0.18:
                     continue
                 lexical = ratio
-                final_score = ratio * 0.62 + graph_bonus
+                final_score = min(ratio * 0.62 + graph_bonus, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
             community_rows.append(
                 {
                     "score": round(final_score, 6),
@@ -46650,6 +52244,7 @@ class TFGraphIDFIndex:
                     "citation": f"[community:{community}]",
                     "route_evidence": "community_report",
                     "sort_bias": 0.18,
+                    "weak_match": weak_match,
                 }
             )
         community_rows.sort(
@@ -46729,6 +52324,10 @@ class TFGraphIDFIndex:
             qbundle=(qweights, qnorm, qentities, qcat),
         )
         support_rows = list(support.get("results", []) or [])
+        strong_support_rows = [
+            row for row in support_rows
+            if (not bool(row.get("weak_match", False))) and float(row.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE
+        ]
         support_entities: Counter[str] = Counter()
         support_titles: list[str] = []
         evidence_lines: list[str] = []
@@ -46785,11 +52384,14 @@ class TFGraphIDFIndex:
         map_text = trim("\n".join(map_lines), 2600)
         map_score = max(
             float(community_row.get("score", 0.0) or 0.0),
-            0.34
-            + min(0.20, 0.05 * len(support_rows))
+            (0.34 if strong_support_rows or float(community_row.get("lexical_score", 0.0) or 0.0) >= 0.04 else RAG_WEAK_MATCH_SCORE_CAP)
+            + min(0.20, 0.05 * len(strong_support_rows))
             + min(0.14, 0.04 * len(overlap_entities))
             + (0.05 if links else 0.0),
         )
+        weak_map = not strong_support_rows and float(community_row.get("lexical_score", 0.0) or 0.0) < 0.04
+        if weak_map:
+            map_score = min(map_score, RAG_WEAK_MATCH_SCORE_CAP)
         return (
             {
                 "score": round(map_score, 6),
@@ -46810,6 +52412,7 @@ class TFGraphIDFIndex:
                 "route_evidence": "community_map",
                 "sort_bias": 0.28,
                 "evidence_citations": support_citations[:6],
+                "weak_match": weak_map,
             },
             support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT],
         )
@@ -46872,6 +52475,16 @@ class TFGraphIDFIndex:
             reduce_lines.append("Evidence anchors: " + "; ".join(evidence_anchors[:6]))
         text = trim("\n".join(reduce_lines), 3200)
         score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
+        # Only give sort_bias boost if underlying support evidence is sufficiently strong
+        max_support_score = max(
+            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8] if not bool(r.get("weak_match", False))),
+            default=0.0,
+        )
+        synthesis_sort_bias = 0.38 if max_support_score >= 0.25 else 0.05
+        weak_reduce = max_support_score < RAG_MIN_SYNTHESIS_SCORE
+        if weak_reduce:
+            score = min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            synthesis_sort_bias = 0.0
         return {
             "score": round(score, 6),
             "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
@@ -46889,7 +52502,9 @@ class TFGraphIDFIndex:
             "entities": [name for name, _ in entity_counter.most_common(12) if name],
             "citation": "[global-synthesis]",
             "route_evidence": "community_reduce",
-            "sort_bias": 0.38,
+            "sort_bias": synthesis_sort_bias,
+            "evidence_citations": evidence_anchors[:6],
+            "weak_match": weak_reduce,
         }
 
     def _global_query(
@@ -46998,6 +52613,7 @@ class TFGraphIDFIndex:
         kind: str = "",
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
         route_meta: dict | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -47011,7 +52627,7 @@ class TFGraphIDFIndex:
                 "route_meta": {"mode": "hybrid"},
             }
         qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
-        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
+        fast = self._fast_query(query, top_k=max(top_k, 8), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat), qvec=qvec)
         global_out = self._global_query(query, top_k=max(4, min(top_k, 6)), category=category, kind=kind, qbundle=(qweights, qnorm, qentities, qcat))
         fast_rows = list(fast.get("results", []) or [])
         global_rows = list(global_out.get("results", []) or [])
@@ -47037,6 +52653,7 @@ class TFGraphIDFIndex:
                 "mode": "hybrid",
                 "fast_count": len(fast_rows),
                 "global_count": len(global_rows),
+                "hybrid_high_recall": True,
                 "selected_communities": list(global_out.get("route_meta", {}).get("selected_communities", []) or [])[:6],
                 "map_count": int(global_out.get("route_meta", {}).get("map_count", 0) or 0),
                 "reduce_mode": str(global_out.get("route_meta", {}).get("reduce_mode", "") or ""),
@@ -47059,6 +52676,7 @@ class TFGraphIDFIndex:
         category: str = "",
         kind: str = "",
         route: str = "auto",
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -47088,10 +52706,26 @@ class TFGraphIDFIndex:
         if decided == "global":
             return self._global_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
         if decided == "hybrid":
-            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta)
-        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle)
+            return self._hybrid_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, route_meta=meta, qvec=qvec)
+        return self._fast_query(query, top_k=top_k, category=category, kind=kind, qbundle=qbundle, qvec=qvec)
 
     def graph_payload(self, max_nodes: int = RAG_GRAPH_MAX_NODES) -> dict:
+        _FILE_EXTS = {
+            ".pdf", ".md", ".txt", ".docx", ".doc", ".xlsx", ".xls",
+            ".csv", ".pptx", ".ppt", ".html", ".htm", ".json", ".xml",
+            ".epub", ".rtf", ".odt", ".ods",
+        }
+
+        def _clean_doc_label(raw: str) -> str:
+            s = str(raw or "").strip()
+            if not s:
+                return s
+            base, ext = os.path.splitext(s)
+            if ext.lower() in _FILE_EXTS and base:
+                s = base
+            s = re.sub(r"[_\-]+", " ", s).strip()
+            return s
+
         docs = sorted(self.doc_meta.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
         nodes: list[dict] = []
         edges: list[dict] = []
@@ -47110,7 +52744,7 @@ class TFGraphIDFIndex:
             nodes.append(
                 {
                     "id": doc_node,
-                    "label": str(doc.get("title", doc_id)),
+                    "label": _clean_doc_label(str(doc.get("title", doc_id))),
                     "type": "document",
                     "category": str(doc.get("category", "")),
                     "community": str(doc.get("community", "")),
@@ -47156,6 +52790,15 @@ class TFGraphIDFIndex:
         }
 
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 6: Persistent library stores and asynchronous ingestion services.
+# 第六层：持久化知识库存储与异步导入服务。
+# 第6層：永続ライブラリ格納と非同期取り込みサービス。
+# ============================================================================
+
+# Persistent RAG backend: owns on-disk metadata, chunk indexes, graph assets,
+# import jobs, and retrieval-facing library state.
 class RAGLibraryStore:
     def _init_storage_layout(self, root: Path):
         self.root = root.resolve()
@@ -47165,6 +52808,7 @@ class RAGLibraryStore:
         self.chunks_path = self.root / "chunks.json"
         self.tasks_path = self.root / "tasks.json"
         self.index_snapshot_path = self.root / "index_snapshot.json"
+        self.embeddings_path = self.root / "embeddings.json"
         self.backup_root = self.root / "backup"
         self.parsed_root = self.root / "parsed"
         self.assets_root = self.root / "assets"
@@ -47187,6 +52831,7 @@ class RAGLibraryStore:
         self._load()
         if not self._restore_index_snapshot():
             self.rebuild_index(persist_snapshot=True)
+        self._restore_embeddings()  # Load pre-built dense embeddings if available
 
     def _rel(self, path: Path) -> str:
         target = path.resolve()
@@ -47285,6 +52930,31 @@ class RAGLibraryStore:
             return self.index.restore(raw.get("index", {}) if isinstance(raw.get("index", {}), dict) else {})
         except Exception:
             return False
+
+    def _persist_embeddings(self) -> None:
+        """Save chunk embeddings to embeddings.json alongside the index snapshot."""
+        if not self.index.chunk_embeddings:
+            return
+        payload = {str(cid): [float(x) for x in vec] for cid, vec in self.index.chunk_embeddings.items()}
+        _write_json_file(self.embeddings_path, payload)
+
+    def _restore_embeddings(self) -> None:
+        """Load pre-built chunk embeddings from embeddings.json if it exists."""
+        if not self.embeddings_path.exists():
+            return
+        try:
+            raw = _read_json_file(self.embeddings_path, {})
+            if not isinstance(raw, dict):
+                return
+            loaded = 0
+            with self.lock:
+                valid_chunk_ids = set(self.chunks.keys())
+            for cid, vec in raw.items():
+                if str(cid) in valid_chunk_ids and isinstance(vec, list) and vec:
+                    self.index.set_chunk_embedding(str(cid), vec)
+                    loaded += 1
+        except Exception:
+            pass
 
     def _find_doc_by_sha_locked(self, sha256: str) -> str:
         target = str(sha256 or "").strip()
@@ -47706,6 +53376,939 @@ class RAGLibraryStore:
         }
 
 
+class WikiStore:
+    """Persistent Markdown wiki layer built from library documents and chunks.
+
+    The wiki is deliberately file-first: Markdown pages are the durable artifact,
+    while query-time scoring builds a lightweight high-recall index over those
+    pages. Raw chunk retrieval remains available as fallback evidence.
+    """
+
+    def __init__(self, library_root: Path, *, kind: str = "knowledge"):
+        self.library_root = Path(library_root).resolve()
+        self.kind = str(kind or "knowledge").strip().lower() or "knowledge"
+        self.root = self.library_root / "wiki"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.sources_root = self.root / "sources"
+        self.entities_root = self.root / "entities"
+        self.concepts_root = self.root / "concepts"
+        self.synthesis_root = self.root / "synthesis"
+        self.workflows_root = self.root / "workflows"
+        for path in (
+            self.sources_root,
+            self.entities_root,
+            self.concepts_root,
+            self.synthesis_root,
+            self.workflows_root,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.root / "index.md"
+        self.log_path = self.root / "log.md"
+        self.schema_path = self.root / "schema.md"
+        self.state_path = self.root / "wiki_state.json"
+        self.lock = threading.RLock()
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self._write_schema()
+        self.thread = threading.Thread(target=self._worker_loop, name=f"{self.kind}-wiki-compiler", daemon=True)
+        self.thread.start()
+
+    def _write_schema(self):
+        title = "Knowledge Wiki" if self.kind == "knowledge" else "Code Wiki"
+        body = (
+            f"# {title} Schema\n\n"
+            "This directory is generated and maintained by Clouds_Coder.\n\n"
+            "## Layers\n\n"
+            "- `sources/`: one page per imported source document or source file.\n"
+            "- `entities/`: pages grouped by recurring entities, symbols, or domain terms.\n"
+            "- `concepts/`: community and synthesis pages derived from graph structure.\n"
+            "- `synthesis/overview.md`: compact library-wide map.\n"
+            "- `index.md`: content catalog used as the first retrieval hop.\n"
+            "- `log.md`: chronological append-only maintenance log.\n\n"
+            "## Query Policy\n\n"
+            "Use Wiki pages first for accumulated synthesis, then fall back to raw chunks "
+            "when exact evidence or line-level details are needed.\n"
+        )
+        _write_text_if_changed(self.schema_path, body)
+
+    def shutdown(self, timeout: float = 1.0):
+        self.stop_event.set()
+        try:
+            self.queue.put_nowait({"type": "__stop__"})
+        except Exception:
+            pass
+        try:
+            self.thread.join(timeout=max(0.1, float(timeout or 0.1)))
+        except Exception:
+            pass
+
+    def enqueue_compile(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "ingest"):
+        ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        self.queue.put({"type": "compile", "store": store, "doc_ids": ids, "reason": str(reason or "ingest")})
+
+    def enqueue_rebuild(self, store: RAGLibraryStore, *, reason: str = "rebuild"):
+        self.queue.put({"type": "compile", "store": store, "doc_ids": [], "reason": str(reason or "rebuild")})
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            try:
+                if not isinstance(job, dict):
+                    continue
+                if str(job.get("type", "")) == "__stop__":
+                    break
+                store = job.get("store")
+                if isinstance(store, RAGLibraryStore):
+                    self.compile_from_store(
+                        store,
+                        doc_ids=[str(x) for x in (job.get("doc_ids", []) or []) if str(x).strip()],
+                        reason=str(job.get("reason", "ingest") or "ingest"),
+                    )
+            except Exception as exc:
+                self._append_log("compile-error", f"{type(exc).__name__}: {trim(str(exc), 220)}")
+            finally:
+                try:
+                    self.queue.task_done()
+                except Exception:
+                    pass
+
+    def _slug(self, raw: object, fallback: str = "page") -> str:
+        text = str(raw or "").strip()
+        if not text:
+            text = fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 80).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        clean: dict[str, object] = {}
+        for key, value in meta.items():
+            if isinstance(value, (str, int, float, bool)):
+                clean[str(key)] = value
+            elif isinstance(value, list):
+                clean[str(key)] = [str(x) for x in value[:80] if str(x).strip()]
+        lines = ["---"]
+        for key, value in clean.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            else:
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _append_log(self, action: str, detail: str):
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        line = f"## [{stamp}] {str(action or 'update')} | {trim(detail, 180)}\n\n"
+        with self.lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+
+    def _source_page_path(self, doc_id: str) -> Path:
+        return self.sources_root / f"{self._slug(doc_id, 'source')}.md"
+
+    def _write_source_page(self, doc: dict, chunks: list[dict]) -> str:
+        doc_id = str(doc.get("id", "") or "").strip()
+        title = str(doc.get("title", doc.get("filename", doc_id)) or doc_id).strip()
+        entities = [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()]
+        source_rel = str(doc.get("source_rel_path", "") or doc.get("filename", "") or "").strip()
+        summary = trim(str(doc.get("summary", "") or ""), 1800)
+        parts = [
+            self._frontmatter(
+                {
+                    "id": f"wiki-source-{doc_id}",
+                    "type": "source",
+                    "title": title,
+                    "source_doc_ids": [doc_id],
+                    "category": str(doc.get("category", "") or ""),
+                    "kind": str(doc.get("kind", "") or ""),
+                    "language": str(doc.get("language", "") or ""),
+                    "updated_at": float(doc.get("updated_at", now_ts()) or now_ts()),
+                    "tags": list(doc.get("labels", []) or [])[:24],
+                    "entities": entities[:24],
+                }
+            ),
+            f"# {title}\n\n",
+        ]
+        if source_rel:
+            parts.append(f"- Source path: `{source_rel}`\n")
+        if str(doc.get("sha256", "") or "").strip():
+            parts.append(f"- SHA256: `{str(doc.get('sha256', '') or '')}`\n")
+        if entities:
+            parts.append("- Entities: " + ", ".join(f"[[entities/{self._slug(ent, 'entity')}|{ent}]]" for ent in entities[:18]) + "\n")
+        if summary:
+            parts.append("\n## Summary\n\n" + summary + "\n")
+        if chunks:
+            parts.append("\n## Evidence Excerpts\n\n")
+            for chunk in chunks[:10]:
+                anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
+                text = trim(str(chunk.get("text", "") or ""), 900)
+                if text:
+                    parts.append(f"### {anchor}\n\n{text}\n\n")
+        path = self._source_page_path(doc_id)
+        _write_text_if_changed(path, "".join(parts).rstrip() + "\n")
+        return self._rel(path)
+
+    def _write_entity_pages(self, docs: dict[str, dict]) -> list[str]:
+        entity_docs: dict[str, list[dict]] = defaultdict(list)
+        for doc in docs.values():
+            for ent in [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()][:32]:
+                entity_docs[ent].append(doc)
+        written: list[str] = []
+        for ent, rows in sorted(entity_docs.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))[:420]:
+            slug = self._slug(ent, "entity")
+            path = self.entities_root / f"{slug}.md"
+            doc_ids = [str(row.get("id", "") or "") for row in rows if str(row.get("id", "") or "").strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-entity-{slug}",
+                        "type": "entity",
+                        "title": ent,
+                        "source_doc_ids": doc_ids[:80],
+                        "updated_at": now_ts(),
+                        "tags": ["entity", self.kind],
+                    }
+                ),
+                f"# {ent}\n\n",
+                f"Appears in {len(doc_ids)} source(s).\n\n",
+                "## Sources\n\n",
+            ]
+            for row in rows[:24]:
+                title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+                summary = trim(str(row.get("summary", "") or ""), 260)
+                body.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]")
+                if summary:
+                    body.append(f": {summary}")
+                body.append("\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_concept_pages(self, store: RAGLibraryStore) -> list[str]:
+        reports = getattr(store.index, "community_reports", {}) or {}
+        written: list[str] = []
+        for community, report in sorted(reports.items(), key=lambda kv: int((kv[1] or {}).get("doc_count", 0) or 0), reverse=True)[:240]:
+            if not isinstance(report, dict):
+                continue
+            title = str(community or "concept")
+            slug = self._slug(title, "concept")
+            path = self.concepts_root / f"{slug}.md"
+            doc_ids = [str(x) for x in (report.get("doc_ids", []) or []) if str(x).strip()]
+            top_entities = [str(x) for x in (report.get("top_entities", []) or []) if str(x).strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-concept-{slug}",
+                        "type": "concept",
+                        "title": title,
+                        "source_doc_ids": doc_ids[:100],
+                        "updated_at": now_ts(),
+                        "tags": ["concept", self.kind],
+                        "entities": top_entities[:24],
+                    }
+                ),
+                f"# {title}\n\n",
+                trim(str(report.get("report", "") or ""), 5000),
+                "\n\n## Representative Sources\n\n",
+            ]
+            for row in (report.get("representative_docs", []) or [])[:12]:
+                if not isinstance(row, dict):
+                    continue
+                doc_id = str(row.get("id", "") or "")
+                label = str(row.get("title", doc_id) or doc_id)
+                body.append(f"- [[sources/{self._slug(doc_id, 'source')}|{label}]]\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_overview_and_index(self, docs: dict[str, dict], page_rows: list[dict]):
+        overview = [
+            self._frontmatter(
+                {
+                    "id": f"{self.kind}-wiki-overview",
+                    "type": "overview",
+                    "title": f"{self.kind.title()} Wiki Overview",
+                    "updated_at": now_ts(),
+                    "tags": ["overview", self.kind],
+                }
+            ),
+            f"# {self.kind.title()} Wiki Overview\n\n",
+            f"- Sources: {len(docs)}\n",
+            f"- Pages: {len(page_rows)}\n",
+            f"- Generated at: {datetime.now().astimezone().isoformat()}\n\n",
+            "## Recent Sources\n\n",
+        ]
+        for row in sorted(docs.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)[:16]:
+            title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+            overview.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]\n")
+        _write_text_if_changed(self.synthesis_root / "overview.md", "".join(overview).rstrip() + "\n")
+        by_type: dict[str, list[dict]] = defaultdict(list)
+        for row in page_rows:
+            by_type[str(row.get("type", "page") or "page")].append(row)
+        index = [
+            f"# {self.kind.title()} Wiki Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            "Read `schema.md` for maintenance conventions. Query uses this index first, then drills into pages.\n\n",
+        ]
+        for typ in ("overview", "source", "entity", "concept", "workflow"):
+            rows = by_type.get(typ, [])
+            if not rows:
+                continue
+            index.append(f"## {typ.title()} Pages\n\n")
+            for row in rows[:500]:
+                path = str(row.get("path", "") or "")
+                title = str(row.get("title", Path(path).stem) or Path(path).stem)
+                summary = trim(str(row.get("summary", "") or ""), 160)
+                index.append(f"- [[{path}|{title}]]")
+                if summary:
+                    index.append(f" - {summary}")
+                index.append("\n")
+            index.append("\n")
+        _write_text_if_changed(self.index_path, "".join(index).rstrip() + "\n")
+
+    def _page_meta_from_text(self, text: str) -> dict:
+        raw = str(text or "")
+        if not raw.startswith("---"):
+            return {}
+        end = raw.find("\n---", 3)
+        if end < 0:
+            return {}
+        block = raw[3:end].strip()
+        if not block:
+            return {}
+        if _yaml is not None:
+            try:
+                obj = _yaml.safe_load(block)
+                return dict(obj) if isinstance(obj, dict) else {}
+            except Exception:
+                pass
+        meta: dict[str, object] = {}
+        current_key = ""
+        for line in block.splitlines():
+            if line.startswith("  - ") and current_key:
+                meta.setdefault(current_key, [])
+                if isinstance(meta[current_key], list):
+                    meta[current_key].append(line[4:].strip().strip("\"'"))
+                continue
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            current_key = key.strip()
+            val = val.strip()
+            if not val:
+                meta[current_key] = []
+                continue
+            try:
+                meta[current_key] = json.loads(val)
+            except Exception:
+                meta[current_key] = val.strip("\"'")
+        return meta
+
+    def _scan_pages(self) -> list[dict]:
+        pages: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name in {"schema.md", "log.md"}:
+                continue
+            if self.kind == "code":
+                try:
+                    rel_probe = path.resolve().relative_to(self.root.resolve()).as_posix()
+                    if rel_probe.startswith("workflows/"):
+                        continue
+                except Exception:
+                    pass
+            text = try_read_text(path, max_bytes=260_000) or ""
+            if not text.strip():
+                continue
+            meta = self._page_meta_from_text(text)
+            rel = self._rel(path)
+            title = str(meta.get("title", "") or path.stem).strip()
+            typ = str(meta.get("type", "") or ("overview" if rel == "synthesis/overview.md" else "page"))
+            body = re.sub(r"(?s)^---.*?---\s*", "", text).strip()
+            pages.append(
+                {
+                    "path": rel,
+                    "title": title,
+                    "type": typ,
+                    "summary": trim(body.replace("\n", " "), 420),
+                    "text": body,
+                    "meta": meta,
+                }
+            )
+        return pages
+
+    def compile_from_store(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "rebuild") -> dict:
+        with store.lock:
+            docs = {str(k): dict(v) for k, v in store.documents.items()}
+            chunks = {str(k): dict(v) for k, v in store.chunks.items()}
+        target_ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        if not target_ids:
+            target_ids = list(docs.keys())
+        written_sources: list[str] = []
+        for doc_id in target_ids:
+            doc = docs.get(doc_id)
+            if not doc:
+                continue
+            doc_chunks = [chunks[cid] for cid in (doc.get("chunk_ids", []) or []) if cid in chunks]
+            written_sources.append(self._write_source_page(doc, doc_chunks))
+        entity_pages = self._write_entity_pages(docs)
+        concept_pages = self._write_concept_pages(store)
+        page_rows = self._scan_pages()
+        self._write_overview_and_index(docs, page_rows)
+        payload = {
+            "kind": self.kind,
+            "updated_at": now_ts(),
+            "documents": len(docs),
+            "pages": len(page_rows),
+            "last_reason": str(reason or "rebuild"),
+            "last_doc_ids": target_ids[-80:],
+        }
+        _write_json_file(self.state_path, payload)
+        self._append_log(str(reason or "compile"), f"sources={len(written_sources)} entities={len(entity_pages)} concepts={len(concept_pages)}")
+        return {"ok": True, **payload}
+
+    def payload(self, limit: int = 240) -> dict:
+        pages = self._scan_pages()
+        state = _read_json_file(self.state_path, {})
+        return {
+            "root": str(self.root),
+            "kind": self.kind,
+            "state": state if isinstance(state, dict) else {},
+            "page_count": len(pages),
+            "pages": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "type": str(row.get("type", "")),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in pages[: max(0, int(limit or 240))]
+            ],
+        }
+
+    def lint(self) -> dict:
+        pages = self._scan_pages()
+        links: Counter[str] = Counter()
+        existing = {str(row.get("path", "")) for row in pages}
+        orphan_pages: list[str] = []
+        missing_links: list[str] = []
+        for row in pages:
+            for target in re.findall(r"\[\[([^\]|#]+)", str(row.get("text", "") or "")):
+                target_norm = target.strip().lstrip("/")
+                links[target_norm] += 1
+                if not any(p == target_norm or p.startswith(target_norm + ".") or p.startswith(target_norm + "/") for p in existing):
+                    missing_links.append(target_norm)
+        for row in pages:
+            path = str(row.get("path", "") or "")
+            if path in {"index.md", "synthesis/overview.md"}:
+                continue
+            stem = path[:-3] if path.endswith(".md") else path
+            if links.get(path, 0) <= 0 and links.get(stem, 0) <= 0:
+                orphan_pages.append(path)
+        return {
+            "ok": True,
+            "page_count": len(pages),
+            "orphan_pages": orphan_pages[:120],
+            "missing_links": sorted(set(missing_links))[:120],
+            "pending_jobs": int(self.queue.qsize()),
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, category: str = "", kind: str = "") -> dict:
+        query = str(query_text or "").strip()
+        pages = self._scan_pages()
+        if not query or not pages:
+            return {"query": query, "results": [], "summary": "", "route": "wiki", "route_meta": {"mode": "wiki"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qentities = set(_rag_filter_entities(_rag_extract_entities(query), limit=24))
+        qlow = query.lower()
+        rows: list[dict] = []
+        for page in pages:
+            meta = page.get("meta", {}) if isinstance(page.get("meta"), dict) else {}
+            page_type = str(page.get("type", "") or "")
+            if page_type == "workflow":
+                continue
+            if category and page_type == "source" and str(meta.get("category", "") or "") != category:
+                continue
+            if kind and page_type == "source" and str(meta.get("kind", "") or "") != kind:
+                continue
+            title = str(page.get("title", "") or "")
+            text = str(page.get("text", "") or "")
+            hay_title = title.lower()
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in hay_title)
+            meta_entities = {str(x).strip() for x in (meta.get("entities", []) or []) if str(x).strip()} if isinstance(meta.get("entities", []), list) else set()
+            ent_overlap = len(qentities.intersection(meta_entities))
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1400]).ratio()
+            score = lexical * 0.72 + min(0.24, 0.08 * title_hits) + min(0.24, 0.08 * ent_overlap)
+            weak_match = False
+            if score <= 0.0 and fuzzy >= 0.10:
+                score = min(fuzzy * 0.55, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            source_doc_ids = [str(x) for x in (meta.get("source_doc_ids", []) or []) if str(x).strip()] if isinstance(meta.get("source_doc_ids", []), list) else []
+            window = _rag_window_for_query(query)
+            excerpt = _rag_focused_excerpt(text, tokens, window=max(700, window), dense_match=fuzzy > 0.18)
+            rows.append(
+                {
+                    "score": round(float(score), 6),
+                    "lexical_score": round(float(lexical), 6),
+                    "graph_score": round(float(min(0.4, 0.08 * ent_overlap + 0.04 * title_hits)), 6),
+                    "doc_id": source_doc_ids[0] if source_doc_ids else "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(page.get("path", ""))).name,
+                    "kind": page_type or "wiki_page",
+                    "category": "wiki",
+                    "language": "markdown",
+                    "community": str(meta.get("community", "") or ""),
+                    "anchor": str(page.get("path", "") or ""),
+                    "text": trim(excerpt, 1800),
+                    "entities": list(meta_entities)[:12],
+                    "citation": f"[wiki:{str(page.get('path', '') or '')}]",
+                    "route_evidence": "wiki_page",
+                    "evidence_layer": "wiki",
+                    "wiki_page": str(page.get("path", "") or ""),
+                    "source_doc_ids": source_doc_ids[:24],
+                    "sort_bias": 0.18 if page_type in {"overview", "concept", "entity"} else 0.10,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "wiki",
+            "route_meta": {"mode": "wiki", "page_count": len(pages), "candidate_count": len(rows)},
+            "query_entities": sorted(qentities),
+        }
+
+
+class WorkflowMemoryStore:
+    """Accepted programming workflow patterns captured from finished sessions."""
+
+    def __init__(self, code_root: Path):
+        self.code_root = Path(code_root).resolve()
+        self.root = self.code_root / "wiki" / "workflows"
+        self.accepted_root = self.root / "accepted"
+        self.candidates_root = self.root / "candidates"
+        self.rejected_root = self.root / "rejected"
+        for path in (self.accepted_root, self.candidates_root, self.rejected_root):
+            path.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "workflow_state.json"
+        self.index_path = self.root / "index.md"
+        self.lock = threading.RLock()
+        self.state = _read_json_file(self.state_path, {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0})
+        if not isinstance(self.state, dict):
+            self.state = {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0}
+        self._write_index()
+
+    def shutdown(self, timeout: float = 0.0):
+        return
+
+    def _slug(self, raw: object, fallback: str = "workflow") -> str:
+        text = str(raw or "").strip() or fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 96).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        lines = ["---"]
+        for key, value in meta.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value[:80]:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            elif isinstance(value, (str, int, float, bool)):
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _extract_operation_rows(self, sess: object) -> list[dict]:
+        rows = []
+        try:
+            raw_rows = list(getattr(sess, "operations", []) or [])[-220:]
+        except Exception:
+            raw_rows = []
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                continue
+            tool = str(raw.get("tool", raw.get("name", raw.get("type", ""))) or "").strip()
+            status = str(raw.get("status", raw.get("result", "")) or "").strip()
+            summary = trim(str(raw.get("summary", raw.get("content", raw.get("text", ""))) or ""), 220)
+            args = raw.get("args", raw.get("input", {}))
+            if isinstance(args, dict) and not summary:
+                summary = trim(json_dumps({k: args.get(k) for k in list(args.keys())[:6]}, indent=None), 220)
+            rows.append(
+                {
+                    "tool": tool,
+                    "status": status,
+                    "summary": summary,
+                    "time": float(raw.get("time", raw.get("ts", raw.get("created_at", 0.0))) or 0.0),
+                }
+            )
+        return rows
+
+    def _extract_text_tail(self, value: object, limit: int = 10, chars: int = 360) -> list[str]:
+        out: list[str] = []
+        if isinstance(value, dict):
+            rows = list(value.values())
+        elif isinstance(value, list):
+            rows = list(value)
+        else:
+            rows = []
+        for row in rows[-limit:]:
+            if isinstance(row, dict):
+                text = str(row.get("content", row.get("summary", row.get("text", row.get("message", "")))) or "")
+            else:
+                text = str(row or "")
+            text = trim(text.replace("\n", " "), chars)
+            if text:
+                out.append(text)
+        return out
+
+    def _score_capture(self, capture: dict) -> tuple[float, list[str]]:
+        text = "\n".join(
+            [
+                str(capture.get("objective", "") or ""),
+                "\n".join(str(x) for x in (capture.get("operation_summaries", []) or [])),
+                "\n".join(str(x) for x in (capture.get("message_tail", []) or [])),
+                "\n".join(str(x) for x in (capture.get("blackboard_tail", []) or [])),
+            ]
+        ).lower()
+        tools = [str(row.get("tool", "") or "").lower() for row in (capture.get("operations", []) or []) if isinstance(row, dict)]
+        todo_rows = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        score = 0.18
+        reasons: list[str] = ["base-session-fingerprint"]
+        if any(term in text for term in ("finish", "completed", "完成", "done", "success")):
+            score += 0.18
+            reasons.append("explicit-completion-signal")
+        if any(tool in {"file_patch", "apply_patch", "write_file", "edit_file"} or "patch" in tool or "write" in tool for tool in tools):
+            score += 0.16
+            reasons.append("code-edit-operation")
+        if any(tool in {"run_shell", "bash", "shell", "exec"} or "test" in tool for tool in tools) or any(term in text for term in ("pytest", "unittest", "npm test", "py_compile", "build succeeded", "tests passed", "验证", "测试")):
+            score += 0.16
+            reasons.append("validation-or-test-step")
+        if todo_rows:
+            completed = sum(1 for row in todo_rows if str(row.get("status", "") or "").lower() == "completed")
+            if completed >= max(1, len(todo_rows) // 2):
+                score += 0.12
+                reasons.append("todo-progress")
+        if any(term in text for term in ("plan", "checklist", "步骤", "计划", "in_progress", "pending")):
+            score += 0.08
+            reasons.append("structured-planning")
+        if any(term in text for term in ("blackboard", "delegate", "agent", "explorer", "worker", "reviewer", "handoff", "交接", "节点")):
+            score += 0.08
+            reasons.append("multi-node-coordination")
+        if any(term in text for term in ("traceback", "failed", "error", "exception", "失败", "报错")):
+            score -= 0.06
+            reasons.append("contains-failure-signal")
+        if any(term in text for term in ("fixed", "resolved", "pass", "ok", "修复", "通过")):
+            score += 0.08
+            reasons.append("recovery-or-pass-signal")
+        return max(0.0, min(1.0, round(score, 4))), reasons[:12]
+
+    def _capture_from_session(self, sess: object) -> dict:
+        sid = str(getattr(sess, "id", "") or "").strip()
+        title = trim(str(getattr(sess, "title", "") or sid or "workflow"), 160)
+        operations = self._extract_operation_rows(sess)
+        op_summaries = []
+        for row in operations[-48:]:
+            label = str(row.get("tool", "") or "operation")
+            summary = str(row.get("summary", "") or str(row.get("status", "") or ""))
+            if summary:
+                op_summaries.append(f"{label}: {summary}")
+            else:
+                op_summaries.append(label)
+        try:
+            todos = getattr(getattr(sess, "todo", None), "snapshot")()
+        except Exception:
+            todos = []
+        if not isinstance(todos, list):
+            todos = []
+        try:
+            blackboard = getattr(sess, "blackboard", {}) or {}
+        except Exception:
+            blackboard = {}
+        capture = {
+            "session_id": sid,
+            "title": title,
+            "objective": trim(str(getattr(sess, "runtime_direct_objective", "") or title), 800),
+            "created_at": now_ts(),
+            "operations": operations,
+            "operation_summaries": op_summaries[-48:],
+            "todos": [dict(x) for x in todos[-40:] if isinstance(x, dict)],
+            "message_tail": self._extract_text_tail(getattr(sess, "agent_messages", []), limit=12, chars=420),
+            "blackboard_tail": self._extract_text_tail(blackboard, limit=16, chars=420),
+            "code_preview_paths": sorted(list((getattr(sess, "code_preview_index", {}) or {}).keys()))[:40]
+            if isinstance(getattr(sess, "code_preview_index", {}), dict)
+            else [],
+        }
+        score, reasons = self._score_capture(capture)
+        capture["score"] = score
+        capture["score_reasons"] = reasons
+        capture["accepted"] = bool(score >= RAG_WORKFLOW_ACCEPT_SCORE)
+        return capture
+
+    def _write_capture_card(self, capture: dict) -> Path:
+        sid = str(capture.get("session_id", "") or make_id("workflow"))
+        score = float(capture.get("score", 0.0) or 0.0)
+        accepted = bool(capture.get("accepted", False))
+        target_root = self.accepted_root if accepted else self.candidates_root
+        filename = f"{self._slug(sid, 'workflow')}-{int(score * 100):02d}.md"
+        path = target_root / filename
+        body = [
+            self._frontmatter(
+                {
+                    "id": f"workflow-{sid}",
+                    "type": "workflow",
+                    "title": str(capture.get("title", "") or sid),
+                    "session_id": sid,
+                    "score": score,
+                    "accepted": accepted,
+                    "updated_at": float(capture.get("created_at", now_ts()) or now_ts()),
+                    "tags": ["workflow", "code", "accepted" if accepted else "candidate"],
+                }
+            ),
+            f"# {str(capture.get('title', '') or sid)}\n\n",
+            f"- Score: `{score:.2f}`\n",
+            f"- Accepted: `{str(accepted).lower()}`\n",
+            "- Reasons: " + ", ".join(str(x) for x in (capture.get("score_reasons", []) or [])) + "\n\n",
+            "## Objective\n\n",
+            trim(str(capture.get("objective", "") or ""), 1200) + "\n\n",
+            "## Workflow Steps\n\n",
+        ]
+        for line in (capture.get("operation_summaries", []) or [])[:48]:
+            body.append(f"- {trim(str(line), 260)}\n")
+        todos = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        if todos:
+            body.append("\n## Todo Pattern\n\n")
+            for row in todos[:24]:
+                body.append(f"- `{str(row.get('status', '') or 'pending')}` {trim(str(row.get('content', '') or ''), 220)}\n")
+        if capture.get("code_preview_paths"):
+            body.append("\n## Code Artifacts\n\n")
+            for item in (capture.get("code_preview_paths", []) or [])[:32]:
+                body.append(f"- `{str(item)}`\n")
+        tail = list(capture.get("blackboard_tail", []) or []) + list(capture.get("message_tail", []) or [])
+        if tail:
+            body.append("\n## Context Signals\n\n")
+            for line in tail[:20]:
+                body.append(f"- {trim(str(line), 360)}\n")
+        _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+        return path
+
+    def _scan_cards(self) -> list[dict]:
+        cards: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name == "index.md":
+                continue
+            text = try_read_text(path, max_bytes=180_000) or ""
+            if not text.strip():
+                continue
+            meta: dict = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end > 0:
+                    raw_meta = text[3:end].strip()
+                    if _yaml is not None:
+                        try:
+                            obj = _yaml.safe_load(raw_meta)
+                            meta = dict(obj) if isinstance(obj, dict) else {}
+                        except Exception:
+                            meta = {}
+                    body = text[end + 4 :].strip()
+                else:
+                    body = text
+            else:
+                body = text
+            cards.append(
+                {
+                    "path": self._rel(path),
+                    "title": str(meta.get("title", path.stem) or path.stem),
+                    "score": float(meta.get("score", 0.0) or 0.0),
+                    "accepted": bool(meta.get("accepted", "accepted" in path.parts)),
+                    "text": body,
+                    "summary": trim(body.replace("\n", " "), 320),
+                    "meta": meta,
+                }
+            )
+        return cards
+
+    def _write_index(self):
+        cards = self._scan_cards()
+        accepted = [row for row in cards if bool(row.get("accepted", False))]
+        candidates = [row for row in cards if not bool(row.get("accepted", False))]
+        body = [
+            "# Code Workflow Memory Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            f"- Accepted: {len(accepted)}\n",
+            f"- Candidates: {len(candidates)}\n\n",
+        ]
+        for heading, rows in (("Accepted", accepted), ("Candidates", candidates)):
+            if not rows:
+                continue
+            body.append(f"## {heading}\n\n")
+            for row in sorted(rows, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[:200]:
+                body.append(f"- [[{row.get('path')}|{row.get('title')}]] score={float(row.get('score', 0.0) or 0.0):.2f}")
+                summary = trim(str(row.get("summary", "") or ""), 140)
+                if summary:
+                    body.append(f" - {summary}")
+                body.append("\n")
+            body.append("\n")
+        _write_text_if_changed(self.index_path, "".join(body).rstrip() + "\n")
+
+    def capture_session(self, sess: object) -> dict:
+        capture = self._capture_from_session(sess)
+        sid = str(capture.get("session_id", "") or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id missing"}
+        with self.lock:
+            captures = self.state.get("captures", {})
+            if not isinstance(captures, dict):
+                captures = {}
+            previous = captures.get(sid)
+            if isinstance(previous, dict) and float(previous.get("score", 0.0) or 0.0) >= float(capture.get("score", 0.0) or 0.0):
+                return {"ok": True, "skipped": True, "reason": "existing_capture_has_equal_or_higher_score", "score": float(previous.get("score", 0.0) or 0.0)}
+            path = self._write_capture_card(capture)
+            captures[sid] = {
+                "path": self._rel(path),
+                "score": float(capture.get("score", 0.0) or 0.0),
+                "accepted": bool(capture.get("accepted", False)),
+                "updated_at": now_ts(),
+                "title": str(capture.get("title", "") or sid),
+            }
+            self.state["captures"] = captures
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            self._write_index()
+            return {"ok": True, "accepted": bool(capture.get("accepted", False)), "score": float(capture.get("score", 0.0) or 0.0), "path": self._rel(path)}
+
+    def rebuild(self) -> dict:
+        with self.lock:
+            self._write_index()
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            return {"ok": True, "accepted": int(self.state.get("accepted", 0) or 0), "candidates": int(self.state.get("candidates", 0) or 0)}
+
+    def payload(self, limit: int = 120) -> dict:
+        cards = self._scan_cards()
+        state = _read_json_file(self.state_path, self.state)
+        return {
+            "root": str(self.root),
+            "state": state if isinstance(state, dict) else {},
+            "card_count": len(cards),
+            "cards": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "score": float(row.get("score", 0.0) or 0.0),
+                    "accepted": bool(row.get("accepted", False)),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in sorted(cards, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[: max(0, int(limit or 120))]
+            ],
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, accepted_only: bool = True) -> dict:
+        query = str(query_text or "").strip()
+        cards = self._scan_cards()
+        if accepted_only:
+            cards = [row for row in cards if bool(row.get("accepted", False))]
+        if not query or not cards:
+            return {"query": query, "results": [], "summary": "", "route": "workflow", "route_meta": {"mode": "workflow"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qlow = query.lower()
+        rows: list[dict] = []
+        for card in cards:
+            title = str(card.get("title", "") or "")
+            text = str(card.get("text", "") or "")
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in title.lower())
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1600]).ratio()
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            base = float(card.get("score", 0.0) or 0.0)
+            score = lexical * 0.64 + min(0.20, 0.06 * title_hits) + base * 0.22
+            weak_match = False
+            if score <= 0.03 and fuzzy >= 0.12:
+                score = min(fuzzy * 0.50 + base * 0.12, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            rows.append(
+                {
+                    "score": round(score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(base, 6),
+                    "doc_id": "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(card.get("path", ""))).name,
+                    "relative_path": str(card.get("path", "")),
+                    "kind": "workflow",
+                    "category": "code",
+                    "language": "markdown",
+                    "anchor": str(card.get("path", "")),
+                    "text": trim(_rag_focused_excerpt(text, tokens, window=1200, dense_match=fuzzy > 0.18), 1800),
+                    "entities": [],
+                    "citation": f"[workflow:{str(card.get('path', '') or '')}]",
+                    "route_evidence": "workflow",
+                    "evidence_layer": "workflow",
+                    "workflow_score": base,
+                    "sort_bias": 0.16 if bool(card.get("accepted", False)) else 0.04,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(key=lambda x: (float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0), float(x.get("graph_score", 0.0) or 0.0)), reverse=True)
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "workflow",
+            "route_meta": {"mode": "workflow", "card_count": len(cards), "candidate_count": len(rows), "accepted_only": bool(accepted_only)},
+        }
+
+
 def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
     try:
         parser = RAGContentParser(include_filename_entities=include_filename_entities)
@@ -47724,10 +54327,11 @@ def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override
 
 
 class RAGIngestionService:
-    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None):
+    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(RAG_IMPORT_WORKER_COUNT)
@@ -48350,6 +54954,7 @@ class RAGIngestionService:
             self.store.update_task(task_id, status="running", started_at=now_ts())
             try:
                 result_rows: list[dict] = []
+                all_result_rows: list[dict] = []
                 item_errors: list[str] = []
                 pending_flushes = 0
                 pending_rebuild = False
@@ -48404,6 +55009,7 @@ class RAGIngestionService:
                             **kwargs,
                         )
                         result_rows.append(row)
+                        all_result_rows.append(row)
                         pending_flushes += 1
                         if bool(row.get("ok", False)) and not bool(row.get("duplicate", False)):
                             pending_rebuild = True
@@ -48562,11 +55168,17 @@ class RAGIngestionService:
                                 strict_local_only=strict_local_only,
                             )
                 _flush_ingest_state()
-                ok_count = sum(1 for row in result_rows if bool(row.get("ok", False)))
-                duplicate_count = sum(1 for row in result_rows if bool(row.get("duplicate", False)))
+                ok_count = sum(1 for row in all_result_rows if bool(row.get("ok", False)))
+                duplicate_count = sum(1 for row in all_result_rows if bool(row.get("duplicate", False)))
                 failed_count = len(item_errors)
                 if failed_count and ok_count <= 0:
                     raise ValueError("\n".join(item_errors[:12]))
+                doc_ids = [str(x.get("doc_id", "")) for x in all_result_rows if str(x.get("doc_id", "")).strip()]
+                if self.wiki_store is not None and doc_ids:
+                    try:
+                        self.wiki_store.enqueue_compile(self.store, doc_ids=doc_ids, reason=f"ingest:{source_mode}")
+                    except Exception:
+                        pass
                 self.store.update_task(
                     task_id,
                     status="completed_with_errors" if failed_count else "completed",
@@ -48575,7 +55187,7 @@ class RAGIngestionService:
                     duplicate_count=duplicate_count,
                     failed_count=failed_count,
                     error="\n".join(item_errors[:12]),
-                    doc_ids=[str(x.get("doc_id", "")) for x in result_rows if str(x.get("doc_id", "")).strip()],
+                    doc_ids=doc_ids,
                 )
             except Exception as exc:
                 self.store.update_task(
@@ -48600,6 +55212,10 @@ class CodeGraphIndex(TFGraphIDFIndex):
         self.symbol_to_docs: dict[str, list[str]] = {}
         self.path_to_doc: dict[str, str] = {}
         self.module_to_docs: dict[str, list[str]] = {}
+        # Function call graph: caller_symbol → [callee_names]
+        self.call_graph: dict[str, list[str]] = {}
+        # Reverse call graph: callee_name → [chunk_ids that call it]
+        self.callee_graph: dict[str, list[str]] = {}
 
     def snapshot(self) -> dict:
         payload = super().snapshot()
@@ -48698,6 +55314,8 @@ class CodeGraphIndex(TFGraphIDFIndex):
         self.symbol_to_docs = {}
         self.path_to_doc = {}
         self.module_to_docs = {}
+        self.call_graph = {}
+        self.callee_graph = {}
         docs_by_id = {
             str(row.get("id", "") or "").strip(): dict(row)
             for row in documents
@@ -48775,6 +55393,22 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     self.related_docs[doc_id][target_id] = int(self.related_docs[doc_id].get(target_id, 0) or 0) + 1
                     self.related_docs[target_id][doc_id] = int(self.related_docs[target_id].get(doc_id, 0) or 0) + 1
         self.import_edges = {tuple(k): int(v or 0) for k, v in import_edges.items()}
+        # Build function call graph from chunk "calls" field (populated by _python_chunks)
+        call_graph: dict[str, list[str]] = {}
+        callee_graph: dict[str, list[str]] = {}
+        for chunk_id, row in self.chunk_meta.items():
+            src = chunks_by_id.get(chunk_id, {})
+            calls = [str(c) for c in (src.get("calls", []) or []) if str(c).strip()]
+            if calls:
+                symbol = str(src.get("symbol", "") or chunk_id)
+                call_graph[symbol] = calls
+                for callee in calls:
+                    callee_graph.setdefault(callee, []).append(chunk_id)
+            # Persist algo flag in chunk_meta for query-time boosting
+            if src.get("algo"):
+                row["algo"] = True
+        self.call_graph = call_graph
+        self.callee_graph = {k: list(set(v)) for k, v in callee_graph.items()}
         for doc_id, row in self.doc_meta.items():
             row["graph_degree"] = (
                 len(self.doc_to_chunks.get(doc_id, []) or [])
@@ -48792,6 +55426,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
         kind: str = "",
         allowed_communities: set[str] | None = None,
         qbundle: tuple[dict[str, float], float, set[str], str] | None = None,
+        qvec: list[float] | None = None,
     ) -> dict:
         query = str(query_text or "").strip()
         if not query:
@@ -48807,11 +55442,29 @@ class CodeGraphIndex(TFGraphIDFIndex):
         qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
         qsymbols = _code_query_terms(query)
         query_low = query.lower()
+        # Detect "who calls X" intent for call graph routing
+        who_calls_intent = bool(re.search(r"who\s+calls?|callers?\s+of|调用了|哪些.*调用", query_low))
+        # Detect algorithm intent for boosting algo-tagged chunks
+        algo_intent = bool(re.search(r"algorithm|implement|how.*work|原理|实现|如何|怎么|步骤|算法|复杂度", query_low))
         allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
         scores: dict[str, float] = defaultdict(float)
         for token, qweight in qweights.items():
             for chunk_id, cweight in self.inverted.get(token, []):
                 scores[chunk_id] += qweight * cweight
+        # "Who calls X" routing: inject callee_graph hits as extra candidates
+        if who_calls_intent:
+            for sym in list(qsymbols) + [str(e) for e in qentities]:
+                for caller_chunk_id in self.callee_graph.get(sym.lower(), []):
+                    if caller_chunk_id not in scores:
+                        scores[caller_chunk_id] = 0.0
+        # Dense retrieval — expand candidate pool with embedding matches
+        dense_scores: dict[str, float] = {}
+        use_dense = self.has_dense_index() and qvec is not None
+        if use_dense:
+            dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
+            for cid in dense_scores:
+                if cid not in scores:
+                    scores[cid] = 0.0
         rows: list[dict] = []
         for chunk_id, dot in scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
@@ -48849,7 +55502,16 @@ class CodeGraphIndex(TFGraphIDFIndex):
                 elif module_low and module_low in query_low:
                     graph_bonus += 0.14
             graph_bonus += min(0.12, math.log1p(len(self.related_docs.get(str(doc.get("id", "")), {}) or {})) / 9.0)
-            final_score = lexical * 0.78 + graph_bonus
+            # Algo chunk boost — reward algorithm-tagged chunks for algorithm intent queries
+            chunk_is_algo = bool(chunk.get("algo", False))
+            if algo_intent and chunk_is_algo:
+                graph_bonus += 0.15
+            # Hybrid dense+lexical scoring
+            if use_dense and qvec is not None:
+                dense_sim = dense_scores.get(chunk_id, 0.0)
+                final_score = lexical * 0.40 + dense_sim * 0.38 + graph_bonus * 0.60
+            else:
+                final_score = lexical * 0.78 + graph_bonus
             line_start = int(chunk.get("line_start", 0) or 0)
             line_end = int(chunk.get("line_end", 0) or 0)
             if rel_path and line_start > 0:
@@ -48880,6 +55542,8 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "citation": citation,
                     "route_evidence": "chunk",
                     "sort_bias": 0.18 if rel_path and rel_path.lower() in query_low else 0.0,
+                    "algo": chunk_is_algo,
+                    "calls": list(chunk.get("calls", []) or [])[:20],
                 }
             )
         if not rows:
@@ -48908,7 +55572,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -48929,6 +55593,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                         ],
                         "citation": f"[{rel_path or doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -49275,10 +55940,11 @@ class CodeLibraryStore(RAGLibraryStore):
 
 
 class CodeIngestionService(RAGIngestionService):
-    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None):
+    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
@@ -49440,11 +56106,19 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
           <label for="queryInput">Query</label>
           <textarea id="queryInput" rows="7" placeholder="Ask the multilingual RAG system"></textarea>
         </div>
+        <div class="field">
+          <label for="embedModelSelect">Embedding Model</label>
+          <select id="embedModelSelect">
+            <option value="">TF-IDF only (no embedding)</option>
+          </select>
+        </div>
         <div class="inline split">
           <div class="field grow">
             <label for="queryRouteInput">Route</label>
             <select id="queryRouteInput">
               <option value="auto" selected>Auto</option>
+              <option value="wiki">Wiki</option>
+              <option value="raw">Raw Hybrid</option>
               <option value="fast">Fast</option>
               <option value="global">Global</option>
               <option value="hybrid">Hybrid</option>
@@ -49452,7 +56126,15 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
           </div>
           <div class="field grow">
             <label for="topKInput">Top K</label>
-            <input id="topKInput" type="number" min="1" max="12" value="8">
+            <input id="topKInput" type="number" min="1" max="64" value="10">
+          </div>
+          <div class="field grow">
+            <label for="queryBudgetInput">Budget</label>
+            <select id="queryBudgetInput">
+              <option value="standard" selected>Standard</option>
+              <option value="tight">Tight</option>
+              <option value="deep">Deep</option>
+            </select>
           </div>
           <label class="check top-gap"><input id="querySynthesize" type="checkbox" checked> synthesize answer</label>
         </div>
@@ -49618,6 +56300,19 @@ const G={
   layout:null,
   layouts:{},
   hoverId:'',
+  selectedNodeId:'',
+  focusMode:false,
+  viewport:{x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1},
+  animation:{active:false,started:0,duration:420,from:null,to:null,reason:''},
+  dragging2d:false,
+  dragStartX:0,
+  dragStartY:0,
+  dragOriginX:0,
+  dragOriginY:0,
+  pointerDownX:0,
+  pointerDownY:0,
+  pointerMoved:false,
+  lastLayoutView:'static',
   screenNodes:[],
   bound:false,
   renderKey:'',
@@ -49639,6 +56334,13 @@ const G={
     fitDistance:360,
     minDistance:96,
     maxDistance:4200,
+    targetDistance:360,
+    targetAzimuth:0.72,
+    targetElevation:0.56,
+    focusCenter:{x:0,y:0,z:0},
+    clickStartX:0,
+    clickStartY:0,
+    moved:false,
     pending:false,
     graphKey:'',
     activeHoverId:'',
@@ -49648,6 +56350,12 @@ const G={
 const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
 const GRAPH_STATIC_NODE_LIMIT=300;
 const GRAPH_STATIC_HERO_COUNT=30;
+const GRAPH_STATIC_EDGE_LIMIT=520;
+const GRAPH_FOCUS_NODE_LIMIT=96;
+const GRAPH_FOCUS_SECOND_HOP_LIMIT=34;
+const GRAPH_FOCUS_EDGE_LIMIT=260;
+const GRAPH_ZOOM_MIN_FACTOR=0.22;
+const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
 async function api(path,init){
   const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
@@ -49668,6 +56376,24 @@ function selectedSession(){return String(E('sessionSelect')?.value||'').trim()}
 function parseTags(){return String(E('tagInput')?.value||'').split(',').map(x=>x.trim()).filter(Boolean)}
 function strictLocalOnlyImport(){return Boolean(E('importLocalOnly')?.checked)}
 function selectedQueryRoute(){return String(E('queryRouteInput')?.value||'auto').trim().toLowerCase()||'auto'}
+function selectedEmbedModel(){return String(E('embedModelSelect')?.value||'').trim()}
+function selectedQueryBudget(){return String(E('queryBudgetInput')?.value||'standard').trim().toLowerCase()||'standard'}
+function renderEmbedModelSelect(){
+  const sel=E('embedModelSelect');
+  if(!sel)return;
+  const prev=sel.value;
+  sel.innerHTML='<option value="">TF-IDF only (no embedding)</option>';
+  const models=Array.isArray(S.config?.embedding_models)?S.config.embedding_models:[];
+  for(const m of models){
+    const op=document.createElement('option');
+    op.value=String(m);
+    op.textContent=String(m);
+    sel.appendChild(op);
+  }
+  const dflt=String(S.config?.default_embed_model||'').trim();
+  if(dflt&&!prev){sel.value=dflt}
+  else if(prev){sel.value=prev}
+}
 function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
 async function submitImportItems(items,batchIndex,batchCount){
   const batchItems=Array.isArray(items)?items.filter(Boolean):[];
@@ -49807,20 +56533,23 @@ function graphSignature(graph){
   const edges=Array.isArray(graph?.edges)?graph.edges:[];
   return JSON.stringify({
     built_at:Number(graph?.built_at||0),
-    node_count:Number(graph?.node_count||0),
-    edge_count:Number(graph?.edge_count||0),
-    nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
-    edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]),
+      node_count:Number(graph?.node_count||0),
+      edge_count:Number(graph?.edge_count||0),
+      rev:Number(graph?.rev||graph?.revision||0),
+      nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
+      edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]).slice(0,3000),
   })
 }
 function normalizeGraphType(v){
   const t=String(v||'').trim().toLowerCase();
   if(t==='community'||t==='document'||t==='entity')return t;
+  if(['file','source','doc','page','module'].includes(t))return 'document';
+  if(['symbol','function','class','method','concept','tag','keyword'].includes(t))return 'entity';
   return 'document';
 }
 function communityHex(key){return hslToHex(hashText(key)%360,72,58)}
-function nodeRadius2D(type){if(type==='community')return 11.5;if(type==='entity')return 2.7;return 4.5}
-function nodeRadius3D(type){if(type==='community')return 8.4;if(type==='entity')return 1.9;return 3.4}
+function nodeRadius2D(type){if(type==='community')return 13.5;if(type==='entity')return 4.1;return 6.2}
+function nodeRadius3D(type){if(type==='community')return 9.4;if(type==='entity')return 2.8;return 4.6}
 function nodeCommunityKey(node){
   const type=normalizeGraphType(node?.type);
   if(type==='community')return String(node?.label||node?.community||node?.id||'community').trim()||'community';
@@ -49880,6 +56609,77 @@ function computeGraphBounds(items){
     spanY:maxY-minY,
     spanZ:maxZ-minZ,
     radius:Math.max(24,Math.sqrt(halfX*halfX+halfY*halfY+halfZ*halfZ)),
+  };
+}
+function edgeRank(edge,itemById){
+  const source=itemById?.get?.(String(edge?.source||''))||null;
+  const target=itemById?.get?.(String(edge?.target||''))||null;
+  const type=String(edge?.type||'related');
+  const base=type==='related'?3.2:(type==='belongs_to'?2.4:(type==='mentions'?1.8:1.2));
+  const weight=Math.log1p(Math.max(0,Number(edge?.weight||0)))*0.85;
+  const nodeScore=Math.log1p(Math.max(0,Number(source?.score||0)))+Math.log1p(Math.max(0,Number(target?.score||0)));
+  const degreePenalty=Math.log1p(Math.max(0,Number(source?.degree||0)+Number(target?.degree||0)))*0.18;
+  return base+weight+nodeScore*0.42-degreePenalty;
+}
+function pruneGraphEdges(edges,itemById,limit=GRAPH_STATIC_EDGE_LIMIT,perNodeLimit=18,focusId=''){
+  const rows=(edges||[])
+    .filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||'')))
+    .map(edge=>({...edge,_rank:edgeRank(edge,itemById)}))
+    .sort((a,b)=>Number(b._rank||0)-Number(a._rank||0));
+  const selected=[];
+  const degree=new Map();
+  const focus=String(focusId||'');
+  for(const edge of rows){
+    if(selected.length>=Math.max(1,Number(limit||GRAPH_STATIC_EDGE_LIMIT)))break;
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const nearFocus=focus&&(s===focus||t===focus);
+    const cap=nearFocus?Math.max(perNodeLimit*2,28):perNodeLimit;
+    if(!nearFocus&&(Number(degree.get(s)||0)>=cap||Number(degree.get(t)||0)>=cap))continue;
+    degree.set(s,Number(degree.get(s)||0)+1);
+    degree.set(t,Number(degree.get(t)||0)+1);
+    const clean={...edge};
+    delete clean._rank;
+    selected.push(clean);
+  }
+  return selected;
+}
+function cloneLayoutItems(items,transform){
+  return (items||[]).map((item,idx)=>{
+    const next={...item};
+    if(typeof transform==='function')Object.assign(next,transform(item,idx)||{});
+    return next;
+  });
+}
+function layoutFromItems(base,items,edges,signature,extra={}){
+  const itemById=new Map((items||[]).map(item=>[String(item.id),item]));
+  const geometry=computeGraphBounds(items||[]);
+  const counts={community:0,document:0,entity:0};
+  (items||[]).forEach(item=>{
+    const type=String(item?.type||'document');
+    if(type==='community'||type==='document'||type==='entity')counts[type]+=1;
+  });
+  return {
+    signature,
+    items:items||[],
+    itemById,
+    edges:edges||[],
+    allEdges:Array.isArray(extra?.allEdges)?extra.allEdges:(edges||[]),
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts,
+    communities:Array.isArray(base?.communities)?base.communities:[],
+    totalNodeCount:Number(base?.totalNodeCount||base?.items?.length||0),
+    totalEdgeCount:Number(base?.totalEdgeCount||base?.edges?.length||0),
+    visibleNodeCount:(items||[]).length,
+    visibleEdgeCount:(edges||[]).length,
+    heroCount:0,
+    sampled:false,
+    labelIds:new Set(),
+    ...extra,
   };
 }
 function buildGraphLayout(graph){
@@ -50068,12 +56868,23 @@ function buildGraphLayout(graph){
     }
     return {...edge,colorHex,alpha,width}
   });
+  const communityItemByKey=new Map(items.filter(item=>String(item.type||'')==='community').map(item=>[String(item.communityKey||item.label||''),item]));
+  for(const item of items){
+    if(String(item.type||'')==='document'){
+      const communityItem=communityItemByKey.get(String(item.communityKey||''));
+      if(communityItem){
+        layoutEdges.push({source:String(item.id),target:String(communityItem.id),type:'belongs_to',weight:1,colorHex:mixHex(Number(item.colorHex||0x607565),Number(communityItem.colorHex||0x607565),0.5),alpha:0.12,width:0.85});
+      }
+    }
+  }
+  const prunedEdges=pruneGraphEdges(layoutEdges,itemById,Math.max(GRAPH_STATIC_EDGE_LIMIT*2,900),34);
   const geometry=computeGraphBounds(items);
   return {
     signature:graphSignature(graph),
     items,
     itemById,
-    edges:layoutEdges,
+    edges:prunedEdges,
+    allEdges:layoutEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -50085,7 +56896,7 @@ function buildGraphLayout(graph){
     totalNodeCount:items.length,
     totalEdgeCount:layoutEdges.length,
     visibleNodeCount:items.length,
-    visibleEdgeCount:layoutEdges.length,
+    visibleEdgeCount:prunedEdges.length,
     heroCount:0,
     sampled:false,
   }
@@ -50108,7 +56919,7 @@ function buildStaticGraphLayout(fullLayout){
       counts:{community:0,document:0,entity:0},
       communities:Array.isArray(base?.communities)?base.communities:[],
       totalNodeCount:totalNodes,
-      totalEdgeCount:Number(base?.edges?.length||0),
+      totalEdgeCount:Number(base?.totalEdgeCount||base?.allEdges?.length||base?.edges?.length||0),
       visibleNodeCount:0,
       visibleEdgeCount:0,
       heroCount:0,
@@ -50166,7 +56977,8 @@ function buildStaticGraphLayout(fullLayout){
     return next;
   });
   const itemById=new Map(items.map(item=>[String(item.id),item]));
-  const edges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const rawEdges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_STATIC_EDGE_LIMIT,16);
   const geometry=computeGraphBounds(items);
   const counts={community:0,document:0,entity:0};
   items.forEach(item=>{
@@ -50178,6 +56990,7 @@ function buildStaticGraphLayout(fullLayout){
     items,
     itemById,
     edges,
+    allEdges:rawEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -50187,7 +57000,7 @@ function buildStaticGraphLayout(fullLayout){
     counts,
     communities:Array.isArray(base.communities)?base.communities:[],
     totalNodeCount:totalNodes,
-    totalEdgeCount:Number(base.edges?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
     visibleNodeCount:items.length,
     visibleEdgeCount:edges.length,
     heroCount,
@@ -50195,20 +57008,155 @@ function buildStaticGraphLayout(fullLayout){
     labelIds,
   };
 }
+function graphAdjacency(layout){
+  const adjacency=new Map();
+  for(const item of layout?.items||[])adjacency.set(String(item.id||''),[]);
+  for(const edge of layout?.allEdges||layout?.edges||[]){
+    const s=String(edge?.source||''),t=String(edge?.target||'');
+    if(!adjacency.has(s)||!adjacency.has(t))continue;
+    adjacency.get(s).push({id:t,edge});
+    adjacency.get(t).push({id:s,edge});
+  }
+  for(const [id,list] of adjacency.entries()){
+    list.sort((a,b)=>edgeRank(b.edge,layout.itemById)-edgeRank(a.edge,layout.itemById));
+  }
+  return adjacency;
+}
+function buildFocusGraphLayout(fullLayout,focusId){
+  const base=fullLayout&&typeof fullLayout==='object'?fullLayout:null;
+  const selected=String(focusId||'').trim();
+  if(!base||!selected||!base.itemById?.has(selected))return null;
+  const focus=base.itemById.get(selected);
+  const adjacency=graphAdjacency(base);
+  const selectedIds=new Set([selected]);
+  const distance=new Map([[selected,0]]);
+  const firstHop=(adjacency.get(selected)||[]).slice(0,Math.max(18,Math.min(58,GRAPH_FOCUS_NODE_LIMIT-1)));
+  for(const row of firstHop){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    selectedIds.add(String(row.id));
+    distance.set(String(row.id),1);
+  }
+  const secondCandidates=[];
+  for(const row of firstHop){
+    for(const next of adjacency.get(String(row.id))||[]){
+      const id=String(next.id||'');
+      if(!id||selectedIds.has(id))continue;
+      secondCandidates.push({id,rank:edgeRank(next.edge,base.itemById)+(Number(base.itemById.get(id)?.score||0)*0.12)});
+    }
+  }
+  secondCandidates.sort((a,b)=>Number(b.rank||0)-Number(a.rank||0));
+  for(const row of secondCandidates){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    if(distance.get(row.id)!==undefined)continue;
+    selectedIds.add(row.id);
+    distance.set(row.id,2);
+    if([...distance.values()].filter(v=>Number(v)===2).length>=GRAPH_FOCUS_SECOND_HOP_LIMIT)break;
+  }
+  const selectedItems=(base.items||[]).filter(item=>selectedIds.has(String(item.id||'')));
+  const focusX=Number(focus.x||0),focusY=Number(focus.y||0),focusZ=Number(focus.z||0);
+  const ringCounts={1:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===1).length),2:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===2).length)};
+  const ringIndex={1:0,2:0};
+  const items=cloneLayoutItems(selectedItems,item=>{
+    const id=String(item.id||'');
+    const d=Number(distance.get(id)||0);
+    if(d===0){
+      return {
+        x:0,y:0,z:0,
+        focusDistance:0,
+        radius2d:Number(item.radius2d||4)*1.86,
+        radius3d:Number(item.radius3d||3)*1.65,
+        hero:true,
+        focusPrimary:true,
+      };
+    }
+    const idx=ringIndex[d]++;
+    const count=ringCounts[d]||1;
+    const angle=(Math.PI*2*idx/count)+GOLDEN_ANGLE*(hashText(id)%17)*0.08;
+    const baseRadius=d===1?86:158;
+    const scoreLift=Math.min(24,Math.log1p(Math.max(0,Number(item.score||0)))*6);
+    const spread=baseRadius+scoreLift+(signedHashUnit(id)*13);
+    const pullX=(Number(item.x||0)-focusX)*0.10;
+    const pullY=(Number(item.y||0)-focusY)*0.10;
+    const pullZ=(Number(item.z||0)-focusZ)*0.12;
+    return {
+      x:Math.cos(angle)*spread+pullX,
+      y:Math.sin(angle)*spread*0.82+pullY,
+      z:Math.sin(angle*1.7)*spread*0.35+pullZ,
+      focusDistance:d,
+      radius2d:Number(item.radius2d||3)*(d===1?1.28:0.96),
+      radius3d:Number(item.radius3d||2)*(d===1?1.20:0.92),
+      hero:d===1&&Number(item.score||0)>=Number(focus.score||0)*0.45,
+      focusPrimary:false,
+    };
+  });
+  const itemById=new Map(items.map(item=>[String(item.id),item]));
+  const rawEdges=(base.allEdges||base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>{
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const near=s===selected||t===selected;
+    return {
+      ...edge,
+      alpha:near?Math.max(0.22,Number(edge.alpha||0.16)):Math.min(0.18,Number(edge.alpha||0.12)),
+      width:near?Math.max(1.25,Number(edge.width||1)+0.45):Math.max(0.65,Number(edge.width||1)*0.82),
+    };
+  });
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_FOCUS_EDGE_LIMIT,24,selected);
+  const labelIds=new Set([selected]);
+  items
+    .filter(item=>Number(item.focusDistance||0)<=1)
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+    .slice(0,24)
+    .forEach(item=>labelIds.add(String(item.id||'')));
+  return layoutFromItems(base,items,edges,`${String(base.signature||'graph')}::focus::${selected}::${items.length}/${edges.length}`,{
+    totalNodeCount:Number(base.totalNodeCount||base.items?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
+    visibleNodeCount:items.length,
+    visibleEdgeCount:edges.length,
+    heroCount:Math.max(1,labelIds.size),
+    sampled:items.length<Number(base.items?.length||0),
+    labelIds,
+    focusId:selected,
+    focusLabel:String(focus.label||selected),
+  });
+}
 function getGraphLayout(force=false,view='auto'){
-  const target=(view==='3d'||view==='json'||view==='full')?'full':'static';
+  const target=(view==='3d'||view==='focus3d'||view==='json'||view==='full')?'full':(view==='focus'?'focus':'static');
   const sig=graphSignature(S.graph||{});
   if(force||!G.layouts||G.layouts.signature!==sig){
-    G.layouts={signature:sig,full:null,static:null};
+    G.layouts={signature:sig,full:null,static:null,focusKey:'',focus:null};
     G.layout=null;
     G.renderKey=sig;
     G.screenNodes=[];
     G.hoverId='';
+    G.selectedNodeId='';
+    G.focusMode=false;
     G.three.graphKey='';
+    resetGraphViewport();
   }
   if(!G.layouts.full)G.layouts.full=buildGraphLayout(S.graph||{});
   if(!G.layouts.static)G.layouts.static=buildStaticGraphLayout(G.layouts.full);
-  G.layout=G.layouts[target]||G.layouts.full;
+  if(target==='focus'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.static;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.static;
+    }
+  }else if(view==='focus3d'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.full;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.full;
+    }
+  }else G.layout=G.layouts[target]||G.layouts.full;
   return G.layout;
 }
 function setGraphRuntime(text,bad=false){
@@ -50217,16 +57165,23 @@ function setGraphRuntime(text,bad=false){
   setChip('graphRuntimeTag',label,bad);
 }
 function setGraphOverlay(){
-  const layout=getGraphLayout(false,G.mode==='3d'||G.mode==='json'?'full':'static');
+  const layout=G.mode==='3d'
+    ? activeGraphLayoutFor3D()
+    : (G.mode==='static'?activeGraphLayoutFor2D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const active=layout.itemById.get(String(G.hoverId||''))||null;
   let text='';
   if(G.mode==='static'){
-    text='Static 2D: simplified top-frequency layout.';
+    text=G.focusMode?'Static 2D: focused neighborhood.':'Static 2D: global overview.';
     if(layout.sampled)text+=` sample ${Number(layout.visibleNodeCount||0)}/${Number(layout.totalNodeCount||0)} nodes, top ${Number(layout.heroCount||0)} highlighted.`;
-  }else if(G.mode==='3d')text='3D View: local three.js, render-on-demand only, camera auto-fits graph span.';
+    text+=' Click node to focus. Drag to pan. Wheel to zoom. Click blank to return.';
+  }else if(G.mode==='3d')text=G.focusMode?'3D View: focused neighborhood, render-on-demand.':'3D View: global overview, render-on-demand.';
   else text='JSON: raw graph payload for audit and debugging.';
-  text+=` nodes=${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  text+=` nodes=${Number(layout.visibleNodeCount||0)}/${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(layout.visibleEdgeCount||0)}/${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  if(G.focusMode&&String(G.selectedNodeId||'')){
+    const focus=fullLayout.itemById.get(String(G.selectedNodeId||''))||layout.itemById.get(String(G.selectedNodeId||''));
+    if(focus)text+=`\\nFocus: ${String(focus.label||focus.id||'')}`;
+  }
   if(active){
     const node=active.node||{};
     const extra=[active.type,active.label];
@@ -50235,7 +57190,7 @@ function setGraphOverlay(){
     if(String(node.kind||'').trim())extra.push(`kind=${String(node.kind)}`);
     text+=`\\n${extra.join(' • ')}`
   }else if(G.mode==='3d'){
-    text+='\\nDrag to orbit. Wheel to zoom. Static frame does not keep rendering.'
+    text+='\\nClick node to focus. Click blank to return. Drag to orbit. Wheel to zoom.'
   }
   const el=E('graphOverlay');
   if(el)el.textContent=text;
@@ -50257,13 +57212,14 @@ function applyGraphModeAvailability(){
   if(G.mode==='3d'&&!available)G.mode='static';
 }
 function renderGraphLegend(){
-  const layout=getGraphLayout(false,G.mode==='static'?'static':'full');
+  const layout=G.mode==='static'?activeGraphLayoutFor2D():(G.mode==='3d'?activeGraphLayoutFor3D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const communities=Object.entries(S.graph?.communities||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
   const chips=[
     {label:G.mode==='static'&&layout.sampled?`Communities ${layout.counts.community}/${fullLayout.counts.community}`:`Communities ${fullLayout.counts.community}`,color:communityHex('community')},
     {label:G.mode==='static'&&layout.sampled?`Documents ${layout.counts.document}/${fullLayout.counts.document}`:`Documents ${fullLayout.counts.document}`,color:mixHex(communityHex('document'),0x13231d,0.18)},
     {label:G.mode==='static'&&layout.sampled?`Entities ${layout.counts.entity}/${fullLayout.counts.entity}`:`Entities ${fullLayout.counts.entity}`,color:mixHex(communityHex('entity'),0xffffff,0.26)},
+    ...(G.focusMode?[{label:`Focus ${Number(layout.visibleNodeCount||0)} nodes`,color:0x173122}]:[]),
     ...communities.map(([name,count])=>({label:`${name} ${count}`,color:communityHex(name)})),
   ];
   const legend=E('graphLegend');
@@ -50307,47 +57263,228 @@ function ensureCanvasMetrics(){
   }
   return {canvas,ctx:canvas.getContext('2d'),width,height,dpr}
 }
-function projectGraphTo2D(layout,width,height){
-  const pad=48;
+function resetGraphViewport(){
+  G.viewport={x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1,minScale:0.1,maxScale:8};
+  G.animation={active:false,started:0,duration:420,from:null,to:null,reason:''};
+}
+function computeGraphFitViewport(layout,width,height,pad=56){
   const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
   const dy=Math.max(1,Number(layout.bounds.maxY||0)-Number(layout.bounds.minY||0));
-  const scale=Math.max(0.1,Math.min((width-pad*2)/dx,(height-pad*2)/dy));
+  const usableW=Math.max(80,width-pad*2);
+  const usableH=Math.max(80,height-pad*2);
+  const fitScale=Math.max(0.08,Math.min(usableW/dx,usableH/dy));
   const cx=(Number(layout.bounds.minX||0)+Number(layout.bounds.maxX||0))/2;
   const cy=(Number(layout.bounds.minY||0)+Number(layout.bounds.maxY||0))/2;
+  return {
+    x:width/2-cx*fitScale,
+    y:height/2-cy*fitScale,
+    scale:fitScale,
+    fitScale,
+    minScale:fitScale*GRAPH_ZOOM_MIN_FACTOR,
+    maxScale:Math.max(fitScale*GRAPH_ZOOM_MAX_FACTOR,fitScale+0.1),
+  };
+}
+function graphWorldToScreen(item,viewport){
+  const vp=viewport||G.viewport||{x:0,y:0,scale:1};
+  return {
+    sx:Number(vp.x||0)+Number(item.x||0)*Number(vp.scale||1),
+    sy:Number(vp.y||0)+Number(item.y||0)*Number(vp.scale||1),
+  };
+}
+function beginGraphViewportAnimation(to,reason='view',duration=420){
+  const current=G.viewport||{x:0,y:0,scale:1};
+  const next={
+    ...current,
+    ...to,
+    targetX:Number(to.x??to.targetX??current.x??0),
+    targetY:Number(to.y??to.targetY??current.y??0),
+    targetScale:Number(to.scale??to.targetScale??current.scale??1),
+  };
+  G.animation={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(80,Number(duration||420)),
+    from:{x:Number(current.x||0),y:Number(current.y||0),scale:Number(current.scale||1)},
+    to:{x:Number(next.targetX||0),y:Number(next.targetY||0),scale:Number(next.targetScale||1)},
+    reason,
+  };
+  Object.assign(G.viewport,next);
+  requestAnimationFrame(()=>drawGraph2D(reason));
+}
+function easeGraph(t){
+  const x=clamp(t,0,1);
+  return x<0.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+}
+function currentGraphViewport(){
+  const vp=G.viewport||{x:0,y:0,scale:1};
+  if(!G.animation?.active)return vp;
+  const t=(performance.now()-Number(G.animation.started||0))/Math.max(1,Number(G.animation.duration||1));
+  if(t>=1){
+    vp.x=Number(G.animation.to?.x||vp.x||0);
+    vp.y=Number(G.animation.to?.y||vp.y||0);
+    vp.scale=Number(G.animation.to?.scale||vp.scale||1);
+    G.animation.active=false;
+    return vp;
+  }
+  const k=easeGraph(t);
+  const from=G.animation.from||vp;
+  const to=G.animation.to||vp;
+  return {
+    ...vp,
+    x:Number(from.x||0)+(Number(to.x||0)-Number(from.x||0))*k,
+    y:Number(from.y||0)+(Number(to.y||0)-Number(from.y||0))*k,
+    scale:Number(from.scale||1)+(Number(to.scale||1)-Number(from.scale||1))*k,
+  };
+}
+function fitGraphViewport(layout,width,height,reason='fit',animated=true){
+  const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+  const current=G.viewport||{};
+  const to={
+    ...current,
+    x:fit.x,
+    y:fit.y,
+    scale:fit.scale,
+    fitScale:fit.fitScale,
+    minScale:fit.minScale,
+    maxScale:fit.maxScale,
+  };
+  if(animated)beginGraphViewportAnimation(to,reason,G.focusMode?480:420);
+  else{
+    G.viewport={...to,targetX:to.x,targetY:to.y,targetScale:to.scale};
+    if(G.animation)G.animation.active=false;
+  }
+}
+function syncGraphViewportForLayout(layout,width,height,reason='draw'){
+  const key=`${String(layout.signature||'')}::${width}x${height}`;
+  if(G.lastLayoutView!==key){
+    const animated=Boolean(G.lastLayoutView)&&String(reason||'')!=='resize';
+    G.lastLayoutView=key;
+    fitGraphViewport(layout,width,height,reason,animated);
+  }else{
+    const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+    G.viewport.fitScale=fit.fitScale;
+    G.viewport.minScale=fit.minScale;
+    G.viewport.maxScale=fit.maxScale;
+    G.viewport.scale=clamp(Number(G.viewport.scale||fit.scale),fit.minScale,fit.maxScale);
+  }
+}
+function activeGraphLayoutFor2D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus'):getGraphLayout(false,'static');
+}
+function activeGraphLayoutFor3D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus3d'):getGraphLayout(false,'full');
+}
+function projectGraphTo2D(layout,width,height,viewport){
+  const vp=viewport||G.viewport||computeGraphFitViewport(layout,width,height);
   return layout.items.map(item=>({
     ...item,
-    sx:width/2+(Number(item.x||0)-cx)*scale,
-    sy:height/2+(Number(item.y||0)-cy)*scale,
-    sr:Number(item.radius2d||3),
+    ...graphWorldToScreen(item,vp),
+    sr:Math.max(2.6,Number(item.radius2d||3)*Math.sqrt(Math.max(0.32,Number(vp.scale||1)/Math.max(0.001,Number(vp.fitScale||vp.scale||1))))),
   }))
+}
+function graphCanvasPoint(clientX,clientY){
+  const canvas=E('graphCanvas2d');
+  if(!canvas)return {x:0,y:0};
+  const rect=canvas.getBoundingClientRect();
+  return {x:Number(clientX||0)-rect.left,y:Number(clientY||0)-rect.top};
+}
+function zoomGraph2DAt(clientX,clientY,deltaY){
+  const layout=activeGraphLayoutFor2D();
+  const metrics=ensureCanvasMetrics();
+  if(!metrics||!layout)return;
+  syncGraphViewportForLayout(layout,metrics.width,metrics.height,'zoom');
+  const point=graphCanvasPoint(clientX,clientY);
+  const vp=G.viewport;
+  const oldScale=Math.max(0.001,Number(vp.scale||1));
+  const factor=Number(deltaY||0)>0?0.88:1.14;
+  const nextScale=clamp(oldScale*factor,Number(vp.minScale||oldScale*0.2),Number(vp.maxScale||oldScale*8));
+  const wx=(point.x-Number(vp.x||0))/oldScale;
+  const wy=(point.y-Number(vp.y||0))/oldScale;
+  vp.scale=nextScale;
+  vp.x=point.x-wx*nextScale;
+  vp.y=point.y-wy*nextScale;
+  vp.targetX=vp.x;vp.targetY=vp.y;vp.targetScale=vp.scale;
+  if(G.animation)G.animation.active=false;
+  drawGraph2D('zoom');
+}
+function focusGraphNode(id){
+  const next=String(id||'').trim();
+  const full=getGraphLayout(false,'full');
+  if(!next||!full.itemById.has(next)){
+    return clearGraphFocus();
+  }
+  if(String(G.selectedNodeId||'')===next&&G.focusMode)return;
+  G.selectedNodeId=next;
+  G.focusMode=true;
+  G.hoverId=next;
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D('focus');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D('focus').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
+}
+function clearGraphFocus(){
+  const had=Boolean(G.focusMode||String(G.selectedNodeId||''));
+  G.focusMode=false;
+  G.selectedNodeId='';
+  G.hoverId='';
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D(had?'return':'idle');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D(had?'return':'idle').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
 }
 function drawGraph2D(reason='draw'){
   const metrics=ensureCanvasMetrics();
   if(!metrics||G.mode!=='static')return;
   const {ctx,width,height,dpr}=metrics;
-  const layout=getGraphLayout(false,'static');
-  const nodes=projectGraphTo2D(layout,width,height);
+  const layout=activeGraphLayoutFor2D();
+  syncGraphViewportForLayout(layout,width,height,reason);
+  const viewport=currentGraphViewport();
+  const nodes=projectGraphTo2D(layout,width,height,viewport);
   G.screenNodes=nodes;
   const byId=new Map(nodes.map(row=>[row.id,row]));
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,metrics.canvas.width,metrics.canvas.height);
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.lineCap='round';
+  ctx.lineJoin='round';
   for(const edge of layout.edges){
     const a=byId.get(edge.source),b=byId.get(edge.target);
     if(!a||!b)continue;
+    const selected=String(G.selectedNodeId||'');
     const hot=String(G.hoverId||'')&&(G.hoverId===edge.source||G.hoverId===edge.target);
+    const selectedEdge=selected&&(selected===edge.source||selected===edge.target);
     ctx.beginPath();
     ctx.moveTo(a.sx,a.sy);
-    ctx.lineTo(b.sx,b.sy);
-    ctx.strokeStyle=rgbaFromHex(edge.colorHex,hot?Math.min(0.42,Number(edge.alpha||0.16)+0.14):Number(edge.alpha||0.16));
-    ctx.lineWidth=hot?Number(edge.width||1)+0.7:Number(edge.width||1);
+    const mx=(a.sx+b.sx)/2;
+    const my=(a.sy+b.sy)/2;
+    const bend=G.focusMode?0.04:0.025;
+    ctx.quadraticCurveTo(mx+(b.sy-a.sy)*bend,my-(b.sx-a.sx)*bend,b.sx,b.sy);
+    const alphaBase=Number(edge.alpha||0.12);
+    const alpha=selectedEdge?Math.min(0.44,alphaBase+0.16):(hot?Math.min(0.36,alphaBase+0.10):Math.min(0.18,alphaBase));
+    ctx.strokeStyle=rgbaFromHex(edge.colorHex,alpha);
+    ctx.lineWidth=Math.max(0.45,(hot||selectedEdge)?Number(edge.width||1)+0.65:Number(edge.width||1)*0.72);
     ctx.stroke();
   }
   const order={entity:0,document:1,community:2};
   nodes.sort((a,b)=>(Number(order[a.type]||0)-Number(order[b.type]||0))||(Number(a.sr||0)-Number(b.sr||0)));
   for(const node of nodes){
     const hot=String(G.hoverId||'')===String(node.id);
+    const selected=String(G.selectedNodeId||'')===String(node.id);
+    const focusDist=Number(node.focusDistance ?? 3);
+    const dim=G.focusMode&&!selected&&focusDist>1;
+    const aura=selected?10:(hot?6:0);
+    if(aura){
+      ctx.beginPath();
+      ctx.arc(node.sx,node.sy,node.sr+aura,0,Math.PI*2);
+      ctx.fillStyle=rgbaFromHex(node.colorHex,selected?0.22:0.14);
+      ctx.fill();
+    }
     if(hot){
       ctx.beginPath();
       ctx.arc(node.sx,node.sy,node.sr+5,0,Math.PI*2);
@@ -50355,11 +57492,11 @@ function drawGraph2D(reason='draw'){
       ctx.fill();
     }
     ctx.beginPath();
-    ctx.arc(node.sx,node.sy,node.sr+(hot?1.5:0),0,Math.PI*2);
-    ctx.fillStyle=rgbaFromHex(node.colorHex,node.type==='entity'?0.82:0.94);
+    ctx.arc(node.sx,node.sy,node.sr+(selected?2.7:(hot?1.7:0)),0,Math.PI*2);
+    ctx.fillStyle=rgbaFromHex(node.colorHex,dim?0.55:(node.type==='entity'?0.88:0.97));
     ctx.fill();
-    ctx.strokeStyle=hot?'rgba(21,35,28,0.92)':'rgba(255,255,255,0.74)';
-    ctx.lineWidth=hot?2.2:(node.type==='community'?1.4:0.75);
+    ctx.strokeStyle=selected?'rgba(21,35,28,0.96)':(hot?'rgba(21,35,28,0.88)':'rgba(255,255,255,0.82)');
+    ctx.lineWidth=selected?2.8:(hot?2.0:(node.type==='community'?1.5:0.9));
     ctx.stroke();
   }
   ctx.font='12px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -50369,8 +57506,13 @@ function drawGraph2D(reason='draw'){
   nodes
     .filter(node=>labelIds.has(String(node.id||'')))
     .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
-    .slice(0,Math.max(16,Number(layout.heroCount||0)))
-    .forEach(node=>ctx.fillText(node.label,node.sx+node.sr+6,node.sy-node.sr-6));
+    .slice(0,Math.max(G.focusMode?24:16,Number(layout.heroCount||0)))
+    .forEach(node=>{
+      const label=String(node.label||'');
+      const maxChars=G.focusMode?34:26;
+      ctx.fillStyle=String(G.selectedNodeId||'')===String(node.id)?'rgba(21,35,28,0.96)':'rgba(23,49,34,0.74)';
+      ctx.fillText(label.length>maxChars?`${label.slice(0,maxChars-1)}...`:label,node.sx+node.sr+7,node.sy-node.sr-7);
+    });
   const active=byId.get(String(G.hoverId||''))||null;
   if(active){
     ctx.font='13px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -50380,6 +57522,7 @@ function drawGraph2D(reason='draw'){
   setChip('graphPerfTag','zero-idle');
   setGraphRuntime(`2d ${reason}`);
   setGraphOverlay();
+  if(G.animation?.active)requestAnimationFrame(()=>drawGraph2D(String(G.animation.reason||reason||'animate')));
 }
 function findGraphNodeAt(clientX,clientY){
   const canvas=E('graphCanvas2d');
@@ -50445,7 +57588,7 @@ function disposeThreeObject(obj){
 }
 function updateThreeCamera(){
   if(!G.three.camera)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const cx=Number(layout.center?.x||0);
   const cy=Number(layout.center?.y||0);
   const cz=Number(layout.center?.z||0);
@@ -50473,14 +57616,14 @@ function fitThreeCameraToLayout(resetDistance=false){
   const host=E('graph3dHost');
   const rect=host?host.getBoundingClientRect():{width:1,height:1};
   const aspect=Math.max(0.75,Number(rect.width||1)/Math.max(1,Number(rect.height||1)));
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const fitDistance=computeThreeFitDistance(layout,aspect);
   const radius=Math.max(24,Number(layout.radius||24));
   G.three.fitDistance=fitDistance;
   G.three.minDistance=Math.max(92,fitDistance*0.16);
   G.three.maxDistance=Math.max(3200,fitDistance*8.8);
   if(resetDistance||!Number.isFinite(G.three.distance)||G.three.distance<G.three.minDistance||G.three.distance>G.three.maxDistance){
-    G.three.distance=fitDistance;
+    G.three.distance=resetDistance&&Number.isFinite(G.three.distance)?G.three.distance+(fitDistance-G.three.distance)*0.72:fitDistance;
   }else{
     G.three.distance=clamp(G.three.distance,G.three.minDistance,G.three.maxDistance);
   }
@@ -50522,6 +57665,18 @@ function applyThreeHover(id){
   }
   scheduleThreeRender('hover');
 }
+function applyThreeFocusStyles(){
+  const selected=String(G.selectedNodeId||'');
+  for(const [id,mesh] of G.three.meshes.entries()){
+    const baseScale=Number(mesh.userData?.baseScale||1);
+    const baseColor=Number(mesh.userData?.baseColor||0x607565);
+    const baseOpacity=Number(mesh.userData?.baseOpacity||0.95);
+    const active=selected&&String(id)===selected;
+    mesh.scale.setScalar(baseScale*(active?1.38:1));
+    mesh.material.opacity=active?1:baseOpacity;
+    mesh.material.color.setHex(active?mixHex(baseColor,0xffffff,0.16):baseColor);
+  }
+}
 function pickThreeNode(ev){
   if(!G.three.renderer||!G.three.camera||!G.three.raycaster||!G.three.meshes.size)return '';
   const rect=G.three.renderer.domElement.getBoundingClientRect();
@@ -50547,7 +57702,7 @@ function resizeThreeRenderer(){
 function buildThreeSceneGraph(){
   const THREE=G.three.lib;
   if(!THREE||!G.three.root)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   while(G.three.root.children.length){
     const child=G.three.root.children.pop();
     disposeThreeObject(child);
@@ -50573,12 +57728,12 @@ function buildThreeSceneGraph(){
     const geometry=new THREE.BufferGeometry();
     geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
     geometry.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
-    const opacity=kind==='related'?0.32:(kind==='mentions'?0.18:0.14);
+    const opacity=kind==='related'?(G.focusMode?0.26:0.22):(kind==='mentions'?(G.focusMode?0.16:0.12):0.10);
     const material=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity,depthWrite:false});
     G.three.root.add(new THREE.LineSegments(geometry,material));
   });
   layout.items.forEach(item=>{
-    const opacity=item.type==='entity'?0.86:0.95;
+    const opacity=item.type==='entity'?0.90:0.97;
     const material=new THREE.MeshBasicMaterial({color:Number(item.colorHex||0x607565),transparent:true,opacity});
     const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
     mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
@@ -50588,6 +57743,7 @@ function buildThreeSceneGraph(){
     G.three.meshes.set(String(item.id),mesh);
   });
   fitThreeCameraToLayout(true);
+  applyThreeFocusStyles();
   G.three.graphKey=layout.signature;
 }
 async function ensureThreeRenderer(){
@@ -50605,7 +57761,7 @@ async function ensureThreeRenderer(){
     host.innerHTML='';
     host.appendChild(G.three.renderer.domElement);
   }
-  if(G.three.graphKey!==getGraphLayout(false,'full').signature)buildThreeSceneGraph();
+  if(G.three.graphKey!==activeGraphLayoutFor3D().signature)buildThreeSceneGraph();
   resizeThreeRenderer();
 }
 function bindThreeEvents(){
@@ -50617,6 +57773,9 @@ function bindThreeEvents(){
     G.three.dragging=true;
     G.three.lastX=Number(ev.clientX||0);
     G.three.lastY=Number(ev.clientY||0);
+    G.three.clickStartX=G.three.lastX;
+    G.three.clickStartY=G.three.lastY;
+    G.three.moved=false;
     host.classList.add('dragging');
     try{host.setPointerCapture(ev.pointerId)}catch{}
   });
@@ -50627,6 +57786,7 @@ function bindThreeEvents(){
       const dy=Number(ev.clientY||0)-G.three.lastY;
       G.three.lastX=Number(ev.clientX||0);
       G.three.lastY=Number(ev.clientY||0);
+      if(Math.abs(Number(ev.clientX||0)-Number(G.three.clickStartX||0))+Math.abs(Number(ev.clientY||0)-Number(G.three.clickStartY||0))>5)G.three.moved=true;
       G.three.azimuth+=dx*0.01;
       G.three.elevation=clamp(G.three.elevation-dy*0.008,-1.2,1.2);
       scheduleThreeRender('drag');
@@ -50635,10 +57795,17 @@ function bindThreeEvents(){
     const hit=pickThreeNode(ev);
     if(String(hit||'')!==String(G.hoverId||''))applyThreeHover(hit);
   });
-  const finishDrag=()=>{
+  const finishDrag=ev=>{
     if(!G.three.dragging)return;
+    const wasClick=!G.three.moved;
     G.three.dragging=false;
     host.classList.remove('dragging');
+    if(wasClick&&ev){
+      const hit=pickThreeNode(ev);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
+      return;
+    }
     scheduleThreeRender('idle');
   };
   host.addEventListener('pointerup',finishDrag);
@@ -50685,25 +57852,76 @@ function setGraphMode(mode){
     return;
   }
   G.mode=target;
+  if(G.animation)G.animation.active=false;
   syncGraphStage();
   if(target==='json')renderGraphJson();
-  else if(target==='3d')renderGraph3D('mode-switch').catch(err=>{
+  else if(target==='3d'){renderGraphLegend();renderGraph3D('mode-switch').catch(err=>{
     G.mode='static';
     syncGraphStage();
     drawGraph2D('fallback');
     setGraphRuntime(err.message,true);
-  });
-  else drawGraph2D('mode-switch');
+  });}
+  else {renderGraphLegend();drawGraph2D('mode-switch');}
 }
 function initGraphUi(){
   if(G.bound)return;
   G.bound=true;
   const canvas=E('graphCanvas2d');
   if(canvas){
-    canvas.addEventListener('mousemove',ev=>{
+    canvas.addEventListener('pointerdown',ev=>{
       if(G.mode!=='static')return;
+      const point=graphCanvasPoint(ev.clientX,ev.clientY);
+      G.dragging2d=true;
+      G.pointerMoved=false;
+      G.pointerDownX=point.x;
+      G.pointerDownY=point.y;
+      G.dragStartX=Number(ev.clientX||0);
+      G.dragStartY=Number(ev.clientY||0);
+      G.dragOriginX=Number(G.viewport?.x||0);
+      G.dragOriginY=Number(G.viewport?.y||0);
+      if(G.animation)G.animation.active=false;
+      try{canvas.setPointerCapture(ev.pointerId)}catch{}
+    });
+    canvas.addEventListener('pointermove',ev=>{
+      if(G.mode!=='static')return;
+      if(G.dragging2d){
+        const dx=Number(ev.clientX||0)-Number(G.dragStartX||0);
+        const dy=Number(ev.clientY||0)-Number(G.dragStartY||0);
+        if(Math.abs(dx)+Math.abs(dy)>4)G.pointerMoved=true;
+        G.viewport.x=Number(G.dragOriginX||0)+dx;
+        G.viewport.y=Number(G.dragOriginY||0)+dy;
+        G.viewport.targetX=G.viewport.x;
+        G.viewport.targetY=G.viewport.y;
+        drawGraph2D('pan');
+        return;
+      }
       const hit=findGraphNodeAt(ev.clientX,ev.clientY);
       if(String(hit||'')!==String(G.hoverId||'')){G.hoverId=String(hit||'');drawGraph2D('hover')}
+    });
+    const finishPointer=ev=>{
+      if(G.mode!=='static'||!G.dragging2d)return;
+      G.dragging2d=false;
+      if(!G.pointerMoved){
+        const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+        if(hit)focusGraphNode(hit);
+        else clearGraphFocus();
+      }else{
+        drawGraph2D('idle');
+      }
+    };
+    canvas.addEventListener('pointerup',finishPointer);
+    canvas.addEventListener('pointercancel',()=>{G.dragging2d=false;drawGraph2D('idle')});
+    canvas.addEventListener('wheel',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      zoomGraph2DAt(ev.clientX,ev.clientY,ev.deltaY);
+    },{passive:false});
+    canvas.addEventListener('dblclick',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
     });
     canvas.addEventListener('mouseleave',()=>{if(G.mode==='static')clearGraphHover()});
   }
@@ -50729,9 +57947,9 @@ function renderGraph(force=false){
   if(view)view.textContent=JSON.stringify(graph,null,2);
   getGraphLayout(force,'full');
   getGraphLayout(force,'static');
-  renderGraphLegend();
   applyGraphModeAvailability();
   syncGraphStage();
+  renderGraphLegend();
   if(G.mode==='json')renderGraphJson();
   else if(G.mode==='3d')renderGraph3D(force?'refresh':'data').catch(err=>{
     G.mode='static';
@@ -50740,6 +57958,7 @@ function renderGraph(force=false){
     setGraphRuntime(err.message,true);
   });
   else drawGraph2D(force?'refresh':'data');
+  renderGraphLegend();
 }
 function renderFilesystem(){
   E('fsView').textContent=JSON.stringify(S.filesystem||{},null,2);
@@ -50750,6 +57969,7 @@ function renderQuery(){
   const routeMeta=S.query?.route_meta||{};
   const routeParts=[];
   if(route)routeParts.push(`Route: ${route}${requested&&requested!==route?` (requested ${requested})`:''}`);
+  if(S.query?.evidence_status)routeParts.push(`Evidence: ${S.query.evidence_status} · confidence=${Number(S.query.confidence||0).toFixed(2)} · budget=${S.query?.context_budget?.mode||routeMeta?.context_budget||''}`);
   if(Array.isArray(routeMeta?.selected_communities)&&routeMeta.selected_communities.length)routeParts.push(`Communities: ${routeMeta.selected_communities.join(', ')}`);
   if(routeMeta?.reduce_mode)routeParts.push(`Global path: ${routeMeta.reduce_mode}`);
   if(Array.isArray(routeMeta?.reasons)&&routeMeta.reasons.length)routeParts.push(`Signals: ${routeMeta.reasons.join(', ')}`);
@@ -50767,7 +57987,7 @@ async function refreshAll(){
     api('/api/rag/filesystem'),
   ]);
   S.config=config; S.library=library; S.tasks=tasks.tasks||[]; S.graph=graph; S.filesystem=filesystem;
-  renderSessions(); renderStats(); renderDocs(); renderTasks(); renderGraph(); renderFilesystem();
+  renderSessions(); renderStats(); renderDocs(); renderTasks(); renderGraph(); renderFilesystem(); renderEmbedModelSelect();
 }
 async function runImportPath(){
   setChip('importStatus','running');
@@ -50817,7 +58037,7 @@ async function runImportText(){
 }
 async function runQuery(){
   setChip('queryStatus','running');
-  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||8),route:selectedQueryRoute(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked)})});
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
   S.query=out; renderQuery(); setChip('queryStatus','done');
 }
 async function rebuildIndex(){
@@ -50844,6 +58064,8 @@ CODE_ADMIN_INDEX_HTML = (
     .replace("Clouds Coder RAG Admin", "Clouds Coder Code Library Admin")
     .replace("/assets/rag-admin.js", "/assets/code-admin.js")
     .replace("TF-Graph_IDF RAG Admin", "Code Graph Library Admin")
+    .replace('<option value="raw">Raw Hybrid</option>', '<option value="workflow">Workflow</option>\n              <option value="raw">Raw Hybrid</option>')
+    .replace('<option value="wiki">Wiki</option>', '<option value="wiki">Code Wiki</option>')
     .replace(
         "Global knowledge library, graph view, batch import, backup, and retrieval control.",
         "Independent code library, repository graph view, batch import, backup, and developer retrieval control.",
@@ -50886,6 +58108,15 @@ CODE_ADMIN_JS = (
     .replace("No query results.", "No code library results.")
 )
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 7: Application orchestration, runtime services, and UI integration.
+# 第七层：应用编排、运行时服务与界面集成。
+# 第7層：アプリケーション編成、ランタイムサービス、UI 統合。
+# ============================================================================
+
+# Runtime composition root: wires models, skills, session managers, storage,
+# background services, and the browser-facing admin/chat surfaces together.
 class AppContext:
     def _discover_external_code_source_roots(self) -> list[str]:
         home = Path.home()
@@ -51059,11 +58290,24 @@ class AppContext:
             self.rag_root,
             include_filename_entities=self.rag_include_filename_entities,
         )
-        self.rag_service = RAGIngestionService(self.rag_store, self.rag_parser, session_resolver=self._resolve_session_for_user)
+        self.rag_wiki = WikiStore(self.rag_root, kind="knowledge")
+        self.rag_service = RAGIngestionService(
+            self.rag_store,
+            self.rag_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.rag_wiki,
+        )
         self.code_parser = CodeContentParser()
         self.code_root = self.workspace / CODE_LIBRARY_DIRNAME
         self.code_store = CodeLibraryStore(self.code_root)
-        self.code_service = CodeIngestionService(self.code_store, self.code_parser, session_resolver=self._resolve_session_for_user)
+        self.code_wiki = WikiStore(self.code_root, kind="code")
+        self.workflow_memory = WorkflowMemoryStore(self.code_root)
+        self.code_service = CodeIngestionService(
+            self.code_store,
+            self.code_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.code_wiki,
+        )
         self.code_source_roots = self._discover_external_code_source_roots()
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
@@ -51334,7 +58578,7 @@ class AppContext:
             return mgr.get(sid)
         return self._latest_session_for_user(user_id)
 
-    # --- File classification constants for auto-routing ---
+    # File classification constants used by upload auto-routing.
     _CODE_EXTS = frozenset({
         ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".c", ".cpp",
         ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".scala", ".lua",
@@ -51444,6 +58688,7 @@ class AppContext:
             "default_session_id": str(getattr(session, "id", "") or ""),
             "active_capabilities": caps,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": self.rag_wiki.payload(limit=24),
             "agent_port": int(getattr(self, "agent_port", 0) or 0),
             "skills_port": int(getattr(self, "skills_port", 0) or 0),
             "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
@@ -51460,8 +58705,29 @@ class AppContext:
             "features": {
                 "strict_local_import": True,
                 "filename_entities": bool(self.rag_include_filename_entities),
+                "wiki_first_rag": True,
+                "high_recall_fusion": True,
             },
+            "embedding_models": self._get_embedding_models(session),
+            "default_embed_model": self._get_default_embed_model(session),
         }
+
+    def _get_embedding_models(self, session: object) -> list[str]:
+        """Return list of available ollama models for use as embedding models."""
+        try:
+            ollama_obj = getattr(session, "ollama", None) if session else None
+            base_url = str(getattr(ollama_obj, "base_url", "") or "http://127.0.0.1:11434").rstrip("/")
+            return list_ollama_models_cached(base_url, ttl_seconds=60)
+        except Exception:
+            return []
+
+    def _get_default_embed_model(self, session: object) -> str:
+        """Return the current default embedding model for the session."""
+        try:
+            ollama_obj = getattr(session, "ollama", None) if session else None
+            return str(getattr(ollama_obj, "embed_model", "") or "").strip()
+        except Exception:
+            return ""
 
     def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
         return self.rag_store.library_payload(limit=limit, offset=offset)
@@ -51474,6 +58740,12 @@ class AppContext:
 
     def rag_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.rag_store.filesystem_payload(max_nodes=max_nodes)
+
+    def rag_wiki_payload(self, limit: int = 240) -> dict:
+        return self.rag_wiki.payload(limit=limit)
+
+    def rag_wiki_lint(self) -> dict:
+        return self.rag_wiki.lint()
 
     def _knowledge_library_status_for_session(self, session: SessionState | None = None) -> dict:
         payload = self.rag_store.library_payload(limit=0)
@@ -51519,26 +58791,388 @@ class AppContext:
             "session_id": str(getattr(session, "id", "") or ""),
         }
 
+    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+        """Embed up to max_chunks RAG chunks that don't yet have embeddings.
+
+        Called lazily on the first query when an embedding model is available.
+        Returns the number of embeddings successfully generated.
+        """
+        with self.rag_store.lock:
+            all_chunks = dict(self.rag_store.chunks)
+        already_embedded = set(self.rag_store.index.chunk_embeddings.keys())
+        to_embed = [cid for cid in all_chunks if cid not in already_embedded]
+        if not to_embed:
+            return 0
+        # Prioritise most recently added chunks; embed up to max_chunks
+        to_embed = to_embed[-max_chunks:]
+        texts = [str(all_chunks[cid].get("text", "") or "")[:2048] for cid in to_embed]
+        vecs = _rag_embed_batch(texts, session)
+        count = 0
+        for cid, vec in zip(to_embed, vecs):
+            if vec:
+                self.rag_store.index.set_chunk_embedding(cid, vec)
+                count += 1
+        if count:
+            try:
+                self.rag_store._persist_embeddings()
+            except Exception:
+                pass
+        return count
+
+    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+        """Embed up to max_chunks Code Library chunks that don't yet have embeddings."""
+        with self.code_store.lock:
+            all_chunks = dict(self.code_store.chunks)
+        already_embedded = set(self.code_store.index.chunk_embeddings.keys())
+        to_embed = [cid for cid in all_chunks if cid not in already_embedded]
+        if not to_embed:
+            return 0
+        to_embed = to_embed[-max_chunks:]
+        anchor_text = lambda cid: (
+            str(all_chunks[cid].get("anchor", "") or "")
+            + "\n"
+            + str(all_chunks[cid].get("text", "") or "")
+        )[:2048]
+        texts = [anchor_text(cid) for cid in to_embed]
+        vecs = _rag_embed_batch(texts, session)
+        count = 0
+        for cid, vec in zip(to_embed, vecs):
+            if vec:
+                self.code_store.index.set_chunk_embedding(cid, vec)
+                count += 1
+        if count:
+            try:
+                self.code_store._persist_embeddings()
+            except Exception:
+                pass
+        return count
+
+    def _merge_retrieval_results(
+        self,
+        query: str,
+        result_sets: list[dict],
+        *,
+        top_k: int,
+        route: str,
+        route_meta: dict | None = None,
+    ) -> dict:
+        rows: list[dict] = []
+        query_entities: set[str] = set()
+        summaries: list[str] = []
+        for result in result_sets:
+            if not isinstance(result, dict):
+                continue
+            query_entities.update(str(x) for x in (result.get("query_entities", []) or []) if str(x).strip())
+            summary = trim(str(result.get("summary", "") or ""), 700)
+            if summary:
+                summaries.append(summary)
+            source_route = str(result.get("route", "") or "")
+            for row in (result.get("results", []) or []):
+                if not isinstance(row, dict):
+                    continue
+                patched = dict(row)
+                if source_route and not str(patched.get("source_route", "") or "").strip():
+                    patched["source_route"] = source_route
+                rows.append(patched)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            key_parts = [
+                str(row.get("citation", "") or ""),
+                str(row.get("doc_id", "") or ""),
+                str(row.get("chunk_id", "") or ""),
+                str(row.get("wiki_page", "") or ""),
+                str(row.get("relative_path", "") or ""),
+                str(row.get("route_evidence", "") or ""),
+            ]
+            key = "|".join(key_parts).strip("|") or trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 260)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        layer_bias = {
+            "workflow": 0.20,
+            "wiki": 0.18,
+            "wiki_page": 0.18,
+            "community_reduce": 0.14,
+            "community_map": 0.12,
+            "chunk": 0.08,
+            "document": 0.04,
+        }
+        for row in deduped:
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            bonus = layer_bias.get(evidence, layer_bias.get(str(row.get("route_evidence", "") or ""), 0.0))
+            if str(row.get("source_route", "") or "") == "hybrid":
+                bonus += 0.04
+            if bool(row.get("weak_match", False)):
+                bonus = min(bonus, 0.015)
+            row["fusion_score"] = round(float(row.get("score", 0.0) or 0.0) + float(row.get("sort_bias", 0.0) or 0.0) + bonus, 6)
+        deduped.sort(
+            key=lambda x: (
+                float(x.get("fusion_score", 0.0) or 0.0),
+                float(x.get("score", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+                float(x.get("graph_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        selected = _rag_mmr_select(deduped, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        evidence_counts = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in selected)
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": route,
+                "candidate_count": len(deduped),
+                "result_set_count": len([x for x in result_sets if isinstance(x, dict)]),
+                "evidence_counts": dict(evidence_counts),
+                "high_recall_pool_multiplier": RAG_HIGH_RECALL_POOL_MULTIPLIER,
+                "high_recall_min_pool": RAG_HIGH_RECALL_MIN_POOL,
+            }
+        )
+        return {
+            "query": query,
+            "results": selected,
+            "summary": "\n".join(summaries[:3]) or "\n".join(f"{r.get('citation')} {r.get('title','')}: {trim(r.get('text',''), 160)}" for r in selected[:4]),
+            "community_cards": [],
+            "query_entities": sorted(query_entities),
+            "route": route,
+            "route_meta": meta,
+        }
+
+    def _expand_retrieval_with_variants(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        payload: dict,
+        code: bool = False,
+        top_k: int,
+        pool_k: int,
+        category: str = "",
+        kind: str = "",
+        raw_route: str = "hybrid",
+        qvec: list[float] | None = None,
+        accepted_only: bool = True,
+    ) -> list[dict]:
+        variants = [v for v in _rag_query_variants(query, max_variants=4) if v and v.strip().lower() != str(query or "").strip().lower()]
+        if not variants:
+            return []
+        variant_top_k = max(top_k, min(pool_k, 18))
+        out: list[dict] = []
+        for variant in variants[:3]:
+            try:
+                if code:
+                    out.append(self.workflow_memory.query(variant, top_k=min(variant_top_k, 16), accepted_only=accepted_only))
+                    out.append(self.code_wiki.query(variant, top_k=variant_top_k, category="code", kind=""))
+                    out.append(self.code_store.index.query(variant, top_k=variant_top_k, category="code", route=raw_route, qvec=qvec))
+                else:
+                    out.append(self.rag_wiki.query(variant, top_k=variant_top_k, category=category, kind=kind))
+                    out.append(self.rag_store.index.query(variant, top_k=variant_top_k, category=category, kind=kind, route=raw_route, qvec=qvec))
+            except Exception:
+                continue
+        for result in out:
+            if isinstance(result, dict):
+                meta = result.get("route_meta", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["variant_expansion"] = True
+                result["route_meta"] = meta
+        return out
+
+    def _rag_budget(self, value: object, *, default: str = "standard") -> tuple[str, dict]:
+        key = str(value or default or "standard").strip().lower()
+        if key not in RAG_CONTEXT_BUDGETS:
+            key = default if default in RAG_CONTEXT_BUDGETS else "standard"
+        return key, dict(RAG_CONTEXT_BUDGETS.get(key, RAG_CONTEXT_BUDGETS["standard"]))
+
+    def _rag_has_global_intent(self, query: str) -> bool:
+        low = str(query or "").lower()
+        terms = (
+            "overview", "summarize", "summary", "compare", "comparison", "relationship", "relationships",
+            "across", "trend", "synthesis", "global", "整体", "全局", "综述", "概览", "总结",
+            "对比", "比较", "关系", "联系", "趋势", "汇总", "跨",
+        )
+        return any(term in low for term in terms)
+
+    def _rag_evidence_metrics(self, result: dict) -> dict:
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        def _row_score(row: dict) -> float:
+            if bool(row.get("weak_match", False)):
+                return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            try:
+                score = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            try:
+                fusion = float(row.get("fusion_score", 0.0) or 0.0)
+            except Exception:
+                fusion = 0.0
+            try:
+                lexical = float(row.get("lexical_score", 0.0) or 0.0)
+            except Exception:
+                lexical = 0.0
+            try:
+                graph = float(row.get("graph_score", 0.0) or 0.0)
+            except Exception:
+                graph = 0.0
+            if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+                supporting = row.get("evidence_citations", [])
+                if not isinstance(supporting, list):
+                    supporting = []
+                if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                    return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
+        best = max((_row_score(row) for row in rows), default=0.0)
+        strong = sum(1 for row in rows if _row_score(row) >= RAG_MIN_SYNTHESIS_SCORE)
+        doc_ids = {
+            str(row.get("doc_id", "") or "").strip()
+            for row in rows
+            if str(row.get("doc_id", "") or "").strip()
+        }
+        layers = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in rows)
+        status = "miss"
+        if rows and best >= RAG_NO_EVIDENCE_THRESHOLD and strong > 0:
+            status = "hit"
+        elif rows:
+            status = "weak"
+        confidence = min(1.0, max(0.0, best + min(0.24, 0.04 * max(0, strong - 1)) + min(0.12, 0.03 * max(0, len(doc_ids) - 1))))
+        return {
+            "evidence_status": status,
+            "confidence": round(confidence, 4),
+            "best_score": round(best, 6),
+            "strong_evidence_count": int(strong),
+            "source_count": len(doc_ids),
+            "evidence_counts": dict(layers),
+        }
+
+    def _annotate_rag_result(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        metrics = self._rag_evidence_metrics(out)
+        out.update(metrics)
+        out["context_budget"] = {
+            "mode": budget_key,
+            "max_chars": int(budget.get("chars", 0) or 0),
+            "max_evidence": int(budget.get("evidence", 0) or 0),
+        }
+        if metrics.get("evidence_status") == "miss":
+            out["no_evidence_message"] = RAG_NO_EVIDENCE_MESSAGE
+            out.setdefault("summary", RAG_NO_EVIDENCE_MESSAGE)
+        elif metrics.get("evidence_status") == "weak":
+            out["weak_evidence_message"] = RAG_WEAK_EVIDENCE_MESSAGE
+            if not str(out.get("answer", "") or "").strip():
+                current_summary = str(out.get("summary", "") or "").strip()
+                out["summary"] = (RAG_WEAK_EVIDENCE_MESSAGE + ("\n\n" + current_summary if current_summary else "")).strip()
+        meta = out.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "evidence_status": metrics.get("evidence_status", "miss"),
+                "confidence": metrics.get("confidence", 0.0),
+                "context_budget": budget_key,
+            }
+        )
+        out["route_meta"] = meta
+        return out
+
+    def _trim_rag_result_to_budget(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        rows = [dict(x) for x in (out.get("results", []) or []) if isinstance(x, dict)]
+        max_chars = max(1200, int(budget.get("chars", 7200) or 7200))
+        max_rows = max(1, int(budget.get("evidence", 6) or 6))
+        used = 0
+        kept: list[dict] = []
+        for row in rows:
+            if len(kept) >= max_rows:
+                break
+            text = str(row.get("text", "") or "")
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                row["text"] = trim(text, max(420, remaining))
+            used += len(str(row.get("text", "") or ""))
+            kept.append(row)
+        out["results"] = kept
+        out = self._annotate_rag_result(out, budget_key=budget_key, budget=budget)
+        if out.get("evidence_status") == "miss":
+            out["results"] = []
+        return out
+
+    def _row_synthesis_score(self, row: dict) -> float:
+        if bool(row.get("weak_match", False)):
+            return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+        evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+        try:
+            score = float(row.get("score", 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        try:
+            fusion = float(row.get("fusion_score", 0.0) or 0.0)
+        except Exception:
+            fusion = 0.0
+        try:
+            lexical = float(row.get("lexical_score", 0.0) or 0.0)
+        except Exception:
+            lexical = 0.0
+        try:
+            graph = float(row.get("graph_score", 0.0) or 0.0)
+        except Exception:
+            graph = 0.0
+        if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+            supporting = row.get("evidence_citations", [])
+            if not isinstance(supporting, list):
+                supporting = []
+            if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+        return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
     def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
         if not isinstance(session, SessionState) or not rows:
             return ""
         evidence_rows = [
             row
             for row in rows
-            if str(row.get("route_evidence", "") or "") in {"chunk", "document"}
+            if str(row.get("route_evidence", "") or "") in {"chunk", "document", "wiki_page", "workflow", "community_reduce", "community_map", "community_bridge"}
         ]
         if not evidence_rows:
             evidence_rows = list(rows)
+
+        # Confidence filtering — drop weak evidence before LLM synthesis
+        best_score = max((self._row_synthesis_score(r) for r in evidence_rows), default=0.0)
+        if best_score < RAG_NO_EVIDENCE_THRESHOLD:
+            return RAG_NO_EVIDENCE_MESSAGE
+        qualified = [r for r in evidence_rows if self._row_synthesis_score(r) >= RAG_MIN_SYNTHESIS_SCORE]
+        if not qualified:
+            return RAG_NO_EVIDENCE_MESSAGE
+
         evidence = []
-        for idx, row in enumerate(evidence_rows[:5], 1):
+        _syn_doc_counts: dict[str, int] = {}
+        for row in qualified:
+            if len(evidence) >= 5:
+                break
+            _doc_id = str(row.get("doc_id", "") or "")
+            if _doc_id and _syn_doc_counts.get(_doc_id, 0) >= RAG_SYNTHESIS_MAX_PER_DOC:
+                continue
+            if _doc_id:
+                _syn_doc_counts[_doc_id] = _syn_doc_counts.get(_doc_id, 0) + 1
+            idx = len(evidence) + 1
+            score_pct = int(min(99, self._row_synthesis_score(row) * 100))
             evidence.append(
-                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')}\n"
+                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
                 f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
             )
         prompt = (
-            "Use the retrieved evidence to answer the query. "
-            "Cite with the provided citation strings exactly as given. "
-            "If evidence is insufficient, say so explicitly.\n\n"
+            "You are a precise knowledge retrieval assistant.\n"
+            "STRICT GROUNDING RULE: ONLY use information explicitly stated in the numbered evidence blocks below. "
+            "For any information NOT present in the evidence, output the word UNKNOWN. "
+            "Do NOT infer, extrapolate, hallucinate, or draw on prior knowledge beyond what is given. "
+            "Cite every factual claim using the provided citation strings exactly as given.\n"
+            "If the evidence is insufficient to answer the query, state exactly: "
+            "'知识库中暂无足够证据回答此问题'\n\n"
             f"Query:\n{query}\n\nEvidence:\n" + "\n\n".join(evidence)
         )
         try:
@@ -51556,21 +59190,115 @@ class AppContext:
     def rag_query(self, user_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
-        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
         category = str(body.get("category", "") or "").strip()
         kind = str(body.get("kind", "") or "").strip()
         route = str(
             body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
             or "auto"
         ).strip().lower()
-        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route)
-        synthesize = bool(body.get("synthesize", False))
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
+        embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Generate query embedding for hybrid dense+sparse retrieval when model is available
+        qvec: list[float] | None = None
+        if isinstance(session, SessionState):
+            # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
+            if (
+                not self.rag_store.index.has_dense_index()
+                and self.rag_store.chunks
+                and self._get_default_embed_model(session)
+            ):
+                try:
+                    self._build_rag_embeddings_batch(session, max_chunks=300)
+                except Exception:
+                    pass
+            if self.rag_store.index.has_dense_index():
+                try:
+                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                except Exception:
+                    qvec = None
+        requested_route = route if route in {"auto", "wiki", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.rag_wiki.query(query, top_k=top_k, category=category, kind=kind)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            wiki_result = self.rag_wiki.query(query, top_k=wide_top_k, category=category, kind=kind)
+            stage_results.append(wiki_result)
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.rag_store.index.query(query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
+            stage_results.append(raw_light)
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.rag_store.index.query(query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.rag_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=False,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category=category,
+                            kind=kind,
+                            raw_route=raw_route,
+                            qvec=qvec,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_route": raw_route,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def rag_import_request(self, user_id: str, payload: dict) -> dict:
@@ -51706,10 +59434,12 @@ class AppContext:
 
     def rag_rebuild(self) -> dict:
         self.rag_store.rebuild_index()
+        wiki = self.rag_wiki.compile_from_store(self.rag_store, reason="manual-rebuild")
         return {
             "ok": True,
             "built_at": self.rag_store.index.built_at,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
         }
 
     def code_config(self, user_id: str) -> dict:
@@ -51734,6 +59464,8 @@ class AppContext:
             "code_root": str(self.code_root),
             "code_source_roots": list(self.code_source_roots or []),
             "status": self._code_library_status_for_session(session),
+            "wiki": self.code_wiki.payload(limit=24),
+            "workflows": self.workflow_memory.payload(limit=24),
             "sessions": sessions,
             "default_session_id": str(getattr(session, "id", "") or ""),
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
@@ -51755,7 +59487,12 @@ class AppContext:
                 "llm_enrichment": False,
                 "strict_local_import": True,
                 "repo_import": True,
+                "wiki_first_code_rag": True,
+                "workflow_memory": True,
+                "high_recall_fusion": True,
             },
+            "embedding_models": self._get_embedding_models(session),
+            "default_embed_model": self._get_default_embed_model(session),
         }
 
     def code_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
@@ -51770,28 +59507,147 @@ class AppContext:
     def code_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.code_store.filesystem_payload(max_nodes=max_nodes)
 
-    def code_query(self, user_id: str, payload: dict) -> dict:
+    def code_wiki_payload(self, limit: int = 240) -> dict:
+        return self.code_wiki.payload(limit=limit)
+
+    def code_wiki_lint(self) -> dict:
+        return self.code_wiki.lint()
+
+    def code_workflows_payload(self, limit: int = 120) -> dict:
+        return self.workflow_memory.payload(limit=limit)
+
+    def code_workflows_query(self, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        accepted_only = bool(body.get("accepted_only", True))
+        return self.workflow_memory.query(query, top_k=top_k, accepted_only=accepted_only)
+
+    def code_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
         route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         language_filter = str(body.get("language", "") or "").strip().lower()
-        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route)
+        embed_model_override = str(body.get("embed_model", "") or "").strip()
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Dense embedding for code query when available
+        qvec: list[float] | None = None
+        if isinstance(session, SessionState):
+            if (
+                not self.code_store.index.has_dense_index()
+                and self.code_store.chunks
+                and self._get_default_embed_model(session)
+            ):
+                try:
+                    self._build_code_embeddings_batch(session, max_chunks=300)
+                except Exception:
+                    pass
+            if self.code_store.index.has_dense_index():
+                try:
+                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                except Exception:
+                    qvec = None
+        requested_route = route if route in {"auto", "wiki", "workflow", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "workflow", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.code_wiki.query(query, top_k=top_k, category="code", kind="")
+        elif requested_route == "workflow":
+            result = self.workflow_memory.query(query, top_k=top_k, accepted_only=True)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.code_store.index.query(query, top_k=top_k, category="code", route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            workflow_result = self.workflow_memory.query(query, top_k=wide_top_k, accepted_only=True)
+            wiki_result = self.code_wiki.query(query, top_k=wide_top_k, category="code", kind="")
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.code_store.index.query(query, top_k=wide_top_k, category="code", route=light_route, qvec=qvec)
+            stage_results.extend([workflow_result, wiki_result, raw_light])
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "workflow_first": True, "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.code_store.index.query(query, top_k=pool_k, category="code", route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.code_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category="code", route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=True,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category="code",
+                            kind="",
+                            raw_route=raw_route,
+                            qvec=qvec,
+                            accepted_only=True,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "workflow_candidate_count": int((workflow_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(workflow_result.get("route_meta", {}), dict)
+                    else 0,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_route": raw_route,
+                    "workflow_first": True,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
         if language_filter:
-            filtered = [
-                dict(row)
-                for row in (result.get("results", []) or [])
-                if str(row.get("language", "") or "").strip().lower() == language_filter
-            ]
+            filtered = []
+            for row in (result.get("results", []) or []):
+                row_lang = str(row.get("language", "") or "").strip().lower()
+                if row_lang in {"", "markdown"} and str(row.get("route_evidence", "") or "") in {"workflow", "wiki_page"}:
+                    filtered.append(dict(row))
+                elif row_lang == language_filter:
+                    filtered.append(dict(row))
             result = dict(result)
             result["results"] = filtered[:top_k]
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
         synthesize = bool(body.get("synthesize", False))
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def code_import_request(self, user_id: str, payload: dict) -> dict:
@@ -51925,10 +59781,14 @@ class AppContext:
 
     def code_rebuild(self) -> dict:
         self.code_store.rebuild_index()
+        wiki = self.code_wiki.compile_from_store(self.code_store, reason="manual-rebuild")
+        workflows = self.workflow_memory.rebuild()
         return {
             "ok": True,
             "built_at": self.code_store.index.built_at,
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
+            "workflows": workflows,
         }
 
     def _looks_like_code_task(self, text: str) -> bool:
@@ -51945,17 +59805,44 @@ class AppContext:
         ]
         return any(term in low for term in code_terms)
 
-    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+    def _looks_like_knowledge_task(self, text: str) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        knowledge_terms = [
+            "research", "analyze", "analysis", "compare", "summarize", "explain", "fact", "evidence",
+            "paper", "document", "report", "knowledge", "source", "citation", "background",
+            "研究", "分析", "对比", "比较", "总结", "解释", "事实", "证据", "论文", "文档", "报告", "知识", "资料", "引用", "背景",
+        ]
+        if any(term in low for term in knowledge_terms):
+            return True
+        return bool(re.search(r"\b(why|how|what are|what is|pros and cons|tradeoffs?)\b", low))
+
+    def _format_reference_payload(self, result: dict, *, prefix: str, limit: int = 6, snippet_chars: int = 420) -> dict:
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        status = str(result.get("evidence_status", "") or "miss")
+        confidence = float(result.get("confidence", 0.0) or 0.0)
         if not rows:
-            return {}
+            return {
+                f"{prefix}_text": (
+                    f"{prefix.title()} Library Context [status={status}, confidence={confidence:.2f}]:\n"
+                    f"{str(result.get('no_evidence_message', RAG_NO_EVIDENCE_MESSAGE) or RAG_NO_EVIDENCE_MESSAGE)}"
+                ),
+                f"{prefix}_meta": {
+                    "route": str(result.get("route", "") or ""),
+                    "requested_route": str(result.get("requested_route", "") or ""),
+                    "result_count": 0,
+                    "evidence_status": status,
+                    "confidence": confidence,
+                },
+            }
         lines = []
+        lines.append(f"evidence_status={status} confidence={confidence:.2f} route={str(result.get('route', '') or '')}")
         for idx, row in enumerate(rows[:limit], 1):
             citation = str(row.get("citation", "") or "").strip()
             title = str(row.get("title", "") or "").strip()
             symbol = str(row.get("symbol", "") or "").strip()
             anchor = str(row.get("anchor", "") or "").strip()
-            snippet = trim(str(row.get("text", "") or ""), 420)
+            snippet = trim(str(row.get("text", "") or ""), snippet_chars)
             header = f"{idx}. {citation} {title}".strip()
             if symbol:
                 header += f" | symbol={symbol}"
@@ -51965,34 +59852,59 @@ class AppContext:
             if snippet:
                 lines.append(snippet)
         return {
-            "code_text": "\n".join(lines),
-            "code_meta": {
+            f"{prefix}_text": "\n".join(lines),
+            f"{prefix}_meta": {
                 "route": str(result.get("route", "") or ""),
                 "requested_route": str(result.get("requested_route", "") or ""),
                 "result_count": len(rows[:limit]),
+                "evidence_status": status,
+                "confidence": confidence,
                 "summary": trim(str(result.get("summary", "") or ""), 600),
             },
         }
 
+    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+        return self._format_reference_payload(result, prefix="code", limit=limit, snippet_chars=420)
+
+    def _format_knowledge_reference_payload(self, result: dict, limit: int = 4) -> dict:
+        return self._format_reference_payload(result, prefix="knowledge", limit=limit, snippet_chars=620)
+
     def _prepare_runtime_references(self, session: SessionState, text: str) -> dict:
         query = trim(str(text or "").strip(), 4000)
-        if not query or not self._looks_like_code_task(query):
+        if not query:
             return {}
-        if not self.code_store.documents:
-            return {}
+        payload: dict = {}
         try:
-            result = self.code_query(
-                str(getattr(session, "owner_user_id", "") or ""),
-                {
-                    "query": query,
-                    "top_k": 6,
-                    "route": "auto",
-                    "session_id": str(getattr(session, "id", "") or ""),
-                },
-            )
+            if self._looks_like_code_task(query) and self.code_store.documents:
+                result = self.code_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 6,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_code_reference_payload(result, limit=6))
         except Exception:
-            return {}
-        return self._format_code_reference_payload(result, limit=6)
+            pass
+        try:
+            if self._looks_like_knowledge_task(query) and self.rag_store.documents:
+                result = self.rag_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 5,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_knowledge_reference_payload(result, limit=4))
+        except Exception:
+            pass
+        return payload
 
     def _query_code_library_tool(self, session: SessionState, args: dict) -> str:
         status = self._code_library_status_for_session(session)
@@ -52019,6 +59931,7 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "language": str((args or {}).get("language", "") or ""),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
@@ -52038,9 +59951,14 @@ class AppContext:
         source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
         if source_roots:
             lines.append("source_roots=" + " | ".join(source_roots[:8]))
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No code library results.")
+            lines.append(str(result.get("no_evidence_message", "No code library results.") or "No code library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -52076,15 +59994,21 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "category": str((args or {}).get("category", "") or ""),
                 "kind": str((args or {}).get("kind", "") or ""),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No knowledge library results.")
+            lines.append(str(result.get("no_evidence_message", "No knowledge library results.") or "No knowledge library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -52104,6 +60028,18 @@ class AppContext:
             pass
         try:
             self.code_service.shutdown()
+        except Exception:
+            pass
+        try:
+            self.rag_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.code_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.workflow_memory.shutdown()
         except Exception:
             pass
 
@@ -52284,6 +60220,7 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        sess = None
         try:
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
@@ -52292,6 +60229,11 @@ class AppContext:
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
+        if sess is not None:
+            try:
+                self.workflow_memory.capture_session(sess)
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -53321,6 +61263,15 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     pass
         return self.model_catalog()
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 8: HTTP surfaces for agent chat, skills studio, RAG admin, and code admin.
+# 第八层：Agent 对话、skills studio、RAG 管理端与代码管理端的 HTTP 暴露层。
+# 第8層：agent 対話、skills studio、RAG 管理画面、code 管理画面の HTTP 公開層。
+# ============================================================================
+
+# Transport wrapper: keeps server-level socket cleanup failures from bubbling
+# into noisy request errors during shutdown or client disconnects.
 class AgentHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
@@ -53351,6 +61302,8 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
+# Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
+# and lightweight HTML entrypoints from one process-local handler.
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebAgent/{APP_VERSION}"
@@ -54542,6 +62495,14 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.rag_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/rag/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.rag_wiki_payload(limit=limit))
+        if path == "/api/rag/wiki/lint":
+            return self._send_json(self.app.rag_wiki_lint())
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -54561,6 +62522,12 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/api/rag/rebuild":
             try:
                 out = self.app.rag_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/wiki/rebuild":
+            try:
+                out = self.app.rag_wiki.compile_from_store(self.app.rag_store, reason="manual-wiki-rebuild")
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -54699,6 +62666,20 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.code_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/code/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.code_wiki_payload(limit=limit))
+        if path == "/api/code/wiki/lint":
+            return self._send_json(self.app.code_wiki_lint())
+        if path == "/api/code/workflows":
+            try:
+                limit = int((query.get("limit", ["120"]) or ["120"])[0] or 120)
+            except Exception:
+                limit = 120
+            return self._send_json(self.app.code_workflows_payload(limit=limit))
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -54721,8 +62702,35 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/wiki/rebuild":
+            try:
+                out = self.app.code_wiki.compile_from_store(self.app.code_store, reason="manual-wiki-rebuild")
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/query":
+            try:
+                out = self.app.code_workflows_query(self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/rebuild":
+            try:
+                out = self.app.workflow_memory.rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 9: Process entrypoint and server bootstrap.
+# 第九层：进程入口与服务启动。
+# 第9層：プロセス入口とサーバ起動。
+# ============================================================================
+
+# Bootstrap sequence: load configuration, initialize shared application state,
+# and expose the HTTP service plus background runtime workers.
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
     parser.add_argument("--host", default="0.0.0.0")
