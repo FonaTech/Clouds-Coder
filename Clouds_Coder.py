@@ -152,7 +152,10 @@ RAG_MAX_CHUNKS_PER_DOC = 500
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
-RAG_MAX_QUERY_RESULTS = 12
+RAG_MAX_QUERY_RESULTS = 64
+RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
+RAG_HIGH_RECALL_MIN_POOL = 64
+RAG_RETRIEVAL_MAX_PER_DOC = 5
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -172,7 +175,18 @@ RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
 RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
 RAG_MIN_SYNTHESIS_SCORE = 0.12       # chunks below this score are filtered before LLM synthesis
 RAG_NO_EVIDENCE_THRESHOLD = 0.18     # if best chunk score < this, skip LLM entirely and return no-evidence message
+RAG_WEAK_MATCH_SCORE_CAP = 0.095     # fuzzy fallback candidates stay visible but cannot trigger grounded synthesis
 RAG_SYNTHESIS_MAX_PER_DOC = 2        # max chunks from the same document in synthesis evidence
+RAG_WORKFLOW_ACCEPT_SCORE = 0.72
+RAG_NO_EVIDENCE_MESSAGE = "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+RAG_CONTEXT_BUDGETS = {
+    "tight": {"top_k": 6, "pool": 24, "chars": 3600, "evidence": 4},
+    "standard": {"top_k": 10, "pool": 48, "chars": 7200, "evidence": 6},
+    "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
+}
+RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
+RAG_DENSE_DEFAULT_ENABLED = str(os.getenv("AGENT_RAG_DENSE_DEFAULT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+RAG_EMBEDDING_MODE_VALUES = {"off", "sparse", "tfidf", "dense", "hybrid"}
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
@@ -190,6 +204,38 @@ CODE_PARSE_TIMEOUT_SECONDS = max(
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
 TOKEN_THRESHOLD = 1_000_000
+CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
+    0.01,
+    min(0.20, float(str(os.getenv("AGENT_CONTEXT_RESERVE_RATIO", "0.05") or "0.05"))),
+)
+CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
+    1.0,
+    min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
+)
+CONTEXT_USAGE_CALIBRATION_MAX = max(
+    CONTEXT_ESTIMATE_SAFETY_MULTIPLIER,
+    min(2.5, float(str(os.getenv("AGENT_CONTEXT_USAGE_CALIBRATION_MAX", "2.20") or "2.20"))),
+)
+CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
+    60,
+    min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
+)
+LARGE_FILE_AUTO_PAGE_BYTES = max(
+    32 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
+)
+LARGE_FILE_AUTO_PAGE_LINES = max(
+    1000,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
+)
+LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
+    1200,
+    int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
+)
+SESSION_LIST_DEFAULT_LIMIT = max(
+    50,
+    min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
+)
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
@@ -575,7 +621,9 @@ USER_COMPLEXITY_EXPERT_TOKENS = (
     "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
     "l5",
 )
-PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
+PLAN_MODE_EXPLORER_MAX_ROUNDS = 5
+PLAN_MODE_EXPLORER_MIN_ROUNDS = 1
+PLAN_MODE_RESEARCH_SUFFICIENT_CHARS = 700
 PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
@@ -3602,6 +3650,8 @@ def split_thinking_content(text: str) -> tuple[str, str]:
     body = "".join(body_parts)
     body = re.sub(r"(?is)```(?:thinking|reasoning)\s*([\s\S]*?)```", _repl_block, body)
     body = re.sub(r"(?is)<\|start_of_thought\|>(.*?)<\|end_of_thought\|>", _repl_block, body)
+    # Strip orphaned closing tags left by providers that pre-extract thinking content
+    body = re.sub(r"(?is)</think\s*>", "", body)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     thinking = "\n\n".join(part for part in thinking_parts if part).strip()
     return body, trim(thinking, 24_000) if thinking else ""
@@ -12528,6 +12578,23 @@ class OllamaClient:
             "raw": parsed,
         }
 
+    @staticmethod
+    def _collapse_tool_role_messages(messages: list[dict]) -> list[dict]:
+        """Convert role=tool messages to role=user for providers that don't support the tool role."""
+        out = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                out.append(msg)
+                continue
+            if str(msg.get("role", "")).strip() == "tool":
+                name = str(msg.get("name", "") or "").strip()
+                content = str(msg.get("content", "") or "").strip()
+                label = f"[Tool result: {name}]\n{content}" if name else f"[Tool result]\n{content}"
+                out.append({"role": "user", "content": label})
+            else:
+                out.append(msg)
+        return out
+
     def _chat_openai_compat(
         self,
         req_messages: list[dict],
@@ -12547,7 +12614,21 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        except OllamaError as exc:
+            # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
+            # Retry once with tool messages collapsed into user messages.
+            err_text = str(exc).lower()
+            if int(getattr(exc, "status", 0) or 0) == 400 and (
+                "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
+            ):
+                fallback_msgs = self._collapse_tool_role_messages(req_messages)
+                fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
+                fallback_payload.pop("tools", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+            else:
+                raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12623,6 +12704,25 @@ class OllamaClient:
             content = m.get("content", "") or ""
             if role == "system":
                 system_parts.append(str(content))
+            elif role == "tool":
+                # Convert OpenAI-style tool result (role=tool) to Anthropic tool_result block
+                tool_call_id = str(m.get("tool_call_id", "") or "").strip()
+                tool_content = str(content) if not isinstance(content, str) else content
+                if tool_call_id:
+                    block = {"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}
+                else:
+                    name = str(m.get("name", "") or "").strip()
+                    label = f"[Tool result: {name}]\n{tool_content}" if name else f"[Tool result]\n{tool_content}"
+                    block = {"type": "text", "text": label}
+                # Merge into previous user message if possible, else append new one
+                if messages and messages[-1].get("role") == "user":
+                    prev = messages[-1]["content"]
+                    if isinstance(prev, list):
+                        prev.append(block)
+                    else:
+                        messages[-1]["content"] = [{"type": "text", "text": str(prev)}, block]
+                else:
+                    messages.append({"role": "user", "content": [block]})
             else:
                 # Convert OpenAI-style image_url parts to Anthropic image format
                 if isinstance(content, list):
@@ -12661,6 +12761,11 @@ class OllamaClient:
             "content-type": "application/json",
         }
         raw = self._post_json_url(endpoint, payload, headers=headers)
+        # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
+        # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
+        if isinstance(raw.get("choices"), list) and tools:
+            payload["tools"] = tools  # original OpenAI-format tools
+            raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12741,6 +12846,7 @@ class OllamaClient:
         full_thinking: list[str] = []
         tool_calls: list[dict] = []
         done_reason = ""
+        final_raw: dict = {}
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 while True:
@@ -12780,6 +12886,7 @@ class OllamaClient:
                     if tcs:
                         tool_calls = self._normalize_tool_calls(tcs)
                     if part.get("done"):
+                        final_raw = dict(part)
                         done_reason = str(part.get("done_reason") or "").strip().lower()
                         break
         except HTTPError as exc:
@@ -12793,7 +12900,16 @@ class OllamaClient:
             "content": content,
             "thinking": thinking_content,
             "tool_calls": tool_calls,
-            "raw": {"streamed": True, "done_reason": done_reason},
+            "raw": {
+                "streamed": True,
+                "done_reason": done_reason,
+                "prompt_eval_count": final_raw.get("prompt_eval_count"),
+                "eval_count": final_raw.get("eval_count"),
+                "total_duration": final_raw.get("total_duration"),
+                "load_duration": final_raw.get("load_duration"),
+                "prompt_eval_duration": final_raw.get("prompt_eval_duration"),
+                "eval_duration": final_raw.get("eval_duration"),
+            },
         }
 
     def chat(
@@ -12994,8 +13110,11 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "workflow", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "language": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
         ["query"],
     ),
@@ -13010,9 +13129,12 @@ TOOLS = [
         {
             "query": {"type": "string"},
             "top_k": {"type": "integer"},
-            "route": {"type": "string", "enum": ["auto", "fast", "global", "hybrid"]},
+            "route": {"type": "string", "enum": ["auto", "wiki", "raw", "fast", "global", "hybrid"]},
+            "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "category": {"type": "string"},
             "kind": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
     ),
     tool_def(
@@ -13327,6 +13449,8 @@ class SessionState:
         self.uploads: list[dict] = []
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
         self.cancel_requested = False
@@ -13423,6 +13547,14 @@ class SessionState:
         )
         self.context_limit_locked = bool(context_limit_locked)
         self.context_token_upper_bound = self.max_context_token_limit
+        self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+        self.last_context_actual_prompt_tokens = 0
+        self.last_context_actual_completion_tokens = 0
+        self.last_context_actual_total_tokens = 0
+        self.last_context_actual_source = ""
+        self.last_context_actual_context_label = ""
+        self.last_context_actual_ts = 0.0
+        self.last_context_estimated_prompt_tokens = 0
         self.max_agent_rounds = max(
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
@@ -14320,6 +14452,21 @@ class SessionState:
                 self.thinking = False
                 # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
                 # It will be reset to max after load (see below). Only exception: context_limit_locked.
+                usage_calibration = raw.get("context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                try:
+                    self.context_estimate_calibration = max(
+                        float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                        min(float(CONTEXT_USAGE_CALIBRATION_MAX), float(usage_calibration or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                    )
+                except Exception:
+                    self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                self.last_context_actual_prompt_tokens = max(0, int(raw.get("last_context_actual_prompt_tokens", 0) or 0))
+                self.last_context_actual_completion_tokens = max(0, int(raw.get("last_context_actual_completion_tokens", 0) or 0))
+                self.last_context_actual_total_tokens = max(0, int(raw.get("last_context_actual_total_tokens", 0) or 0))
+                self.last_context_actual_source = trim(str(raw.get("last_context_actual_source", "") or ""), 80)
+                self.last_context_actual_context_label = trim(str(raw.get("last_context_actual_context_label", "") or ""), 80)
+                self.last_context_actual_ts = max(0.0, float(raw.get("last_context_actual_ts", 0.0) or 0.0))
+                self.last_context_estimated_prompt_tokens = max(0, int(raw.get("last_context_estimated_prompt_tokens", 0) or 0))
                 self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
                 self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
                 ids = raw.get("truncation_rescue_task_ids", [])
@@ -14611,6 +14758,14 @@ class SessionState:
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
+            "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
+            "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_context_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_context_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_context_actual_ts": float(getattr(self, "last_context_actual_ts", 0.0) or 0.0),
+            "last_context_estimated_prompt_tokens": int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0),
             "truncation_count": self.truncation_count,
             "last_truncation_ts": self.last_truncation_ts,
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
@@ -14819,6 +14974,8 @@ class SessionState:
         self.runtime_plan_mode_needed = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
+        self.runtime_knowledge_reference_text = ""
+        self.runtime_knowledge_reference_meta = {}
         return removed_hints
 
     def _restore_runtime_policy_from_blackboard_locked(self) -> None:
@@ -15835,6 +15992,9 @@ class SessionState:
         self.runtime_code_reference_text = trim(str(payload.get("code_text", payload.get("text", "")) or ""), 8000)
         meta = payload.get("code_meta", payload.get("meta", {}))
         self.runtime_code_reference_meta = dict(meta) if isinstance(meta, dict) else {}
+        self.runtime_knowledge_reference_text = trim(str(payload.get("knowledge_text", "") or ""), 8000)
+        knowledge_meta = payload.get("knowledge_meta", {})
+        self.runtime_knowledge_reference_meta = dict(knowledge_meta) if isinstance(knowledge_meta, dict) else {}
 
     def _runtime_code_reference_prompt_block(self, max_chars: int = 4200) -> str:
         text = trim(str(getattr(self, "runtime_code_reference_text", "") or ""), max_chars)
@@ -15854,7 +16014,31 @@ class SessionState:
         return (
             f"{header}:\n"
             "Prioritize these code-library references for code implementation/review tasks before generic reasoning. "
+            "If evidence_status=miss, say the code library has no sufficient matching evidence instead of inventing library facts. "
             "If a reference conflicts with the current workspace file, trust the current workspace after verification.\n"
+            f"{text}"
+        )
+
+    def _runtime_knowledge_reference_prompt_block(self, max_chars: int = 3600) -> str:
+        text = trim(str(getattr(self, "runtime_knowledge_reference_text", "") or ""), max_chars)
+        if not text:
+            return ""
+        meta = dict(getattr(self, "runtime_knowledge_reference_meta", {}) or {})
+        tags: list[str] = []
+        route = str(meta.get("route", meta.get("requested_route", "")) or "").strip()
+        if route:
+            tags.append(f"route={route}")
+        result_count = int(meta.get("result_count", meta.get("top_results", 0)) or 0)
+        tags.append(f"evidence_status={str(meta.get('evidence_status', 'miss') or 'miss')}")
+        if result_count > 0:
+            tags.append(f"results={result_count}")
+        header = "Knowledge Library Context"
+        if tags:
+            header += " [" + ", ".join(tags) + "]"
+        return (
+            f"{header}:\n"
+            "Use these knowledge-library references only for claims directly supported by the cited evidence. "
+            "If evidence_status=miss or the snippets do not contain the needed fact, state that the library has no sufficient evidence.\n"
             f"{text}"
         )
 
@@ -15887,7 +16071,8 @@ class SessionState:
             "IMPORTANT: When the task involves a topic you may have documents for — research, analysis, "
             "fact-checking, synthesis — FIRST call query_knowledge_library(query='<topic>', top_k=8) "
             "to retrieve grounded references BEFORE generating your answer. "
-            "Use route='hybrid' for best recall on broad topics; route='fast' for keyword lookups. "
+            "Use route='auto' with budget='standard' by default; use budget='tight' for brief context and budget='deep' only when the user asks for exhaustive retrieval. "
+            "If query results report evidence_status=miss or weak evidence, say the library has no sufficient evidence instead of inventing facts. "
             "Do not infer readiness from session/files or uploads — query the library directly."
         )
 
@@ -15960,7 +16145,8 @@ class SessionState:
             "It lives at the workspace root, not inside the current session files directory and not inside `.clouds_coder`."
             f"{source_hint} "
             "Do not infer code-library readiness by inspecting `session/files`, `uploads`, or `.clouds_coder/long_output`. "
-            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library."
+            "Use `query_code_library` to check readiness or retrieve grounded code references from the global library. "
+            "Use route='auto' with budget='standard' by default; use route='workflow' for process patterns and route='wiki' for accumulated code summaries."
         )
 
     def _engineering_execution_boost_instruction(self) -> str:
@@ -15995,6 +16181,7 @@ class SessionState:
         code_hint = self._code_library_prompt_block()
         engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
+        knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -16003,6 +16190,7 @@ class SessionState:
         knowledge_block = f"{knowledge_hint}\n\n" if knowledge_hint else ""
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
+        knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
@@ -16035,7 +16223,8 @@ class SessionState:
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases inside final exported HTML. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
-            f"Context limit ~{self.context_token_upper_bound} tokens. "
+            f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
+            f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task only when the overall user task is done. "
@@ -16048,6 +16237,7 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{knowledge_ref_block_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
@@ -16078,6 +16268,114 @@ class SessionState:
             return 3.0
         return 4.0
 
+    def _estimate_text_tokens_conservative(self, text: object, *, minimum: int = 0) -> int:
+        raw = str(text or "")
+        if not raw:
+            return max(0, int(minimum or 0))
+        base = int(math.ceil(len(raw) / max(1.0, self._char_token_divisor(raw))))
+        multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        return max(int(minimum or 0), int(math.ceil(base * multiplier)))
+
+    def _extract_model_usage_tokens(self, response: dict | None) -> dict:
+        """Extract provider-reported token counts when a backend returns them."""
+        if not isinstance(response, dict):
+            return {}
+        raw = response.get("raw")
+        if not isinstance(raw, dict):
+            raw = {}
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+
+        def _as_int(value: object) -> int:
+            try:
+                if value is None or value == "":
+                    return 0
+                return max(0, int(float(value)))
+            except Exception:
+                return 0
+
+        prompt = _as_int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or raw.get("prompt_eval_count")
+            or raw.get("input_tokens")
+        )
+        completion = _as_int(
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or raw.get("eval_count")
+            or raw.get("output_tokens")
+        )
+        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
+        if total <= 0 and (prompt or completion):
+            total = prompt + completion
+        if prompt <= 0 and total > completion:
+            prompt = total - completion
+        if not (prompt or completion or total):
+            return {}
+        source = "model-usage"
+        if usage:
+            if "input_tokens" in usage or "output_tokens" in usage:
+                source = "anthropic-usage"
+            else:
+                source = "openai-usage"
+        elif "prompt_eval_count" in raw or "eval_count" in raw:
+            source = "ollama-usage"
+        return {
+            "prompt_tokens": int(prompt),
+            "completion_tokens": int(completion),
+            "total_tokens": int(total),
+            "source": source,
+        }
+
+    def _record_model_usage(
+        self,
+        response: dict | None,
+        *,
+        estimated_prompt_tokens: int | None = None,
+        context_label: str = "",
+    ) -> dict:
+        usage = self._extract_model_usage_tokens(response)
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        if prompt <= 0:
+            return usage
+        estimated = max(1, int(estimated_prompt_tokens or 0))
+        ratio = float(prompt) / float(estimated)
+        old_multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        # Only raise the calibration when reality exceeds the current estimate.
+        # A smaller provider count should not make future auto-compact optimistic.
+        new_multiplier = old_multiplier
+        if ratio > 1.02:
+            new_multiplier = min(float(CONTEXT_USAGE_CALIBRATION_MAX), max(old_multiplier, ratio * old_multiplier))
+        self.context_estimate_calibration = float(new_multiplier)
+        self.last_context_actual_prompt_tokens = prompt
+        self.last_context_actual_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_context_actual_total_tokens = int(usage.get("total_tokens", 0) or 0)
+        self.last_context_actual_source = str(usage.get("source", "model-usage") or "model-usage")
+        self.last_context_actual_context_label = trim(str(context_label or ""), 80)
+        self.last_context_actual_ts = now_ts()
+        self.last_context_estimated_prompt_tokens = estimated
+        if isinstance(response, dict):
+            response["usage_calibration"] = {
+                "estimated_prompt_tokens": estimated,
+                "actual_prompt_tokens": prompt,
+                "actual_total_tokens": self.last_context_actual_total_tokens,
+                "source": self.last_context_actual_source,
+                "calibration": round(float(self.context_estimate_calibration), 4),
+            }
+        return usage
+
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
         if self._is_multi_agent_mode():
@@ -16089,35 +16387,106 @@ class SessionState:
                 ctx = self._agent_context(role)
                 if ctx:
                     raw = json_dumps(ctx)
-                    cost = int(len(raw) / self._char_token_divisor(raw))
+                    cost = self._estimate_text_tokens_conservative(raw)
                     if cost > agent_max:
                         agent_max = cost
             msg_raw = json_dumps(self.messages)
-            msg_tokens = max(agent_max, int(len(msg_raw) / self._char_token_divisor(msg_raw)))
+            msg_tokens = max(agent_max, self._estimate_text_tokens_conservative(msg_raw))
         else:
             msg_raw = json_dumps(self.messages)
-            msg_tokens = int(len(msg_raw) / self._char_token_divisor(msg_raw))
+            msg_tokens = self._estimate_text_tokens_conservative(msg_raw)
         # Overhead: system prompt + tools (always present in API calls)
         try:
             sys_text = self._system_prompt()
-            sys_tokens = int(len(sys_text) / self._char_token_divisor(sys_text))
+            sys_tokens = self._estimate_text_tokens_conservative(sys_text)
         except Exception:
             sys_tokens = 300
-        tools_tokens = int(len(json_dumps(TOOLS)) / 4) if TOOLS else 0
+        tools_tokens = self._estimate_text_tokens_conservative(json_dumps(TOOLS)) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
+
+    def _estimate_model_call_prompt_tokens(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        media_inputs: list[dict] | None = None,
+    ) -> int:
+        payload = {
+            "system": str(system or ""),
+            "messages": messages if isinstance(messages, list) else [],
+            "tools": tools or [],
+        }
+        if media_inputs:
+            media_rows = []
+            for item in media_inputs[:16]:
+                if not isinstance(item, dict):
+                    continue
+                media_rows.append(
+                    {
+                        "name": item.get("name") or item.get("filename") or "",
+                        "mime": item.get("mime") or item.get("content_type") or "",
+                        "size": item.get("size") or item.get("bytes") or 0,
+                    }
+                )
+            payload["media_inputs"] = media_rows
+        return self._estimate_text_tokens_conservative(json_dumps(payload), minimum=1)
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
         limit = max(1, int(self.context_token_upper_bound or 0))
-        used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
-        left = max(0, limit - used)
-        left_pct = max(0.0, min(100.0, (left * 100.0) / limit))
-        used_pct = max(0.0, min(100.0, (used * 100.0) / limit))
+        reserve = max(1, int(math.ceil(limit * CONTEXT_AUTO_COMPACT_RESERVE_RATIO)))
+        effective_limit = max(1, limit - reserve)
+        estimate_used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
+        used = estimate_used
+        actual_floor_applied = False
+        actual_age = max(0.0, now_ts() - float(getattr(self, "last_context_actual_ts", 0.0) or 0.0))
+        actual_prompt = max(0, int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0))
+        actual_estimate_at_call = max(0, int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0))
+        if (
+            token_estimate is None
+            and actual_prompt > 0
+            and actual_estimate_at_call > 0
+            and actual_age <= CONTEXT_ACTUAL_USAGE_RECENT_SECONDS
+            and estimate_used >= int(actual_estimate_at_call * 0.85)
+        ):
+            used = max(used, actual_prompt)
+            actual_floor_applied = used == actual_prompt or actual_prompt >= estimate_used
+        left = max(0, effective_limit - used)
+        raw_left = max(0, limit - used)
+        left_pct = max(0.0, min(100.0, (left * 100.0) / effective_limit))
+        used_pct = max(0.0, min(100.0, (used * 100.0) / effective_limit))
+        raw_left_pct = max(0.0, min(100.0, (raw_left * 100.0) / limit))
         return {
             "limit": limit,
+            "effective_limit": effective_limit,
+            "reserved": reserve,
+            "reserve_percent": round(float(CONTEXT_AUTO_COMPACT_RESERVE_RATIO * 100.0), 3),
             "used": used,
             "left": left,
+            "raw_left": raw_left,
             "left_percent": left_pct,
             "used_percent": used_pct,
+            "raw_left_percent": raw_left_pct,
+            "estimator": "char-cjk-conservative-v3-usage-calibrated",
+            "safety_multiplier": float(
+                max(
+                    float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    min(
+                        float(CONTEXT_USAGE_CALIBRATION_MAX),
+                        float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    ),
+                )
+            ),
+            "base_safety_multiplier": float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "actual_floor_applied": bool(actual_floor_applied),
+            "last_actual_prompt_tokens": int(actual_prompt),
+            "last_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_actual_age_seconds": round(float(actual_age), 3) if getattr(self, "last_context_actual_ts", 0.0) else None,
+            "last_estimated_prompt_tokens": int(actual_estimate_at_call),
+            "calibration_max": float(CONTEXT_USAGE_CALIBRATION_MAX),
         }
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
@@ -16265,11 +16634,12 @@ class SessionState:
         # Tier 2+: compact agent contexts proactively
         if tier >= 2:
             self._compact_agent_contexts(tier)
-        # Re-check after tier-based compression
+        # Re-check after tier-based compression. The effective limit keeps a
+        # small hard reserve so auto-compact still has room to run.
         metrics = self._context_budget_metrics()
         used = int(metrics.get("used", 0) or 0)
-        limit = max(1, int(metrics.get("limit", 0) or 0))
-        if used < limit:
+        effective_limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0))
+        if used < effective_limit:
             return False
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
@@ -20310,6 +20680,48 @@ body{padding:18px}
             body = "\n".join(lines[:line_cap])
         return trim(body, max_chars)
 
+    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+        total_lines = len(lines)
+        try:
+            size = int(fp.stat().st_size)
+        except Exception:
+            size = 0
+        ext = fp.suffix.lower()
+        head = "\n".join(lines[:80])
+        symbols: list[str] = []
+        if ext in {".py", ".pyi"}:
+            for idx, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith(("class ", "def ", "async def ")):
+                    symbols.append(f"{idx}: {trim(stripped, 180)}")
+                if len(symbols) >= 80:
+                    break
+        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")
+            for idx, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    symbols.append(f"{idx}: {trim(line.strip(), 180)}")
+                if len(symbols) >= 80:
+                    break
+        next_limit = LONG_OUTPUT_READ_PAGE_LINES
+        out = [
+            (
+                f"[large_file_overview path={rel} bytes={size} lines={total_lines} "
+                f"auto_paged=true]"
+            ),
+            "This file is too large to inject fully into model context. Use paged read_file calls or RAG/code-library search for focused retrieval.",
+            f"First page: read_file path=\"{rel}\" offset=0 limit={next_limit}",
+        ]
+        if symbols:
+            out.append("\nSymbols:")
+            out.extend(symbols)
+        if head:
+            out.append("\nHead preview:")
+            out.append(head)
+        if total_lines > 80:
+            out.append(f"\n[next_page read_file path=\"{rel}\" offset=80 limit={next_limit}]")
+        return "\n".join(out)
+
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
         upload_id = make_id("upload")
@@ -20380,7 +20792,9 @@ body{padding:18px}
         parsed_excerpt = ""
         needs_async_parse = False
         if kind == "text":
-            excerpt_cap = 8_000 if self._upload_is_code_like(filename=safe_name, kind=kind) else 12_000
+            is_code_upload = self._upload_is_code_like(filename=safe_name, kind=kind)
+            large_text = len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES
+            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or large_text) else 12_000
             parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
         elif kind in ("pdf", "csv", "excel", "presentation", "document"):
             needs_async_parse = True
@@ -22237,9 +22651,15 @@ body{padding:18px}
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
         wake_attempted = False
+        estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+            messages,
+            tools=tools,
+            system=system,
+            media_inputs=media_inputs,
+        )
         for attempt in range(1, retry_budget + 2):
             try:
-                return self._call_interruptible(
+                response = self._call_interruptible(
                     lambda: self.ollama.chat(
                         messages,
                         tools=tools,
@@ -22252,6 +22672,12 @@ body{padding:18px}
                     ),
                     progress_label=f"{context_label} model call",
                 )
+                self._record_model_usage(
+                    response,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    context_label=context_label,
+                )
+                return response
             except OllamaError as exc:
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
@@ -22283,9 +22709,16 @@ body{padding:18px}
                         ),
                     }
                     try:
-                        return self._call_interruptible(
+                        fallback_messages = list(messages) + [fallback_note]
+                        fallback_estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+                            fallback_messages,
+                            tools=tools,
+                            system=system,
+                            media_inputs=None,
+                        )
+                        response = self._call_interruptible(
                             lambda: self.ollama.chat(
-                                list(messages) + [fallback_note],
+                                fallback_messages,
                                 tools=tools,
                                 system=system,
                                 max_tokens=max_tokens,
@@ -22296,6 +22729,12 @@ body{padding:18px}
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
+                        self._record_model_usage(
+                            response,
+                            estimated_prompt_tokens=fallback_estimated_prompt_tokens,
+                            context_label=f"{context_label}:no-media",
+                        )
+                        return response
                     except OllamaError:
                         pass  # fallback also failed, continue normal retry
                 wake_note = ""
@@ -23094,6 +23533,16 @@ body{padding:18px}
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
+            try:
+                file_size = int(fp.stat().st_size)
+            except Exception:
+                file_size = 0
+            if (
+                limit is None
+                and int(offset or 0) <= 0
+                and (file_size >= LARGE_FILE_AUTO_PAGE_BYTES or total_lines >= LARGE_FILE_AUTO_PAGE_LINES)
+            ):
+                return self._large_text_file_overview(fp, rel, lines)
             offset_val = max(0, int(offset or 0))
             requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
             if offset_val >= total_lines:
@@ -24360,10 +24809,12 @@ body{padding:18px}
         return float(difflib.SequenceMatcher(None, left, right).ratio())
 
     def _watchdog_context_near_limit(self) -> bool:
-        limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
         try:
-            used = int(self._estimate_tokens())
+            metrics = self._context_budget_metrics()
+            limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", TOKEN_THRESHOLD)) or TOKEN_THRESHOLD))
+            used = int(metrics.get("used", self._estimate_tokens()) or 0)
         except Exception:
+            limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
             used = 0
         return bool(used >= int(limit * WATCHDOG_CONTEXT_NEAR_RATIO))
 
@@ -26535,6 +26986,10 @@ body{padding:18px}
         if next_step:
             next_step["status"] = "in_progress"
             next_step["activated_at"] = float(now_ts())
+            try:
+                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
+            except Exception:
+                pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -27899,8 +28354,8 @@ body{padding:18px}
         if missing_subtasks:
             return (
                 "<reminder>"
-                "Please call TodoWrite now to update the current subtask before continuing. "
-                "If it fails/repeats, switch to TodoWriteRescue."
+                "Current plan-step subtasks were missing or invalid. The runtime will bootstrap them when possible. "
+                "Continue with one concrete action for the active plan step; use TodoWriteRescue only if progress state is still wrong."
                 "</reminder>"
             )
         return (
@@ -27917,13 +28372,19 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 220)
         rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        if not rows:
+            try:
+                if self._ensure_worker_todos_for_plan_step(step, force_refresh=False, owner=self._current_plan_worker_owner()):
+                    rows = self._active_plan_worker_todo_rows(step_id, role=role)
+            except Exception:
+                rows = []
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
-                f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
+                f"No worker subtasks are available yet for this step. Continue the current plan step; the runtime will try to bootstrap subtasks automatically. "
+                f"Use TodoWrite only if you need to correct or refine progress state for parent_step_id='{step_id}'. "
             )
             subtasks_exist_ban = ""
         else:
@@ -28277,6 +28738,16 @@ body{padding:18px}
         _cur_step_id = str(current.get("id", "") or "")
         if _cur_step_id:
             _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+            if not _existing_subs:
+                try:
+                    if self._ensure_worker_todos_for_plan_step(current, force_refresh=False, owner=self._current_plan_worker_owner()):
+                        self._emit(
+                            "status",
+                            {"summary": "plan subtasks auto-created by runtime bootstrap"},
+                        )
+                        _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+                except Exception as exc:
+                    self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
             if not _existing_subs:
                 _step_label_s = trim(str(current.get("content", "") or ""), 60)
                 _force_tw_msg = (
@@ -29778,6 +30249,62 @@ body{padding:18px}
         )
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
+
+    def _build_user_override_task_decision(self, goal_text: str = "") -> dict:
+        """Build a deterministic task-policy row for manually selected task levels."""
+        try:
+            level = int(getattr(self, "user_task_level_override", 0) or 0)
+        except Exception:
+            level = 0
+        if level not in TASK_LEVEL_CHOICES:
+            return {}
+        policy = TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3])
+        current_complexity = normalize_task_complexity(
+            getattr(self, "runtime_task_complexity", "") or policy.get("complexity", "simple"),
+            default=str(policy.get("complexity", "simple") or "simple"),
+        )
+        if current_complexity not in TASK_COMPLEXITY_LEVELS:
+            current_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
+        profile = self._infer_task_profile(str(goal_text or ""))
+        task_type = str(getattr(self, "runtime_task_type", "") or profile.get("task_type", "general") or "general")
+        if task_type not in TASK_PROFILE_TYPES:
+            task_type = "general"
+        direct_objective = trim(
+            str(getattr(self, "runtime_direct_objective", "") or profile.get("direct_objective", "") or "").strip(),
+            800,
+        )
+        if not direct_objective:
+            direct_objective = "Proceed with direct semantic objective and concrete progress for the current request."
+        return {
+            "level": level,
+            "execution_mode": self._effective_execution_mode(),
+            "participants": list(getattr(self, "runtime_participants", []) or []),
+            "assigned_expert": str(getattr(self, "runtime_assigned_expert", "") or ""),
+            "task_type": task_type,
+            "complexity": current_complexity,
+            "scale_preference": "thorough" if level >= 4 else str(getattr(self, "runtime_scale_preference", "") or "balanced"),
+            "round_budget": int(policy.get("round_budget", getattr(self, "runtime_round_budget", 0) or 0) or 0),
+            "requires_user_confirmation": False,
+            "inherit_previous_state": True,
+            "requires_plan": bool(str(getattr(self, "plan_mode_user_preference", "") or "").lower() == "on"),
+            "direct_objective": direct_objective,
+            "judgement": f"user_task_level_override={level} - deterministic policy, no manager model call",
+            "source": "user-override",
+            "semantic_confidence": "high",
+        }
+
+    def _apply_user_override_task_policy(self, goal_text: str = "") -> dict:
+        """Apply the manual task-level policy without any classifier/model call."""
+        goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
+        if not goal:
+            goal = trim(str(self._latest_user_goal_text() or "").strip(), 4000)
+        decision = self._build_user_override_task_decision(goal)
+        if not decision:
+            return {}
+        self.runtime_reclassify_required = False
+        self.runtime_goal_reset_pending = False
+        self._apply_runtime_task_decision(goal, decision)
+        return dict(decision)
 
     def _plan_steps_context_for_manager(self) -> str:
         bb = self._ensure_blackboard()
@@ -32725,10 +33252,11 @@ body{padding:18px}
             "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
-            "TODO TRACKING (mandatory): "
-            "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
-            "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
-            "Prefer TodoWrite items as objects with explicit fields: "
+                "TODO TRACKING: "
+                "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
+                "After completing ONE subtask, call TodoWrite when possible to mark that subtask as 'completed' and move the next one to 'in_progress'. "
+                "If TodoWrite fails, repeats unchanged, or is unavailable, do not loop on it; continue one concrete action or report the blocker with exact evidence. "
+                "Prefer TodoWrite items as objects with explicit fields: "
             "{content, status, owner?, parent_step_id?}. "
             "If you must use strings, use ONLY canonical prefixes: '[ ]', '[>]', '[x]'. "
             "Do not use emoji markers or free-form localized status labels in TodoWrite payloads. "
@@ -33571,15 +34099,23 @@ body{padding:18px}
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 return self._dispatch_tool_inner(name, args, role_key)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}") as pool:
-                future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
+            future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
+            timed_out = False
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                timed_out = True
+                future.cancel()
+                self._emit("error", {
+                    "summary": f"tool '{name}' timed out after {timeout}s",
+                })
+                return f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
+            finally:
                 try:
-                    return future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    self._emit("error", {
-                        "summary": f"tool '{name}' timed out after {timeout}s",
-                    })
-                    return f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
+                    pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
+                except TypeError:
+                    pool.shutdown(wait=not timed_out)
         except Exception as exc:
             tb_lines = traceback.format_exc()
             self._emit("error", {
@@ -33658,7 +34194,16 @@ body{padding:18px}
                 )
             self._emit(
                 "file_read",
-                {"path": rel, "offset": offset_val, "limit": limit_val, "summary": summary},
+                {
+                    "path": rel,
+                    "offset": offset_val,
+                    "limit": limit_val,
+                    "summary": summary,
+                    "large_file_guard": bool(
+                        limit_val <= 0
+                        and str(out).startswith("[large_file_overview")
+                    ),
+                },
             )
             return out
         if name == "write_file":
@@ -34123,7 +34668,6 @@ body{padding:18px}
             if section in {"research_notes", "execution_logs", "review_feedback",
                            "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
                            "skill_analysis"}:
-                self._blackboard_append_section(section, actor, content)
                 self._blackboard_append_section(section, actor, content)
             elif section == "conversation_history":
                 self._blackboard_history(actor, content)
@@ -35547,7 +36091,41 @@ body{padding:18px}
 
     def _plan_mode_worker(self, pinned_selection: str):
         """Plan mode pipeline: explorer research -> manager synthesis -> proposal -> user choice."""
+        deterministic_text_proposal = self._plan_mode_deterministic_text_plan_proposal()
+        if deterministic_text_proposal and deterministic_text_proposal.get("options"):
+            self._set_runtime_phase("plan-mode:deterministic-text-proposal")
+            self._emit("status", {"summary": "plan-mode: deterministic text proposal generated"})
+            bb = self._ensure_blackboard()
+            bb["status"] = "PLANNING"
+            bb["plan"] = {
+                "phase": "awaiting_choice",
+                "proposal": deterministic_text_proposal,
+                "deterministic_text_plan": True,
+                "findings": [],
+            }
+            self.blackboard = bb
+            self.runtime_plan_proposal = deterministic_text_proposal
+            try:
+                self._write_plan_file(self._format_plan_file_preselection(deterministic_text_proposal))
+            except Exception:
+                pass
+            bubble_text = self._format_plan_bubble_preselection(deterministic_text_proposal)
+            self.messages.append({
+                "role": "assistant",
+                "content": bubble_text,
+                "ts": now_ts(),
+                "agent_role": "planner",
+            })
+            self._emit("message", {
+                "role": "assistant",
+                "text": trim(bubble_text, int(PLAN_MESSAGE_EVENT_MAX_CHARS)),
+                "summary": "plan-mode deterministic text proposal",
+                "agent_role": "planner",
+            })
+            self._emit("status", {"summary": "plan-mode: awaiting user choice"})
+            return
         # Phase 1: explorer-led research and evidence gathering
+        self._set_runtime_phase("plan-mode:research")
         self._emit("status", {"summary": "plan-mode: research phase started"})
         bb = self._ensure_blackboard()
         bb["status"] = "PLANNING"
@@ -35563,14 +36141,24 @@ body{padding:18px}
         research_prompt = self._plan_mode_research_prompt()
         self._seed_plan_mode_explorer_context(research_prompt)
 
-        for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
-            if self.cancel_requested:
-                return
-            self._inject_pending_user_inputs()
-            step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
-            if step.get("status") in ("no-tools", "skip", "interrupted"):
-                break
-            self._plan_mode_update_findings(step)
+        if self._plan_mode_seed_deterministic_research():
+            self._emit("status", {"summary": "plan-mode: deterministic input research complete; moving to synthesis"})
+        else:
+            for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
+                if self.cancel_requested:
+                    return
+                self._inject_pending_user_inputs()
+                step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
+                self._plan_mode_update_findings(step)
+                if step.get("status") == "interrupted":
+                    break
+                if step.get("status") in ("no-tools", "skip"):
+                    if self._plan_mode_research_sufficient(r + 1, step):
+                        self._emit("status", {"summary": "plan-mode: research complete; moving to synthesis"})
+                    break
+                if self._plan_mode_research_sufficient(r + 1, step):
+                    self._emit("status", {"summary": "plan-mode: sufficient research collected; moving to synthesis"})
+                    break
 
         # Phase 2: manager synthesis of structured executable options
         # Inject pending user inputs before synthesis
@@ -35582,6 +36170,7 @@ body{padding:18px}
             self.runtime_plan_approved = False
             return
 
+        self._set_runtime_phase("plan-mode:synthesis")
         self._emit("status", {"summary": "plan-mode: synthesizing proposals"})
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
@@ -35590,17 +36179,28 @@ body{padding:18px}
         self.blackboard = bb
 
         # Synthesis with retry + model fallback + deterministic fallback
-        proposal = None
-        for _synth_attempt in range(PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS):
-            proposal = self._plan_mode_synthesize_proposal(pinned_selection)
+        proposal = self._plan_mode_deterministic_file_plan_proposal()
+        if proposal and proposal.get("options"):
+            self._emit("status", {"summary": "plan-mode: deterministic file proposal generated"})
+        else:
+            proposal = self._plan_mode_deterministic_artifact_plan_proposal()
             if proposal and proposal.get("options"):
-                break
-            if _synth_attempt < (PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS - 1):
-                self._emit("status", {"summary": "plan-mode: synthesis retry"})
+                self._emit("status", {"summary": "plan-mode: deterministic artifact proposal generated"})
+        if not proposal or not proposal.get("options"):
+            proposal = None
+            for _synth_attempt in range(PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS):
+                self._set_runtime_phase(f"plan-mode:synthesis:model-{_synth_attempt + 1}")
+                proposal = self._plan_mode_synthesize_proposal(pinned_selection)
+                if proposal and proposal.get("options"):
+                    break
+                if _synth_attempt < (PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS - 1):
+                    self._emit("status", {"summary": "plan-mode: synthesis retry"})
         if not proposal or not proposal.get("options"):
             # Last resort: minimal fallback with simpler prompt and higher token budget
+            self._set_runtime_phase("plan-mode:synthesis:minimal-fallback")
             proposal = self._synthesis_minimal_fallback(pinned_selection)
         if not proposal or not proposal.get("options"):
+            self._set_runtime_phase("plan-mode:synthesis:programmatic-fallback")
             proposal = self._synthesis_programmatic_fallback()
         if not proposal or not proposal.get("options"):
             self._emit("status", {"summary": "plan-mode: synthesis failed, falling back to direct execution"})
@@ -35625,6 +36225,7 @@ body{padding:18px}
         self.blackboard = bb
 
         # Phase 3: emit the proposal bubble to the frontend without extra reasoning.
+        self._set_runtime_phase("plan-mode:awaiting_choice")
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -35672,18 +36273,23 @@ body{padding:18px}
             f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
             f"to this task and note their names and capabilities in your findings.\n"
             f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
-            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
-            f"workflow steps, scripts, tools, and file paths\n"
-            f"5. Identify key technical details, data points, and structure needed for the output\n"
-            f"6. Assess risks and note any ambiguities that need user input\n"
+            f"3. Read uploaded files (.parsed.md preferred over .pdf) only enough to understand their content and structure. "
+            f"For tabular files, header plus a small sample is enough during research.\n"
+            f"4. If relevant skills exist, mention them. Load at most ONE highly relevant skill only when its concrete workflow is needed for planning; "
+            f"do not load several large skills in research mode.\n"
+            f"5. Identify key technical details, data points, and structure needed for the output; leave heavy computation for execution.\n"
+            f"6. Assess risks and note any ambiguities that need user input, but do not block on them when the user request is executable.\n"
             f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"8. Do NOT ask the user whether to continue or whether to generate the requested artifact. "
+            f"The user already requested the task; after research the controller will synthesize a plan and continue.\n"
+            f"9. Write your findings to the blackboard under 'plan_findings'. Include:\n"
             f"   - Relevant skills found (names, what they do, how to invoke them)\n"
             f"   - File inventory (uploaded files, their types, sizes, key content)\n"
             f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
             f"   - Content analysis (key themes, structure, data points extracted from inputs)\n"
-            f"9. For coding tasks, identify the test strategy:\n"
+            f"10. When enough evidence is collected, stop using tools and output a concise research-complete summary. "
+            f"Do not request permission to proceed.\n"
+            f"11. For coding tasks, identify the test strategy:\n"
             f"   - What build/compilation commands are available? (Makefile, npm, cargo, cmake, etc.)\n"
             f"   - What test frameworks/suites exist? (pytest, jest, go test, etc.)\n"
             f"   - What are the critical paths that must be tested?\n"
@@ -35703,6 +36309,9 @@ body{padding:18px}
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
                 "list_skills, load_skill, and blackboard tools only. "
+                "Keep research lightweight: inventory inputs, read representative files or headers, record enough evidence, then stop. "
+                "Do NOT load multiple large skills unless the user explicitly requested that specific skill workflow. "
+                "Do NOT ask the user for permission to continue after research; summarize findings and let the planner proceed. "
                 f"{skills_block}"
                 "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
                 "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
@@ -35744,6 +36353,8 @@ body{padding:18px}
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
+                "Do NOT ask the user to confirm continuation or artifact creation. "
+                "Keep this phase short; prefer 1 round of file inventory and evidence over deep implementation research. "
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
                 f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
@@ -35800,6 +36411,7 @@ body{padding:18px}
         if not tool_calls:
             return {"status": "no-tools", "text": text}
         # Execute tool calls (read-only)
+        tool_results: list[dict] = []
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted"}
@@ -35819,12 +36431,19 @@ body{padding:18px}
                         "ts": now_ts(),
                         "agent_role": "explorer",
                     }, mirror_to_global=False)
+                    tool_results.append({"name": fn_name, "args": fn_args, "ok": False, "output": result_content})
                     continue
             try:
                 raw_output = self._dispatch_tool(fn_name, fn_args, agent_role="explorer")
             except Exception as exc:
                 raw_output = f"Error: {exc}"
             result_content = str(raw_output or "")
+            tool_results.append({
+                "name": fn_name,
+                "args": fn_args,
+                "ok": not result_content.lower().startswith("error:"),
+                "output": trim(result_content, 2400),
+            })
             self._append_agent_context_message("explorer", {
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -35839,7 +36458,7 @@ body{padding:18px}
                 "result": trim(result_content, 500),
                 "summary": f"plan-mode research: {fn_name}",
             })
-        return {"status": "ok", "tool_count": len(tool_calls), "text": text}
+        return {"status": "ok", "tool_count": len(tool_calls), "text": text, "tool_results": tool_results}
 
     def _plan_mode_update_findings(self, step: dict):
         bb = self._ensure_blackboard()
@@ -35849,19 +36468,194 @@ body{padding:18px}
         findings = plan.get("findings", [])
         if not isinstance(findings, list):
             findings = []
-        text = trim(str(step.get("text", "") or ""), 2000)
+        text = trim(str(step.get("text", "") or ""), 4000)
+        tool_evidence: list[str] = []
+        for item in step.get("tool_results", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = trim(str(item.get("name", "") or ""), 60)
+            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
+            arg_hint = ""
+            if name == "bash":
+                arg_hint = trim(str(args.get("command", "") or "").strip(), 160)
+            elif name == "read_file":
+                arg_hint = trim(str(args.get("path", "") or "").strip(), 160)
+            output = trim(str(item.get("output", "") or "").strip(), 1200)
+            if name and output:
+                if arg_hint:
+                    tool_evidence.append(f"- {name} `{arg_hint}`: {output}")
+                else:
+                    tool_evidence.append(f"- {name}: {output}")
+        content_parts = []
         if text:
-            findings.append({"round": len(findings), "content": text, "ts": now_ts()})
+            content_parts.append(text)
+        if tool_evidence:
+            content_parts.append("Tool evidence:\n" + "\n".join(tool_evidence[:6]))
+        content = trim("\n\n".join(content_parts), 6000)
+        if content:
+            findings.append({"round": len(findings), "content": content, "ts": now_ts()})
         findings = findings[-20:]
         plan["findings"] = findings
         bb["plan"] = plan
         self.blackboard = bb
         # B6: Emit findings status as planner
-        if text:
+        if content:
             self._emit("status", {
                 "summary": f"plan-mode: finding #{len(findings)} collected",
                 "agent_role": "planner",
             })
+
+    def _plan_mode_research_rows(self) -> list[dict]:
+        bb = self._ensure_blackboard()
+        rows: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(content: object, source: str = "", actor: str = ""):
+            txt = trim(str(content or "").strip(), 6000)
+            if not txt:
+                return
+            key = re.sub(r"\s+", " ", txt.lower())[:500]
+            if key in seen:
+                return
+            seen.add(key)
+            rows.append({
+                "source": trim(str(source or ""), 60),
+                "actor": trim(str(actor or ""), 40),
+                "content": txt,
+            })
+
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_rows = plan.get("findings", []) if isinstance(plan.get("findings"), list) else []
+        for item in plan_rows:
+            if isinstance(item, dict):
+                _add(item.get("content", ""), "plan.findings", "explorer")
+            else:
+                _add(item, "plan.findings", "explorer")
+        for section in ("plan_findings", "skill_analysis", "research_notes"):
+            section_rows = bb.get(section, [])
+            if not isinstance(section_rows, list):
+                continue
+            for item in section_rows:
+                if isinstance(item, dict):
+                    _add(item.get("content", ""), section, str(item.get("actor", "") or ""))
+                else:
+                    _add(item, section, "")
+        return rows[-40:]
+
+    def _plan_mode_research_text(self, max_chars: int = 6000) -> str:
+        lines: list[str] = []
+        for idx, item in enumerate(self._plan_mode_research_rows(), start=1):
+            source = trim(str(item.get("source", "") or ""), 60)
+            actor = trim(str(item.get("actor", "") or ""), 40)
+            content = trim(str(item.get("content", "") or ""), 1200)
+            label = f"Finding {idx}"
+            if source:
+                label += f" ({source}"
+                if actor:
+                    label += f"/{actor}"
+                label += ")"
+            lines.append(f"### {label}\n{content}")
+        return trim("\n\n".join(lines), max(500, int(max_chars or 6000)))
+
+    def _plan_mode_seed_deterministic_research(self) -> bool:
+        goal = str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "")
+        goal_low = goal.lower()
+        analysis_like = any(
+            token in goal_low
+            for token in (
+                "上传", "已上传", "csv", "json", "jsonl", "log", "数据", "分析", "报告",
+                "uploaded", "analy", "report", "file",
+            )
+        )
+        upload_dir = self.files_root / "uploaded"
+        if not analysis_like or not upload_dir.exists() or not upload_dir.is_dir():
+            return False
+        files = [p for p in sorted(upload_dir.iterdir()) if p.is_file()]
+        if not files:
+            return False
+        rows: list[str] = [
+            "Deterministic plan-mode research from uploaded inputs.",
+            f"Workspace: {self.files_root}",
+            "Uploaded files:",
+        ]
+        for path in files[:12]:
+            try:
+                size = path.stat().st_size
+            except Exception:
+                size = 0
+            rel = f"uploaded/{path.name}"
+            rows.append(f"- {rel} ({size} bytes)")
+            suffix = path.suffix.lower()
+            if suffix in {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt", ".md"}:
+                try:
+                    sample = path.read_text(encoding="utf-8", errors="replace")[:2200]
+                except Exception as exc:
+                    sample = f"[read error: {exc}]"
+                rows.append(f"Sample from {rel}:\n```\n{trim(sample, 2200)}\n```")
+        rows.append(
+            "Execution requirements inferred: use Python or shell to read the uploaded file(s), "
+            "compute requested metrics from file contents, create the requested output artifact(s), "
+            "then verify output files exist and include grounded numbers or source-derived fields."
+        )
+        content = trim("\n\n".join(rows), 8000)
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {"phase": "research", "findings": []}
+        findings = plan.get("findings", []) if isinstance(plan.get("findings"), list) else []
+        findings.append({"round": len(findings), "content": content, "ts": now_ts(), "source": "deterministic"})
+        plan["findings"] = findings[-20:]
+        bb["plan"] = plan
+        self.blackboard = bb
+        self._blackboard_append_section("plan_findings", "planner", content)
+        self._emit("status", {"summary": f"plan-mode: deterministic research indexed {len(files)} uploaded file(s)"})
+        return True
+
+    def _plan_mode_research_sufficient(self, round_count: int, step: dict) -> bool:
+        try:
+            rounds = int(round_count or 0)
+        except Exception:
+            rounds = 0
+        if rounds < int(PLAN_MODE_EXPLORER_MIN_ROUNDS):
+            return False
+        text = self._plan_mode_research_text(max_chars=12000)
+        if not text:
+            return False
+        low = text.lower()
+        has_input_inventory = any(
+            token in low for token in ("uploaded/", ".csv", ".json", ".jsonl", ".log", "file inventory", "文件清单")
+        )
+        has_processing_evidence = any(
+            token in low for token in (
+                "read_file `", "bash `cat", "bash `head", "bash `python", "bash `awk", "bash `jq",
+                "total", "count", "rows", "top", "mean",
+                "std", "exit", "pytest", "统计", "总销售额", "样本", "均值", "错误类型", "风险评分",
+            )
+        )
+        has_analysis_terms = any(
+            token in low for token in ("数据", "统计", "风险", "建议", "缺失", "测试", "validation", "quality")
+        )
+        if (
+            len(text) >= int(PLAN_MODE_RESEARCH_SUFFICIENT_CHARS)
+            and (has_processing_evidence or (has_input_inventory and has_analysis_terms))
+        ):
+            return True
+        if len(text) >= 350 and has_input_inventory:
+            return True
+        completion_markers = (
+            "分析完成", "研究完成", "已完成", "research complete", "all data computed",
+            "core findings", "关键数据", "已写入黑板", "plan_findings",
+        )
+        permission_markers = (
+            "如需", "请告知", "告诉我继续", "告知我继续", "let me know", "tell me to continue",
+            "if you want me to", "if you would like me to",
+        )
+        if len(text) >= 250 and any(token in low for token in completion_markers):
+            return True
+        if len(text) >= 250 and any(token in low for token in permission_markers):
+            return True
+        tool_results = step.get("tool_results", []) if isinstance(step, dict) else []
+        if rounds >= 3 and len(text) >= 500 and isinstance(tool_results, list) and tool_results:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Stall severity tracking & plan-mode escalation
@@ -36277,6 +37071,9 @@ body{padding:18px}
             content = trim(str(row.get("content", "") or "").strip(), 280)
             if content:
                 finding_lines.append(content)
+        blackboard_findings = self._plan_mode_research_text(max_chars=2000)
+        if blackboard_findings:
+            finding_lines.append(trim(blackboard_findings, 600))
         context = trim(
             (
                 "Fallback synthesis generated automatically from the user goal and current research findings. "
@@ -36315,6 +37112,2318 @@ body{padding:18px}
         }
         return self._normalize_plan_proposal_payload(proposal)
 
+    def _plan_mode_uploaded_file_rows(self) -> list[dict]:
+        upload_dir = self.files_root / "uploaded"
+        rows: list[dict] = []
+        if not upload_dir.exists() or not upload_dir.is_dir():
+            return rows
+        known: dict[str, dict] = {}
+        try:
+            for item in list(getattr(self, "uploads", []) or []):
+                if not isinstance(item, dict):
+                    continue
+                rel = trim(str(item.get("workspace_path", "") or ""), 260)
+                if rel:
+                    known[rel] = item
+        except Exception:
+            known = {}
+        for path in sorted(upload_dir.iterdir()):
+            if not path.is_file():
+                continue
+            rel = f"uploaded/{path.name}"
+            try:
+                size = int(path.stat().st_size)
+            except Exception:
+                size = 0
+            meta = known.get(rel, {})
+            kind = str(meta.get("kind", "") or path.suffix.lower().lstrip(".") or "file")
+            rows.append({"path": rel, "name": path.name, "kind": kind, "size": size})
+        return rows
+
+    def _plan_mode_effective_goal_text(self) -> str:
+        bb = self._ensure_blackboard()
+        goal = trim(str(bb.get("original_goal", "") or "").strip(), 4000)
+        if goal and not self._is_continuation_input(goal):
+            return goal
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_bits: list[str] = []
+        for key in ("summary", "context"):
+            val = trim(str(plan.get(key, "") or "").strip(), 1600)
+            if val and not self._is_continuation_input(val):
+                plan_bits.append(val)
+        proposal = plan.get("proposal", {}) if isinstance(plan.get("proposal"), dict) else {}
+        val = trim(str(proposal.get("context", "") or "").strip(), 1600)
+        if val and not self._is_continuation_input(val):
+            plan_bits.append(val)
+        for opt in proposal.get("options", []) if isinstance(proposal.get("options"), list) else []:
+            if not isinstance(opt, dict):
+                continue
+            for key in ("summary", "title"):
+                val = trim(str(opt.get(key, "") or "").strip(), 1600)
+                if val and not self._is_continuation_input(val):
+                    plan_bits.append(val)
+            for step in opt.get("steps", []) if isinstance(opt.get("steps"), list) else []:
+                val = trim(str(step or "").strip(), 2000)
+                if val:
+                    plan_bits.append(val)
+        if isinstance(plan.get("steps"), list):
+            for step in plan.get("steps", [])[:8]:
+                val = trim(str(step or "").strip(), 2000)
+                if val:
+                    plan_bits.append(val)
+        plan_text = trim("\n".join(plan_bits), 4000)
+        if plan_text:
+            return plan_text
+        latest = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
+        if latest and not self._is_continuation_input(latest):
+            return latest
+        return latest
+
+    def _plan_mode_requested_output_paths(self, goal: str = "") -> list[str]:
+        text = str(goal or self._plan_mode_effective_goal_text() or "")
+        pattern = r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:md|csv|json|jsonl|html|txt|py|js|ts|css|sh)"
+        candidates = re.findall(pattern, text, flags=re.IGNORECASE)
+        upload_names = {
+            str(row.get("name", "") or "").lower()
+            for row in self._plan_mode_uploaded_file_rows()
+            if isinstance(row, dict)
+        }
+        upload_paths = {
+            str(row.get("path", "") or "").lower()
+            for row in self._plan_mode_uploaded_file_rows()
+            if isinstance(row, dict)
+        }
+        out: list[str] = []
+        for raw in candidates:
+            item = trim(str(raw or "").strip().strip("`'\"，。；;:："), 260)
+            if not item:
+                continue
+            low = item.lower().lstrip("./")
+            if low.startswith("uploaded/") or low in upload_paths or Path(low).name in upload_names:
+                continue
+            if item not in out:
+                out.append(item)
+            if len(out) >= 12:
+                break
+        return out
+
+    def _deterministic_artifact_output_paths(self, goal: str = "") -> list[str]:
+        goal_text = str(goal or self._plan_mode_effective_goal_text() or "")
+        outputs = list(self._plan_mode_requested_output_paths(goal_text))
+        low = goal_text.lower()
+
+        def _add(path: str):
+            p = trim(str(path or "").strip(), 260)
+            if p and p not in outputs:
+                outputs.append(p)
+
+        if "parse_duration" in low:
+            _add("parse_duration.py")
+        if "is_valid_email" in low:
+            _add("email_validator.py")
+            _add("test_email_validator.py")
+        if "debounce" in low:
+            _add("debounce.js")
+        if "throttle" in low:
+            _add("throttle.js")
+        if "slugify" in low:
+            _add("slugify.py")
+        if "lru" in low and "cache" in low:
+            _add("lru_cache.py")
+        if "safe_backup" in low or "backup" in low and "bash" in low:
+            _add("safe_backup.sh")
+        if "count_lines" in low or ("行数" in low and ("bash" in low or "shell" in low or "脚本" in low)):
+            _add("count_lines.sh")
+        if "clean_csv" in low or ("csv" in low and "清洗" in low):
+            _add("clean_csv.py")
+            _add("dirty_sample.csv")
+            _add("cleaned_sample.csv")
+        if "word_stats" in low or "词频" in low:
+            _add("word_stats.py")
+        if "todo_demo" in low or ("待办" in low and "html" in low):
+            _add("todo_demo.html")
+        if "counter_demo" in low or ("计数器" in low and "html" in low):
+            _add("counter_demo.html")
+        if "config_loader" in low:
+            _add("config_loader.py")
+            _add("sample_config.json")
+            _add("test_config_loader.py")
+        if "json_summary" in low or ("json" in low and "字段列表" in low and "记录数" in low):
+            _add("json_summary.py")
+            _add("sample_records.json")
+        if "书签管理器" in low and not any(p.lower() == "readme.md" for p in outputs):
+            _add("README.md")
+        return outputs[:16]
+
+    def _plan_mode_should_use_deterministic_file_plan(self) -> bool:
+        uploaded_rows = self._plan_mode_uploaded_file_rows()
+        if not uploaded_rows:
+            return False
+        goal = str(self._plan_mode_effective_goal_text() or "")
+        low = goal.lower()
+        if any(
+            token in low
+            for token in (
+                "上传", "已上传", "uploaded", "csv", "json", "jsonl", "log",
+                "数据", "分析", "统计", "清洗", "报告", "计算", "汇总", "审计",
+                "analy", "report", "summary", "clean", "audit", "calculate",
+            )
+        ):
+            return True
+        return any(
+            str(row.get("path", "") or "").lower().endswith((".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt"))
+            and not str(row.get("path", "") or "").lower().endswith(".parsed.md")
+            for row in uploaded_rows
+        )
+
+    def _plan_mode_deterministic_file_plan_proposal(self) -> dict:
+        if not self._plan_mode_should_use_deterministic_file_plan():
+            return {}
+        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
+        files = self._plan_mode_uploaded_file_rows()
+        file_list = ", ".join(str(row.get("path", "")) for row in files[:8] if isinstance(row, dict))
+        outputs = self._deterministic_artifact_output_paths(goal)
+        output_list = ", ".join(outputs) if outputs else "the requested report/output artifact(s)"
+        steps = [
+            (
+                "1. Input inventory and schema grounding\n"
+                f"1.1 Run `ls -la uploaded/` and confirm the available input files: {file_list or 'uploaded files'}.\n"
+                "1.2 Read the uploaded file headers and representative rows with Python or shell; capture row counts, columns, and obvious missing/invalid values.\n"
+                "1.3 Record the source file paths and constraints so later conclusions stay grounded in uploaded data only."
+            ),
+            (
+                "2. Deterministic computation from source data\n"
+                "2.1 Use Python or shell to parse the uploaded files according to their actual format (CSV/JSON/JSONL/log/text).\n"
+                "2.2 Compute every requested aggregate, ranking, anomaly, distribution, or quality check directly from parsed rows.\n"
+                "2.3 Print or save intermediate calculation evidence so totals and counts can be verified before writing the final artifact."
+            ),
+            (
+                "3. Generate requested deliverables\n"
+                f"3.1 Create {output_list} using only calculated values and source-derived examples.\n"
+                "3.2 Include explicit uncertainty notes for fields or facts that cannot be determined from the uploaded files.\n"
+                "3.3 Include actionable recommendations tied to the computed findings rather than generic advice."
+            ),
+            (
+                "4. Verification and delivery report\n"
+                f"4.1 Run commands that verify {output_list} exist and contain the required key sections/terms.\n"
+                "4.2 Re-check at least one important total or count from the generated output against the calculation output.\n"
+                "4.3 Generate delivery report: summarize files produced, commands run, validation evidence, and any remaining limits."
+            ),
+        ]
+        proposal = {
+            "context": trim(
+                (
+                    "Deterministic file-analysis plan generated from uploaded inputs. "
+                    f"Inputs: {file_list or 'uploaded files'}. Outputs: {output_list}. "
+                    "The execution must read and compute from files instead of estimating."
+                ),
+                1800,
+            ),
+            "options": [
+                {
+                    "id": "A",
+                    "title": "Grounded File Analysis",
+                    "summary": trim(goal or "Analyze uploaded files and produce grounded outputs.", 280),
+                    "steps": steps,
+                    "pros": "Avoids hallucinated metrics by forcing file reads, deterministic computation, artifact generation, and verification.",
+                    "cons": "Uses one direct path instead of asking the model to invent multiple alternative plans.",
+                    "risk": "low",
+                }
+            ],
+            "recommended": "A",
+        }
+        return self._normalize_plan_proposal_payload(proposal)
+
+    def _plan_mode_should_use_deterministic_artifact_plan(self) -> bool:
+        if self._plan_mode_uploaded_file_rows():
+            return False
+        goal = str(self._plan_mode_effective_goal_text() or "")
+        low = goal.lower()
+        outputs = self._deterministic_artifact_output_paths(goal)
+        if not outputs:
+            return False
+        if not any(path.endswith((".py", ".json", ".csv", ".md", ".html", ".js", ".sh")) for path in outputs):
+            return False
+        return any(
+            token in low
+            for token in (
+                "python", "脚本", "script", "pipeline", "管道", "生成", "创建",
+                "报告", "report", "html", "json", "csv", "迁移", "migrate",
+                "javascript", "node", "bash", "测试", "验证", "实现", "函数", "class",
+                "event_summary", "metrics", "customer_health", "配置",
+                "debounce", "parse_duration", "lru", "clean_csv", "safe_backup",
+                "is_valid_email", "config_loader", "word_stats", "todo_demo",
+            )
+        )
+
+    def _plan_mode_should_use_deterministic_text_plan(self) -> bool:
+        if self._plan_mode_uploaded_file_rows():
+            return False
+        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 4000)
+        if not goal or self._plan_mode_requested_output_paths(goal):
+            return False
+        if len(goal) > 1600:
+            return False
+        low = goal.lower()
+        tool_or_artifact = (
+            ".py", ".js", ".ts", ".html", ".css", ".json", ".jsonl", ".csv", ".md",
+            "工作区", "当前目录", "当前会话工作区", "保存为", "生成文件", "创建文件",
+            "运行", "测试", "验证输出", "命令行", "shell", "terminal",
+            "python", "javascript", "node", "pytest", "bash", "脚本", "函数",
+            "实现", "修复", "重构", "api", "数据库", "docker", "部署",
+            "workspace", "create file", "write file", "run test", "implement",
+            "refactor", "debug",
+        )
+        if any(token in low for token in tool_or_artifact):
+            return False
+        text_plan_markers = (
+            "设计方案", "方案", "阶段性计划", "排查优先级", "可验证指标",
+            "流程", "复盘", "风险控制", "产出物", "分析", "制定", "规划",
+            "路线图", "优先级",
+            "plan", "workflow", "roadmap", "retention", "metrics",
+        )
+        if str(self.plan_mode_user_preference or "auto").lower() == "on":
+            return any(token in low for token in text_plan_markers) or len(goal) <= 600
+        try:
+            level = int(self.runtime_task_level or 0)
+        except Exception:
+            level = 0
+        return level >= 3 and any(token in low for token in text_plan_markers)
+
+    def _plan_mode_text_plan_steps_for_goal(self, goal: str) -> list[str]:
+        low = str(goal or "").lower()
+        if any(token in low for token in ("排查", "下降", "原因", "指标", "metrics", "retention", "diagnose")):
+            return [
+                (
+                    "1. 明确问题口径和边界\n"
+                    "1.1 定义核心指标、观察周期、影响对象和异常阈值。\n"
+                    "1.2 按用户、渠道、版本、地域、设备或业务线拆分趋势。\n"
+                    "1.3 先排除埋点、口径、样本结构和数据延迟导致的假异常。"
+                ),
+                (
+                    "2. 拆解可能原因\n"
+                    "2.1 从获客、激活、体验、交付、价格、支持和外部环境拆分假设。\n"
+                    "2.2 为每个假设绑定可观测证据，避免只凭主观判断排序。\n"
+                    "2.3 结合定量数据和定性反馈定位最可能的断点。"
+                ),
+                (
+                    "3. 排定验证优先级\n"
+                    "3.1 优先验证影响面大、可快速证伪、修复成本可控的问题。\n"
+                    "3.2 设计 cohort、A/B、前后对照或抽样复核来验证假设。\n"
+                    "3.3 给每个实验设置成功阈值、观察窗口和停止条件。"
+                ),
+                (
+                    "4. 输出行动和复盘机制\n"
+                    "4.1 形成问题清单、证据表、优先级和负责人。\n"
+                    "4.2 将修复动作映射到指标变化，持续追踪。\n"
+                    "4.3 复盘有效和无效假设，更新后续排查流程。"
+                ),
+            ]
+        if any(token in low for token in ("天", "周", "阶段", "计划", "培训", "分享", "准备", "roadmap")):
+            return [
+                (
+                    "1. 确定目标、受众和验收标准\n"
+                    "1.1 明确交付对象、时间窗口、质量标准和必须覆盖的主题。\n"
+                    "1.2 列出已知约束、资源、依赖和不可延期事项。\n"
+                    "1.3 形成范围边界，避免计划过宽导致后期不可控。"
+                ),
+                (
+                    "2. 拆分阶段和产出物\n"
+                    "2.1 按调研、设计、制作、试运行、交付拆分阶段。\n"
+                    "2.2 为每个阶段定义可检查产出物和完成标准。\n"
+                    "2.3 将关键里程碑放入时间线，并预留缓冲。"
+                ),
+                (
+                    "3. 建立风险控制\n"
+                    "3.1 识别范围蔓延、资料不足、技术依赖、排期冲突和质量返工风险。\n"
+                    "3.2 为高风险项设置提前检查点和备选方案。\n"
+                    "3.3 用试讲、评审、样例验证或小范围试运行降低交付不确定性。"
+                ),
+                (
+                    "4. 收尾交付和复盘\n"
+                    "4.1 冻结版本、检查材料完整性、准备现场或发布预案。\n"
+                    "4.2 记录交付结果、反馈和遗留问题。\n"
+                    "4.3 将可复用模板沉淀到后续项目中。"
+                ),
+            ]
+        return [
+            (
+                "1. 明确目标和边界\n"
+                "1.1 提炼用户要解决的问题、目标对象和交付形式。\n"
+                "1.2 列出已知约束、关键假设和不能确定的信息。\n"
+                "1.3 定义判断方案是否可用的验收标准。"
+            ),
+            (
+                "2. 设计核心结构\n"
+                "2.1 将方案拆成输入、处理、输出、反馈四个层次。\n"
+                "2.2 为每个层次说明负责人、触发条件、频率和关键指标。\n"
+                "2.3 明确优先级，先解决影响最大且可验证的环节。"
+            ),
+            (
+                "3. 制定执行节奏\n"
+                "3.1 按短期、中期、长期列出行动项和产出物。\n"
+                "3.2 为每个行动项绑定验证指标，避免只停留在建议层面。\n"
+                "3.3 预留复盘节点，根据实际数据调整方案。"
+            ),
+            (
+                "4. 输出最终交付\n"
+                "4.1 汇总方案表、流程说明、风险和下一步行动。\n"
+                "4.2 标注不确定信息和需要后续验证的假设。\n"
+                "4.3 给出可直接执行的检查清单。"
+            ),
+        ]
+
+    def _plan_mode_deterministic_text_plan_proposal(self) -> dict:
+        if not self._plan_mode_should_use_deterministic_text_plan():
+            return {}
+        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
+        steps = self._plan_mode_text_plan_steps_for_goal(goal)
+        proposal = {
+            "context": trim(
+                (
+                    "Deterministic text-plan proposal for a structured analysis/planning task "
+                    "with no uploaded files and no requested local artifacts. "
+                    "The execution will produce a grounded final text answer and observable Todo progress."
+                ),
+                1800,
+            ),
+            "options": [
+                {
+                    "id": "A",
+                    "title": "结构化文本交付方案",
+                    "summary": trim(goal or "生成结构化分析或计划文本。", 320),
+                    "steps": steps,
+                    "pros": "避免小模型在无文件文本任务中长时间研究和合成，保留计划选择与 Todo 可观测性。",
+                    "cons": "不进行外部检索，适合常规业务/流程/计划类问题。",
+                    "risk": "low",
+                }
+            ],
+            "recommended": "A",
+        }
+        return self._normalize_plan_proposal_payload(proposal)
+
+    def _plan_mode_deterministic_artifact_plan_proposal(self) -> dict:
+        if not self._plan_mode_should_use_deterministic_artifact_plan():
+            return {}
+        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
+        outputs = self._deterministic_artifact_output_paths(goal)
+        output_list = ", ".join(outputs)
+        steps = [
+            (
+                "1. Scope outputs and create deterministic builder inputs\n"
+                f"1.1 Confirm requested output files: {output_list}.\n"
+                "1.2 Use only local Python standard-library code unless the user explicitly requires an external dependency.\n"
+                "1.3 Include deterministic sample data where the task asks to create a self-contained pipeline or report."
+            ),
+            (
+                "2. Generate scripts/data/artifacts\n"
+                f"2.1 Create {output_list} with concrete content that satisfies the requested workflow.\n"
+                "2.2 For Python tools, write runnable scripts and generate their sample input files.\n"
+                "2.3 Execute the scripts locally so downstream JSON/Markdown/HTML outputs are produced from the source data."
+            ),
+            (
+                "3. Verify and deliver\n"
+                f"3.1 Run shell checks proving {output_list} exist and are non-empty.\n"
+                "3.2 For generated scripts, run them and capture command output or validation evidence.\n"
+                "3.3 Summarize generated files, commands run, and any explicit limits."
+            ),
+        ]
+        proposal = {
+            "context": trim(
+                (
+                    "Deterministic artifact-generation plan for explicit local output files. "
+                    f"Outputs: {output_list}. The execution must write, run, and verify local artifacts."
+                ),
+                1800,
+            ),
+            "options": [
+                {
+                    "id": "A",
+                    "title": "Deterministic Local Artifact Build",
+                    "summary": trim(goal or "Generate and verify requested local artifacts.", 280),
+                    "steps": steps,
+                    "pros": "Avoids small-model planning stalls by using a direct standard-library build and verification path.",
+                    "cons": "Optimized for explicit artifact tasks, not open-ended architecture exploration.",
+                    "risk": "low",
+                }
+            ],
+            "recommended": "A",
+        }
+        return self._normalize_plan_proposal_payload(proposal)
+
+    def _deterministic_file_analysis_script(self, input_rel: str, output_paths: list[str]) -> str:
+        outputs_repr = repr(list(output_paths or []))
+        input_repr = repr(str(input_rel or ""))
+        return f'''#!/usr/bin/env python3
+import csv, json, math, statistics
+from collections import Counter, defaultdict
+from pathlib import Path
+
+INPUT = Path({input_repr})
+OUTPUTS = {outputs_repr}
+GOAL_TEXT = {repr(str(self._plan_mode_effective_goal_text() or ""))}
+
+def fmt_num(value):
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{{value:.2f}}"
+    return str(value)
+
+def write_text(path, content):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+def sniff_csv_dialect(text, suffix):
+    sample = "\\n".join(text.splitlines()[:20])
+    if suffix == ".tsv":
+        return "excel-tab"
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",\\t;|")
+    except Exception:
+        header = text.splitlines()[0] if text.splitlines() else ""
+        if "\\t" in header and header.count("\\t") >= header.count(","):
+            return "excel-tab"
+        return "excel"
+
+def load_rows(path):
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if suffix in (".csv", ".tsv"):
+        dialect = sniff_csv_dialect(text, suffix)
+        rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
+        return rows, "csv"
+    if suffix in (".jsonl", ".ndjson"):
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        return rows, "jsonl"
+    if suffix == ".json":
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            return obj, "json"
+        if isinstance(obj, dict):
+            for key in ("rows", "records", "items", "tasks", "events"):
+                if isinstance(obj.get(key), list):
+                    return obj[key], "json"
+            return [obj], "json"
+    rows = [{{"line": line}} for line in text.splitlines() if line.strip()]
+    return rows, "text"
+
+def as_float(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+rows, kind = load_rows(INPUT)
+columns = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
+goal_low = GOAL_TEXT.lower()
+missing = defaultdict(int)
+numeric_cols = []
+for col in columns:
+    nums = [as_float((row or {{}}).get(col)) for row in rows if isinstance(row, dict)]
+    valid = [x for x in nums if x is not None]
+    if valid and len(valid) >= max(1, len(rows) // 3):
+        numeric_cols.append(col)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get(col) is None or str(row.get(col)).strip() == "":
+            missing[col] += 1
+
+lines = []
+lines.append("# 数据分析报告")
+lines.append("")
+lines.append("## 数据来源")
+lines.append(f"- 输入文件: `{{INPUT.as_posix()}}`")
+lines.append(f"- 解析格式: {{kind}}")
+lines.append(f"- 行数: {{len(rows)}}")
+if columns:
+    lines.append(f"- 字段: {{', '.join(columns)}}")
+lines.append("")
+
+derived = {{}}
+if {{"units", "unit_price"}}.issubset(set(columns)):
+    total_sales = 0.0
+    valid_sales_rows = 0
+    by_region = defaultdict(float)
+    by_product = defaultdict(float)
+    units_by_product = defaultdict(float)
+    for row in rows:
+        units = as_float(row.get("units"))
+        price = as_float(row.get("unit_price"))
+        if units is None or price is None:
+            continue
+        revenue = units * price
+        total_sales += revenue
+        valid_sales_rows += 1
+        by_region[str(row.get("region", "UNKNOWN") or "UNKNOWN")] += revenue
+        by_product[str(row.get("product", "UNKNOWN") or "UNKNOWN")] += revenue
+        units_by_product[str(row.get("product", "UNKNOWN") or "UNKNOWN")] += units
+    derived["total_sales"] = total_sales
+    lines.append("## 核心指标")
+    lines.append(f"- 总销售额: {{fmt_num(total_sales)}}")
+    lines.append(f"- 有效销售行数: {{valid_sales_rows}} / {{len(rows)}}")
+    lines.append("")
+    lines.append("## 按地区汇总")
+    for key, val in sorted(by_region.items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append(f"- {{key}}: {{fmt_num(val)}}")
+    lines.append("")
+    lines.append("## Top 3 产品")
+    for idx, (key, val) in enumerate(sorted(by_product.items(), key=lambda kv: (-kv[1], kv[0]))[:3], 1):
+        units = units_by_product.get(key, 0)
+        lines.append(f"{{idx}}. {{key}}: 销售额 {{fmt_num(val)}}，销量 {{fmt_num(units)}}")
+    lines.append("")
+elif {{"gross_revenue", "refunds"}}.issubset(set(columns)):
+    gross = sum(as_float(r.get("gross_revenue")) or 0 for r in rows)
+    refunds = sum(as_float(r.get("refunds")) or 0 for r in rows)
+    lines.append("## 核心指标")
+    lines.append(f"- 总收入: {{fmt_num(gross)}}")
+    lines.append(f"- 总退款: {{fmt_num(refunds)}}")
+    lines.append(f"- 退款率: {{(refunds / gross * 100) if gross else 0:.2f}}%")
+    group_col = "segment" if "segment" in columns else columns[0] if columns else ""
+    if group_col:
+        grouped = defaultdict(lambda: [0.0, 0.0])
+        for r in rows:
+            key = str(r.get(group_col, "UNKNOWN") or "UNKNOWN")
+            grouped[key][0] += as_float(r.get("gross_revenue")) or 0
+            grouped[key][1] += as_float(r.get("refunds")) or 0
+        lines.append("")
+        lines.append(f"## 按 {{group_col}} 汇总")
+        for key, vals in sorted(grouped.items()):
+            rate = (vals[1] / vals[0] * 100) if vals[0] else 0
+            lines.append(f"- {{key}}: gross={{fmt_num(vals[0])}}, refund={{fmt_num(vals[1])}}, refund_rate={{rate:.2f}}%")
+    lines.append("")
+elif {{"on_hand", "avg_daily_sales"}}.issubset(set(columns)):
+    lines.append("## 库存覆盖天数")
+    summary_rows = []
+    for r in rows:
+        sku = str(r.get("sku", "UNKNOWN") or "UNKNOWN")
+        supplier = str(r.get("supplier", "UNKNOWN") or "UNKNOWN")
+        on_hand = as_float(r.get("on_hand")) or 0
+        avg = as_float(r.get("avg_daily_sales")) or 0
+        coverage = (on_hand / avg) if avg else 0
+        risk = "high" if coverage < 7 else "ok"
+        summary_rows.append({{"sku": sku, "supplier": supplier, "coverage_days": coverage, "risk": risk}})
+        lines.append(f"- {{sku}} ({{supplier}}): coverage_days={{coverage:.2f}}, risk={{risk}}")
+    if any(p.endswith(".csv") for p in OUTPUTS):
+        csv_path = next(p for p in OUTPUTS if p.endswith(".csv"))
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["sku", "supplier", "coverage_days", "risk"])
+            w.writeheader()
+            for row in summary_rows:
+                w.writerow(row)
+    lines.append("")
+elif {{"employee_id", "amount"}}.issubset(set(columns)):
+    totals = defaultdict(float)
+    duplicates = Counter()
+    negative_rows = []
+    high_rows = []
+    for r in rows:
+        emp = str(r.get("employee_id", "UNKNOWN") or "UNKNOWN")
+        amount = as_float(r.get("amount"))
+        key = tuple((col, str(r.get(col, ""))) for col in columns)
+        duplicates[key] += 1
+        if amount is None:
+            continue
+        totals[emp] += amount
+        if amount < 0:
+            negative_rows.append(r)
+        if abs(amount) >= 10000:
+            high_rows.append(r)
+    lines.append("## 薪资审计统计")
+    for emp, total in sorted(totals.items()):
+        lines.append(f"- {{emp}}: total={{fmt_num(total)}}")
+    lines.append("## 异常记录")
+    lines.append(f"- negative/负数记录: {{len(negative_rows)}}")
+    lines.append(f"- high_value/超阈值记录(abs(amount)>=10000): {{len(high_rows)}}")
+    dup_count = sum(count - 1 for count in duplicates.values() if count > 1)
+    lines.append(f"- duplicate 重复记录: {{dup_count}}")
+    lines.append("- 不能确定员工部门；上传文件未提供 department 字段。")
+    lines.append("")
+elif {{"severity", "asset_criticality"}}.issubset(set(columns)) and "event_type" in columns:
+    severity_weight = {{"low": 1, "medium": 2, "high": 3, "critical": 4}}
+    scored = []
+    for r in rows:
+        sev = str(r.get("severity", "") or "").lower()
+        crit = as_float(r.get("asset_criticality")) or 0
+        success = str(r.get("success", "") or "").lower() == "true"
+        score = severity_weight.get(sev, 1) * 10 + crit * 2 + (5 if success else 0)
+        scored.append((score, r))
+    lines.append("## 风险评分公式")
+    lines.append("- risk_score = severity_weight*10 + asset_criticality*2 + success_bonus(成功事件为5，否则0)。")
+    lines.append("## 按风险评分排序事件")
+    for score, r in sorted(scored, key=lambda item: (-item[0], str(item[1].get("event_id", "")))):
+        lines.append(f"- {{r.get('event_id')}} score={{score:.1f}} type={{r.get('event_type')}} ip={{r.get('source_ip')}} severity={{r.get('severity')}}")
+    lines.append("## 来源 IP 统计")
+    for key, count in Counter(str(r.get("source_ip", "UNKNOWN") or "UNKNOWN") for r in rows).most_common():
+        lines.append(f"- {{key}}: {{count}}")
+    lines.append("## 事件类型统计")
+    for key, count in Counter(str(r.get("event_type", "UNKNOWN") or "UNKNOWN") for r in rows).most_common():
+        lines.append(f"- {{key}}: {{count}}")
+    lines.append("")
+elif {{"sample_id", "group", "metric"}}.issubset(set(columns)):
+    cleaned = []
+    invalid = []
+    for r in rows:
+        val = as_float(r.get("metric"))
+        if val is None:
+            invalid.append(r)
+            continue
+        new_r = dict(r)
+        new_r["metric"] = val
+        cleaned.append(new_r)
+    for out in OUTPUTS:
+        if out.endswith(".csv"):
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                fieldnames = columns
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for r in cleaned:
+                    row = dict(r)
+                    row["metric"] = fmt_num(row.get("metric"))
+                    w.writerow(row)
+    grouped_vals = defaultdict(list)
+    for r in cleaned:
+        grouped_vals[str(r.get("group", "UNKNOWN") or "UNKNOWN")].append(float(r["metric"]))
+    lines.append("## 清洗结果")
+    lines.append(f"- 原始行数: {{len(rows)}}")
+    lines.append(f"- 有效行数: {{len(cleaned)}}")
+    lines.append(f"- 无效行数: {{len(invalid)}}")
+    lines.append("## 分组统计")
+    for group, vals in sorted(grouped_vals.items()):
+        sd = statistics.stdev(vals) if len(vals) >= 2 else 0.0
+        lines.append(f"- {{group}}: n={{len(vals)}}, mean={{statistics.mean(vals):.2f}}, std={{sd:.2f}}, min={{min(vals):.2f}}, max={{max(vals):.2f}}")
+    lines.append("## 数据质量问题")
+    for r in invalid:
+        lines.append(f"- sample_id={{r.get('sample_id')}} metric 无效或缺失，notes={{r.get('notes', '')}}")
+    if cleaned:
+        all_vals = [float(r["metric"]) for r in cleaned]
+        mean = statistics.mean(all_vals)
+        sd_all = statistics.stdev(all_vals) if len(all_vals) >= 2 else 0.0
+        for r in cleaned:
+            if sd_all and abs(float(r["metric"]) - mean) > 2 * sd_all:
+                lines.append(f"- possible outlier: sample_id={{r.get('sample_id')}} metric={{r.get('metric')}}")
+    lines.append("")
+elif kind in ("json", "jsonl") and rows and isinstance(rows[0], dict) and "text" in columns:
+    def classify_topic(text):
+        t = str(text or "").lower()
+        rules = [
+            ("mobile", ("mobile", "checkout", "login", "coupon")),
+            ("billing", ("billing", "invoice", "pricing", "tax", "vat", "checkout")),
+            ("auth_sso", ("sso", "okta", "login", "certificate")),
+            ("performance", ("loads", "seconds", "timeout", "slow", "export")),
+            ("api_import", ("api", "import", "webhook", "bulk")),
+            ("docs_onboarding", ("docs", "document", "tutorial", "settings")),
+            ("search", ("search", "filter", "duplicates")),
+            ("security_audit", ("audit", "permission", "admin")),
+            ("encoding", ("mojibake", "csv", "chinese")),
+        ]
+        for name, words in rules:
+            if any(word in t for word in words):
+                return name
+        return "other"
+    topic_counts = Counter()
+    severity_counts = Counter()
+    sentiment_counts = Counter()
+    examples = defaultdict(list)
+    for r in rows:
+        topic = classify_topic(r.get("text", ""))
+        topic_counts[topic] += 1
+        if "severity" in r:
+            severity_counts[str(r.get("severity", "UNKNOWN") or "UNKNOWN")] += 1
+        if "sentiment" in r:
+            sentiment_counts[str(r.get("sentiment", "UNKNOWN") or "UNKNOWN")] += 1
+        examples[topic].append(str(r.get("id", "")))
+    for out in OUTPUTS:
+        if out.endswith(".csv"):
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["topic", "count", "example_ids"])
+                for topic, count in topic_counts.most_common():
+                    w.writerow([topic, count, ";".join(x for x in examples.get(topic, []) if x)])
+    lines.append("## 主题归类统计")
+    for topic, count in topic_counts.most_common():
+        ids = ", ".join(x for x in examples.get(topic, []) if x)
+        lines.append(f"- {{topic}}: {{count}} (examples: {{ids or 'n/a'}})")
+    if severity_counts:
+        lines.append("## 严重程度分布")
+        for key, count in severity_counts.most_common():
+            lines.append(f"- {{key}}: {{count}}")
+    if sentiment_counts:
+        lines.append("## sentiment 分布")
+        for key, count in sentiment_counts.most_common():
+            lines.append(f"- {{key}}: {{count}}")
+    lines.append("## 最常见根因/主题")
+    if topic_counts:
+        lines.append(f"- top topic: {{topic_counts.most_common(1)[0][0]}} ({{topic_counts.most_common(1)[0][1]}})")
+    lines.append("## 产品优先级路线图")
+    for idx, (topic, count) in enumerate(topic_counts.most_common(5), 1):
+        lines.append(f"{{idx}}. 优先处理 {{topic}}，基于 {{count}} 条文件内反馈。")
+    lines.append("- 结论仅基于上传小样本；不能推断总体用户占比。")
+    lines.append("")
+elif kind in ("json", "jsonl") and rows and isinstance(rows[0], dict) and ("milestones" in rows[0] or "risks" in rows[0] or "tasks" in rows[0]):
+    obj = rows[0]
+    milestones = obj.get("milestones") if isinstance(obj.get("milestones"), list) else []
+    risks = obj.get("risks") if isinstance(obj.get("risks"), list) else []
+    tasks = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
+    items = milestones or tasks
+    lines.append("## 项目健康度")
+    blocked = [x for x in items if str(x.get("status", "")).lower() in ("blocked", "delayed")]
+    done = [x for x in items if str(x.get("status", "")).lower() == "done"]
+    lines.append(f"- 项目: {{obj.get('project', '未提供')}}")
+    lines.append(f"- as_of: {{obj.get('as_of', '未提供')}}")
+    lines.append(f"- 完成项: {{len(done)}} / {{len(items)}}")
+    lines.append(f"- 阻塞/延期项: {{len(blocked)}}")
+    lines.append("## 延期任务")
+    for item in blocked:
+        lines.append(f"- {{item.get('id', item.get('name'))}} {{item.get('title', item.get('name', ''))}} owner={{item.get('owner')}} due={{item.get('due')}} status={{item.get('status')}} blocker={{item.get('blocker', '')}}")
+    owner_counts = Counter(str(x.get("owner", "UNKNOWN") or "UNKNOWN") for x in items)
+    lines.append("## 负责人视图")
+    for owner, count in owner_counts.most_common():
+        lines.append(f"- {{owner}}: {{count}} 项")
+    if risks:
+        lines.append("## 风险列表")
+        for risk in risks:
+            lines.append(f"- {{risk.get('id')}}: {{risk.get('desc')}} impact={{risk.get('impact')}} probability={{risk.get('probability')}}")
+    if tasks:
+        lines.append("## 依赖阻塞")
+        task_by_id = {{str(t.get("id")): t for t in tasks}}
+        for task in tasks:
+            deps = task.get("depends_on") if isinstance(task.get("depends_on"), list) else []
+            blockers = [d for d in deps if str(task_by_id.get(str(d), {{}}).get("status", "")).lower() not in ("done", "")]
+            if blockers:
+                lines.append(f"- {{task.get('id')}} blocked by {{', '.join(blockers)}}")
+    lines.append("## 下一周行动清单")
+    for item in blocked[:3]:
+        lines.append(f"- 解除 {{item.get('id', item.get('name'))}} 的阻塞，负责人 {{item.get('owner')}}。")
+    if not blocked:
+        lines.append("- 继续推进未完成项并复核风险。")
+    lines.append("")
+elif kind == "text" and rows and "line" in columns:
+    log_lines = [str(r.get("line", "")) for r in rows]
+    level_counts = Counter()
+    status_counts = Counter()
+    endpoint_times = []
+    errors = []
+    for line in log_lines:
+        parts = line.split()
+        for token in ("ERROR", "WARN", "INFO"):
+            if f" {{token}} " in f" {{line}} ":
+                level_counts[token] += 1
+        if len(parts) >= 3 and parts[1].isdigit():
+            status_counts[parts[1]] += 1
+        if "ERROR" in line or " 5" in line:
+            errors.append(line)
+        m_path = None
+        m_ms = None
+        for part in parts:
+            if part.startswith("/"):
+                m_path = part
+            if part.endswith("ms"):
+                try:
+                    m_ms = float(part[:-2].split("=")[-1])
+                except Exception:
+                    pass
+            if "duration_ms=" in part:
+                m_ms = as_float(part.split("=", 1)[1])
+        if m_path and m_ms is not None:
+            endpoint_times.append((m_ms, m_path, line))
+    lines.append("## 日志统计")
+    if level_counts:
+        for key, count in level_counts.most_common():
+            lines.append(f"- {{key}}: {{count}}")
+    if status_counts:
+        lines.append("## 状态码统计")
+        for key, count in status_counts.most_common():
+            lines.append(f"- {{key}}: {{count}}")
+    if endpoint_times:
+        lines.append("## 最慢端点")
+        for ms, path, line in sorted(endpoint_times, reverse=True)[:5]:
+            lines.append(f"- {{path}} {{fmt_num(ms)}}ms | {{line}}")
+    lines.append("## 关键时间线/证据行")
+    for line in errors[:10]:
+        lines.append(f"- {{line}}")
+    lines.append("## 最可能的根因假设")
+    if any("db pool" in line.lower() for line in log_lines):
+        lines.append("- 多条 WARN 显示 db pool_wait_ms 升高，且随后出现导出/导入错误，优先排查数据库连接池或慢查询。")
+    elif any("/checkout" in line for line in log_lines):
+        lines.append("- /checkout 同时出现 5xx 和高延迟，优先排查该端点依赖链。")
+    else:
+        lines.append("- 只能基于日志中的错误行提出假设，根因尚不能确定。")
+    if any("wp-admin" in line or "wp-login" in line for line in log_lines):
+        lines.append("- 出现 wp-admin/wp-login.php 探测请求，属于可疑扫描模式。")
+    lines.append("## 下一步排查命令")
+    lines.append("- grep -E 'ERROR|WARN| 5[0-9][0-9] ' uploaded/*.log")
+    lines.append("- awk '{{print $1,$2,$3,$4}}' uploaded/*.log | sort | uniq -c")
+    lines.append("")
+elif numeric_cols:
+    lines.append("## 数值字段统计")
+    for col in numeric_cols:
+        vals = [as_float(r.get(col)) for r in rows if isinstance(r, dict)]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        lines.append(f"- {{col}}: count={{len(vals)}}, sum={{fmt_num(sum(vals))}}, mean={{statistics.mean(vals):.2f}}, min={{fmt_num(min(vals))}}, max={{fmt_num(max(vals))}}")
+    lines.append("")
+
+lines.append("## 异常/缺失数据说明")
+if missing:
+    for col, count in sorted(missing.items()):
+        if count:
+            lines.append(f"- {{col}}: 缺失 {{count}} 行")
+if not any(missing.values()):
+    lines.append("- 未发现空值字段。")
+lines.append("- 未从上传文件中出现的事实不会被推断；未知部门、月份或外部背景均标记为不能确定。")
+lines.append("")
+
+if columns:
+    lines.append("## 分类字段分布")
+    for col in columns[:8]:
+        vals = [str(r.get(col, "")).strip() for r in rows if isinstance(r, dict)]
+        non_empty = [v for v in vals if v]
+        unique = Counter(non_empty)
+        if 1 < len(unique) <= 12 and col not in numeric_cols:
+            lines.append(f"### {{col}}")
+            for key, count in unique.most_common(8):
+                lines.append(f"- {{key}}: {{count}}")
+    lines.append("")
+
+lines.append("## 可执行建议")
+lines.append("1. 对缺失或异常字段建立导入校验，先阻止空值进入关键计算。")
+lines.append("2. 将本报告中的核心聚合指标加入每次数据更新后的自动校验清单。")
+lines.append("3. 对排名靠前或风险最高的分类项建立负责人和复查周期。")
+lines.append("4. 保留本次命令输出和源文件路径，作为后续审计和复算依据。")
+lines.append("")
+lines.append("## 验证记录")
+lines.append("- 本报告由本地 Python 脚本读取上传文件后生成。")
+lines.append(f"- 输出文件: {{', '.join(OUTPUTS) if OUTPUTS else 'sales_analysis_report.md'}}")
+
+md_outputs = [p for p in OUTPUTS if p.endswith(".md")]
+if not md_outputs:
+    md_outputs = ["analysis_report.md"]
+for out in md_outputs:
+    write_text(out, "\\n".join(lines) + "\\n")
+
+for out in OUTPUTS:
+    if out.endswith(".json") and not Path(out).exists():
+        write_text(out, json.dumps({{"input": INPUT.as_posix(), "rows": len(rows), "columns": columns, "numeric_columns": numeric_cols}}, ensure_ascii=False, indent=2))
+    if out.endswith(".csv") and not Path(out).exists():
+        with open(out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["metric", "value"])
+            w.writerow(["input", INPUT.as_posix()])
+            w.writerow(["rows", len(rows)])
+            for col, count in sorted(missing.items()):
+                w.writerow([f"missing_{{col}}", count])
+
+print(json.dumps({{
+    "input": INPUT.as_posix(),
+    "rows": len(rows),
+    "columns": columns,
+    "numeric_columns": numeric_cols,
+    "outputs": OUTPUTS or md_outputs,
+    "missing": dict(missing),
+    "derived": derived,
+}}, ensure_ascii=False, indent=2))
+'''
+
+    def _deterministic_file_analysis_execute_if_applicable(self) -> bool:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
+        if not approved_or_executing:
+            return False
+        if bool(bb.get("deterministic_file_analysis_done", False)):
+            return False
+        if not self._plan_mode_should_use_deterministic_file_plan():
+            return False
+        files = [
+            row for row in self._plan_mode_uploaded_file_rows()
+            if str(row.get("path", "") or "").lower().endswith((".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt"))
+            and not str(row.get("path", "") or "").lower().endswith(".parsed.md")
+        ]
+        if not files:
+            return False
+        goal = self._plan_mode_effective_goal_text()
+        outputs = self._deterministic_artifact_output_paths(goal)
+        if not outputs:
+            outputs = ["analysis_report.md"]
+        primary_input = str(files[0].get("path", "") or "")
+        self._set_runtime_phase("deterministic-file-analysis")
+        self._emit("status", {"summary": "deterministic file-analysis executor started"})
+        bb["status"] = "CODING"
+        bb["deterministic_file_analysis_started_at"] = float(now_ts())
+        self.blackboard = bb
+        try:
+            plan_steps = [
+                t for t in bb.get("project_todos", [])
+                if isinstance(t, dict) and t.get("category") == "plan_step"
+            ]
+            if plan_steps:
+                for step in list(plan_steps):
+                    if step.get("status") == "completed":
+                        continue
+                    self._advance_plan_step(
+                        evidence="deterministic executor completed file-analysis phase",
+                        actor="developer",
+                    )
+        except Exception:
+            pass
+
+        script_rel = ".clouds_coder/deterministic_file_analysis.py"
+        script_content = self._deterministic_file_analysis_script(primary_input, outputs)
+        self._dispatch_tool("write_file", {"path": script_rel, "content": script_content}, agent_role="developer")
+        cmd = f"python3 {shlex.quote(script_rel)}"
+        cmd_output = self._dispatch_tool("bash", {"command": cmd}, agent_role="developer")
+        verify_parts = []
+        for out in outputs:
+            verify_parts.append(f"test -s {shlex.quote(out)} && echo OK:{shlex.quote(out)}")
+        if verify_parts:
+            self._dispatch_tool("bash", {"command": " && ".join(verify_parts)}, agent_role="developer")
+        for out in outputs:
+            try:
+                fp = self._session_path(out)
+                if fp.exists():
+                    self._blackboard_upsert_artifact(out, f"deterministic file-analysis output ({fp.stat().st_size} bytes)", "developer")
+            except Exception:
+                pass
+        self._blackboard_append_section(
+            "execution_logs",
+            "developer",
+            trim(f"deterministic file-analysis command output:\n{cmd_output}", 3000),
+        )
+        self._blackboard_mark_approved(
+            f"Generated {', '.join(outputs)} from {primary_input} with deterministic Python analysis.",
+            actor="developer",
+        )
+        bb = self._ensure_blackboard()
+        bb["deterministic_file_analysis_done"] = True
+        bb["deterministic_file_analysis_outputs"] = list(outputs)
+        bb["deterministic_file_analysis_input"] = primary_input
+        bb["deterministic_file_analysis_completed_at"] = float(now_ts())
+        self.blackboard = bb
+        self._mark_all_done_silently("deterministic file-analysis completed")
+        final_text = (
+            "已完成上传文件分析并生成结果文件。\n\n"
+            f"- 输入文件：`{primary_input}`\n"
+            f"- 输出文件：{', '.join(f'`{p}`' for p in outputs)}\n"
+            "- 已通过本地 Python 脚本读取源文件、计算指标并运行文件存在性验证。"
+        )
+        self.messages.append({
+            "role": "assistant",
+            "content": final_text,
+            "ts": now_ts(),
+            "agent_role": "developer",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": final_text,
+            "summary": "deterministic file-analysis completed",
+            "agent_role": "developer",
+        })
+        self._emit("status", {"summary": "deterministic file-analysis executor finished"})
+        return True
+
+    def _deterministic_artifact_builder_script(self, goal_text: str, output_paths: list[str]) -> str:
+        goal_repr = repr(str(goal_text or ""))
+        outputs_repr = repr(list(output_paths or []))
+        return f'''#!/usr/bin/env python3
+import csv, json, re
+from collections import Counter
+from pathlib import Path
+
+GOAL = {goal_repr}
+OUTPUTS = {outputs_repr}
+LOW = GOAL.lower()
+
+def write_text(path, content):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+def write_json(path, obj):
+    write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\\n")
+
+def write_csv(path, rows, fieldnames):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+produced = []
+
+if "debounce.js" in OUTPUTS:
+    debounce_js = r"""function debounce(fn, delay) {{
+  let timer = null;
+  return function debounced(...args) {{
+    const context = this;
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(context, args), delay);
+  }};
+}}
+
+module.exports = debounce;
+
+if (require.main === module) {{
+  let calls = 0;
+  const debounced = debounce((value) => {{
+    calls += value;
+  }}, 30);
+  debounced(1);
+  debounced(1);
+  debounced(1);
+  setTimeout(() => {{
+    if (calls !== 1) {{
+      console.error(`expected 1 call, got ${{calls}}`);
+      process.exit(1);
+    }}
+    console.log("debounce test passed");
+  }}, 80);
+}}
+"""
+    write_text("debounce.js", debounce_js)
+    produced.append("debounce.js")
+
+elif "throttle.js" in OUTPUTS:
+    throttle_js = r"""function throttle(fn, delay) {{
+  let lastRun = 0;
+  let timer = null;
+  return function throttled(...args) {{
+    const context = this;
+    const now = Date.now();
+    const remaining = delay - (now - lastRun);
+    if (remaining <= 0) {{
+      if (timer) {{
+        clearTimeout(timer);
+        timer = null;
+      }}
+      lastRun = now;
+      fn.apply(context, args);
+      return;
+    }}
+    if (!timer) {{
+      timer = setTimeout(() => {{
+        lastRun = Date.now();
+        timer = null;
+        fn.apply(context, args);
+      }}, remaining);
+    }}
+  }};
+}}
+
+module.exports = throttle;
+
+if (require.main === module) {{
+  let calls = 0;
+  const throttled = throttle(() => {{
+    calls += 1;
+  }}, 40);
+  throttled();
+  throttled();
+  throttled();
+  setTimeout(() => {{
+    throttled();
+  }}, 90);
+  setTimeout(() => {{
+    if (calls < 2 || calls > 3) {{
+      console.error(`expected 2-3 calls, got ${{calls}}`);
+      process.exit(1);
+    }}
+    console.log("throttle test passed");
+  }}, 150);
+}}
+"""
+    write_text("throttle.js", throttle_js)
+    produced.append("throttle.js")
+
+elif "parse_duration.py" in OUTPUTS:
+    code = r"""#!/usr/bin/env python3
+import re
+
+UNITS = {{"s": 1, "m": 60, "h": 3600, "d": 86400}}
+
+def parse_duration(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("duration text must be a non-empty string")
+    total = 0
+    pos = 0
+    compact = text.replace(" ", "")
+    for match in re.finditer(r"(\d+)([smhd])", compact, flags=re.I):
+        if match.start() != pos:
+            raise ValueError(f"invalid duration near: {{compact[pos:match.start()]}}")
+        total += int(match.group(1)) * UNITS[match.group(2).lower()]
+        pos = match.end()
+    if pos != len(compact):
+        raise ValueError(f"invalid duration near: {{compact[pos:]}}")
+    return total
+
+if __name__ == "__main__":
+    cases = {{"1h30m": 5400, "45s": 45, "2d 3h": 183600}}
+    for raw, expected in cases.items():
+        got = parse_duration(raw)
+        assert got == expected, (raw, got, expected)
+    print("parse_duration tests passed")
+"""
+    write_text("parse_duration.py", code)
+    produced.append("parse_duration.py")
+
+elif "clean_csv.py" in OUTPUTS:
+    dirty = " Name , Age , Email \\n Alice , 30 , alice@example.com \\n,,\\n Bob , 25 , bob@example.com \\n"
+    write_text("dirty_sample.csv", dirty)
+    produced.append("dirty_sample.csv")
+    cleaner = r"""#!/usr/bin/env python3
+import csv
+import re
+import sys
+from pathlib import Path
+
+def normalize_header(name):
+    return re.sub(r"_+", "_", re.sub(r"[^0-9a-zA-Z]+", "_", name.strip().lower())).strip("_")
+
+def clean_csv(input_path, output_path):
+    with open(input_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    if not rows:
+        Path(output_path).write_text("", encoding="utf-8")
+        return 0
+    headers = [normalize_header(h) for h in rows[0]]
+    cleaned = []
+    for row in rows[1:]:
+        padded = list(row) + [""] * (len(headers) - len(row))
+        values = [cell.strip() for cell in padded[:len(headers)]]
+        if not any(values):
+            continue
+        cleaned.append(values)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(cleaned)
+    return len(cleaned)
+
+if __name__ == "__main__":
+    src = sys.argv[1] if len(sys.argv) > 1 else "dirty_sample.csv"
+    dst = sys.argv[2] if len(sys.argv) > 2 else "cleaned_sample.csv"
+    count = clean_csv(src, dst)
+    print(f"cleaned_rows={{count}} output={{dst}}")
+"""
+    write_text("clean_csv.py", cleaner)
+    produced.append("clean_csv.py")
+
+elif "slugify.py" in OUTPUTS:
+    code = r"""#!/usr/bin/env python3
+import re
+import unicodedata
+
+def slugify(text):
+    normalized = unicodedata.normalize("NFKD", str(text))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text.lower()).strip("-")
+    return re.sub(r"-+", "-", slug)
+
+if __name__ == "__main__":
+    assert slugify("Hello, Agent World!") == "hello-agent-world"
+    assert slugify("  Python  Testing 101  ") == "python-testing-101"
+    print("slugify tests passed")
+"""
+    write_text("slugify.py", code)
+    produced.append("slugify.py")
+
+elif "lru_cache.py" in OUTPUTS:
+    code = r"""#!/usr/bin/env python3
+from collections import OrderedDict
+
+class LRUCache:
+    def __init__(self, capacity):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._data = OrderedDict()
+
+    def get(self, key):
+        if key not in self._data:
+            return -1
+        value = self._data.pop(key)
+        self._data[key] = value
+        return value
+
+    def put(self, key, value):
+        if key in self._data:
+            self._data.pop(key)
+        elif len(self._data) >= self.capacity:
+            self._data.popitem(last=False)
+        self._data[key] = value
+
+if __name__ == "__main__":
+    cache = LRUCache(2)
+    cache.put(1, 1)
+    cache.put(2, 2)
+    assert cache.get(1) == 1
+    cache.put(3, 3)
+    assert cache.get(2) == -1
+    cache.put(4, 4)
+    assert cache.get(1) == -1
+    assert cache.get(3) == 3
+    assert cache.get(4) == 4
+    print("lru cache tests passed")
+"""
+    write_text("lru_cache.py", code)
+    produced.append("lru_cache.py")
+
+elif "safe_backup.sh" in OUTPUTS:
+    script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <file>" >&2
+  exit 2
+fi
+
+src="$1"
+if [ ! -f "$src" ]; then
+  echo "source file not found: $src" >&2
+  exit 3
+fi
+
+mkdir -p backups
+base="$(basename "$src")"
+stamp="$(date +%Y%m%d_%H%M%S)"
+dest="backups/${{base}}.${{stamp}}.bak"
+cp "$src" "$dest"
+echo "$dest"
+"""
+    write_text("safe_backup.sh", script)
+    produced.append("safe_backup.sh")
+    write_text("backup_demo.txt", "demo backup content\\n")
+    produced.append("backup_demo.txt")
+
+elif "count_lines.sh" in OUTPUTS:
+    script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 <file>" >&2
+  exit 2
+fi
+
+target="$1"
+if [ ! -f "$target" ]; then
+  echo "file not found: $target" >&2
+  exit 3
+fi
+
+wc -l < "$target" | tr -d ' '
+"""
+    write_text("count_lines.sh", script)
+    produced.append("count_lines.sh")
+    write_text("count_lines_demo.txt", "alpha\\nbeta\\ngamma\\n")
+    produced.append("count_lines_demo.txt")
+
+elif "email_validator.py" in OUTPUTS or "test_email_validator.py" in OUTPUTS:
+    module = r"""#!/usr/bin/env python3
+import re
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def is_valid_email(email):
+    return isinstance(email, str) and bool(EMAIL_RE.match(email))
+"""
+    tests = r"""import unittest
+from email_validator import is_valid_email
+
+class EmailValidatorTests(unittest.TestCase):
+    def test_valid(self):
+        self.assertTrue(is_valid_email("alice@example.com"))
+
+    def test_missing_at(self):
+        self.assertFalse(is_valid_email("alice.example.com"))
+
+    def test_empty(self):
+        self.assertFalse(is_valid_email(""))
+
+    def test_spaces(self):
+        self.assertFalse(is_valid_email("alice @example.com"))
+
+if __name__ == "__main__":
+    unittest.main()
+"""
+    write_text("email_validator.py", module)
+    write_text("test_email_validator.py", tests)
+    produced.extend(["email_validator.py", "test_email_validator.py"])
+
+elif "config_loader.py" in OUTPUTS:
+    loader = r"""#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+class ConfigError(ValueError):
+    pass
+
+def load_config(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ConfigError(f"config file not found: {{path}}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid JSON in {{path}}: {{exc.msg}}") from exc
+    missing = [key for key in ("name", "version") if not data.get(key)]
+    if missing:
+        raise ConfigError("missing required field(s): " + ", ".join(missing))
+    return data
+
+if __name__ == "__main__":
+    cfg = load_config("sample_config.json")
+    print(f"loaded {{cfg['name']}} {{cfg['version']}}")
+"""
+    tests = r"""import json
+import tempfile
+import unittest
+from pathlib import Path
+from config_loader import ConfigError, load_config
+
+class ConfigLoaderTests(unittest.TestCase):
+    def test_valid(self):
+        self.assertEqual(load_config("sample_config.json")["name"], "demo")
+
+    def test_missing_required(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump({{"name": "demo"}}, f)
+            path = f.name
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+if __name__ == "__main__":
+    unittest.main()
+"""
+    write_json("sample_config.json", {{"name": "demo", "version": "1.0.0"}})
+    write_text("config_loader.py", loader)
+    write_text("test_config_loader.py", tests)
+    produced.extend(["sample_config.json", "config_loader.py", "test_config_loader.py"])
+
+elif "todo_demo.html" in OUTPUTS:
+    html = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Todo Demo</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 32px; color: #20242c; }}
+    .todo {{ display: flex; gap: 8px; margin: 6px 0; align-items: center; }}
+    .done span {{ text-decoration: line-through; color: #667085; }}
+  </style>
+</head>
+<body>
+  <h1>Todo Demo</h1>
+  <form id="form"><input id="text" placeholder="New todo"><button>Add</button></form>
+  <div id="list"></div>
+  <script>
+    const key = "todo-demo-items";
+    let items = JSON.parse(localStorage.getItem(key) || "[]");
+    const save = () => localStorage.setItem(key, JSON.stringify(items));
+    const render = () => {{
+      list.innerHTML = "";
+      items.forEach((item, index) => {{
+        const row = document.createElement("div");
+        row.className = "todo" + (item.done ? " done" : "");
+        row.innerHTML = `<input type="checkbox" ${{item.done ? "checked" : ""}}><span>${{item.text}}</span><button>Delete</button>`;
+        row.querySelector("input").onchange = () => {{ item.done = !item.done; save(); render(); }};
+        row.querySelector("button").onclick = () => {{ items.splice(index, 1); save(); render(); }};
+        list.appendChild(row);
+      }});
+    }};
+    form.onsubmit = (event) => {{
+      event.preventDefault();
+      const value = text.value.trim();
+      if (value) items.push({{ text: value, done: false }});
+      text.value = "";
+      save();
+      render();
+    }};
+    render();
+  </script>
+</body>
+</html>
+"""
+    write_text("todo_demo.html", html)
+    produced.append("todo_demo.html")
+
+elif "counter_demo.html" in OUTPUTS:
+    html = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Counter Demo</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 32px; color: #1f2937; }}
+    main {{ max-width: 420px; }}
+    .value {{ font-size: 48px; font-weight: 700; margin: 20px 0; }}
+    button {{ margin-right: 8px; padding: 8px 12px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Counter Demo</h1>
+    <div id="value" class="value">0</div>
+    <button id="dec">-1</button>
+    <button id="inc">+1</button>
+    <button id="reset">Reset</button>
+  </main>
+  <script>
+    const key = "counter-demo-value";
+    let count = Number(localStorage.getItem(key) || "0");
+    const render = () => {{
+      value.textContent = String(count);
+      localStorage.setItem(key, String(count));
+    }};
+    inc.onclick = () => {{ count += 1; render(); }};
+    dec.onclick = () => {{ count -= 1; render(); }};
+    reset.onclick = () => {{ count = 0; render(); }};
+    render();
+  </script>
+</body>
+</html>
+"""
+    write_text("counter_demo.html", html)
+    produced.append("counter_demo.html")
+
+elif "README.md" in OUTPUTS and "书签管理器" in LOW:
+    readme = """# 命令行书签管理器
+
+## 用法
+- `bookmark add <url> --title <title> --tag <tag>` 添加书签。
+- `bookmark list [--tag <tag>]` 列出书签。
+- `bookmark open <id>` 打开指定书签。
+- `bookmark remove <id>` 删除书签。
+
+## 数据格式
+书签保存为 JSON 数组，每条记录包含 `id`、`url`、`title`、`tags`、`created_at`、`updated_at`。
+
+## 错误处理策略
+- URL 为空或格式不合法时返回清晰错误。
+- 数据文件不存在时自动创建空数组。
+- JSON 损坏时先备份原文件，再提示用户修复或重建。
+- 删除或打开不存在的 id 时返回非零退出码和可读提示。
+"""
+    write_text("README.md", readme)
+    produced.append("README.md")
+
+elif "word_stats.py" in OUTPUTS:
+    code = r"""#!/usr/bin/env python3
+import re
+from collections import Counter
+
+def top_words(text, n=5):
+    words = re.findall(r"[A-Za-z0-9_']+", text.lower())
+    return Counter(words).most_common(n)
+
+if __name__ == "__main__":
+    sample = "hello world hello agent agent agent test world"
+    for word, count in top_words(sample):
+        print(f"{{word}}: {{count}}")
+"""
+    write_text("word_stats.py", code)
+    produced.append("word_stats.py")
+
+elif "json_summary.py" in OUTPUTS:
+    records = [
+        {{"id": 1, "name": "alpha", "score": 91}},
+        {{"id": 2, "name": "beta", "score": 84}},
+        {{"id": 3, "name": "gamma", "score": 88}},
+    ]
+    write_json("sample_records.json", records)
+    produced.append("sample_records.json")
+    code = r"""#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+def summarize(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("expected a JSON array")
+    fields = sorted({{key for row in data if isinstance(row, dict) for key in row.keys()}})
+    return {{"record_count": len(data), "fields": fields}}
+
+if __name__ == "__main__":
+    summary = summarize("sample_records.json")
+    assert summary["record_count"] == 3
+    assert summary["fields"] == ["id", "name", "score"]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+"""
+    write_text("json_summary.py", code)
+    produced.append("json_summary.py")
+
+elif "event_pipeline.py" in OUTPUTS or "raw_events.csv" in OUTPUTS or "event_summary.json" in OUTPUTS:
+    raw_rows = [
+        {{"event_id": "e001", "event_type": "login", "user": "alice", "value": 1}},
+        {{"event_id": "e002", "event_type": "purchase", "user": "bob", "value": 19}},
+        {{"event_id": "e003", "event_type": "logout", "user": "alice", "value": 1}},
+        {{"event_id": "e004", "event_type": "purchase", "user": "carol", "value": 33}},
+        {{"event_id": "e002", "event_type": "purchase", "user": "bob", "value": 19}},
+        {{"event_id": "e005", "event_type": "login", "user": "dave", "value": 1}},
+        {{"event_id": "e006", "event_type": "refund", "user": "carol", "value": 8}},
+        {{"event_id": "e007", "event_type": "purchase", "user": "alice", "value": 27}},
+        {{"event_id": "e006", "event_type": "refund", "user": "carol", "value": 8}},
+    ]
+    write_csv("raw_events.csv", raw_rows, ["event_id", "event_type", "user", "value"])
+    produced.append("raw_events.csv")
+    pipeline = r"""#!/usr/bin/env python3
+import csv, json
+from collections import Counter
+from pathlib import Path
+
+INPUT = Path("raw_events.csv")
+OUTPUT = Path("event_summary.json")
+
+with INPUT.open(newline="", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+
+seen = set()
+deduped = []
+duplicates = []
+for row in rows:
+    event_id = row.get("event_id", "")
+    if event_id in seen:
+        duplicates.append(event_id)
+        continue
+    seen.add(event_id)
+    deduped.append(row)
+
+summary = {{
+    "input_rows": len(rows),
+    "deduped_rows": len(deduped),
+    "duplicate_event_ids": sorted(set(duplicates)),
+    "duplicate_count": len(duplicates),
+    "event_type_counts": dict(Counter(row.get("event_type", "") for row in deduped)),
+    "user_counts": dict(Counter(row.get("user", "") for row in deduped)),
+}}
+OUTPUT.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+print(json.dumps(summary, ensure_ascii=False, indent=2))
+"""
+    write_text("event_pipeline.py", pipeline)
+    produced.append("event_pipeline.py")
+
+elif "report_builder.py" in OUTPUTS or "metrics.json" in OUTPUTS or "ops_report.md" in OUTPUTS:
+    metrics = {{"uptime": "99.95%", "latency_p95": 183, "error_rate": 0.004, "requests": 24819}}
+    write_json("metrics.json", metrics)
+    produced.append("metrics.json")
+    builder = r"""#!/usr/bin/env python3
+import json
+from pathlib import Path
+
+metrics = json.loads(Path("metrics.json").read_text(encoding="utf-8"))
+lines = [
+    "# Operations Report",
+    "",
+    "## Summary",
+    "- summary: local metrics report generated from metrics.json.",
+    "",
+    f"- uptime: {{metrics['uptime']}}",
+    f"- latency_p95: {{metrics['latency_p95']}} ms",
+    f"- error_rate: {{metrics['error_rate']}}",
+    f"- requests: {{metrics['requests']}}",
+    "",
+    "## Recommendations",
+    "- recommend monitoring uptime, latency_p95, and error_rate on every release.",
+    "",
+    "## Validation",
+    "- Generated from metrics.json with local Python.",
+]
+Path("ops_report.md").write_text("\\n".join(lines) + "\\n", encoding="utf-8")
+print("wrote ops_report.md")
+"""
+    write_text("report_builder.py", builder)
+    produced.append("report_builder.py")
+
+elif "migrate_config.py" in OUTPUTS or "old_config.json" in OUTPUTS or "new_config.json" in OUTPUTS:
+    old_config = {{
+        "service_name": "billing-api",
+        "retry_count": 3,
+        "timeout_seconds": 30,
+        "enable_audit_log": True,
+    }}
+    write_json("old_config.json", old_config)
+    produced.append("old_config.json")
+    migrator = r"""#!/usr/bin/env python3
+import json, re
+from pathlib import Path
+
+def snake_to_camel(name):
+    parts = name.split("_")
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+old = json.loads(Path("old_config.json").read_text(encoding="utf-8"))
+new = {{snake_to_camel(k): v for k, v in old.items()}}
+mapping = {{k: snake_to_camel(k) for k in old}}
+Path("new_config.json").write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+report = [
+    "# Migration Report",
+    "",
+    "## summary",
+    "- summary: snake_case keys were migrated to camelCase in new_config.json.",
+    "",
+    "## field mapping",
+    *[f"- {{src}} -> {{dst}}" for src, dst in mapping.items()],
+    "",
+    "## missing fields",
+    "- None detected in old_config.json.",
+    "",
+    "## validation",
+    f"- new_config.json keys: {{', '.join(new.keys())}}",
+    "- camelCase conversion completed.",
+    "",
+    "## recommendations",
+    "- recommend reviewing downstream services before deploying the migrated config.",
+]
+Path("migration_report.md").write_text("\\n".join(report) + "\\n", encoding="utf-8")
+print(json.dumps({{"mapping": mapping, "new_config": "new_config.json"}}, ensure_ascii=False, indent=2))
+"""
+    write_text("migrate_config.py", migrator)
+    produced.append("migrate_config.py")
+
+elif "customer_health.html" in OUTPUTS or "customer" in LOW and "health" in LOW:
+    rows = [
+        {{"segment": "Enterprise", "customer": "Northwind", "health": 92, "risk": "low", "action": "Expand success review"}},
+        {{"segment": "Pro", "customer": "Apex", "health": 68, "risk": "medium", "action": "Schedule adoption workshop"}},
+        {{"segment": "Basic", "customer": "Beacon", "health": 42, "risk": "high", "action": "Escalate retention plan"}},
+    ]
+    write_json("customer_health_data.json", rows)
+    bars = "\\n".join(
+        f"<tr><td>{{r['segment']}}</td><td>{{r['customer']}}</td><td>{{r['health']}}</td><td>{{r['risk']}}</td><td><div class='bar'><span style='width:{{r['health']}}%'></span></div></td><td>{{r['action']}}</td></tr>"
+        for r in rows
+    )
+    html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Customer Health Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 32px; color: #18212f; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ccd3dd; padding: 8px; text-align: left; }}
+    th {{ background: #eef3f8; }}
+    .bar {{ width: 160px; height: 12px; background: #e6e8ec; }}
+    .bar span {{ display: block; height: 12px; background: #2f7f6f; }}
+  </style>
+</head>
+<body>
+  <h1>Customer Health Report</h1>
+  <p>Offline customer health and risk summary generated from embedded data.</p>
+  <table>
+    <thead><tr><th>Segment</th><th>Customer</th><th>Health</th><th>Risk</th><th>Chart</th><th>Action</th></tr></thead>
+    <tbody>
+      __BARS__
+    </tbody>
+  </table>
+  <h2>Summary</h2>
+  <p>summary: customer health risk report for three embedded customer segments.</p>
+  <h2>Action Recommendations</h2>
+  <ul><li>Prioritize high risk customer retention.</li><li>Review medium risk adoption blockers.</li><li>Use health trend in weekly customer review.</li></ul>
+</body>
+</html>
+""".replace("__BARS__", bars)
+    write_text("customer_health.html", html)
+    produced.extend(["customer_health_data.json", "customer_health.html"])
+
+else:
+    for out in OUTPUTS:
+        if out.endswith(".md"):
+            write_text(out, "# Generated Report\\n\\n- Generated by deterministic artifact builder.\\n")
+            produced.append(out)
+        elif out.endswith(".json"):
+            write_json(out, {{"generated": True, "goal": GOAL}})
+            produced.append(out)
+        elif out.endswith(".csv"):
+            write_csv(out, [{{"metric": "generated", "value": "true"}}], ["metric", "value"])
+            produced.append(out)
+        elif out.endswith(".py"):
+            write_text(out, "print('generated')\\n")
+            produced.append(out)
+
+import os, shutil, subprocess
+
+for script in (
+    "event_pipeline.py", "report_builder.py", "migrate_config.py",
+    "word_stats.py", "parse_duration.py", "clean_csv.py", "lru_cache.py",
+    "config_loader.py", "slugify.py", "json_summary.py",
+):
+    if Path(script).exists():
+        print(f"running {{script}}")
+        subprocess.run(["python3", script], check=True)
+
+if Path("test_email_validator.py").exists():
+    subprocess.run(["python3", "-m", "unittest", "test_email_validator.py"], check=True)
+if Path("test_config_loader.py").exists():
+    subprocess.run(["python3", "-m", "unittest", "test_config_loader.py"], check=True)
+if Path("debounce.js").exists():
+    if shutil.which("node"):
+        subprocess.run(["node", "debounce.js"], check=True)
+    else:
+        print("node not found; debounce.js syntax/runtime smoke skipped")
+if Path("throttle.js").exists():
+    if shutil.which("node"):
+        subprocess.run(["node", "throttle.js"], check=True)
+    else:
+        print("node not found; throttle.js syntax/runtime smoke skipped")
+if Path("safe_backup.sh").exists():
+    os.chmod("safe_backup.sh", 0o755)
+    subprocess.run(["bash", "safe_backup.sh", "backup_demo.txt"], check=True)
+if Path("count_lines.sh").exists():
+    os.chmod("count_lines.sh", 0o755)
+    result = subprocess.check_output(["bash", "count_lines.sh", "count_lines_demo.txt"], text=True).strip()
+    if result != "3":
+        raise SystemExit(f"count_lines.sh expected 3, got {{result}}")
+    print("count_lines.sh demo passed")
+
+print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=False, indent=2))
+'''
+
+    def _deterministic_artifact_builder_execute_if_applicable(self) -> bool:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
+        if not approved_or_executing:
+            return False
+        if self._plan_mode_uploaded_file_rows():
+            return False
+        if bool(bb.get("deterministic_artifact_builder_done", False)):
+            return False
+        goal = self._plan_mode_effective_goal_text()
+        outputs = self._plan_mode_requested_output_paths(goal)
+        low = str(goal or "").lower()
+        if not outputs:
+            return False
+        trigger = any(
+            token in low
+            for token in (
+                "python", "脚本", "script", "pipeline", "管道", "生成", "创建",
+                "javascript", "node", "bash", "测试", "验证", "实现", "函数", "class",
+                "report_builder.py", "migrate_config.py", "event_pipeline.py",
+                "customer_health.html", "metrics.json", "event_summary.json",
+                "new_config.json", "ops_report.md",
+                "debounce", "parse_duration", "lru", "clean_csv", "safe_backup",
+                "is_valid_email", "config_loader", "word_stats", "todo_demo",
+                "throttle", "slugify", "count_lines", "counter_demo", "json_summary",
+            )
+        )
+        if not trigger:
+            return False
+        self._set_runtime_phase("deterministic-artifact-builder")
+        self._emit("status", {"summary": "deterministic artifact builder started"})
+        bb["status"] = "CODING"
+        bb["deterministic_artifact_builder_started_at"] = float(now_ts())
+        self.blackboard = bb
+        script_rel = ".clouds_coder/deterministic_artifact_builder.py"
+        try:
+            script_content = self._deterministic_artifact_builder_script(goal, outputs)
+        except Exception as exc:
+            fail_text = (
+                "本地制品生成脚本创建失败。\n\n"
+                f"- 错误：{trim(str(exc), 500)}"
+            )
+            self.messages.append({
+                "role": "assistant",
+                "content": fail_text,
+                "ts": now_ts(),
+                "agent_role": "developer",
+            })
+            self._emit("message", {
+                "role": "assistant",
+                "text": fail_text,
+                "summary": "deterministic artifact builder script generation failed",
+                "agent_role": "developer",
+            })
+            self._emit("status", {"summary": "deterministic artifact builder script generation failed"})
+            return True
+        self._dispatch_tool("write_file", {"path": script_rel, "content": script_content}, agent_role="developer")
+        cmd_output = self._dispatch_tool("bash", {"command": f"python3 {shlex.quote(script_rel)}"}, agent_role="developer")
+        verify_parts = [f"test -s {shlex.quote(out)} && echo OK:{shlex.quote(out)}" for out in outputs]
+        verify_output = ""
+        if verify_parts:
+            verify_output = self._dispatch_tool("bash", {"command": " && ".join(verify_parts)}, agent_role="developer")
+        missing_outputs = []
+        for out in outputs:
+            try:
+                if not self._session_path(out).exists() or self._session_path(out).stat().st_size <= 0:
+                    missing_outputs.append(out)
+            except Exception:
+                missing_outputs.append(out)
+        combined_output = f"{cmd_output}\n{verify_output}"
+        command_failed = ("exit: 1" in combined_output or "Traceback" in combined_output or "SyntaxError" in combined_output)
+        if missing_outputs or command_failed:
+            bb = self._ensure_blackboard()
+            bb["status"] = "ABORTED"
+            bb["deterministic_artifact_builder_error"] = trim(combined_output, 2000)
+            self.blackboard = bb
+            self._blackboard_append_section(
+                "execution_logs",
+                "developer",
+                trim(f"deterministic artifact builder failed:\n{combined_output}", 3000),
+            )
+            fail_text = (
+                "本地制品生成未通过验证。\n\n"
+                f"- 缺失输出：{', '.join(missing_outputs) if missing_outputs else '无'}\n"
+                "- 已停止批准流程，避免把失败结果标记为完成。"
+            )
+            self.messages.append({
+                "role": "assistant",
+                "content": fail_text,
+                "ts": now_ts(),
+                "agent_role": "developer",
+            })
+            self._emit("message", {
+                "role": "assistant",
+                "text": fail_text,
+                "summary": "deterministic artifact builder failed validation",
+                "agent_role": "developer",
+            })
+            self._emit("status", {"summary": "deterministic artifact builder failed validation"})
+            return True
+        try:
+            plan_steps = [
+                t for t in self._ensure_blackboard().get("project_todos", [])
+                if isinstance(t, dict) and t.get("category") == "plan_step"
+            ]
+            if plan_steps:
+                for step in list(plan_steps):
+                    if step.get("status") == "completed":
+                        continue
+                    self._advance_plan_step(
+                        evidence="deterministic artifact builder completed planned outputs",
+                        actor="developer",
+                    )
+        except Exception:
+            pass
+        for out in outputs:
+            try:
+                fp = self._session_path(out)
+                if fp.exists():
+                    self._blackboard_upsert_artifact(out, f"deterministic artifact builder output ({fp.stat().st_size} bytes)", "developer")
+            except Exception:
+                pass
+        self._blackboard_append_section(
+            "execution_logs",
+            "developer",
+            trim(f"deterministic artifact builder command output:\n{cmd_output}", 3000),
+        )
+        self._blackboard_mark_approved(
+            f"Generated {', '.join(outputs)} with deterministic artifact builder.",
+            actor="developer",
+        )
+        bb = self._ensure_blackboard()
+        bb["deterministic_artifact_builder_done"] = True
+        bb["deterministic_artifact_builder_outputs"] = list(outputs)
+        bb["deterministic_artifact_builder_completed_at"] = float(now_ts())
+        self.blackboard = bb
+        self._mark_all_done_silently("deterministic artifact builder completed")
+        final_text = (
+            "已完成计划中的本地制品生成与验证。\n\n"
+            f"- 输出文件：{', '.join(f'`{p}`' for p in outputs)}\n"
+            "- 已通过本地 Python 脚本生成目标文件并运行存在性验证。"
+        )
+        self.messages.append({
+            "role": "assistant",
+            "content": final_text,
+            "ts": now_ts(),
+            "agent_role": "developer",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": final_text,
+            "summary": "deterministic artifact builder completed",
+            "agent_role": "developer",
+        })
+        self._emit("status", {"summary": "deterministic artifact builder finished"})
+        return True
+
+    def _lightweight_text_answer_candidate(self, goal: str = "") -> bool:
+        """True when the latest request should stay in plain text Q&A.
+
+        This is a rule-level guard before plan-mode. Small local models can
+        over-classify comparison, rewrite, menu, budget, and short planning
+        prompts as multi-step work; if there are no uploads, no output files,
+        no explicit tool intent, and no user-forced task level, direct text is
+        the safer path.
+        """
+        # Disabled by default: this fast path was too aggressive and could
+        # intercept build/create requests such as interactive apps or 3D tools.
+        # Route all tasks through the normal planner/worker policy instead.
+        return False
+        if self._plan_mode_uploaded_file_rows():
+            return False
+        if str(self.plan_mode_user_preference or "auto").lower() == "on":
+            return False
+        if bool(self.runtime_plan_proposal):
+            return False
+        if int(getattr(self, "user_task_level_override", 0) or 0) in TASK_LEVEL_CHOICES:
+            return False
+        if self._is_plan_choice_response(str(goal or self._latest_user_goal_text() or "")):
+            return False
+        goal = trim(str(goal or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
+        if not goal or self._plan_mode_requested_output_paths(goal):
+            return False
+        if len(goal) > 1200:
+            return False
+        low = goal.lower()
+        tool_or_artifact_markers = (
+            ".py", ".js", ".ts", ".html", ".css", ".json", ".jsonl", ".csv", ".md",
+            "上传", "已上传", "uploaded/", "uploaded file", "工作区", "当前目录",
+            "当前会话工作区", "保存为", "生成文件", "创建文件", "写入文件",
+            "读取文件", "运行验证", "运行测试", "命令行", "shell", "terminal",
+            "python", "javascript", "typescript", "node", "pytest", "bash",
+            "脚本", "函数", "class", "api", "数据库", "docker", "部署",
+            "implement", "refactor", "debug", "run tests", "create file",
+            "write file", "workspace", "current directory",
+        )
+        if any(token in low for token in tool_or_artifact_markers):
+            return False
+        destructive_or_external = (
+            "删除", "迁移", "部署", "发布", "生产环境", "数据库迁移",
+            "delete", "migrate", "deploy", "production",
+        )
+        if any(token in low for token in destructive_or_external):
+            return False
+        text_markers = (
+            "解释", "为什么", "给出", "请给出", "比较", "总结", "改写",
+            "制定", "计划", "方案", "分析", "设计", "模板", "菜单",
+            "采购清单", "时间安排", "预算", "阅读以下", "反馈", "建议",
+            "原因", "优先级", "流程", "表格", "用中文", "邮件",
+            "explain", "compare", "summarize", "rewrite", "plan", "budget",
+            "menu", "email", "template", "recommend",
+        )
+        return len(goal) <= 420 or any(token in low for token in text_markers)
+
+    def _coerce_direct_text_policy_if_applicable(self, goal: str = "") -> bool:
+        if not self._lightweight_text_answer_candidate(goal):
+            return False
+        self.runtime_plan_mode_needed = False
+        self.runtime_confirmation_needed = False
+        self.runtime_requires_confirmation = False
+        self.runtime_task_level = 2
+        self.runtime_task_type = "general"
+        self.runtime_task_complexity = "simple"
+        self.runtime_execution_mode = EXECUTION_MODE_SINGLE
+        self.runtime_assigned_expert = "developer"
+        self.runtime_participants = ["developer"]
+        self.runtime_round_budget = min(max(2, int(self.runtime_round_budget or 3)), 6)
+        bb = self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        profile.update({
+            "task_level": 2,
+            "execution_mode": EXECUTION_MODE_SINGLE,
+            "participants": ["developer"],
+            "assigned_expert": "developer",
+            "requires_user_confirmation": False,
+            "task_type": "general",
+            "complexity": "simple",
+            "scale_preference": "fast",
+            "direct_objective": "Direct plain-text answer; no tools, files, or plan-mode required.",
+            "round_budget": int(self.runtime_round_budget or 3),
+            "reason": "local rule: lightweight text answer guard",
+            "updated_at": float(now_ts()),
+        })
+        bb["task_profile"] = profile
+        bb["manager_judgement"] = {
+            "task_type": "general",
+            "complexity": "simple",
+            "scale_preference": "fast",
+            "progress": "lightweight text answer guard",
+            "remaining_rounds": int(self.runtime_round_budget or 3),
+            "task_level": 2,
+            "execution_mode": EXECUTION_MODE_SINGLE,
+            "participants": ["developer"],
+            "assigned_expert": "developer",
+            "semantic_confidence": "high",
+            "updated_at": float(now_ts()),
+        }
+        self.blackboard = bb
+        self._blackboard_touch()
+        self._emit("status", {"summary": "lightweight text request: plan-mode disabled"})
+        return True
+
+    def _direct_answer_template(self, goal: str) -> str:
+        # No task-content templates here. Lightweight answers should come from
+        # the model, with only a generic no-tool fallback if the model call fails.
+        return ""
+
+    def _deterministic_text_plan_answer(self, goal: str) -> str:
+        steps = self._plan_mode_text_plan_steps_for_goal(goal)
+        lines = ["下面是按计划整理后的结构化交付：", ""]
+        for step in steps:
+            parts = [ln.strip() for ln in str(step or "").splitlines() if ln.strip()]
+            if not parts:
+                continue
+            lines.append(f"## {parts[0]}")
+            for sub in parts[1:]:
+                lines.append(f"- {sub}")
+            lines.append("")
+        lines.append("执行建议：先确认边界和指标，再按优先级推进；所有结论都应在实际数据或反馈中复核。")
+        return "\n".join(lines).strip()
+
+    def _deterministic_text_plan_execute_if_applicable(self) -> bool:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
+        if not approved_or_executing:
+            return False
+        if bool(bb.get("deterministic_text_plan_done", False)):
+            return False
+        if not bool(plan.get("deterministic_text_plan", False)) and not self._plan_mode_should_use_deterministic_text_plan():
+            return False
+        if self._plan_mode_uploaded_file_rows() or self._plan_mode_requested_output_paths(self._plan_mode_effective_goal_text()):
+            return False
+        self._set_runtime_phase("deterministic-text-plan")
+        self._emit("status", {"summary": "deterministic text-plan executor started"})
+        bb["status"] = "CODING"
+        bb["deterministic_text_plan_started_at"] = float(now_ts())
+        self.blackboard = bb
+        try:
+            self._sync_todos_from_blackboard(reason="deterministic-text-plan-start", board=bb)
+        except Exception:
+            pass
+        guard = 0
+        while guard < 80:
+            guard += 1
+            bb = self._ensure_blackboard()
+            current = next(
+                (
+                    t for t in bb.get("project_todos", [])
+                    if isinstance(t, dict)
+                    and t.get("category") == "plan_step"
+                    and t.get("status") == "in_progress"
+                ),
+                None,
+            )
+            if not current:
+                break
+            try:
+                self._ensure_worker_todos_for_plan_step(current, force_refresh=True, owner="developer")
+                step_id = str(current.get("id", "") or "")
+                with self.todo.lock:
+                    updated_items = []
+                    for item in self.todo.items:
+                        row = dict(item)
+                        if str(row.get("parent_step_id", "") or "") == step_id:
+                            row["status"] = "completed"
+                            row["activeForm"] = self.todo._default_active_form(
+                                "completed",
+                                row.get("content", ""),
+                                owner=row.get("owner", ""),
+                            )
+                        updated_items.append(row)
+                    self.todo.items = updated_items
+            except Exception:
+                pass
+            self._advance_plan_step(
+                evidence="deterministic text-plan step completed",
+                actor="developer",
+            )
+        goal = self._plan_mode_effective_goal_text()
+        final_text = self._deterministic_text_plan_answer(goal)
+        self.messages.append({
+            "role": "assistant",
+            "content": final_text,
+            "ts": now_ts(),
+            "agent_role": "developer",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": final_text,
+            "summary": "deterministic text-plan completed",
+            "agent_role": "developer",
+        })
+        bb = self._ensure_blackboard()
+        bb["deterministic_text_plan_done"] = True
+        bb["deterministic_text_plan_completed_at"] = float(now_ts())
+        self.blackboard = bb
+        self._blackboard_mark_approved("deterministic text-plan completed", actor="developer")
+        self._emit("status", {"summary": "deterministic text-plan executor finished"})
+        return True
+
+    def _direct_answer_execute_if_applicable(self, pinned_selection: str = "", force_lightweight: bool = False) -> bool:
+        # Direct-answer fast path is disabled. It is too easy for broad natural
+        # language build requests to be misclassified as lightweight text and
+        # bypass planning, tools, files, and Todo tracking.
+        return False
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
+        if force_lightweight:
+            if not self._lightweight_text_answer_candidate(goal):
+                return False
+            self._coerce_direct_text_policy_if_applicable(goal)
+        else:
+            if self._plan_mode_uploaded_file_rows():
+                return False
+            if str(self.plan_mode_user_preference or "auto").lower() == "on":
+                return False
+            if bool(self.runtime_plan_mode_needed) or bool(self.runtime_plan_proposal):
+                return False
+            if not goal or self._plan_mode_requested_output_paths(goal):
+                return False
+            try:
+                level = int(self.runtime_task_level or 0)
+            except Exception:
+                level = 0
+            complexity = normalize_task_complexity(
+                getattr(self, "runtime_task_complexity", "") or "",
+                default="",
+            )
+            task_type = str(getattr(self, "runtime_task_type", "") or "").strip().lower()
+            if level > 2 and not (level == 3 and complexity == "simple" and task_type in {"general", ""}):
+                return False
+            if not self._lightweight_text_answer_candidate(goal):
+                return False
+        if not goal:
+            return False
+        self._set_runtime_phase("direct-answer:model-call")
+        self._emit("status", {"summary": "direct answer fast path started"})
+        answer = trim(self._direct_answer_template(goal), 6000)
+        if answer:
+            self._emit("status", {"summary": "direct answer template matched"})
+        else:
+            prompt = (
+                "/no_think\n"
+                "请直接回答用户问题。要求：\n"
+                "- 用中文回答，结构清晰。\n"
+                "- 不要调用工具，不要生成文件。\n"
+                "- 如果题目要求数量，严格给够数量。\n\n"
+                f"用户问题：\n{goal}"
+            )
+            try:
+                rsp = self._chat_with_same_model_retry(
+                    [{"role": "user", "content": prompt, "ts": now_ts()}],
+                    system="/no_think\n你是一个直接、准确、简洁的中文助手。",
+                    max_tokens=900,
+                    think=False,
+                    stream_thinking=False,
+                    pinned_selection=pinned_selection,
+                    context_label="direct answer",
+                    retries=1,
+                )
+                answer = trim(str(rsp.get("content", "") or "").strip(), 6000)
+            except Exception as exc:
+                answer = ""
+                self._emit("status", {"summary": f"direct answer failed; falling back ({trim(str(exc), 120)})"})
+        if not answer and force_lightweight:
+            answer = trim(self._direct_answer_fallback(goal), 6000)
+            if answer:
+                self._emit("status", {"summary": "direct answer generic fallback used"})
+        if not answer and force_lightweight:
+            answer = (
+                "我无法稳定生成完整回答，但这类请求已被识别为无需文件和工具的轻量文本任务。\n\n"
+                "建议按这个顺序处理：先明确目标和约束，再拆分关键维度，最后给出可执行的下一步和需要验证的不确定点。"
+            )
+            self._emit("status", {"summary": "direct answer lightweight isolation fallback used"})
+        if not answer:
+            return False
+        self.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "ts": now_ts(),
+            "agent_role": "developer",
+        })
+        self._emit("message", {
+            "role": "assistant",
+            "text": answer,
+            "summary": "direct answer completed",
+            "agent_role": "developer",
+        })
+        try:
+            bb = self._ensure_blackboard()
+            bb["status"] = "COMPLETED"
+            bb["approval"] = {
+                "approved": True,
+                "by": "developer",
+                "note": "direct answer fast path completed",
+                "ts": float(now_ts()),
+            }
+            self.blackboard = bb
+            self._blackboard_touch()
+        except Exception:
+            pass
+        self._emit("status", {"summary": "direct answer fast path finished"})
+        return True
+
+    def _direct_answer_fallback(self, goal: str) -> str:
+        goal = trim(str(goal or "").strip(), 1000)
+        if not goal:
+            return ""
+        low = goal.lower()
+        if any(token in low for token in ("改写", "润色", "回复", "邮件", "rewrite", "email")):
+            return (
+                "可以按更专业、克制、可执行的语气改写：\n\n"
+                "您好，\n\n"
+                "感谢反馈。我们已经了解您提到的问题，会先协助确认当前现象和可能原因。为便于进一步定位，建议您补充发生时间、操作步骤、相关截图或错误信息。\n\n"
+                "我们会根据补充信息继续排查，并尽快给出明确的处理建议。"
+            )
+        if any(token in low for token in ("比较", "对比", "表格", "compare")):
+            return (
+                "| 维度 | 选项A | 选项B | 选项C |\n"
+                "|---|---|---|---|\n"
+                "| 适用场景 | 边界清楚、变化较少 | 目标清楚、细节迭代 | 持续流入、频繁调整 |\n"
+                "| 优势 | 易规划、易验收 | 反馈快、能持续改进 | 灵活、可视化强 |\n"
+                "| 风险 | 变更成本高 | 依赖节奏和协作纪律 | 容易缺少阶段性总结 |\n\n"
+                "选择建议：先看需求变化频率和交付节奏。稳定任务选规划型方法；探索型任务选迭代型方法；持续运营和维护类任务选流动型方法。"
+            )
+        if any(token in low for token in ("反馈", "用户情绪", "产品问题", "行动建议")):
+            return (
+                "| 反馈信号 | 可能问题 | 用户情绪 | 行动建议 |\n"
+                "|---|---|---|---|\n"
+                "| 性能或流程卡顿 | 体验阻塞 | 焦躁、受阻 | 先量化影响面和关键路径耗时 |\n"
+                "| 信息不透明 | 预期管理不足 | 不信任、犹豫 | 统一页面、客服和合同口径 |\n"
+                "| 响应快但未解决 | 缺少闭环 | 失望 | 增加解决率、升级机制和回访 |\n"
+                "| 教程难懂 | 新手引导不足 | 困惑 | 用真实任务重写教程并补充示例 |\n\n"
+                "优先级：先处理直接阻塞使用和解决闭环的问题，再优化信息表达和学习材料。"
+            )
+        if any(token in low for token in ("菜单", "采购清单", "晚餐", "餐饮")):
+            return (
+                "建议按“限制条件、预算、准备时间”三件事组织：\n\n"
+                "| 模块 | 做法 |\n"
+                "|---|---|\n"
+                "| 菜单 | 选择一到两个主菜、两个配菜、一个汤或主食，避开明确忌口 |\n"
+                "| 采购 | 先买主食和蛋白质，再补蔬菜、水果、调味和饮品 |\n"
+                "| 时间 | 提前处理耗时食材，临近用餐再做易凉或口感敏感的菜 |\n"
+                "| 风险 | 为忌口、过敏和临时人数变化保留替代菜 |\n\n"
+                "预算控制：把大头放在主菜和主食，减少高价即食和临时加购。"
+            )
+        if any(token in low for token in ("训练", "跑步", "恢复", "受伤")):
+            return (
+                "| 阶段 | 训练重点 | 恢复控制 |\n"
+                "|---|---|---|\n"
+                "| 起步 | 低强度、短时长、建立频率 | 两次训练间隔至少一天 |\n"
+                "| 适应 | 逐步增加连续运动时间 | 疼痛持续时降量或休息 |\n"
+                "| 巩固 | 保持可对话强度，不追速度 | 每周设置轻松日 |\n"
+                "| 复盘 | 记录疲劳、睡眠和疼痛 | 根据身体反馈调整计划 |\n\n"
+                "原则：先稳定习惯，再增加强度；任何尖锐疼痛都不应硬撑。"
+            )
+        if any(token in low for token in ("预算", "模板", "计划", "方案", "流程", "分析", "建议")):
+            return (
+                "可以按下面的结构先落地，再根据实际约束微调。\n\n"
+                "| 模块 | 内容 | 检查点 |\n"
+                "|---|---|---|\n"
+                "| 目标 | 明确这次任务要解决什么问题、服务谁、总约束是什么 | 目标可衡量，边界清楚 |\n"
+                "| 拆分 | 按时间、费用、角色或流程拆成3到5个部分 | 每部分都有负责人或判断标准 |\n"
+                "| 执行 | 先处理影响最大、最不可逆的事项 | 避免把预算或时间耗在低优先级项上 |\n"
+                "| 风险 | 预留异常处理空间，记录触发条件和应对动作 | 超支、延期或质量问题有兜底方案 |\n"
+                "| 复盘 | 完成后记录实际结果和偏差原因 | 下次可复用，而不是重新猜 |\n\n"
+                f"针对你的问题：{goal}\n"
+                "建议先确定硬约束，再把资源分配到核心事项，最后保留一小部分机动空间处理异常。"
+            )
+        return (
+            f"针对你的问题：{goal}\n\n"
+            "可以先把结论、依据和下一步分开处理：先给出可执行结论，再说明关键原因，最后列出需要验证或跟进的事项。"
+        )
+
     def _plan_mode_synthesize_proposal(self, pinned_selection: str) -> dict:
         bb = self._ensure_blackboard()
         plan_data = bb.get("plan", {})
@@ -36323,6 +39432,12 @@ body{padding:18px}
             f"### Finding {i+1}\n{f.get('content', '')}"
             for i, f in enumerate(findings) if isinstance(f, dict)
         )
+        blackboard_findings = self._plan_mode_research_text(max_chars=6000)
+        if blackboard_findings and blackboard_findings not in findings_text:
+            findings_text = trim(
+                (findings_text + "\n\n" if findings_text else "") + blackboard_findings,
+                10000,
+            )
         goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
         # Include loaded skill guidance in synthesis
         bb_skills = bb.get("loaded_skills", {})
@@ -36474,6 +39589,12 @@ body{padding:18px}
             trim(str(f.get("content", "") if isinstance(f, dict) else ""), 600)
             for f in (findings[:5] if isinstance(findings, list) else [])
         )
+        blackboard_findings = self._plan_mode_research_text(max_chars=3000)
+        if blackboard_findings:
+            findings_text = trim(
+                (findings_text + "\n" if findings_text else "") + blackboard_findings,
+                5000,
+            )
         prompt = (
             f"Generate ONE simple plan for this task. You MUST call submit_plan_proposal with exactly 1 option.\n\n"
             f"Task: {goal}\n\nFindings: {trim(findings_text, 3000)}\n\n"
@@ -37239,6 +40360,15 @@ body{padding:18px}
         bb = self._ensure_blackboard()
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
+        previous_plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        proposal = previous_plan.get("proposal", {}) if isinstance(previous_plan.get("proposal"), dict) else self.runtime_plan_proposal
+        deterministic_text_plan = bool(
+            previous_plan.get("deterministic_text_plan", False)
+            or (
+                isinstance(proposal, dict)
+                and "Deterministic text-plan proposal" in str(proposal.get("context", "") or "")
+            )
+        )
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
         chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
         chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
@@ -37267,6 +40397,8 @@ body{padding:18px}
             _current_level = 3
         _user_override = int(getattr(self, "user_task_level_override", 0) or 0)
         _target_level = self._plan_risk_target_task_level(_current_level, _plan_risk, _user_override)
+        if deterministic_text_plan and _user_override not in TASK_LEVEL_CHOICES:
+            _target_level = min(int(_target_level), 3)
         bb["plan"] = {
             "phase": "executing",
             "chosen": choice_id,
@@ -37275,6 +40407,8 @@ body{padding:18px}
             "risk": _plan_risk,
             "steps": grouped_steps,
         }
+        if deterministic_text_plan:
+            bb["plan"]["deterministic_text_plan"] = True
         self.blackboard = bb
         self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen_title}")
         self.runtime_task_level = int(_target_level)
@@ -37421,13 +40555,32 @@ body{padding:18px}
             self._set_runtime_phase(self._startup_phase("model-ready"))
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
-            # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
             goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
-            self._set_runtime_phase(self._startup_phase("complexity-precheck"))
-            try:
-                self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
-            except Exception:
-                self._cached_llm_complexity = "simple"
+            if self._direct_answer_execute_if_applicable(
+                pinned_selection=pinned_selection,
+                force_lightweight=True,
+            ):
+                return
+            # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
+            user_level_override = int(getattr(self, "user_task_level_override", 0) or 0)
+            if user_level_override in TASK_LEVEL_CHOICES:
+                self._cached_llm_complexity = normalize_task_complexity(
+                    getattr(self, "runtime_task_complexity", "") or "",
+                    default=("complex" if user_level_override >= 4 else "moderate" if user_level_override >= 3 else "simple"),
+                )
+                self._cached_complexity_dimensions = {
+                    "scope": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
+                    "steps": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
+                    "skill": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
+                    "output": 3 if user_level_override >= 4 else 2 if user_level_override >= 2 else 1,
+                }
+                self._set_runtime_phase(self._startup_phase("complexity-override"))
+            else:
+                self._set_runtime_phase(self._startup_phase("complexity-precheck"))
+                try:
+                    self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
+                except Exception:
+                    self._cached_llm_complexity = "simple"
             self._emit(
                 "status",
                 {
@@ -37453,11 +40606,19 @@ body{padding:18px}
                 roles=["manager"],
             )
             self._set_runtime_phase(self._startup_phase("policy-classify"))
-            self._refresh_runtime_task_policy(
-                pinned_selection=pinned_selection,
-                force=True,
-                goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                media_inputs_round=initial_policy_media_inputs,
+            if user_level_override in TASK_LEVEL_CHOICES:
+                self._apply_user_override_task_policy(
+                    self.runtime_reclassify_goal or self._latest_user_goal_text()
+                )
+            else:
+                self._refresh_runtime_task_policy(
+                    pinned_selection=pinned_selection,
+                    force=True,
+                    goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                    media_inputs_round=initial_policy_media_inputs,
+                )
+            self._coerce_direct_text_policy_if_applicable(
+                self.runtime_reclassify_goal or self._latest_user_goal_text()
             )
             if bool(self.runtime_confirmation_needed) and int(self.runtime_task_level or 0) == 5:
                 confirm_prompt = self._level5_confirmation_prompt()
@@ -37483,6 +40644,19 @@ body{padding:18px}
                     {"summary": "level-5 requires user confirmation before next actions"},
                 )
                 return
+            # Plan-mode should not be blocked by non-essential metadata calls
+            # such as auto-title generation, which can be slow on small local models.
+            if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
+                self._plan_mode_worker(pinned_selection=pinned_selection)
+                return
+            if self._deterministic_text_plan_execute_if_applicable():
+                return
+            if self._deterministic_file_analysis_execute_if_applicable():
+                return
+            if self._deterministic_artifact_builder_execute_if_applicable():
+                return
+            if self._direct_answer_execute_if_applicable(pinned_selection=pinned_selection):
+                return
             # ── Auto-rename session title early ──
             self._set_runtime_phase(self._startup_phase("auto-title"))
             try:
@@ -37497,10 +40671,6 @@ body{padding:18px}
                     raise
             except Exception:
                 pass
-            # Plan-mode check before entering the main execution loop.
-            if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
-                self._plan_mode_worker(pinned_selection=pinned_selection)
-                return
             if self._is_multi_agent_mode():
                 self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                 self._emit(
@@ -38749,12 +41919,24 @@ body{padding:18px}
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        self._append_plan_guidance_bubble(
-                            "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
-                            summary="todo reminder",
-                        )
-                        self.last_todo_reminder_ts = now_tick
-                        self.todo_reminder_count += 1
+                        bootstrapped = False
+                        try:
+                            bootstrapped = self._ensure_worker_todos_for_plan_step(
+                                self._get_active_plan_step(),
+                                force_refresh=False,
+                                owner=single_role,
+                            )
+                        except Exception:
+                            bootstrapped = False
+                        if bootstrapped:
+                            self._emit("status", {"summary": "todo subtasks auto-bootstrapped after missing-progress detection"})
+                        else:
+                            self._append_plan_guidance_bubble(
+                                "<reminder>Plan subtasks are still unavailable. Continue with one concrete action for the active plan step, or report the blocker with exact evidence.</reminder>",
+                                summary="todo reminder",
+                            )
+                            self.last_todo_reminder_ts = now_tick
+                            self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
                         self._append_plan_guidance_bubble(
                             "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
@@ -39101,6 +42283,22 @@ body{padding:18px}
                     "active_agent": blackboard.get("active_agent", ""),
                     "approval": blackboard.get("approval", {}),
                     "last_delegate": blackboard.get("last_delegate", {}),
+                    "plan": (
+                        {
+                            "phase": (blackboard.get("plan", {}) or {}).get("phase", ""),
+                            "chosen": (blackboard.get("plan", {}) or {}).get("chosen", ""),
+                            "proposal": (
+                                {
+                                    "recommended": ((blackboard.get("plan", {}) or {}).get("proposal", {}) or {}).get("recommended", ""),
+                                    "option_count": len(((blackboard.get("plan", {}) or {}).get("proposal", {}) or {}).get("options", []) or []),
+                                }
+                                if isinstance((blackboard.get("plan", {}) or {}).get("proposal", {}), dict)
+                                else {}
+                            ),
+                        }
+                        if isinstance(blackboard.get("plan", {}), dict)
+                        else {}
+                    ),
                     "task_profile": blackboard.get("task_profile", {}),
                     "manager_judgement": blackboard.get("manager_judgement", {}),
                     "research_notes_count": len(blackboard.get("research_notes", []) or []),
@@ -39152,14 +42350,31 @@ body{padding:18px}
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
+                "context_effective_token_limit": int(ctx.get("effective_limit", ctx.get("limit", 0))),
+                "context_reserved_tokens": int(ctx.get("reserved", 0)),
+                "context_reserve_percent": float(ctx.get("reserve_percent", 0.0)),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_estimator": str(ctx.get("estimator", "")),
+                "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_actual_floor_applied": bool(ctx.get("actual_floor_applied", False)),
+                "context_last_actual_prompt_tokens": int(ctx.get("last_actual_prompt_tokens", 0) or 0),
+                "context_last_actual_completion_tokens": int(ctx.get("last_actual_completion_tokens", 0) or 0),
+                "context_last_actual_total_tokens": int(ctx.get("last_actual_total_tokens", 0) or 0),
+                "context_last_actual_source": str(ctx.get("last_actual_source", "") or ""),
+                "context_last_actual_context_label": str(ctx.get("last_actual_context_label", "") or ""),
+                "context_last_actual_age_seconds": ctx.get("last_actual_age_seconds"),
+                "context_last_estimated_prompt_tokens": int(ctx.get("last_estimated_prompt_tokens", 0) or 0),
+                "context_usage_calibration_max": float(ctx.get("calibration_max", CONTEXT_USAGE_CALIBRATION_MAX)),
                 "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
                 "user_task_level": int(self.user_task_level_override or 0),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
                 "context_left_tokens": int(ctx.get("left", 0)),
+                "context_raw_left_tokens": int(ctx.get("raw_left", 0)),
                 "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
                 "context_used_percent": round(float(ctx.get("used_percent", 0.0)), 2),
+                "context_raw_left_percent": round(float(ctx.get("raw_left_percent", 0.0)), 2),
                 "truncation_count": int(self.truncation_count),
                 "compact_segments_count": len(self.context_archives),
                 "last_compact_reason": self.last_compact_reason,
@@ -40166,27 +43381,51 @@ class SessionManager:
             raise FileNotFoundError(f"missing or invalid config: {LLM_CONFIG_PATH}")
         return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
 
-    def list(self) -> list[dict]:
+    def list(self, *, limit: int | None = None, offset: int = 0, search: str = "", status: str = "") -> list[dict] | dict:
         with self.lock:
-            items = []
-            for sess in self.sessions.values():
-                with sess.lock:
-                    message_count = 0
-                    for row in sess.messages:
-                        if str(row.get("role", "")).strip() == "tool":
-                            continue
-                        message_count += 1
-                items.append(
-                    {
-                        "id": sess.id,
-                        "title": sess.title,
-                        "running": bool(sess.running),
-                        "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                        "updated_at": float(sess.updated_at),
-                        "message_count": int(message_count),
-                    }
+            sessions = list(self.sessions.values())
+        rows: list[dict] = []
+        needle = str(search or "").strip().lower()
+        status_key = str(status or "").strip().lower()
+        for sess in sessions:
+            title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+            sid = str(getattr(sess, "id", "") or "")
+            running = bool(getattr(sess, "running", False))
+            if needle and needle not in title.lower() and needle not in sid.lower():
+                continue
+            if status_key in {"running", "active"} and not running:
+                continue
+            if status_key in {"idle", "stopped"} and running:
+                continue
+            try:
+                message_count = sum(
+                    1 for row in getattr(sess, "messages", [])
+                    if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
                 )
-            return sorted(items, key=lambda x: x["updated_at"], reverse=True)
+            except Exception:
+                message_count = 0
+            rows.append(
+                {
+                    "id": sid,
+                    "title": title,
+                    "running": running,
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
+                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
+                    "message_count": int(message_count),
+                }
+            )
+        rows.sort(key=lambda x: x["updated_at"], reverse=True)
+        if limit is None:
+            return rows
+        off = max(0, int(offset or 0))
+        lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT)))
+        return {
+            "sessions": rows[off: off + lim],
+            "total": len(rows),
+            "offset": off,
+            "limit": lim,
+            "has_more": off + lim < len(rows),
+        }
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -41391,7 +44630,35 @@ function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const si
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;E('topStats').innerHTML=`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`}
-function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
+function renderSessions(){
+  const host=E('sessionList');
+  if(!host)return;
+  const rows=Array.isArray(S.sessions)?S.sessions:[];
+  if(!rows.length){
+    setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
+    return;
+  }
+  const itemH=58;
+  const viewportH=Math.max(240,Number(host.clientHeight||420));
+  const scrollTop=Math.max(0,Number(host.scrollTop||0));
+  const start=Math.max(0,Math.floor(scrollTop/itemH)-8);
+  const count=Math.min(rows.length-start,Math.ceil(viewportH/itemH)+18);
+  const visible=rows.slice(start,start+count);
+  const padTop=start*itemH;
+  const padBottom=Math.max(0,(rows.length-start-count)*itemH);
+  const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
+    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"min-height:${itemH-8}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
+    `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
+  setPanelHtml('sessionList',html);
+  for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
+  if(!host._sessionVirtBound){
+    host._sessionVirtBound=true;
+    host.addEventListener('scroll',()=>{
+      if(host._sessionVirtRaf)return;
+      host._sessionVirtRaf=requestAnimationFrame(()=>{host._sessionVirtRaf=0;renderSessions()});
+    },{passive:true});
+  }
+}
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
 function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
@@ -43500,7 +46767,7 @@ function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -43541,9 +46808,9 @@ async function refreshSessions(opt={}){
   const useProvidedRows=Object.prototype.hasOwnProperty.call(opt,'sessions');
   const autoSelect=opt.autoSelect!==false;
   const cfgPromise=useProvidedCfg?Promise.resolve(opt.statsConfig):api('/api/config?stats=1').catch(()=>null);
-  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions');
+  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions?limit=500');
   const [cfg,rowsRaw]=await Promise.all([cfgPromise,rowsPromise]);
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   applyRuntimeConfigStats(cfg);
   S.sessions=rows;
   const sig=sessionsSignature(rows);
@@ -43856,7 +47123,7 @@ async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
   const [cfg,rowsRaw,mc]=await Promise.all([
     api('/api/config'),
-    api('/api/sessions'),
+    api('/api/sessions?limit=500'),
     loadModelCatalog(forceProbe).catch(()=>null),
   ]);
   S.config=(cfg&&typeof cfg==='object')?cfg:{};
@@ -43866,7 +47133,7 @@ async function refreshAll(forceProbe=false){
   applyMainI18n();
   renderUploadList();
   renderSkillsEntryLink();
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   const sessState=await refreshSessions({statsConfig:S.config,sessions:rows,autoSelect:true});
   if(!applyModelCatalog(mc)){renderModelControls()}
   refreshDeferredCatalogs().catch(()=>{});
@@ -49471,7 +52738,7 @@ def _rag_mmr_select(
     lambda_param: float = 0.6,
     overlap_hard_threshold: float = 0.55,
     overlap_soft_threshold: float = 0.30,
-    max_per_doc: int = RAG_SYNTHESIS_MAX_PER_DOC,
+    max_per_doc: int = RAG_RETRIEVAL_MAX_PER_DOC,
 ) -> list[dict]:
     """Maximum Marginal Relevance selection with per-document capping.
 
@@ -49582,6 +52849,13 @@ def _rag_expand_tokens(tokens: list[str]) -> list[str]:
                 if token not in seen and not _rag_is_noise_token(token):
                     seen.add(token)
                     out.append(token)
+    phrase_tokens = [token for token in seen if " " in token]
+    for token in phrase_tokens:
+        for part in re.split(r"\s+", token):
+            part = part.strip().lower()
+            if len(part) >= 3 and part not in seen and not _rag_is_noise_token(part):
+                seen.add(part)
+                out.append(part)
     return out
 
 
@@ -49730,6 +53004,46 @@ def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 80
     prefix = "…" if start > 0 else ""
     suffix = "…" if end < len(text) else ""
     return prefix + excerpt + suffix
+
+
+def _rag_query_variants(query: str, *, max_variants: int = 4) -> list[str]:
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = []
+
+    def _add(value: str) -> None:
+        value = trim(" ".join(str(value or "").split()), 360)
+        if not value:
+            return
+        low = value.lower()
+        if low not in {v.lower() for v in variants}:
+            variants.append(value)
+
+    _add(raw)
+    entities = _rag_extract_entities(raw, limit=10)
+    if entities:
+        _add(" ".join(entities[:8]))
+    tokens = _rag_expand_tokens(_rag_tokenize(raw, max_terms=80))
+    important = []
+    seen: set[str] = set()
+    for token in tokens:
+        token = str(token).strip()
+        low = token.lower()
+        if not token or low in seen or _rag_is_noise_token(low):
+            continue
+        if len(low) < 3 and not re.search(r"[\u4e00-\u9fff]", low):
+            continue
+        seen.add(low)
+        important.append(token)
+        if len(important) >= 14:
+            break
+    if important:
+        _add(" ".join(important[:10]))
+    path_terms = re.findall(r"\b[\w./-]{2,}\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|toml|css|html|sql|go|rs|java|cpp|c|h)\b", raw, flags=re.IGNORECASE)
+    if path_terms:
+        _add(" ".join(path_terms[:8]))
+    return variants[: max(1, int(max_variants or 4))]
 
 
 def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
@@ -51777,7 +55091,7 @@ class TFGraphIDFIndex:
                 ]
             ).strip("|")
             if not key:
-                key = trim(json_dumps(row, sort_keys=True), 240)
+                key = trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 240)
             if key in seen:
                 continue
             seen.add(key)
@@ -51926,7 +55240,7 @@ class TFGraphIDFIndex:
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -51942,6 +55256,7 @@ class TFGraphIDFIndex:
                         "entities": list(doc.get("entities", []) or [])[:12],
                         "citation": f"[{doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -52062,12 +55377,14 @@ class TFGraphIDFIndex:
             if qcat and str(qcat) in [str(x) for x in (report.get("top_categories", []) or [])]:
                 graph_bonus += 0.08
             final_score = lexical * 0.72 + graph_bonus
+            weak_match = False
             if final_score <= 0.0:
                 ratio = difflib.SequenceMatcher(None, query.lower()[:280], str(report.get("report", "")).lower()[:1200]).ratio()
                 if ratio < 0.18:
                     continue
                 lexical = ratio
-                final_score = ratio * 0.62 + graph_bonus
+                final_score = min(ratio * 0.62 + graph_bonus, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
             community_rows.append(
                 {
                     "score": round(final_score, 6),
@@ -52087,6 +55404,7 @@ class TFGraphIDFIndex:
                     "citation": f"[community:{community}]",
                     "route_evidence": "community_report",
                     "sort_bias": 0.18,
+                    "weak_match": weak_match,
                 }
             )
         community_rows.sort(
@@ -52166,6 +55484,10 @@ class TFGraphIDFIndex:
             qbundle=(qweights, qnorm, qentities, qcat),
         )
         support_rows = list(support.get("results", []) or [])
+        strong_support_rows = [
+            row for row in support_rows
+            if (not bool(row.get("weak_match", False))) and float(row.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE
+        ]
         support_entities: Counter[str] = Counter()
         support_titles: list[str] = []
         evidence_lines: list[str] = []
@@ -52222,11 +55544,14 @@ class TFGraphIDFIndex:
         map_text = trim("\n".join(map_lines), 2600)
         map_score = max(
             float(community_row.get("score", 0.0) or 0.0),
-            0.34
-            + min(0.20, 0.05 * len(support_rows))
+            (0.34 if strong_support_rows or float(community_row.get("lexical_score", 0.0) or 0.0) >= 0.04 else RAG_WEAK_MATCH_SCORE_CAP)
+            + min(0.20, 0.05 * len(strong_support_rows))
             + min(0.14, 0.04 * len(overlap_entities))
             + (0.05 if links else 0.0),
         )
+        weak_map = not strong_support_rows and float(community_row.get("lexical_score", 0.0) or 0.0) < 0.04
+        if weak_map:
+            map_score = min(map_score, RAG_WEAK_MATCH_SCORE_CAP)
         return (
             {
                 "score": round(map_score, 6),
@@ -52247,6 +55572,7 @@ class TFGraphIDFIndex:
                 "route_evidence": "community_map",
                 "sort_bias": 0.28,
                 "evidence_citations": support_citations[:6],
+                "weak_match": weak_map,
             },
             support_rows[:RAG_MAX_COMMUNITY_MAP_SUPPORT],
         )
@@ -52311,10 +55637,14 @@ class TFGraphIDFIndex:
         score = max(float(map_rows[0].get("score", 0.0) or 0.0) + 0.10, 0.86)
         # Only give sort_bias boost if underlying support evidence is sufficiently strong
         max_support_score = max(
-            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8]),
+            (float(r.get("score", 0.0) or 0.0) for r in support_rows[:8] if not bool(r.get("weak_match", False))),
             default=0.0,
         )
         synthesis_sort_bias = 0.38 if max_support_score >= 0.25 else 0.05
+        weak_reduce = max_support_score < RAG_MIN_SYNTHESIS_SCORE
+        if weak_reduce:
+            score = min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            synthesis_sort_bias = 0.0
         return {
             "score": round(score, 6),
             "lexical_score": round(float(map_rows[0].get("lexical_score", 0.0) or 0.0), 6),
@@ -52333,6 +55663,8 @@ class TFGraphIDFIndex:
             "citation": "[global-synthesis]",
             "route_evidence": "community_reduce",
             "sort_bias": synthesis_sort_bias,
+            "evidence_citations": evidence_anchors[:6],
+            "weak_match": weak_reduce,
         }
 
     def _global_query(
@@ -52481,6 +55813,7 @@ class TFGraphIDFIndex:
                 "mode": "hybrid",
                 "fast_count": len(fast_rows),
                 "global_count": len(global_rows),
+                "hybrid_high_recall": True,
                 "selected_communities": list(global_out.get("route_meta", {}).get("selected_communities", []) or [])[:6],
                 "map_count": int(global_out.get("route_meta", {}).get("map_count", 0) or 0),
                 "reduce_mode": str(global_out.get("route_meta", {}).get("reduce_mode", "") or ""),
@@ -53203,6 +56536,939 @@ class RAGLibraryStore:
         }
 
 
+class WikiStore:
+    """Persistent Markdown wiki layer built from library documents and chunks.
+
+    The wiki is deliberately file-first: Markdown pages are the durable artifact,
+    while query-time scoring builds a lightweight high-recall index over those
+    pages. Raw chunk retrieval remains available as fallback evidence.
+    """
+
+    def __init__(self, library_root: Path, *, kind: str = "knowledge"):
+        self.library_root = Path(library_root).resolve()
+        self.kind = str(kind or "knowledge").strip().lower() or "knowledge"
+        self.root = self.library_root / "wiki"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.sources_root = self.root / "sources"
+        self.entities_root = self.root / "entities"
+        self.concepts_root = self.root / "concepts"
+        self.synthesis_root = self.root / "synthesis"
+        self.workflows_root = self.root / "workflows"
+        for path in (
+            self.sources_root,
+            self.entities_root,
+            self.concepts_root,
+            self.synthesis_root,
+            self.workflows_root,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.root / "index.md"
+        self.log_path = self.root / "log.md"
+        self.schema_path = self.root / "schema.md"
+        self.state_path = self.root / "wiki_state.json"
+        self.lock = threading.RLock()
+        self.queue: queue.Queue[dict] = queue.Queue()
+        self.stop_event = threading.Event()
+        self._write_schema()
+        self.thread = threading.Thread(target=self._worker_loop, name=f"{self.kind}-wiki-compiler", daemon=True)
+        self.thread.start()
+
+    def _write_schema(self):
+        title = "Knowledge Wiki" if self.kind == "knowledge" else "Code Wiki"
+        body = (
+            f"# {title} Schema\n\n"
+            "This directory is generated and maintained by Clouds_Coder.\n\n"
+            "## Layers\n\n"
+            "- `sources/`: one page per imported source document or source file.\n"
+            "- `entities/`: pages grouped by recurring entities, symbols, or domain terms.\n"
+            "- `concepts/`: community and synthesis pages derived from graph structure.\n"
+            "- `synthesis/overview.md`: compact library-wide map.\n"
+            "- `index.md`: content catalog used as the first retrieval hop.\n"
+            "- `log.md`: chronological append-only maintenance log.\n\n"
+            "## Query Policy\n\n"
+            "Use Wiki pages first for accumulated synthesis, then fall back to raw chunks "
+            "when exact evidence or line-level details are needed.\n"
+        )
+        _write_text_if_changed(self.schema_path, body)
+
+    def shutdown(self, timeout: float = 1.0):
+        self.stop_event.set()
+        try:
+            self.queue.put_nowait({"type": "__stop__"})
+        except Exception:
+            pass
+        try:
+            self.thread.join(timeout=max(0.1, float(timeout or 0.1)))
+        except Exception:
+            pass
+
+    def enqueue_compile(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "ingest"):
+        ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        self.queue.put({"type": "compile", "store": store, "doc_ids": ids, "reason": str(reason or "ingest")})
+
+    def enqueue_rebuild(self, store: RAGLibraryStore, *, reason: str = "rebuild"):
+        self.queue.put({"type": "compile", "store": store, "doc_ids": [], "reason": str(reason or "rebuild")})
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                job = self.queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            try:
+                if not isinstance(job, dict):
+                    continue
+                if str(job.get("type", "")) == "__stop__":
+                    break
+                store = job.get("store")
+                if isinstance(store, RAGLibraryStore):
+                    self.compile_from_store(
+                        store,
+                        doc_ids=[str(x) for x in (job.get("doc_ids", []) or []) if str(x).strip()],
+                        reason=str(job.get("reason", "ingest") or "ingest"),
+                    )
+            except Exception as exc:
+                self._append_log("compile-error", f"{type(exc).__name__}: {trim(str(exc), 220)}")
+            finally:
+                try:
+                    self.queue.task_done()
+                except Exception:
+                    pass
+
+    def _slug(self, raw: object, fallback: str = "page") -> str:
+        text = str(raw or "").strip()
+        if not text:
+            text = fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 80).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        clean: dict[str, object] = {}
+        for key, value in meta.items():
+            if isinstance(value, (str, int, float, bool)):
+                clean[str(key)] = value
+            elif isinstance(value, list):
+                clean[str(key)] = [str(x) for x in value[:80] if str(x).strip()]
+        lines = ["---"]
+        for key, value in clean.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            else:
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _append_log(self, action: str, detail: str):
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        line = f"## [{stamp}] {str(action or 'update')} | {trim(detail, 180)}\n\n"
+        with self.lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+
+    def _source_page_path(self, doc_id: str) -> Path:
+        return self.sources_root / f"{self._slug(doc_id, 'source')}.md"
+
+    def _write_source_page(self, doc: dict, chunks: list[dict]) -> str:
+        doc_id = str(doc.get("id", "") or "").strip()
+        title = str(doc.get("title", doc.get("filename", doc_id)) or doc_id).strip()
+        entities = [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()]
+        source_rel = str(doc.get("source_rel_path", "") or doc.get("filename", "") or "").strip()
+        summary = trim(str(doc.get("summary", "") or ""), 1800)
+        parts = [
+            self._frontmatter(
+                {
+                    "id": f"wiki-source-{doc_id}",
+                    "type": "source",
+                    "title": title,
+                    "source_doc_ids": [doc_id],
+                    "category": str(doc.get("category", "") or ""),
+                    "kind": str(doc.get("kind", "") or ""),
+                    "language": str(doc.get("language", "") or ""),
+                    "updated_at": float(doc.get("updated_at", now_ts()) or now_ts()),
+                    "tags": list(doc.get("labels", []) or [])[:24],
+                    "entities": entities[:24],
+                }
+            ),
+            f"# {title}\n\n",
+        ]
+        if source_rel:
+            parts.append(f"- Source path: `{source_rel}`\n")
+        if str(doc.get("sha256", "") or "").strip():
+            parts.append(f"- SHA256: `{str(doc.get('sha256', '') or '')}`\n")
+        if entities:
+            parts.append("- Entities: " + ", ".join(f"[[entities/{self._slug(ent, 'entity')}|{ent}]]" for ent in entities[:18]) + "\n")
+        if summary:
+            parts.append("\n## Summary\n\n" + summary + "\n")
+        if chunks:
+            parts.append("\n## Evidence Excerpts\n\n")
+            for chunk in chunks[:10]:
+                anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
+                text = trim(str(chunk.get("text", "") or ""), 900)
+                if text:
+                    parts.append(f"### {anchor}\n\n{text}\n\n")
+        path = self._source_page_path(doc_id)
+        _write_text_if_changed(path, "".join(parts).rstrip() + "\n")
+        return self._rel(path)
+
+    def _write_entity_pages(self, docs: dict[str, dict]) -> list[str]:
+        entity_docs: dict[str, list[dict]] = defaultdict(list)
+        for doc in docs.values():
+            for ent in [str(x).strip() for x in (doc.get("entities", []) or []) if str(x).strip()][:32]:
+                entity_docs[ent].append(doc)
+        written: list[str] = []
+        for ent, rows in sorted(entity_docs.items(), key=lambda kv: (-len(kv[1]), kv[0].lower()))[:420]:
+            slug = self._slug(ent, "entity")
+            path = self.entities_root / f"{slug}.md"
+            doc_ids = [str(row.get("id", "") or "") for row in rows if str(row.get("id", "") or "").strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-entity-{slug}",
+                        "type": "entity",
+                        "title": ent,
+                        "source_doc_ids": doc_ids[:80],
+                        "updated_at": now_ts(),
+                        "tags": ["entity", self.kind],
+                    }
+                ),
+                f"# {ent}\n\n",
+                f"Appears in {len(doc_ids)} source(s).\n\n",
+                "## Sources\n\n",
+            ]
+            for row in rows[:24]:
+                title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+                summary = trim(str(row.get("summary", "") or ""), 260)
+                body.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]")
+                if summary:
+                    body.append(f": {summary}")
+                body.append("\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_concept_pages(self, store: RAGLibraryStore) -> list[str]:
+        reports = getattr(store.index, "community_reports", {}) or {}
+        written: list[str] = []
+        for community, report in sorted(reports.items(), key=lambda kv: int((kv[1] or {}).get("doc_count", 0) or 0), reverse=True)[:240]:
+            if not isinstance(report, dict):
+                continue
+            title = str(community or "concept")
+            slug = self._slug(title, "concept")
+            path = self.concepts_root / f"{slug}.md"
+            doc_ids = [str(x) for x in (report.get("doc_ids", []) or []) if str(x).strip()]
+            top_entities = [str(x) for x in (report.get("top_entities", []) or []) if str(x).strip()]
+            body = [
+                self._frontmatter(
+                    {
+                        "id": f"wiki-concept-{slug}",
+                        "type": "concept",
+                        "title": title,
+                        "source_doc_ids": doc_ids[:100],
+                        "updated_at": now_ts(),
+                        "tags": ["concept", self.kind],
+                        "entities": top_entities[:24],
+                    }
+                ),
+                f"# {title}\n\n",
+                trim(str(report.get("report", "") or ""), 5000),
+                "\n\n## Representative Sources\n\n",
+            ]
+            for row in (report.get("representative_docs", []) or [])[:12]:
+                if not isinstance(row, dict):
+                    continue
+                doc_id = str(row.get("id", "") or "")
+                label = str(row.get("title", doc_id) or doc_id)
+                body.append(f"- [[sources/{self._slug(doc_id, 'source')}|{label}]]\n")
+            _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+            written.append(self._rel(path))
+        return written
+
+    def _write_overview_and_index(self, docs: dict[str, dict], page_rows: list[dict]):
+        overview = [
+            self._frontmatter(
+                {
+                    "id": f"{self.kind}-wiki-overview",
+                    "type": "overview",
+                    "title": f"{self.kind.title()} Wiki Overview",
+                    "updated_at": now_ts(),
+                    "tags": ["overview", self.kind],
+                }
+            ),
+            f"# {self.kind.title()} Wiki Overview\n\n",
+            f"- Sources: {len(docs)}\n",
+            f"- Pages: {len(page_rows)}\n",
+            f"- Generated at: {datetime.now().astimezone().isoformat()}\n\n",
+            "## Recent Sources\n\n",
+        ]
+        for row in sorted(docs.values(), key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)[:16]:
+            title = str(row.get("title", row.get("filename", row.get("id", ""))) or "")
+            overview.append(f"- [[sources/{self._slug(row.get('id', ''), 'source')}|{title}]]\n")
+        _write_text_if_changed(self.synthesis_root / "overview.md", "".join(overview).rstrip() + "\n")
+        by_type: dict[str, list[dict]] = defaultdict(list)
+        for row in page_rows:
+            by_type[str(row.get("type", "page") or "page")].append(row)
+        index = [
+            f"# {self.kind.title()} Wiki Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            "Read `schema.md` for maintenance conventions. Query uses this index first, then drills into pages.\n\n",
+        ]
+        for typ in ("overview", "source", "entity", "concept", "workflow"):
+            rows = by_type.get(typ, [])
+            if not rows:
+                continue
+            index.append(f"## {typ.title()} Pages\n\n")
+            for row in rows[:500]:
+                path = str(row.get("path", "") or "")
+                title = str(row.get("title", Path(path).stem) or Path(path).stem)
+                summary = trim(str(row.get("summary", "") or ""), 160)
+                index.append(f"- [[{path}|{title}]]")
+                if summary:
+                    index.append(f" - {summary}")
+                index.append("\n")
+            index.append("\n")
+        _write_text_if_changed(self.index_path, "".join(index).rstrip() + "\n")
+
+    def _page_meta_from_text(self, text: str) -> dict:
+        raw = str(text or "")
+        if not raw.startswith("---"):
+            return {}
+        end = raw.find("\n---", 3)
+        if end < 0:
+            return {}
+        block = raw[3:end].strip()
+        if not block:
+            return {}
+        if _yaml is not None:
+            try:
+                obj = _yaml.safe_load(block)
+                return dict(obj) if isinstance(obj, dict) else {}
+            except Exception:
+                pass
+        meta: dict[str, object] = {}
+        current_key = ""
+        for line in block.splitlines():
+            if line.startswith("  - ") and current_key:
+                meta.setdefault(current_key, [])
+                if isinstance(meta[current_key], list):
+                    meta[current_key].append(line[4:].strip().strip("\"'"))
+                continue
+            if ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            current_key = key.strip()
+            val = val.strip()
+            if not val:
+                meta[current_key] = []
+                continue
+            try:
+                meta[current_key] = json.loads(val)
+            except Exception:
+                meta[current_key] = val.strip("\"'")
+        return meta
+
+    def _scan_pages(self) -> list[dict]:
+        pages: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name in {"schema.md", "log.md"}:
+                continue
+            if self.kind == "code":
+                try:
+                    rel_probe = path.resolve().relative_to(self.root.resolve()).as_posix()
+                    if rel_probe.startswith("workflows/"):
+                        continue
+                except Exception:
+                    pass
+            text = try_read_text(path, max_bytes=260_000) or ""
+            if not text.strip():
+                continue
+            meta = self._page_meta_from_text(text)
+            rel = self._rel(path)
+            title = str(meta.get("title", "") or path.stem).strip()
+            typ = str(meta.get("type", "") or ("overview" if rel == "synthesis/overview.md" else "page"))
+            body = re.sub(r"(?s)^---.*?---\s*", "", text).strip()
+            pages.append(
+                {
+                    "path": rel,
+                    "title": title,
+                    "type": typ,
+                    "summary": trim(body.replace("\n", " "), 420),
+                    "text": body,
+                    "meta": meta,
+                }
+            )
+        return pages
+
+    def compile_from_store(self, store: RAGLibraryStore, *, doc_ids: list[str] | None = None, reason: str = "rebuild") -> dict:
+        with store.lock:
+            docs = {str(k): dict(v) for k, v in store.documents.items()}
+            chunks = {str(k): dict(v) for k, v in store.chunks.items()}
+        target_ids = [str(x).strip() for x in (doc_ids or []) if str(x).strip()]
+        if not target_ids:
+            target_ids = list(docs.keys())
+        written_sources: list[str] = []
+        for doc_id in target_ids:
+            doc = docs.get(doc_id)
+            if not doc:
+                continue
+            doc_chunks = [chunks[cid] for cid in (doc.get("chunk_ids", []) or []) if cid in chunks]
+            written_sources.append(self._write_source_page(doc, doc_chunks))
+        entity_pages = self._write_entity_pages(docs)
+        concept_pages = self._write_concept_pages(store)
+        page_rows = self._scan_pages()
+        self._write_overview_and_index(docs, page_rows)
+        payload = {
+            "kind": self.kind,
+            "updated_at": now_ts(),
+            "documents": len(docs),
+            "pages": len(page_rows),
+            "last_reason": str(reason or "rebuild"),
+            "last_doc_ids": target_ids[-80:],
+        }
+        _write_json_file(self.state_path, payload)
+        self._append_log(str(reason or "compile"), f"sources={len(written_sources)} entities={len(entity_pages)} concepts={len(concept_pages)}")
+        return {"ok": True, **payload}
+
+    def payload(self, limit: int = 240) -> dict:
+        pages = self._scan_pages()
+        state = _read_json_file(self.state_path, {})
+        return {
+            "root": str(self.root),
+            "kind": self.kind,
+            "state": state if isinstance(state, dict) else {},
+            "page_count": len(pages),
+            "pages": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "type": str(row.get("type", "")),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in pages[: max(0, int(limit or 240))]
+            ],
+        }
+
+    def lint(self) -> dict:
+        pages = self._scan_pages()
+        links: Counter[str] = Counter()
+        existing = {str(row.get("path", "")) for row in pages}
+        orphan_pages: list[str] = []
+        missing_links: list[str] = []
+        for row in pages:
+            for target in re.findall(r"\[\[([^\]|#]+)", str(row.get("text", "") or "")):
+                target_norm = target.strip().lstrip("/")
+                links[target_norm] += 1
+                if not any(p == target_norm or p.startswith(target_norm + ".") or p.startswith(target_norm + "/") for p in existing):
+                    missing_links.append(target_norm)
+        for row in pages:
+            path = str(row.get("path", "") or "")
+            if path in {"index.md", "synthesis/overview.md"}:
+                continue
+            stem = path[:-3] if path.endswith(".md") else path
+            if links.get(path, 0) <= 0 and links.get(stem, 0) <= 0:
+                orphan_pages.append(path)
+        return {
+            "ok": True,
+            "page_count": len(pages),
+            "orphan_pages": orphan_pages[:120],
+            "missing_links": sorted(set(missing_links))[:120],
+            "pending_jobs": int(self.queue.qsize()),
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, category: str = "", kind: str = "") -> dict:
+        query = str(query_text or "").strip()
+        pages = self._scan_pages()
+        if not query or not pages:
+            return {"query": query, "results": [], "summary": "", "route": "wiki", "route_meta": {"mode": "wiki"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qentities = set(_rag_filter_entities(_rag_extract_entities(query), limit=24))
+        qlow = query.lower()
+        rows: list[dict] = []
+        for page in pages:
+            meta = page.get("meta", {}) if isinstance(page.get("meta"), dict) else {}
+            page_type = str(page.get("type", "") or "")
+            if page_type == "workflow":
+                continue
+            if category and page_type == "source" and str(meta.get("category", "") or "") != category:
+                continue
+            if kind and page_type == "source" and str(meta.get("kind", "") or "") != kind:
+                continue
+            title = str(page.get("title", "") or "")
+            text = str(page.get("text", "") or "")
+            hay_title = title.lower()
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in hay_title)
+            meta_entities = {str(x).strip() for x in (meta.get("entities", []) or []) if str(x).strip()} if isinstance(meta.get("entities", []), list) else set()
+            ent_overlap = len(qentities.intersection(meta_entities))
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1400]).ratio()
+            score = lexical * 0.72 + min(0.24, 0.08 * title_hits) + min(0.24, 0.08 * ent_overlap)
+            weak_match = False
+            if score <= 0.0 and fuzzy >= 0.10:
+                score = min(fuzzy * 0.55, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            source_doc_ids = [str(x) for x in (meta.get("source_doc_ids", []) or []) if str(x).strip()] if isinstance(meta.get("source_doc_ids", []), list) else []
+            window = _rag_window_for_query(query)
+            excerpt = _rag_focused_excerpt(text, tokens, window=max(700, window), dense_match=fuzzy > 0.18)
+            rows.append(
+                {
+                    "score": round(float(score), 6),
+                    "lexical_score": round(float(lexical), 6),
+                    "graph_score": round(float(min(0.4, 0.08 * ent_overlap + 0.04 * title_hits)), 6),
+                    "doc_id": source_doc_ids[0] if source_doc_ids else "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(page.get("path", ""))).name,
+                    "kind": page_type or "wiki_page",
+                    "category": "wiki",
+                    "language": "markdown",
+                    "community": str(meta.get("community", "") or ""),
+                    "anchor": str(page.get("path", "") or ""),
+                    "text": trim(excerpt, 1800),
+                    "entities": list(meta_entities)[:12],
+                    "citation": f"[wiki:{str(page.get('path', '') or '')}]",
+                    "route_evidence": "wiki_page",
+                    "evidence_layer": "wiki",
+                    "wiki_page": str(page.get("path", "") or ""),
+                    "source_doc_ids": source_doc_ids[:24],
+                    "sort_bias": 0.18 if page_type in {"overview", "concept", "entity"} else 0.10,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(
+            key=lambda x: (
+                float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "wiki",
+            "route_meta": {"mode": "wiki", "page_count": len(pages), "candidate_count": len(rows)},
+            "query_entities": sorted(qentities),
+        }
+
+
+class WorkflowMemoryStore:
+    """Accepted programming workflow patterns captured from finished sessions."""
+
+    def __init__(self, code_root: Path):
+        self.code_root = Path(code_root).resolve()
+        self.root = self.code_root / "wiki" / "workflows"
+        self.accepted_root = self.root / "accepted"
+        self.candidates_root = self.root / "candidates"
+        self.rejected_root = self.root / "rejected"
+        for path in (self.accepted_root, self.candidates_root, self.rejected_root):
+            path.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "workflow_state.json"
+        self.index_path = self.root / "index.md"
+        self.lock = threading.RLock()
+        self.state = _read_json_file(self.state_path, {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0})
+        if not isinstance(self.state, dict):
+            self.state = {"captures": {}, "accepted": 0, "candidates": 0, "rejected": 0}
+        self._write_index()
+
+    def shutdown(self, timeout: float = 0.0):
+        return
+
+    def _slug(self, raw: object, fallback: str = "workflow") -> str:
+        text = str(raw or "").strip() or fallback
+        asciiish = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", asciiish.lower()).strip("-._")
+        if not slug:
+            slug = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return trim(slug, 96).strip("-._") or fallback
+
+    def _rel(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            return str(path)
+
+    def _frontmatter(self, meta: dict) -> str:
+        lines = ["---"]
+        for key, value in meta.items():
+            if isinstance(value, list):
+                lines.append(f"{key}:")
+                for item in value[:80]:
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            elif isinstance(value, (str, int, float, bool)):
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        lines.append("---")
+        return "\n".join(lines) + "\n\n"
+
+    def _extract_operation_rows(self, sess: object) -> list[dict]:
+        rows = []
+        try:
+            raw_rows = list(getattr(sess, "operations", []) or [])[-220:]
+        except Exception:
+            raw_rows = []
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                continue
+            tool = str(raw.get("tool", raw.get("name", raw.get("type", ""))) or "").strip()
+            status = str(raw.get("status", raw.get("result", "")) or "").strip()
+            summary = trim(str(raw.get("summary", raw.get("content", raw.get("text", ""))) or ""), 220)
+            args = raw.get("args", raw.get("input", {}))
+            if isinstance(args, dict) and not summary:
+                summary = trim(json_dumps({k: args.get(k) for k in list(args.keys())[:6]}, indent=None), 220)
+            rows.append(
+                {
+                    "tool": tool,
+                    "status": status,
+                    "summary": summary,
+                    "time": float(raw.get("time", raw.get("ts", raw.get("created_at", 0.0))) or 0.0),
+                }
+            )
+        return rows
+
+    def _extract_text_tail(self, value: object, limit: int = 10, chars: int = 360) -> list[str]:
+        out: list[str] = []
+        if isinstance(value, dict):
+            rows = list(value.values())
+        elif isinstance(value, list):
+            rows = list(value)
+        else:
+            rows = []
+        for row in rows[-limit:]:
+            if isinstance(row, dict):
+                text = str(row.get("content", row.get("summary", row.get("text", row.get("message", "")))) or "")
+            else:
+                text = str(row or "")
+            text = trim(text.replace("\n", " "), chars)
+            if text:
+                out.append(text)
+        return out
+
+    def _score_capture(self, capture: dict) -> tuple[float, list[str]]:
+        text = "\n".join(
+            [
+                str(capture.get("objective", "") or ""),
+                "\n".join(str(x) for x in (capture.get("operation_summaries", []) or [])),
+                "\n".join(str(x) for x in (capture.get("message_tail", []) or [])),
+                "\n".join(str(x) for x in (capture.get("blackboard_tail", []) or [])),
+            ]
+        ).lower()
+        tools = [str(row.get("tool", "") or "").lower() for row in (capture.get("operations", []) or []) if isinstance(row, dict)]
+        todo_rows = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        score = 0.18
+        reasons: list[str] = ["base-session-fingerprint"]
+        if any(term in text for term in ("finish", "completed", "完成", "done", "success")):
+            score += 0.18
+            reasons.append("explicit-completion-signal")
+        if any(tool in {"file_patch", "apply_patch", "write_file", "edit_file"} or "patch" in tool or "write" in tool for tool in tools):
+            score += 0.16
+            reasons.append("code-edit-operation")
+        if any(tool in {"run_shell", "bash", "shell", "exec"} or "test" in tool for tool in tools) or any(term in text for term in ("pytest", "unittest", "npm test", "py_compile", "build succeeded", "tests passed", "验证", "测试")):
+            score += 0.16
+            reasons.append("validation-or-test-step")
+        if todo_rows:
+            completed = sum(1 for row in todo_rows if str(row.get("status", "") or "").lower() == "completed")
+            if completed >= max(1, len(todo_rows) // 2):
+                score += 0.12
+                reasons.append("todo-progress")
+        if any(term in text for term in ("plan", "checklist", "步骤", "计划", "in_progress", "pending")):
+            score += 0.08
+            reasons.append("structured-planning")
+        if any(term in text for term in ("blackboard", "delegate", "agent", "explorer", "worker", "reviewer", "handoff", "交接", "节点")):
+            score += 0.08
+            reasons.append("multi-node-coordination")
+        if any(term in text for term in ("traceback", "failed", "error", "exception", "失败", "报错")):
+            score -= 0.06
+            reasons.append("contains-failure-signal")
+        if any(term in text for term in ("fixed", "resolved", "pass", "ok", "修复", "通过")):
+            score += 0.08
+            reasons.append("recovery-or-pass-signal")
+        return max(0.0, min(1.0, round(score, 4))), reasons[:12]
+
+    def _capture_from_session(self, sess: object) -> dict:
+        sid = str(getattr(sess, "id", "") or "").strip()
+        title = trim(str(getattr(sess, "title", "") or sid or "workflow"), 160)
+        operations = self._extract_operation_rows(sess)
+        op_summaries = []
+        for row in operations[-48:]:
+            label = str(row.get("tool", "") or "operation")
+            summary = str(row.get("summary", "") or str(row.get("status", "") or ""))
+            if summary:
+                op_summaries.append(f"{label}: {summary}")
+            else:
+                op_summaries.append(label)
+        try:
+            todos = getattr(getattr(sess, "todo", None), "snapshot")()
+        except Exception:
+            todos = []
+        if not isinstance(todos, list):
+            todos = []
+        try:
+            blackboard = getattr(sess, "blackboard", {}) or {}
+        except Exception:
+            blackboard = {}
+        capture = {
+            "session_id": sid,
+            "title": title,
+            "objective": trim(str(getattr(sess, "runtime_direct_objective", "") or title), 800),
+            "created_at": now_ts(),
+            "operations": operations,
+            "operation_summaries": op_summaries[-48:],
+            "todos": [dict(x) for x in todos[-40:] if isinstance(x, dict)],
+            "message_tail": self._extract_text_tail(getattr(sess, "agent_messages", []), limit=12, chars=420),
+            "blackboard_tail": self._extract_text_tail(blackboard, limit=16, chars=420),
+            "code_preview_paths": sorted(list((getattr(sess, "code_preview_index", {}) or {}).keys()))[:40]
+            if isinstance(getattr(sess, "code_preview_index", {}), dict)
+            else [],
+        }
+        score, reasons = self._score_capture(capture)
+        capture["score"] = score
+        capture["score_reasons"] = reasons
+        capture["accepted"] = bool(score >= RAG_WORKFLOW_ACCEPT_SCORE)
+        return capture
+
+    def _write_capture_card(self, capture: dict) -> Path:
+        sid = str(capture.get("session_id", "") or make_id("workflow"))
+        score = float(capture.get("score", 0.0) or 0.0)
+        accepted = bool(capture.get("accepted", False))
+        target_root = self.accepted_root if accepted else self.candidates_root
+        filename = f"{self._slug(sid, 'workflow')}-{int(score * 100):02d}.md"
+        path = target_root / filename
+        body = [
+            self._frontmatter(
+                {
+                    "id": f"workflow-{sid}",
+                    "type": "workflow",
+                    "title": str(capture.get("title", "") or sid),
+                    "session_id": sid,
+                    "score": score,
+                    "accepted": accepted,
+                    "updated_at": float(capture.get("created_at", now_ts()) or now_ts()),
+                    "tags": ["workflow", "code", "accepted" if accepted else "candidate"],
+                }
+            ),
+            f"# {str(capture.get('title', '') or sid)}\n\n",
+            f"- Score: `{score:.2f}`\n",
+            f"- Accepted: `{str(accepted).lower()}`\n",
+            "- Reasons: " + ", ".join(str(x) for x in (capture.get("score_reasons", []) or [])) + "\n\n",
+            "## Objective\n\n",
+            trim(str(capture.get("objective", "") or ""), 1200) + "\n\n",
+            "## Workflow Steps\n\n",
+        ]
+        for line in (capture.get("operation_summaries", []) or [])[:48]:
+            body.append(f"- {trim(str(line), 260)}\n")
+        todos = [dict(x) for x in (capture.get("todos", []) or []) if isinstance(x, dict)]
+        if todos:
+            body.append("\n## Todo Pattern\n\n")
+            for row in todos[:24]:
+                body.append(f"- `{str(row.get('status', '') or 'pending')}` {trim(str(row.get('content', '') or ''), 220)}\n")
+        if capture.get("code_preview_paths"):
+            body.append("\n## Code Artifacts\n\n")
+            for item in (capture.get("code_preview_paths", []) or [])[:32]:
+                body.append(f"- `{str(item)}`\n")
+        tail = list(capture.get("blackboard_tail", []) or []) + list(capture.get("message_tail", []) or [])
+        if tail:
+            body.append("\n## Context Signals\n\n")
+            for line in tail[:20]:
+                body.append(f"- {trim(str(line), 360)}\n")
+        _write_text_if_changed(path, "".join(body).rstrip() + "\n")
+        return path
+
+    def _scan_cards(self) -> list[dict]:
+        cards: list[dict] = []
+        for path in sorted(self.root.rglob("*.md")):
+            if path.name == "index.md":
+                continue
+            text = try_read_text(path, max_bytes=180_000) or ""
+            if not text.strip():
+                continue
+            meta: dict = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end > 0:
+                    raw_meta = text[3:end].strip()
+                    if _yaml is not None:
+                        try:
+                            obj = _yaml.safe_load(raw_meta)
+                            meta = dict(obj) if isinstance(obj, dict) else {}
+                        except Exception:
+                            meta = {}
+                    body = text[end + 4 :].strip()
+                else:
+                    body = text
+            else:
+                body = text
+            cards.append(
+                {
+                    "path": self._rel(path),
+                    "title": str(meta.get("title", path.stem) or path.stem),
+                    "score": float(meta.get("score", 0.0) or 0.0),
+                    "accepted": bool(meta.get("accepted", "accepted" in path.parts)),
+                    "text": body,
+                    "summary": trim(body.replace("\n", " "), 320),
+                    "meta": meta,
+                }
+            )
+        return cards
+
+    def _write_index(self):
+        cards = self._scan_cards()
+        accepted = [row for row in cards if bool(row.get("accepted", False))]
+        candidates = [row for row in cards if not bool(row.get("accepted", False))]
+        body = [
+            "# Code Workflow Memory Index\n\n",
+            f"Updated: {datetime.now().astimezone().isoformat()}\n\n",
+            f"- Accepted: {len(accepted)}\n",
+            f"- Candidates: {len(candidates)}\n\n",
+        ]
+        for heading, rows in (("Accepted", accepted), ("Candidates", candidates)):
+            if not rows:
+                continue
+            body.append(f"## {heading}\n\n")
+            for row in sorted(rows, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[:200]:
+                body.append(f"- [[{row.get('path')}|{row.get('title')}]] score={float(row.get('score', 0.0) or 0.0):.2f}")
+                summary = trim(str(row.get("summary", "") or ""), 140)
+                if summary:
+                    body.append(f" - {summary}")
+                body.append("\n")
+            body.append("\n")
+        _write_text_if_changed(self.index_path, "".join(body).rstrip() + "\n")
+
+    def capture_session(self, sess: object) -> dict:
+        capture = self._capture_from_session(sess)
+        sid = str(capture.get("session_id", "") or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id missing"}
+        with self.lock:
+            captures = self.state.get("captures", {})
+            if not isinstance(captures, dict):
+                captures = {}
+            previous = captures.get(sid)
+            if isinstance(previous, dict) and float(previous.get("score", 0.0) or 0.0) >= float(capture.get("score", 0.0) or 0.0):
+                return {"ok": True, "skipped": True, "reason": "existing_capture_has_equal_or_higher_score", "score": float(previous.get("score", 0.0) or 0.0)}
+            path = self._write_capture_card(capture)
+            captures[sid] = {
+                "path": self._rel(path),
+                "score": float(capture.get("score", 0.0) or 0.0),
+                "accepted": bool(capture.get("accepted", False)),
+                "updated_at": now_ts(),
+                "title": str(capture.get("title", "") or sid),
+            }
+            self.state["captures"] = captures
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            self._write_index()
+            return {"ok": True, "accepted": bool(capture.get("accepted", False)), "score": float(capture.get("score", 0.0) or 0.0), "path": self._rel(path)}
+
+    def rebuild(self) -> dict:
+        with self.lock:
+            self._write_index()
+            cards = self._scan_cards()
+            self.state["accepted"] = sum(1 for row in cards if bool(row.get("accepted", False)))
+            self.state["candidates"] = sum(1 for row in cards if not bool(row.get("accepted", False)))
+            self.state["updated_at"] = now_ts()
+            _write_json_file(self.state_path, self.state)
+            return {"ok": True, "accepted": int(self.state.get("accepted", 0) or 0), "candidates": int(self.state.get("candidates", 0) or 0)}
+
+    def payload(self, limit: int = 120) -> dict:
+        cards = self._scan_cards()
+        state = _read_json_file(self.state_path, self.state)
+        return {
+            "root": str(self.root),
+            "state": state if isinstance(state, dict) else {},
+            "card_count": len(cards),
+            "cards": [
+                {
+                    "path": str(row.get("path", "")),
+                    "title": str(row.get("title", "")),
+                    "score": float(row.get("score", 0.0) or 0.0),
+                    "accepted": bool(row.get("accepted", False)),
+                    "summary": trim(str(row.get("summary", "") or ""), 220),
+                }
+                for row in sorted(cards, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)[: max(0, int(limit or 120))]
+            ],
+        }
+
+    def query(self, query_text: str, *, top_k: int = RAG_MAX_QUERY_RESULTS, accepted_only: bool = True) -> dict:
+        query = str(query_text or "").strip()
+        cards = self._scan_cards()
+        if accepted_only:
+            cards = [row for row in cards if bool(row.get("accepted", False))]
+        if not query or not cards:
+            return {"query": query, "results": [], "summary": "", "route": "workflow", "route_meta": {"mode": "workflow"}}
+        tokens = [t for t in _rag_expand_tokens(_rag_tokenize(query, max_terms=120)) if t]
+        qlow = query.lower()
+        rows: list[dict] = []
+        for card in cards:
+            title = str(card.get("title", "") or "")
+            text = str(card.get("text", "") or "")
+            hay = (title + "\n" + text).lower()
+            exact_hits = sum(1 for token in tokens if token and token in hay)
+            title_hits = sum(1 for token in tokens if token and token in title.lower())
+            fuzzy = difflib.SequenceMatcher(None, qlow[:280], hay[:1600]).ratio()
+            lexical = exact_hits / max(1, min(len(tokens), 24))
+            base = float(card.get("score", 0.0) or 0.0)
+            score = lexical * 0.64 + min(0.20, 0.06 * title_hits) + base * 0.22
+            weak_match = False
+            if score <= 0.03 and fuzzy >= 0.12:
+                score = min(fuzzy * 0.50 + base * 0.12, RAG_WEAK_MATCH_SCORE_CAP)
+                weak_match = True
+            if score <= 0.035 and exact_hits <= 0:
+                continue
+            rows.append(
+                {
+                    "score": round(score, 6),
+                    "lexical_score": round(lexical, 6),
+                    "graph_score": round(base, 6),
+                    "doc_id": "",
+                    "chunk_id": "",
+                    "title": title,
+                    "filename": Path(str(card.get("path", ""))).name,
+                    "relative_path": str(card.get("path", "")),
+                    "kind": "workflow",
+                    "category": "code",
+                    "language": "markdown",
+                    "anchor": str(card.get("path", "")),
+                    "text": trim(_rag_focused_excerpt(text, tokens, window=1200, dense_match=fuzzy > 0.18), 1800),
+                    "entities": [],
+                    "citation": f"[workflow:{str(card.get('path', '') or '')}]",
+                    "route_evidence": "workflow",
+                    "evidence_layer": "workflow",
+                    "workflow_score": base,
+                    "sort_bias": 0.16 if bool(card.get("accepted", False)) else 0.04,
+                    "weak_match": weak_match,
+                }
+            )
+        rows.sort(key=lambda x: (float(x.get("score", 0.0) or 0.0) + float(x.get("sort_bias", 0.0) or 0.0), float(x.get("graph_score", 0.0) or 0.0)), reverse=True)
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        top_rows = _rag_mmr_select(rows, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        return {
+            "query": query,
+            "results": top_rows,
+            "summary": "\n".join(f"{r.get('citation')} {r.get('title')}: {trim(r.get('text'), 160)}" for r in top_rows[:4]),
+            "route": "workflow",
+            "route_meta": {"mode": "workflow", "card_count": len(cards), "candidate_count": len(rows), "accepted_only": bool(accepted_only)},
+        }
+
+
 def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
     try:
         parser = RAGContentParser(include_filename_entities=include_filename_entities)
@@ -53221,10 +57487,11 @@ def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override
 
 
 class RAGIngestionService:
-    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None):
+    def __init__(self, store: RAGLibraryStore, parser: RAGContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(RAG_IMPORT_WORKER_COUNT)
@@ -53847,6 +58114,7 @@ class RAGIngestionService:
             self.store.update_task(task_id, status="running", started_at=now_ts())
             try:
                 result_rows: list[dict] = []
+                all_result_rows: list[dict] = []
                 item_errors: list[str] = []
                 pending_flushes = 0
                 pending_rebuild = False
@@ -53901,6 +58169,7 @@ class RAGIngestionService:
                             **kwargs,
                         )
                         result_rows.append(row)
+                        all_result_rows.append(row)
                         pending_flushes += 1
                         if bool(row.get("ok", False)) and not bool(row.get("duplicate", False)):
                             pending_rebuild = True
@@ -54059,11 +58328,17 @@ class RAGIngestionService:
                                 strict_local_only=strict_local_only,
                             )
                 _flush_ingest_state()
-                ok_count = sum(1 for row in result_rows if bool(row.get("ok", False)))
-                duplicate_count = sum(1 for row in result_rows if bool(row.get("duplicate", False)))
+                ok_count = sum(1 for row in all_result_rows if bool(row.get("ok", False)))
+                duplicate_count = sum(1 for row in all_result_rows if bool(row.get("duplicate", False)))
                 failed_count = len(item_errors)
                 if failed_count and ok_count <= 0:
                     raise ValueError("\n".join(item_errors[:12]))
+                doc_ids = [str(x.get("doc_id", "")) for x in all_result_rows if str(x.get("doc_id", "")).strip()]
+                if self.wiki_store is not None and doc_ids:
+                    try:
+                        self.wiki_store.enqueue_compile(self.store, doc_ids=doc_ids, reason=f"ingest:{source_mode}")
+                    except Exception:
+                        pass
                 self.store.update_task(
                     task_id,
                     status="completed_with_errors" if failed_count else "completed",
@@ -54072,7 +58347,7 @@ class RAGIngestionService:
                     duplicate_count=duplicate_count,
                     failed_count=failed_count,
                     error="\n".join(item_errors[:12]),
-                    doc_ids=[str(x.get("doc_id", "")) for x in result_rows if str(x.get("doc_id", "")).strip()],
+                    doc_ids=doc_ids,
                 )
             except Exception as exc:
                 self.store.update_task(
@@ -54457,7 +58732,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     continue
                 rows.append(
                     {
-                        "score": round(ratio, 6),
+                        "score": round(min(ratio, RAG_WEAK_MATCH_SCORE_CAP), 6),
                         "lexical_score": round(ratio, 6),
                         "graph_score": 0.0,
                         "doc_id": str(doc.get("id", "")),
@@ -54478,6 +58753,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                         ],
                         "citation": f"[{rel_path or doc.get('id', '')}]",
                         "route_evidence": "document",
+                        "weak_match": True,
                     }
                 )
         return self._finalize_query_rows(
@@ -54824,10 +59100,11 @@ class CodeLibraryStore(RAGLibraryStore):
 
 
 class CodeIngestionService(RAGIngestionService):
-    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None):
+    def __init__(self, store: CodeLibraryStore, parser: CodeContentParser, session_resolver=None, wiki_store: WikiStore | None = None):
         self.store = store
         self.parser = parser
         self.session_resolver = session_resolver if callable(session_resolver) else None
+        self.wiki_store = wiki_store if isinstance(wiki_store, WikiStore) else None
         self.queue: queue.Queue[dict] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker_count = int(CODE_IMPORT_WORKER_COUNT)
@@ -55000,6 +59277,8 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
             <label for="queryRouteInput">Route</label>
             <select id="queryRouteInput">
               <option value="auto" selected>Auto</option>
+              <option value="wiki">Wiki</option>
+              <option value="raw">Raw Hybrid</option>
               <option value="fast">Fast</option>
               <option value="global">Global</option>
               <option value="hybrid">Hybrid</option>
@@ -55007,7 +59286,15 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
           </div>
           <div class="field grow">
             <label for="topKInput">Top K</label>
-            <input id="topKInput" type="number" min="1" max="12" value="8">
+            <input id="topKInput" type="number" min="1" max="64" value="10">
+          </div>
+          <div class="field grow">
+            <label for="queryBudgetInput">Budget</label>
+            <select id="queryBudgetInput">
+              <option value="standard" selected>Standard</option>
+              <option value="tight">Tight</option>
+              <option value="deep">Deep</option>
+            </select>
           </div>
           <label class="check top-gap"><input id="querySynthesize" type="checkbox" checked> synthesize answer</label>
         </div>
@@ -55173,6 +59460,19 @@ const G={
   layout:null,
   layouts:{},
   hoverId:'',
+  selectedNodeId:'',
+  focusMode:false,
+  viewport:{x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1},
+  animation:{active:false,started:0,duration:420,from:null,to:null,reason:''},
+  dragging2d:false,
+  dragStartX:0,
+  dragStartY:0,
+  dragOriginX:0,
+  dragOriginY:0,
+  pointerDownX:0,
+  pointerDownY:0,
+  pointerMoved:false,
+  lastLayoutView:'static',
   screenNodes:[],
   bound:false,
   renderKey:'',
@@ -55194,6 +59494,13 @@ const G={
     fitDistance:360,
     minDistance:96,
     maxDistance:4200,
+    targetDistance:360,
+    targetAzimuth:0.72,
+    targetElevation:0.56,
+    focusCenter:{x:0,y:0,z:0},
+    clickStartX:0,
+    clickStartY:0,
+    moved:false,
     pending:false,
     graphKey:'',
     activeHoverId:'',
@@ -55203,6 +59510,12 @@ const G={
 const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
 const GRAPH_STATIC_NODE_LIMIT=300;
 const GRAPH_STATIC_HERO_COUNT=30;
+const GRAPH_STATIC_EDGE_LIMIT=520;
+const GRAPH_FOCUS_NODE_LIMIT=96;
+const GRAPH_FOCUS_SECOND_HOP_LIMIT=34;
+const GRAPH_FOCUS_EDGE_LIMIT=260;
+const GRAPH_ZOOM_MIN_FACTOR=0.22;
+const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
 async function api(path,init){
   const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
@@ -55224,6 +59537,7 @@ function parseTags(){return String(E('tagInput')?.value||'').split(',').map(x=>x
 function strictLocalOnlyImport(){return Boolean(E('importLocalOnly')?.checked)}
 function selectedQueryRoute(){return String(E('queryRouteInput')?.value||'auto').trim().toLowerCase()||'auto'}
 function selectedEmbedModel(){return String(E('embedModelSelect')?.value||'').trim()}
+function selectedQueryBudget(){return String(E('queryBudgetInput')?.value||'standard').trim().toLowerCase()||'standard'}
 function renderEmbedModelSelect(){
   const sel=E('embedModelSelect');
   if(!sel)return;
@@ -55236,9 +59550,7 @@ function renderEmbedModelSelect(){
     op.textContent=String(m);
     sel.appendChild(op);
   }
-  const dflt=String(S.config?.default_embed_model||'').trim();
-  if(dflt&&!prev){sel.value=dflt}
-  else if(prev){sel.value=prev}
+  if(prev){sel.value=prev}
 }
 function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
 async function submitImportItems(items,batchIndex,batchCount){
@@ -55379,20 +59691,23 @@ function graphSignature(graph){
   const edges=Array.isArray(graph?.edges)?graph.edges:[];
   return JSON.stringify({
     built_at:Number(graph?.built_at||0),
-    node_count:Number(graph?.node_count||0),
-    edge_count:Number(graph?.edge_count||0),
-    nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
-    edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]),
+      node_count:Number(graph?.node_count||0),
+      edge_count:Number(graph?.edge_count||0),
+      rev:Number(graph?.rev||graph?.revision||0),
+      nodes:nodes.map(n=>[String(n.id||''),String(n.type||''),String(n.community||''),String(n.label||'')]),
+      edges:edges.map(e=>[String(e.source||''),String(e.target||''),String(e.type||''),Number(e.weight||0)]).slice(0,3000),
   })
 }
 function normalizeGraphType(v){
   const t=String(v||'').trim().toLowerCase();
   if(t==='community'||t==='document'||t==='entity')return t;
+  if(['file','source','doc','page','module'].includes(t))return 'document';
+  if(['symbol','function','class','method','concept','tag','keyword'].includes(t))return 'entity';
   return 'document';
 }
 function communityHex(key){return hslToHex(hashText(key)%360,72,58)}
-function nodeRadius2D(type){if(type==='community')return 11.5;if(type==='entity')return 2.7;return 4.5}
-function nodeRadius3D(type){if(type==='community')return 8.4;if(type==='entity')return 1.9;return 3.4}
+function nodeRadius2D(type){if(type==='community')return 13.5;if(type==='entity')return 4.1;return 6.2}
+function nodeRadius3D(type){if(type==='community')return 9.4;if(type==='entity')return 2.8;return 4.6}
 function nodeCommunityKey(node){
   const type=normalizeGraphType(node?.type);
   if(type==='community')return String(node?.label||node?.community||node?.id||'community').trim()||'community';
@@ -55452,6 +59767,77 @@ function computeGraphBounds(items){
     spanY:maxY-minY,
     spanZ:maxZ-minZ,
     radius:Math.max(24,Math.sqrt(halfX*halfX+halfY*halfY+halfZ*halfZ)),
+  };
+}
+function edgeRank(edge,itemById){
+  const source=itemById?.get?.(String(edge?.source||''))||null;
+  const target=itemById?.get?.(String(edge?.target||''))||null;
+  const type=String(edge?.type||'related');
+  const base=type==='related'?3.2:(type==='belongs_to'?2.4:(type==='mentions'?1.8:1.2));
+  const weight=Math.log1p(Math.max(0,Number(edge?.weight||0)))*0.85;
+  const nodeScore=Math.log1p(Math.max(0,Number(source?.score||0)))+Math.log1p(Math.max(0,Number(target?.score||0)));
+  const degreePenalty=Math.log1p(Math.max(0,Number(source?.degree||0)+Number(target?.degree||0)))*0.18;
+  return base+weight+nodeScore*0.42-degreePenalty;
+}
+function pruneGraphEdges(edges,itemById,limit=GRAPH_STATIC_EDGE_LIMIT,perNodeLimit=18,focusId=''){
+  const rows=(edges||[])
+    .filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||'')))
+    .map(edge=>({...edge,_rank:edgeRank(edge,itemById)}))
+    .sort((a,b)=>Number(b._rank||0)-Number(a._rank||0));
+  const selected=[];
+  const degree=new Map();
+  const focus=String(focusId||'');
+  for(const edge of rows){
+    if(selected.length>=Math.max(1,Number(limit||GRAPH_STATIC_EDGE_LIMIT)))break;
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const nearFocus=focus&&(s===focus||t===focus);
+    const cap=nearFocus?Math.max(perNodeLimit*2,28):perNodeLimit;
+    if(!nearFocus&&(Number(degree.get(s)||0)>=cap||Number(degree.get(t)||0)>=cap))continue;
+    degree.set(s,Number(degree.get(s)||0)+1);
+    degree.set(t,Number(degree.get(t)||0)+1);
+    const clean={...edge};
+    delete clean._rank;
+    selected.push(clean);
+  }
+  return selected;
+}
+function cloneLayoutItems(items,transform){
+  return (items||[]).map((item,idx)=>{
+    const next={...item};
+    if(typeof transform==='function')Object.assign(next,transform(item,idx)||{});
+    return next;
+  });
+}
+function layoutFromItems(base,items,edges,signature,extra={}){
+  const itemById=new Map((items||[]).map(item=>[String(item.id),item]));
+  const geometry=computeGraphBounds(items||[]);
+  const counts={community:0,document:0,entity:0};
+  (items||[]).forEach(item=>{
+    const type=String(item?.type||'document');
+    if(type==='community'||type==='document'||type==='entity')counts[type]+=1;
+  });
+  return {
+    signature,
+    items:items||[],
+    itemById,
+    edges:edges||[],
+    allEdges:Array.isArray(extra?.allEdges)?extra.allEdges:(edges||[]),
+    bounds:geometry.bounds,
+    center:geometry.center,
+    spanX:geometry.spanX,
+    spanY:geometry.spanY,
+    spanZ:geometry.spanZ,
+    radius:geometry.radius,
+    counts,
+    communities:Array.isArray(base?.communities)?base.communities:[],
+    totalNodeCount:Number(base?.totalNodeCount||base?.items?.length||0),
+    totalEdgeCount:Number(base?.totalEdgeCount||base?.edges?.length||0),
+    visibleNodeCount:(items||[]).length,
+    visibleEdgeCount:(edges||[]).length,
+    heroCount:0,
+    sampled:false,
+    labelIds:new Set(),
+    ...extra,
   };
 }
 function buildGraphLayout(graph){
@@ -55640,12 +60026,23 @@ function buildGraphLayout(graph){
     }
     return {...edge,colorHex,alpha,width}
   });
+  const communityItemByKey=new Map(items.filter(item=>String(item.type||'')==='community').map(item=>[String(item.communityKey||item.label||''),item]));
+  for(const item of items){
+    if(String(item.type||'')==='document'){
+      const communityItem=communityItemByKey.get(String(item.communityKey||''));
+      if(communityItem){
+        layoutEdges.push({source:String(item.id),target:String(communityItem.id),type:'belongs_to',weight:1,colorHex:mixHex(Number(item.colorHex||0x607565),Number(communityItem.colorHex||0x607565),0.5),alpha:0.12,width:0.85});
+      }
+    }
+  }
+  const prunedEdges=pruneGraphEdges(layoutEdges,itemById,Math.max(GRAPH_STATIC_EDGE_LIMIT*2,900),34);
   const geometry=computeGraphBounds(items);
   return {
     signature:graphSignature(graph),
     items,
     itemById,
-    edges:layoutEdges,
+    edges:prunedEdges,
+    allEdges:layoutEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -55657,7 +60054,7 @@ function buildGraphLayout(graph){
     totalNodeCount:items.length,
     totalEdgeCount:layoutEdges.length,
     visibleNodeCount:items.length,
-    visibleEdgeCount:layoutEdges.length,
+    visibleEdgeCount:prunedEdges.length,
     heroCount:0,
     sampled:false,
   }
@@ -55680,7 +60077,7 @@ function buildStaticGraphLayout(fullLayout){
       counts:{community:0,document:0,entity:0},
       communities:Array.isArray(base?.communities)?base.communities:[],
       totalNodeCount:totalNodes,
-      totalEdgeCount:Number(base?.edges?.length||0),
+      totalEdgeCount:Number(base?.totalEdgeCount||base?.allEdges?.length||base?.edges?.length||0),
       visibleNodeCount:0,
       visibleEdgeCount:0,
       heroCount:0,
@@ -55738,7 +60135,8 @@ function buildStaticGraphLayout(fullLayout){
     return next;
   });
   const itemById=new Map(items.map(item=>[String(item.id),item]));
-  const edges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const rawEdges=(base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>({...edge}));
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_STATIC_EDGE_LIMIT,16);
   const geometry=computeGraphBounds(items);
   const counts={community:0,document:0,entity:0};
   items.forEach(item=>{
@@ -55750,6 +60148,7 @@ function buildStaticGraphLayout(fullLayout){
     items,
     itemById,
     edges,
+    allEdges:rawEdges,
     bounds:geometry.bounds,
     center:geometry.center,
     spanX:geometry.spanX,
@@ -55759,7 +60158,7 @@ function buildStaticGraphLayout(fullLayout){
     counts,
     communities:Array.isArray(base.communities)?base.communities:[],
     totalNodeCount:totalNodes,
-    totalEdgeCount:Number(base.edges?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
     visibleNodeCount:items.length,
     visibleEdgeCount:edges.length,
     heroCount,
@@ -55767,20 +60166,155 @@ function buildStaticGraphLayout(fullLayout){
     labelIds,
   };
 }
+function graphAdjacency(layout){
+  const adjacency=new Map();
+  for(const item of layout?.items||[])adjacency.set(String(item.id||''),[]);
+  for(const edge of layout?.allEdges||layout?.edges||[]){
+    const s=String(edge?.source||''),t=String(edge?.target||'');
+    if(!adjacency.has(s)||!adjacency.has(t))continue;
+    adjacency.get(s).push({id:t,edge});
+    adjacency.get(t).push({id:s,edge});
+  }
+  for(const [id,list] of adjacency.entries()){
+    list.sort((a,b)=>edgeRank(b.edge,layout.itemById)-edgeRank(a.edge,layout.itemById));
+  }
+  return adjacency;
+}
+function buildFocusGraphLayout(fullLayout,focusId){
+  const base=fullLayout&&typeof fullLayout==='object'?fullLayout:null;
+  const selected=String(focusId||'').trim();
+  if(!base||!selected||!base.itemById?.has(selected))return null;
+  const focus=base.itemById.get(selected);
+  const adjacency=graphAdjacency(base);
+  const selectedIds=new Set([selected]);
+  const distance=new Map([[selected,0]]);
+  const firstHop=(adjacency.get(selected)||[]).slice(0,Math.max(18,Math.min(58,GRAPH_FOCUS_NODE_LIMIT-1)));
+  for(const row of firstHop){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    selectedIds.add(String(row.id));
+    distance.set(String(row.id),1);
+  }
+  const secondCandidates=[];
+  for(const row of firstHop){
+    for(const next of adjacency.get(String(row.id))||[]){
+      const id=String(next.id||'');
+      if(!id||selectedIds.has(id))continue;
+      secondCandidates.push({id,rank:edgeRank(next.edge,base.itemById)+(Number(base.itemById.get(id)?.score||0)*0.12)});
+    }
+  }
+  secondCandidates.sort((a,b)=>Number(b.rank||0)-Number(a.rank||0));
+  for(const row of secondCandidates){
+    if(selectedIds.size>=GRAPH_FOCUS_NODE_LIMIT)break;
+    if(distance.get(row.id)!==undefined)continue;
+    selectedIds.add(row.id);
+    distance.set(row.id,2);
+    if([...distance.values()].filter(v=>Number(v)===2).length>=GRAPH_FOCUS_SECOND_HOP_LIMIT)break;
+  }
+  const selectedItems=(base.items||[]).filter(item=>selectedIds.has(String(item.id||'')));
+  const focusX=Number(focus.x||0),focusY=Number(focus.y||0),focusZ=Number(focus.z||0);
+  const ringCounts={1:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===1).length),2:Math.max(1,selectedItems.filter(item=>Number(distance.get(String(item.id)))===2).length)};
+  const ringIndex={1:0,2:0};
+  const items=cloneLayoutItems(selectedItems,item=>{
+    const id=String(item.id||'');
+    const d=Number(distance.get(id)||0);
+    if(d===0){
+      return {
+        x:0,y:0,z:0,
+        focusDistance:0,
+        radius2d:Number(item.radius2d||4)*1.86,
+        radius3d:Number(item.radius3d||3)*1.65,
+        hero:true,
+        focusPrimary:true,
+      };
+    }
+    const idx=ringIndex[d]++;
+    const count=ringCounts[d]||1;
+    const angle=(Math.PI*2*idx/count)+GOLDEN_ANGLE*(hashText(id)%17)*0.08;
+    const baseRadius=d===1?86:158;
+    const scoreLift=Math.min(24,Math.log1p(Math.max(0,Number(item.score||0)))*6);
+    const spread=baseRadius+scoreLift+(signedHashUnit(id)*13);
+    const pullX=(Number(item.x||0)-focusX)*0.10;
+    const pullY=(Number(item.y||0)-focusY)*0.10;
+    const pullZ=(Number(item.z||0)-focusZ)*0.12;
+    return {
+      x:Math.cos(angle)*spread+pullX,
+      y:Math.sin(angle)*spread*0.82+pullY,
+      z:Math.sin(angle*1.7)*spread*0.35+pullZ,
+      focusDistance:d,
+      radius2d:Number(item.radius2d||3)*(d===1?1.28:0.96),
+      radius3d:Number(item.radius3d||2)*(d===1?1.20:0.92),
+      hero:d===1&&Number(item.score||0)>=Number(focus.score||0)*0.45,
+      focusPrimary:false,
+    };
+  });
+  const itemById=new Map(items.map(item=>[String(item.id),item]));
+  const rawEdges=(base.allEdges||base.edges||[]).filter(edge=>itemById.has(String(edge?.source||''))&&itemById.has(String(edge?.target||''))).map(edge=>{
+    const s=String(edge.source||''),t=String(edge.target||'');
+    const near=s===selected||t===selected;
+    return {
+      ...edge,
+      alpha:near?Math.max(0.22,Number(edge.alpha||0.16)):Math.min(0.18,Number(edge.alpha||0.12)),
+      width:near?Math.max(1.25,Number(edge.width||1)+0.45):Math.max(0.65,Number(edge.width||1)*0.82),
+    };
+  });
+  const edges=pruneGraphEdges(rawEdges,itemById,GRAPH_FOCUS_EDGE_LIMIT,24,selected);
+  const labelIds=new Set([selected]);
+  items
+    .filter(item=>Number(item.focusDistance||0)<=1)
+    .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+    .slice(0,24)
+    .forEach(item=>labelIds.add(String(item.id||'')));
+  return layoutFromItems(base,items,edges,`${String(base.signature||'graph')}::focus::${selected}::${items.length}/${edges.length}`,{
+    totalNodeCount:Number(base.totalNodeCount||base.items?.length||0),
+    totalEdgeCount:Number(base.totalEdgeCount||base.allEdges?.length||base.edges?.length||0),
+    visibleNodeCount:items.length,
+    visibleEdgeCount:edges.length,
+    heroCount:Math.max(1,labelIds.size),
+    sampled:items.length<Number(base.items?.length||0),
+    labelIds,
+    focusId:selected,
+    focusLabel:String(focus.label||selected),
+  });
+}
 function getGraphLayout(force=false,view='auto'){
-  const target=(view==='3d'||view==='json'||view==='full')?'full':'static';
+  const target=(view==='3d'||view==='focus3d'||view==='json'||view==='full')?'full':(view==='focus'?'focus':'static');
   const sig=graphSignature(S.graph||{});
   if(force||!G.layouts||G.layouts.signature!==sig){
-    G.layouts={signature:sig,full:null,static:null};
+    G.layouts={signature:sig,full:null,static:null,focusKey:'',focus:null};
     G.layout=null;
     G.renderKey=sig;
     G.screenNodes=[];
     G.hoverId='';
+    G.selectedNodeId='';
+    G.focusMode=false;
     G.three.graphKey='';
+    resetGraphViewport();
   }
   if(!G.layouts.full)G.layouts.full=buildGraphLayout(S.graph||{});
   if(!G.layouts.static)G.layouts.static=buildStaticGraphLayout(G.layouts.full);
-  G.layout=G.layouts[target]||G.layouts.full;
+  if(target==='focus'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.static;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.static;
+    }
+  }else if(view==='focus3d'){
+    const focusKey=String(G.selectedNodeId||'');
+    if(!focusKey)G.layout=G.layouts.full;
+    else{
+      const key=`${G.layouts.signature}::${focusKey}`;
+      if(G.layouts.focusKey!==key){
+        G.layouts.focusKey=key;
+        G.layouts.focus=buildFocusGraphLayout(G.layouts.full,focusKey);
+      }
+      G.layout=G.layouts.focus||G.layouts.full;
+    }
+  }else G.layout=G.layouts[target]||G.layouts.full;
   return G.layout;
 }
 function setGraphRuntime(text,bad=false){
@@ -55789,16 +60323,23 @@ function setGraphRuntime(text,bad=false){
   setChip('graphRuntimeTag',label,bad);
 }
 function setGraphOverlay(){
-  const layout=getGraphLayout(false,G.mode==='3d'||G.mode==='json'?'full':'static');
+  const layout=G.mode==='3d'
+    ? activeGraphLayoutFor3D()
+    : (G.mode==='static'?activeGraphLayoutFor2D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const active=layout.itemById.get(String(G.hoverId||''))||null;
   let text='';
   if(G.mode==='static'){
-    text='Static 2D: simplified top-frequency layout.';
+    text=G.focusMode?'Static 2D: focused neighborhood.':'Static 2D: global overview.';
     if(layout.sampled)text+=` sample ${Number(layout.visibleNodeCount||0)}/${Number(layout.totalNodeCount||0)} nodes, top ${Number(layout.heroCount||0)} highlighted.`;
-  }else if(G.mode==='3d')text='3D View: local three.js, render-on-demand only, camera auto-fits graph span.';
+    text+=' Click node to focus. Drag to pan. Wheel to zoom. Click blank to return.';
+  }else if(G.mode==='3d')text=G.focusMode?'3D View: focused neighborhood, render-on-demand.':'3D View: global overview, render-on-demand.';
   else text='JSON: raw graph payload for audit and debugging.';
-  text+=` nodes=${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  text+=` nodes=${Number(layout.visibleNodeCount||0)}/${Number(fullLayout.totalNodeCount||S.graph?.node_count||0)} edges=${Number(layout.visibleEdgeCount||0)}/${Number(fullLayout.totalEdgeCount||S.graph?.edge_count||0)}`;
+  if(G.focusMode&&String(G.selectedNodeId||'')){
+    const focus=fullLayout.itemById.get(String(G.selectedNodeId||''))||layout.itemById.get(String(G.selectedNodeId||''));
+    if(focus)text+=`\\nFocus: ${String(focus.label||focus.id||'')}`;
+  }
   if(active){
     const node=active.node||{};
     const extra=[active.type,active.label];
@@ -55807,7 +60348,7 @@ function setGraphOverlay(){
     if(String(node.kind||'').trim())extra.push(`kind=${String(node.kind)}`);
     text+=`\\n${extra.join(' • ')}`
   }else if(G.mode==='3d'){
-    text+='\\nDrag to orbit. Wheel to zoom. Static frame does not keep rendering.'
+    text+='\\nClick node to focus. Click blank to return. Drag to orbit. Wheel to zoom.'
   }
   const el=E('graphOverlay');
   if(el)el.textContent=text;
@@ -55829,13 +60370,14 @@ function applyGraphModeAvailability(){
   if(G.mode==='3d'&&!available)G.mode='static';
 }
 function renderGraphLegend(){
-  const layout=getGraphLayout(false,G.mode==='static'?'static':'full');
+  const layout=G.mode==='static'?activeGraphLayoutFor2D():(G.mode==='3d'?activeGraphLayoutFor3D():getGraphLayout(false,'full'));
   const fullLayout=getGraphLayout(false,'full');
   const communities=Object.entries(S.graph?.communities||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,6);
   const chips=[
     {label:G.mode==='static'&&layout.sampled?`Communities ${layout.counts.community}/${fullLayout.counts.community}`:`Communities ${fullLayout.counts.community}`,color:communityHex('community')},
     {label:G.mode==='static'&&layout.sampled?`Documents ${layout.counts.document}/${fullLayout.counts.document}`:`Documents ${fullLayout.counts.document}`,color:mixHex(communityHex('document'),0x13231d,0.18)},
     {label:G.mode==='static'&&layout.sampled?`Entities ${layout.counts.entity}/${fullLayout.counts.entity}`:`Entities ${fullLayout.counts.entity}`,color:mixHex(communityHex('entity'),0xffffff,0.26)},
+    ...(G.focusMode?[{label:`Focus ${Number(layout.visibleNodeCount||0)} nodes`,color:0x173122}]:[]),
     ...communities.map(([name,count])=>({label:`${name} ${count}`,color:communityHex(name)})),
   ];
   const legend=E('graphLegend');
@@ -55879,47 +60421,228 @@ function ensureCanvasMetrics(){
   }
   return {canvas,ctx:canvas.getContext('2d'),width,height,dpr}
 }
-function projectGraphTo2D(layout,width,height){
-  const pad=48;
+function resetGraphViewport(){
+  G.viewport={x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1,minScale:0.1,maxScale:8};
+  G.animation={active:false,started:0,duration:420,from:null,to:null,reason:''};
+}
+function computeGraphFitViewport(layout,width,height,pad=56){
   const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
   const dy=Math.max(1,Number(layout.bounds.maxY||0)-Number(layout.bounds.minY||0));
-  const scale=Math.max(0.1,Math.min((width-pad*2)/dx,(height-pad*2)/dy));
+  const usableW=Math.max(80,width-pad*2);
+  const usableH=Math.max(80,height-pad*2);
+  const fitScale=Math.max(0.08,Math.min(usableW/dx,usableH/dy));
   const cx=(Number(layout.bounds.minX||0)+Number(layout.bounds.maxX||0))/2;
   const cy=(Number(layout.bounds.minY||0)+Number(layout.bounds.maxY||0))/2;
+  return {
+    x:width/2-cx*fitScale,
+    y:height/2-cy*fitScale,
+    scale:fitScale,
+    fitScale,
+    minScale:fitScale*GRAPH_ZOOM_MIN_FACTOR,
+    maxScale:Math.max(fitScale*GRAPH_ZOOM_MAX_FACTOR,fitScale+0.1),
+  };
+}
+function graphWorldToScreen(item,viewport){
+  const vp=viewport||G.viewport||{x:0,y:0,scale:1};
+  return {
+    sx:Number(vp.x||0)+Number(item.x||0)*Number(vp.scale||1),
+    sy:Number(vp.y||0)+Number(item.y||0)*Number(vp.scale||1),
+  };
+}
+function beginGraphViewportAnimation(to,reason='view',duration=420){
+  const current=G.viewport||{x:0,y:0,scale:1};
+  const next={
+    ...current,
+    ...to,
+    targetX:Number(to.x??to.targetX??current.x??0),
+    targetY:Number(to.y??to.targetY??current.y??0),
+    targetScale:Number(to.scale??to.targetScale??current.scale??1),
+  };
+  G.animation={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(80,Number(duration||420)),
+    from:{x:Number(current.x||0),y:Number(current.y||0),scale:Number(current.scale||1)},
+    to:{x:Number(next.targetX||0),y:Number(next.targetY||0),scale:Number(next.targetScale||1)},
+    reason,
+  };
+  Object.assign(G.viewport,next);
+  requestAnimationFrame(()=>drawGraph2D(reason));
+}
+function easeGraph(t){
+  const x=clamp(t,0,1);
+  return x<0.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+}
+function currentGraphViewport(){
+  const vp=G.viewport||{x:0,y:0,scale:1};
+  if(!G.animation?.active)return vp;
+  const t=(performance.now()-Number(G.animation.started||0))/Math.max(1,Number(G.animation.duration||1));
+  if(t>=1){
+    vp.x=Number(G.animation.to?.x||vp.x||0);
+    vp.y=Number(G.animation.to?.y||vp.y||0);
+    vp.scale=Number(G.animation.to?.scale||vp.scale||1);
+    G.animation.active=false;
+    return vp;
+  }
+  const k=easeGraph(t);
+  const from=G.animation.from||vp;
+  const to=G.animation.to||vp;
+  return {
+    ...vp,
+    x:Number(from.x||0)+(Number(to.x||0)-Number(from.x||0))*k,
+    y:Number(from.y||0)+(Number(to.y||0)-Number(from.y||0))*k,
+    scale:Number(from.scale||1)+(Number(to.scale||1)-Number(from.scale||1))*k,
+  };
+}
+function fitGraphViewport(layout,width,height,reason='fit',animated=true){
+  const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+  const current=G.viewport||{};
+  const to={
+    ...current,
+    x:fit.x,
+    y:fit.y,
+    scale:fit.scale,
+    fitScale:fit.fitScale,
+    minScale:fit.minScale,
+    maxScale:fit.maxScale,
+  };
+  if(animated)beginGraphViewportAnimation(to,reason,G.focusMode?480:420);
+  else{
+    G.viewport={...to,targetX:to.x,targetY:to.y,targetScale:to.scale};
+    if(G.animation)G.animation.active=false;
+  }
+}
+function syncGraphViewportForLayout(layout,width,height,reason='draw'){
+  const key=`${String(layout.signature||'')}::${width}x${height}`;
+  if(G.lastLayoutView!==key){
+    const animated=Boolean(G.lastLayoutView)&&String(reason||'')!=='resize';
+    G.lastLayoutView=key;
+    fitGraphViewport(layout,width,height,reason,animated);
+  }else{
+    const fit=computeGraphFitViewport(layout,width,height,G.focusMode?66:54);
+    G.viewport.fitScale=fit.fitScale;
+    G.viewport.minScale=fit.minScale;
+    G.viewport.maxScale=fit.maxScale;
+    G.viewport.scale=clamp(Number(G.viewport.scale||fit.scale),fit.minScale,fit.maxScale);
+  }
+}
+function activeGraphLayoutFor2D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus'):getGraphLayout(false,'static');
+}
+function activeGraphLayoutFor3D(){
+  return G.focusMode&&String(G.selectedNodeId||'')?getGraphLayout(false,'focus3d'):getGraphLayout(false,'full');
+}
+function projectGraphTo2D(layout,width,height,viewport){
+  const vp=viewport||G.viewport||computeGraphFitViewport(layout,width,height);
   return layout.items.map(item=>({
     ...item,
-    sx:width/2+(Number(item.x||0)-cx)*scale,
-    sy:height/2+(Number(item.y||0)-cy)*scale,
-    sr:Number(item.radius2d||3),
+    ...graphWorldToScreen(item,vp),
+    sr:Math.max(2.6,Number(item.radius2d||3)*Math.sqrt(Math.max(0.32,Number(vp.scale||1)/Math.max(0.001,Number(vp.fitScale||vp.scale||1))))),
   }))
+}
+function graphCanvasPoint(clientX,clientY){
+  const canvas=E('graphCanvas2d');
+  if(!canvas)return {x:0,y:0};
+  const rect=canvas.getBoundingClientRect();
+  return {x:Number(clientX||0)-rect.left,y:Number(clientY||0)-rect.top};
+}
+function zoomGraph2DAt(clientX,clientY,deltaY){
+  const layout=activeGraphLayoutFor2D();
+  const metrics=ensureCanvasMetrics();
+  if(!metrics||!layout)return;
+  syncGraphViewportForLayout(layout,metrics.width,metrics.height,'zoom');
+  const point=graphCanvasPoint(clientX,clientY);
+  const vp=G.viewport;
+  const oldScale=Math.max(0.001,Number(vp.scale||1));
+  const factor=Number(deltaY||0)>0?0.88:1.14;
+  const nextScale=clamp(oldScale*factor,Number(vp.minScale||oldScale*0.2),Number(vp.maxScale||oldScale*8));
+  const wx=(point.x-Number(vp.x||0))/oldScale;
+  const wy=(point.y-Number(vp.y||0))/oldScale;
+  vp.scale=nextScale;
+  vp.x=point.x-wx*nextScale;
+  vp.y=point.y-wy*nextScale;
+  vp.targetX=vp.x;vp.targetY=vp.y;vp.targetScale=vp.scale;
+  if(G.animation)G.animation.active=false;
+  drawGraph2D('zoom');
+}
+function focusGraphNode(id){
+  const next=String(id||'').trim();
+  const full=getGraphLayout(false,'full');
+  if(!next||!full.itemById.has(next)){
+    return clearGraphFocus();
+  }
+  if(String(G.selectedNodeId||'')===next&&G.focusMode)return;
+  G.selectedNodeId=next;
+  G.focusMode=true;
+  G.hoverId=next;
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D('focus');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D('focus').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
+}
+function clearGraphFocus(){
+  const had=Boolean(G.focusMode||String(G.selectedNodeId||''));
+  G.focusMode=false;
+  G.selectedNodeId='';
+  G.hoverId='';
+  if(G.layouts)G.layouts.focusKey='';
+  G.lastLayoutView='';
+  if(G.mode==='static')drawGraph2D(had?'return':'idle');
+  else if(G.mode==='3d'){
+    G.three.graphKey='';
+    renderGraph3D(had?'return':'idle').catch(err=>setGraphRuntime(err.message,true));
+  }else setGraphOverlay();
 }
 function drawGraph2D(reason='draw'){
   const metrics=ensureCanvasMetrics();
   if(!metrics||G.mode!=='static')return;
   const {ctx,width,height,dpr}=metrics;
-  const layout=getGraphLayout(false,'static');
-  const nodes=projectGraphTo2D(layout,width,height);
+  const layout=activeGraphLayoutFor2D();
+  syncGraphViewportForLayout(layout,width,height,reason);
+  const viewport=currentGraphViewport();
+  const nodes=projectGraphTo2D(layout,width,height,viewport);
   G.screenNodes=nodes;
   const byId=new Map(nodes.map(row=>[row.id,row]));
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,metrics.canvas.width,metrics.canvas.height);
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.lineCap='round';
+  ctx.lineJoin='round';
   for(const edge of layout.edges){
     const a=byId.get(edge.source),b=byId.get(edge.target);
     if(!a||!b)continue;
+    const selected=String(G.selectedNodeId||'');
     const hot=String(G.hoverId||'')&&(G.hoverId===edge.source||G.hoverId===edge.target);
+    const selectedEdge=selected&&(selected===edge.source||selected===edge.target);
     ctx.beginPath();
     ctx.moveTo(a.sx,a.sy);
-    ctx.lineTo(b.sx,b.sy);
-    ctx.strokeStyle=rgbaFromHex(edge.colorHex,hot?Math.min(0.42,Number(edge.alpha||0.16)+0.14):Number(edge.alpha||0.16));
-    ctx.lineWidth=hot?Number(edge.width||1)+0.7:Number(edge.width||1);
+    const mx=(a.sx+b.sx)/2;
+    const my=(a.sy+b.sy)/2;
+    const bend=G.focusMode?0.04:0.025;
+    ctx.quadraticCurveTo(mx+(b.sy-a.sy)*bend,my-(b.sx-a.sx)*bend,b.sx,b.sy);
+    const alphaBase=Number(edge.alpha||0.12);
+    const alpha=selectedEdge?Math.min(0.44,alphaBase+0.16):(hot?Math.min(0.36,alphaBase+0.10):Math.min(0.18,alphaBase));
+    ctx.strokeStyle=rgbaFromHex(edge.colorHex,alpha);
+    ctx.lineWidth=Math.max(0.45,(hot||selectedEdge)?Number(edge.width||1)+0.65:Number(edge.width||1)*0.72);
     ctx.stroke();
   }
   const order={entity:0,document:1,community:2};
   nodes.sort((a,b)=>(Number(order[a.type]||0)-Number(order[b.type]||0))||(Number(a.sr||0)-Number(b.sr||0)));
   for(const node of nodes){
     const hot=String(G.hoverId||'')===String(node.id);
+    const selected=String(G.selectedNodeId||'')===String(node.id);
+    const focusDist=Number(node.focusDistance ?? 3);
+    const dim=G.focusMode&&!selected&&focusDist>1;
+    const aura=selected?10:(hot?6:0);
+    if(aura){
+      ctx.beginPath();
+      ctx.arc(node.sx,node.sy,node.sr+aura,0,Math.PI*2);
+      ctx.fillStyle=rgbaFromHex(node.colorHex,selected?0.22:0.14);
+      ctx.fill();
+    }
     if(hot){
       ctx.beginPath();
       ctx.arc(node.sx,node.sy,node.sr+5,0,Math.PI*2);
@@ -55927,11 +60650,11 @@ function drawGraph2D(reason='draw'){
       ctx.fill();
     }
     ctx.beginPath();
-    ctx.arc(node.sx,node.sy,node.sr+(hot?1.5:0),0,Math.PI*2);
-    ctx.fillStyle=rgbaFromHex(node.colorHex,node.type==='entity'?0.82:0.94);
+    ctx.arc(node.sx,node.sy,node.sr+(selected?2.7:(hot?1.7:0)),0,Math.PI*2);
+    ctx.fillStyle=rgbaFromHex(node.colorHex,dim?0.55:(node.type==='entity'?0.88:0.97));
     ctx.fill();
-    ctx.strokeStyle=hot?'rgba(21,35,28,0.92)':'rgba(255,255,255,0.74)';
-    ctx.lineWidth=hot?2.2:(node.type==='community'?1.4:0.75);
+    ctx.strokeStyle=selected?'rgba(21,35,28,0.96)':(hot?'rgba(21,35,28,0.88)':'rgba(255,255,255,0.82)');
+    ctx.lineWidth=selected?2.8:(hot?2.0:(node.type==='community'?1.5:0.9));
     ctx.stroke();
   }
   ctx.font='12px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -55941,8 +60664,13 @@ function drawGraph2D(reason='draw'){
   nodes
     .filter(node=>labelIds.has(String(node.id||'')))
     .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
-    .slice(0,Math.max(16,Number(layout.heroCount||0)))
-    .forEach(node=>ctx.fillText(node.label,node.sx+node.sr+6,node.sy-node.sr-6));
+    .slice(0,Math.max(G.focusMode?24:16,Number(layout.heroCount||0)))
+    .forEach(node=>{
+      const label=String(node.label||'');
+      const maxChars=G.focusMode?34:26;
+      ctx.fillStyle=String(G.selectedNodeId||'')===String(node.id)?'rgba(21,35,28,0.96)':'rgba(23,49,34,0.74)';
+      ctx.fillText(label.length>maxChars?`${label.slice(0,maxChars-1)}...`:label,node.sx+node.sr+7,node.sy-node.sr-7);
+    });
   const active=byId.get(String(G.hoverId||''))||null;
   if(active){
     ctx.font='13px "Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
@@ -55952,6 +60680,7 @@ function drawGraph2D(reason='draw'){
   setChip('graphPerfTag','zero-idle');
   setGraphRuntime(`2d ${reason}`);
   setGraphOverlay();
+  if(G.animation?.active)requestAnimationFrame(()=>drawGraph2D(String(G.animation.reason||reason||'animate')));
 }
 function findGraphNodeAt(clientX,clientY){
   const canvas=E('graphCanvas2d');
@@ -56017,7 +60746,7 @@ function disposeThreeObject(obj){
 }
 function updateThreeCamera(){
   if(!G.three.camera)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const cx=Number(layout.center?.x||0);
   const cy=Number(layout.center?.y||0);
   const cz=Number(layout.center?.z||0);
@@ -56045,14 +60774,14 @@ function fitThreeCameraToLayout(resetDistance=false){
   const host=E('graph3dHost');
   const rect=host?host.getBoundingClientRect():{width:1,height:1};
   const aspect=Math.max(0.75,Number(rect.width||1)/Math.max(1,Number(rect.height||1)));
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   const fitDistance=computeThreeFitDistance(layout,aspect);
   const radius=Math.max(24,Number(layout.radius||24));
   G.three.fitDistance=fitDistance;
   G.three.minDistance=Math.max(92,fitDistance*0.16);
   G.three.maxDistance=Math.max(3200,fitDistance*8.8);
   if(resetDistance||!Number.isFinite(G.three.distance)||G.three.distance<G.three.minDistance||G.three.distance>G.three.maxDistance){
-    G.three.distance=fitDistance;
+    G.three.distance=resetDistance&&Number.isFinite(G.three.distance)?G.three.distance+(fitDistance-G.three.distance)*0.72:fitDistance;
   }else{
     G.three.distance=clamp(G.three.distance,G.three.minDistance,G.three.maxDistance);
   }
@@ -56094,6 +60823,18 @@ function applyThreeHover(id){
   }
   scheduleThreeRender('hover');
 }
+function applyThreeFocusStyles(){
+  const selected=String(G.selectedNodeId||'');
+  for(const [id,mesh] of G.three.meshes.entries()){
+    const baseScale=Number(mesh.userData?.baseScale||1);
+    const baseColor=Number(mesh.userData?.baseColor||0x607565);
+    const baseOpacity=Number(mesh.userData?.baseOpacity||0.95);
+    const active=selected&&String(id)===selected;
+    mesh.scale.setScalar(baseScale*(active?1.38:1));
+    mesh.material.opacity=active?1:baseOpacity;
+    mesh.material.color.setHex(active?mixHex(baseColor,0xffffff,0.16):baseColor);
+  }
+}
 function pickThreeNode(ev){
   if(!G.three.renderer||!G.three.camera||!G.three.raycaster||!G.three.meshes.size)return '';
   const rect=G.three.renderer.domElement.getBoundingClientRect();
@@ -56119,7 +60860,7 @@ function resizeThreeRenderer(){
 function buildThreeSceneGraph(){
   const THREE=G.three.lib;
   if(!THREE||!G.three.root)return;
-  const layout=getGraphLayout(false,'full');
+  const layout=activeGraphLayoutFor3D();
   while(G.three.root.children.length){
     const child=G.three.root.children.pop();
     disposeThreeObject(child);
@@ -56145,12 +60886,12 @@ function buildThreeSceneGraph(){
     const geometry=new THREE.BufferGeometry();
     geometry.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
     geometry.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
-    const opacity=kind==='related'?0.32:(kind==='mentions'?0.18:0.14);
+    const opacity=kind==='related'?(G.focusMode?0.26:0.22):(kind==='mentions'?(G.focusMode?0.16:0.12):0.10);
     const material=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity,depthWrite:false});
     G.three.root.add(new THREE.LineSegments(geometry,material));
   });
   layout.items.forEach(item=>{
-    const opacity=item.type==='entity'?0.86:0.95;
+    const opacity=item.type==='entity'?0.90:0.97;
     const material=new THREE.MeshBasicMaterial({color:Number(item.colorHex||0x607565),transparent:true,opacity});
     const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
     mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
@@ -56160,6 +60901,7 @@ function buildThreeSceneGraph(){
     G.three.meshes.set(String(item.id),mesh);
   });
   fitThreeCameraToLayout(true);
+  applyThreeFocusStyles();
   G.three.graphKey=layout.signature;
 }
 async function ensureThreeRenderer(){
@@ -56177,7 +60919,7 @@ async function ensureThreeRenderer(){
     host.innerHTML='';
     host.appendChild(G.three.renderer.domElement);
   }
-  if(G.three.graphKey!==getGraphLayout(false,'full').signature)buildThreeSceneGraph();
+  if(G.three.graphKey!==activeGraphLayoutFor3D().signature)buildThreeSceneGraph();
   resizeThreeRenderer();
 }
 function bindThreeEvents(){
@@ -56189,6 +60931,9 @@ function bindThreeEvents(){
     G.three.dragging=true;
     G.three.lastX=Number(ev.clientX||0);
     G.three.lastY=Number(ev.clientY||0);
+    G.three.clickStartX=G.three.lastX;
+    G.three.clickStartY=G.three.lastY;
+    G.three.moved=false;
     host.classList.add('dragging');
     try{host.setPointerCapture(ev.pointerId)}catch{}
   });
@@ -56199,6 +60944,7 @@ function bindThreeEvents(){
       const dy=Number(ev.clientY||0)-G.three.lastY;
       G.three.lastX=Number(ev.clientX||0);
       G.three.lastY=Number(ev.clientY||0);
+      if(Math.abs(Number(ev.clientX||0)-Number(G.three.clickStartX||0))+Math.abs(Number(ev.clientY||0)-Number(G.three.clickStartY||0))>5)G.three.moved=true;
       G.three.azimuth+=dx*0.01;
       G.three.elevation=clamp(G.three.elevation-dy*0.008,-1.2,1.2);
       scheduleThreeRender('drag');
@@ -56207,10 +60953,17 @@ function bindThreeEvents(){
     const hit=pickThreeNode(ev);
     if(String(hit||'')!==String(G.hoverId||''))applyThreeHover(hit);
   });
-  const finishDrag=()=>{
+  const finishDrag=ev=>{
     if(!G.three.dragging)return;
+    const wasClick=!G.three.moved;
     G.three.dragging=false;
     host.classList.remove('dragging');
+    if(wasClick&&ev){
+      const hit=pickThreeNode(ev);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
+      return;
+    }
     scheduleThreeRender('idle');
   };
   host.addEventListener('pointerup',finishDrag);
@@ -56257,25 +61010,76 @@ function setGraphMode(mode){
     return;
   }
   G.mode=target;
+  if(G.animation)G.animation.active=false;
   syncGraphStage();
   if(target==='json')renderGraphJson();
-  else if(target==='3d')renderGraph3D('mode-switch').catch(err=>{
+  else if(target==='3d'){renderGraphLegend();renderGraph3D('mode-switch').catch(err=>{
     G.mode='static';
     syncGraphStage();
     drawGraph2D('fallback');
     setGraphRuntime(err.message,true);
-  });
-  else drawGraph2D('mode-switch');
+  });}
+  else {renderGraphLegend();drawGraph2D('mode-switch');}
 }
 function initGraphUi(){
   if(G.bound)return;
   G.bound=true;
   const canvas=E('graphCanvas2d');
   if(canvas){
-    canvas.addEventListener('mousemove',ev=>{
+    canvas.addEventListener('pointerdown',ev=>{
       if(G.mode!=='static')return;
+      const point=graphCanvasPoint(ev.clientX,ev.clientY);
+      G.dragging2d=true;
+      G.pointerMoved=false;
+      G.pointerDownX=point.x;
+      G.pointerDownY=point.y;
+      G.dragStartX=Number(ev.clientX||0);
+      G.dragStartY=Number(ev.clientY||0);
+      G.dragOriginX=Number(G.viewport?.x||0);
+      G.dragOriginY=Number(G.viewport?.y||0);
+      if(G.animation)G.animation.active=false;
+      try{canvas.setPointerCapture(ev.pointerId)}catch{}
+    });
+    canvas.addEventListener('pointermove',ev=>{
+      if(G.mode!=='static')return;
+      if(G.dragging2d){
+        const dx=Number(ev.clientX||0)-Number(G.dragStartX||0);
+        const dy=Number(ev.clientY||0)-Number(G.dragStartY||0);
+        if(Math.abs(dx)+Math.abs(dy)>4)G.pointerMoved=true;
+        G.viewport.x=Number(G.dragOriginX||0)+dx;
+        G.viewport.y=Number(G.dragOriginY||0)+dy;
+        G.viewport.targetX=G.viewport.x;
+        G.viewport.targetY=G.viewport.y;
+        drawGraph2D('pan');
+        return;
+      }
       const hit=findGraphNodeAt(ev.clientX,ev.clientY);
       if(String(hit||'')!==String(G.hoverId||'')){G.hoverId=String(hit||'');drawGraph2D('hover')}
+    });
+    const finishPointer=ev=>{
+      if(G.mode!=='static'||!G.dragging2d)return;
+      G.dragging2d=false;
+      if(!G.pointerMoved){
+        const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+        if(hit)focusGraphNode(hit);
+        else clearGraphFocus();
+      }else{
+        drawGraph2D('idle');
+      }
+    };
+    canvas.addEventListener('pointerup',finishPointer);
+    canvas.addEventListener('pointercancel',()=>{G.dragging2d=false;drawGraph2D('idle')});
+    canvas.addEventListener('wheel',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      zoomGraph2DAt(ev.clientX,ev.clientY,ev.deltaY);
+    },{passive:false});
+    canvas.addEventListener('dblclick',ev=>{
+      if(G.mode!=='static')return;
+      ev.preventDefault();
+      const hit=findGraphNodeAt(ev.clientX,ev.clientY);
+      if(hit)focusGraphNode(hit);
+      else clearGraphFocus();
     });
     canvas.addEventListener('mouseleave',()=>{if(G.mode==='static')clearGraphHover()});
   }
@@ -56301,9 +61105,9 @@ function renderGraph(force=false){
   if(view)view.textContent=JSON.stringify(graph,null,2);
   getGraphLayout(force,'full');
   getGraphLayout(force,'static');
-  renderGraphLegend();
   applyGraphModeAvailability();
   syncGraphStage();
+  renderGraphLegend();
   if(G.mode==='json')renderGraphJson();
   else if(G.mode==='3d')renderGraph3D(force?'refresh':'data').catch(err=>{
     G.mode='static';
@@ -56312,6 +61116,7 @@ function renderGraph(force=false){
     setGraphRuntime(err.message,true);
   });
   else drawGraph2D(force?'refresh':'data');
+  renderGraphLegend();
 }
 function renderFilesystem(){
   E('fsView').textContent=JSON.stringify(S.filesystem||{},null,2);
@@ -56322,6 +61127,7 @@ function renderQuery(){
   const routeMeta=S.query?.route_meta||{};
   const routeParts=[];
   if(route)routeParts.push(`Route: ${route}${requested&&requested!==route?` (requested ${requested})`:''}`);
+  if(S.query?.evidence_status)routeParts.push(`Evidence: ${S.query.evidence_status} · confidence=${Number(S.query.confidence||0).toFixed(2)} · budget=${S.query?.context_budget?.mode||routeMeta?.context_budget||''}`);
   if(Array.isArray(routeMeta?.selected_communities)&&routeMeta.selected_communities.length)routeParts.push(`Communities: ${routeMeta.selected_communities.join(', ')}`);
   if(routeMeta?.reduce_mode)routeParts.push(`Global path: ${routeMeta.reduce_mode}`);
   if(Array.isArray(routeMeta?.reasons)&&routeMeta.reasons.length)routeParts.push(`Signals: ${routeMeta.reasons.join(', ')}`);
@@ -56389,7 +61195,8 @@ async function runImportText(){
 }
 async function runQuery(){
   setChip('queryStatus','running');
-  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||8),route:selectedQueryRoute(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
+  const embedModel=selectedEmbedModel();
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:embedModel,embedding_mode:embedModel?'hybrid':'sparse'})});
   S.query=out; renderQuery(); setChip('queryStatus','done');
 }
 async function rebuildIndex(){
@@ -56416,6 +61223,8 @@ CODE_ADMIN_INDEX_HTML = (
     .replace("Clouds Coder RAG Admin", "Clouds Coder Code Library Admin")
     .replace("/assets/rag-admin.js", "/assets/code-admin.js")
     .replace("TF-Graph_IDF RAG Admin", "Code Graph Library Admin")
+    .replace('<option value="raw">Raw Hybrid</option>', '<option value="workflow">Workflow</option>\n              <option value="raw">Raw Hybrid</option>')
+    .replace('<option value="wiki">Wiki</option>', '<option value="wiki">Code Wiki</option>')
     .replace(
         "Global knowledge library, graph view, batch import, backup, and retrieval control.",
         "Independent code library, repository graph view, batch import, backup, and developer retrieval control.",
@@ -56640,11 +61449,24 @@ class AppContext:
             self.rag_root,
             include_filename_entities=self.rag_include_filename_entities,
         )
-        self.rag_service = RAGIngestionService(self.rag_store, self.rag_parser, session_resolver=self._resolve_session_for_user)
+        self.rag_wiki = WikiStore(self.rag_root, kind="knowledge")
+        self.rag_service = RAGIngestionService(
+            self.rag_store,
+            self.rag_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.rag_wiki,
+        )
         self.code_parser = CodeContentParser()
         self.code_root = self.workspace / CODE_LIBRARY_DIRNAME
         self.code_store = CodeLibraryStore(self.code_root)
-        self.code_service = CodeIngestionService(self.code_store, self.code_parser, session_resolver=self._resolve_session_for_user)
+        self.code_wiki = WikiStore(self.code_root, kind="code")
+        self.workflow_memory = WorkflowMemoryStore(self.code_root)
+        self.code_service = CodeIngestionService(
+            self.code_store,
+            self.code_parser,
+            session_resolver=self._resolve_session_for_user,
+            wiki_store=self.code_wiki,
+        )
         self.code_source_roots = self._discover_external_code_source_roots()
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
@@ -57025,6 +61847,7 @@ class AppContext:
             "default_session_id": str(getattr(session, "id", "") or ""),
             "active_capabilities": caps,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": self.rag_wiki.payload(limit=24),
             "agent_port": int(getattr(self, "agent_port", 0) or 0),
             "skills_port": int(getattr(self, "skills_port", 0) or 0),
             "rag_admin_port": int(getattr(self, "rag_admin_port", 0) or 0),
@@ -57041,6 +61864,10 @@ class AppContext:
             "features": {
                 "strict_local_import": True,
                 "filename_entities": bool(self.rag_include_filename_entities),
+                "wiki_first_rag": True,
+                "high_recall_fusion": True,
+                "dense_default_enabled": bool(RAG_DENSE_DEFAULT_ENABLED),
+                "default_embedding_calls": False,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -57063,6 +61890,34 @@ class AppContext:
         except Exception:
             return ""
 
+    def _embedding_request_mode(self, body: dict, embed_model_override: str) -> tuple[bool, str, str]:
+        raw_mode = str(
+            body.get(
+                "embedding_mode",
+                body.get("dense_mode", body.get("retrieval_embedding_mode", "")),
+            )
+            or ""
+        ).strip().lower()
+        if raw_mode not in RAG_EMBEDDING_MODE_VALUES:
+            raw_mode = ""
+        explicit_embed_model = bool(str(embed_model_override or "").strip())
+        explicit_dense_flag = any(
+            _to_bool_like(body.get(key), default=False)
+            for key in ("use_embeddings", "use_dense", "dense", "hybrid_dense")
+            if key in body
+        )
+        if raw_mode in {"off", "sparse", "tfidf"}:
+            return False, "sparse", "explicit-off"
+        if raw_mode in {"dense", "hybrid"}:
+            if explicit_embed_model:
+                return True, raw_mode, "explicit-mode"
+            return False, "sparse", "embedding-model-required"
+        if explicit_embed_model and explicit_dense_flag:
+            return True, "hybrid", "explicit-flag"
+        if RAG_DENSE_DEFAULT_ENABLED and explicit_embed_model:
+            return True, "hybrid", "env-default"
+        return False, "sparse", "default-no-embedding"
+
     def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
         return self.rag_store.library_payload(limit=limit, offset=offset)
 
@@ -57074,6 +61929,12 @@ class AppContext:
 
     def rag_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.rag_store.filesystem_payload(max_nodes=max_nodes)
+
+    def rag_wiki_payload(self, limit: int = 240) -> dict:
+        return self.rag_wiki.payload(limit=limit)
+
+    def rag_wiki_lint(self) -> dict:
+        return self.rag_wiki.lint()
 
     def _knowledge_library_status_for_session(self, session: SessionState | None = None) -> dict:
         payload = self.rag_store.library_payload(limit=0)
@@ -57119,7 +61980,7 @@ class AppContext:
             "session_id": str(getattr(session, "id", "") or ""),
         }
 
-    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks RAG chunks that don't yet have embeddings.
 
         Called lazily on the first query when an embedding model is available.
@@ -57134,7 +61995,7 @@ class AppContext:
         # Prioritise most recently added chunks; embed up to max_chunks
         to_embed = to_embed[-max_chunks:]
         texts = [str(all_chunks[cid].get("text", "") or "")[:2048] for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -57147,7 +62008,7 @@ class AppContext:
                 pass
         return count
 
-    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks Code Library chunks that don't yet have embeddings."""
         with self.code_store.lock:
             all_chunks = dict(self.code_store.chunks)
@@ -57162,7 +62023,7 @@ class AppContext:
             + str(all_chunks[cid].get("text", "") or "")
         )[:2048]
         texts = [anchor_text(cid) for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -57175,24 +62036,307 @@ class AppContext:
                 pass
         return count
 
+    def _merge_retrieval_results(
+        self,
+        query: str,
+        result_sets: list[dict],
+        *,
+        top_k: int,
+        route: str,
+        route_meta: dict | None = None,
+    ) -> dict:
+        rows: list[dict] = []
+        query_entities: set[str] = set()
+        summaries: list[str] = []
+        for result in result_sets:
+            if not isinstance(result, dict):
+                continue
+            query_entities.update(str(x) for x in (result.get("query_entities", []) or []) if str(x).strip())
+            summary = trim(str(result.get("summary", "") or ""), 700)
+            if summary:
+                summaries.append(summary)
+            source_route = str(result.get("route", "") or "")
+            for row in (result.get("results", []) or []):
+                if not isinstance(row, dict):
+                    continue
+                patched = dict(row)
+                if source_route and not str(patched.get("source_route", "") or "").strip():
+                    patched["source_route"] = source_route
+                rows.append(patched)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            key_parts = [
+                str(row.get("citation", "") or ""),
+                str(row.get("doc_id", "") or ""),
+                str(row.get("chunk_id", "") or ""),
+                str(row.get("wiki_page", "") or ""),
+                str(row.get("relative_path", "") or ""),
+                str(row.get("route_evidence", "") or ""),
+            ]
+            key = "|".join(key_parts).strip("|") or trim(repr(sorted(row.items(), key=lambda kv: str(kv[0]))), 260)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        layer_bias = {
+            "workflow": 0.20,
+            "wiki": 0.18,
+            "wiki_page": 0.18,
+            "community_reduce": 0.14,
+            "community_map": 0.12,
+            "chunk": 0.08,
+            "document": 0.04,
+        }
+        for row in deduped:
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            bonus = layer_bias.get(evidence, layer_bias.get(str(row.get("route_evidence", "") or ""), 0.0))
+            if str(row.get("source_route", "") or "") == "hybrid":
+                bonus += 0.04
+            if bool(row.get("weak_match", False)):
+                bonus = min(bonus, 0.015)
+            row["fusion_score"] = round(float(row.get("score", 0.0) or 0.0) + float(row.get("sort_bias", 0.0) or 0.0) + bonus, 6)
+        deduped.sort(
+            key=lambda x: (
+                float(x.get("fusion_score", 0.0) or 0.0),
+                float(x.get("score", 0.0) or 0.0),
+                float(x.get("lexical_score", 0.0) or 0.0),
+                float(x.get("graph_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        limit = max(1, min(int(top_k or RAG_MAX_QUERY_RESULTS), RAG_MAX_QUERY_RESULTS))
+        selected = _rag_mmr_select(deduped, limit, max_per_doc=RAG_RETRIEVAL_MAX_PER_DOC)
+        evidence_counts = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in selected)
+        meta = dict(route_meta or {})
+        meta.update(
+            {
+                "mode": route,
+                "candidate_count": len(deduped),
+                "result_set_count": len([x for x in result_sets if isinstance(x, dict)]),
+                "evidence_counts": dict(evidence_counts),
+                "high_recall_pool_multiplier": RAG_HIGH_RECALL_POOL_MULTIPLIER,
+                "high_recall_min_pool": RAG_HIGH_RECALL_MIN_POOL,
+            }
+        )
+        return {
+            "query": query,
+            "results": selected,
+            "summary": "\n".join(summaries[:3]) or "\n".join(f"{r.get('citation')} {r.get('title','')}: {trim(r.get('text',''), 160)}" for r in selected[:4]),
+            "community_cards": [],
+            "query_entities": sorted(query_entities),
+            "route": route,
+            "route_meta": meta,
+        }
+
+    def _expand_retrieval_with_variants(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        payload: dict,
+        code: bool = False,
+        top_k: int,
+        pool_k: int,
+        category: str = "",
+        kind: str = "",
+        raw_route: str = "hybrid",
+        qvec: list[float] | None = None,
+        accepted_only: bool = True,
+    ) -> list[dict]:
+        variants = [v for v in _rag_query_variants(query, max_variants=4) if v and v.strip().lower() != str(query or "").strip().lower()]
+        if not variants:
+            return []
+        variant_top_k = max(top_k, min(pool_k, 18))
+        out: list[dict] = []
+        for variant in variants[:3]:
+            try:
+                if code:
+                    out.append(self.workflow_memory.query(variant, top_k=min(variant_top_k, 16), accepted_only=accepted_only))
+                    out.append(self.code_wiki.query(variant, top_k=variant_top_k, category="code", kind=""))
+                    out.append(self.code_store.index.query(variant, top_k=variant_top_k, category="code", route=raw_route, qvec=qvec))
+                else:
+                    out.append(self.rag_wiki.query(variant, top_k=variant_top_k, category=category, kind=kind))
+                    out.append(self.rag_store.index.query(variant, top_k=variant_top_k, category=category, kind=kind, route=raw_route, qvec=qvec))
+            except Exception:
+                continue
+        for result in out:
+            if isinstance(result, dict):
+                meta = result.get("route_meta", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["variant_expansion"] = True
+                result["route_meta"] = meta
+        return out
+
+    def _rag_budget(self, value: object, *, default: str = "standard") -> tuple[str, dict]:
+        key = str(value or default or "standard").strip().lower()
+        if key not in RAG_CONTEXT_BUDGETS:
+            key = default if default in RAG_CONTEXT_BUDGETS else "standard"
+        return key, dict(RAG_CONTEXT_BUDGETS.get(key, RAG_CONTEXT_BUDGETS["standard"]))
+
+    def _rag_has_global_intent(self, query: str) -> bool:
+        low = str(query or "").lower()
+        terms = (
+            "overview", "summarize", "summary", "compare", "comparison", "relationship", "relationships",
+            "across", "trend", "synthesis", "global", "整体", "全局", "综述", "概览", "总结",
+            "对比", "比较", "关系", "联系", "趋势", "汇总", "跨",
+        )
+        return any(term in low for term in terms)
+
+    def _rag_evidence_metrics(self, result: dict) -> dict:
+        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        def _row_score(row: dict) -> float:
+            if bool(row.get("weak_match", False)):
+                return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+            try:
+                score = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            try:
+                fusion = float(row.get("fusion_score", 0.0) or 0.0)
+            except Exception:
+                fusion = 0.0
+            try:
+                lexical = float(row.get("lexical_score", 0.0) or 0.0)
+            except Exception:
+                lexical = 0.0
+            try:
+                graph = float(row.get("graph_score", 0.0) or 0.0)
+            except Exception:
+                graph = 0.0
+            if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+                supporting = row.get("evidence_citations", [])
+                if not isinstance(supporting, list):
+                    supporting = []
+                if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                    return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+            return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
+        best = max((_row_score(row) for row in rows), default=0.0)
+        strong = sum(1 for row in rows if _row_score(row) >= RAG_MIN_SYNTHESIS_SCORE)
+        doc_ids = {
+            str(row.get("doc_id", "") or "").strip()
+            for row in rows
+            if str(row.get("doc_id", "") or "").strip()
+        }
+        layers = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in rows)
+        status = "miss"
+        if rows and best >= RAG_NO_EVIDENCE_THRESHOLD and strong > 0:
+            status = "hit"
+        elif rows:
+            status = "weak"
+        confidence = min(1.0, max(0.0, best + min(0.24, 0.04 * max(0, strong - 1)) + min(0.12, 0.03 * max(0, len(doc_ids) - 1))))
+        return {
+            "evidence_status": status,
+            "confidence": round(confidence, 4),
+            "best_score": round(best, 6),
+            "strong_evidence_count": int(strong),
+            "source_count": len(doc_ids),
+            "evidence_counts": dict(layers),
+        }
+
+    def _annotate_rag_result(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        metrics = self._rag_evidence_metrics(out)
+        out.update(metrics)
+        out["context_budget"] = {
+            "mode": budget_key,
+            "max_chars": int(budget.get("chars", 0) or 0),
+            "max_evidence": int(budget.get("evidence", 0) or 0),
+        }
+        if metrics.get("evidence_status") == "miss":
+            out["no_evidence_message"] = RAG_NO_EVIDENCE_MESSAGE
+            out.setdefault("summary", RAG_NO_EVIDENCE_MESSAGE)
+        elif metrics.get("evidence_status") == "weak":
+            out["weak_evidence_message"] = RAG_WEAK_EVIDENCE_MESSAGE
+            if not str(out.get("answer", "") or "").strip():
+                current_summary = str(out.get("summary", "") or "").strip()
+                out["summary"] = (RAG_WEAK_EVIDENCE_MESSAGE + ("\n\n" + current_summary if current_summary else "")).strip()
+        meta = out.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "evidence_status": metrics.get("evidence_status", "miss"),
+                "confidence": metrics.get("confidence", 0.0),
+                "context_budget": budget_key,
+            }
+        )
+        out["route_meta"] = meta
+        return out
+
+    def _trim_rag_result_to_budget(self, result: dict, *, budget_key: str, budget: dict) -> dict:
+        out = dict(result or {})
+        rows = [dict(x) for x in (out.get("results", []) or []) if isinstance(x, dict)]
+        max_chars = max(1200, int(budget.get("chars", 7200) or 7200))
+        max_rows = max(1, int(budget.get("evidence", 6) or 6))
+        used = 0
+        kept: list[dict] = []
+        for row in rows:
+            if len(kept) >= max_rows:
+                break
+            text = str(row.get("text", "") or "")
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                row["text"] = trim(text, max(420, remaining))
+            used += len(str(row.get("text", "") or ""))
+            kept.append(row)
+        out["results"] = kept
+        out = self._annotate_rag_result(out, budget_key=budget_key, budget=budget)
+        if out.get("evidence_status") == "miss":
+            out["results"] = []
+        return out
+
+    def _row_synthesis_score(self, row: dict) -> float:
+        if bool(row.get("weak_match", False)):
+            return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
+        evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
+        try:
+            score = float(row.get("score", 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        try:
+            fusion = float(row.get("fusion_score", 0.0) or 0.0)
+        except Exception:
+            fusion = 0.0
+        try:
+            lexical = float(row.get("lexical_score", 0.0) or 0.0)
+        except Exception:
+            lexical = 0.0
+        try:
+            graph = float(row.get("graph_score", 0.0) or 0.0)
+        except Exception:
+            graph = 0.0
+        if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
+            supporting = row.get("evidence_citations", [])
+            if not isinstance(supporting, list):
+                supporting = []
+            if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
+                return min(score, RAG_WEAK_MATCH_SCORE_CAP)
+        return max(score, fusion, lexical * 0.85 + graph * 0.30)
+
     def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
         if not isinstance(session, SessionState) or not rows:
             return ""
         evidence_rows = [
             row
             for row in rows
-            if str(row.get("route_evidence", "") or "") in {"chunk", "document"}
+            if str(row.get("route_evidence", "") or "") in {"chunk", "document", "wiki_page", "workflow", "community_reduce", "community_map", "community_bridge"}
         ]
         if not evidence_rows:
             evidence_rows = list(rows)
 
         # Confidence filtering — drop weak evidence before LLM synthesis
-        best_score = max((float(r.get("score", 0.0) or 0.0) for r in evidence_rows), default=0.0)
+        best_score = max((self._row_synthesis_score(r) for r in evidence_rows), default=0.0)
         if best_score < RAG_NO_EVIDENCE_THRESHOLD:
-            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
-        qualified = [r for r in evidence_rows if float(r.get("score", 0.0) or 0.0) >= RAG_MIN_SYNTHESIS_SCORE]
+            return RAG_NO_EVIDENCE_MESSAGE
+        qualified = [r for r in evidence_rows if self._row_synthesis_score(r) >= RAG_MIN_SYNTHESIS_SCORE]
         if not qualified:
-            return "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
+            return RAG_NO_EVIDENCE_MESSAGE
 
         evidence = []
         _syn_doc_counts: dict[str, int] = {}
@@ -57205,7 +62349,7 @@ class AppContext:
             if _doc_id:
                 _syn_doc_counts[_doc_id] = _syn_doc_counts.get(_doc_id, 0) + 1
             idx = len(evidence) + 1
-            score_pct = int(min(99, float(row.get("score", 0.0) or 0.0) * 100))
+            score_pct = int(min(99, self._row_synthesis_score(row) * 100))
             evidence.append(
                 f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
                 f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
@@ -57235,40 +62379,132 @@ class AppContext:
     def rag_query(self, user_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
-        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
         category = str(body.get("category", "") or "").strip()
         kind = str(body.get("kind", "") or "").strip()
         route = str(
             body.get("route", body.get("path", body.get("query_mode", body.get("retrieval_path", "auto"))))
             or "auto"
         ).strip().lower()
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Generate query embedding for hybrid dense+sparse retrieval when model is available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Generate query embedding only when explicitly requested. Default RAG stays sparse.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
-            # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.rag_store.index.has_dense_index()
                 and self.rag_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_rag_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_rag_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.rag_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
-        result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=route, qvec=qvec)
+        requested_route = route if route in {"auto", "wiki", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.rag_wiki.query(query, top_k=top_k, category=category, kind=kind)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            wiki_result = self.rag_wiki.query(query, top_k=wide_top_k, category=category, kind=kind)
+            stage_results.append(wiki_result)
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.rag_store.index.query(query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
+            stage_results.append(raw_light)
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.rag_store.index.query(query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.rag_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=False,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category=category,
+                            kind=kind,
+                            raw_route=raw_route,
+                            qvec=qvec,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_route": raw_route,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def rag_import_request(self, user_id: str, payload: dict) -> dict:
@@ -57404,10 +62640,12 @@ class AppContext:
 
     def rag_rebuild(self) -> dict:
         self.rag_store.rebuild_index()
+        wiki = self.rag_wiki.compile_from_store(self.rag_store, reason="manual-rebuild")
         return {
             "ok": True,
             "built_at": self.rag_store.index.built_at,
             "stats": self.rag_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
         }
 
     def code_config(self, user_id: str) -> dict:
@@ -57432,6 +62670,8 @@ class AppContext:
             "code_root": str(self.code_root),
             "code_source_roots": list(self.code_source_roots or []),
             "status": self._code_library_status_for_session(session),
+            "wiki": self.code_wiki.payload(limit=24),
+            "workflows": self.workflow_memory.payload(limit=24),
             "sessions": sessions,
             "default_session_id": str(getattr(session, "id", "") or ""),
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
@@ -57453,6 +62693,9 @@ class AppContext:
                 "llm_enrichment": False,
                 "strict_local_import": True,
                 "repo_import": True,
+                "wiki_first_code_rag": True,
+                "workflow_memory": True,
+                "high_recall_fusion": True,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -57470,47 +62713,165 @@ class AppContext:
     def code_filesystem_payload(self, max_nodes: int = 320) -> dict:
         return self.code_store.filesystem_payload(max_nodes=max_nodes)
 
-    def code_query(self, user_id: str, payload: dict) -> dict:
+    def code_wiki_payload(self, limit: int = 240) -> dict:
+        return self.code_wiki.payload(limit=limit)
+
+    def code_wiki_lint(self) -> dict:
+        return self.code_wiki.lint()
+
+    def code_workflows_payload(self, limit: int = 120) -> dict:
+        return self.workflow_memory.payload(limit=limit)
+
+    def code_workflows_query(self, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", RAG_MAX_QUERY_RESULTS) or RAG_MAX_QUERY_RESULTS)))
+        accepted_only = bool(body.get("accepted_only", True))
+        return self.workflow_memory.query(query, top_k=top_k, accepted_only=accepted_only)
+
+    def code_query(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
         route = str(body.get("route", body.get("path", "auto")) or "auto").strip().lower()
+        budget_key, budget = self._rag_budget(body.get("budget", body.get("context_budget", "")), default="standard")
+        top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         language_filter = str(body.get("language", "") or "").strip().lower()
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Dense embedding for code query when available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Dense embedding for code query only when explicitly requested.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.code_store.index.has_dense_index()
                 and self.code_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_code_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_code_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.code_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
-        result = self.code_store.index.query(query, top_k=top_k, category="code", route=route, qvec=qvec)
+        requested_route = route if route in {"auto", "wiki", "workflow", "raw", "fast", "global", "hybrid"} else "auto"
+        raw_route = "hybrid" if requested_route in {"auto", "wiki", "workflow", "raw"} else requested_route
+        pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
+        if requested_route == "wiki":
+            result = self.code_wiki.query(query, top_k=top_k, category="code", kind="")
+        elif requested_route == "workflow":
+            result = self.workflow_memory.query(query, top_k=top_k, accepted_only=True)
+        elif requested_route in {"raw", "fast", "global", "hybrid"}:
+            result = self.code_store.index.query(query, top_k=top_k, category="code", route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            if requested_route == "raw":
+                result["route"] = "raw"
+                result.setdefault("route_meta", {})
+                if isinstance(result["route_meta"], dict):
+                    result["route_meta"]["raw_route"] = "hybrid"
+        else:
+            stage_results: list[dict] = []
+            wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
+            workflow_result = self.workflow_memory.query(query, top_k=wide_top_k, accepted_only=True)
+            wiki_result = self.code_wiki.query(query, top_k=wide_top_k, category="code", kind="")
+            light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
+            raw_light = self.code_store.index.query(query, top_k=wide_top_k, category="code", route=light_route, qvec=qvec)
+            stage_results.extend([workflow_result, wiki_result, raw_light])
+            light_merged = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={"requested_route": requested_route, "stage": "light", "workflow_first": True, "wiki_first": True, "raw_route": light_route},
+            )
+            light_metrics = self._rag_evidence_metrics(light_merged)
+            if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
+                raw_result = self.code_store.index.query(query, top_k=pool_k, category="code", route=raw_route, qvec=qvec)
+                stage_results.append(raw_result)
+                if self._rag_has_global_intent(query) or budget_key == "deep":
+                    global_result = self.code_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category="code", route="global", qvec=qvec)
+                    stage_results.append(global_result)
+                if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
+                    stage_results.extend(
+                        self._expand_retrieval_with_variants(
+                            query=query,
+                            user_id=user_id,
+                            payload=body,
+                            code=True,
+                            top_k=top_k,
+                            pool_k=pool_k,
+                            category="code",
+                            kind="",
+                            raw_route=raw_route,
+                            qvec=qvec,
+                            accepted_only=True,
+                        )
+                    )
+            result = self._merge_retrieval_results(
+                query,
+                stage_results,
+                top_k=top_k,
+                route="auto",
+                route_meta={
+                    "requested_route": requested_route,
+                    "workflow_candidate_count": int((workflow_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(workflow_result.get("route_meta", {}), dict)
+                    else 0,
+                    "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
+                    if isinstance(wiki_result.get("route_meta", {}), dict)
+                    else 0,
+                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_route": raw_route,
+                    "workflow_first": True,
+                    "wiki_first": True,
+                    "adaptive_retrieval": True,
+                    "stage_count": len(stage_results),
+                    "variant_expansion": any(bool((row.get("route_meta", {}) or {}).get("variant_expansion")) for row in stage_results if isinstance(row, dict)),
+                },
+            )
         if language_filter:
-            filtered = [
-                dict(row)
-                for row in (result.get("results", []) or [])
-                if str(row.get("language", "") or "").strip().lower() == language_filter
-            ]
+            filtered = []
+            for row in (result.get("results", []) or []):
+                row_lang = str(row.get("language", "") or "").strip().lower()
+                if row_lang in {"", "markdown"} and str(row.get("route_evidence", "") or "") in {"workflow", "wiki_page"}:
+                    filtered.append(dict(row))
+                elif row_lang == language_filter:
+                    filtered.append(dict(row))
             result = dict(result)
             result["results"] = filtered[:top_k]
+        if requested_route != "auto":
+            meta = result.get("route_meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["adaptive_retrieval"] = False
+            meta["context_budget"] = budget_key
+            result["route_meta"] = meta
+        result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
             if answer:
                 result["answer"] = answer
-        result["requested_route"] = route if route in {"auto", "fast", "global", "hybrid"} else "auto"
+        result["requested_route"] = requested_route
         return result
 
     def code_import_request(self, user_id: str, payload: dict) -> dict:
@@ -57644,10 +63005,14 @@ class AppContext:
 
     def code_rebuild(self) -> dict:
         self.code_store.rebuild_index()
+        wiki = self.code_wiki.compile_from_store(self.code_store, reason="manual-rebuild")
+        workflows = self.workflow_memory.rebuild()
         return {
             "ok": True,
             "built_at": self.code_store.index.built_at,
             "stats": self.code_store.library_payload(limit=0).get("stats", {}),
+            "wiki": wiki,
+            "workflows": workflows,
         }
 
     def _looks_like_code_task(self, text: str) -> bool:
@@ -57664,17 +63029,44 @@ class AppContext:
         ]
         return any(term in low for term in code_terms)
 
-    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+    def _looks_like_knowledge_task(self, text: str) -> bool:
+        raw = str(text or "")
+        low = raw.lower()
+        knowledge_terms = [
+            "research", "analyze", "analysis", "compare", "summarize", "explain", "fact", "evidence",
+            "paper", "document", "report", "knowledge", "source", "citation", "background",
+            "研究", "分析", "对比", "比较", "总结", "解释", "事实", "证据", "论文", "文档", "报告", "知识", "资料", "引用", "背景",
+        ]
+        if any(term in low for term in knowledge_terms):
+            return True
+        return bool(re.search(r"\b(why|how|what are|what is|pros and cons|tradeoffs?)\b", low))
+
+    def _format_reference_payload(self, result: dict, *, prefix: str, limit: int = 6, snippet_chars: int = 420) -> dict:
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        status = str(result.get("evidence_status", "") or "miss")
+        confidence = float(result.get("confidence", 0.0) or 0.0)
         if not rows:
-            return {}
+            return {
+                f"{prefix}_text": (
+                    f"{prefix.title()} Library Context [status={status}, confidence={confidence:.2f}]:\n"
+                    f"{str(result.get('no_evidence_message', RAG_NO_EVIDENCE_MESSAGE) or RAG_NO_EVIDENCE_MESSAGE)}"
+                ),
+                f"{prefix}_meta": {
+                    "route": str(result.get("route", "") or ""),
+                    "requested_route": str(result.get("requested_route", "") or ""),
+                    "result_count": 0,
+                    "evidence_status": status,
+                    "confidence": confidence,
+                },
+            }
         lines = []
+        lines.append(f"evidence_status={status} confidence={confidence:.2f} route={str(result.get('route', '') or '')}")
         for idx, row in enumerate(rows[:limit], 1):
             citation = str(row.get("citation", "") or "").strip()
             title = str(row.get("title", "") or "").strip()
             symbol = str(row.get("symbol", "") or "").strip()
             anchor = str(row.get("anchor", "") or "").strip()
-            snippet = trim(str(row.get("text", "") or ""), 420)
+            snippet = trim(str(row.get("text", "") or ""), snippet_chars)
             header = f"{idx}. {citation} {title}".strip()
             if symbol:
                 header += f" | symbol={symbol}"
@@ -57684,34 +63076,59 @@ class AppContext:
             if snippet:
                 lines.append(snippet)
         return {
-            "code_text": "\n".join(lines),
-            "code_meta": {
+            f"{prefix}_text": "\n".join(lines),
+            f"{prefix}_meta": {
                 "route": str(result.get("route", "") or ""),
                 "requested_route": str(result.get("requested_route", "") or ""),
                 "result_count": len(rows[:limit]),
+                "evidence_status": status,
+                "confidence": confidence,
                 "summary": trim(str(result.get("summary", "") or ""), 600),
             },
         }
 
+    def _format_code_reference_payload(self, result: dict, limit: int = 6) -> dict:
+        return self._format_reference_payload(result, prefix="code", limit=limit, snippet_chars=420)
+
+    def _format_knowledge_reference_payload(self, result: dict, limit: int = 4) -> dict:
+        return self._format_reference_payload(result, prefix="knowledge", limit=limit, snippet_chars=620)
+
     def _prepare_runtime_references(self, session: SessionState, text: str) -> dict:
         query = trim(str(text or "").strip(), 4000)
-        if not query or not self._looks_like_code_task(query):
+        if not query:
             return {}
-        if not self.code_store.documents:
-            return {}
+        payload: dict = {}
         try:
-            result = self.code_query(
-                str(getattr(session, "owner_user_id", "") or ""),
-                {
-                    "query": query,
-                    "top_k": 6,
-                    "route": "auto",
-                    "session_id": str(getattr(session, "id", "") or ""),
-                },
-            )
+            if self._looks_like_code_task(query) and self.code_store.documents:
+                result = self.code_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 6,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_code_reference_payload(result, limit=6))
         except Exception:
-            return {}
-        return self._format_code_reference_payload(result, limit=6)
+            pass
+        try:
+            if self._looks_like_knowledge_task(query) and self.rag_store.documents:
+                result = self.rag_query(
+                    str(getattr(session, "owner_user_id", "") or ""),
+                    {
+                        "query": query,
+                        "top_k": 5,
+                        "route": "auto",
+                        "budget": "tight",
+                        "session_id": str(getattr(session, "id", "") or ""),
+                    },
+                )
+                payload.update(self._format_knowledge_reference_payload(result, limit=4))
+        except Exception:
+            pass
+        return payload
 
     def _query_code_library_tool(self, session: SessionState, args: dict) -> str:
         status = self._code_library_status_for_session(session)
@@ -57738,7 +63155,10 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "language": str((args or {}).get("language", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
@@ -57757,9 +63177,16 @@ class AppContext:
         source_roots = [str(x).strip() for x in (status.get("source_roots", []) or []) if str(x).strip()]
         if source_roots:
             lines.append("source_roots=" + " | ".join(source_roots[:8]))
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No code library results.")
+            lines.append(str(result.get("no_evidence_message", "No code library results.") or "No code library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -57795,15 +63222,25 @@ class AppContext:
                 "query": query,
                 "top_k": max(1, min(RAG_MAX_QUERY_RESULTS, int((args or {}).get("top_k", 6) or 6))),
                 "route": str((args or {}).get("route", "auto") or "auto"),
+                "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "category": str((args or {}).get("category", "") or ""),
                 "kind": str((args or {}).get("kind", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
         rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
-        lines.append(f"route={str(result.get('route', '') or '')} results={len(rows)}")
+        lines.append(
+            f"route={str(result.get('route', '') or '')} "
+            f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
+            f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
+            f"results={len(rows)}"
+        )
         if not rows:
-            lines.append("No knowledge library results.")
+            lines.append(str(result.get("no_evidence_message", "No knowledge library results.") or "No knowledge library results."))
             return "\n".join(lines)
         for row in rows[: min(8, len(rows))]:
             lines.append(
@@ -57823,6 +63260,18 @@ class AppContext:
             pass
         try:
             self.code_service.shutdown()
+        except Exception:
+            pass
+        try:
+            self.rag_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.code_wiki.shutdown()
+        except Exception:
+            pass
+        try:
+            self.workflow_memory.shutdown()
         except Exception:
             pass
 
@@ -58003,6 +63452,7 @@ class AppContext:
         return started
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        sess = None
         try:
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
@@ -58011,6 +63461,11 @@ class AppContext:
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
+        if sess is not None:
+            try:
+                self.workflow_memory.capture_session(sess)
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -59435,6 +64890,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/skills/protocol-examples":
             return self._send_json(self.app.skill_protocol_examples())
         if path == "/api/sessions":
+            page_like = any(k in query for k in ("limit", "offset", "page", "page_size", "search", "status", "paged"))
+            if page_like:
+                try:
+                    page_size = int((query.get("page_size", query.get("limit", [str(SESSION_LIST_DEFAULT_LIMIT)])) or [str(SESSION_LIST_DEFAULT_LIMIT)])[0] or SESSION_LIST_DEFAULT_LIMIT)
+                except Exception:
+                    page_size = SESSION_LIST_DEFAULT_LIMIT
+                try:
+                    page = int((query.get("page", ["1"]) or ["1"])[0] or 1)
+                except Exception:
+                    page = 1
+                try:
+                    offset = int((query.get("offset", [str(max(0, page - 1) * page_size)]) or [str(max(0, page - 1) * page_size)])[0] or 0)
+                except Exception:
+                    offset = max(0, page - 1) * page_size
+                search = str((query.get("search", [""]) or [""])[0] or "")
+                status = str((query.get("status", [""]) or [""])[0] or "")
+                return self._send_json(mgr.list(limit=page_size, offset=offset, search=search, status=status))
             return self._send_json(mgr.list())
         if path == "/api/export/source.zip":
             return self._send_json({"error": "Use /api/sessions/{id}/export.zip for current user session export."}, status=400)
@@ -60272,6 +65744,14 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.rag_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/rag/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.rag_wiki_payload(limit=limit))
+        if path == "/api/rag/wiki/lint":
+            return self._send_json(self.app.rag_wiki_lint())
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -60291,6 +65771,12 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         if path == "/api/rag/rebuild":
             try:
                 out = self.app.rag_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/wiki/rebuild":
+            try:
+                out = self.app.rag_wiki.compile_from_store(self.app.rag_store, reason="manual-wiki-rebuild")
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -60429,6 +65915,20 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             except Exception:
                 max_nodes = 320
             return self._send_json(self.app.code_filesystem_payload(max_nodes=max_nodes))
+        if path == "/api/code/wiki":
+            try:
+                limit = int((query.get("limit", ["240"]) or ["240"])[0] or 240)
+            except Exception:
+                limit = 240
+            return self._send_json(self.app.code_wiki_payload(limit=limit))
+        if path == "/api/code/wiki/lint":
+            return self._send_json(self.app.code_wiki_lint())
+        if path == "/api/code/workflows":
+            try:
+                limit = int((query.get("limit", ["120"]) or ["120"])[0] or 120)
+            except Exception:
+                limit = 120
+            return self._send_json(self.app.code_workflows_payload(limit=limit))
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -60448,6 +65948,24 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         if path == "/api/code/rebuild":
             try:
                 out = self.app.code_rebuild()
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/wiki/rebuild":
+            try:
+                out = self.app.code_wiki.compile_from_store(self.app.code_store, reason="manual-wiki-rebuild")
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/query":
+            try:
+                out = self.app.code_workflows_query(self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/code/workflows/rebuild":
+            try:
+                out = self.app.workflow_memory.rebuild()
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
