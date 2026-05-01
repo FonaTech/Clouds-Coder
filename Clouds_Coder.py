@@ -43,7 +43,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 try:
     import certifi as _certifi
@@ -5515,8 +5515,8 @@ def preview_kind_for_path(path_text: str) -> str:
     rel = normalize_rel_preview_path(path_text).lower()
     if not rel:
         return ""
-        if rel.endswith((".html", ".htm")):
-            return "html"
+    if rel.endswith((".html", ".htm")):
+        return "html"
     if rel.endswith((".md", ".markdown")):
         return "markdown"
     if is_code_preview_candidate(rel):
@@ -43642,6 +43642,11 @@ function _chatVirtCollectRows(){
   }
   return rows;
 }
+function _chatVirtRowsStableKey(rows){
+  const arr=Array.isArray(rows)?rows:[];
+  if(!arr.length)return'0';
+  return `${arr.length}|${arr.map(row=>String(row?._vk||'')).join('|')}`;
+}
 function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const totalLen=txtLen+thinkLen;const base=totalLen>1200?Math.max(400,Math.min(3200,120+Math.ceil(totalLen/60)*18)):Math.max(72,Math.min(560,80+Math.ceil(totalLen/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
 function _chatVirtBindPreviewButtons(root){if(!root)return;for(const btn of root.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}}
 function _chatVirtPruneHeightCache(rows){const keys=Object.keys(CHAT_VIRT.heights||{});if(keys.length<=CHAT_VIRT.maxCacheKeys)return;const keep=new Set(rows.map(x=>String(x?._vk||'')));for(const k of keys){if(!keep.has(k)){delete CHAT_VIRT.heights[k]}}}
@@ -44212,6 +44217,7 @@ function renderChat(reason='snapshot'){
     c._virtRowsCacheSig=feedSig;
     c._virtRowsCacheRows=rows;
   }
+  const rowsStableKey=_chatVirtRowsStableKey(rows);
   _chatVirtPruneHeightCache(rows);
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
@@ -44231,11 +44237,17 @@ function renderChat(reason='snapshot'){
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
+  const renderKey=`${rangeKey}|${rowsStableKey}|hv=${Number(CHAT_VIRT.heightVersion||0)}|running=${S.snap?.running?1:0}`;
   // Early exit BEFORE any layout queries (_chatVirtCaptureAnchor uses getBoundingClientRect).
   if(reason==='scroll'&&c._virtRangeKey===rangeKey){
     return;
   }
+  if(reason!=='scroll'&&c._chatHasRendered&&String(c._virtRenderKey||'')===renderKey){
+    _chatVirtSyncRunTicker(c);
+    return;
+  }
   c._virtRangeKey=rangeKey;
+  c._virtRenderKey=renderKey;
   // Layout reads below — only reached when DOM will actually change.
   const atBottomNow=nearBottom(c,6);
   if((!S.snap?.running)&&atBottomNow){
@@ -44247,6 +44259,32 @@ function renderChat(reason='snapshot'){
   c._virtRendering=true;
   const rendered=[];
   let usedIncrementalPatch=false;
+  if(
+    reason!=='scroll'&&
+    !first&&
+    rows.length+1===prevRows.length&&
+    prevWinStart===win.start&&
+    prevWinEnd===prevRows.length&&
+    win.end===rows.length
+  ){
+    let stableAll=true;
+    for(let i=0;i<rows.length;i++){
+      if(String(prevRows[i]?._vk||'')!==String(rows[i]?._vk||'')){
+        stableAll=false;
+        break;
+      }
+    }
+    const removedLast=String(prevRows[prevRows.length-1]?.type||'')==='live_run_notice';
+    if(stableAll&&removedLast){
+      const visibleNodes=c.querySelectorAll('.msg[data-vk]');
+      const lastNode=visibleNodes.length?visibleNodes[visibleNodes.length-1]:null;
+      if(lastNode&&String(lastNode.getAttribute('data-run-live')||'')==='1'){
+        _chatVirtReleaseNode(lastNode);
+        lastNode.remove();
+        usedIncrementalPatch=true;
+      }
+    }
+  }
   if(
     reason!=='scroll'&&
     !first&&
@@ -44347,7 +44385,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    c.scrollTop=maxTop;
+    if(Math.abs(Number(c.scrollTop||0)-maxTop)>0.75)c.scrollTop=maxTop;
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
   }
@@ -62328,9 +62366,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_bytes(self, data: bytes, content_type: str, filename: str):
         try:
+            raw_name = Path(str(filename or "download.bin")).name or "download.bin"
+            ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
+            ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
+            encoded_name = quote(raw_name.encode("utf-8"), safe="")
+            disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", disposition)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
