@@ -232,6 +232,44 @@ LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
     int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
 )
+CHAT_UPLOAD_PARSE_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_QUEUE_MAX", "12") or "12"))),
+)
+CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS = max(
+    5,
+    min(180, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_TIMEOUT", "45") or "45"))),
+)
+CHAT_UPLOAD_INLINE_TEXT_BYTES = max(
+    16 * 1024,
+    min(512 * 1024, int(str(os.getenv("AGENT_CHAT_UPLOAD_INLINE_TEXT_BYTES", "131072") or "131072"))),
+)
+CHAT_UPLOAD_PARSE_MAX_BYTES = max(
+    256 * 1024,
+    min(
+        24 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_MAX_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))),
+    ),
+)
+CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
+    64 * 1024,
+    min(
+        4 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES", str(768 * 1024)) or str(768 * 1024))),
+    ),
+)
+CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
+    1200,
+    min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
+)
+SESSION_WATCHDOG_INTERVAL_SECONDS = max(
+    10,
+    min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
+)
+SESSION_HEARTBEAT_STALE_SECONDS = max(
+    60,
+    min(7200, int(str(os.getenv("AGENT_SESSION_HEARTBEAT_STALE_SECONDS", "900") or "900"))),
+)
 SESSION_LIST_DEFAULT_LIMIT = max(
     50,
     min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
@@ -13445,6 +13483,12 @@ class SessionState:
         self.operations: list[dict] = []
         self.code_preview_index: dict[str, list[dict]] = {}
         self.uploads: list[dict] = []
+        self.upload_parse_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_PARSE_QUEUE_MAX)
+        self.upload_parse_worker_started = False
+        self.upload_parse_worker_lock = threading.Lock()
+        self.upload_parse_last_heartbeat = 0.0
+        self.upload_parse_active_id = ""
+        self.upload_parse_active_started_at = 0.0
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
         self.runtime_knowledge_reference_text = ""
@@ -13454,6 +13498,10 @@ class SessionState:
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
         self.run_generation = 0
+        self.run_started_at = 0.0
+        self.run_last_heartbeat = 0.0
+        self.run_recovered_at = 0.0
+        self.run_recovered_reason = ""
         self.live_input_seq = 0
         self.agent_round_index = 0
         self.current_phase = "idle"
@@ -15142,6 +15190,11 @@ class SessionState:
             return int(self.event_seq)
 
     def _emit(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -15164,6 +15217,11 @@ class SessionState:
         self.activity = self.activity[-300:]
 
     def _emit_transient(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -20230,11 +20288,81 @@ body{padding:18px}
                 continue
         return data.decode("latin-1", errors="ignore")
 
+    def _safe_read_head_bytes(self, fp: Path, max_bytes: int = CHAT_UPLOAD_PARSE_MAX_BYTES) -> bytes:
+        try:
+            cap = max(0, int(max_bytes or 0))
+        except Exception:
+            cap = CHAT_UPLOAD_PARSE_MAX_BYTES
+        if cap <= 0:
+            return b""
+        try:
+            with open(fp, "rb") as f:
+                return f.read(cap + 1)
+        except Exception:
+            return b""
+
+    def _upload_size(self, fp: Path) -> int:
+        try:
+            return int(fp.stat().st_size or 0)
+        except Exception:
+            return 0
+
+    def _zip_read_limited(self, zf: zipfile.ZipFile, name: str, limit: int = CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) -> str:
+        try:
+            info = zf.getinfo(name)
+            if int(info.file_size or 0) > int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES):
+                return ""
+            with zf.open(info, "r") as fh:
+                data = fh.read(int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) + 1)
+            data = data[: int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES)]
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _upload_kind_for(self, safe_name: str, mime: str = "") -> tuple[str, str]:
+        ext = Path(safe_name).suffix.lower()
+        mime_low = str(mime or "").strip().lower()
+        text_like_ext = {
+            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
+            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
+            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
+            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
+            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
+            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp", ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
+            ".asm", ".s", ".bas", ".vb", ".vbs", ".vba", ".bat", ".cmd", ".ps1", ".psm1", ".clj", ".cljs", ".cljc", ".edn",
+            ".coffee", ".cr", ".dart", ".dockerfile", ".erl", ".hrl", ".ex", ".exs", ".fs", ".fsi", ".fsx",
+            ".gradle", ".groovy", ".gvy", ".hs", ".lhs", ".jl", ".lua", ".lisp", ".cl", ".el", ".scm", ".rkt",
+            ".mk", ".cmake", ".ml", ".mli", ".nix", ".pas", ".pp", ".inc", ".pde", ".ino", ".proto", ".purs",
+            ".raku", ".p6", ".sol", ".sv", ".svh", ".vh", ".vhd", ".vhdl", ".tcl", ".tk", ".tf", ".tfvars", ".hcl",
+            ".tex", ".bib", ".sty", ".cls", ".typ", ".wat", ".diff", ".patch", ".graphql", ".gql", ".prisma", ".svg",
+        }
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            return "image", ext
+        if ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            return "video", ext
+        if ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            return "audio", ext
+        if ext == ".pdf" or "pdf" in mime_low:
+            return "pdf", ext
+        if ext in (".csv", ".tsv"):
+            return "csv", ext
+        if ext in (".xlsx", ".xls"):
+            return "excel", ext
+        if ext in (".pptx", ".ppt"):
+            return "presentation", ext
+        if ext in (".docx", ".doc"):
+            return "document", ext
+        if ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low or "xml" in mime_low:
+            return "text", ext
+        return "binary", ext
+
     def _extract_pdf_text(self, pdf_path: Path) -> str:
+        if self._upload_size(pdf_path) > CHAT_UPLOAD_PARSE_MAX_BYTES:
+            return f"[skipped_large] PDF is larger than safe parse cap ({CHAT_UPLOAD_PARSE_MAX_BYTES} bytes). Use focused file tools or external extraction."
         # Prefer pdfminer.six first because it is pure Python and self-contained.
         try:
             from pdfminer.high_level import extract_text
-            text = extract_text(str(pdf_path))
+            text = extract_text(str(pdf_path), maxpages=30)
             if text and text.strip():
                 return text.strip()
         except ImportError:
@@ -20249,7 +20377,7 @@ body{padding:18px}
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
                     text=True,
-                    timeout=45,
+                    timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     return r.stdout.strip()
@@ -20257,7 +20385,7 @@ body{padding:18px}
                 pass
         # Final fallback: approximate text recovery from PDF string literals.
         try:
-            raw = pdf_path.read_bytes()
+            raw = self._safe_read_head_bytes(pdf_path, min(CHAT_UPLOAD_PARSE_MAX_BYTES, 2 * 1024 * 1024))
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
             merged = "\n".join(chunks)
@@ -20329,7 +20457,9 @@ body{padding:18px}
         return out
 
     def _extract_csv_text(self, raw: bytes) -> str:
-        text = self._decode_text_bytes(raw)
+        data = raw[: CHAT_UPLOAD_PARSE_MAX_BYTES + 1]
+        truncated = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES
+        text = self._decode_text_bytes(data)
         if not text:
             return ""
         lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -20347,15 +20477,18 @@ body{padding:18px}
             for i, row in enumerate(reader):
                 if i >= 180:
                     break
-                vals = [str(v).strip() for v in row]
+                vals = [str(v).strip()[:500] for v in row[:80]]
                 if any(vals):
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:180]
+        if truncated:
+            table_lines.insert(0, f"[truncated] CSV preview limited to {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes.")
         return trim("\n".join(table_lines), 24_000)
 
     def _extract_xlsx_text(self, fp: Path) -> str:
         if self._module_available("openpyxl"):
+            wb = None
             try:
                 import openpyxl  # type: ignore
 
@@ -20364,7 +20497,7 @@ body{padding:18px}
                 for ws in list(wb.worksheets)[:5]:
                     lines.append(f"[Sheet] {ws.title}")
                     rows = 0
-                    for row in ws.iter_rows(min_row=1, max_row=200, values_only=True):
+                    for row in ws.iter_rows(min_row=1, max_row=200, max_col=80, values_only=True):
                         vals = [str(v).strip() for v in row if v not in (None, "")]
                         if not vals:
                             continue
@@ -20372,27 +20505,39 @@ body{padding:18px}
                         rows += 1
                         if rows >= 120:
                             break
-                wb.close()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
+            finally:
+                try:
+                    if wb is not None:
+                        wb.close()
+                except Exception:
+                    pass
         try:
             with zipfile.ZipFile(fp, "r") as zf:
                 shared: list[str] = []
-                if "xl/sharedStrings.xml" in zf.namelist():
-                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                names = zf.namelist()
+                if "xl/sharedStrings.xml" in names:
+                    shared_xml = self._zip_read_limited(zf, "xl/sharedStrings.xml")
                     shared = self._extract_xml_text_tokens(shared_xml, ("t",))
                 lines: list[str] = []
-                for name in sorted(zf.namelist()):
+                sheet_count = 0
+                for name in sorted(names):
                     if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
                         continue
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
-                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    sheet_count += 1
+                    if sheet_count > 5:
+                        break
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text[:CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES])
                     lines.append(f"[Sheet] {Path(name).stem}")
                     taken = 0
                     for row_raw in rows_raw:
-                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)[:80]
                         vals: list[str] = []
                         for attrs, body in cells:
                             ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
@@ -20415,7 +20560,7 @@ body{padding:18px}
                                         token = html.unescape(raw)
                             token = token.strip()
                             if token:
-                                vals.append(token)
+                                vals.append(token[:500])
                         if vals:
                             lines.append("\t".join(vals))
                             taken += 1
@@ -20431,6 +20576,7 @@ body{padding:18px}
 
     def _extract_xls_text(self, fp: Path) -> str:
         if self._module_available("xlrd"):
+            wb = None
             try:
                 import xlrd  # type: ignore
 
@@ -20441,19 +20587,24 @@ body{padding:18px}
                     lines.append(f"[Sheet] {sh.name}")
                     for r in range(min(sh.nrows, 120)):
                         vals: list[str] = []
-                        for c in range(sh.ncols):
+                        for c in range(min(sh.ncols, 80)):
                             value = sh.cell_value(r, c)
                             if value in ("", None):
                                 continue
-                            vals.append(str(value).strip())
+                            vals.append(str(value).strip()[:500])
                         if vals:
                             lines.append("\t".join(vals))
-                wb.release_resources()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
-        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+            finally:
+                try:
+                    if wb is not None:
+                        wb.release_resources()
+                except Exception:
+                    pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
         if xls2csv_text:
             return trim(xls2csv_text, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20465,13 +20616,13 @@ body{padding:18px}
 
                 doc = docx.Document(str(fp))
                 lines: list[str] = []
-                for p in doc.paragraphs:
+                for p in list(doc.paragraphs)[:1500]:
                     text = (p.text or "").strip()
                     if text:
                         lines.append(text)
-                for tb in doc.tables:
-                    for row in tb.rows:
-                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                for tb in list(doc.tables)[:40]:
+                    for row in list(tb.rows)[:120]:
+                        vals = [str(cell.text or "").strip()[:500] for cell in list(row.cells)[:40]]
                         vals = [v for v in vals if v]
                         if vals:
                             lines.append("\t".join(vals))
@@ -20484,7 +20635,9 @@ body{padding:18px}
                 parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
                 lines: list[str] = []
                 for name in sorted(parts):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Part] {Path(name).name}")
@@ -20503,7 +20656,7 @@ body{padding:18px}
             ["catdoc", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20515,9 +20668,9 @@ body{padding:18px}
 
                 pres = pptx.Presentation(str(fp))
                 lines: list[str] = []
-                for idx, slide in enumerate(pres.slides, 1):
+                for idx, slide in enumerate(list(pres.slides)[:80], 1):
                     lines.append(f"[Slide {idx}]")
-                    for shape in slide.shapes:
+                    for shape in list(slide.shapes)[:120]:
                         text = ""
                         if hasattr(shape, "text"):
                             text = str(getattr(shape, "text") or "").strip()
@@ -20531,8 +20684,10 @@ body{padding:18px}
             with zipfile.ZipFile(fp, "r") as zf:
                 slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
                 lines: list[str] = []
-                for name in sorted(slides):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                for name in sorted(slides)[:80]:
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Slide] {Path(name).stem}")
@@ -20548,7 +20703,7 @@ body{padding:18px}
             ["catppt", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20726,80 +20881,23 @@ body{padding:18px}
         stored = self.uploads_dir / f"{upload_id}_{safe_name}"
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_bytes(raw)
-        ext = stored.suffix.lower()
-        text_like_ext = {
-            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
-            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
-            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
-            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
-            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
-            # Fortran
-            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
-            # Additional text-like source formats
-            ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
-            ".asm", ".s",
-            ".bas", ".vb", ".vbs", ".vba",
-            ".bat", ".cmd", ".ps1", ".psm1",
-            ".clj", ".cljs", ".cljc", ".edn",
-            ".coffee", ".cr", ".dart",
-            ".dockerfile",
-            ".erl", ".hrl", ".ex", ".exs",
-            ".fs", ".fsi", ".fsx",
-            ".gradle", ".groovy", ".gvy",
-            ".hs", ".lhs",
-            ".jl", ".lua",
-            ".lisp", ".cl", ".el", ".scm", ".rkt",
-            ".mk", ".cmake",
-            ".ml", ".mli", ".nix",
-            ".pas", ".pp", ".inc",
-            ".pde", ".ino",
-            ".proto", ".purs",
-            ".raku", ".p6",
-            ".sol",
-            ".sv", ".svh", ".vh", ".vhd", ".vhdl",
-            ".tcl", ".tk",
-            ".tf", ".tfvars", ".hcl",
-            ".tex", ".bib", ".sty", ".cls", ".typ",
-            ".wat",
-            ".diff", ".patch",
-            ".graphql", ".gql",
-            ".prisma", ".svg",
-        }
-        # --- Fast phase: determine kind without heavy parsing ---
-        kind = "binary"
-        mime_low = str(mime or "").strip().lower()
-        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
-            kind = "image"
-        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
-            kind = "video"
-        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
-            kind = "audio"
-        elif ext == ".pdf" or "pdf" in mime_low:
-            kind = "pdf"
-        elif ext == ".csv":
-            kind = "csv"
-        elif ext in (".xlsx", ".xls"):
-            kind = "excel"
-        elif ext in (".pptx", ".ppt"):
-            kind = "presentation"
-        elif ext in (".docx", ".doc"):
-            kind = "document"
-        elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
-            kind = "text"
-        # For small text files, parse inline (fast); for everything else, defer
+        kind, ext = self._upload_kind_for(safe_name, mime)
         parsed_excerpt = ""
-        needs_async_parse = False
+        needs_parse = kind in {"text", "pdf", "csv", "excel", "presentation", "document"}
         if kind == "text":
             is_code_upload = self._upload_is_code_like(filename=safe_name, kind=kind)
-            large_text = len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES
-            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or large_text) else 12_000
-            parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
-        elif kind in ("pdf", "csv", "excel", "presentation", "document"):
-            needs_async_parse = True
+            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES) else CHAT_UPLOAD_TEXT_CONTEXT_CHARS
+            parsed_excerpt = trim(self._decode_text_bytes(raw[: CHAT_UPLOAD_INLINE_TEXT_BYTES + 1]), excerpt_cap)
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
         workspace_rel = self._session_rel(workspace_target)
+        too_large_for_parse = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}
+        parse_status = "skipped_large" if too_large_for_parse else ("pending" if needs_parse else "done")
+        parse_error = (
+            f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            if too_large_for_parse else ""
+        )
         meta = {
             "id": upload_id,
             "filename": safe_name,
@@ -20811,47 +20909,36 @@ body{padding:18px}
             "stored_path": str(stored),
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
-            "parse_status": "pending" if needs_async_parse else "done",
-            "parse_error": "",
+            "parse_status": parse_status,
+            "parse_error": parse_error,
+            "parse_started_at": 0.0,
+            "parse_finished_at": now_ts() if parse_status in {"done", "skipped_large"} else 0.0,
         }
         with self.lock:
             self.uploads.append(meta)
             self.uploads = self.uploads[-80:]
             self.updated_at = now_ts()
             self._persist()
-        if parsed_excerpt:
-            bb_excerpt = self._prepare_upload_excerpt(
-                safe_name,
-                workspace_rel,
-                kind,
-                parsed_excerpt,
-                max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                max_lines=60,
-            )
-            if bb_excerpt:
-                bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                self._blackboard_append_section("research_notes", "system", bb_content)
-        if not needs_async_parse:
-            self._emit(
-                "upload",
-                {
-                    "id": upload_id,
-                    "filename": safe_name,
-                    "workspace_path": workspace_rel,
-                    "kind": kind,
-                    "size": len(raw),
-                    "parse_status": meta["parse_status"],
-                    "parse_error": "",
-                    "summary": f"upload: {safe_name} -> {workspace_rel}",
-                    "preview": trim(parsed_excerpt, 500),
-                },
-            )
+        self._emit(
+            "upload",
+            {
+                "id": upload_id,
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "parse_status": meta["parse_status"],
+                "parse_error": parse_error,
+                "summary": f"upload saved: {safe_name} -> {workspace_rel}",
+                "preview": trim(parsed_excerpt, 500),
+            },
+        )
         # --- Config detection (kept synchronous as per user preference) ---
         loaded_config = None
         low_name = safe_name.lower()
         cfg_obj = {}
-        if ext == ".json" or "json" in (mime or "").lower() or "config" in low_name:
-            cfg_text = self._decode_text_bytes(raw)
+        if (ext == ".json" or "json" in (mime or "").lower() or "config" in low_name) and len(raw) <= CHAT_UPLOAD_INLINE_TEXT_BYTES:
+            cfg_text = self._decode_text_bytes(raw[:CHAT_UPLOAD_INLINE_TEXT_BYTES])
             cfg_obj = parse_json_object(cfg_text, {})
         named_config = (
             low_name == "llm.config.json"
@@ -20882,37 +20969,10 @@ body{padding:18px}
                 "summary": f"LLM config {'queued (agent running)' if config_delayed else 'applied'} from {safe_name}",
                 "delayed": config_delayed,
             })
-        # --- Slow phase: async parsing + library ingestion ---
-        if needs_async_parse:
-            threading.Thread(
-                target=self._parse_upload_async,
-                args=(upload_id, safe_name, stored, workspace_target, kind, ext, raw, mime),
-                daemon=True,
-            ).start()
+        if parse_status == "pending":
+            self._enqueue_upload_parse(upload_id, safe_name, stored, workspace_target, kind, ext, mime)
         else:
-            # Inline RAG/Code callback for already-parsed files
-            parsed_target: Path | None = None
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                meta["rag"] = dict(rag_info)
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, len(raw))
         return {
             "id": upload_id,
             "filename": safe_name,
@@ -20926,14 +20986,153 @@ body{padding:18px}
             "model_catalog": loaded_config,
         }
 
-    def _parse_upload_async(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, raw: bytes, mime: str):
-        """Async parsing phase — runs in background thread for heavy file types."""
+    def _enqueue_upload_parse(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, mime: str):
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "stored": str(stored),
+            "workspace_target": str(workspace_target),
+            "kind": kind,
+            "ext": ext,
+            "mime": mime,
+            "queued_at": now_ts(),
+        }
+        try:
+            self.upload_parse_queue.put_nowait(job)
+            self._ensure_upload_parse_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                parse_status="skipped_timeout",
+                parse_error=f"upload parse queue is full ({CHAT_UPLOAD_PARSE_QUEUE_MAX}); file saved without parsing",
+                parse_finished_at=now_ts(),
+            )
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, 0, "skipped_timeout", "upload parse queue is full", "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, self._upload_size(workspace_target))
+
+    def _ensure_upload_parse_worker(self):
+        with self.upload_parse_worker_lock:
+            if self.upload_parse_worker_started:
+                return
+            self.upload_parse_worker_started = True
+            threading.Thread(target=self._upload_parse_worker_loop, name=f"upload-parse-{self.id}", daemon=True).start()
+
+    def _upload_parse_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_parse_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_parse_worker_lock:
+                    if self.upload_parse_queue.empty():
+                        self.upload_parse_worker_started = False
+                        return
+                    continue
+            try:
+                if isinstance(job, dict):
+                    self._parse_upload_job(job)
+            except Exception as exc:
+                try:
+                    upload_id = str((job or {}).get("id", ""))
+                    safe_name = str((job or {}).get("safe_name", "upload"))
+                    workspace_target = Path(str((job or {}).get("workspace_target", "")))
+                    kind = str((job or {}).get("kind", "file"))
+                    self._patch_upload_meta(
+                        upload_id,
+                        parse_status="failed_saved",
+                        parse_error=trim(str(exc), 300),
+                        parse_finished_at=now_ts(),
+                    )
+                    self._emit_upload_status(upload_id, safe_name, workspace_target, kind, self._upload_size(workspace_target), "failed_saved", trim(str(exc), 300), "")
+                except Exception:
+                    pass
+            finally:
+                with self.lock:
+                    self.upload_parse_active_id = ""
+                    self.upload_parse_active_started_at = 0.0
+                    self.upload_parse_last_heartbeat = now_ts()
+                try:
+                    self.upload_parse_queue.task_done()
+                except Exception:
+                    pass
+
+    def _patch_upload_meta(self, upload_id: str, **updates):
+        if not upload_id:
+            return
+        with self.lock:
+            for idx in range(len(self.uploads) - 1, -1, -1):
+                row = self.uploads[idx]
+                if str(row.get("id", "")) != upload_id:
+                    continue
+                patched = dict(row)
+                patched.update(updates)
+                self.uploads[idx] = patched
+                self.updated_at = now_ts()
+                self._persist()
+                break
+
+    def _emit_upload_status(self, upload_id: str, safe_name: str, workspace_target: Path, kind: str, size: int, status: str, error: str = "", preview: str = ""):
+        workspace_rel = self._session_rel(workspace_target) if workspace_target else ""
+        self._emit("upload", {
+            "id": upload_id,
+            "filename": safe_name,
+            "workspace_path": workspace_rel,
+            "kind": kind,
+            "size": int(size or 0),
+            "parse_status": status,
+            "parse_error": error,
+            "summary": f"upload: {safe_name} -> {workspace_rel} (parse {status})",
+            "preview": trim(preview, 500),
+        })
+
+    def _enqueue_upload_ingest(self, upload_id: str, safe_name: str, workspace_target: Path, parsed_target: Path | None, kind: str, mime: str, size: int):
+        if not callable(self.upload_callback):
+            return
+
+        def ingest():
+            rag_info: dict = {}
+            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": int(size or 0)}
+            try:
+                maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                if isinstance(maybe, dict):
+                    rag_info = dict(maybe)
+            except Exception as exc:
+                rag_info = {"ok": False, "error": trim(str(exc), 260)}
+            if rag_info:
+                self._patch_upload_meta(upload_id, rag=dict(rag_info))
+
+        threading.Thread(target=ingest, name=f"upload-ingest-{self.id}", daemon=True).start()
+
+    def _parse_upload_job(self, job: dict):
+        upload_id = str(job.get("id", ""))
+        safe_name = str(job.get("safe_name", "upload"))
+        stored = Path(str(job.get("stored", "")))
+        workspace_target = Path(str(job.get("workspace_target", "")))
+        kind = str(job.get("kind", "binary"))
+        ext = str(job.get("ext", ""))
+        mime = str(job.get("mime", ""))
+        started = now_ts()
+        with self.lock:
+            self.upload_parse_active_id = upload_id
+            self.upload_parse_active_started_at = started
+            self.upload_parse_last_heartbeat = started
+        self._patch_upload_meta(upload_id, parse_status="pending", parse_error="", parse_started_at=started)
+        size = self._upload_size(stored)
+        if size > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}:
+            msg = f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            self._patch_upload_meta(upload_id, parse_status="skipped_large", parse_error=msg, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "skipped_large", msg, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
+            return
         try:
             parsed_excerpt = ""
+            deadline = time.time() + CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS
             if kind == "pdf":
                 parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
+            elif kind == "text":
+                raw_head = self._safe_read_head_bytes(stored, CHAT_UPLOAD_INLINE_TEXT_BYTES)
+                parsed_excerpt = trim(self._decode_text_bytes(raw_head), CHAT_UPLOAD_TEXT_CONTEXT_CHARS)
             elif kind == "csv":
-                parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
+                parsed_excerpt = trim(self._extract_csv_text(self._safe_read_head_bytes(stored, CHAT_UPLOAD_PARSE_MAX_BYTES)), 24_000)
             elif kind == "excel" and ext == ".xlsx":
                 parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
             elif kind == "excel" and ext == ".xls":
@@ -20946,29 +21145,25 @@ body{padding:18px}
                 parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
             elif kind == "document" and ext == ".doc":
                 parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
+            if time.time() > deadline:
+                raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
             # Save parsed.md
             parsed_target: Path | None = None
             if parsed_excerpt and kind not in ("text", "code"):
                 parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
                 try:
-                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
+                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({size} bytes)\n\n"
                     parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
                 except Exception:
                     parsed_target = None
             # Update meta in uploads list
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parsed_excerpt"] = parsed_excerpt
-                    patched["parse_status"] = "done"
-                    patched["parse_error"] = ""
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
+            self._patch_upload_meta(
+                upload_id,
+                parsed_excerpt=parsed_excerpt,
+                parse_status="done",
+                parse_error="",
+                parse_finished_at=now_ts(),
+            )
             if parsed_excerpt:
                 bb_excerpt = self._prepare_upload_excerpt(
                     safe_name,
@@ -20982,67 +21177,14 @@ body{padding:18px}
                     bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
                     self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "done",
-                "parse_error": "",
-                "summary": f"upload: {safe_name} -> {workspace_rel}" + (f" (parsed {len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
-                "preview": trim(parsed_excerpt, 500),
-            })
-            # RAG/Code library ingestion
-            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": len(raw)}
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "done", "", parsed_excerpt)
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, parsed_target, kind, mime, size)
         except Exception as exc:
             # Mark parse as failed
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parse_status"] = "failed"
-                    patched["parse_error"] = trim(str(exc), 300)
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "failed",
-                "summary": f"upload: {safe_name} -> {workspace_rel} (parse failed)",
-                "error": trim(str(exc), 300),
-                "parse_error": trim(str(exc), 300),
-                "preview": "",
-            })
+            err = trim(str(exc), 300)
+            self._patch_upload_meta(upload_id, parse_status="failed_saved", parse_error=err, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "failed_saved", err, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
 
     def _auto_switch_model(self, reason: str) -> bool:
         if not bool(self.auto_model_switch):
@@ -22548,6 +22690,7 @@ body{padding:18px}
         with self.lock:
             self.current_phase = str(phase or "idle")
             self.current_tool_name = str(tool_name or "")
+            self.run_last_heartbeat = now_ts()
 
     def _startup_phase(self, step: str = "") -> str:
         label = trim(str(step or "").strip(), 80)
@@ -22593,6 +22736,10 @@ body{padding:18px}
                     break
                 if self.cancel_requested:
                     raise OllamaError("interrupted by user", status=499)
+                try:
+                    self.run_last_heartbeat = now_ts()
+                except Exception:
+                    pass
                 if interval > 0:
                     now = time.time()
                     if now - start_ts >= delay and now - last_progress_emit >= interval:
@@ -35036,6 +35183,10 @@ body{padding:18px}
                     self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
                 self.running = True
+                self.run_started_at = now_ts()
+                self.run_last_heartbeat = self.run_started_at
+                self.run_recovered_at = 0.0
+                self.run_recovered_reason = ""
                 self.current_phase = "starting"
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
@@ -39317,6 +39468,7 @@ body{padding:18px}
                     dropped_pending_inputs = len(self.pending_user_inputs)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
+                self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
             if dropped_pending_inputs > 0:
@@ -39693,6 +39845,125 @@ body{padding:18px}
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
             }
+
+    def degraded_snapshot(self, reason: str = "session busy") -> dict:
+        return {
+            "id": self.id,
+            "title": str(getattr(self, "title", self.id) or self.id),
+            "running": bool(getattr(self, "running", False)),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
+            "updated_at": float(getattr(self, "updated_at", 0.0) or 0.0),
+            "message_count": 0,
+            "model": str(getattr(getattr(self, "ollama", None), "model", "") or ""),
+            "provider": str(getattr(getattr(self, "ollama", None), "provider", "") or ""),
+            "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
+            "agent_phase": str(getattr(self, "current_phase", "busy") or "busy"),
+            "agent_active_tool": str(getattr(self, "current_tool_name", "") or ""),
+            "run_started_at": float(getattr(self, "run_started_at", 0.0) or 0.0),
+            "run_last_heartbeat": float(getattr(self, "run_last_heartbeat", 0.0) or 0.0),
+            "recovered_at": float(getattr(self, "run_recovered_at", 0.0) or 0.0),
+            "recovered_reason": str(getattr(self, "run_recovered_reason", "") or ""),
+            "degraded": True,
+            "degraded_reason": trim(reason, 220),
+            "messages": [],
+            "conversation_feed": [],
+            "uploads": [],
+            "todos": [],
+            "tasks": [],
+            "background": [],
+            "teammates": [],
+            "activity": [],
+            "operations": [],
+        }
+
+    def snapshot_safe(self, include_model_catalog: bool = False, lite: bool = False, lock_timeout: float = 0.4) -> dict:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=max(0.0, float(lock_timeout or 0.0))))
+        except Exception:
+            acquired = False
+        if not acquired:
+            return self.degraded_snapshot("session lock busy")
+        try:
+            return self.snapshot(include_model_catalog=include_model_catalog, lite=lite)
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+
+    def recover_if_stale(self, now_value: float | None = None, stale_seconds: int = SESSION_HEARTBEAT_STALE_SECONDS) -> bool:
+        now_value = float(now_value or now_ts())
+        acquired = False
+        restart_parse_worker = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            try:
+                if bool(getattr(self, "running", False)):
+                    hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                    started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                    baseline = hb or started
+                    if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                        self.cancel_requested = True
+                        self.running = False
+                        self.current_phase = "crashed_recovered"
+                        self.current_tool_name = ""
+                        self.run_recovered_at = now_value
+                        self.run_recovered_reason = (
+                            f"watchdog recovered lock-busy session after {int(now_value - baseline)}s without heartbeat"
+                        )
+                        self.updated_at = now_value
+                        return True
+            except Exception:
+                pass
+            return False
+        try:
+            changed = False
+            parse_active = str(getattr(self, "upload_parse_active_id", "") or "")
+            parse_started = float(getattr(self, "upload_parse_active_started_at", 0.0) or 0.0)
+            if parse_active and parse_started and (now_value - parse_started) > max(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS * 2, 60):
+                self._patch_upload_meta(
+                    parse_active,
+                    parse_status="skipped_timeout",
+                    parse_error=f"upload parser timed out after {int(now_value - parse_started)}s",
+                    parse_finished_at=now_value,
+                )
+                self.upload_parse_active_id = ""
+                self.upload_parse_active_started_at = 0.0
+                restart_parse_worker = True
+                changed = True
+            if bool(getattr(self, "running", False)):
+                hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                baseline = hb or started
+                if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                    self.cancel_requested = True
+                    self.running = False
+                    self.current_phase = "crashed_recovered"
+                    self.current_tool_name = ""
+                    self.run_recovered_at = now_value
+                    self.run_recovered_reason = f"watchdog recovered stale session after {int(now_value - baseline)}s without heartbeat"
+                    self.updated_at = now_value
+                    changed = True
+            if changed:
+                self._persist()
+            return changed
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+            if restart_parse_worker:
+                try:
+                    with self.upload_parse_worker_lock:
+                        self.upload_parse_worker_started = False
+                    if not self.upload_parse_queue.empty():
+                        self._ensure_upload_parse_worker()
+                except Exception:
+                    pass
 
     def export_bundle(self) -> bytes:
         bio = io.BytesIO()
@@ -40690,18 +40961,38 @@ class SessionManager:
                 continue
             if status_key in {"idle", "stopped"} and running:
                 continue
+            degraded = False
             try:
-                message_count = sum(
-                    1 for row in getattr(sess, "messages", [])
-                    if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
-                )
+                acquired = bool(sess.lock.acquire(timeout=0.03))
             except Exception:
+                acquired = False
+            if acquired:
+                try:
+                    message_count = sum(
+                        1 for row in getattr(sess, "messages", [])
+                        if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
+                    )
+                    title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+                    running = bool(getattr(sess, "running", False))
+                except Exception:
+                    message_count = 0
+                    degraded = True
+                finally:
+                    try:
+                        sess.lock.release()
+                    except Exception:
+                        pass
+            else:
                 message_count = 0
+                degraded = True
             rows.append(
                 {
                     "id": sid,
                     "title": title,
                     "running": running,
+                    "degraded": degraded,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
                     "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
                     "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
                     "message_count": int(message_count),
@@ -40947,7 +41238,9 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
-.session-item{padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+.session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:94px;min-height:94px;flex:0 0 94px;display:flex;flex-direction:column;justify-content:flex-start;gap:7px;overflow:hidden}
+.session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.session-item .mono{display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
 .chat #chat{flex:1;min-height:0;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:8px;background:#fff;border:1px solid var(--line);border-radius:12px;overscroll-behavior:contain;overflow-anchor:none}
 .chat-tabs{display:flex;align-items:center;gap:6px;min-height:38px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f6f9ff;margin-bottom:8px;overflow:auto}
@@ -41931,16 +42224,17 @@ function renderSessions(){
     setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
     return;
   }
-  const itemH=58;
+  const itemH=94;
+  const rowStride=102;
   const viewportH=Math.max(240,Number(host.clientHeight||420));
   const scrollTop=Math.max(0,Number(host.scrollTop||0));
-  const start=Math.max(0,Math.floor(scrollTop/itemH)-8);
-  const count=Math.min(rows.length-start,Math.ceil(viewportH/itemH)+18);
+  const start=Math.max(0,Math.floor(scrollTop/rowStride)-8);
+  const count=Math.min(rows.length-start,Math.ceil(viewportH/rowStride)+18);
   const visible=rows.slice(start,start+count);
-  const padTop=start*itemH;
-  const padBottom=Math.max(0,(rows.length-start-count)*itemH);
+  const padTop=start*rowStride;
+  const padBottom=Math.max(0,(rows.length-start-count)*rowStride);
   const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
-    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"min-height:${itemH-8}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
+    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"height:${itemH}px;min-height:${itemH}px;flex:0 0 ${itemH}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
     `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
   setPanelHtml('sessionList',html);
   for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
@@ -43989,7 +44283,7 @@ async function waitForPendingUploads(){const pending=S.uploadQueuePromise;if(pen
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
-async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');if(named.size>20*1024*1024){showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});uploaded+=1;if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return{uploaded,failed}}
 async function uploadFiles(fileList){if(!S.activeId){showError(t('select_session_first'));return}const files=Array.from(fileList||[]).filter(Boolean);if(!files.length)return;const run=async()=>{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0))+files.length;try{return await _uploadFilesNow(files)}finally{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0)-files.length)}};const prev=(S.uploadQueuePromise&&typeof S.uploadQueuePromise.then==='function')?S.uploadQueuePromise:Promise.resolve();const chained=prev.catch(()=>{}).then(run);const queued=chained.finally(()=>{if(S.uploadQueuePromise===queued)S.uploadQueuePromise=null});S.uploadQueuePromise=queued;return queued}
 function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
 function statusClass(status){return `st-${normalizeStatus(status)}`}
@@ -44407,7 +44701,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await waitForPendingUploads();await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -58761,6 +59055,49 @@ class AppContext:
             wiki_store=self.code_wiki,
         )
         self.code_source_roots = self._discover_external_code_source_roots()
+        self._session_watchdog_stop = threading.Event()
+        self._session_watchdog_thread = threading.Thread(
+            target=self._session_watchdog_loop,
+            name="session-watchdog",
+            daemon=True,
+        )
+        self._session_watchdog_thread.start()
+
+    def _session_watchdog_loop(self):
+        while not self._session_watchdog_stop.is_set():
+            try:
+                self._session_watchdog_scan()
+            except Exception:
+                pass
+            self._session_watchdog_stop.wait(float(SESSION_WATCHDOG_INTERVAL_SECONDS))
+
+    def _session_watchdog_scan(self):
+        now_value = now_ts()
+        with self._lock:
+            managers = list(self._session_mgrs.values())
+        for mgr in managers:
+            try:
+                with mgr.lock:
+                    sessions = list(mgr.sessions.values())
+            except Exception:
+                continue
+            for sess in sessions:
+                try:
+                    if sess.recover_if_stale(now_value, SESSION_HEARTBEAT_STALE_SECONDS):
+                        try:
+                            sess._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        str(getattr(sess, "run_recovered_reason", "") or "")
+                                        or "session recovered by watchdog"
+                                    )
+                                },
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -62309,7 +62646,7 @@ class Handler(BaseHTTPRequestHandler):
                 (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
             ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
             return self._send_json(
-                sess.snapshot(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot)
             )
         m = re.match(r"^/api/sessions/([^/]+)/events$", path)
         if m:
