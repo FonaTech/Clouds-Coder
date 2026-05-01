@@ -232,6 +232,44 @@ LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
     int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
 )
+CHAT_UPLOAD_PARSE_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_QUEUE_MAX", "12") or "12"))),
+)
+CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS = max(
+    5,
+    min(180, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_TIMEOUT", "45") or "45"))),
+)
+CHAT_UPLOAD_INLINE_TEXT_BYTES = max(
+    16 * 1024,
+    min(512 * 1024, int(str(os.getenv("AGENT_CHAT_UPLOAD_INLINE_TEXT_BYTES", "131072") or "131072"))),
+)
+CHAT_UPLOAD_PARSE_MAX_BYTES = max(
+    256 * 1024,
+    min(
+        24 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_MAX_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))),
+    ),
+)
+CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
+    64 * 1024,
+    min(
+        4 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES", str(768 * 1024)) or str(768 * 1024))),
+    ),
+)
+CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
+    1200,
+    min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
+)
+SESSION_WATCHDOG_INTERVAL_SECONDS = max(
+    10,
+    min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
+)
+SESSION_HEARTBEAT_STALE_SECONDS = max(
+    60,
+    min(7200, int(str(os.getenv("AGENT_SESSION_HEARTBEAT_STALE_SECONDS", "900") or "900"))),
+)
 SESSION_LIST_DEFAULT_LIMIT = max(
     50,
     min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
@@ -621,9 +659,7 @@ USER_COMPLEXITY_EXPERT_TOKENS = (
     "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
     "l5",
 )
-PLAN_MODE_EXPLORER_MAX_ROUNDS = 5
-PLAN_MODE_EXPLORER_MIN_ROUNDS = 1
-PLAN_MODE_RESEARCH_SUFFICIENT_CHARS = 700
+PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
 PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
@@ -871,6 +907,10 @@ CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
 CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
 CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
 CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
+CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
+CODE_PREVIEW_DIFF_MERGE_GAP = 10
+PREVIEW_DOWNLOAD_MAX_FILES = 500
+PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 RENDER_FRAME_MAX_POINTS = 12_000
 RENDER_FRAME_MAX_LINES = 2_000
@@ -5258,91 +5298,171 @@ def _compress_rows_keep_hotspot(
     return out, truncated
 
 
+def _focused_diff_rows_from_opcodes(
+    old_lines: list[str],
+    new_lines: list[str],
+    opcodes: list[tuple[str, int, int, int, int]],
+    *,
+    max_rows: int,
+    context_lines: int = CODE_PREVIEW_DIFF_CONTEXT_LINES,
+    merge_gap: int = CODE_PREVIEW_DIFF_MERGE_GAP,
+) -> tuple[list[dict], bool]:
+    context_lines = max(0, int(context_lines or 0))
+    merge_gap = max(0, int(merge_gap or 0))
+    max_rows = max(8, int(max_rows or 8))
+    hunks: list[dict] = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        old_start = max(0, i1 - context_lines)
+        old_end = min(len(old_lines), i2 + context_lines)
+        new_start = max(0, j1 - context_lines)
+        new_end = min(len(new_lines), j2 + context_lines)
+        if hunks and old_start <= (int(hunks[-1]["old_end"]) + merge_gap) and new_start <= (int(hunks[-1]["new_end"]) + merge_gap):
+            hunks[-1]["old_end"] = max(int(hunks[-1]["old_end"]), old_end)
+            hunks[-1]["new_end"] = max(int(hunks[-1]["new_end"]), new_end)
+            hunks[-1]["change_count"] = int(hunks[-1].get("change_count", 0)) + max(1, (i2 - i1) + (j2 - j1))
+        else:
+            hunks.append(
+                {
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": new_start,
+                    "new_end": new_end,
+                    "change_count": max(1, (i2 - i1) + (j2 - j1)),
+                }
+            )
+    if not hunks:
+        return [], False
+
+    rows: list[dict] = []
+    op_idx = 0
+    prev_old_end = 0
+    prev_new_end = 0
+
+    def _append_gap(old_start: int, new_start: int):
+        old_gap = max(0, int(old_start) - int(prev_old_end))
+        new_gap = max(0, int(new_start) - int(prev_new_end))
+        gap = max(old_gap, new_gap)
+        if gap > 0:
+            rows.append(_skip_row(f"⋮ ... ({gap} unchanged lines omitted)"))
+
+    for hunk in hunks:
+        h_old_start = int(hunk["old_start"])
+        h_old_end = int(hunk["old_end"])
+        h_new_start = int(hunk["new_start"])
+        h_new_end = int(hunk["new_end"])
+        _append_gap(h_old_start, h_new_start)
+        while op_idx < len(opcodes):
+            tag, i1, i2, j1, j2 = opcodes[op_idx]
+            if i2 <= h_old_start and j2 <= h_new_start:
+                op_idx += 1
+                continue
+            if i1 >= h_old_end and j1 >= h_new_end:
+                break
+            if tag == "equal":
+                start_old = max(i1, h_old_start)
+                end_old = min(i2, h_old_end)
+                offset = start_old - i1
+                for old_i in range(start_old, end_old):
+                    new_j = j1 + offset + (old_i - start_old)
+                    if new_j < h_new_start or new_j >= h_new_end or new_j >= len(new_lines):
+                        continue
+                    rows.append(
+                        {
+                            "kind": "context",
+                            "sign": " ",
+                            "old_line": old_i + 1,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "delete":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+            elif tag == "insert":
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "replace":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            if i2 <= h_old_end and j2 <= h_new_end:
+                op_idx += 1
+            else:
+                break
+        prev_old_end = h_old_end
+        prev_new_end = h_new_end
+    trailing_gap = max(len(old_lines) - prev_old_end, len(new_lines) - prev_new_end)
+    if trailing_gap > 0:
+        rows.append(_skip_row(f"⋮ ... ({trailing_gap} unchanged lines omitted)"))
+    out, truncated = _compress_rows_keep_hotspot(rows, max_rows)
+    return out, bool(truncated or len(out) < len(rows))
+
+
 def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
-    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
-    entries: list[dict] = []
     max_lines = max(16, int(max_lines or 320))
-    # Keep bounded memory on huge files while preserving latest/hot rows.
-    buffer_cap = max(max_lines + 256, min(6_000, max_lines * 6))
-    dropped_head = 0
-
-    def _push(row: dict):
-        nonlocal dropped_head
-        entries.append(row)
-        if len(entries) <= buffer_cap:
-            return
-        drop = len(entries) - buffer_cap
-        del entries[:drop]
-        dropped_head += drop
-
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for off in range(i2 - i1):
-                _push(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "old_col": 1,
-                        "new_col": 1,
-                        "text": old_lines[i1 + off],
-                    }
-                )
-        elif tag == "delete":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-        elif tag == "insert":
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-        elif tag == "replace":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-    out, _ = _compress_rows_keep_hotspot(entries, max_lines, prefix_omitted=dropped_head)
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    rows, _ = _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        list(sm.get_opcodes()),
+        max_rows=max_lines,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
+    if rows:
+        return rows
+    show = min(len(new_lines), max_lines)
+    out = [
+        {
+            "kind": "context",
+            "sign": " ",
+            "old_line": i + 1,
+            "new_line": i + 1,
+            "old_col": 1,
+            "new_col": 1,
+            "text": new_lines[i],
+        }
+        for i in range(show)
+    ]
+    if len(new_lines) > show:
+        out.append(_skip_row(f"⋮ ... ({len(new_lines) - show} lines omitted)"))
     return out
 
 def render_numbered_diff_text(entries: list[dict]) -> str:
@@ -5395,9 +5515,13 @@ def preview_kind_for_path(path_text: str) -> str:
     rel = normalize_rel_preview_path(path_text).lower()
     if not rel:
         return ""
-    if rel.endswith((".html", ".htm")):
-        return "html"
+        if rel.endswith((".html", ".htm")):
+            return "html"
     if rel.endswith((".md", ".markdown")):
+        return "markdown"
+    if is_code_preview_candidate(rel):
+        return "code"
+    if rel.endswith(".txt"):
         return "markdown"
     ext = PurePosixPath(rel).suffix.lower()
     if ext in IMAGE_EXTS:
@@ -5416,8 +5540,6 @@ def preview_kind_for_path(path_text: str) -> str:
         return "presentation"
     if ext in DOCUMENT_PREVIEW_EXTS:
         return "document"
-    if is_code_preview_candidate(rel):
-        return "code"
     return ""
 
 
@@ -5443,25 +5565,6 @@ def build_code_preview_rows(
         if tag != "equal":
             has_changes = True
             break
-    # Avoid unbounded memory for giant files while keeping recent/hot rows.
-    buffer_cap = max(max_rows + 2048, min(120_000, max_rows * 3))
-    context_window = 96
-
-    def _append(row: dict):
-        nonlocal dropped_head
-        rows.append(row)
-        if len(rows) <= buffer_cap:
-            return
-        drop = len(rows) - buffer_cap
-        del rows[:drop]
-        dropped_head += drop
-
-    def _append_skip(omitted_lines: int):
-        n = max(0, int(omitted_lines or 0))
-        if n <= 0:
-            return
-        _append(_skip_row(f"⋮ ... ({n} unchanged lines omitted)"))
-
     if not has_changes:
         total = len(new_lines)
         show = min(total, max_rows)
@@ -5480,132 +5583,14 @@ def build_code_preview_rows(
             rows.append(_skip_row(f"⋮ ... ({total - show} lines omitted)"))
         return rows, truncated
 
-    for idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag == "equal":
-            span = i2 - i1
-            if span <= 0:
-                continue
-            prev_changed = idx > 0 and opcodes[idx - 1][0] != "equal"
-            next_changed = idx + 1 < len(opcodes) and opcodes[idx + 1][0] != "equal"
-            if prev_changed and next_changed:
-                keep_head = min(context_window, span)
-                keep_tail = min(context_window, max(0, span - keep_head))
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if next_changed:
-                keep_tail = min(context_window, span)
-                _append_skip(span - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if prev_changed:
-                keep_head = min(context_window, span)
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head)
-                continue
-            keep = min(context_window * 2, span)
-            for off in range(keep):
-                _append(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "text": new_lines[j1 + off],
-                    }
-                )
-            _append_skip(span - keep)
-            continue
-        if tag == "delete":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            continue
-        if tag == "insert":
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-            continue
-        if tag == "replace":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-    out, truncated = _compress_rows_keep_hotspot(rows, max_rows, prefix_omitted=dropped_head)
-    if truncated and out and str(out[-1].get("kind", "")).lower() == "skip":
-        out[-1]["text"] = str(out[-1].get("text") or "").strip() or f"⋮ ... preview truncated at {max_rows} rows"
-    return out, truncated
+    return _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        opcodes,
+        max_rows=max_rows,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
 
 class EventHub:
     _MAXSIZE = 512
@@ -13447,6 +13432,12 @@ class SessionState:
         self.operations: list[dict] = []
         self.code_preview_index: dict[str, list[dict]] = {}
         self.uploads: list[dict] = []
+        self.upload_parse_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_PARSE_QUEUE_MAX)
+        self.upload_parse_worker_started = False
+        self.upload_parse_worker_lock = threading.Lock()
+        self.upload_parse_last_heartbeat = 0.0
+        self.upload_parse_active_id = ""
+        self.upload_parse_active_started_at = 0.0
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
         self.runtime_knowledge_reference_text = ""
@@ -13456,6 +13447,10 @@ class SessionState:
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
         self.run_generation = 0
+        self.run_started_at = 0.0
+        self.run_last_heartbeat = 0.0
+        self.run_recovered_at = 0.0
+        self.run_recovered_reason = ""
         self.live_input_seq = 0
         self.agent_round_index = 0
         self.current_phase = "idle"
@@ -15144,6 +15139,11 @@ class SessionState:
             return int(self.event_seq)
 
     def _emit(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -15166,6 +15166,11 @@ class SessionState:
         self.activity = self.activity[-300:]
 
     def _emit_transient(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -20108,6 +20113,84 @@ body{padding:18px}
                 return self._preview_ppt_html(fp)
         raise ValueError(f"html preview not supported for: {rel}")
 
+    def preview_html_bundle(self, rel_path: str) -> bytes:
+        fp = self._session_path(rel_path)
+        rel = normalize_rel_preview_path(self._session_rel(fp))
+        if not rel:
+            raise ValueError("path required")
+        if not fp.exists() or not fp.is_file():
+            raise FileNotFoundError(f"file not found: {rel}")
+        if fp.suffix.lower() not in {".html", ".htm"}:
+            raise ValueError(f"html bundle not supported for: {rel}")
+        root = self.files_root.resolve()
+        html_text = try_read_text(fp, max_bytes=4_000_000) or ""
+        candidates: set[Path] = {fp.resolve()}
+        base_dir = fp.parent.resolve()
+        attr_re = re.compile(r'''(?is)\b(?:src|href|poster)\s*=\s*["']([^"']+)["']''')
+        css_re = re.compile(r'''(?is)url\(\s*["']?([^"')]+)["']?\s*\)''')
+        raw_refs = [m.group(1) for m in attr_re.finditer(html_text)]
+        raw_refs.extend(m.group(1) for m in css_re.finditer(html_text))
+        for raw_ref in raw_refs:
+            ref = html.unescape(str(raw_ref or "").strip())
+            if not ref or ref.startswith(("#", "data:", "javascript:", "mailto:", "tel:", "//")):
+                continue
+            if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", ref):
+                continue
+            ref = ref.split("#", 1)[0].split("?", 1)[0].strip()
+            if not ref:
+                continue
+            try:
+                candidate = (base_dir / unquote(ref)).resolve()
+                if not candidate.is_relative_to(root):
+                    continue
+                if candidate.exists() and candidate.is_file():
+                    candidates.add(candidate)
+            except Exception:
+                continue
+        # Include common same-directory asset folders for offline HTML exports.
+        for dirname in ("assets", "asset", "static", "js", "css", "images", "img", "media"):
+            d = base_dir / dirname
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for child in sorted(d.rglob("*")):
+                    if len(candidates) >= PREVIEW_DOWNLOAD_MAX_FILES:
+                        break
+                    if child.is_file() and child.resolve().is_relative_to(root):
+                        candidates.add(child.resolve())
+            except Exception:
+                continue
+        bio = io.BytesIO()
+        total_bytes = 0
+        written = 0
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(candidates, key=lambda p: p.relative_to(root).as_posix()):
+                if written >= PREVIEW_DOWNLOAD_MAX_FILES:
+                    break
+                try:
+                    size = int(item.stat().st_size)
+                except Exception:
+                    continue
+                if total_bytes + size > PREVIEW_DOWNLOAD_MAX_BYTES:
+                    continue
+                try:
+                    arc = item.relative_to(root).as_posix()
+                    zf.write(item, arc)
+                    total_bytes += size
+                    written += 1
+                except Exception:
+                    continue
+            manifest = {
+                "source": rel,
+                "files": written,
+                "max_files": PREVIEW_DOWNLOAD_MAX_FILES,
+                "max_bytes": PREVIEW_DOWNLOAD_MAX_BYTES,
+                "generated_at": now_ts(),
+            }
+            zf.writestr("clouds_preview_bundle.json", json_dumps(manifest, indent=2))
+        bio.seek(0)
+        return bio.read()
+
     def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
         root = self.files_root.resolve()
         max_nodes = max(100, min(8000, int(max_nodes or 1200)))
@@ -20232,11 +20315,81 @@ body{padding:18px}
                 continue
         return data.decode("latin-1", errors="ignore")
 
+    def _safe_read_head_bytes(self, fp: Path, max_bytes: int = CHAT_UPLOAD_PARSE_MAX_BYTES) -> bytes:
+        try:
+            cap = max(0, int(max_bytes or 0))
+        except Exception:
+            cap = CHAT_UPLOAD_PARSE_MAX_BYTES
+        if cap <= 0:
+            return b""
+        try:
+            with open(fp, "rb") as f:
+                return f.read(cap + 1)
+        except Exception:
+            return b""
+
+    def _upload_size(self, fp: Path) -> int:
+        try:
+            return int(fp.stat().st_size or 0)
+        except Exception:
+            return 0
+
+    def _zip_read_limited(self, zf: zipfile.ZipFile, name: str, limit: int = CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) -> str:
+        try:
+            info = zf.getinfo(name)
+            if int(info.file_size or 0) > int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES):
+                return ""
+            with zf.open(info, "r") as fh:
+                data = fh.read(int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) + 1)
+            data = data[: int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES)]
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _upload_kind_for(self, safe_name: str, mime: str = "") -> tuple[str, str]:
+        ext = Path(safe_name).suffix.lower()
+        mime_low = str(mime or "").strip().lower()
+        text_like_ext = {
+            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
+            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
+            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
+            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
+            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
+            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp", ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
+            ".asm", ".s", ".bas", ".vb", ".vbs", ".vba", ".bat", ".cmd", ".ps1", ".psm1", ".clj", ".cljs", ".cljc", ".edn",
+            ".coffee", ".cr", ".dart", ".dockerfile", ".erl", ".hrl", ".ex", ".exs", ".fs", ".fsi", ".fsx",
+            ".gradle", ".groovy", ".gvy", ".hs", ".lhs", ".jl", ".lua", ".lisp", ".cl", ".el", ".scm", ".rkt",
+            ".mk", ".cmake", ".ml", ".mli", ".nix", ".pas", ".pp", ".inc", ".pde", ".ino", ".proto", ".purs",
+            ".raku", ".p6", ".sol", ".sv", ".svh", ".vh", ".vhd", ".vhdl", ".tcl", ".tk", ".tf", ".tfvars", ".hcl",
+            ".tex", ".bib", ".sty", ".cls", ".typ", ".wat", ".diff", ".patch", ".graphql", ".gql", ".prisma", ".svg",
+        }
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            return "image", ext
+        if ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            return "video", ext
+        if ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            return "audio", ext
+        if ext == ".pdf" or "pdf" in mime_low:
+            return "pdf", ext
+        if ext in (".csv", ".tsv"):
+            return "csv", ext
+        if ext in (".xlsx", ".xls"):
+            return "excel", ext
+        if ext in (".pptx", ".ppt"):
+            return "presentation", ext
+        if ext in (".docx", ".doc"):
+            return "document", ext
+        if ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low or "xml" in mime_low:
+            return "text", ext
+        return "binary", ext
+
     def _extract_pdf_text(self, pdf_path: Path) -> str:
+        if self._upload_size(pdf_path) > CHAT_UPLOAD_PARSE_MAX_BYTES:
+            return f"[skipped_large] PDF is larger than safe parse cap ({CHAT_UPLOAD_PARSE_MAX_BYTES} bytes). Use focused file tools or external extraction."
         # Prefer pdfminer.six first because it is pure Python and self-contained.
         try:
             from pdfminer.high_level import extract_text
-            text = extract_text(str(pdf_path))
+            text = extract_text(str(pdf_path), maxpages=30)
             if text and text.strip():
                 return text.strip()
         except ImportError:
@@ -20251,7 +20404,7 @@ body{padding:18px}
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
                     text=True,
-                    timeout=45,
+                    timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     return r.stdout.strip()
@@ -20259,7 +20412,7 @@ body{padding:18px}
                 pass
         # Final fallback: approximate text recovery from PDF string literals.
         try:
-            raw = pdf_path.read_bytes()
+            raw = self._safe_read_head_bytes(pdf_path, min(CHAT_UPLOAD_PARSE_MAX_BYTES, 2 * 1024 * 1024))
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
             merged = "\n".join(chunks)
@@ -20331,7 +20484,9 @@ body{padding:18px}
         return out
 
     def _extract_csv_text(self, raw: bytes) -> str:
-        text = self._decode_text_bytes(raw)
+        data = raw[: CHAT_UPLOAD_PARSE_MAX_BYTES + 1]
+        truncated = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES
+        text = self._decode_text_bytes(data)
         if not text:
             return ""
         lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -20349,15 +20504,18 @@ body{padding:18px}
             for i, row in enumerate(reader):
                 if i >= 180:
                     break
-                vals = [str(v).strip() for v in row]
+                vals = [str(v).strip()[:500] for v in row[:80]]
                 if any(vals):
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:180]
+        if truncated:
+            table_lines.insert(0, f"[truncated] CSV preview limited to {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes.")
         return trim("\n".join(table_lines), 24_000)
 
     def _extract_xlsx_text(self, fp: Path) -> str:
         if self._module_available("openpyxl"):
+            wb = None
             try:
                 import openpyxl  # type: ignore
 
@@ -20366,7 +20524,7 @@ body{padding:18px}
                 for ws in list(wb.worksheets)[:5]:
                     lines.append(f"[Sheet] {ws.title}")
                     rows = 0
-                    for row in ws.iter_rows(min_row=1, max_row=200, values_only=True):
+                    for row in ws.iter_rows(min_row=1, max_row=200, max_col=80, values_only=True):
                         vals = [str(v).strip() for v in row if v not in (None, "")]
                         if not vals:
                             continue
@@ -20374,27 +20532,39 @@ body{padding:18px}
                         rows += 1
                         if rows >= 120:
                             break
-                wb.close()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
+            finally:
+                try:
+                    if wb is not None:
+                        wb.close()
+                except Exception:
+                    pass
         try:
             with zipfile.ZipFile(fp, "r") as zf:
                 shared: list[str] = []
-                if "xl/sharedStrings.xml" in zf.namelist():
-                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                names = zf.namelist()
+                if "xl/sharedStrings.xml" in names:
+                    shared_xml = self._zip_read_limited(zf, "xl/sharedStrings.xml")
                     shared = self._extract_xml_text_tokens(shared_xml, ("t",))
                 lines: list[str] = []
-                for name in sorted(zf.namelist()):
+                sheet_count = 0
+                for name in sorted(names):
                     if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
                         continue
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
-                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    sheet_count += 1
+                    if sheet_count > 5:
+                        break
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text[:CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES])
                     lines.append(f"[Sheet] {Path(name).stem}")
                     taken = 0
                     for row_raw in rows_raw:
-                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)[:80]
                         vals: list[str] = []
                         for attrs, body in cells:
                             ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
@@ -20417,7 +20587,7 @@ body{padding:18px}
                                         token = html.unescape(raw)
                             token = token.strip()
                             if token:
-                                vals.append(token)
+                                vals.append(token[:500])
                         if vals:
                             lines.append("\t".join(vals))
                             taken += 1
@@ -20433,6 +20603,7 @@ body{padding:18px}
 
     def _extract_xls_text(self, fp: Path) -> str:
         if self._module_available("xlrd"):
+            wb = None
             try:
                 import xlrd  # type: ignore
 
@@ -20443,19 +20614,24 @@ body{padding:18px}
                     lines.append(f"[Sheet] {sh.name}")
                     for r in range(min(sh.nrows, 120)):
                         vals: list[str] = []
-                        for c in range(sh.ncols):
+                        for c in range(min(sh.ncols, 80)):
                             value = sh.cell_value(r, c)
                             if value in ("", None):
                                 continue
-                            vals.append(str(value).strip())
+                            vals.append(str(value).strip()[:500])
                         if vals:
                             lines.append("\t".join(vals))
-                wb.release_resources()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
-        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+            finally:
+                try:
+                    if wb is not None:
+                        wb.release_resources()
+                except Exception:
+                    pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
         if xls2csv_text:
             return trim(xls2csv_text, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20467,13 +20643,13 @@ body{padding:18px}
 
                 doc = docx.Document(str(fp))
                 lines: list[str] = []
-                for p in doc.paragraphs:
+                for p in list(doc.paragraphs)[:1500]:
                     text = (p.text or "").strip()
                     if text:
                         lines.append(text)
-                for tb in doc.tables:
-                    for row in tb.rows:
-                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                for tb in list(doc.tables)[:40]:
+                    for row in list(tb.rows)[:120]:
+                        vals = [str(cell.text or "").strip()[:500] for cell in list(row.cells)[:40]]
                         vals = [v for v in vals if v]
                         if vals:
                             lines.append("\t".join(vals))
@@ -20486,7 +20662,9 @@ body{padding:18px}
                 parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
                 lines: list[str] = []
                 for name in sorted(parts):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Part] {Path(name).name}")
@@ -20505,7 +20683,7 @@ body{padding:18px}
             ["catdoc", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20517,9 +20695,9 @@ body{padding:18px}
 
                 pres = pptx.Presentation(str(fp))
                 lines: list[str] = []
-                for idx, slide in enumerate(pres.slides, 1):
+                for idx, slide in enumerate(list(pres.slides)[:80], 1):
                     lines.append(f"[Slide {idx}]")
-                    for shape in slide.shapes:
+                    for shape in list(slide.shapes)[:120]:
                         text = ""
                         if hasattr(shape, "text"):
                             text = str(getattr(shape, "text") or "").strip()
@@ -20533,8 +20711,10 @@ body{padding:18px}
             with zipfile.ZipFile(fp, "r") as zf:
                 slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
                 lines: list[str] = []
-                for name in sorted(slides):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                for name in sorted(slides)[:80]:
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Slide] {Path(name).stem}")
@@ -20550,7 +20730,7 @@ body{padding:18px}
             ["catppt", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20728,80 +20908,23 @@ body{padding:18px}
         stored = self.uploads_dir / f"{upload_id}_{safe_name}"
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_bytes(raw)
-        ext = stored.suffix.lower()
-        text_like_ext = {
-            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
-            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
-            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
-            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
-            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
-            # Fortran
-            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
-            # Additional text-like source formats
-            ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
-            ".asm", ".s",
-            ".bas", ".vb", ".vbs", ".vba",
-            ".bat", ".cmd", ".ps1", ".psm1",
-            ".clj", ".cljs", ".cljc", ".edn",
-            ".coffee", ".cr", ".dart",
-            ".dockerfile",
-            ".erl", ".hrl", ".ex", ".exs",
-            ".fs", ".fsi", ".fsx",
-            ".gradle", ".groovy", ".gvy",
-            ".hs", ".lhs",
-            ".jl", ".lua",
-            ".lisp", ".cl", ".el", ".scm", ".rkt",
-            ".mk", ".cmake",
-            ".ml", ".mli", ".nix",
-            ".pas", ".pp", ".inc",
-            ".pde", ".ino",
-            ".proto", ".purs",
-            ".raku", ".p6",
-            ".sol",
-            ".sv", ".svh", ".vh", ".vhd", ".vhdl",
-            ".tcl", ".tk",
-            ".tf", ".tfvars", ".hcl",
-            ".tex", ".bib", ".sty", ".cls", ".typ",
-            ".wat",
-            ".diff", ".patch",
-            ".graphql", ".gql",
-            ".prisma", ".svg",
-        }
-        # --- Fast phase: determine kind without heavy parsing ---
-        kind = "binary"
-        mime_low = str(mime or "").strip().lower()
-        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
-            kind = "image"
-        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
-            kind = "video"
-        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
-            kind = "audio"
-        elif ext == ".pdf" or "pdf" in mime_low:
-            kind = "pdf"
-        elif ext == ".csv":
-            kind = "csv"
-        elif ext in (".xlsx", ".xls"):
-            kind = "excel"
-        elif ext in (".pptx", ".ppt"):
-            kind = "presentation"
-        elif ext in (".docx", ".doc"):
-            kind = "document"
-        elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
-            kind = "text"
-        # For small text files, parse inline (fast); for everything else, defer
+        kind, ext = self._upload_kind_for(safe_name, mime)
         parsed_excerpt = ""
-        needs_async_parse = False
+        needs_parse = kind in {"text", "pdf", "csv", "excel", "presentation", "document"}
         if kind == "text":
             is_code_upload = self._upload_is_code_like(filename=safe_name, kind=kind)
-            large_text = len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES
-            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or large_text) else 12_000
-            parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
-        elif kind in ("pdf", "csv", "excel", "presentation", "document"):
-            needs_async_parse = True
+            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES) else CHAT_UPLOAD_TEXT_CONTEXT_CHARS
+            parsed_excerpt = trim(self._decode_text_bytes(raw[: CHAT_UPLOAD_INLINE_TEXT_BYTES + 1]), excerpt_cap)
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
         workspace_rel = self._session_rel(workspace_target)
+        too_large_for_parse = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}
+        parse_status = "skipped_large" if too_large_for_parse else ("pending" if needs_parse else "done")
+        parse_error = (
+            f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            if too_large_for_parse else ""
+        )
         meta = {
             "id": upload_id,
             "filename": safe_name,
@@ -20813,47 +20936,36 @@ body{padding:18px}
             "stored_path": str(stored),
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
-            "parse_status": "pending" if needs_async_parse else "done",
-            "parse_error": "",
+            "parse_status": parse_status,
+            "parse_error": parse_error,
+            "parse_started_at": 0.0,
+            "parse_finished_at": now_ts() if parse_status in {"done", "skipped_large"} else 0.0,
         }
         with self.lock:
             self.uploads.append(meta)
             self.uploads = self.uploads[-80:]
             self.updated_at = now_ts()
             self._persist()
-        if parsed_excerpt:
-            bb_excerpt = self._prepare_upload_excerpt(
-                safe_name,
-                workspace_rel,
-                kind,
-                parsed_excerpt,
-                max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                max_lines=60,
-            )
-            if bb_excerpt:
-                bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                self._blackboard_append_section("research_notes", "system", bb_content)
-        if not needs_async_parse:
-            self._emit(
-                "upload",
-                {
-                    "id": upload_id,
-                    "filename": safe_name,
-                    "workspace_path": workspace_rel,
-                    "kind": kind,
-                    "size": len(raw),
-                    "parse_status": meta["parse_status"],
-                    "parse_error": "",
-                    "summary": f"upload: {safe_name} -> {workspace_rel}",
-                    "preview": trim(parsed_excerpt, 500),
-                },
-            )
+        self._emit(
+            "upload",
+            {
+                "id": upload_id,
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "parse_status": meta["parse_status"],
+                "parse_error": parse_error,
+                "summary": f"upload saved: {safe_name} -> {workspace_rel}",
+                "preview": trim(parsed_excerpt, 500),
+            },
+        )
         # --- Config detection (kept synchronous as per user preference) ---
         loaded_config = None
         low_name = safe_name.lower()
         cfg_obj = {}
-        if ext == ".json" or "json" in (mime or "").lower() or "config" in low_name:
-            cfg_text = self._decode_text_bytes(raw)
+        if (ext == ".json" or "json" in (mime or "").lower() or "config" in low_name) and len(raw) <= CHAT_UPLOAD_INLINE_TEXT_BYTES:
+            cfg_text = self._decode_text_bytes(raw[:CHAT_UPLOAD_INLINE_TEXT_BYTES])
             cfg_obj = parse_json_object(cfg_text, {})
         named_config = (
             low_name == "llm.config.json"
@@ -20884,37 +20996,10 @@ body{padding:18px}
                 "summary": f"LLM config {'queued (agent running)' if config_delayed else 'applied'} from {safe_name}",
                 "delayed": config_delayed,
             })
-        # --- Slow phase: async parsing + library ingestion ---
-        if needs_async_parse:
-            threading.Thread(
-                target=self._parse_upload_async,
-                args=(upload_id, safe_name, stored, workspace_target, kind, ext, raw, mime),
-                daemon=True,
-            ).start()
+        if parse_status == "pending":
+            self._enqueue_upload_parse(upload_id, safe_name, stored, workspace_target, kind, ext, mime)
         else:
-            # Inline RAG/Code callback for already-parsed files
-            parsed_target: Path | None = None
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                meta["rag"] = dict(rag_info)
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, len(raw))
         return {
             "id": upload_id,
             "filename": safe_name,
@@ -20928,14 +21013,153 @@ body{padding:18px}
             "model_catalog": loaded_config,
         }
 
-    def _parse_upload_async(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, raw: bytes, mime: str):
-        """Async parsing phase — runs in background thread for heavy file types."""
+    def _enqueue_upload_parse(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, mime: str):
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "stored": str(stored),
+            "workspace_target": str(workspace_target),
+            "kind": kind,
+            "ext": ext,
+            "mime": mime,
+            "queued_at": now_ts(),
+        }
+        try:
+            self.upload_parse_queue.put_nowait(job)
+            self._ensure_upload_parse_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                parse_status="skipped_timeout",
+                parse_error=f"upload parse queue is full ({CHAT_UPLOAD_PARSE_QUEUE_MAX}); file saved without parsing",
+                parse_finished_at=now_ts(),
+            )
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, 0, "skipped_timeout", "upload parse queue is full", "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, self._upload_size(workspace_target))
+
+    def _ensure_upload_parse_worker(self):
+        with self.upload_parse_worker_lock:
+            if self.upload_parse_worker_started:
+                return
+            self.upload_parse_worker_started = True
+            threading.Thread(target=self._upload_parse_worker_loop, name=f"upload-parse-{self.id}", daemon=True).start()
+
+    def _upload_parse_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_parse_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_parse_worker_lock:
+                    if self.upload_parse_queue.empty():
+                        self.upload_parse_worker_started = False
+                        return
+                    continue
+            try:
+                if isinstance(job, dict):
+                    self._parse_upload_job(job)
+            except Exception as exc:
+                try:
+                    upload_id = str((job or {}).get("id", ""))
+                    safe_name = str((job or {}).get("safe_name", "upload"))
+                    workspace_target = Path(str((job or {}).get("workspace_target", "")))
+                    kind = str((job or {}).get("kind", "file"))
+                    self._patch_upload_meta(
+                        upload_id,
+                        parse_status="failed_saved",
+                        parse_error=trim(str(exc), 300),
+                        parse_finished_at=now_ts(),
+                    )
+                    self._emit_upload_status(upload_id, safe_name, workspace_target, kind, self._upload_size(workspace_target), "failed_saved", trim(str(exc), 300), "")
+                except Exception:
+                    pass
+            finally:
+                with self.lock:
+                    self.upload_parse_active_id = ""
+                    self.upload_parse_active_started_at = 0.0
+                    self.upload_parse_last_heartbeat = now_ts()
+                try:
+                    self.upload_parse_queue.task_done()
+                except Exception:
+                    pass
+
+    def _patch_upload_meta(self, upload_id: str, **updates):
+        if not upload_id:
+            return
+        with self.lock:
+            for idx in range(len(self.uploads) - 1, -1, -1):
+                row = self.uploads[idx]
+                if str(row.get("id", "")) != upload_id:
+                    continue
+                patched = dict(row)
+                patched.update(updates)
+                self.uploads[idx] = patched
+                self.updated_at = now_ts()
+                self._persist()
+                break
+
+    def _emit_upload_status(self, upload_id: str, safe_name: str, workspace_target: Path, kind: str, size: int, status: str, error: str = "", preview: str = ""):
+        workspace_rel = self._session_rel(workspace_target) if workspace_target else ""
+        self._emit("upload", {
+            "id": upload_id,
+            "filename": safe_name,
+            "workspace_path": workspace_rel,
+            "kind": kind,
+            "size": int(size or 0),
+            "parse_status": status,
+            "parse_error": error,
+            "summary": f"upload: {safe_name} -> {workspace_rel} (parse {status})",
+            "preview": trim(preview, 500),
+        })
+
+    def _enqueue_upload_ingest(self, upload_id: str, safe_name: str, workspace_target: Path, parsed_target: Path | None, kind: str, mime: str, size: int):
+        if not callable(self.upload_callback):
+            return
+
+        def ingest():
+            rag_info: dict = {}
+            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": int(size or 0)}
+            try:
+                maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                if isinstance(maybe, dict):
+                    rag_info = dict(maybe)
+            except Exception as exc:
+                rag_info = {"ok": False, "error": trim(str(exc), 260)}
+            if rag_info:
+                self._patch_upload_meta(upload_id, rag=dict(rag_info))
+
+        threading.Thread(target=ingest, name=f"upload-ingest-{self.id}", daemon=True).start()
+
+    def _parse_upload_job(self, job: dict):
+        upload_id = str(job.get("id", ""))
+        safe_name = str(job.get("safe_name", "upload"))
+        stored = Path(str(job.get("stored", "")))
+        workspace_target = Path(str(job.get("workspace_target", "")))
+        kind = str(job.get("kind", "binary"))
+        ext = str(job.get("ext", ""))
+        mime = str(job.get("mime", ""))
+        started = now_ts()
+        with self.lock:
+            self.upload_parse_active_id = upload_id
+            self.upload_parse_active_started_at = started
+            self.upload_parse_last_heartbeat = started
+        self._patch_upload_meta(upload_id, parse_status="pending", parse_error="", parse_started_at=started)
+        size = self._upload_size(stored)
+        if size > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}:
+            msg = f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            self._patch_upload_meta(upload_id, parse_status="skipped_large", parse_error=msg, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "skipped_large", msg, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
+            return
         try:
             parsed_excerpt = ""
+            deadline = time.time() + CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS
             if kind == "pdf":
                 parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
+            elif kind == "text":
+                raw_head = self._safe_read_head_bytes(stored, CHAT_UPLOAD_INLINE_TEXT_BYTES)
+                parsed_excerpt = trim(self._decode_text_bytes(raw_head), CHAT_UPLOAD_TEXT_CONTEXT_CHARS)
             elif kind == "csv":
-                parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
+                parsed_excerpt = trim(self._extract_csv_text(self._safe_read_head_bytes(stored, CHAT_UPLOAD_PARSE_MAX_BYTES)), 24_000)
             elif kind == "excel" and ext == ".xlsx":
                 parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
             elif kind == "excel" and ext == ".xls":
@@ -20948,29 +21172,25 @@ body{padding:18px}
                 parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
             elif kind == "document" and ext == ".doc":
                 parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
+            if time.time() > deadline:
+                raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
             # Save parsed.md
             parsed_target: Path | None = None
             if parsed_excerpt and kind not in ("text", "code"):
                 parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
                 try:
-                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
+                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({size} bytes)\n\n"
                     parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
                 except Exception:
                     parsed_target = None
             # Update meta in uploads list
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parsed_excerpt"] = parsed_excerpt
-                    patched["parse_status"] = "done"
-                    patched["parse_error"] = ""
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
+            self._patch_upload_meta(
+                upload_id,
+                parsed_excerpt=parsed_excerpt,
+                parse_status="done",
+                parse_error="",
+                parse_finished_at=now_ts(),
+            )
             if parsed_excerpt:
                 bb_excerpt = self._prepare_upload_excerpt(
                     safe_name,
@@ -20984,67 +21204,14 @@ body{padding:18px}
                     bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
                     self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "done",
-                "parse_error": "",
-                "summary": f"upload: {safe_name} -> {workspace_rel}" + (f" (parsed {len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
-                "preview": trim(parsed_excerpt, 500),
-            })
-            # RAG/Code library ingestion
-            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": len(raw)}
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "done", "", parsed_excerpt)
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, parsed_target, kind, mime, size)
         except Exception as exc:
             # Mark parse as failed
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parse_status"] = "failed"
-                    patched["parse_error"] = trim(str(exc), 300)
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "failed",
-                "summary": f"upload: {safe_name} -> {workspace_rel} (parse failed)",
-                "error": trim(str(exc), 300),
-                "parse_error": trim(str(exc), 300),
-                "preview": "",
-            })
+            err = trim(str(exc), 300)
+            self._patch_upload_meta(upload_id, parse_status="failed_saved", parse_error=err, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "failed_saved", err, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
 
     def _auto_switch_model(self, reason: str) -> bool:
         if not bool(self.auto_model_switch):
@@ -22550,6 +22717,7 @@ body{padding:18px}
         with self.lock:
             self.current_phase = str(phase or "idle")
             self.current_tool_name = str(tool_name or "")
+            self.run_last_heartbeat = now_ts()
 
     def _startup_phase(self, step: str = "") -> str:
         label = trim(str(step or "").strip(), 80)
@@ -22595,6 +22763,10 @@ body{padding:18px}
                     break
                 if self.cancel_requested:
                     raise OllamaError("interrupted by user", status=499)
+                try:
+                    self.run_last_heartbeat = now_ts()
+                except Exception:
+                    pass
                 if interval > 0:
                     now = time.time()
                     if now - start_ts >= delay and now - last_progress_emit >= interval:
@@ -30250,62 +30422,6 @@ body{padding:18px}
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
 
-    def _build_user_override_task_decision(self, goal_text: str = "") -> dict:
-        """Build a deterministic task-policy row for manually selected task levels."""
-        try:
-            level = int(getattr(self, "user_task_level_override", 0) or 0)
-        except Exception:
-            level = 0
-        if level not in TASK_LEVEL_CHOICES:
-            return {}
-        policy = TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3])
-        current_complexity = normalize_task_complexity(
-            getattr(self, "runtime_task_complexity", "") or policy.get("complexity", "simple"),
-            default=str(policy.get("complexity", "simple") or "simple"),
-        )
-        if current_complexity not in TASK_COMPLEXITY_LEVELS:
-            current_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
-        profile = self._infer_task_profile(str(goal_text or ""))
-        task_type = str(getattr(self, "runtime_task_type", "") or profile.get("task_type", "general") or "general")
-        if task_type not in TASK_PROFILE_TYPES:
-            task_type = "general"
-        direct_objective = trim(
-            str(getattr(self, "runtime_direct_objective", "") or profile.get("direct_objective", "") or "").strip(),
-            800,
-        )
-        if not direct_objective:
-            direct_objective = "Proceed with direct semantic objective and concrete progress for the current request."
-        return {
-            "level": level,
-            "execution_mode": self._effective_execution_mode(),
-            "participants": list(getattr(self, "runtime_participants", []) or []),
-            "assigned_expert": str(getattr(self, "runtime_assigned_expert", "") or ""),
-            "task_type": task_type,
-            "complexity": current_complexity,
-            "scale_preference": "thorough" if level >= 4 else str(getattr(self, "runtime_scale_preference", "") or "balanced"),
-            "round_budget": int(policy.get("round_budget", getattr(self, "runtime_round_budget", 0) or 0) or 0),
-            "requires_user_confirmation": False,
-            "inherit_previous_state": True,
-            "requires_plan": bool(str(getattr(self, "plan_mode_user_preference", "") or "").lower() == "on"),
-            "direct_objective": direct_objective,
-            "judgement": f"user_task_level_override={level} - deterministic policy, no manager model call",
-            "source": "user-override",
-            "semantic_confidence": "high",
-        }
-
-    def _apply_user_override_task_policy(self, goal_text: str = "") -> dict:
-        """Apply the manual task-level policy without any classifier/model call."""
-        goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
-        if not goal:
-            goal = trim(str(self._latest_user_goal_text() or "").strip(), 4000)
-        decision = self._build_user_override_task_decision(goal)
-        if not decision:
-            return {}
-        self.runtime_reclassify_required = False
-        self.runtime_goal_reset_pending = False
-        self._apply_runtime_task_decision(goal, decision)
-        return dict(decision)
-
     def _plan_steps_context_for_manager(self) -> str:
         bb = self._ensure_blackboard()
         todos = bb.get("project_todos", [])
@@ -34099,23 +34215,15 @@ body{padding:18px}
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 return self._dispatch_tool_inner(name, args, role_key)
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
-            future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
-            timed_out = False
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                timed_out = True
-                future.cancel()
-                self._emit("error", {
-                    "summary": f"tool '{name}' timed out after {timeout}s",
-                })
-                return f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
-            finally:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}") as pool:
+                future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
                 try:
-                    pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
-                except TypeError:
-                    pool.shutdown(wait=not timed_out)
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    self._emit("error", {
+                        "summary": f"tool '{name}' timed out after {timeout}s",
+                    })
+                    return f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
         except Exception as exc:
             tb_lines = traceback.format_exc()
             self._emit("error", {
@@ -34669,6 +34777,7 @@ body{padding:18px}
                            "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
                            "skill_analysis"}:
                 self._blackboard_append_section(section, actor, content)
+                self._blackboard_append_section(section, actor, content)
             elif section == "conversation_history":
                 self._blackboard_history(actor, content)
             elif section == "status":
@@ -35101,6 +35210,10 @@ body{padding:18px}
                     self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
                 self.running = True
+                self.run_started_at = now_ts()
+                self.run_last_heartbeat = self.run_started_at
+                self.run_recovered_at = 0.0
+                self.run_recovered_reason = ""
                 self.current_phase = "starting"
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
@@ -36091,41 +36204,7 @@ body{padding:18px}
 
     def _plan_mode_worker(self, pinned_selection: str):
         """Plan mode pipeline: explorer research -> manager synthesis -> proposal -> user choice."""
-        deterministic_text_proposal = self._plan_mode_deterministic_text_plan_proposal()
-        if deterministic_text_proposal and deterministic_text_proposal.get("options"):
-            self._set_runtime_phase("plan-mode:deterministic-text-proposal")
-            self._emit("status", {"summary": "plan-mode: deterministic text proposal generated"})
-            bb = self._ensure_blackboard()
-            bb["status"] = "PLANNING"
-            bb["plan"] = {
-                "phase": "awaiting_choice",
-                "proposal": deterministic_text_proposal,
-                "deterministic_text_plan": True,
-                "findings": [],
-            }
-            self.blackboard = bb
-            self.runtime_plan_proposal = deterministic_text_proposal
-            try:
-                self._write_plan_file(self._format_plan_file_preselection(deterministic_text_proposal))
-            except Exception:
-                pass
-            bubble_text = self._format_plan_bubble_preselection(deterministic_text_proposal)
-            self.messages.append({
-                "role": "assistant",
-                "content": bubble_text,
-                "ts": now_ts(),
-                "agent_role": "planner",
-            })
-            self._emit("message", {
-                "role": "assistant",
-                "text": trim(bubble_text, int(PLAN_MESSAGE_EVENT_MAX_CHARS)),
-                "summary": "plan-mode deterministic text proposal",
-                "agent_role": "planner",
-            })
-            self._emit("status", {"summary": "plan-mode: awaiting user choice"})
-            return
         # Phase 1: explorer-led research and evidence gathering
-        self._set_runtime_phase("plan-mode:research")
         self._emit("status", {"summary": "plan-mode: research phase started"})
         bb = self._ensure_blackboard()
         bb["status"] = "PLANNING"
@@ -36141,24 +36220,14 @@ body{padding:18px}
         research_prompt = self._plan_mode_research_prompt()
         self._seed_plan_mode_explorer_context(research_prompt)
 
-        if self._plan_mode_seed_deterministic_research():
-            self._emit("status", {"summary": "plan-mode: deterministic input research complete; moving to synthesis"})
-        else:
-            for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
-                if self.cancel_requested:
-                    return
-                self._inject_pending_user_inputs()
-                step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
-                self._plan_mode_update_findings(step)
-                if step.get("status") == "interrupted":
-                    break
-                if step.get("status") in ("no-tools", "skip"):
-                    if self._plan_mode_research_sufficient(r + 1, step):
-                        self._emit("status", {"summary": "plan-mode: research complete; moving to synthesis"})
-                    break
-                if self._plan_mode_research_sufficient(r + 1, step):
-                    self._emit("status", {"summary": "plan-mode: sufficient research collected; moving to synthesis"})
-                    break
+        for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
+            if self.cancel_requested:
+                return
+            self._inject_pending_user_inputs()
+            step = self._plan_mode_explorer_turn(pinned_selection, round_idx=r)
+            if step.get("status") in ("no-tools", "skip", "interrupted"):
+                break
+            self._plan_mode_update_findings(step)
 
         # Phase 2: manager synthesis of structured executable options
         # Inject pending user inputs before synthesis
@@ -36170,7 +36239,6 @@ body{padding:18px}
             self.runtime_plan_approved = False
             return
 
-        self._set_runtime_phase("plan-mode:synthesis")
         self._emit("status", {"summary": "plan-mode: synthesizing proposals"})
         bb = self._ensure_blackboard()
         if not isinstance(bb.get("plan"), dict):
@@ -36179,28 +36247,17 @@ body{padding:18px}
         self.blackboard = bb
 
         # Synthesis with retry + model fallback + deterministic fallback
-        proposal = self._plan_mode_deterministic_file_plan_proposal()
-        if proposal and proposal.get("options"):
-            self._emit("status", {"summary": "plan-mode: deterministic file proposal generated"})
-        else:
-            proposal = self._plan_mode_deterministic_artifact_plan_proposal()
+        proposal = None
+        for _synth_attempt in range(PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS):
+            proposal = self._plan_mode_synthesize_proposal(pinned_selection)
             if proposal and proposal.get("options"):
-                self._emit("status", {"summary": "plan-mode: deterministic artifact proposal generated"})
-        if not proposal or not proposal.get("options"):
-            proposal = None
-            for _synth_attempt in range(PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS):
-                self._set_runtime_phase(f"plan-mode:synthesis:model-{_synth_attempt + 1}")
-                proposal = self._plan_mode_synthesize_proposal(pinned_selection)
-                if proposal and proposal.get("options"):
-                    break
-                if _synth_attempt < (PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS - 1):
-                    self._emit("status", {"summary": "plan-mode: synthesis retry"})
+                break
+            if _synth_attempt < (PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS - 1):
+                self._emit("status", {"summary": "plan-mode: synthesis retry"})
         if not proposal or not proposal.get("options"):
             # Last resort: minimal fallback with simpler prompt and higher token budget
-            self._set_runtime_phase("plan-mode:synthesis:minimal-fallback")
             proposal = self._synthesis_minimal_fallback(pinned_selection)
         if not proposal or not proposal.get("options"):
-            self._set_runtime_phase("plan-mode:synthesis:programmatic-fallback")
             proposal = self._synthesis_programmatic_fallback()
         if not proposal or not proposal.get("options"):
             self._emit("status", {"summary": "plan-mode: synthesis failed, falling back to direct execution"})
@@ -36225,7 +36282,6 @@ body{padding:18px}
         self.blackboard = bb
 
         # Phase 3: emit the proposal bubble to the frontend without extra reasoning.
-        self._set_runtime_phase("plan-mode:awaiting_choice")
         bubble_text = self._format_plan_bubble_preselection(proposal)
         self.messages.append({
             "role": "assistant",
@@ -36273,23 +36329,18 @@ body{padding:18px}
             f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
             f"to this task and note their names and capabilities in your findings.\n"
             f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"3. Read uploaded files (.parsed.md preferred over .pdf) only enough to understand their content and structure. "
-            f"For tabular files, header plus a small sample is enough during research.\n"
-            f"4. If relevant skills exist, mention them. Load at most ONE highly relevant skill only when its concrete workflow is needed for planning; "
-            f"do not load several large skills in research mode.\n"
-            f"5. Identify key technical details, data points, and structure needed for the output; leave heavy computation for execution.\n"
-            f"6. Assess risks and note any ambiguities that need user input, but do not block on them when the user request is executable.\n"
+            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
+            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
+            f"workflow steps, scripts, tools, and file paths\n"
+            f"5. Identify key technical details, data points, and structure needed for the output\n"
+            f"6. Assess risks and note any ambiguities that need user input\n"
             f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"8. Do NOT ask the user whether to continue or whether to generate the requested artifact. "
-            f"The user already requested the task; after research the controller will synthesize a plan and continue.\n"
-            f"9. Write your findings to the blackboard under 'plan_findings'. Include:\n"
+            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
             f"   - Relevant skills found (names, what they do, how to invoke them)\n"
             f"   - File inventory (uploaded files, their types, sizes, key content)\n"
             f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
             f"   - Content analysis (key themes, structure, data points extracted from inputs)\n"
-            f"10. When enough evidence is collected, stop using tools and output a concise research-complete summary. "
-            f"Do not request permission to proceed.\n"
-            f"11. For coding tasks, identify the test strategy:\n"
+            f"9. For coding tasks, identify the test strategy:\n"
             f"   - What build/compilation commands are available? (Makefile, npm, cargo, cmake, etc.)\n"
             f"   - What test frameworks/suites exist? (pytest, jest, go test, etc.)\n"
             f"   - What are the critical paths that must be tested?\n"
@@ -36309,9 +36360,6 @@ body{padding:18px}
                 "Analyze the codebase to understand the task scope. "
                 "Do NOT modify any files. Use read_file, bash (read-only commands), "
                 "list_skills, load_skill, and blackboard tools only. "
-                "Keep research lightweight: inventory inputs, read representative files or headers, record enough evidence, then stop. "
-                "Do NOT load multiple large skills unless the user explicitly requested that specific skill workflow. "
-                "Do NOT ask the user for permission to continue after research; summarize findings and let the planner proceed. "
                 f"{skills_block}"
                 "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
                 "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
@@ -36353,8 +36401,6 @@ body{padding:18px}
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
-                "Do NOT ask the user to confirm continuation or artifact creation. "
-                "Keep this phase short; prefer 1 round of file inventory and evidence over deep implementation research. "
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
                 f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
@@ -36411,7 +36457,6 @@ body{padding:18px}
         if not tool_calls:
             return {"status": "no-tools", "text": text}
         # Execute tool calls (read-only)
-        tool_results: list[dict] = []
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted"}
@@ -36431,19 +36476,12 @@ body{padding:18px}
                         "ts": now_ts(),
                         "agent_role": "explorer",
                     }, mirror_to_global=False)
-                    tool_results.append({"name": fn_name, "args": fn_args, "ok": False, "output": result_content})
                     continue
             try:
                 raw_output = self._dispatch_tool(fn_name, fn_args, agent_role="explorer")
             except Exception as exc:
                 raw_output = f"Error: {exc}"
             result_content = str(raw_output or "")
-            tool_results.append({
-                "name": fn_name,
-                "args": fn_args,
-                "ok": not result_content.lower().startswith("error:"),
-                "output": trim(result_content, 2400),
-            })
             self._append_agent_context_message("explorer", {
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -36458,7 +36496,7 @@ body{padding:18px}
                 "result": trim(result_content, 500),
                 "summary": f"plan-mode research: {fn_name}",
             })
-        return {"status": "ok", "tool_count": len(tool_calls), "text": text, "tool_results": tool_results}
+        return {"status": "ok", "tool_count": len(tool_calls), "text": text}
 
     def _plan_mode_update_findings(self, step: dict):
         bb = self._ensure_blackboard()
@@ -36468,194 +36506,19 @@ body{padding:18px}
         findings = plan.get("findings", [])
         if not isinstance(findings, list):
             findings = []
-        text = trim(str(step.get("text", "") or ""), 4000)
-        tool_evidence: list[str] = []
-        for item in step.get("tool_results", []) or []:
-            if not isinstance(item, dict):
-                continue
-            name = trim(str(item.get("name", "") or ""), 60)
-            args = item.get("args", {}) if isinstance(item.get("args", {}), dict) else {}
-            arg_hint = ""
-            if name == "bash":
-                arg_hint = trim(str(args.get("command", "") or "").strip(), 160)
-            elif name == "read_file":
-                arg_hint = trim(str(args.get("path", "") or "").strip(), 160)
-            output = trim(str(item.get("output", "") or "").strip(), 1200)
-            if name and output:
-                if arg_hint:
-                    tool_evidence.append(f"- {name} `{arg_hint}`: {output}")
-                else:
-                    tool_evidence.append(f"- {name}: {output}")
-        content_parts = []
+        text = trim(str(step.get("text", "") or ""), 2000)
         if text:
-            content_parts.append(text)
-        if tool_evidence:
-            content_parts.append("Tool evidence:\n" + "\n".join(tool_evidence[:6]))
-        content = trim("\n\n".join(content_parts), 6000)
-        if content:
-            findings.append({"round": len(findings), "content": content, "ts": now_ts()})
+            findings.append({"round": len(findings), "content": text, "ts": now_ts()})
         findings = findings[-20:]
         plan["findings"] = findings
         bb["plan"] = plan
         self.blackboard = bb
         # B6: Emit findings status as planner
-        if content:
+        if text:
             self._emit("status", {
                 "summary": f"plan-mode: finding #{len(findings)} collected",
                 "agent_role": "planner",
             })
-
-    def _plan_mode_research_rows(self) -> list[dict]:
-        bb = self._ensure_blackboard()
-        rows: list[dict] = []
-        seen: set[str] = set()
-
-        def _add(content: object, source: str = "", actor: str = ""):
-            txt = trim(str(content or "").strip(), 6000)
-            if not txt:
-                return
-            key = re.sub(r"\s+", " ", txt.lower())[:500]
-            if key in seen:
-                return
-            seen.add(key)
-            rows.append({
-                "source": trim(str(source or ""), 60),
-                "actor": trim(str(actor or ""), 40),
-                "content": txt,
-            })
-
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        plan_rows = plan.get("findings", []) if isinstance(plan.get("findings"), list) else []
-        for item in plan_rows:
-            if isinstance(item, dict):
-                _add(item.get("content", ""), "plan.findings", "explorer")
-            else:
-                _add(item, "plan.findings", "explorer")
-        for section in ("plan_findings", "skill_analysis", "research_notes"):
-            section_rows = bb.get(section, [])
-            if not isinstance(section_rows, list):
-                continue
-            for item in section_rows:
-                if isinstance(item, dict):
-                    _add(item.get("content", ""), section, str(item.get("actor", "") or ""))
-                else:
-                    _add(item, section, "")
-        return rows[-40:]
-
-    def _plan_mode_research_text(self, max_chars: int = 6000) -> str:
-        lines: list[str] = []
-        for idx, item in enumerate(self._plan_mode_research_rows(), start=1):
-            source = trim(str(item.get("source", "") or ""), 60)
-            actor = trim(str(item.get("actor", "") or ""), 40)
-            content = trim(str(item.get("content", "") or ""), 1200)
-            label = f"Finding {idx}"
-            if source:
-                label += f" ({source}"
-                if actor:
-                    label += f"/{actor}"
-                label += ")"
-            lines.append(f"### {label}\n{content}")
-        return trim("\n\n".join(lines), max(500, int(max_chars or 6000)))
-
-    def _plan_mode_seed_deterministic_research(self) -> bool:
-        goal = str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "")
-        goal_low = goal.lower()
-        analysis_like = any(
-            token in goal_low
-            for token in (
-                "上传", "已上传", "csv", "json", "jsonl", "log", "数据", "分析", "报告",
-                "uploaded", "analy", "report", "file",
-            )
-        )
-        upload_dir = self.files_root / "uploaded"
-        if not analysis_like or not upload_dir.exists() or not upload_dir.is_dir():
-            return False
-        files = [p for p in sorted(upload_dir.iterdir()) if p.is_file()]
-        if not files:
-            return False
-        rows: list[str] = [
-            "Deterministic plan-mode research from uploaded inputs.",
-            f"Workspace: {self.files_root}",
-            "Uploaded files:",
-        ]
-        for path in files[:12]:
-            try:
-                size = path.stat().st_size
-            except Exception:
-                size = 0
-            rel = f"uploaded/{path.name}"
-            rows.append(f"- {rel} ({size} bytes)")
-            suffix = path.suffix.lower()
-            if suffix in {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt", ".md"}:
-                try:
-                    sample = path.read_text(encoding="utf-8", errors="replace")[:2200]
-                except Exception as exc:
-                    sample = f"[read error: {exc}]"
-                rows.append(f"Sample from {rel}:\n```\n{trim(sample, 2200)}\n```")
-        rows.append(
-            "Execution requirements inferred: use Python or shell to read the uploaded file(s), "
-            "compute requested metrics from file contents, create the requested output artifact(s), "
-            "then verify output files exist and include grounded numbers or source-derived fields."
-        )
-        content = trim("\n\n".join(rows), 8000)
-        bb = self._ensure_blackboard()
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {"phase": "research", "findings": []}
-        findings = plan.get("findings", []) if isinstance(plan.get("findings"), list) else []
-        findings.append({"round": len(findings), "content": content, "ts": now_ts(), "source": "deterministic"})
-        plan["findings"] = findings[-20:]
-        bb["plan"] = plan
-        self.blackboard = bb
-        self._blackboard_append_section("plan_findings", "planner", content)
-        self._emit("status", {"summary": f"plan-mode: deterministic research indexed {len(files)} uploaded file(s)"})
-        return True
-
-    def _plan_mode_research_sufficient(self, round_count: int, step: dict) -> bool:
-        try:
-            rounds = int(round_count or 0)
-        except Exception:
-            rounds = 0
-        if rounds < int(PLAN_MODE_EXPLORER_MIN_ROUNDS):
-            return False
-        text = self._plan_mode_research_text(max_chars=12000)
-        if not text:
-            return False
-        low = text.lower()
-        has_input_inventory = any(
-            token in low for token in ("uploaded/", ".csv", ".json", ".jsonl", ".log", "file inventory", "文件清单")
-        )
-        has_processing_evidence = any(
-            token in low for token in (
-                "read_file `", "bash `cat", "bash `head", "bash `python", "bash `awk", "bash `jq",
-                "total", "count", "rows", "top", "mean",
-                "std", "exit", "pytest", "统计", "总销售额", "样本", "均值", "错误类型", "风险评分",
-            )
-        )
-        has_analysis_terms = any(
-            token in low for token in ("数据", "统计", "风险", "建议", "缺失", "测试", "validation", "quality")
-        )
-        if (
-            len(text) >= int(PLAN_MODE_RESEARCH_SUFFICIENT_CHARS)
-            and (has_processing_evidence or (has_input_inventory and has_analysis_terms))
-        ):
-            return True
-        if len(text) >= 350 and has_input_inventory:
-            return True
-        completion_markers = (
-            "分析完成", "研究完成", "已完成", "research complete", "all data computed",
-            "core findings", "关键数据", "已写入黑板", "plan_findings",
-        )
-        permission_markers = (
-            "如需", "请告知", "告诉我继续", "告知我继续", "let me know", "tell me to continue",
-            "if you want me to", "if you would like me to",
-        )
-        if len(text) >= 250 and any(token in low for token in completion_markers):
-            return True
-        if len(text) >= 250 and any(token in low for token in permission_markers):
-            return True
-        tool_results = step.get("tool_results", []) if isinstance(step, dict) else []
-        if rounds >= 3 and len(text) >= 500 and isinstance(tool_results, list) and tool_results:
-            return True
-        return False
 
     # ------------------------------------------------------------------
     # Stall severity tracking & plan-mode escalation
@@ -37071,9 +36934,6 @@ body{padding:18px}
             content = trim(str(row.get("content", "") or "").strip(), 280)
             if content:
                 finding_lines.append(content)
-        blackboard_findings = self._plan_mode_research_text(max_chars=2000)
-        if blackboard_findings:
-            finding_lines.append(trim(blackboard_findings, 600))
         context = trim(
             (
                 "Fallback synthesis generated automatically from the user goal and current research findings. "
@@ -37112,2318 +36972,6 @@ body{padding:18px}
         }
         return self._normalize_plan_proposal_payload(proposal)
 
-    def _plan_mode_uploaded_file_rows(self) -> list[dict]:
-        upload_dir = self.files_root / "uploaded"
-        rows: list[dict] = []
-        if not upload_dir.exists() or not upload_dir.is_dir():
-            return rows
-        known: dict[str, dict] = {}
-        try:
-            for item in list(getattr(self, "uploads", []) or []):
-                if not isinstance(item, dict):
-                    continue
-                rel = trim(str(item.get("workspace_path", "") or ""), 260)
-                if rel:
-                    known[rel] = item
-        except Exception:
-            known = {}
-        for path in sorted(upload_dir.iterdir()):
-            if not path.is_file():
-                continue
-            rel = f"uploaded/{path.name}"
-            try:
-                size = int(path.stat().st_size)
-            except Exception:
-                size = 0
-            meta = known.get(rel, {})
-            kind = str(meta.get("kind", "") or path.suffix.lower().lstrip(".") or "file")
-            rows.append({"path": rel, "name": path.name, "kind": kind, "size": size})
-        return rows
-
-    def _plan_mode_effective_goal_text(self) -> str:
-        bb = self._ensure_blackboard()
-        goal = trim(str(bb.get("original_goal", "") or "").strip(), 4000)
-        if goal and not self._is_continuation_input(goal):
-            return goal
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        plan_bits: list[str] = []
-        for key in ("summary", "context"):
-            val = trim(str(plan.get(key, "") or "").strip(), 1600)
-            if val and not self._is_continuation_input(val):
-                plan_bits.append(val)
-        proposal = plan.get("proposal", {}) if isinstance(plan.get("proposal"), dict) else {}
-        val = trim(str(proposal.get("context", "") or "").strip(), 1600)
-        if val and not self._is_continuation_input(val):
-            plan_bits.append(val)
-        for opt in proposal.get("options", []) if isinstance(proposal.get("options"), list) else []:
-            if not isinstance(opt, dict):
-                continue
-            for key in ("summary", "title"):
-                val = trim(str(opt.get(key, "") or "").strip(), 1600)
-                if val and not self._is_continuation_input(val):
-                    plan_bits.append(val)
-            for step in opt.get("steps", []) if isinstance(opt.get("steps"), list) else []:
-                val = trim(str(step or "").strip(), 2000)
-                if val:
-                    plan_bits.append(val)
-        if isinstance(plan.get("steps"), list):
-            for step in plan.get("steps", [])[:8]:
-                val = trim(str(step or "").strip(), 2000)
-                if val:
-                    plan_bits.append(val)
-        plan_text = trim("\n".join(plan_bits), 4000)
-        if plan_text:
-            return plan_text
-        latest = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
-        if latest and not self._is_continuation_input(latest):
-            return latest
-        return latest
-
-    def _plan_mode_requested_output_paths(self, goal: str = "") -> list[str]:
-        text = str(goal or self._plan_mode_effective_goal_text() or "")
-        pattern = r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:md|csv|json|jsonl|html|txt|py|js|ts|css|sh)"
-        candidates = re.findall(pattern, text, flags=re.IGNORECASE)
-        upload_names = {
-            str(row.get("name", "") or "").lower()
-            for row in self._plan_mode_uploaded_file_rows()
-            if isinstance(row, dict)
-        }
-        upload_paths = {
-            str(row.get("path", "") or "").lower()
-            for row in self._plan_mode_uploaded_file_rows()
-            if isinstance(row, dict)
-        }
-        out: list[str] = []
-        for raw in candidates:
-            item = trim(str(raw or "").strip().strip("`'\"，。；;:："), 260)
-            if not item:
-                continue
-            low = item.lower().lstrip("./")
-            if low.startswith("uploaded/") or low in upload_paths or Path(low).name in upload_names:
-                continue
-            if item not in out:
-                out.append(item)
-            if len(out) >= 12:
-                break
-        return out
-
-    def _deterministic_artifact_output_paths(self, goal: str = "") -> list[str]:
-        goal_text = str(goal or self._plan_mode_effective_goal_text() or "")
-        outputs = list(self._plan_mode_requested_output_paths(goal_text))
-        low = goal_text.lower()
-
-        def _add(path: str):
-            p = trim(str(path or "").strip(), 260)
-            if p and p not in outputs:
-                outputs.append(p)
-
-        if "parse_duration" in low:
-            _add("parse_duration.py")
-        if "is_valid_email" in low:
-            _add("email_validator.py")
-            _add("test_email_validator.py")
-        if "debounce" in low:
-            _add("debounce.js")
-        if "throttle" in low:
-            _add("throttle.js")
-        if "slugify" in low:
-            _add("slugify.py")
-        if "lru" in low and "cache" in low:
-            _add("lru_cache.py")
-        if "safe_backup" in low or "backup" in low and "bash" in low:
-            _add("safe_backup.sh")
-        if "count_lines" in low or ("行数" in low and ("bash" in low or "shell" in low or "脚本" in low)):
-            _add("count_lines.sh")
-        if "clean_csv" in low or ("csv" in low and "清洗" in low):
-            _add("clean_csv.py")
-            _add("dirty_sample.csv")
-            _add("cleaned_sample.csv")
-        if "word_stats" in low or "词频" in low:
-            _add("word_stats.py")
-        if "todo_demo" in low or ("待办" in low and "html" in low):
-            _add("todo_demo.html")
-        if "counter_demo" in low or ("计数器" in low and "html" in low):
-            _add("counter_demo.html")
-        if "config_loader" in low:
-            _add("config_loader.py")
-            _add("sample_config.json")
-            _add("test_config_loader.py")
-        if "json_summary" in low or ("json" in low and "字段列表" in low and "记录数" in low):
-            _add("json_summary.py")
-            _add("sample_records.json")
-        if "书签管理器" in low and not any(p.lower() == "readme.md" for p in outputs):
-            _add("README.md")
-        return outputs[:16]
-
-    def _plan_mode_should_use_deterministic_file_plan(self) -> bool:
-        uploaded_rows = self._plan_mode_uploaded_file_rows()
-        if not uploaded_rows:
-            return False
-        goal = str(self._plan_mode_effective_goal_text() or "")
-        low = goal.lower()
-        if any(
-            token in low
-            for token in (
-                "上传", "已上传", "uploaded", "csv", "json", "jsonl", "log",
-                "数据", "分析", "统计", "清洗", "报告", "计算", "汇总", "审计",
-                "analy", "report", "summary", "clean", "audit", "calculate",
-            )
-        ):
-            return True
-        return any(
-            str(row.get("path", "") or "").lower().endswith((".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt"))
-            and not str(row.get("path", "") or "").lower().endswith(".parsed.md")
-            for row in uploaded_rows
-        )
-
-    def _plan_mode_deterministic_file_plan_proposal(self) -> dict:
-        if not self._plan_mode_should_use_deterministic_file_plan():
-            return {}
-        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
-        files = self._plan_mode_uploaded_file_rows()
-        file_list = ", ".join(str(row.get("path", "")) for row in files[:8] if isinstance(row, dict))
-        outputs = self._deterministic_artifact_output_paths(goal)
-        output_list = ", ".join(outputs) if outputs else "the requested report/output artifact(s)"
-        steps = [
-            (
-                "1. Input inventory and schema grounding\n"
-                f"1.1 Run `ls -la uploaded/` and confirm the available input files: {file_list or 'uploaded files'}.\n"
-                "1.2 Read the uploaded file headers and representative rows with Python or shell; capture row counts, columns, and obvious missing/invalid values.\n"
-                "1.3 Record the source file paths and constraints so later conclusions stay grounded in uploaded data only."
-            ),
-            (
-                "2. Deterministic computation from source data\n"
-                "2.1 Use Python or shell to parse the uploaded files according to their actual format (CSV/JSON/JSONL/log/text).\n"
-                "2.2 Compute every requested aggregate, ranking, anomaly, distribution, or quality check directly from parsed rows.\n"
-                "2.3 Print or save intermediate calculation evidence so totals and counts can be verified before writing the final artifact."
-            ),
-            (
-                "3. Generate requested deliverables\n"
-                f"3.1 Create {output_list} using only calculated values and source-derived examples.\n"
-                "3.2 Include explicit uncertainty notes for fields or facts that cannot be determined from the uploaded files.\n"
-                "3.3 Include actionable recommendations tied to the computed findings rather than generic advice."
-            ),
-            (
-                "4. Verification and delivery report\n"
-                f"4.1 Run commands that verify {output_list} exist and contain the required key sections/terms.\n"
-                "4.2 Re-check at least one important total or count from the generated output against the calculation output.\n"
-                "4.3 Generate delivery report: summarize files produced, commands run, validation evidence, and any remaining limits."
-            ),
-        ]
-        proposal = {
-            "context": trim(
-                (
-                    "Deterministic file-analysis plan generated from uploaded inputs. "
-                    f"Inputs: {file_list or 'uploaded files'}. Outputs: {output_list}. "
-                    "The execution must read and compute from files instead of estimating."
-                ),
-                1800,
-            ),
-            "options": [
-                {
-                    "id": "A",
-                    "title": "Grounded File Analysis",
-                    "summary": trim(goal or "Analyze uploaded files and produce grounded outputs.", 280),
-                    "steps": steps,
-                    "pros": "Avoids hallucinated metrics by forcing file reads, deterministic computation, artifact generation, and verification.",
-                    "cons": "Uses one direct path instead of asking the model to invent multiple alternative plans.",
-                    "risk": "low",
-                }
-            ],
-            "recommended": "A",
-        }
-        return self._normalize_plan_proposal_payload(proposal)
-
-    def _plan_mode_should_use_deterministic_artifact_plan(self) -> bool:
-        if self._plan_mode_uploaded_file_rows():
-            return False
-        goal = str(self._plan_mode_effective_goal_text() or "")
-        low = goal.lower()
-        outputs = self._deterministic_artifact_output_paths(goal)
-        if not outputs:
-            return False
-        if not any(path.endswith((".py", ".json", ".csv", ".md", ".html", ".js", ".sh")) for path in outputs):
-            return False
-        return any(
-            token in low
-            for token in (
-                "python", "脚本", "script", "pipeline", "管道", "生成", "创建",
-                "报告", "report", "html", "json", "csv", "迁移", "migrate",
-                "javascript", "node", "bash", "测试", "验证", "实现", "函数", "class",
-                "event_summary", "metrics", "customer_health", "配置",
-                "debounce", "parse_duration", "lru", "clean_csv", "safe_backup",
-                "is_valid_email", "config_loader", "word_stats", "todo_demo",
-            )
-        )
-
-    def _plan_mode_should_use_deterministic_text_plan(self) -> bool:
-        if self._plan_mode_uploaded_file_rows():
-            return False
-        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 4000)
-        if not goal or self._plan_mode_requested_output_paths(goal):
-            return False
-        if len(goal) > 1600:
-            return False
-        low = goal.lower()
-        tool_or_artifact = (
-            ".py", ".js", ".ts", ".html", ".css", ".json", ".jsonl", ".csv", ".md",
-            "工作区", "当前目录", "当前会话工作区", "保存为", "生成文件", "创建文件",
-            "运行", "测试", "验证输出", "命令行", "shell", "terminal",
-            "python", "javascript", "node", "pytest", "bash", "脚本", "函数",
-            "实现", "修复", "重构", "api", "数据库", "docker", "部署",
-            "workspace", "create file", "write file", "run test", "implement",
-            "refactor", "debug",
-        )
-        if any(token in low for token in tool_or_artifact):
-            return False
-        text_plan_markers = (
-            "设计方案", "方案", "阶段性计划", "排查优先级", "可验证指标",
-            "流程", "复盘", "风险控制", "产出物", "分析", "制定", "规划",
-            "路线图", "优先级",
-            "plan", "workflow", "roadmap", "retention", "metrics",
-        )
-        if str(self.plan_mode_user_preference or "auto").lower() == "on":
-            return any(token in low for token in text_plan_markers) or len(goal) <= 600
-        try:
-            level = int(self.runtime_task_level or 0)
-        except Exception:
-            level = 0
-        return level >= 3 and any(token in low for token in text_plan_markers)
-
-    def _plan_mode_text_plan_steps_for_goal(self, goal: str) -> list[str]:
-        low = str(goal or "").lower()
-        if any(token in low for token in ("排查", "下降", "原因", "指标", "metrics", "retention", "diagnose")):
-            return [
-                (
-                    "1. 明确问题口径和边界\n"
-                    "1.1 定义核心指标、观察周期、影响对象和异常阈值。\n"
-                    "1.2 按用户、渠道、版本、地域、设备或业务线拆分趋势。\n"
-                    "1.3 先排除埋点、口径、样本结构和数据延迟导致的假异常。"
-                ),
-                (
-                    "2. 拆解可能原因\n"
-                    "2.1 从获客、激活、体验、交付、价格、支持和外部环境拆分假设。\n"
-                    "2.2 为每个假设绑定可观测证据，避免只凭主观判断排序。\n"
-                    "2.3 结合定量数据和定性反馈定位最可能的断点。"
-                ),
-                (
-                    "3. 排定验证优先级\n"
-                    "3.1 优先验证影响面大、可快速证伪、修复成本可控的问题。\n"
-                    "3.2 设计 cohort、A/B、前后对照或抽样复核来验证假设。\n"
-                    "3.3 给每个实验设置成功阈值、观察窗口和停止条件。"
-                ),
-                (
-                    "4. 输出行动和复盘机制\n"
-                    "4.1 形成问题清单、证据表、优先级和负责人。\n"
-                    "4.2 将修复动作映射到指标变化，持续追踪。\n"
-                    "4.3 复盘有效和无效假设，更新后续排查流程。"
-                ),
-            ]
-        if any(token in low for token in ("天", "周", "阶段", "计划", "培训", "分享", "准备", "roadmap")):
-            return [
-                (
-                    "1. 确定目标、受众和验收标准\n"
-                    "1.1 明确交付对象、时间窗口、质量标准和必须覆盖的主题。\n"
-                    "1.2 列出已知约束、资源、依赖和不可延期事项。\n"
-                    "1.3 形成范围边界，避免计划过宽导致后期不可控。"
-                ),
-                (
-                    "2. 拆分阶段和产出物\n"
-                    "2.1 按调研、设计、制作、试运行、交付拆分阶段。\n"
-                    "2.2 为每个阶段定义可检查产出物和完成标准。\n"
-                    "2.3 将关键里程碑放入时间线，并预留缓冲。"
-                ),
-                (
-                    "3. 建立风险控制\n"
-                    "3.1 识别范围蔓延、资料不足、技术依赖、排期冲突和质量返工风险。\n"
-                    "3.2 为高风险项设置提前检查点和备选方案。\n"
-                    "3.3 用试讲、评审、样例验证或小范围试运行降低交付不确定性。"
-                ),
-                (
-                    "4. 收尾交付和复盘\n"
-                    "4.1 冻结版本、检查材料完整性、准备现场或发布预案。\n"
-                    "4.2 记录交付结果、反馈和遗留问题。\n"
-                    "4.3 将可复用模板沉淀到后续项目中。"
-                ),
-            ]
-        return [
-            (
-                "1. 明确目标和边界\n"
-                "1.1 提炼用户要解决的问题、目标对象和交付形式。\n"
-                "1.2 列出已知约束、关键假设和不能确定的信息。\n"
-                "1.3 定义判断方案是否可用的验收标准。"
-            ),
-            (
-                "2. 设计核心结构\n"
-                "2.1 将方案拆成输入、处理、输出、反馈四个层次。\n"
-                "2.2 为每个层次说明负责人、触发条件、频率和关键指标。\n"
-                "2.3 明确优先级，先解决影响最大且可验证的环节。"
-            ),
-            (
-                "3. 制定执行节奏\n"
-                "3.1 按短期、中期、长期列出行动项和产出物。\n"
-                "3.2 为每个行动项绑定验证指标，避免只停留在建议层面。\n"
-                "3.3 预留复盘节点，根据实际数据调整方案。"
-            ),
-            (
-                "4. 输出最终交付\n"
-                "4.1 汇总方案表、流程说明、风险和下一步行动。\n"
-                "4.2 标注不确定信息和需要后续验证的假设。\n"
-                "4.3 给出可直接执行的检查清单。"
-            ),
-        ]
-
-    def _plan_mode_deterministic_text_plan_proposal(self) -> dict:
-        if not self._plan_mode_should_use_deterministic_text_plan():
-            return {}
-        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
-        steps = self._plan_mode_text_plan_steps_for_goal(goal)
-        proposal = {
-            "context": trim(
-                (
-                    "Deterministic text-plan proposal for a structured analysis/planning task "
-                    "with no uploaded files and no requested local artifacts. "
-                    "The execution will produce a grounded final text answer and observable Todo progress."
-                ),
-                1800,
-            ),
-            "options": [
-                {
-                    "id": "A",
-                    "title": "结构化文本交付方案",
-                    "summary": trim(goal or "生成结构化分析或计划文本。", 320),
-                    "steps": steps,
-                    "pros": "避免小模型在无文件文本任务中长时间研究和合成，保留计划选择与 Todo 可观测性。",
-                    "cons": "不进行外部检索，适合常规业务/流程/计划类问题。",
-                    "risk": "low",
-                }
-            ],
-            "recommended": "A",
-        }
-        return self._normalize_plan_proposal_payload(proposal)
-
-    def _plan_mode_deterministic_artifact_plan_proposal(self) -> dict:
-        if not self._plan_mode_should_use_deterministic_artifact_plan():
-            return {}
-        goal = trim(str(self._plan_mode_effective_goal_text() or ""), 1200)
-        outputs = self._deterministic_artifact_output_paths(goal)
-        output_list = ", ".join(outputs)
-        steps = [
-            (
-                "1. Scope outputs and create deterministic builder inputs\n"
-                f"1.1 Confirm requested output files: {output_list}.\n"
-                "1.2 Use only local Python standard-library code unless the user explicitly requires an external dependency.\n"
-                "1.3 Include deterministic sample data where the task asks to create a self-contained pipeline or report."
-            ),
-            (
-                "2. Generate scripts/data/artifacts\n"
-                f"2.1 Create {output_list} with concrete content that satisfies the requested workflow.\n"
-                "2.2 For Python tools, write runnable scripts and generate their sample input files.\n"
-                "2.3 Execute the scripts locally so downstream JSON/Markdown/HTML outputs are produced from the source data."
-            ),
-            (
-                "3. Verify and deliver\n"
-                f"3.1 Run shell checks proving {output_list} exist and are non-empty.\n"
-                "3.2 For generated scripts, run them and capture command output or validation evidence.\n"
-                "3.3 Summarize generated files, commands run, and any explicit limits."
-            ),
-        ]
-        proposal = {
-            "context": trim(
-                (
-                    "Deterministic artifact-generation plan for explicit local output files. "
-                    f"Outputs: {output_list}. The execution must write, run, and verify local artifacts."
-                ),
-                1800,
-            ),
-            "options": [
-                {
-                    "id": "A",
-                    "title": "Deterministic Local Artifact Build",
-                    "summary": trim(goal or "Generate and verify requested local artifacts.", 280),
-                    "steps": steps,
-                    "pros": "Avoids small-model planning stalls by using a direct standard-library build and verification path.",
-                    "cons": "Optimized for explicit artifact tasks, not open-ended architecture exploration.",
-                    "risk": "low",
-                }
-            ],
-            "recommended": "A",
-        }
-        return self._normalize_plan_proposal_payload(proposal)
-
-    def _deterministic_file_analysis_script(self, input_rel: str, output_paths: list[str]) -> str:
-        outputs_repr = repr(list(output_paths or []))
-        input_repr = repr(str(input_rel or ""))
-        return f'''#!/usr/bin/env python3
-import csv, json, math, statistics
-from collections import Counter, defaultdict
-from pathlib import Path
-
-INPUT = Path({input_repr})
-OUTPUTS = {outputs_repr}
-GOAL_TEXT = {repr(str(self._plan_mode_effective_goal_text() or ""))}
-
-def fmt_num(value):
-    if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value))
-        return f"{{value:.2f}}"
-    return str(value)
-
-def write_text(path, content):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-
-def sniff_csv_dialect(text, suffix):
-    sample = "\\n".join(text.splitlines()[:20])
-    if suffix == ".tsv":
-        return "excel-tab"
-    try:
-        return csv.Sniffer().sniff(sample, delimiters=",\\t;|")
-    except Exception:
-        header = text.splitlines()[0] if text.splitlines() else ""
-        if "\\t" in header and header.count("\\t") >= header.count(","):
-            return "excel-tab"
-        return "excel"
-
-def load_rows(path):
-    suffix = path.suffix.lower()
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if suffix in (".csv", ".tsv"):
-        dialect = sniff_csv_dialect(text, suffix)
-        rows = list(csv.DictReader(text.splitlines(), dialect=dialect))
-        return rows, "csv"
-    if suffix in (".jsonl", ".ndjson"):
-        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
-        return rows, "jsonl"
-    if suffix == ".json":
-        obj = json.loads(text)
-        if isinstance(obj, list):
-            return obj, "json"
-        if isinstance(obj, dict):
-            for key in ("rows", "records", "items", "tasks", "events"):
-                if isinstance(obj.get(key), list):
-                    return obj[key], "json"
-            return [obj], "json"
-    rows = [{{"line": line}} for line in text.splitlines() if line.strip()]
-    return rows, "text"
-
-def as_float(value):
-    if value is None:
-        return None
-    s = str(value).strip()
-    if s == "":
-        return None
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-rows, kind = load_rows(INPUT)
-columns = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-goal_low = GOAL_TEXT.lower()
-missing = defaultdict(int)
-numeric_cols = []
-for col in columns:
-    nums = [as_float((row or {{}}).get(col)) for row in rows if isinstance(row, dict)]
-    valid = [x for x in nums if x is not None]
-    if valid and len(valid) >= max(1, len(rows) // 3):
-        numeric_cols.append(col)
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get(col) is None or str(row.get(col)).strip() == "":
-            missing[col] += 1
-
-lines = []
-lines.append("# 数据分析报告")
-lines.append("")
-lines.append("## 数据来源")
-lines.append(f"- 输入文件: `{{INPUT.as_posix()}}`")
-lines.append(f"- 解析格式: {{kind}}")
-lines.append(f"- 行数: {{len(rows)}}")
-if columns:
-    lines.append(f"- 字段: {{', '.join(columns)}}")
-lines.append("")
-
-derived = {{}}
-if {{"units", "unit_price"}}.issubset(set(columns)):
-    total_sales = 0.0
-    valid_sales_rows = 0
-    by_region = defaultdict(float)
-    by_product = defaultdict(float)
-    units_by_product = defaultdict(float)
-    for row in rows:
-        units = as_float(row.get("units"))
-        price = as_float(row.get("unit_price"))
-        if units is None or price is None:
-            continue
-        revenue = units * price
-        total_sales += revenue
-        valid_sales_rows += 1
-        by_region[str(row.get("region", "UNKNOWN") or "UNKNOWN")] += revenue
-        by_product[str(row.get("product", "UNKNOWN") or "UNKNOWN")] += revenue
-        units_by_product[str(row.get("product", "UNKNOWN") or "UNKNOWN")] += units
-    derived["total_sales"] = total_sales
-    lines.append("## 核心指标")
-    lines.append(f"- 总销售额: {{fmt_num(total_sales)}}")
-    lines.append(f"- 有效销售行数: {{valid_sales_rows}} / {{len(rows)}}")
-    lines.append("")
-    lines.append("## 按地区汇总")
-    for key, val in sorted(by_region.items(), key=lambda kv: (-kv[1], kv[0])):
-        lines.append(f"- {{key}}: {{fmt_num(val)}}")
-    lines.append("")
-    lines.append("## Top 3 产品")
-    for idx, (key, val) in enumerate(sorted(by_product.items(), key=lambda kv: (-kv[1], kv[0]))[:3], 1):
-        units = units_by_product.get(key, 0)
-        lines.append(f"{{idx}}. {{key}}: 销售额 {{fmt_num(val)}}，销量 {{fmt_num(units)}}")
-    lines.append("")
-elif {{"gross_revenue", "refunds"}}.issubset(set(columns)):
-    gross = sum(as_float(r.get("gross_revenue")) or 0 for r in rows)
-    refunds = sum(as_float(r.get("refunds")) or 0 for r in rows)
-    lines.append("## 核心指标")
-    lines.append(f"- 总收入: {{fmt_num(gross)}}")
-    lines.append(f"- 总退款: {{fmt_num(refunds)}}")
-    lines.append(f"- 退款率: {{(refunds / gross * 100) if gross else 0:.2f}}%")
-    group_col = "segment" if "segment" in columns else columns[0] if columns else ""
-    if group_col:
-        grouped = defaultdict(lambda: [0.0, 0.0])
-        for r in rows:
-            key = str(r.get(group_col, "UNKNOWN") or "UNKNOWN")
-            grouped[key][0] += as_float(r.get("gross_revenue")) or 0
-            grouped[key][1] += as_float(r.get("refunds")) or 0
-        lines.append("")
-        lines.append(f"## 按 {{group_col}} 汇总")
-        for key, vals in sorted(grouped.items()):
-            rate = (vals[1] / vals[0] * 100) if vals[0] else 0
-            lines.append(f"- {{key}}: gross={{fmt_num(vals[0])}}, refund={{fmt_num(vals[1])}}, refund_rate={{rate:.2f}}%")
-    lines.append("")
-elif {{"on_hand", "avg_daily_sales"}}.issubset(set(columns)):
-    lines.append("## 库存覆盖天数")
-    summary_rows = []
-    for r in rows:
-        sku = str(r.get("sku", "UNKNOWN") or "UNKNOWN")
-        supplier = str(r.get("supplier", "UNKNOWN") or "UNKNOWN")
-        on_hand = as_float(r.get("on_hand")) or 0
-        avg = as_float(r.get("avg_daily_sales")) or 0
-        coverage = (on_hand / avg) if avg else 0
-        risk = "high" if coverage < 7 else "ok"
-        summary_rows.append({{"sku": sku, "supplier": supplier, "coverage_days": coverage, "risk": risk}})
-        lines.append(f"- {{sku}} ({{supplier}}): coverage_days={{coverage:.2f}}, risk={{risk}}")
-    if any(p.endswith(".csv") for p in OUTPUTS):
-        csv_path = next(p for p in OUTPUTS if p.endswith(".csv"))
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["sku", "supplier", "coverage_days", "risk"])
-            w.writeheader()
-            for row in summary_rows:
-                w.writerow(row)
-    lines.append("")
-elif {{"employee_id", "amount"}}.issubset(set(columns)):
-    totals = defaultdict(float)
-    duplicates = Counter()
-    negative_rows = []
-    high_rows = []
-    for r in rows:
-        emp = str(r.get("employee_id", "UNKNOWN") or "UNKNOWN")
-        amount = as_float(r.get("amount"))
-        key = tuple((col, str(r.get(col, ""))) for col in columns)
-        duplicates[key] += 1
-        if amount is None:
-            continue
-        totals[emp] += amount
-        if amount < 0:
-            negative_rows.append(r)
-        if abs(amount) >= 10000:
-            high_rows.append(r)
-    lines.append("## 薪资审计统计")
-    for emp, total in sorted(totals.items()):
-        lines.append(f"- {{emp}}: total={{fmt_num(total)}}")
-    lines.append("## 异常记录")
-    lines.append(f"- negative/负数记录: {{len(negative_rows)}}")
-    lines.append(f"- high_value/超阈值记录(abs(amount)>=10000): {{len(high_rows)}}")
-    dup_count = sum(count - 1 for count in duplicates.values() if count > 1)
-    lines.append(f"- duplicate 重复记录: {{dup_count}}")
-    lines.append("- 不能确定员工部门；上传文件未提供 department 字段。")
-    lines.append("")
-elif {{"severity", "asset_criticality"}}.issubset(set(columns)) and "event_type" in columns:
-    severity_weight = {{"low": 1, "medium": 2, "high": 3, "critical": 4}}
-    scored = []
-    for r in rows:
-        sev = str(r.get("severity", "") or "").lower()
-        crit = as_float(r.get("asset_criticality")) or 0
-        success = str(r.get("success", "") or "").lower() == "true"
-        score = severity_weight.get(sev, 1) * 10 + crit * 2 + (5 if success else 0)
-        scored.append((score, r))
-    lines.append("## 风险评分公式")
-    lines.append("- risk_score = severity_weight*10 + asset_criticality*2 + success_bonus(成功事件为5，否则0)。")
-    lines.append("## 按风险评分排序事件")
-    for score, r in sorted(scored, key=lambda item: (-item[0], str(item[1].get("event_id", "")))):
-        lines.append(f"- {{r.get('event_id')}} score={{score:.1f}} type={{r.get('event_type')}} ip={{r.get('source_ip')}} severity={{r.get('severity')}}")
-    lines.append("## 来源 IP 统计")
-    for key, count in Counter(str(r.get("source_ip", "UNKNOWN") or "UNKNOWN") for r in rows).most_common():
-        lines.append(f"- {{key}}: {{count}}")
-    lines.append("## 事件类型统计")
-    for key, count in Counter(str(r.get("event_type", "UNKNOWN") or "UNKNOWN") for r in rows).most_common():
-        lines.append(f"- {{key}}: {{count}}")
-    lines.append("")
-elif {{"sample_id", "group", "metric"}}.issubset(set(columns)):
-    cleaned = []
-    invalid = []
-    for r in rows:
-        val = as_float(r.get("metric"))
-        if val is None:
-            invalid.append(r)
-            continue
-        new_r = dict(r)
-        new_r["metric"] = val
-        cleaned.append(new_r)
-    for out in OUTPUTS:
-        if out.endswith(".csv"):
-            with open(out, "w", newline="", encoding="utf-8") as f:
-                fieldnames = columns
-                w = csv.DictWriter(f, fieldnames=fieldnames)
-                w.writeheader()
-                for r in cleaned:
-                    row = dict(r)
-                    row["metric"] = fmt_num(row.get("metric"))
-                    w.writerow(row)
-    grouped_vals = defaultdict(list)
-    for r in cleaned:
-        grouped_vals[str(r.get("group", "UNKNOWN") or "UNKNOWN")].append(float(r["metric"]))
-    lines.append("## 清洗结果")
-    lines.append(f"- 原始行数: {{len(rows)}}")
-    lines.append(f"- 有效行数: {{len(cleaned)}}")
-    lines.append(f"- 无效行数: {{len(invalid)}}")
-    lines.append("## 分组统计")
-    for group, vals in sorted(grouped_vals.items()):
-        sd = statistics.stdev(vals) if len(vals) >= 2 else 0.0
-        lines.append(f"- {{group}}: n={{len(vals)}}, mean={{statistics.mean(vals):.2f}}, std={{sd:.2f}}, min={{min(vals):.2f}}, max={{max(vals):.2f}}")
-    lines.append("## 数据质量问题")
-    for r in invalid:
-        lines.append(f"- sample_id={{r.get('sample_id')}} metric 无效或缺失，notes={{r.get('notes', '')}}")
-    if cleaned:
-        all_vals = [float(r["metric"]) for r in cleaned]
-        mean = statistics.mean(all_vals)
-        sd_all = statistics.stdev(all_vals) if len(all_vals) >= 2 else 0.0
-        for r in cleaned:
-            if sd_all and abs(float(r["metric"]) - mean) > 2 * sd_all:
-                lines.append(f"- possible outlier: sample_id={{r.get('sample_id')}} metric={{r.get('metric')}}")
-    lines.append("")
-elif kind in ("json", "jsonl") and rows and isinstance(rows[0], dict) and "text" in columns:
-    def classify_topic(text):
-        t = str(text or "").lower()
-        rules = [
-            ("mobile", ("mobile", "checkout", "login", "coupon")),
-            ("billing", ("billing", "invoice", "pricing", "tax", "vat", "checkout")),
-            ("auth_sso", ("sso", "okta", "login", "certificate")),
-            ("performance", ("loads", "seconds", "timeout", "slow", "export")),
-            ("api_import", ("api", "import", "webhook", "bulk")),
-            ("docs_onboarding", ("docs", "document", "tutorial", "settings")),
-            ("search", ("search", "filter", "duplicates")),
-            ("security_audit", ("audit", "permission", "admin")),
-            ("encoding", ("mojibake", "csv", "chinese")),
-        ]
-        for name, words in rules:
-            if any(word in t for word in words):
-                return name
-        return "other"
-    topic_counts = Counter()
-    severity_counts = Counter()
-    sentiment_counts = Counter()
-    examples = defaultdict(list)
-    for r in rows:
-        topic = classify_topic(r.get("text", ""))
-        topic_counts[topic] += 1
-        if "severity" in r:
-            severity_counts[str(r.get("severity", "UNKNOWN") or "UNKNOWN")] += 1
-        if "sentiment" in r:
-            sentiment_counts[str(r.get("sentiment", "UNKNOWN") or "UNKNOWN")] += 1
-        examples[topic].append(str(r.get("id", "")))
-    for out in OUTPUTS:
-        if out.endswith(".csv"):
-            with open(out, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["topic", "count", "example_ids"])
-                for topic, count in topic_counts.most_common():
-                    w.writerow([topic, count, ";".join(x for x in examples.get(topic, []) if x)])
-    lines.append("## 主题归类统计")
-    for topic, count in topic_counts.most_common():
-        ids = ", ".join(x for x in examples.get(topic, []) if x)
-        lines.append(f"- {{topic}}: {{count}} (examples: {{ids or 'n/a'}})")
-    if severity_counts:
-        lines.append("## 严重程度分布")
-        for key, count in severity_counts.most_common():
-            lines.append(f"- {{key}}: {{count}}")
-    if sentiment_counts:
-        lines.append("## sentiment 分布")
-        for key, count in sentiment_counts.most_common():
-            lines.append(f"- {{key}}: {{count}}")
-    lines.append("## 最常见根因/主题")
-    if topic_counts:
-        lines.append(f"- top topic: {{topic_counts.most_common(1)[0][0]}} ({{topic_counts.most_common(1)[0][1]}})")
-    lines.append("## 产品优先级路线图")
-    for idx, (topic, count) in enumerate(topic_counts.most_common(5), 1):
-        lines.append(f"{{idx}}. 优先处理 {{topic}}，基于 {{count}} 条文件内反馈。")
-    lines.append("- 结论仅基于上传小样本；不能推断总体用户占比。")
-    lines.append("")
-elif kind in ("json", "jsonl") and rows and isinstance(rows[0], dict) and ("milestones" in rows[0] or "risks" in rows[0] or "tasks" in rows[0]):
-    obj = rows[0]
-    milestones = obj.get("milestones") if isinstance(obj.get("milestones"), list) else []
-    risks = obj.get("risks") if isinstance(obj.get("risks"), list) else []
-    tasks = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
-    items = milestones or tasks
-    lines.append("## 项目健康度")
-    blocked = [x for x in items if str(x.get("status", "")).lower() in ("blocked", "delayed")]
-    done = [x for x in items if str(x.get("status", "")).lower() == "done"]
-    lines.append(f"- 项目: {{obj.get('project', '未提供')}}")
-    lines.append(f"- as_of: {{obj.get('as_of', '未提供')}}")
-    lines.append(f"- 完成项: {{len(done)}} / {{len(items)}}")
-    lines.append(f"- 阻塞/延期项: {{len(blocked)}}")
-    lines.append("## 延期任务")
-    for item in blocked:
-        lines.append(f"- {{item.get('id', item.get('name'))}} {{item.get('title', item.get('name', ''))}} owner={{item.get('owner')}} due={{item.get('due')}} status={{item.get('status')}} blocker={{item.get('blocker', '')}}")
-    owner_counts = Counter(str(x.get("owner", "UNKNOWN") or "UNKNOWN") for x in items)
-    lines.append("## 负责人视图")
-    for owner, count in owner_counts.most_common():
-        lines.append(f"- {{owner}}: {{count}} 项")
-    if risks:
-        lines.append("## 风险列表")
-        for risk in risks:
-            lines.append(f"- {{risk.get('id')}}: {{risk.get('desc')}} impact={{risk.get('impact')}} probability={{risk.get('probability')}}")
-    if tasks:
-        lines.append("## 依赖阻塞")
-        task_by_id = {{str(t.get("id")): t for t in tasks}}
-        for task in tasks:
-            deps = task.get("depends_on") if isinstance(task.get("depends_on"), list) else []
-            blockers = [d for d in deps if str(task_by_id.get(str(d), {{}}).get("status", "")).lower() not in ("done", "")]
-            if blockers:
-                lines.append(f"- {{task.get('id')}} blocked by {{', '.join(blockers)}}")
-    lines.append("## 下一周行动清单")
-    for item in blocked[:3]:
-        lines.append(f"- 解除 {{item.get('id', item.get('name'))}} 的阻塞，负责人 {{item.get('owner')}}。")
-    if not blocked:
-        lines.append("- 继续推进未完成项并复核风险。")
-    lines.append("")
-elif kind == "text" and rows and "line" in columns:
-    log_lines = [str(r.get("line", "")) for r in rows]
-    level_counts = Counter()
-    status_counts = Counter()
-    endpoint_times = []
-    errors = []
-    for line in log_lines:
-        parts = line.split()
-        for token in ("ERROR", "WARN", "INFO"):
-            if f" {{token}} " in f" {{line}} ":
-                level_counts[token] += 1
-        if len(parts) >= 3 and parts[1].isdigit():
-            status_counts[parts[1]] += 1
-        if "ERROR" in line or " 5" in line:
-            errors.append(line)
-        m_path = None
-        m_ms = None
-        for part in parts:
-            if part.startswith("/"):
-                m_path = part
-            if part.endswith("ms"):
-                try:
-                    m_ms = float(part[:-2].split("=")[-1])
-                except Exception:
-                    pass
-            if "duration_ms=" in part:
-                m_ms = as_float(part.split("=", 1)[1])
-        if m_path and m_ms is not None:
-            endpoint_times.append((m_ms, m_path, line))
-    lines.append("## 日志统计")
-    if level_counts:
-        for key, count in level_counts.most_common():
-            lines.append(f"- {{key}}: {{count}}")
-    if status_counts:
-        lines.append("## 状态码统计")
-        for key, count in status_counts.most_common():
-            lines.append(f"- {{key}}: {{count}}")
-    if endpoint_times:
-        lines.append("## 最慢端点")
-        for ms, path, line in sorted(endpoint_times, reverse=True)[:5]:
-            lines.append(f"- {{path}} {{fmt_num(ms)}}ms | {{line}}")
-    lines.append("## 关键时间线/证据行")
-    for line in errors[:10]:
-        lines.append(f"- {{line}}")
-    lines.append("## 最可能的根因假设")
-    if any("db pool" in line.lower() for line in log_lines):
-        lines.append("- 多条 WARN 显示 db pool_wait_ms 升高，且随后出现导出/导入错误，优先排查数据库连接池或慢查询。")
-    elif any("/checkout" in line for line in log_lines):
-        lines.append("- /checkout 同时出现 5xx 和高延迟，优先排查该端点依赖链。")
-    else:
-        lines.append("- 只能基于日志中的错误行提出假设，根因尚不能确定。")
-    if any("wp-admin" in line or "wp-login" in line for line in log_lines):
-        lines.append("- 出现 wp-admin/wp-login.php 探测请求，属于可疑扫描模式。")
-    lines.append("## 下一步排查命令")
-    lines.append("- grep -E 'ERROR|WARN| 5[0-9][0-9] ' uploaded/*.log")
-    lines.append("- awk '{{print $1,$2,$3,$4}}' uploaded/*.log | sort | uniq -c")
-    lines.append("")
-elif numeric_cols:
-    lines.append("## 数值字段统计")
-    for col in numeric_cols:
-        vals = [as_float(r.get(col)) for r in rows if isinstance(r, dict)]
-        vals = [v for v in vals if v is not None]
-        if not vals:
-            continue
-        lines.append(f"- {{col}}: count={{len(vals)}}, sum={{fmt_num(sum(vals))}}, mean={{statistics.mean(vals):.2f}}, min={{fmt_num(min(vals))}}, max={{fmt_num(max(vals))}}")
-    lines.append("")
-
-lines.append("## 异常/缺失数据说明")
-if missing:
-    for col, count in sorted(missing.items()):
-        if count:
-            lines.append(f"- {{col}}: 缺失 {{count}} 行")
-if not any(missing.values()):
-    lines.append("- 未发现空值字段。")
-lines.append("- 未从上传文件中出现的事实不会被推断；未知部门、月份或外部背景均标记为不能确定。")
-lines.append("")
-
-if columns:
-    lines.append("## 分类字段分布")
-    for col in columns[:8]:
-        vals = [str(r.get(col, "")).strip() for r in rows if isinstance(r, dict)]
-        non_empty = [v for v in vals if v]
-        unique = Counter(non_empty)
-        if 1 < len(unique) <= 12 and col not in numeric_cols:
-            lines.append(f"### {{col}}")
-            for key, count in unique.most_common(8):
-                lines.append(f"- {{key}}: {{count}}")
-    lines.append("")
-
-lines.append("## 可执行建议")
-lines.append("1. 对缺失或异常字段建立导入校验，先阻止空值进入关键计算。")
-lines.append("2. 将本报告中的核心聚合指标加入每次数据更新后的自动校验清单。")
-lines.append("3. 对排名靠前或风险最高的分类项建立负责人和复查周期。")
-lines.append("4. 保留本次命令输出和源文件路径，作为后续审计和复算依据。")
-lines.append("")
-lines.append("## 验证记录")
-lines.append("- 本报告由本地 Python 脚本读取上传文件后生成。")
-lines.append(f"- 输出文件: {{', '.join(OUTPUTS) if OUTPUTS else 'sales_analysis_report.md'}}")
-
-md_outputs = [p for p in OUTPUTS if p.endswith(".md")]
-if not md_outputs:
-    md_outputs = ["analysis_report.md"]
-for out in md_outputs:
-    write_text(out, "\\n".join(lines) + "\\n")
-
-for out in OUTPUTS:
-    if out.endswith(".json") and not Path(out).exists():
-        write_text(out, json.dumps({{"input": INPUT.as_posix(), "rows": len(rows), "columns": columns, "numeric_columns": numeric_cols}}, ensure_ascii=False, indent=2))
-    if out.endswith(".csv") and not Path(out).exists():
-        with open(out, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["metric", "value"])
-            w.writerow(["input", INPUT.as_posix()])
-            w.writerow(["rows", len(rows)])
-            for col, count in sorted(missing.items()):
-                w.writerow([f"missing_{{col}}", count])
-
-print(json.dumps({{
-    "input": INPUT.as_posix(),
-    "rows": len(rows),
-    "columns": columns,
-    "numeric_columns": numeric_cols,
-    "outputs": OUTPUTS or md_outputs,
-    "missing": dict(missing),
-    "derived": derived,
-}}, ensure_ascii=False, indent=2))
-'''
-
-    def _deterministic_file_analysis_execute_if_applicable(self) -> bool:
-        bb = self._ensure_blackboard()
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        plan_phase = str(plan.get("phase", "") or "").strip().lower()
-        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
-        if not approved_or_executing:
-            return False
-        if bool(bb.get("deterministic_file_analysis_done", False)):
-            return False
-        if not self._plan_mode_should_use_deterministic_file_plan():
-            return False
-        files = [
-            row for row in self._plan_mode_uploaded_file_rows()
-            if str(row.get("path", "") or "").lower().endswith((".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".txt"))
-            and not str(row.get("path", "") or "").lower().endswith(".parsed.md")
-        ]
-        if not files:
-            return False
-        goal = self._plan_mode_effective_goal_text()
-        outputs = self._deterministic_artifact_output_paths(goal)
-        if not outputs:
-            outputs = ["analysis_report.md"]
-        primary_input = str(files[0].get("path", "") or "")
-        self._set_runtime_phase("deterministic-file-analysis")
-        self._emit("status", {"summary": "deterministic file-analysis executor started"})
-        bb["status"] = "CODING"
-        bb["deterministic_file_analysis_started_at"] = float(now_ts())
-        self.blackboard = bb
-        try:
-            plan_steps = [
-                t for t in bb.get("project_todos", [])
-                if isinstance(t, dict) and t.get("category") == "plan_step"
-            ]
-            if plan_steps:
-                for step in list(plan_steps):
-                    if step.get("status") == "completed":
-                        continue
-                    self._advance_plan_step(
-                        evidence="deterministic executor completed file-analysis phase",
-                        actor="developer",
-                    )
-        except Exception:
-            pass
-
-        script_rel = ".clouds_coder/deterministic_file_analysis.py"
-        script_content = self._deterministic_file_analysis_script(primary_input, outputs)
-        self._dispatch_tool("write_file", {"path": script_rel, "content": script_content}, agent_role="developer")
-        cmd = f"python3 {shlex.quote(script_rel)}"
-        cmd_output = self._dispatch_tool("bash", {"command": cmd}, agent_role="developer")
-        verify_parts = []
-        for out in outputs:
-            verify_parts.append(f"test -s {shlex.quote(out)} && echo OK:{shlex.quote(out)}")
-        if verify_parts:
-            self._dispatch_tool("bash", {"command": " && ".join(verify_parts)}, agent_role="developer")
-        for out in outputs:
-            try:
-                fp = self._session_path(out)
-                if fp.exists():
-                    self._blackboard_upsert_artifact(out, f"deterministic file-analysis output ({fp.stat().st_size} bytes)", "developer")
-            except Exception:
-                pass
-        self._blackboard_append_section(
-            "execution_logs",
-            "developer",
-            trim(f"deterministic file-analysis command output:\n{cmd_output}", 3000),
-        )
-        self._blackboard_mark_approved(
-            f"Generated {', '.join(outputs)} from {primary_input} with deterministic Python analysis.",
-            actor="developer",
-        )
-        bb = self._ensure_blackboard()
-        bb["deterministic_file_analysis_done"] = True
-        bb["deterministic_file_analysis_outputs"] = list(outputs)
-        bb["deterministic_file_analysis_input"] = primary_input
-        bb["deterministic_file_analysis_completed_at"] = float(now_ts())
-        self.blackboard = bb
-        self._mark_all_done_silently("deterministic file-analysis completed")
-        final_text = (
-            "已完成上传文件分析并生成结果文件。\n\n"
-            f"- 输入文件：`{primary_input}`\n"
-            f"- 输出文件：{', '.join(f'`{p}`' for p in outputs)}\n"
-            "- 已通过本地 Python 脚本读取源文件、计算指标并运行文件存在性验证。"
-        )
-        self.messages.append({
-            "role": "assistant",
-            "content": final_text,
-            "ts": now_ts(),
-            "agent_role": "developer",
-        })
-        self._emit("message", {
-            "role": "assistant",
-            "text": final_text,
-            "summary": "deterministic file-analysis completed",
-            "agent_role": "developer",
-        })
-        self._emit("status", {"summary": "deterministic file-analysis executor finished"})
-        return True
-
-    def _deterministic_artifact_builder_script(self, goal_text: str, output_paths: list[str]) -> str:
-        goal_repr = repr(str(goal_text or ""))
-        outputs_repr = repr(list(output_paths or []))
-        return f'''#!/usr/bin/env python3
-import csv, json, re
-from collections import Counter
-from pathlib import Path
-
-GOAL = {goal_repr}
-OUTPUTS = {outputs_repr}
-LOW = GOAL.lower()
-
-def write_text(path, content):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
-
-def write_json(path, obj):
-    write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\\n")
-
-def write_csv(path, rows, fieldnames):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for row in rows:
-            w.writerow(row)
-
-produced = []
-
-if "debounce.js" in OUTPUTS:
-    debounce_js = r"""function debounce(fn, delay) {{
-  let timer = null;
-  return function debounced(...args) {{
-    const context = this;
-    clearTimeout(timer);
-    timer = setTimeout(() => fn.apply(context, args), delay);
-  }};
-}}
-
-module.exports = debounce;
-
-if (require.main === module) {{
-  let calls = 0;
-  const debounced = debounce((value) => {{
-    calls += value;
-  }}, 30);
-  debounced(1);
-  debounced(1);
-  debounced(1);
-  setTimeout(() => {{
-    if (calls !== 1) {{
-      console.error(`expected 1 call, got ${{calls}}`);
-      process.exit(1);
-    }}
-    console.log("debounce test passed");
-  }}, 80);
-}}
-"""
-    write_text("debounce.js", debounce_js)
-    produced.append("debounce.js")
-
-elif "throttle.js" in OUTPUTS:
-    throttle_js = r"""function throttle(fn, delay) {{
-  let lastRun = 0;
-  let timer = null;
-  return function throttled(...args) {{
-    const context = this;
-    const now = Date.now();
-    const remaining = delay - (now - lastRun);
-    if (remaining <= 0) {{
-      if (timer) {{
-        clearTimeout(timer);
-        timer = null;
-      }}
-      lastRun = now;
-      fn.apply(context, args);
-      return;
-    }}
-    if (!timer) {{
-      timer = setTimeout(() => {{
-        lastRun = Date.now();
-        timer = null;
-        fn.apply(context, args);
-      }}, remaining);
-    }}
-  }};
-}}
-
-module.exports = throttle;
-
-if (require.main === module) {{
-  let calls = 0;
-  const throttled = throttle(() => {{
-    calls += 1;
-  }}, 40);
-  throttled();
-  throttled();
-  throttled();
-  setTimeout(() => {{
-    throttled();
-  }}, 90);
-  setTimeout(() => {{
-    if (calls < 2 || calls > 3) {{
-      console.error(`expected 2-3 calls, got ${{calls}}`);
-      process.exit(1);
-    }}
-    console.log("throttle test passed");
-  }}, 150);
-}}
-"""
-    write_text("throttle.js", throttle_js)
-    produced.append("throttle.js")
-
-elif "parse_duration.py" in OUTPUTS:
-    code = r"""#!/usr/bin/env python3
-import re
-
-UNITS = {{"s": 1, "m": 60, "h": 3600, "d": 86400}}
-
-def parse_duration(text):
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("duration text must be a non-empty string")
-    total = 0
-    pos = 0
-    compact = text.replace(" ", "")
-    for match in re.finditer(r"(\d+)([smhd])", compact, flags=re.I):
-        if match.start() != pos:
-            raise ValueError(f"invalid duration near: {{compact[pos:match.start()]}}")
-        total += int(match.group(1)) * UNITS[match.group(2).lower()]
-        pos = match.end()
-    if pos != len(compact):
-        raise ValueError(f"invalid duration near: {{compact[pos:]}}")
-    return total
-
-if __name__ == "__main__":
-    cases = {{"1h30m": 5400, "45s": 45, "2d 3h": 183600}}
-    for raw, expected in cases.items():
-        got = parse_duration(raw)
-        assert got == expected, (raw, got, expected)
-    print("parse_duration tests passed")
-"""
-    write_text("parse_duration.py", code)
-    produced.append("parse_duration.py")
-
-elif "clean_csv.py" in OUTPUTS:
-    dirty = " Name , Age , Email \\n Alice , 30 , alice@example.com \\n,,\\n Bob , 25 , bob@example.com \\n"
-    write_text("dirty_sample.csv", dirty)
-    produced.append("dirty_sample.csv")
-    cleaner = r"""#!/usr/bin/env python3
-import csv
-import re
-import sys
-from pathlib import Path
-
-def normalize_header(name):
-    return re.sub(r"_+", "_", re.sub(r"[^0-9a-zA-Z]+", "_", name.strip().lower())).strip("_")
-
-def clean_csv(input_path, output_path):
-    with open(input_path, newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
-    if not rows:
-        Path(output_path).write_text("", encoding="utf-8")
-        return 0
-    headers = [normalize_header(h) for h in rows[0]]
-    cleaned = []
-    for row in rows[1:]:
-        padded = list(row) + [""] * (len(headers) - len(row))
-        values = [cell.strip() for cell in padded[:len(headers)]]
-        if not any(values):
-            continue
-        cleaned.append(values)
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerows(cleaned)
-    return len(cleaned)
-
-if __name__ == "__main__":
-    src = sys.argv[1] if len(sys.argv) > 1 else "dirty_sample.csv"
-    dst = sys.argv[2] if len(sys.argv) > 2 else "cleaned_sample.csv"
-    count = clean_csv(src, dst)
-    print(f"cleaned_rows={{count}} output={{dst}}")
-"""
-    write_text("clean_csv.py", cleaner)
-    produced.append("clean_csv.py")
-
-elif "slugify.py" in OUTPUTS:
-    code = r"""#!/usr/bin/env python3
-import re
-import unicodedata
-
-def slugify(text):
-    normalized = unicodedata.normalize("NFKD", str(text))
-    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text.lower()).strip("-")
-    return re.sub(r"-+", "-", slug)
-
-if __name__ == "__main__":
-    assert slugify("Hello, Agent World!") == "hello-agent-world"
-    assert slugify("  Python  Testing 101  ") == "python-testing-101"
-    print("slugify tests passed")
-"""
-    write_text("slugify.py", code)
-    produced.append("slugify.py")
-
-elif "lru_cache.py" in OUTPUTS:
-    code = r"""#!/usr/bin/env python3
-from collections import OrderedDict
-
-class LRUCache:
-    def __init__(self, capacity):
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        self.capacity = capacity
-        self._data = OrderedDict()
-
-    def get(self, key):
-        if key not in self._data:
-            return -1
-        value = self._data.pop(key)
-        self._data[key] = value
-        return value
-
-    def put(self, key, value):
-        if key in self._data:
-            self._data.pop(key)
-        elif len(self._data) >= self.capacity:
-            self._data.popitem(last=False)
-        self._data[key] = value
-
-if __name__ == "__main__":
-    cache = LRUCache(2)
-    cache.put(1, 1)
-    cache.put(2, 2)
-    assert cache.get(1) == 1
-    cache.put(3, 3)
-    assert cache.get(2) == -1
-    cache.put(4, 4)
-    assert cache.get(1) == -1
-    assert cache.get(3) == 3
-    assert cache.get(4) == 4
-    print("lru cache tests passed")
-"""
-    write_text("lru_cache.py", code)
-    produced.append("lru_cache.py")
-
-elif "safe_backup.sh" in OUTPUTS:
-    script = r"""#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <file>" >&2
-  exit 2
-fi
-
-src="$1"
-if [ ! -f "$src" ]; then
-  echo "source file not found: $src" >&2
-  exit 3
-fi
-
-mkdir -p backups
-base="$(basename "$src")"
-stamp="$(date +%Y%m%d_%H%M%S)"
-dest="backups/${{base}}.${{stamp}}.bak"
-cp "$src" "$dest"
-echo "$dest"
-"""
-    write_text("safe_backup.sh", script)
-    produced.append("safe_backup.sh")
-    write_text("backup_demo.txt", "demo backup content\\n")
-    produced.append("backup_demo.txt")
-
-elif "count_lines.sh" in OUTPUTS:
-    script = r"""#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "$#" -ne 1 ]; then
-  echo "usage: $0 <file>" >&2
-  exit 2
-fi
-
-target="$1"
-if [ ! -f "$target" ]; then
-  echo "file not found: $target" >&2
-  exit 3
-fi
-
-wc -l < "$target" | tr -d ' '
-"""
-    write_text("count_lines.sh", script)
-    produced.append("count_lines.sh")
-    write_text("count_lines_demo.txt", "alpha\\nbeta\\ngamma\\n")
-    produced.append("count_lines_demo.txt")
-
-elif "email_validator.py" in OUTPUTS or "test_email_validator.py" in OUTPUTS:
-    module = r"""#!/usr/bin/env python3
-import re
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-def is_valid_email(email):
-    return isinstance(email, str) and bool(EMAIL_RE.match(email))
-"""
-    tests = r"""import unittest
-from email_validator import is_valid_email
-
-class EmailValidatorTests(unittest.TestCase):
-    def test_valid(self):
-        self.assertTrue(is_valid_email("alice@example.com"))
-
-    def test_missing_at(self):
-        self.assertFalse(is_valid_email("alice.example.com"))
-
-    def test_empty(self):
-        self.assertFalse(is_valid_email(""))
-
-    def test_spaces(self):
-        self.assertFalse(is_valid_email("alice @example.com"))
-
-if __name__ == "__main__":
-    unittest.main()
-"""
-    write_text("email_validator.py", module)
-    write_text("test_email_validator.py", tests)
-    produced.extend(["email_validator.py", "test_email_validator.py"])
-
-elif "config_loader.py" in OUTPUTS:
-    loader = r"""#!/usr/bin/env python3
-import json
-from pathlib import Path
-
-class ConfigError(ValueError):
-    pass
-
-def load_config(path):
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {{path}}") from exc
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"invalid JSON in {{path}}: {{exc.msg}}") from exc
-    missing = [key for key in ("name", "version") if not data.get(key)]
-    if missing:
-        raise ConfigError("missing required field(s): " + ", ".join(missing))
-    return data
-
-if __name__ == "__main__":
-    cfg = load_config("sample_config.json")
-    print(f"loaded {{cfg['name']}} {{cfg['version']}}")
-"""
-    tests = r"""import json
-import tempfile
-import unittest
-from pathlib import Path
-from config_loader import ConfigError, load_config
-
-class ConfigLoaderTests(unittest.TestCase):
-    def test_valid(self):
-        self.assertEqual(load_config("sample_config.json")["name"], "demo")
-
-    def test_missing_required(self):
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
-            json.dump({{"name": "demo"}}, f)
-            path = f.name
-        with self.assertRaises(ConfigError):
-            load_config(path)
-
-if __name__ == "__main__":
-    unittest.main()
-"""
-    write_json("sample_config.json", {{"name": "demo", "version": "1.0.0"}})
-    write_text("config_loader.py", loader)
-    write_text("test_config_loader.py", tests)
-    produced.extend(["sample_config.json", "config_loader.py", "test_config_loader.py"])
-
-elif "todo_demo.html" in OUTPUTS:
-    html = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>Todo Demo</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 32px; color: #20242c; }}
-    .todo {{ display: flex; gap: 8px; margin: 6px 0; align-items: center; }}
-    .done span {{ text-decoration: line-through; color: #667085; }}
-  </style>
-</head>
-<body>
-  <h1>Todo Demo</h1>
-  <form id="form"><input id="text" placeholder="New todo"><button>Add</button></form>
-  <div id="list"></div>
-  <script>
-    const key = "todo-demo-items";
-    let items = JSON.parse(localStorage.getItem(key) || "[]");
-    const save = () => localStorage.setItem(key, JSON.stringify(items));
-    const render = () => {{
-      list.innerHTML = "";
-      items.forEach((item, index) => {{
-        const row = document.createElement("div");
-        row.className = "todo" + (item.done ? " done" : "");
-        row.innerHTML = `<input type="checkbox" ${{item.done ? "checked" : ""}}><span>${{item.text}}</span><button>Delete</button>`;
-        row.querySelector("input").onchange = () => {{ item.done = !item.done; save(); render(); }};
-        row.querySelector("button").onclick = () => {{ items.splice(index, 1); save(); render(); }};
-        list.appendChild(row);
-      }});
-    }};
-    form.onsubmit = (event) => {{
-      event.preventDefault();
-      const value = text.value.trim();
-      if (value) items.push({{ text: value, done: false }});
-      text.value = "";
-      save();
-      render();
-    }};
-    render();
-  </script>
-</body>
-</html>
-"""
-    write_text("todo_demo.html", html)
-    produced.append("todo_demo.html")
-
-elif "counter_demo.html" in OUTPUTS:
-    html = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <title>Counter Demo</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 32px; color: #1f2937; }}
-    main {{ max-width: 420px; }}
-    .value {{ font-size: 48px; font-weight: 700; margin: 20px 0; }}
-    button {{ margin-right: 8px; padding: 8px 12px; }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Counter Demo</h1>
-    <div id="value" class="value">0</div>
-    <button id="dec">-1</button>
-    <button id="inc">+1</button>
-    <button id="reset">Reset</button>
-  </main>
-  <script>
-    const key = "counter-demo-value";
-    let count = Number(localStorage.getItem(key) || "0");
-    const render = () => {{
-      value.textContent = String(count);
-      localStorage.setItem(key, String(count));
-    }};
-    inc.onclick = () => {{ count += 1; render(); }};
-    dec.onclick = () => {{ count -= 1; render(); }};
-    reset.onclick = () => {{ count = 0; render(); }};
-    render();
-  </script>
-</body>
-</html>
-"""
-    write_text("counter_demo.html", html)
-    produced.append("counter_demo.html")
-
-elif "README.md" in OUTPUTS and "书签管理器" in LOW:
-    readme = """# 命令行书签管理器
-
-## 用法
-- `bookmark add <url> --title <title> --tag <tag>` 添加书签。
-- `bookmark list [--tag <tag>]` 列出书签。
-- `bookmark open <id>` 打开指定书签。
-- `bookmark remove <id>` 删除书签。
-
-## 数据格式
-书签保存为 JSON 数组，每条记录包含 `id`、`url`、`title`、`tags`、`created_at`、`updated_at`。
-
-## 错误处理策略
-- URL 为空或格式不合法时返回清晰错误。
-- 数据文件不存在时自动创建空数组。
-- JSON 损坏时先备份原文件，再提示用户修复或重建。
-- 删除或打开不存在的 id 时返回非零退出码和可读提示。
-"""
-    write_text("README.md", readme)
-    produced.append("README.md")
-
-elif "word_stats.py" in OUTPUTS:
-    code = r"""#!/usr/bin/env python3
-import re
-from collections import Counter
-
-def top_words(text, n=5):
-    words = re.findall(r"[A-Za-z0-9_']+", text.lower())
-    return Counter(words).most_common(n)
-
-if __name__ == "__main__":
-    sample = "hello world hello agent agent agent test world"
-    for word, count in top_words(sample):
-        print(f"{{word}}: {{count}}")
-"""
-    write_text("word_stats.py", code)
-    produced.append("word_stats.py")
-
-elif "json_summary.py" in OUTPUTS:
-    records = [
-        {{"id": 1, "name": "alpha", "score": 91}},
-        {{"id": 2, "name": "beta", "score": 84}},
-        {{"id": 3, "name": "gamma", "score": 88}},
-    ]
-    write_json("sample_records.json", records)
-    produced.append("sample_records.json")
-    code = r"""#!/usr/bin/env python3
-import json
-from pathlib import Path
-
-def summarize(path):
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise ValueError("expected a JSON array")
-    fields = sorted({{key for row in data if isinstance(row, dict) for key in row.keys()}})
-    return {{"record_count": len(data), "fields": fields}}
-
-if __name__ == "__main__":
-    summary = summarize("sample_records.json")
-    assert summary["record_count"] == 3
-    assert summary["fields"] == ["id", "name", "score"]
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-"""
-    write_text("json_summary.py", code)
-    produced.append("json_summary.py")
-
-elif "event_pipeline.py" in OUTPUTS or "raw_events.csv" in OUTPUTS or "event_summary.json" in OUTPUTS:
-    raw_rows = [
-        {{"event_id": "e001", "event_type": "login", "user": "alice", "value": 1}},
-        {{"event_id": "e002", "event_type": "purchase", "user": "bob", "value": 19}},
-        {{"event_id": "e003", "event_type": "logout", "user": "alice", "value": 1}},
-        {{"event_id": "e004", "event_type": "purchase", "user": "carol", "value": 33}},
-        {{"event_id": "e002", "event_type": "purchase", "user": "bob", "value": 19}},
-        {{"event_id": "e005", "event_type": "login", "user": "dave", "value": 1}},
-        {{"event_id": "e006", "event_type": "refund", "user": "carol", "value": 8}},
-        {{"event_id": "e007", "event_type": "purchase", "user": "alice", "value": 27}},
-        {{"event_id": "e006", "event_type": "refund", "user": "carol", "value": 8}},
-    ]
-    write_csv("raw_events.csv", raw_rows, ["event_id", "event_type", "user", "value"])
-    produced.append("raw_events.csv")
-    pipeline = r"""#!/usr/bin/env python3
-import csv, json
-from collections import Counter
-from pathlib import Path
-
-INPUT = Path("raw_events.csv")
-OUTPUT = Path("event_summary.json")
-
-with INPUT.open(newline="", encoding="utf-8") as f:
-    rows = list(csv.DictReader(f))
-
-seen = set()
-deduped = []
-duplicates = []
-for row in rows:
-    event_id = row.get("event_id", "")
-    if event_id in seen:
-        duplicates.append(event_id)
-        continue
-    seen.add(event_id)
-    deduped.append(row)
-
-summary = {{
-    "input_rows": len(rows),
-    "deduped_rows": len(deduped),
-    "duplicate_event_ids": sorted(set(duplicates)),
-    "duplicate_count": len(duplicates),
-    "event_type_counts": dict(Counter(row.get("event_type", "") for row in deduped)),
-    "user_counts": dict(Counter(row.get("user", "") for row in deduped)),
-}}
-OUTPUT.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
-print(json.dumps(summary, ensure_ascii=False, indent=2))
-"""
-    write_text("event_pipeline.py", pipeline)
-    produced.append("event_pipeline.py")
-
-elif "report_builder.py" in OUTPUTS or "metrics.json" in OUTPUTS or "ops_report.md" in OUTPUTS:
-    metrics = {{"uptime": "99.95%", "latency_p95": 183, "error_rate": 0.004, "requests": 24819}}
-    write_json("metrics.json", metrics)
-    produced.append("metrics.json")
-    builder = r"""#!/usr/bin/env python3
-import json
-from pathlib import Path
-
-metrics = json.loads(Path("metrics.json").read_text(encoding="utf-8"))
-lines = [
-    "# Operations Report",
-    "",
-    "## Summary",
-    "- summary: local metrics report generated from metrics.json.",
-    "",
-    f"- uptime: {{metrics['uptime']}}",
-    f"- latency_p95: {{metrics['latency_p95']}} ms",
-    f"- error_rate: {{metrics['error_rate']}}",
-    f"- requests: {{metrics['requests']}}",
-    "",
-    "## Recommendations",
-    "- recommend monitoring uptime, latency_p95, and error_rate on every release.",
-    "",
-    "## Validation",
-    "- Generated from metrics.json with local Python.",
-]
-Path("ops_report.md").write_text("\\n".join(lines) + "\\n", encoding="utf-8")
-print("wrote ops_report.md")
-"""
-    write_text("report_builder.py", builder)
-    produced.append("report_builder.py")
-
-elif "migrate_config.py" in OUTPUTS or "old_config.json" in OUTPUTS or "new_config.json" in OUTPUTS:
-    old_config = {{
-        "service_name": "billing-api",
-        "retry_count": 3,
-        "timeout_seconds": 30,
-        "enable_audit_log": True,
-    }}
-    write_json("old_config.json", old_config)
-    produced.append("old_config.json")
-    migrator = r"""#!/usr/bin/env python3
-import json, re
-from pathlib import Path
-
-def snake_to_camel(name):
-    parts = name.split("_")
-    return parts[0] + "".join(part.capitalize() for part in parts[1:])
-
-old = json.loads(Path("old_config.json").read_text(encoding="utf-8"))
-new = {{snake_to_camel(k): v for k, v in old.items()}}
-mapping = {{k: snake_to_camel(k) for k in old}}
-Path("new_config.json").write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
-report = [
-    "# Migration Report",
-    "",
-    "## summary",
-    "- summary: snake_case keys were migrated to camelCase in new_config.json.",
-    "",
-    "## field mapping",
-    *[f"- {{src}} -> {{dst}}" for src, dst in mapping.items()],
-    "",
-    "## missing fields",
-    "- None detected in old_config.json.",
-    "",
-    "## validation",
-    f"- new_config.json keys: {{', '.join(new.keys())}}",
-    "- camelCase conversion completed.",
-    "",
-    "## recommendations",
-    "- recommend reviewing downstream services before deploying the migrated config.",
-]
-Path("migration_report.md").write_text("\\n".join(report) + "\\n", encoding="utf-8")
-print(json.dumps({{"mapping": mapping, "new_config": "new_config.json"}}, ensure_ascii=False, indent=2))
-"""
-    write_text("migrate_config.py", migrator)
-    produced.append("migrate_config.py")
-
-elif "customer_health.html" in OUTPUTS or "customer" in LOW and "health" in LOW:
-    rows = [
-        {{"segment": "Enterprise", "customer": "Northwind", "health": 92, "risk": "low", "action": "Expand success review"}},
-        {{"segment": "Pro", "customer": "Apex", "health": 68, "risk": "medium", "action": "Schedule adoption workshop"}},
-        {{"segment": "Basic", "customer": "Beacon", "health": 42, "risk": "high", "action": "Escalate retention plan"}},
-    ]
-    write_json("customer_health_data.json", rows)
-    bars = "\\n".join(
-        f"<tr><td>{{r['segment']}}</td><td>{{r['customer']}}</td><td>{{r['health']}}</td><td>{{r['risk']}}</td><td><div class='bar'><span style='width:{{r['health']}}%'></span></div></td><td>{{r['action']}}</td></tr>"
-        for r in rows
-    )
-    html = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Customer Health Report</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 32px; color: #18212f; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #ccd3dd; padding: 8px; text-align: left; }}
-    th {{ background: #eef3f8; }}
-    .bar {{ width: 160px; height: 12px; background: #e6e8ec; }}
-    .bar span {{ display: block; height: 12px; background: #2f7f6f; }}
-  </style>
-</head>
-<body>
-  <h1>Customer Health Report</h1>
-  <p>Offline customer health and risk summary generated from embedded data.</p>
-  <table>
-    <thead><tr><th>Segment</th><th>Customer</th><th>Health</th><th>Risk</th><th>Chart</th><th>Action</th></tr></thead>
-    <tbody>
-      __BARS__
-    </tbody>
-  </table>
-  <h2>Summary</h2>
-  <p>summary: customer health risk report for three embedded customer segments.</p>
-  <h2>Action Recommendations</h2>
-  <ul><li>Prioritize high risk customer retention.</li><li>Review medium risk adoption blockers.</li><li>Use health trend in weekly customer review.</li></ul>
-</body>
-</html>
-""".replace("__BARS__", bars)
-    write_text("customer_health.html", html)
-    produced.extend(["customer_health_data.json", "customer_health.html"])
-
-else:
-    for out in OUTPUTS:
-        if out.endswith(".md"):
-            write_text(out, "# Generated Report\\n\\n- Generated by deterministic artifact builder.\\n")
-            produced.append(out)
-        elif out.endswith(".json"):
-            write_json(out, {{"generated": True, "goal": GOAL}})
-            produced.append(out)
-        elif out.endswith(".csv"):
-            write_csv(out, [{{"metric": "generated", "value": "true"}}], ["metric", "value"])
-            produced.append(out)
-        elif out.endswith(".py"):
-            write_text(out, "print('generated')\\n")
-            produced.append(out)
-
-import os, shutil, subprocess
-
-for script in (
-    "event_pipeline.py", "report_builder.py", "migrate_config.py",
-    "word_stats.py", "parse_duration.py", "clean_csv.py", "lru_cache.py",
-    "config_loader.py", "slugify.py", "json_summary.py",
-):
-    if Path(script).exists():
-        print(f"running {{script}}")
-        subprocess.run(["python3", script], check=True)
-
-if Path("test_email_validator.py").exists():
-    subprocess.run(["python3", "-m", "unittest", "test_email_validator.py"], check=True)
-if Path("test_config_loader.py").exists():
-    subprocess.run(["python3", "-m", "unittest", "test_config_loader.py"], check=True)
-if Path("debounce.js").exists():
-    if shutil.which("node"):
-        subprocess.run(["node", "debounce.js"], check=True)
-    else:
-        print("node not found; debounce.js syntax/runtime smoke skipped")
-if Path("throttle.js").exists():
-    if shutil.which("node"):
-        subprocess.run(["node", "throttle.js"], check=True)
-    else:
-        print("node not found; throttle.js syntax/runtime smoke skipped")
-if Path("safe_backup.sh").exists():
-    os.chmod("safe_backup.sh", 0o755)
-    subprocess.run(["bash", "safe_backup.sh", "backup_demo.txt"], check=True)
-if Path("count_lines.sh").exists():
-    os.chmod("count_lines.sh", 0o755)
-    result = subprocess.check_output(["bash", "count_lines.sh", "count_lines_demo.txt"], text=True).strip()
-    if result != "3":
-        raise SystemExit(f"count_lines.sh expected 3, got {{result}}")
-    print("count_lines.sh demo passed")
-
-print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=False, indent=2))
-'''
-
-    def _deterministic_artifact_builder_execute_if_applicable(self) -> bool:
-        bb = self._ensure_blackboard()
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        plan_phase = str(plan.get("phase", "") or "").strip().lower()
-        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
-        if not approved_or_executing:
-            return False
-        if self._plan_mode_uploaded_file_rows():
-            return False
-        if bool(bb.get("deterministic_artifact_builder_done", False)):
-            return False
-        goal = self._plan_mode_effective_goal_text()
-        outputs = self._plan_mode_requested_output_paths(goal)
-        low = str(goal or "").lower()
-        if not outputs:
-            return False
-        trigger = any(
-            token in low
-            for token in (
-                "python", "脚本", "script", "pipeline", "管道", "生成", "创建",
-                "javascript", "node", "bash", "测试", "验证", "实现", "函数", "class",
-                "report_builder.py", "migrate_config.py", "event_pipeline.py",
-                "customer_health.html", "metrics.json", "event_summary.json",
-                "new_config.json", "ops_report.md",
-                "debounce", "parse_duration", "lru", "clean_csv", "safe_backup",
-                "is_valid_email", "config_loader", "word_stats", "todo_demo",
-                "throttle", "slugify", "count_lines", "counter_demo", "json_summary",
-            )
-        )
-        if not trigger:
-            return False
-        self._set_runtime_phase("deterministic-artifact-builder")
-        self._emit("status", {"summary": "deterministic artifact builder started"})
-        bb["status"] = "CODING"
-        bb["deterministic_artifact_builder_started_at"] = float(now_ts())
-        self.blackboard = bb
-        script_rel = ".clouds_coder/deterministic_artifact_builder.py"
-        try:
-            script_content = self._deterministic_artifact_builder_script(goal, outputs)
-        except Exception as exc:
-            fail_text = (
-                "本地制品生成脚本创建失败。\n\n"
-                f"- 错误：{trim(str(exc), 500)}"
-            )
-            self.messages.append({
-                "role": "assistant",
-                "content": fail_text,
-                "ts": now_ts(),
-                "agent_role": "developer",
-            })
-            self._emit("message", {
-                "role": "assistant",
-                "text": fail_text,
-                "summary": "deterministic artifact builder script generation failed",
-                "agent_role": "developer",
-            })
-            self._emit("status", {"summary": "deterministic artifact builder script generation failed"})
-            return True
-        self._dispatch_tool("write_file", {"path": script_rel, "content": script_content}, agent_role="developer")
-        cmd_output = self._dispatch_tool("bash", {"command": f"python3 {shlex.quote(script_rel)}"}, agent_role="developer")
-        verify_parts = [f"test -s {shlex.quote(out)} && echo OK:{shlex.quote(out)}" for out in outputs]
-        verify_output = ""
-        if verify_parts:
-            verify_output = self._dispatch_tool("bash", {"command": " && ".join(verify_parts)}, agent_role="developer")
-        missing_outputs = []
-        for out in outputs:
-            try:
-                if not self._session_path(out).exists() or self._session_path(out).stat().st_size <= 0:
-                    missing_outputs.append(out)
-            except Exception:
-                missing_outputs.append(out)
-        combined_output = f"{cmd_output}\n{verify_output}"
-        command_failed = ("exit: 1" in combined_output or "Traceback" in combined_output or "SyntaxError" in combined_output)
-        if missing_outputs or command_failed:
-            bb = self._ensure_blackboard()
-            bb["status"] = "ABORTED"
-            bb["deterministic_artifact_builder_error"] = trim(combined_output, 2000)
-            self.blackboard = bb
-            self._blackboard_append_section(
-                "execution_logs",
-                "developer",
-                trim(f"deterministic artifact builder failed:\n{combined_output}", 3000),
-            )
-            fail_text = (
-                "本地制品生成未通过验证。\n\n"
-                f"- 缺失输出：{', '.join(missing_outputs) if missing_outputs else '无'}\n"
-                "- 已停止批准流程，避免把失败结果标记为完成。"
-            )
-            self.messages.append({
-                "role": "assistant",
-                "content": fail_text,
-                "ts": now_ts(),
-                "agent_role": "developer",
-            })
-            self._emit("message", {
-                "role": "assistant",
-                "text": fail_text,
-                "summary": "deterministic artifact builder failed validation",
-                "agent_role": "developer",
-            })
-            self._emit("status", {"summary": "deterministic artifact builder failed validation"})
-            return True
-        try:
-            plan_steps = [
-                t for t in self._ensure_blackboard().get("project_todos", [])
-                if isinstance(t, dict) and t.get("category") == "plan_step"
-            ]
-            if plan_steps:
-                for step in list(plan_steps):
-                    if step.get("status") == "completed":
-                        continue
-                    self._advance_plan_step(
-                        evidence="deterministic artifact builder completed planned outputs",
-                        actor="developer",
-                    )
-        except Exception:
-            pass
-        for out in outputs:
-            try:
-                fp = self._session_path(out)
-                if fp.exists():
-                    self._blackboard_upsert_artifact(out, f"deterministic artifact builder output ({fp.stat().st_size} bytes)", "developer")
-            except Exception:
-                pass
-        self._blackboard_append_section(
-            "execution_logs",
-            "developer",
-            trim(f"deterministic artifact builder command output:\n{cmd_output}", 3000),
-        )
-        self._blackboard_mark_approved(
-            f"Generated {', '.join(outputs)} with deterministic artifact builder.",
-            actor="developer",
-        )
-        bb = self._ensure_blackboard()
-        bb["deterministic_artifact_builder_done"] = True
-        bb["deterministic_artifact_builder_outputs"] = list(outputs)
-        bb["deterministic_artifact_builder_completed_at"] = float(now_ts())
-        self.blackboard = bb
-        self._mark_all_done_silently("deterministic artifact builder completed")
-        final_text = (
-            "已完成计划中的本地制品生成与验证。\n\n"
-            f"- 输出文件：{', '.join(f'`{p}`' for p in outputs)}\n"
-            "- 已通过本地 Python 脚本生成目标文件并运行存在性验证。"
-        )
-        self.messages.append({
-            "role": "assistant",
-            "content": final_text,
-            "ts": now_ts(),
-            "agent_role": "developer",
-        })
-        self._emit("message", {
-            "role": "assistant",
-            "text": final_text,
-            "summary": "deterministic artifact builder completed",
-            "agent_role": "developer",
-        })
-        self._emit("status", {"summary": "deterministic artifact builder finished"})
-        return True
-
-    def _lightweight_text_answer_candidate(self, goal: str = "") -> bool:
-        """True when the latest request should stay in plain text Q&A.
-
-        This is a rule-level guard before plan-mode. Small local models can
-        over-classify comparison, rewrite, menu, budget, and short planning
-        prompts as multi-step work; if there are no uploads, no output files,
-        no explicit tool intent, and no user-forced task level, direct text is
-        the safer path.
-        """
-        # Disabled by default: this fast path was too aggressive and could
-        # intercept build/create requests such as interactive apps or 3D tools.
-        # Route all tasks through the normal planner/worker policy instead.
-        return False
-        if self._plan_mode_uploaded_file_rows():
-            return False
-        if str(self.plan_mode_user_preference or "auto").lower() == "on":
-            return False
-        if bool(self.runtime_plan_proposal):
-            return False
-        if int(getattr(self, "user_task_level_override", 0) or 0) in TASK_LEVEL_CHOICES:
-            return False
-        if self._is_plan_choice_response(str(goal or self._latest_user_goal_text() or "")):
-            return False
-        goal = trim(str(goal or self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
-        if not goal or self._plan_mode_requested_output_paths(goal):
-            return False
-        if len(goal) > 1200:
-            return False
-        low = goal.lower()
-        tool_or_artifact_markers = (
-            ".py", ".js", ".ts", ".html", ".css", ".json", ".jsonl", ".csv", ".md",
-            "上传", "已上传", "uploaded/", "uploaded file", "工作区", "当前目录",
-            "当前会话工作区", "保存为", "生成文件", "创建文件", "写入文件",
-            "读取文件", "运行验证", "运行测试", "命令行", "shell", "terminal",
-            "python", "javascript", "typescript", "node", "pytest", "bash",
-            "脚本", "函数", "class", "api", "数据库", "docker", "部署",
-            "implement", "refactor", "debug", "run tests", "create file",
-            "write file", "workspace", "current directory",
-        )
-        if any(token in low for token in tool_or_artifact_markers):
-            return False
-        destructive_or_external = (
-            "删除", "迁移", "部署", "发布", "生产环境", "数据库迁移",
-            "delete", "migrate", "deploy", "production",
-        )
-        if any(token in low for token in destructive_or_external):
-            return False
-        text_markers = (
-            "解释", "为什么", "给出", "请给出", "比较", "总结", "改写",
-            "制定", "计划", "方案", "分析", "设计", "模板", "菜单",
-            "采购清单", "时间安排", "预算", "阅读以下", "反馈", "建议",
-            "原因", "优先级", "流程", "表格", "用中文", "邮件",
-            "explain", "compare", "summarize", "rewrite", "plan", "budget",
-            "menu", "email", "template", "recommend",
-        )
-        return len(goal) <= 420 or any(token in low for token in text_markers)
-
-    def _coerce_direct_text_policy_if_applicable(self, goal: str = "") -> bool:
-        if not self._lightweight_text_answer_candidate(goal):
-            return False
-        self.runtime_plan_mode_needed = False
-        self.runtime_confirmation_needed = False
-        self.runtime_requires_confirmation = False
-        self.runtime_task_level = 2
-        self.runtime_task_type = "general"
-        self.runtime_task_complexity = "simple"
-        self.runtime_execution_mode = EXECUTION_MODE_SINGLE
-        self.runtime_assigned_expert = "developer"
-        self.runtime_participants = ["developer"]
-        self.runtime_round_budget = min(max(2, int(self.runtime_round_budget or 3)), 6)
-        bb = self._ensure_blackboard()
-        profile = self._ensure_blackboard_task_profile(bb)
-        profile.update({
-            "task_level": 2,
-            "execution_mode": EXECUTION_MODE_SINGLE,
-            "participants": ["developer"],
-            "assigned_expert": "developer",
-            "requires_user_confirmation": False,
-            "task_type": "general",
-            "complexity": "simple",
-            "scale_preference": "fast",
-            "direct_objective": "Direct plain-text answer; no tools, files, or plan-mode required.",
-            "round_budget": int(self.runtime_round_budget or 3),
-            "reason": "local rule: lightweight text answer guard",
-            "updated_at": float(now_ts()),
-        })
-        bb["task_profile"] = profile
-        bb["manager_judgement"] = {
-            "task_type": "general",
-            "complexity": "simple",
-            "scale_preference": "fast",
-            "progress": "lightweight text answer guard",
-            "remaining_rounds": int(self.runtime_round_budget or 3),
-            "task_level": 2,
-            "execution_mode": EXECUTION_MODE_SINGLE,
-            "participants": ["developer"],
-            "assigned_expert": "developer",
-            "semantic_confidence": "high",
-            "updated_at": float(now_ts()),
-        }
-        self.blackboard = bb
-        self._blackboard_touch()
-        self._emit("status", {"summary": "lightweight text request: plan-mode disabled"})
-        return True
-
-    def _direct_answer_template(self, goal: str) -> str:
-        # No task-content templates here. Lightweight answers should come from
-        # the model, with only a generic no-tool fallback if the model call fails.
-        return ""
-
-    def _deterministic_text_plan_answer(self, goal: str) -> str:
-        steps = self._plan_mode_text_plan_steps_for_goal(goal)
-        lines = ["下面是按计划整理后的结构化交付：", ""]
-        for step in steps:
-            parts = [ln.strip() for ln in str(step or "").splitlines() if ln.strip()]
-            if not parts:
-                continue
-            lines.append(f"## {parts[0]}")
-            for sub in parts[1:]:
-                lines.append(f"- {sub}")
-            lines.append("")
-        lines.append("执行建议：先确认边界和指标，再按优先级推进；所有结论都应在实际数据或反馈中复核。")
-        return "\n".join(lines).strip()
-
-    def _deterministic_text_plan_execute_if_applicable(self) -> bool:
-        bb = self._ensure_blackboard()
-        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        plan_phase = str(plan.get("phase", "") or "").strip().lower()
-        approved_or_executing = bool(self.runtime_plan_approved) or plan_phase == "executing"
-        if not approved_or_executing:
-            return False
-        if bool(bb.get("deterministic_text_plan_done", False)):
-            return False
-        if not bool(plan.get("deterministic_text_plan", False)) and not self._plan_mode_should_use_deterministic_text_plan():
-            return False
-        if self._plan_mode_uploaded_file_rows() or self._plan_mode_requested_output_paths(self._plan_mode_effective_goal_text()):
-            return False
-        self._set_runtime_phase("deterministic-text-plan")
-        self._emit("status", {"summary": "deterministic text-plan executor started"})
-        bb["status"] = "CODING"
-        bb["deterministic_text_plan_started_at"] = float(now_ts())
-        self.blackboard = bb
-        try:
-            self._sync_todos_from_blackboard(reason="deterministic-text-plan-start", board=bb)
-        except Exception:
-            pass
-        guard = 0
-        while guard < 80:
-            guard += 1
-            bb = self._ensure_blackboard()
-            current = next(
-                (
-                    t for t in bb.get("project_todos", [])
-                    if isinstance(t, dict)
-                    and t.get("category") == "plan_step"
-                    and t.get("status") == "in_progress"
-                ),
-                None,
-            )
-            if not current:
-                break
-            try:
-                self._ensure_worker_todos_for_plan_step(current, force_refresh=True, owner="developer")
-                step_id = str(current.get("id", "") or "")
-                with self.todo.lock:
-                    updated_items = []
-                    for item in self.todo.items:
-                        row = dict(item)
-                        if str(row.get("parent_step_id", "") or "") == step_id:
-                            row["status"] = "completed"
-                            row["activeForm"] = self.todo._default_active_form(
-                                "completed",
-                                row.get("content", ""),
-                                owner=row.get("owner", ""),
-                            )
-                        updated_items.append(row)
-                    self.todo.items = updated_items
-            except Exception:
-                pass
-            self._advance_plan_step(
-                evidence="deterministic text-plan step completed",
-                actor="developer",
-            )
-        goal = self._plan_mode_effective_goal_text()
-        final_text = self._deterministic_text_plan_answer(goal)
-        self.messages.append({
-            "role": "assistant",
-            "content": final_text,
-            "ts": now_ts(),
-            "agent_role": "developer",
-        })
-        self._emit("message", {
-            "role": "assistant",
-            "text": final_text,
-            "summary": "deterministic text-plan completed",
-            "agent_role": "developer",
-        })
-        bb = self._ensure_blackboard()
-        bb["deterministic_text_plan_done"] = True
-        bb["deterministic_text_plan_completed_at"] = float(now_ts())
-        self.blackboard = bb
-        self._blackboard_mark_approved("deterministic text-plan completed", actor="developer")
-        self._emit("status", {"summary": "deterministic text-plan executor finished"})
-        return True
-
-    def _direct_answer_execute_if_applicable(self, pinned_selection: str = "", force_lightweight: bool = False) -> bool:
-        # Direct-answer fast path is disabled. It is too easy for broad natural
-        # language build requests to be misclassified as lightweight text and
-        # bypass planning, tools, files, and Todo tracking.
-        return False
-        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or "").strip(), 4000)
-        if force_lightweight:
-            if not self._lightweight_text_answer_candidate(goal):
-                return False
-            self._coerce_direct_text_policy_if_applicable(goal)
-        else:
-            if self._plan_mode_uploaded_file_rows():
-                return False
-            if str(self.plan_mode_user_preference or "auto").lower() == "on":
-                return False
-            if bool(self.runtime_plan_mode_needed) or bool(self.runtime_plan_proposal):
-                return False
-            if not goal or self._plan_mode_requested_output_paths(goal):
-                return False
-            try:
-                level = int(self.runtime_task_level or 0)
-            except Exception:
-                level = 0
-            complexity = normalize_task_complexity(
-                getattr(self, "runtime_task_complexity", "") or "",
-                default="",
-            )
-            task_type = str(getattr(self, "runtime_task_type", "") or "").strip().lower()
-            if level > 2 and not (level == 3 and complexity == "simple" and task_type in {"general", ""}):
-                return False
-            if not self._lightweight_text_answer_candidate(goal):
-                return False
-        if not goal:
-            return False
-        self._set_runtime_phase("direct-answer:model-call")
-        self._emit("status", {"summary": "direct answer fast path started"})
-        answer = trim(self._direct_answer_template(goal), 6000)
-        if answer:
-            self._emit("status", {"summary": "direct answer template matched"})
-        else:
-            prompt = (
-                "/no_think\n"
-                "请直接回答用户问题。要求：\n"
-                "- 用中文回答，结构清晰。\n"
-                "- 不要调用工具，不要生成文件。\n"
-                "- 如果题目要求数量，严格给够数量。\n\n"
-                f"用户问题：\n{goal}"
-            )
-            try:
-                rsp = self._chat_with_same_model_retry(
-                    [{"role": "user", "content": prompt, "ts": now_ts()}],
-                    system="/no_think\n你是一个直接、准确、简洁的中文助手。",
-                    max_tokens=900,
-                    think=False,
-                    stream_thinking=False,
-                    pinned_selection=pinned_selection,
-                    context_label="direct answer",
-                    retries=1,
-                )
-                answer = trim(str(rsp.get("content", "") or "").strip(), 6000)
-            except Exception as exc:
-                answer = ""
-                self._emit("status", {"summary": f"direct answer failed; falling back ({trim(str(exc), 120)})"})
-        if not answer and force_lightweight:
-            answer = trim(self._direct_answer_fallback(goal), 6000)
-            if answer:
-                self._emit("status", {"summary": "direct answer generic fallback used"})
-        if not answer and force_lightweight:
-            answer = (
-                "我无法稳定生成完整回答，但这类请求已被识别为无需文件和工具的轻量文本任务。\n\n"
-                "建议按这个顺序处理：先明确目标和约束，再拆分关键维度，最后给出可执行的下一步和需要验证的不确定点。"
-            )
-            self._emit("status", {"summary": "direct answer lightweight isolation fallback used"})
-        if not answer:
-            return False
-        self.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "ts": now_ts(),
-            "agent_role": "developer",
-        })
-        self._emit("message", {
-            "role": "assistant",
-            "text": answer,
-            "summary": "direct answer completed",
-            "agent_role": "developer",
-        })
-        try:
-            bb = self._ensure_blackboard()
-            bb["status"] = "COMPLETED"
-            bb["approval"] = {
-                "approved": True,
-                "by": "developer",
-                "note": "direct answer fast path completed",
-                "ts": float(now_ts()),
-            }
-            self.blackboard = bb
-            self._blackboard_touch()
-        except Exception:
-            pass
-        self._emit("status", {"summary": "direct answer fast path finished"})
-        return True
-
-    def _direct_answer_fallback(self, goal: str) -> str:
-        goal = trim(str(goal or "").strip(), 1000)
-        if not goal:
-            return ""
-        low = goal.lower()
-        if any(token in low for token in ("改写", "润色", "回复", "邮件", "rewrite", "email")):
-            return (
-                "可以按更专业、克制、可执行的语气改写：\n\n"
-                "您好，\n\n"
-                "感谢反馈。我们已经了解您提到的问题，会先协助确认当前现象和可能原因。为便于进一步定位，建议您补充发生时间、操作步骤、相关截图或错误信息。\n\n"
-                "我们会根据补充信息继续排查，并尽快给出明确的处理建议。"
-            )
-        if any(token in low for token in ("比较", "对比", "表格", "compare")):
-            return (
-                "| 维度 | 选项A | 选项B | 选项C |\n"
-                "|---|---|---|---|\n"
-                "| 适用场景 | 边界清楚、变化较少 | 目标清楚、细节迭代 | 持续流入、频繁调整 |\n"
-                "| 优势 | 易规划、易验收 | 反馈快、能持续改进 | 灵活、可视化强 |\n"
-                "| 风险 | 变更成本高 | 依赖节奏和协作纪律 | 容易缺少阶段性总结 |\n\n"
-                "选择建议：先看需求变化频率和交付节奏。稳定任务选规划型方法；探索型任务选迭代型方法；持续运营和维护类任务选流动型方法。"
-            )
-        if any(token in low for token in ("反馈", "用户情绪", "产品问题", "行动建议")):
-            return (
-                "| 反馈信号 | 可能问题 | 用户情绪 | 行动建议 |\n"
-                "|---|---|---|---|\n"
-                "| 性能或流程卡顿 | 体验阻塞 | 焦躁、受阻 | 先量化影响面和关键路径耗时 |\n"
-                "| 信息不透明 | 预期管理不足 | 不信任、犹豫 | 统一页面、客服和合同口径 |\n"
-                "| 响应快但未解决 | 缺少闭环 | 失望 | 增加解决率、升级机制和回访 |\n"
-                "| 教程难懂 | 新手引导不足 | 困惑 | 用真实任务重写教程并补充示例 |\n\n"
-                "优先级：先处理直接阻塞使用和解决闭环的问题，再优化信息表达和学习材料。"
-            )
-        if any(token in low for token in ("菜单", "采购清单", "晚餐", "餐饮")):
-            return (
-                "建议按“限制条件、预算、准备时间”三件事组织：\n\n"
-                "| 模块 | 做法 |\n"
-                "|---|---|\n"
-                "| 菜单 | 选择一到两个主菜、两个配菜、一个汤或主食，避开明确忌口 |\n"
-                "| 采购 | 先买主食和蛋白质，再补蔬菜、水果、调味和饮品 |\n"
-                "| 时间 | 提前处理耗时食材，临近用餐再做易凉或口感敏感的菜 |\n"
-                "| 风险 | 为忌口、过敏和临时人数变化保留替代菜 |\n\n"
-                "预算控制：把大头放在主菜和主食，减少高价即食和临时加购。"
-            )
-        if any(token in low for token in ("训练", "跑步", "恢复", "受伤")):
-            return (
-                "| 阶段 | 训练重点 | 恢复控制 |\n"
-                "|---|---|---|\n"
-                "| 起步 | 低强度、短时长、建立频率 | 两次训练间隔至少一天 |\n"
-                "| 适应 | 逐步增加连续运动时间 | 疼痛持续时降量或休息 |\n"
-                "| 巩固 | 保持可对话强度，不追速度 | 每周设置轻松日 |\n"
-                "| 复盘 | 记录疲劳、睡眠和疼痛 | 根据身体反馈调整计划 |\n\n"
-                "原则：先稳定习惯，再增加强度；任何尖锐疼痛都不应硬撑。"
-            )
-        if any(token in low for token in ("预算", "模板", "计划", "方案", "流程", "分析", "建议")):
-            return (
-                "可以按下面的结构先落地，再根据实际约束微调。\n\n"
-                "| 模块 | 内容 | 检查点 |\n"
-                "|---|---|---|\n"
-                "| 目标 | 明确这次任务要解决什么问题、服务谁、总约束是什么 | 目标可衡量，边界清楚 |\n"
-                "| 拆分 | 按时间、费用、角色或流程拆成3到5个部分 | 每部分都有负责人或判断标准 |\n"
-                "| 执行 | 先处理影响最大、最不可逆的事项 | 避免把预算或时间耗在低优先级项上 |\n"
-                "| 风险 | 预留异常处理空间，记录触发条件和应对动作 | 超支、延期或质量问题有兜底方案 |\n"
-                "| 复盘 | 完成后记录实际结果和偏差原因 | 下次可复用，而不是重新猜 |\n\n"
-                f"针对你的问题：{goal}\n"
-                "建议先确定硬约束，再把资源分配到核心事项，最后保留一小部分机动空间处理异常。"
-            )
-        return (
-            f"针对你的问题：{goal}\n\n"
-            "可以先把结论、依据和下一步分开处理：先给出可执行结论，再说明关键原因，最后列出需要验证或跟进的事项。"
-        )
-
     def _plan_mode_synthesize_proposal(self, pinned_selection: str) -> dict:
         bb = self._ensure_blackboard()
         plan_data = bb.get("plan", {})
@@ -39432,12 +36980,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
             f"### Finding {i+1}\n{f.get('content', '')}"
             for i, f in enumerate(findings) if isinstance(f, dict)
         )
-        blackboard_findings = self._plan_mode_research_text(max_chars=6000)
-        if blackboard_findings and blackboard_findings not in findings_text:
-            findings_text = trim(
-                (findings_text + "\n\n" if findings_text else "") + blackboard_findings,
-                10000,
-            )
         goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 4000)
         # Include loaded skill guidance in synthesis
         bb_skills = bb.get("loaded_skills", {})
@@ -39589,12 +37131,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
             trim(str(f.get("content", "") if isinstance(f, dict) else ""), 600)
             for f in (findings[:5] if isinstance(findings, list) else [])
         )
-        blackboard_findings = self._plan_mode_research_text(max_chars=3000)
-        if blackboard_findings:
-            findings_text = trim(
-                (findings_text + "\n" if findings_text else "") + blackboard_findings,
-                5000,
-            )
         prompt = (
             f"Generate ONE simple plan for this task. You MUST call submit_plan_proposal with exactly 1 option.\n\n"
             f"Task: {goal}\n\nFindings: {trim(findings_text, 3000)}\n\n"
@@ -40360,15 +37896,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
         bb = self._ensure_blackboard()
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
-        previous_plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        proposal = previous_plan.get("proposal", {}) if isinstance(previous_plan.get("proposal"), dict) else self.runtime_plan_proposal
-        deterministic_text_plan = bool(
-            previous_plan.get("deterministic_text_plan", False)
-            or (
-                isinstance(proposal, dict)
-                and "Deterministic text-plan proposal" in str(proposal.get("context", "") or "")
-            )
-        )
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
         chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
         chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
@@ -40397,8 +37924,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
             _current_level = 3
         _user_override = int(getattr(self, "user_task_level_override", 0) or 0)
         _target_level = self._plan_risk_target_task_level(_current_level, _plan_risk, _user_override)
-        if deterministic_text_plan and _user_override not in TASK_LEVEL_CHOICES:
-            _target_level = min(int(_target_level), 3)
         bb["plan"] = {
             "phase": "executing",
             "chosen": choice_id,
@@ -40407,8 +37932,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
             "risk": _plan_risk,
             "steps": grouped_steps,
         }
-        if deterministic_text_plan:
-            bb["plan"]["deterministic_text_plan"] = True
         self.blackboard = bb
         self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen_title}")
         self.runtime_task_level = int(_target_level)
@@ -40555,32 +38078,13 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
             self._set_runtime_phase(self._startup_phase("model-ready"))
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
-            goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
-            if self._direct_answer_execute_if_applicable(
-                pinned_selection=pinned_selection,
-                force_lightweight=True,
-            ):
-                return
             # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
-            user_level_override = int(getattr(self, "user_task_level_override", 0) or 0)
-            if user_level_override in TASK_LEVEL_CHOICES:
-                self._cached_llm_complexity = normalize_task_complexity(
-                    getattr(self, "runtime_task_complexity", "") or "",
-                    default=("complex" if user_level_override >= 4 else "moderate" if user_level_override >= 3 else "simple"),
-                )
-                self._cached_complexity_dimensions = {
-                    "scope": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
-                    "steps": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
-                    "skill": 3 if user_level_override >= 4 else 2 if user_level_override >= 3 else 1,
-                    "output": 3 if user_level_override >= 4 else 2 if user_level_override >= 2 else 1,
-                }
-                self._set_runtime_phase(self._startup_phase("complexity-override"))
-            else:
-                self._set_runtime_phase(self._startup_phase("complexity-precheck"))
-                try:
-                    self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
-                except Exception:
-                    self._cached_llm_complexity = "simple"
+            goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
+            self._set_runtime_phase(self._startup_phase("complexity-precheck"))
+            try:
+                self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
+            except Exception:
+                self._cached_llm_complexity = "simple"
             self._emit(
                 "status",
                 {
@@ -40606,19 +38110,11 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                 roles=["manager"],
             )
             self._set_runtime_phase(self._startup_phase("policy-classify"))
-            if user_level_override in TASK_LEVEL_CHOICES:
-                self._apply_user_override_task_policy(
-                    self.runtime_reclassify_goal or self._latest_user_goal_text()
-                )
-            else:
-                self._refresh_runtime_task_policy(
-                    pinned_selection=pinned_selection,
-                    force=True,
-                    goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
-                    media_inputs_round=initial_policy_media_inputs,
-                )
-            self._coerce_direct_text_policy_if_applicable(
-                self.runtime_reclassify_goal or self._latest_user_goal_text()
+            self._refresh_runtime_task_policy(
+                pinned_selection=pinned_selection,
+                force=True,
+                goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                media_inputs_round=initial_policy_media_inputs,
             )
             if bool(self.runtime_confirmation_needed) and int(self.runtime_task_level or 0) == 5:
                 confirm_prompt = self._level5_confirmation_prompt()
@@ -40644,19 +38140,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                     {"summary": "level-5 requires user confirmation before next actions"},
                 )
                 return
-            # Plan-mode should not be blocked by non-essential metadata calls
-            # such as auto-title generation, which can be slow on small local models.
-            if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
-                self._plan_mode_worker(pinned_selection=pinned_selection)
-                return
-            if self._deterministic_text_plan_execute_if_applicable():
-                return
-            if self._deterministic_file_analysis_execute_if_applicable():
-                return
-            if self._deterministic_artifact_builder_execute_if_applicable():
-                return
-            if self._direct_answer_execute_if_applicable(pinned_selection=pinned_selection):
-                return
             # ── Auto-rename session title early ──
             self._set_runtime_phase(self._startup_phase("auto-title"))
             try:
@@ -40671,6 +38154,10 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                     raise
             except Exception:
                 pass
+            # Plan-mode check before entering the main execution loop.
+            if bool(self.runtime_plan_mode_needed) and not bool(self.runtime_plan_approved):
+                self._plan_mode_worker(pinned_selection=pinned_selection)
+                return
             if self._is_multi_agent_mode():
                 self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                 self._emit(
@@ -42008,6 +39495,7 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                     dropped_pending_inputs = len(self.pending_user_inputs)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
+                self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
             if dropped_pending_inputs > 0:
@@ -42283,22 +39771,6 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                     "active_agent": blackboard.get("active_agent", ""),
                     "approval": blackboard.get("approval", {}),
                     "last_delegate": blackboard.get("last_delegate", {}),
-                    "plan": (
-                        {
-                            "phase": (blackboard.get("plan", {}) or {}).get("phase", ""),
-                            "chosen": (blackboard.get("plan", {}) or {}).get("chosen", ""),
-                            "proposal": (
-                                {
-                                    "recommended": ((blackboard.get("plan", {}) or {}).get("proposal", {}) or {}).get("recommended", ""),
-                                    "option_count": len(((blackboard.get("plan", {}) or {}).get("proposal", {}) or {}).get("options", []) or []),
-                                }
-                                if isinstance((blackboard.get("plan", {}) or {}).get("proposal", {}), dict)
-                                else {}
-                            ),
-                        }
-                        if isinstance(blackboard.get("plan", {}), dict)
-                        else {}
-                    ),
                     "task_profile": blackboard.get("task_profile", {}),
                     "manager_judgement": blackboard.get("manager_judgement", {}),
                     "research_notes_count": len(blackboard.get("research_notes", []) or []),
@@ -42400,6 +39872,125 @@ print(json.dumps({{"outputs": OUTPUTS, "produced": produced}}, ensure_ascii=Fals
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
             }
+
+    def degraded_snapshot(self, reason: str = "session busy") -> dict:
+        return {
+            "id": self.id,
+            "title": str(getattr(self, "title", self.id) or self.id),
+            "running": bool(getattr(self, "running", False)),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
+            "updated_at": float(getattr(self, "updated_at", 0.0) or 0.0),
+            "message_count": 0,
+            "model": str(getattr(getattr(self, "ollama", None), "model", "") or ""),
+            "provider": str(getattr(getattr(self, "ollama", None), "provider", "") or ""),
+            "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
+            "agent_phase": str(getattr(self, "current_phase", "busy") or "busy"),
+            "agent_active_tool": str(getattr(self, "current_tool_name", "") or ""),
+            "run_started_at": float(getattr(self, "run_started_at", 0.0) or 0.0),
+            "run_last_heartbeat": float(getattr(self, "run_last_heartbeat", 0.0) or 0.0),
+            "recovered_at": float(getattr(self, "run_recovered_at", 0.0) or 0.0),
+            "recovered_reason": str(getattr(self, "run_recovered_reason", "") or ""),
+            "degraded": True,
+            "degraded_reason": trim(reason, 220),
+            "messages": [],
+            "conversation_feed": [],
+            "uploads": [],
+            "todos": [],
+            "tasks": [],
+            "background": [],
+            "teammates": [],
+            "activity": [],
+            "operations": [],
+        }
+
+    def snapshot_safe(self, include_model_catalog: bool = False, lite: bool = False, lock_timeout: float = 0.4) -> dict:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=max(0.0, float(lock_timeout or 0.0))))
+        except Exception:
+            acquired = False
+        if not acquired:
+            return self.degraded_snapshot("session lock busy")
+        try:
+            return self.snapshot(include_model_catalog=include_model_catalog, lite=lite)
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+
+    def recover_if_stale(self, now_value: float | None = None, stale_seconds: int = SESSION_HEARTBEAT_STALE_SECONDS) -> bool:
+        now_value = float(now_value or now_ts())
+        acquired = False
+        restart_parse_worker = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            try:
+                if bool(getattr(self, "running", False)):
+                    hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                    started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                    baseline = hb or started
+                    if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                        self.cancel_requested = True
+                        self.running = False
+                        self.current_phase = "crashed_recovered"
+                        self.current_tool_name = ""
+                        self.run_recovered_at = now_value
+                        self.run_recovered_reason = (
+                            f"watchdog recovered lock-busy session after {int(now_value - baseline)}s without heartbeat"
+                        )
+                        self.updated_at = now_value
+                        return True
+            except Exception:
+                pass
+            return False
+        try:
+            changed = False
+            parse_active = str(getattr(self, "upload_parse_active_id", "") or "")
+            parse_started = float(getattr(self, "upload_parse_active_started_at", 0.0) or 0.0)
+            if parse_active and parse_started and (now_value - parse_started) > max(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS * 2, 60):
+                self._patch_upload_meta(
+                    parse_active,
+                    parse_status="skipped_timeout",
+                    parse_error=f"upload parser timed out after {int(now_value - parse_started)}s",
+                    parse_finished_at=now_value,
+                )
+                self.upload_parse_active_id = ""
+                self.upload_parse_active_started_at = 0.0
+                restart_parse_worker = True
+                changed = True
+            if bool(getattr(self, "running", False)):
+                hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                baseline = hb or started
+                if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                    self.cancel_requested = True
+                    self.running = False
+                    self.current_phase = "crashed_recovered"
+                    self.current_tool_name = ""
+                    self.run_recovered_at = now_value
+                    self.run_recovered_reason = f"watchdog recovered stale session after {int(now_value - baseline)}s without heartbeat"
+                    self.updated_at = now_value
+                    changed = True
+            if changed:
+                self._persist()
+            return changed
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+            if restart_parse_worker:
+                try:
+                    with self.upload_parse_worker_lock:
+                        self.upload_parse_worker_started = False
+                    if not self.upload_parse_queue.empty():
+                        self._ensure_upload_parse_worker()
+                except Exception:
+                    pass
 
     def export_bundle(self) -> bytes:
         bio = io.BytesIO()
@@ -43397,18 +40988,38 @@ class SessionManager:
                 continue
             if status_key in {"idle", "stopped"} and running:
                 continue
+            degraded = False
             try:
-                message_count = sum(
-                    1 for row in getattr(sess, "messages", [])
-                    if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
-                )
+                acquired = bool(sess.lock.acquire(timeout=0.03))
             except Exception:
+                acquired = False
+            if acquired:
+                try:
+                    message_count = sum(
+                        1 for row in getattr(sess, "messages", [])
+                        if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
+                    )
+                    title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+                    running = bool(getattr(sess, "running", False))
+                except Exception:
+                    message_count = 0
+                    degraded = True
+                finally:
+                    try:
+                        sess.lock.release()
+                    except Exception:
+                        pass
+            else:
                 message_count = 0
+                degraded = True
             rows.append(
                 {
                     "id": sid,
                     "title": title,
                     "running": running,
+                    "degraded": degraded,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
                     "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
                     "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
                     "message_count": int(message_count),
@@ -43574,6 +41185,8 @@ window.MathJax={
           <div id="previewStageStat" class="mono preview-stage-stat"></div>
         </div>
         <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
+        <button id="previewModeBtn" class="subtle hidden">Source</button>
+        <button id="previewDownloadBtn" class="subtle hidden">Download</button>
         <button id="previewReloadBtn" class="subtle">Reload</button>
       </div>
       <div id="previewBody" class="preview-body"></div>
@@ -43654,7 +41267,9 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
-.session-item{padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+.session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:94px;min-height:94px;flex:0 0 94px;display:flex;flex-direction:column;justify-content:flex-start;gap:7px;overflow:hidden}
+.session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.session-item .mono{display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
 .chat #chat{flex:1;min-height:0;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:8px;background:#fff;border:1px solid var(--line);border-radius:12px;overscroll-behavior:contain;overflow-anchor:none}
 .chat-tabs{display:flex;align-items:center;gap:6px;min-height:38px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f6f9ff;margin-bottom:8px;overflow:auto}
@@ -44006,7 +41621,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -44222,6 +41837,7 @@ Object.assign(I18N['en'],{
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -44242,6 +41858,7 @@ Object.assign(I18N['zh-CN'],{
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -44265,6 +41882,7 @@ Object.assign(I18N['zh-TW'],{
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -44286,6 +41904,7 @@ Object.assign(I18N['ja'],{
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -44297,7 +41916,7 @@ function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
 function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
-async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();renderChat('language');renderSkillsEntryLink()}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const explicit=Number(o.timeoutMs);const timeoutMs=(Number.isFinite(explicit)&&explicit>0)?Math.max(1000,Math.min(86400000,Math.round(explicit))):globalApiTimeoutMs();delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
@@ -44426,8 +42045,8 @@ function _deltaScheduleRender(flags={}){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('delta'));}
-        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');renderChat('delta');}
+        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
+        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');scheduleRenderChat('delta');}
       }
     }
     if(needBoards){
@@ -44438,6 +42057,19 @@ function _deltaScheduleRender(flags={}){
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
       }
     }
+  });
+}
+function scheduleRenderChat(reason='snapshot'){
+  const next=String(reason||'snapshot');
+  const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
+  const cur=String(S.chatRenderPendingReason||'');
+  if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
+  if(S.chatRenderRaf)return;
+  S.chatRenderRaf=requestAnimationFrame(()=>{
+    S.chatRenderRaf=0;
+    const runReason=String(S.chatRenderPendingReason||next||'snapshot');
+    S.chatRenderPendingReason='';
+    renderChat(runReason);
   });
 }
 function _deltaConsumeSeq(evt){
@@ -44638,16 +42270,17 @@ function renderSessions(){
     setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
     return;
   }
-  const itemH=58;
+  const itemH=94;
+  const rowStride=102;
   const viewportH=Math.max(240,Number(host.clientHeight||420));
   const scrollTop=Math.max(0,Number(host.scrollTop||0));
-  const start=Math.max(0,Math.floor(scrollTop/itemH)-8);
-  const count=Math.min(rows.length-start,Math.ceil(viewportH/itemH)+18);
+  const start=Math.max(0,Math.floor(scrollTop/rowStride)-8);
+  const count=Math.min(rows.length-start,Math.ceil(viewportH/rowStride)+18);
   const visible=rows.slice(start,start+count);
-  const padTop=start*itemH;
-  const padBottom=Math.max(0,(rows.length-start-count)*itemH);
+  const padTop=start*rowStride;
+  const padBottom=Math.max(0,(rows.length-start-count)*rowStride);
   const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
-    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"min-height:${itemH-8}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
+    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"height:${itemH}px;min-height:${itemH}px;flex:0 0 ${itemH}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
     `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
   setPanelHtml('sessionList',html);
   for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
@@ -45249,12 +42882,14 @@ function _mdWorkerQueue(text,key){
 }
 function renderMarkdownCached(text,key){const src=String(text||'');const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const jobId=_mdWorkerQueue(src,k);if(jobId>0){return `<div class=\"md-async-slot\" data-md-job=\"${jobId}\">${esc(src).replace(/\\n/g,'<br>')}</div>`}const html=renderMarkdown(src);if(k){_mdCacheSet(k,html)}return html}
 function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
-function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';if(ext==='.txt')return 'markdown';return ''}
 function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='image')return '🖼️';if(kind==='video')return '🎞️';if(kind==='audio')return '🔊';if(kind==='pdf')return '📕';if(kind==='csv')return '📊';if(kind==='excel')return '📗';if(kind==='document')return '📘';if(kind==='presentation')return '📽️';if(kind==='code')return '{}';return '📄'}
 function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
 function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
 function encodePreviewPath(path){return normalizePreviewPath(path).split('/').filter(Boolean).map(x=>encodeURIComponent(x)).join('/')}
 function previewFileUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-file/${rel}${ts}`}
+function previewDownloadUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-file/${rel}?download=1`}
+function previewHtmlBundleUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-html-bundle/${rel}`}
 function previewHtmlUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-html/${rel}${ts}`}
 function previewCodeStagesUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code-stages/${rel}${ts}`}
 function previewCodeUrl(sessionId,path,stage='latest',forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const st=encodeURIComponent(String(stage||'latest'));const ts=forceReload?`&ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code/${rel}?stage=${st}${ts}`}
@@ -45307,7 +42942,7 @@ function _previewRenderStageSelector(tab,stages,selectedReq,payload=null){
   const lineTail=(Number.isFinite(linesAfter)&&linesAfter>0)?` · lines=${linesAfter}`:'';
   stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
 }
-function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
+function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(ext==='.html'||ext==='.htm')return'html';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
 function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake'||v==='nim'||v==='julia'||v==='elixir'||v==='crystal')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql'||v==='haskell')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml'||v==='vhdl')return{hashComment:false,slashComment:false,dashComment:true,blockComment:false,xmlComment:true,backtick:false};if(v==='json'||v==='fortran'||v==='asm'||v==='protobuf'||v==='prisma'||v==='graphql'||v==='wgsl')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='lisp'||v==='clojure'||v==='racket')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
 function _codeWordSet(lang){return CODE_KEYWORDS[String(lang||'default')]||CODE_KEYWORDS.default}
 function _isWordStart(ch){return /[A-Za-z_$]/.test(ch)}
@@ -45573,13 +43208,33 @@ function _codeRowsToStageText(rows){
   }
   return out.join('\\n');
 }
-function _setPreviewCopyState(tab){
+function _setPreviewToolbarState(tab){
   const btn=E('previewCopyBtn');
-  if(!btn)return;
+  const modeBtn=E('previewModeBtn');
+  const dlBtn=E('previewDownloadBtn');
   const isCode=!!(tab&&tab.kind==='code');
-  btn.classList.toggle('hidden',!isCode);
-  btn.disabled=!isCode;
-  if(isCode)btn.textContent=t('copy_code');
+  const isHtml=!!(tab&&tab.kind==='html');
+  const hasDownload=!!(tab&&tab.path);
+  if(btn){
+    btn.classList.toggle('hidden',!isCode);
+    btn.disabled=!isCode;
+    if(isCode)btn.textContent=t('copy_code');
+  }
+  if(modeBtn){
+    modeBtn.classList.toggle('hidden',!isHtml);
+    modeBtn.disabled=!isHtml;
+    if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
+    modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
+  }
+  if(dlBtn){
+    dlBtn.classList.toggle('hidden',!hasDownload);
+    dlBtn.disabled=!hasDownload;
+    dlBtn.textContent=t('preview_download');
+    dlBtn.onclick=(ev)=>{ev.preventDefault();downloadActivePreview()};
+  }
+}
+function _setPreviewCopyState(tab){
+  _setPreviewToolbarState(tab);
 }
 function _selectedCodePreviewText(body,sel){
   if(!body||!sel||typeof sel.toString!=='function')return'';
@@ -45780,19 +43435,21 @@ async function _renderCodePreviewTab(tab,body,forceReload=false){
   }
 }
 function previewButtonHtml(path){const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return '';const title=rel.split('/').pop()||rel;return `<div class=\"msg-preview-row\"><button class=\"msg-preview-btn\" data-preview-path=\"${esc(rel)}\" title=\"${esc(title)}\">${previewKindIcon(kind)} ${esc(title)}</button></div>`}
-function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':'')};st.tabs.push(row)}st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':''),htmlMode:'preview'};st.tabs.push(row)}if(kind==='html'&&!row.htmlMode)row.htmlMode='preview';st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function closePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');const idx=st.tabs.findIndex(x=>x.id===id);if(idx<0)return;st.tabs.splice(idx,1);if(st.active===id)st.active='conversation';renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activatePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');if(id==='conversation'){st.active='conversation'}else if(st.tabs.some(x=>x.id===id)){st.active=id}else{st.active='conversation'}renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activePreviewTab(){if(!S.activeId)return null;const st=ensurePreviewState(S.activeId);if(st.active==='conversation')return null;return st.tabs.find(x=>x.id===st.active)||null}
 function renderPreviewTabs(){const host=E('chatTabs');if(!host)return;if(!S.activeId){host.innerHTML='';return}const st=ensurePreviewState(S.activeId);const convActive=st.active==='conversation';const tabs=[`<div class=\"chat-tab chat-tab-conversation${convActive?' active':''}\" data-tab-id=\"conversation\"><span class=\"chat-tab-title\">💬 ${esc(t('panel_conversation'))}</span><span class=\"chat-tab-close chat-tab-close-placeholder\" aria-hidden=\"true\">×</span></div>`];for(const tab of st.tabs){tabs.push(`<div class=\"chat-tab${st.active===tab.id?' active':''}\" data-tab-id=\"${esc(tab.id)}\"><span class=\"chat-tab-title\">${previewKindIcon(tab.kind)} ${esc(tab.title||tab.path)}</span><button class=\"chat-tab-close\" data-close-id=\"${esc(tab.id)}\">×</button></div>`)}host.innerHTML=tabs.join('');for(const el of host.querySelectorAll('[data-tab-id]')){el.onclick=()=>activatePreviewTab(el.getAttribute('data-tab-id')||'conversation')}for(const el of host.querySelectorAll('[data-close-id]')){el.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();closePreviewTab(el.getAttribute('data-close-id')||'')}}}
-function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewCopyState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewToolbarState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function togglePreviewMode(){const tab=activePreviewTab();if(!tab||tab.kind!=='html')return;tab.htmlMode=(String(tab.htmlMode||'preview')==='source')?'preview':'source';const body=E('previewBody');if(body){body.removeAttribute('data-preview-key');body.removeAttribute('data-preview-ready')}renderPreviewVisibility();renderActivePreview(false)}
+function downloadActivePreview(){const tab=activePreviewTab();if(!tab||!S.activeId||!tab.path)return;const url=(tab.kind==='html')?previewHtmlBundleUrl(S.activeId,tab.path):previewDownloadUrl(S.activeId,tab.path);const a=document.createElement('a');a.href=url;a.download='';a.rel='noreferrer';document.body.appendChild(a);a.click();setTimeout(()=>{try{document.body.removeChild(a)}catch(_){}},0)}
 function renderActivePreview(forceReload=false){
   const pv=E('previewView');
   const body=E('previewBody');
   const meta=E('previewMeta');
   if(!pv||!body||!meta)return;
   const tab=activePreviewTab();
-  _setPreviewCopyState(tab);
+  _setPreviewToolbarState(tab);
   if(!tab){
     meta.textContent='';
     body.innerHTML='';
@@ -45802,7 +43459,7 @@ function renderActivePreview(forceReload=false){
     _previewResetStageUi();
     return;
   }
-  meta.textContent=tab.path;
+  meta.textContent=tab.kind==='html'?`${tab.path} · ${String(tab.htmlMode||'preview')==='source'?'source':'preview'}`:tab.path;
   if(tab.kind==='code'){
     const req=String(tab.codeStageId||'latest');
     const hint=_previewLatestCodeStageHint(tab.path);
@@ -45816,12 +43473,30 @@ function renderActivePreview(forceReload=false){
   }
   body._previewCopyText='';
   _previewResetStageUi();
-  const key=`${tab.id}|${tab.kind}`;
+  const key=`${tab.id}|${tab.kind}|${tab.kind==='html'?String(tab.htmlMode||'preview'):''}`;
   if(!forceReload&&body.getAttribute('data-preview-key')===key)return;
   body.setAttribute('data-preview-key',key);
   body.removeAttribute('data-preview-ready');
   const url=previewFileUrl(S.activeId,tab.path,forceReload);
   if(tab.kind==='html'){
+    if(String(tab.htmlMode||'preview')==='source'){
+      body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
+      const ticket=String(++S.previewNonce);
+      body.setAttribute('data-preview-ticket',ticket);
+      fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{
+        if(body.getAttribute('data-preview-ticket')!==ticket)return;
+        body._previewCopyText=txt;
+        const lang=_previewLangFromPath(tab.path)||'html';
+        const rows=_codeRowsFromFullText(txt);
+        if(rows.length>=CODE_PREVIEW_VIRT_THRESHOLD){
+          _renderCodeRowsVirtual(body,rows,lang,1);
+        }else{
+          body.innerHTML=`<div class=\"preview-code-scroll\"><div class=\"preview-code-shell\">${_renderCodeRows(rows,lang)}</div></div>`;
+          _bindNestedScrollGuards(body);
+        }
+      }).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`});
+      return;
+    }
     body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
     return;
   }
@@ -46461,7 +44136,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtRaf=requestAnimationFrame(()=>{
           chatEl._virtRaf=0;
           chatEl._virtLastScrollRenderTs=Date.now();
-          renderChat('scroll');
+          scheduleRenderChat('scroll');
         });
       },wait);
       return;
@@ -46470,7 +44145,7 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtRaf=requestAnimationFrame(()=>{
       chatEl._virtRaf=0;
       chatEl._virtLastScrollRenderTs=Date.now();
-      renderChat('scroll');
+      scheduleRenderChat('scroll');
     });
   };
   chatEl.addEventListener('wheel',ev=>{
@@ -46516,6 +44191,10 @@ function renderChat(reason='snapshot'){
   const c=E('chat');
   if(!c)return;
   _chatVirtBindScroll(c);
+  if(c._virtRendering){
+    scheduleRenderChat(reason==='scroll'?'scroll':'delta');
+    return;
+  }
   if(reason!=='scroll'){
     if(c._virtScrollRenderTimer){clearTimeout(c._virtScrollRenderTimer);c._virtScrollRenderTimer=0;}
     if(c._virtRaf){cancelAnimationFrame(c._virtRaf);c._virtRaf=0;}
@@ -46679,9 +44358,9 @@ function renderChat(reason='snapshot'){
   c._virtLastWinEnd=win.end;
   c._virtLastTopOffset=Number(win.topOffset||0);
   c._virtLastEndOffset=Number(win.endOffset||0);
-  if(hasHeightChange&&reason!=='scroll'){
+  if(hasHeightChange&&reason!=='scroll'&&reason!=='measure'){
     if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
-    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
+    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;const now=Date.now();if(now-Number(c._virtLastMeasureRenderTs||0)>180){c._virtLastMeasureRenderTs=now;scheduleRenderChat('measure')}});
   }
   if(reason!=='scroll'){
     renderPreviewTabs();
@@ -46696,7 +44375,7 @@ async function waitForPendingUploads(){const pending=S.uploadQueuePromise;if(pen
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
-async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');if(named.size>20*1024*1024){showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});uploaded+=1;if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return{uploaded,failed}}
 async function uploadFiles(fileList){if(!S.activeId){showError(t('select_session_first'));return}const files=Array.from(fileList||[]).filter(Boolean);if(!files.length)return;const run=async()=>{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0))+files.length;try{return await _uploadFilesNow(files)}finally{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0)-files.length)}};const prev=(S.uploadQueuePromise&&typeof S.uploadQueuePromise.then==='function')?S.uploadQueuePromise:Promise.resolve();const chained=prev.catch(()=>{}).then(run);const queued=chained.finally(()=>{if(S.uploadQueuePromise===queued)S.uploadQueuePromise=null});S.uploadQueuePromise=queued;return queued}
 function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
 function statusClass(status){return `st-${normalizeStatus(status)}`}
@@ -46983,7 +44662,7 @@ async function refreshSnapshot(opt={}){
     if(needBoards)S.lastBoardsSig=boardSig;
     if(needChat||needBoards){
       const doRender=()=>{
-        if(needChat)renderChat('snapshot');
+        if(needChat)scheduleRenderChat('snapshot');
         if(needBoards)renderBoards();
       };
       if(scrolling&&chatEl){
@@ -47114,7 +44793,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await waitForPendingUploads();await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -61468,6 +59147,49 @@ class AppContext:
             wiki_store=self.code_wiki,
         )
         self.code_source_roots = self._discover_external_code_source_roots()
+        self._session_watchdog_stop = threading.Event()
+        self._session_watchdog_thread = threading.Thread(
+            target=self._session_watchdog_loop,
+            name="session-watchdog",
+            daemon=True,
+        )
+        self._session_watchdog_thread.start()
+
+    def _session_watchdog_loop(self):
+        while not self._session_watchdog_stop.is_set():
+            try:
+                self._session_watchdog_scan()
+            except Exception:
+                pass
+            self._session_watchdog_stop.wait(float(SESSION_WATCHDOG_INTERVAL_SECONDS))
+
+    def _session_watchdog_scan(self):
+        now_value = now_ts()
+        with self._lock:
+            managers = list(self._session_mgrs.values())
+        for mgr in managers:
+            try:
+                with mgr.lock:
+                    sessions = list(mgr.sessions.values())
+            except Exception:
+                continue
+            for sess in sessions:
+                try:
+                    if sess.recover_if_stale(now_value, SESSION_HEARTBEAT_STALE_SECONDS):
+                        try:
+                            sess._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        str(getattr(sess, "run_recovered_reason", "") or "")
+                                        or "session recovered by watchdog"
+                                    )
+                                },
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -64974,6 +62696,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
+        m = re.match(r"^/api/sessions/([^/]+)/preview-html-bundle/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                data = sess.preview_html_bundle(rel)
+                name = Path(normalize_rel_preview_path(rel)).name or "preview.html"
+                stem = Path(name).stem or "preview"
+                return self._send_bytes(data, "application/zip", f"{stem}_html_bundle.zip")
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -64995,6 +62734,8 @@ class Handler(BaseHTTPRequestHandler):
             content_type = guess_mime_from_name(fp.name, "application/octet-stream")
             if content_type.startswith("text/") and "charset=" not in content_type.lower():
                 content_type = f"{content_type}; charset=utf-8"
+            if _to_bool_like((query.get("download", ["0"]) or ["0"])[0], default=False):
+                return self._send_bytes(data, content_type, fp.name)
             return self._send_inline_bytes(data, content_type)
         m = re.match(r"^/api/sessions/([^/]+)/render-state$", path)
         if m:
@@ -65016,7 +62757,7 @@ class Handler(BaseHTTPRequestHandler):
                 (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
             ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
             return self._send_json(
-                sess.snapshot(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot)
             )
         m = re.match(r"^/api/sessions/([^/]+)/events$", path)
         if m:
