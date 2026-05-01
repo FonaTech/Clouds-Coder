@@ -8,6 +8,7 @@ import concurrent.futures
 import csv
 import difflib
 import errno
+from email.utils import parsedate_to_datetime
 import html
 import hashlib
 import hmac
@@ -38,7 +39,7 @@ import uuid
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -262,6 +263,38 @@ CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
     1200,
     min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
 )
+CHAT_UPLOAD_PROMPT_MAX_FILES = max(
+    2,
+    min(12, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_FILES", "6") or "6"))),
+)
+CHAT_UPLOAD_PROMPT_MAX_CHARS = max(
+    2400,
+    min(16_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_CHARS", "6000") or "6000"))),
+)
+CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
+    240,
+    min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
+)
+CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
+    1000,
+    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+)
+CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
+    str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+CHAT_UPLOAD_INGEST_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_INGEST_QUEUE_MAX", "8") or "8"))),
+)
+SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS = max(
+    0.05,
+    min(2.0, float(str(os.getenv("AGENT_SESSION_SUBMIT_LOCK_TIMEOUT", "0.08") or "0.08"))),
+)
+SESSION_DEFERRED_START_QUEUE_MAX = max(
+    4,
+    min(80, int(str(os.getenv("AGENT_SESSION_DEFERRED_START_QUEUE_MAX", "24") or "24"))),
+)
 SESSION_WATCHDOG_INTERVAL_SECONDS = max(
     10,
     min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
@@ -279,6 +312,23 @@ POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
 MODEL_CALL_PROGRESS_DELAY = 8.0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
+LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
+    0,
+    min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
+)
+LLM_HTTP_RETRY_DELAY_SECONDS = max(
+    1.0,
+    min(600.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_DELAY_SECONDS", "60") or "60"))),
+)
+LLM_HTTP_RETRY_MAX_SECONDS = max(
+    LLM_HTTP_RETRY_DELAY_SECONDS,
+    min(1800.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_SECONDS", "600") or "600"))),
+)
+LLM_HTTP_RETRY_404_ON_VLLM = (
+    str(os.getenv("AGENT_LLM_HTTP_RETRY_404_ON_VLLM", "true") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
@@ -11846,12 +11896,31 @@ class WorktreeManager:
         return json_dumps(out, indent=2)
 
 class OllamaError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        *,
+        headers: dict | None = None,
+        body: str = "",
+        url: str = "",
+        retry_after: float | None = None,
+        retryable: bool | None = None,
+        transient: bool | None = None,
+    ):
         super().__init__(message)
         self.status = status
+        self.headers = dict(headers or {})
+        self.body = str(body or "")
+        self.url = str(url or "")
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.transient = transient
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
+    _retry_lock = threading.RLock()
+    _endpoint_cooldowns: dict[str, dict] = {}
 
     def __init__(
         self,
@@ -11883,6 +11952,174 @@ class OllamaClient:
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
+
+    def _http_retry_key(self, url: str) -> str:
+        parsed = urlparse(str(url or ""))
+        host = parsed.netloc or parsed.path
+        return "|".join(
+            [
+                normalize_openai_compat_provider_name(self.provider),
+                str(host or "").strip().lower(),
+                str(self.model or "").strip().lower(),
+            ]
+        )
+
+    def _provider_retry_label(self) -> str:
+        provider = normalize_openai_compat_provider_name(self.provider)
+        model = str(self.model or "").strip()
+        return f"{provider}/{model}" if model else provider
+
+    @staticmethod
+    def _headers_to_dict(headers: object) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            items = headers.items()  # type: ignore[attr-defined]
+        except Exception:
+            items = []
+        for key, value in items:
+            out[str(key)] = str(value)
+        return out
+
+    @staticmethod
+    def _parse_retry_after_seconds(headers: dict | None, body: str = "") -> float | None:
+        hdrs = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+        raw = hdrs.get("retry-after") or hdrs.get("x-retry-after")
+        if raw:
+            try:
+                value = float(raw)
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+            except Exception:
+                pass
+        reset = hdrs.get("x-ratelimit-reset") or hdrs.get("x-rate-limit-reset")
+        if reset:
+            try:
+                value = float(reset)
+                if value > 1_000_000_000:
+                    return max(0.0, value - time.time())
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+        parsed_body = parse_json_object(body, {})
+        if isinstance(parsed_body, dict):
+            for key in ("retry_after", "retryAfter", "retry_after_seconds", "wait_seconds"):
+                if key not in parsed_body:
+                    continue
+                try:
+                    value = float(parsed_body.get(key))
+                    if value >= 0:
+                        return value
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _looks_like_nginx_or_upstream(text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        markers = (
+            "nginx",
+            "openresty",
+            "upstream",
+            "bad gateway",
+            "gateway timeout",
+            "gateway error",
+            "service unavailable",
+            "temporarily unavailable",
+            "connection reset",
+            "connection refused",
+            "no healthy upstream",
+            "upstream request timeout",
+            "proxy error",
+            "reverse proxy",
+            "load balancer",
+            "envoy",
+            "traefik",
+            "the server encountered an internal error",
+        )
+        return any(marker in low for marker in markers)
+
+    def _is_retryable_http_error(self, exc: OllamaError, url: str) -> tuple[bool, bool]:
+        status = int(getattr(exc, "status", 0) or 0)
+        body = str(getattr(exc, "body", "") or str(exc))
+        provider = normalize_openai_compat_provider_name(self.provider)
+        if status in LLM_HTTP_RETRY_STATUSES:
+            return True, True
+        if status == 404 and LLM_HTTP_RETRY_404_ON_VLLM and provider in {"vllm", "openai_compat", "lmstudio"}:
+            path = str(urlparse(str(url or "")).path or "").lower()
+            if path.endswith("/chat/completions") and self._looks_like_nginx_or_upstream(body):
+                return True, True
+        return False, False
+
+    def _is_retryable_connection_error(self, exc: OllamaError) -> bool:
+        status = int(getattr(exc, "status", 0) or 0)
+        if status:
+            return False
+        text = str(exc).lower()
+        markers = (
+            "connection error",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "remote end closed",
+            "temporarily unavailable",
+            "service unavailable",
+        )
+        return any(marker in text for marker in markers)
+
+    def _http_retry_delay(self, exc: OllamaError, attempt_index: int) -> float:
+        retry_after = getattr(exc, "retry_after", None)
+        delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        try:
+            if retry_after is not None:
+                delay = max(delay, float(retry_after))
+        except Exception:
+            delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        return max(1.0, min(float(delay), float(LLM_HTTP_RETRY_MAX_SECONDS)))
+
+    def _cooldown_remaining(self, key: str) -> float:
+        with self._retry_lock:
+            row = self._endpoint_cooldowns.get(key, {})
+            until = float(row.get("until", 0.0) or 0.0) if isinstance(row, dict) else 0.0
+        return max(0.0, until - time.time())
+
+    def _set_endpoint_cooldown(self, key: str, delay: float, exc: OllamaError):
+        if delay <= 0:
+            return
+        with self._retry_lock:
+            self._endpoint_cooldowns[key] = {
+                "until": time.time() + float(delay),
+                "status": int(getattr(exc, "status", 0) or 0),
+                "error": trim(str(exc), 240),
+                "provider": normalize_openai_compat_provider_name(self.provider),
+                "model": str(self.model or ""),
+            }
+
+    def _wait_with_cancel(self, seconds: float, cancel_check=None):
+        deadline = time.time() + max(0.0, float(seconds or 0.0))
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        raise OllamaError("interrupted by user", status=499)
+                except OllamaError:
+                    raise
+                except Exception:
+                    pass
+            time.sleep(min(1.0, remaining))
 
     def apply_profile(self, profile: dict):
         self.provider = str(profile.get("provider", "ollama") or "ollama")
@@ -11992,9 +12229,83 @@ class OllamaClient:
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
+
+    def _post_json_url_with_retries(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        cancel_check=None,
+        on_retry=None,
+    ) -> dict:
+        retry_budget = LLM_HTTP_RETRY_MAX_ATTEMPTS if max_attempts is None else max(0, int(max_attempts or 0))
+        key = self._http_retry_key(url)
+        label = self._provider_retry_label()
+        last_exc: OllamaError | None = None
+        for attempt in range(0, retry_budget + 1):
+            cooldown = self._cooldown_remaining(key)
+            if cooldown > 0:
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt,
+                                "retry_budget": retry_budget,
+                                "delay": round(cooldown, 2),
+                                "reason": "endpoint cooldown",
+                                "status": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(cooldown, cancel_check=cancel_check)
+            try:
+                return self._post_json_url(url, payload, headers=headers)
+            except OllamaError as exc:
+                last_exc = exc
+                http_retryable, transient = self._is_retryable_http_error(exc, url)
+                conn_retryable = self._is_retryable_connection_error(exc)
+                retryable = bool(http_retryable or conn_retryable)
+                exc.retryable = retryable
+                exc.transient = bool(transient or conn_retryable)
+                if not retryable or attempt >= retry_budget:
+                    raise
+                delay = self._http_retry_delay(exc, attempt)
+                self._set_endpoint_cooldown(key, delay, exc)
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt + 1,
+                                "retry_budget": retry_budget,
+                                "delay": round(delay, 2),
+                                "reason": trim(str(exc), 240),
+                                "status": int(getattr(exc, "status", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(delay, cancel_check=cancel_check)
+        if last_exc is not None:
+            raise last_exc
+        raise OllamaError("model HTTP request failed", url=url)
 
     def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
         req_headers = {"Content-Type": "application/json"}
@@ -12013,9 +12324,17 @@ class OllamaClient:
                 return body, ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
         req = Request(url, headers=self._render_headers(), method="GET")
@@ -12025,9 +12344,17 @@ class OllamaClient:
                 return resp.read(), ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
         out = []
@@ -12588,6 +12915,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
         payload = {
@@ -12600,7 +12930,14 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
         try:
-            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+            raw = self._post_json_url_with_retries(
+                endpoint,
+                payload,
+                headers=self._render_headers(),
+                max_attempts=http_retry_attempts,
+                cancel_check=cancel_check,
+                on_retry=on_http_retry,
+            )
         except OllamaError as exc:
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
@@ -12611,7 +12948,14 @@ class OllamaClient:
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
                 fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
                 fallback_payload.pop("tools", None)
-                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
             else:
                 raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
@@ -12625,6 +12969,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -12651,7 +12998,14 @@ class OllamaClient:
             }
             if tools:
                 payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        raw = self._post_json_url_with_retries(
+            endpoint,
+            payload,
+            headers=self._render_headers(),
+            max_attempts=http_retry_attempts,
+            cancel_check=cancel_check,
+            on_retry=on_http_retry,
+        )
         if isinstance(raw, dict) and "choices" in raw:
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -12910,12 +13264,15 @@ class OllamaClient:
         on_thinking_chunk=None,
         media_inputs: list[dict] | None = None,
         probe_mode: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
         req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
+        http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
         # Some providers require all system messages at the beginning (or merged into one)
@@ -12934,7 +13291,14 @@ class OllamaClient:
                 req_messages = sys_msgs + non_sys_msgs
         if is_openai_compat_provider(provider):
             return self._chat_openai_compat(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
         if provider == "anthropic":
             return self._chat_anthropic(
@@ -12942,7 +13306,14 @@ class OllamaClient:
             )
         if provider == "custom_http":
             return self._chat_custom_http(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
         if stream_thinking:
             try:
@@ -13438,14 +13809,23 @@ class SessionState:
         self.upload_parse_last_heartbeat = 0.0
         self.upload_parse_active_id = ""
         self.upload_parse_active_started_at = 0.0
+        self.upload_ingest_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_INGEST_QUEUE_MAX)
+        self.upload_ingest_worker_started = False
+        self.upload_ingest_worker_lock = threading.Lock()
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
         self.runtime_knowledge_reference_text = ""
         self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
+        self.scheduler_starting = False
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
+        self.deferred_start_inputs: list[dict] = []
+        self.deferred_start_seq = 0
+        self.deferred_start_worker_started = False
+        self.deferred_start_worker_lock = threading.Lock()
+        self.scheduler_visible_inputs: list[dict] = []
         self.run_generation = 0
         self.run_started_at = 0.0
         self.run_last_heartbeat = 0.0
@@ -14549,6 +14929,57 @@ class SessionState:
                         except Exception:
                             continue
                     self.live_input_seq = max(self.live_input_seq, max_id)
+                deferred_inputs = raw.get("deferred_start_inputs", [])
+                if isinstance(deferred_inputs, list):
+                    clean_deferred: list[dict] = []
+                    for row in deferred_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        clean_deferred.append(
+                            {
+                                "id": int(row.get("id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "reason": trim(str(row.get("reason", "") or "session busy"), 120),
+                            }
+                        )
+                    self.deferred_start_inputs = clean_deferred[-SESSION_DEFERRED_START_QUEUE_MAX:]
+                    max_deferred_id = int(raw.get("deferred_start_seq", 0) or 0)
+                    for row in self.deferred_start_inputs:
+                        try:
+                            max_deferred_id = max(max_deferred_id, int(row.get("id", 0) or 0))
+                        except Exception:
+                            continue
+                    self.deferred_start_seq = max(self.deferred_start_seq, max_deferred_id)
+                scheduler_visible_inputs = raw.get("scheduler_visible_inputs", [])
+                if isinstance(scheduler_visible_inputs, list):
+                    clean_scheduler_visible: list[dict] = []
+                    for row in scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        status = str(row.get("scheduler_status", "queued") or "queued").strip().lower()
+                        if status not in {"queued", "started", "cancelled", "failed"}:
+                            status = "queued"
+                        clean_scheduler_visible.append(
+                            {
+                                "queue_id": int(row.get("queue_id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "started_at": float(row.get("started_at", 0.0) or 0.0),
+                                "finished_at": float(row.get("finished_at", 0.0) or 0.0),
+                                "queue_position": int(row.get("queue_position", 0) or 0),
+                                "queue_size": int(row.get("queue_size", 0) or 0),
+                                "scheduler_reason": trim(str(row.get("scheduler_reason", "") or ""), 120),
+                                "scheduler_status": status,
+                            }
+                        )
+                    self.scheduler_visible_inputs = clean_scheduler_visible[-SESSION_DEFERRED_START_QUEUE_MAX:]
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
@@ -14736,6 +15167,10 @@ class SessionState:
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
+        with self.deferred_start_worker_lock:
+            deferred_start_inputs_snapshot = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            deferred_start_seq_snapshot = int(self.deferred_start_seq)
+        scheduler_visible_inputs_snapshot = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
         data = {
             "id": self.id,
             "title": self.title,
@@ -14774,6 +15209,9 @@ class SessionState:
             "reviewer_debug_context": trim(str(self.reviewer_debug_context or ""), 1000),
             "developer_edit_fail_streaks": dict(self.developer_edit_fail_streaks) if self.developer_edit_fail_streaks else {},
             "pending_user_inputs": self.pending_user_inputs[-40:],
+            "deferred_start_inputs": deferred_start_inputs_snapshot,
+            "deferred_start_seq": int(deferred_start_seq_snapshot),
+            "scheduler_visible_inputs": scheduler_visible_inputs_snapshot,
             "run_generation": int(self.run_generation),
             "agent_round_index": int(self.agent_round_index),
             "current_phase": str(self.current_phase or "idle"),
@@ -14919,6 +15357,7 @@ class SessionState:
             if removed_hints > 0:
                 self.messages = kept[-400:]
         self.pending_user_inputs = []
+        self.deferred_start_worker_started = False
         self.cancel_requested = False
         self.current_phase = "idle"
         self.current_tool_name = ""
@@ -15164,6 +15603,119 @@ class SessionState:
             }
         )
         self.activity = self.activity[-300:]
+
+    def record_scheduler_queued_message(
+        self,
+        queue_id: int,
+        content: str,
+        *,
+        queue_position: int = 1,
+        queue_size: int = 1,
+        scheduler_reason: str = "",
+        queued_at: float | None = None,
+    ) -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        row = {
+            "queue_id": int(queue_id or 0),
+            "content": text,
+            "queued_at": float(queued_at or now_ts()),
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "queue_position": max(1, int(queue_position or 1)),
+            "queue_size": max(1, int(queue_size or 1)),
+            "scheduler_reason": trim(str(scheduler_reason or ""), 120),
+            "scheduler_status": "queued",
+        }
+        with self.lock:
+            replaced = False
+            for idx in range(len(self.scheduler_visible_inputs) - 1, -1, -1):
+                if int((self.scheduler_visible_inputs[idx] or {}).get("queue_id", 0) or 0) == int(queue_id or 0):
+                    self.scheduler_visible_inputs[idx] = row
+                    replaced = True
+                    break
+            if not replaced:
+                self.scheduler_visible_inputs.append(row)
+            self.scheduler_visible_inputs = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        self._emit(
+            "message",
+            {
+                "role": "user",
+                "text": text,
+                "summary": "queued user message",
+                "scheduler_status": "queued",
+                "scheduler_queue_id": int(queue_id or 0),
+                "queue_position": int(row["queue_position"]),
+                "queue_size": int(row["queue_size"]),
+                "scheduler_reason": row["scheduler_reason"],
+            },
+        )
+        return dict(row)
+
+    def update_scheduler_visible_message(
+        self,
+        queue_id: int,
+        *,
+        status: str = "",
+        queue_position: int | None = None,
+        queue_size: int | None = None,
+        scheduler_reason: str | None = None,
+    ) -> dict:
+        qid = int(queue_id or 0)
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"queued", "started", "cancelled", "failed"}:
+            clean_status = ""
+        out: dict = {}
+        now = now_ts()
+        with self.lock:
+            kept: list[dict] = []
+            for row in self.scheduler_visible_inputs:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("queue_id", 0) or 0) != qid:
+                    kept.append(row)
+                    continue
+                patched = dict(row)
+                if clean_status:
+                    patched["scheduler_status"] = clean_status
+                    if clean_status == "started":
+                        patched["started_at"] = now
+                    elif clean_status in {"cancelled", "failed"}:
+                        patched["finished_at"] = now
+                if queue_position is not None:
+                    patched["queue_position"] = max(0, int(queue_position or 0))
+                if queue_size is not None:
+                    patched["queue_size"] = max(0, int(queue_size or 0))
+                if scheduler_reason is not None:
+                    patched["scheduler_reason"] = trim(str(scheduler_reason or ""), 120)
+                out = patched
+                if clean_status not in {"started", "cancelled", "failed"}:
+                    kept.append(patched)
+            self.scheduler_visible_inputs = kept[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now
+            try:
+                self._persist()
+            except Exception:
+                pass
+        if out and clean_status:
+            try:
+                self._emit(
+                    "status",
+                    {
+                        "summary": f"scheduler task #{qid} {clean_status}",
+                        "scheduler_status": clean_status,
+                        "scheduler_queue_id": qid,
+                    },
+                )
+            except Exception:
+                pass
+        return out
 
     def _emit_transient(self, kind: str, data: dict):
         try:
@@ -20513,7 +21065,15 @@ body{padding:18px}
             table_lines.insert(0, f"[truncated] CSV preview limited to {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes.")
         return trim("\n".join(table_lines), 24_000)
 
-    def _extract_xlsx_text(self, fp: Path) -> str:
+    def _upload_parse_deadline(self) -> float:
+        return time.time() + max(1.0, float(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
+
+    def _raise_if_upload_parse_expired(self, deadline: float):
+        if deadline and time.time() > float(deadline):
+            raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
+
+    def _extract_xlsx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("openpyxl"):
             wb = None
             try:
@@ -20522,9 +21082,12 @@ body{padding:18px}
                 wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
                 lines: list[str] = []
                 for ws in list(wb.worksheets)[:5]:
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Sheet] {ws.title}")
                     rows = 0
                     for row in ws.iter_rows(min_row=1, max_row=200, max_col=80, values_only=True):
+                        if rows and rows % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals = [str(v).strip() for v in row if v not in (None, "")]
                         if not vals:
                             continue
@@ -20552,6 +21115,7 @@ body{padding:18px}
                 lines: list[str] = []
                 sheet_count = 0
                 for name in sorted(names):
+                    self._raise_if_upload_parse_expired(deadline)
                     if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
                         continue
                     sheet_count += 1
@@ -20564,6 +21128,8 @@ body{padding:18px}
                     lines.append(f"[Sheet] {Path(name).stem}")
                     taken = 0
                     for row_raw in rows_raw:
+                        if taken and taken % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)[:80]
                         vals: list[str] = []
                         for attrs, body in cells:
@@ -20601,7 +21167,8 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_xls_text(self, fp: Path) -> str:
+    def _extract_xls_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("xlrd"):
             wb = None
             try:
@@ -20610,9 +21177,12 @@ body{padding:18px}
                 wb = xlrd.open_workbook(str(fp), on_demand=True)
                 lines: list[str] = []
                 for si in range(min(wb.nsheets, 5)):
+                    self._raise_if_upload_parse_expired(deadline)
                     sh = wb.sheet_by_index(si)
                     lines.append(f"[Sheet] {sh.name}")
                     for r in range(min(sh.nrows, 120)):
+                        if r and r % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals: list[str] = []
                         for c in range(min(sh.ncols, 80)):
                             value = sh.cell_value(r, c)
@@ -20636,19 +21206,25 @@ body{padding:18px}
             return trim(xls2csv_text, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_docx_text(self, fp: Path) -> str:
+    def _extract_docx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("docx"):
             try:
                 import docx  # type: ignore
 
                 doc = docx.Document(str(fp))
                 lines: list[str] = []
-                for p in list(doc.paragraphs)[:1500]:
+                for idx, p in enumerate(list(doc.paragraphs)[:1500]):
+                    if idx and idx % 100 == 0:
+                        self._raise_if_upload_parse_expired(deadline)
                     text = (p.text or "").strip()
                     if text:
                         lines.append(text)
-                for tb in list(doc.tables)[:40]:
-                    for row in list(tb.rows)[:120]:
+                for tb_idx, tb in enumerate(list(doc.tables)[:40]):
+                    self._raise_if_upload_parse_expired(deadline)
+                    for row_idx, row in enumerate(list(tb.rows)[:120]):
+                        if row_idx and row_idx % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals = [str(cell.text or "").strip()[:500] for cell in list(row.cells)[:40]]
                         vals = [v for v in vals if v]
                         if vals:
@@ -20662,6 +21238,7 @@ body{padding:18px}
                 parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
                 lines: list[str] = []
                 for name in sorted(parts):
+                    self._raise_if_upload_parse_expired(deadline)
                     xml_text = self._zip_read_limited(zf, name)
                     if not xml_text:
                         continue
@@ -20677,7 +21254,7 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_doc_text(self, fp: Path) -> str:
+    def _extract_doc_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["antiword", str(fp)],
             ["catdoc", str(fp)],
@@ -20688,7 +21265,8 @@ body{padding:18px}
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_pptx_text(self, fp: Path) -> str:
+    def _extract_pptx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("pptx"):
             try:
                 import pptx  # type: ignore
@@ -20696,8 +21274,11 @@ body{padding:18px}
                 pres = pptx.Presentation(str(fp))
                 lines: list[str] = []
                 for idx, slide in enumerate(list(pres.slides)[:80], 1):
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Slide {idx}]")
-                    for shape in list(slide.shapes)[:120]:
+                    for shape_idx, shape in enumerate(list(slide.shapes)[:120]):
+                        if shape_idx and shape_idx % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         text = ""
                         if hasattr(shape, "text"):
                             text = str(getattr(shape, "text") or "").strip()
@@ -20712,6 +21293,7 @@ body{padding:18px}
                 slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
                 lines: list[str] = []
                 for name in sorted(slides)[:80]:
+                    self._raise_if_upload_parse_expired(deadline)
                     xml_text = self._zip_read_limited(zf, name)
                     if not xml_text:
                         continue
@@ -20725,7 +21307,7 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_ppt_text(self, fp: Path) -> str:
+    def _extract_ppt_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["catppt", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
@@ -20750,9 +21332,21 @@ body{padding:18px}
                 return test
             i += 1
 
-    def _uploads_prompt_block(self, max_chars: int = 24_000) -> str:
+    def _upload_parsed_ref(self, item: dict) -> str:
+        wp = str((item or {}).get("workspace_path", "") or "").strip()
+        if not wp:
+            return ""
+        item_kind = str((item or {}).get("kind", "file") or "file")
+        if item_kind not in ("text", "code"):
+            from pathlib import PurePosixPath
+            stem = PurePosixPath(wp).stem
+            parent = str(PurePosixPath(wp).parent)
+            return f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+        return wp
+
+    def _uploads_prompt_block(self, max_chars: int = CHAT_UPLOAD_PROMPT_MAX_CHARS) -> str:
         with self.lock:
-            items = list(self.uploads[-10:])
+            items = list(self.uploads[-CHAT_UPLOAD_PROMPT_MAX_FILES:])
         if not items:
             return "(none)"
         lines = []
@@ -20761,36 +21355,39 @@ body{padding:18px}
             item_kind = str(item.get("kind", "file") or "file")
             wp = str(item.get("workspace_path", "") or "")
             filename = str(item.get("filename", "") or "")
+            status = str(item.get("parse_status", "") or "").strip() or "unknown"
+            parse_error = trim(str(item.get("parse_error", "") or "").strip(), 180)
+            full_ref = self._upload_parsed_ref(item)
+            status_note = f", parse={status}"
+            if parse_error:
+                status_note += f", error={parse_error}"
             lines.append(
                 f"- {filename} => {wp} "
-                f"({item_kind}, {item.get('size',0)} bytes)"
+                f"({item_kind}, {item.get('size',0)} bytes{status_note})"
             )
-            excerpt = str(item.get("parsed_excerpt", "")).strip()
-            if not excerpt or remaining < 200:
-                full_ref = ""
-                if wp:
-                    if item_kind not in ("text", "code"):
-                        from pathlib import PurePosixPath
-                        stem = PurePosixPath(wp).stem
-                        parent = str(PurePosixPath(wp).parent)
-                        full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                    else:
-                        full_ref = wp
-                if full_ref:
-                    lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
+            if full_ref:
+                lines.append(f"  source: {full_ref} (use read_file for complete content)")
+            if status in {"pending", "failed_saved", "skipped_large", "skipped_timeout"}:
+                if status == "pending":
+                    lines.append("  note: parsing may still be running; do not claim full-file understanding until read_file succeeds.")
+                else:
+                    lines.append("  note: parser did not provide reliable full text; use the saved file/path and report uncertainty.")
                 continue
-            chunk_cap = min(2200, remaining)
+            excerpt = str(item.get("parsed_excerpt", "")).strip()
+            if not excerpt or remaining < 160:
+                continue
+            chunk_cap = min(CHAT_UPLOAD_PROMPT_PER_FILE_CHARS, remaining)
             if self._upload_is_code_like(item):
-                chunk_cap = min(1200, remaining)
+                chunk_cap = min(600, remaining)
             elif item_kind == "text":
-                chunk_cap = min(1600, remaining)
+                chunk_cap = min(800, remaining)
             chunk = self._prepare_upload_excerpt(
                 filename,
                 wp,
                 item_kind,
                 excerpt,
                 max_chars=chunk_cap,
-                max_lines=36 if self._upload_is_code_like(item) else 72,
+                max_lines=18 if self._upload_is_code_like(item) else 28,
             )
             if not chunk:
                 continue
@@ -20798,17 +21395,6 @@ body{padding:18px}
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
-            full_ref = ""
-            if wp:
-                if item_kind not in ("text", "code"):
-                    from pathlib import PurePosixPath
-                    stem = PurePosixPath(wp).stem
-                    parent = str(PurePosixPath(wp).parent)
-                    full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                else:
-                    full_ref = wp
-            if full_ref:
-                lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
         return "\n".join(lines)
 
     def _upload_is_code_like(self, item: dict | None = None, *, filename: str = "", workspace_path: str = "", kind: str = "") -> bool:
@@ -21108,13 +21694,80 @@ body{padding:18px}
             "parse_status": status,
             "parse_error": error,
             "summary": f"upload: {safe_name} -> {workspace_rel} (parse {status})",
-            "preview": trim(preview, 500),
+            "preview": trim(preview, 180),
         })
 
     def _enqueue_upload_ingest(self, upload_id: str, safe_name: str, workspace_target: Path, parsed_target: Path | None, kind: str, mime: str, size: int):
+        if not bool(CHAT_UPLOAD_AUTO_LIBRARY_INGEST):
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "chat_upload_auto_library_ingest_disabled",
+                },
+            )
+            return
         if not callable(self.upload_callback):
             return
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "workspace_target": str(workspace_target),
+            "parsed_target": str(parsed_target) if parsed_target else "",
+            "kind": kind,
+            "mime": mime,
+            "size": int(size or 0),
+        }
+        try:
+            self.upload_ingest_queue.put_nowait(job)
+            self._ensure_upload_ingest_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": False,
+                    "skipped": True,
+                    "error": f"upload ingest queue is full ({CHAT_UPLOAD_INGEST_QUEUE_MAX}); file saved without library import",
+                },
+            )
 
+    def _ensure_upload_ingest_worker(self):
+        with self.upload_ingest_worker_lock:
+            if self.upload_ingest_worker_started:
+                return
+            self.upload_ingest_worker_started = True
+            threading.Thread(target=self._upload_ingest_worker_loop, name=f"upload-ingest-{self.id}", daemon=True).start()
+
+    def _upload_ingest_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_ingest_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_ingest_worker_lock:
+                    if self.upload_ingest_queue.empty():
+                        self.upload_ingest_worker_started = False
+                        return
+                    continue
+            try:
+                self._run_upload_ingest_job(job if isinstance(job, dict) else {})
+            finally:
+                try:
+                    self.upload_ingest_queue.task_done()
+                except Exception:
+                    pass
+
+    def _run_upload_ingest_job(self, job: dict):
+        if not callable(self.upload_callback):
+            return
+        upload_id = str(job.get("id", "") or "")
+        safe_name = str(job.get("safe_name", "upload") or "upload")
+        workspace_target = Path(str(job.get("workspace_target", "") or ""))
+        parsed_raw = str(job.get("parsed_target", "") or "")
+        parsed_target = Path(parsed_raw) if parsed_raw else None
+        kind = str(job.get("kind", "file") or "file")
+        mime = str(job.get("mime", "") or "")
+        size = int(job.get("size", 0) or 0)
         def ingest():
             rag_info: dict = {}
             meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": int(size or 0)}
@@ -21127,7 +21780,7 @@ body{padding:18px}
             if rag_info:
                 self._patch_upload_meta(upload_id, rag=dict(rag_info))
 
-        threading.Thread(target=ingest, name=f"upload-ingest-{self.id}", daemon=True).start()
+        ingest()
 
     def _parse_upload_job(self, job: dict):
         upload_id = str(job.get("id", ""))
@@ -21152,7 +21805,7 @@ body{padding:18px}
             return
         try:
             parsed_excerpt = ""
-            deadline = time.time() + CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS
+            deadline = self._upload_parse_deadline()
             if kind == "pdf":
                 parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
             elif kind == "text":
@@ -21161,19 +21814,18 @@ body{padding:18px}
             elif kind == "csv":
                 parsed_excerpt = trim(self._extract_csv_text(self._safe_read_head_bytes(stored, CHAT_UPLOAD_PARSE_MAX_BYTES)), 24_000)
             elif kind == "excel" and ext == ".xlsx":
-                parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xlsx_text(stored, deadline), 24_000)
             elif kind == "excel" and ext == ".xls":
-                parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xls_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".pptx":
-                parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_pptx_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".ppt":
-                parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_ppt_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".docx":
-                parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_docx_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".doc":
-                parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
-            if time.time() > deadline:
-                raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
+                parsed_excerpt = trim(self._extract_doc_text(stored, deadline), 24_000)
+            self._raise_if_upload_parse_expired(deadline)
             # Save parsed.md
             parsed_target: Path | None = None
             if parsed_excerpt and kind not in ("text", "code"):
@@ -21192,17 +21844,12 @@ body{padding:18px}
                 parse_finished_at=now_ts(),
             )
             if parsed_excerpt:
-                bb_excerpt = self._prepare_upload_excerpt(
-                    safe_name,
-                    self._session_rel(workspace_target),
-                    kind,
-                    parsed_excerpt,
-                    max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                    max_lines=60,
+                parsed_rel = self._session_rel(parsed_target) if parsed_target else self._session_rel(workspace_target)
+                bb_content = (
+                    f"[upload:{safe_name}] kind={kind} size={size} parse=done "
+                    f"chars={len(parsed_excerpt)} source={parsed_rel}"
                 )
-                if bb_excerpt:
-                    bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                    self._blackboard_append_section("research_notes", "system", bb_content)
+                self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
             self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "done", "", parsed_excerpt)
             self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, parsed_target, kind, mime, size)
@@ -22829,6 +23476,39 @@ body{padding:18px}
             system=system,
             media_inputs=media_inputs,
         )
+
+        def _emit_http_retry(meta: dict):
+            try:
+                delay = float((meta or {}).get("delay", 0.0) or 0.0)
+            except Exception:
+                delay = 0.0
+            status = int((meta or {}).get("status", 0) or 0)
+            provider = str((meta or {}).get("provider", "") or pin).strip() or pin
+            attempt_no = int((meta or {}).get("attempt", 0) or 0)
+            retry_budget = int((meta or {}).get("retry_budget", 0) or 0)
+            reason = trim(str((meta or {}).get("reason", "") or ""), 160)
+            status_txt = f"HTTP {status}" if status else "network"
+            if attempt_no > 0:
+                label = f"retry {attempt_no}/{retry_budget}"
+            else:
+                label = "cooldown"
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{context_label} model call {status_txt} on {provider}; "
+                        f"{label} after {delay:.0f}s"
+                        + (f": {reason}" if reason else "")
+                    ),
+                    "llm_http_retry": True,
+                    "provider": provider,
+                    "status": status,
+                    "delay": delay,
+                    "attempt": attempt_no,
+                    "retry_budget": retry_budget,
+                },
+            )
+
         for attempt in range(1, retry_budget + 2):
             try:
                 response = self._call_interruptible(
@@ -22841,6 +23521,8 @@ body{padding:18px}
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
                         media_inputs=media_inputs,
+                        cancel_check=lambda: bool(self.cancel_requested),
+                        on_http_retry=_emit_http_retry,
                     ),
                     progress_label=f"{context_label} model call",
                 )
@@ -22898,6 +23580,8 @@ body{padding:18px}
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
                                 media_inputs=None,
+                                cancel_check=lambda: bool(self.cancel_requested),
+                                on_http_retry=_emit_http_retry,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
@@ -34899,6 +35583,104 @@ body{padding:18px}
         )
         return row
 
+    def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            # Last-resort in-memory queue update. This keeps the HTTP request from
+            # hanging behind parser/session persistence locks.
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            if start_worker:
+                threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+            return row
+        try:
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+        self._emit("status", {"summary": f"user message queued until session lock is free (id={row['id']})"})
+        if start_worker:
+            threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+        return row
+
+    def _append_deferred_start_input_unlocked(self, text: str, reason: str) -> tuple[dict, bool]:
+        with self.deferred_start_worker_lock:
+            self.deferred_start_seq += 1
+            row = {
+                "id": int(self.deferred_start_seq),
+                "content": text,
+                "queued_at": now_ts(),
+                "reason": trim(str(reason or "session busy"), 120),
+            }
+            self.deferred_start_inputs.append(row)
+            self.deferred_start_inputs = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            start_worker = not self.deferred_start_worker_started
+            self.deferred_start_worker_started = True
+        return row, start_worker
+
+    def _deferred_start_worker_loop(self):
+        while True:
+            row = None
+            acquired = False
+            try:
+                acquired = bool(self.lock.acquire(timeout=0.5))
+            except Exception:
+                acquired = False
+            if not acquired:
+                time.sleep(0.1)
+                continue
+            try:
+                with self.deferred_start_worker_lock:
+                    has_deferred_inputs = bool(self.deferred_start_inputs)
+                    if not has_deferred_inputs:
+                        self.deferred_start_worker_started = False
+                        return
+                    row = self.deferred_start_inputs.pop(0)
+                if self.running:
+                    # Current run will pick up additional user input through the
+                    # normal live-input path after it releases the lock.
+                    text = str(row.get("content", "") or "")
+                    self.lock.release()
+                    acquired = False
+                    try:
+                        self._enqueue_running_user_input(text)
+                    except Exception:
+                        pass
+                    continue
+                self.updated_at = now_ts()
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+            finally:
+                if acquired:
+                    try:
+                        self.lock.release()
+                    except Exception:
+                        pass
+            if not row:
+                continue
+            try:
+                self.submit_user_message(str(row.get("content", "") or ""))
+            except Exception as exc:
+                try:
+                    self._emit("error", {"summary": f"queued user message failed to start: {trim(str(exc), 220)}"})
+                except Exception:
+                    pass
+
     def _inject_pending_user_inputs(self) -> int:
         injected: list[dict] = []
         with self.lock:
@@ -35155,7 +35937,22 @@ body{padding:18px}
         start_worker = False
         dropped_stale_inputs = 0
         removed_runtime_hints = 0
-        with self.lock:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS))
+        except Exception:
+            acquired = False
+        if not acquired:
+            row = self._enqueue_deferred_start_input(content, "session lock busy")
+            return {
+                "ok": True,
+                "queued": True,
+                "running": bool(getattr(self, "running", False)),
+                "queue_id": int(row.get("id", 0) or 0),
+                "delay_reason": str(row.get("reason", "session lock busy")),
+                "deferred_start": True,
+            }
+        try:
             if self.running:
                 pass
             else:
@@ -35220,6 +36017,11 @@ body{padding:18px}
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
                 self._persist()
                 start_worker = True
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
         if dropped_stale_inputs > 0:
             self._emit(
                 "status",
@@ -39495,6 +40297,7 @@ body{padding:18px}
                     dropped_pending_inputs = len(self.pending_user_inputs)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
+                self.scheduler_starting = False
                 self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
@@ -39541,7 +40344,7 @@ body{padding:18px}
         with self.lock:
             msg_window = 120 if lite else 200
             op_feed_window = 80 if lite else 240
-            upload_window = 16 if lite else 40
+            upload_window = 12 if lite else 40
             conversation_window = 160 if lite else 400
             activity_window = 40 if lite else 100
             ops_window = 60 if lite else 200
@@ -39552,6 +40355,29 @@ body{padding:18px}
                 if str((msg or {}).get("role", "")).strip() == "tool":
                     continue
                 total_message_count += 1
+            scheduler_feed_rows: list[dict] = []
+            for row in self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("content", "") or "").strip()
+                if not text:
+                    continue
+                qid = int(row.get("queue_id", 0) or 0)
+                scheduler_feed_rows.append(
+                    {
+                        "role": "user",
+                        "type": "scheduler_queued",
+                        "ts": float(row.get("queued_at", 0.0) or now_ts()),
+                        "text": text,
+                        "scheduler_status": str(row.get("scheduler_status", "queued") or "queued"),
+                        "scheduler_queue_id": qid,
+                        "queue_position": int(row.get("queue_position", 0) or 0),
+                        "queue_size": int(row.get("queue_size", 0) or 0),
+                        "scheduler_reason": str(row.get("scheduler_reason", "") or ""),
+                        "_vk": f"scheduler:{qid}:{len(text)}",
+                    }
+                )
+            total_message_count += len(scheduler_feed_rows)
             inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
             inferred_bus_target_role = ""
             for msg in self.messages[-msg_window:]:
@@ -39727,6 +40553,7 @@ body{padding:18px}
                     conversation_feed.append(
                         {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
                     )
+            conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
             upload_view = []
             for item in self.uploads[-upload_window:]:
@@ -39738,7 +40565,7 @@ body{padding:18px}
                         "kind": item.get("kind"),
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
-                        "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                        "preview": trim(item.get("parsed_excerpt", ""), 240 if lite else 700),
                         "parse_status": item.get("parse_status"),
                         "parse_error": item.get("parse_error"),
                     }
@@ -39821,6 +40648,10 @@ body{padding:18px}
                 "agent_active_tool": str(self.current_tool_name or ""),
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
+                "scheduler_queued_inputs_count": sum(
+                    1 for row in self.scheduler_visible_inputs
+                    if isinstance(row, dict) and str(row.get("scheduler_status", "queued") or "queued") == "queued"
+                ),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
                 "context_effective_token_limit": int(ctx.get("effective_limit", ctx.get("limit", 0))),
                 "context_reserved_tokens": int(ctx.get("reserved", 0)),
@@ -39874,6 +40705,27 @@ body{padding:18px}
             }
 
     def degraded_snapshot(self, reason: str = "session busy") -> dict:
+        uploads_view: list[dict] = []
+        try:
+            uploads_raw = list(getattr(self, "uploads", []) or [])[-12:]
+            for item in uploads_raw:
+                if not isinstance(item, dict):
+                    continue
+                uploads_view.append(
+                    {
+                        "id": item.get("id"),
+                        "filename": item.get("filename"),
+                        "workspace_path": item.get("workspace_path"),
+                        "kind": item.get("kind"),
+                        "size": item.get("size"),
+                        "uploaded_at": item.get("uploaded_at"),
+                        "preview": trim(item.get("parsed_excerpt", ""), 160),
+                        "parse_status": item.get("parse_status"),
+                        "parse_error": item.get("parse_error"),
+                    }
+                )
+        except Exception:
+            uploads_view = []
         return {
             "id": self.id,
             "title": str(getattr(self, "title", self.id) or self.id),
@@ -39894,7 +40746,7 @@ body{padding:18px}
             "degraded_reason": trim(reason, 220),
             "messages": [],
             "conversation_feed": [],
-            "uploads": [],
+            "uploads": uploads_view,
             "todos": [],
             "tasks": [],
             "background": [],
@@ -39929,14 +40781,15 @@ body{padding:18px}
             acquired = False
         if not acquired:
             try:
-                if bool(getattr(self, "running", False)):
-                    hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
-                    started = float(getattr(self, "run_started_at", 0.0) or 0.0)
-                    baseline = hb or started
-                    if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
-                        self.cancel_requested = True
-                        self.running = False
-                        self.current_phase = "crashed_recovered"
+                    if bool(getattr(self, "running", False)):
+                        hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                        started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                        baseline = hb or started
+                        if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                            self.cancel_requested = True
+                            self.running = False
+                            self.scheduler_starting = False
+                            self.current_phase = "crashed_recovered"
                         self.current_tool_name = ""
                         self.run_recovered_at = now_value
                         self.run_recovered_reason = (
@@ -39969,6 +40822,7 @@ body{padding:18px}
                 if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
                     self.cancel_requested = True
                     self.running = False
+                    self.scheduler_starting = False
                     self.current_phase = "crashed_recovered"
                     self.current_tool_name = ""
                     self.run_recovered_at = now_value
@@ -40999,6 +41853,10 @@ class SessionManager:
                         1 for row in getattr(sess, "messages", [])
                         if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
                     )
+                    message_count += sum(
+                        1 for row in getattr(sess, "scheduler_visible_inputs", [])
+                        if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+                    )
                     title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
                     running = bool(getattr(sess, "running", False))
                 except Exception:
@@ -41267,7 +42125,7 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
-.session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:94px;min-height:94px;flex:0 0 94px;display:flex;flex-direction:column;justify-content:flex-start;gap:7px;overflow:hidden}
+.session-item{padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:80px;min-height:80px;flex:0 0 80px;display:flex;flex-direction:column;justify-content:flex-start;gap:6px;overflow:hidden}
 .session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
 .session-item .mono{display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
@@ -41833,7 +42691,8 @@ Object.assign(I18N['en'],{
   event_upload_title:'Upload',event_upload_path:'path',event_upload_filename:'filename',event_preview_unavailable:'Preview unavailable for this upload.',event_upload_parsing:'Parsing uploaded file in background. The bubble will refresh when parsing completes.',event_upload_failed:'Upload parsing failed',
   event_command_title:'Command',event_command_label:'command',event_cwd:'cwd',event_changed:'changed',event_command_empty:'No command output captured.',event_ui_truncated:'UI truncated',event_model_truncated:'Model truncated',event_temp_read_file:'Temp read_file',event_buffered:'Buffered',
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
-  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
@@ -41854,7 +42713,8 @@ Object.assign(I18N['zh-CN'],{
   event_upload_title:'上传',event_upload_path:'路径',event_upload_filename:'文件名',event_preview_unavailable:'该上传暂不支持预览。',event_upload_parsing:'正在后台解析上传文件。解析完成后气泡会自动刷新。',event_upload_failed:'上传解析失败',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目录',event_changed:'变更',event_command_empty:'未捕获到命令输出。',event_ui_truncated:'UI 截断',event_model_truncated:'模型截断',event_temp_read_file:'临时 read_file',event_buffered:'已缓冲',
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
-  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
@@ -41878,7 +42738,8 @@ Object.assign(I18N['zh-TW'],{
   event_upload_title:'上傳',event_upload_path:'路徑',event_upload_filename:'檔名',event_preview_unavailable:'此上傳暫時無法預覽。',event_upload_parsing:'正在背景解析上傳檔案。解析完成後氣泡會自動更新。',event_upload_failed:'上傳解析失敗',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目錄',event_changed:'變更',event_command_empty:'未擷取到命令輸出。',event_ui_truncated:'UI 截斷',event_model_truncated:'模型截斷',event_temp_read_file:'暫存 read_file',event_buffered:'已緩衝',
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
-  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
@@ -41900,7 +42761,8 @@ Object.assign(I18N['ja'],{
   event_upload_title:'アップロード',event_upload_path:'パス',event_upload_filename:'ファイル名',event_preview_unavailable:'このアップロードではプレビューを利用できません。',event_upload_parsing:'アップロードファイルをバックグラウンドで解析中です。完了するとバブルが更新されます。',event_upload_failed:'アップロード解析失敗',
   event_command_title:'コマンド',event_command_label:'コマンド',event_cwd:'作業ディレクトリ',event_changed:'変更',event_command_empty:'コマンド出力は取得されませんでした。',event_ui_truncated:'UI 切り詰め',event_model_truncated:'モデル切り詰め',event_temp_read_file:'一時 read_file',event_buffered:'バッファ済み',
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
-  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
@@ -41993,6 +42855,39 @@ function _deltaPushLimited(arr,row,maxCount){if(!Array.isArray(arr))return;if(!r
 function _deltaAdoptAgentRole(data){if(!_deltaEnsureSnapshot())return'';const role=_chatVirtAgentRoleKey(data?.agent_role);if(!role)return'';S.snap.agent_active_role=role;return role}
 function _deltaAppendActivity(type,data,ts){if(!_deltaEnsureSnapshot())return;const d=(data&&typeof data==='object')?data:{};const summary=String(d.summary||d.text||d.name||type||'').trim();if(!summary)return;_deltaPushLimited(S.snap.activity,{ts:Number(ts||Date.now()/1000),type:String(type||''),summary:summary},DELTA_MAX_ACTIVITY)}
 function _deltaAppendConversationRow(row){if(!_deltaEnsureSnapshot())return;_deltaPushLimited(S.snap.conversation_feed,row,DELTA_MAX_FEED)}
+function _deltaRemoveSchedulerQueued(queueId=0,text=''){
+  if(!_deltaEnsureSnapshot())return 0;
+  const qid=Number(queueId||0);
+  const txt=String(text||'').trim();
+  const match=row=>{
+    if(!row||typeof row!=='object')return false;
+    if(String(row.type||'')!=='scheduler_queued')return false;
+    if(qid&&Number(row.scheduler_queue_id||0)===qid)return true;
+    if(!qid&&txt&&String(row.text||'').trim()===txt)return true;
+    return false;
+  };
+  let feedRemoved=0;
+  const removeFrom=(arr,limitOne=false)=>{
+    if(!Array.isArray(arr))return 0;
+    let n=0;
+    for(let i=arr.length-1;i>=0;i--){
+      if(!match(arr[i]))continue;
+      arr.splice(i,1);
+      n+=1;
+      if(limitOne&&!qid)break;
+    }
+    return n;
+  };
+  feedRemoved=removeFrom(S.snap.conversation_feed,true);
+  removeFrom(S.snap.messages,true);
+  if(feedRemoved>0){
+    const queued=Number(S.snap.scheduler_queued_inputs_count||0);
+    S.snap.scheduler_queued_inputs_count=Math.max(0,(Number.isFinite(queued)?queued:0)-feedRemoved);
+    const mc=Number(S.snap.message_count||0);
+    S.snap.message_count=Math.max(0,(Number.isFinite(mc)?mc:0)-feedRemoved);
+  }
+  return feedRemoved;
+}
 function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;const op={id:String(data?.id||''),seq:Number(data?.seq||0),ts:Number(ts||Date.now()/1000),type:String(type||''),data:(data&&typeof data==='object')?{...data}:{}};_deltaPushLimited(S.snap.operations,op,DELTA_MAX_OPERATIONS)}
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
@@ -42156,13 +43051,23 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='message'){
     const role=String(data.role||'assistant').trim()||'assistant';
-    const rowType=String(data.type||'message').trim()||'message';
+    const schedulerStatus=String(data.scheduler_status||'').trim();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const rowType=(schedulerStatus&&schedulerQueueId)?'scheduler_queued':(String(data.type||'message').trim()||'message');
     let text=String(data.text||'');
     if(rowType==='plan_notice'&&!text&&data&&typeof data.data==='object'){
       text=String(data.data.body||'');
     }
     const msgRow={role:role,text:text,ts:ts,type:rowType};
     if(data&&typeof data==='object'&&data.data&&typeof data.data==='object')msgRow.data={...data.data};
+    if(rowType==='scheduler_queued'){
+      msgRow.scheduler_status=schedulerStatus||'queued';
+      msgRow.scheduler_queue_id=schedulerQueueId;
+      msgRow.queue_position=Number(data.queue_position||0);
+      msgRow.queue_size=Number(data.queue_size||0);
+      msgRow.scheduler_reason=String(data.scheduler_reason||'');
+      msgRow._vk=`scheduler:${schedulerQueueId}:${text.length}`;
+    }
     const ar=String(data.agent_role||'').trim();
     if(ar){
       msgRow.agent_role=ar;
@@ -42171,14 +43076,20 @@ function _deltaApplyRuntimeEvent(evt){
     }
     const thinking=String(data.thinking||'').trim();
     if(thinking)msgRow.thinking=thinking;
-    _deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
+    if(rowType!=='scheduler_queued'&&role==='user'){
+      _deltaRemoveSchedulerQueued(Number(data.scheduler_queue_id||0),text);
+    }
+    if(rowType!=='scheduler_queued')_deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
     _deltaAppendConversationRow(msgRow);
     _deltaAppendActivity(typ,data,ts);
     if(role!=='tool'){
       const cur=Number(S.snap.message_count||0);
       S.snap.message_count=(Number.isFinite(cur)?cur:0)+1;
     }
-    if(role==='user')S.snap.running=true;
+    if(rowType==='scheduler_queued'){
+      const curQueued=Number(S.snap.scheduler_queued_inputs_count||0);
+      S.snap.scheduler_queued_inputs_count=(Number.isFinite(curQueued)?curQueued:0)+1;
+    }else if(role==='user')S.snap.running=true;
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
@@ -42209,9 +43120,12 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='status'||typ==='tool_start'||typ==='tool_result'||typ==='error'||typ==='file_read'||typ==='agent_bus'||typ==='background'||typ==='inbox'||typ==='teammate'||typ==='task.completed'||typ==='model_config'||typ==='skill_write'||typ.startsWith('worktree.')){
     _deltaAppendActivity(typ,data,ts);
+    const schedulerStatus=String(data.scheduler_status||'').trim().toLowerCase();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
     if(summaryLow==='run finished')S.snap.running=false;
-    _deltaScheduleRender({boards:true,sessions:true});
+    _deltaScheduleRender({chat:removedScheduler>0,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
   return{handled:false,needsSnapshot:true};
@@ -42270,8 +43184,8 @@ function renderSessions(){
     setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
     return;
   }
-  const itemH=94;
-  const rowStride=102;
+  const itemH=80;
+  const rowStride=88;
   const viewportH=Math.max(240,Number(host.clientHeight||420));
   const scrollTop=Math.max(0,Number(host.scrollTop||0));
   const start=Math.max(0,Math.floor(scrollTop/rowStride)-8);
@@ -43944,9 +44858,9 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-math-request',key);
     return d;
   }
-  if(m.type==='live_run_notice'){
-    const label=String(m.label||'model call');
-    const elapsedNow=Math.max(0,Number(m.elapsed||0));
+	  if(m.type==='live_run_notice'){
+	    const label=String(m.label||'model call');
+	    const elapsedNow=Math.max(0,Number(m.elapsed||0));
     const startedAt=Number(m.startedAt||0);
     d.setAttribute('data-run-live','1');
     d.setAttribute('data-run-label',label);
@@ -43962,9 +44876,28 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
-    return d;
-  }
-  if(m.type==='plan_notice'){
+	    return d;
+	  }
+	  if(m.type==='scheduler_queued'){
+	    const status=String(m.scheduler_status||'queued').trim()||'queued';
+	    const qid=Number(m.scheduler_queue_id||0);
+	    const pos=Number(m.queue_position||0);
+	    const size=Number(m.queue_size||0);
+	    const reason=String(m.scheduler_reason||'').trim();
+	    const pills=[
+	      _chatVirtEventPillHtml(t('event_scheduler_queued_hint'),'warn'),
+	      qid?_chatVirtEventPillHtml(`#${qid}`,'neutral','mono'):'',
+	      pos?_chatVirtEventPillHtml(`${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`,'info'):'',
+	      reason?_chatVirtEventPillHtml(`${t('event_scheduler_reason')} ${reason}`,'neutral'):'',
+	    ];
+	    const key=`${String(m._vk||'')}:scheduler`;
+	    const noteHtml=`<div class="msg-event-note">${esc(t('event_scheduler_queued_note'))}</div>`;
+	    const bodyHtml=`<div class="msg-event-body">${noteHtml}<div class="msg-md">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+	    d.innerHTML=`${_chatVirtEventCardHtml(t('event_scheduler_queued_title'),status,pills,[],bodyHtml,'msg-event-card-plan')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(m.type==='plan_notice'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const title=String(info.title||'Plan Guidance').trim()||'Plan Guidance';
     const subtitle=String(info.subtitle||'').trim();
@@ -44409,11 +45342,11 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(){const pending=S.uploadQueuePromise;if(pending&&typeof pending.then==='function')await pending}
+async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
-async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return{uploaded,failed}}
+async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:false,allowWhenFrozen:true});return{uploaded,failed}}
 async function uploadFiles(fileList){if(!S.activeId){showError(t('select_session_first'));return}const files=Array.from(fileList||[]).filter(Boolean);if(!files.length)return;const run=async()=>{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0))+files.length;try{return await _uploadFilesNow(files)}finally{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0)-files.length)}};const prev=(S.uploadQueuePromise&&typeof S.uploadQueuePromise.then==='function')?S.uploadQueuePromise:Promise.resolve();const chained=prev.catch(()=>{}).then(run);const queued=chained.finally(()=>{if(S.uploadQueuePromise===queued)S.uploadQueuePromise=null});S.uploadQueuePromise=queued;return queued}
 function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
 function statusClass(status){return `st-${normalizeStatus(status)}`}
@@ -44831,7 +45764,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();if(out&&out.queued&&!out.scheduler_started){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})}else if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -59205,6 +60138,7 @@ class AppContext:
         now_value = now_ts()
         with self._lock:
             managers = list(self._session_mgrs.values())
+        recovered_rows: list[tuple[str, str]] = []
         for mgr in managers:
             try:
                 with mgr.lock:
@@ -59214,6 +60148,7 @@ class AppContext:
             for sess in sessions:
                 try:
                     if sess.recover_if_stale(now_value, SESSION_HEARTBEAT_STALE_SECONDS):
+                        recovered_rows.append((str(getattr(mgr, "user_id", "") or ""), str(getattr(sess, "id", "") or "")))
                         try:
                             sess._emit(
                                 "status",
@@ -59226,6 +60161,12 @@ class AppContext:
                             )
                         except Exception:
                             pass
+                except Exception:
+                    continue
+        if recovered_rows and self.scheduler_limits_enabled():
+            for uid, sid in recovered_rows[:16]:
+                try:
+                    self._on_session_run_finished(uid, sid)
                 except Exception:
                     continue
 
@@ -61144,7 +62085,7 @@ class AppContext:
             running = 0
             for sess in sessions:
                 try:
-                    if bool(getattr(sess, "running", False)):
+                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
                         running += 1
                 except Exception:
                     continue
@@ -61168,6 +62109,11 @@ class AppContext:
             sess = row.get("session")
             if not isinstance(sess, SessionState):
                 continue
+            qid = int(req.get("id", 0) or 0)
+            try:
+                sess.update_scheduler_visible_message(qid, status="started", queue_position=0, queue_size=0)
+            except Exception:
+                pass
             wait_sec = max(0.0, now_ts() - float(req.get("queued_at", 0.0) or 0.0))
             try:
                 sess._emit(
@@ -61175,7 +62121,7 @@ class AppContext:
                     {
                         "summary": (
                             "scheduler started queued task "
-                            f"#{int(req.get('id', 0) or 0)} after {wait_sec:.1f}s"
+                            f"#{qid} after {wait_sec:.1f}s"
                         )
                     },
                 )
@@ -61186,30 +62132,87 @@ class AppContext:
         started: list[dict] = []
         if not self.scheduler_limits_enabled():
             return started
-        while self._task_queue:
-            req = self._task_queue[0] if self._task_queue else {}
+        if not self._task_queue:
+            return started
+        total_running, per_user = self._running_counts_locked()
+        remaining: deque[dict] = deque()
+        selected_sessions: set[tuple[str, str]] = set()
+        for req in list(self._task_queue):
+            if not isinstance(req, dict):
+                continue
             uid = str(req.get("user_id", "") or "")
             sid = str(req.get("session_id", "") or "")
             mgr = self._session_mgrs.get(uid)
             if not mgr:
-                self._task_queue.popleft()
                 continue
             sess = mgr.get(sid)
             if not sess:
-                self._task_queue.popleft()
                 continue
-            if bool(getattr(sess, "running", False)):
-                break
-            ok, _, _, _ = self._can_start_for_user_locked(uid)
-            if not ok:
-                break
-            self._task_queue.popleft()
+            session_key = (uid, sid)
+            if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+                remaining.append(req)
+                continue
+            if session_key in selected_sessions:
+                remaining.append(req)
+                continue
+            user_running = int(per_user.get(uid, 0) or 0)
+            if self.max_user > 0 and total_running >= self.max_user:
+                remaining.append(req)
+                continue
+            if self.max_user_sessions > 0 and user_running >= self.max_user_sessions:
+                remaining.append(req)
+                continue
+            try:
+                setattr(sess, "scheduler_starting", True)
+            except Exception:
+                pass
+            started.append({"request": req, "session": sess})
+            selected_sessions.add(session_key)
+            total_running += 1
+            per_user[uid] = user_running + 1
+        self._task_queue = remaining
+        return started
+
+    def _start_scheduler_rows(self, rows: list[dict]) -> list[dict]:
+        started: list[dict] = []
+        for row in rows:
+            req = row.get("request", {}) if isinstance(row, dict) else {}
+            sess = row.get("session")
+            if not isinstance(sess, SessionState):
+                continue
             try:
                 out = sess.submit_user_message(str(req.get("content", "") or ""))
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
+                try:
+                    sess.update_scheduler_visible_message(int(req.get("id", 0) or 0), status="failed")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if not bool(getattr(sess, "running", False)):
+                        setattr(sess, "scheduler_starting", False)
+                except Exception:
+                    pass
             started.append({"request": req, "result": out, "session": sess})
         return started
+
+    def _refresh_scheduler_visible_positions(self):
+        queue_rows: list[dict] = []
+        with self._lock:
+            queue_rows = [dict(row) for row in self._task_queue if isinstance(row, dict)]
+            queue_size = len(queue_rows)
+        for idx, row in enumerate(queue_rows):
+            uid = str(row.get("user_id", "") or "")
+            sid = str(row.get("session_id", "") or "")
+            qid = int(row.get("id", 0) or 0)
+            try:
+                mgr = self.manager_for_user(uid)
+                sess = mgr.get(sid)
+                if sess:
+                    sess.update_scheduler_visible_message(qid, queue_position=idx + 1, queue_size=queue_size)
+            except Exception:
+                continue
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
         sess = None
@@ -61231,6 +62234,8 @@ class AppContext:
         started_rows: list[dict] = []
         with self._lock:
             started_rows = self._drain_task_queue_locked()
+        started_rows = self._start_scheduler_rows(started_rows)
+        self._refresh_scheduler_visible_positions()
         if started_rows:
             self._emit_scheduler_started(started_rows)
 
@@ -61261,9 +62266,10 @@ class AppContext:
         if not self.scheduler_limits_enabled():
             return sess.submit_user_message(text)
 
-        started_rows: list[dict] = []
+        selected_rows: list[dict] = []
         response: dict = {"ok": True, "queued": True}
         queue_id = 0
+        record_visible = False
         with self._lock:
             self._task_queue_seq = int(self._task_queue_seq) + 1
             queue_id = int(self._task_queue_seq)
@@ -61275,23 +62281,14 @@ class AppContext:
                 "queued_at": now_ts(),
             }
             self._task_queue.append(req)
-            started_rows = self._drain_task_queue_locked()
+            selected_rows = self._drain_task_queue_locked()
             started_self = None
-            for row in started_rows:
+            for row in selected_rows:
                 row_req = row.get("request", {}) if isinstance(row, dict) else {}
                 if int(row_req.get("id", 0) or 0) == queue_id:
                     started_self = row
                     break
             if started_self is not None:
-                out = started_self.get("result")
-                if isinstance(out, dict):
-                    response = dict(out)
-                else:
-                    response = {"ok": True, "result": out}
-                response.setdefault("ok", True)
-                response["queued"] = bool(response.get("queued", False))
-                response["running"] = bool(response.get("running", True))
-                response["scheduler_started"] = True
                 response["queue_id"] = queue_id
                 response["queue_position"] = 0
                 response["limits"] = {
@@ -61321,6 +62318,43 @@ class AppContext:
                         "running_user": int(per_user.get(str(user_id or ""), 0)),
                     },
                 }
+                record_visible = True
+        if record_visible:
+            try:
+                sess.record_scheduler_queued_message(
+                    queue_id,
+                    text,
+                    queue_position=int(response.get("queue_position", 1) or 1),
+                    queue_size=int(response.get("queue_size", 1) or 1),
+                    scheduler_reason=str(response.get("scheduler_reason", "") or ""),
+                    queued_at=now_ts(),
+                )
+            except Exception:
+                pass
+        started_rows = self._start_scheduler_rows(selected_rows)
+        self._refresh_scheduler_visible_positions()
+        started_self_result = None
+        for row in started_rows:
+            row_req = row.get("request", {}) if isinstance(row, dict) else {}
+            if int(row_req.get("id", 0) or 0) == queue_id:
+                started_self_result = row
+                break
+        if started_self_result is not None:
+            out = started_self_result.get("result")
+            if isinstance(out, dict):
+                response = dict(out)
+            else:
+                response = {"ok": True, "result": out}
+            response.setdefault("ok", True)
+            response["queued"] = bool(response.get("queued", False))
+            response["running"] = bool(response.get("running", True))
+            response["scheduler_started"] = True
+            response["queue_id"] = queue_id
+            response["queue_position"] = 0
+            response["limits"] = {
+                "max_user": int(self.max_user),
+                "max_user_sessions": int(self.max_user_sessions),
+            }
         if started_rows:
             self._emit_scheduler_started(started_rows)
         if bool(response.get("queued")) and not bool(response.get("scheduler_started")):
@@ -62799,8 +63833,9 @@ class Handler(BaseHTTPRequestHandler):
             include_model_catalog = _to_bool_like(
                 (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
             ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
+            lock_timeout = 0.08 if lite_snapshot else 0.4
             return self._send_json(
-                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot, lock_timeout=lock_timeout)
             )
         m = re.match(r"^/api/sessions/([^/]+)/events$", path)
         if m:
