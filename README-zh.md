@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 更新日志（EN/中文/日本語）</a> ·
@@ -29,7 +30,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-本次架构更新三语总览见：[`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | 上期：[`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+本次架构更新三语总览见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | 上期：[`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -117,11 +118,14 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - **Restart 意图融合** — 恢复时按 用户意图 > plan 意图 > 上下文意图 优先级融合
 - **Skills 生态全面兼容** — 兼容 5 大生态系统（awesome-claude-skills / Minimax-skills / skills-main / kimi-agent-internals / academic-pptx），LLM 自主判断按任务类型加载，支持多 skills 并发 + 冲突检测
 - **双库 RAG 知识架构** — Code RAG（`CodeIngestionService`）+ Data RAG（`RAGIngestionService`），均基于 TF_G_IDF_RAG，统一检索接口 `query_knowledge_library`，RAG 检索指南注入到内置 skills
+- **持久化 Wiki RAG** — `WikiStore` 将 raw library sources 编译为长期维护的 Markdown Wiki（`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`），检索优先复用累计综合，再回退 raw chunks
+- **编程工作流记忆** — `WorkflowMemoryStore` 对完成的编程 session 自动评分，把优质工作流卡片收录到 Code Wiki memory，通过 `workflow` 路由召回工具调用、任务交接、验证和实现模式
 - **多因素优先级上下文压缩** — 10 因素消息重要性评分（时间近因、角色权重、任务进度、错误、目标相关性、skills、compact-resume），替代纯时序裁剪
 - 内置 Web UI + 可选外部 Web UI
 - Skills Studio（独立端口）用于扫描/编辑/生成/上传 skills
 - Ollama 探测与模型目录加载
 - 通过 `LLM.config.json` 支持 OpenAI-compatible 多配置
+- 私有 vLLM / OpenAI-compatible 韧性：5 次 HTTP 重试治理、默认 60 秒间隔、遵循 `Retry-After` / 限流恢复信号、endpoint cooldown、nginx/upstream 临时错误重试
 - 统一 timeout 调度（全局超时，模型 active 时段排除）
 - 截断恢复循环（续写 pass/token 计数 + UI 实时展示）
 - 上下文压缩 + 历史归档召回 + 无损状态衔接
@@ -130,6 +134,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - SSE 心跳与写入异常处理
 - 预览链路：Markdown/HTML/代码/PDF/CSV/Excel/Word/PPT/媒体/代码阶段预览
 - 前端资源控制：live/static 冻结、快照调度、对话虚拟化
+- 可导入架构拆分工具：`split_coder.py` 通过 `_source_bridge.py` 重新生成可 import 的 `Code_Structure/` 导航包
 - 科研��务友好：工件优先、阶段可追溯、可复现持久化链路
 
 ## 3. 架构总览
@@ -619,18 +624,43 @@ sequenceDiagram
 
 完整三语详情见：[`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
 
+### 3.9 2026-05-02 重大更新：持久化 Wiki RAG + 工作流记忆 + Provider 韧性 + 可导入拆分架构
+
+**持久化 Wiki RAG**
+- `WikiStore` 现在会把每个 RAG library 编译为持久化 Markdown Wiki，包含 `sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`。
+- 检索可以先读取 Wiki 中已经积累的综合知识，再在需要精确证据或行级细节时回退到 raw chunks。
+- 知识 Wiki RAG 与编程 Code RAG 在架构上分离，便于分别优化通用知识综合与代码检索。
+
+**编程工作流记忆**
+- `WorkflowMemoryStore` 会捕获完成后的编程 session 模式，自动评分，并把通过阈值的工作流写入 Code Wiki workflow memory。
+- Code RAG 可通过 `workflow` 路由检索已经验证过的流程模式，包括工具调用顺序、节点交接、todo 结构、验证步骤和恢复信号。
+
+**Provider 韧性**
+- 私有 vLLM / OpenAI-compatible / LM Studio endpoint 现在默认采用 5 次重试、60 秒间隔的 HTTP 重试治理。
+- 重试策略会遵循 `Retry-After`、`X-RateLimit-Reset`、JSON retry hints、endpoint cooldown，并处理 nginx/upstream 风格的临时故障。
+- 正常对话完成后不再额外追加“任务执行完成”的合成 summary 气泡，除非显式设置 `AGENT_RUN_COMPLETION_SUMMARY=true`。
+
+**拆分架构工具**
+- `split_coder.py` 现在通过 `_source_bridge.py` 生成可导入的 `Code_Structure/` 包，避免循环 import，同时保留符号覆盖。
+- self-check 覆盖顶层符号一致性、`py_compile`、陈旧生成文件、package import walk、entry-point help 和生成缓存清理。
+
+完整三语详情见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
 ## 4. 关键运行时组件
 
 - `AppContext`：全局运行时容器（配置、模型目录、服务状态）
 - `SessionManager`：会话生命周期管理
 - `SessionState`：单会话 agent 状态、工具执行状态、上下文/截断/运行时标记
 - `EventHub`：SSE 与内部事件的发布订阅总线
-- `OllamaClient`：模型调用适配与回退逻辑
+- `OllamaClient`：模型调用适配、provider 重试治理、cooldown 与回退逻辑
 - `SkillStore`：本地/Provider skills 注册与扫描加载
 - `TodoManager` / `TaskManager` / `BackgroundManager`：规划与异步执行
 - `WorktreeManager`：隔离工作目录管理
 - `Handler` / `SkillsHandler`：Agent UI 与 Skills Studio 的 API 入口
 - `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：基于 `TFGraphIDFIndex` / `CodeGraphIndex` 的双库知识摄取与检索引擎
+- `WikiStore`：面向知识库和代码库累计综合的持久化 Markdown Wiki 编译器
+- `WorkflowMemoryStore`：面向可复用代码任务模式的评分式编程工作流记忆
+- `split_coder.py` / `Code_Structure`：由 `_source_bridge.py` 支撑的可导入拆分架构导航包
 
 ## 4.1 RAG 知识架构：TF-Graph_IDF 引擎
 

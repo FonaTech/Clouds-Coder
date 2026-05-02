@@ -1,0 +1,23 @@
+# Keep `ruff check .` focused on the maintained runtime sources.
+# This repository also carries historical Clouds_Coder snapshots, generated
+# split-package output, user/session data, and bundled third-party skill scripts.
+include = [
+    "Clouds_Coder.py",
+    "split_coder.py",
+    "run_split.py",
+    "repro_*.py",
+]
+
+exclude = [
+    "Code_Structure",
+    "Code_Library",
+    "RAG_Library",
+    "Codes",
+    "skills",
+    "js_lib",
+    "__pycache__",
+    "Split Tools",
+    "Clouds_Coder_*.py",
+    "*.bak*",
+    "*.backup_*",
+]

@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog</a> ·
@@ -29,7 +30,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Latest architecture update summary (trilingual): [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | Previous: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Latest architecture update summary (trilingual): [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | Previous: [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -117,11 +118,14 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - **Restart intent fusion** — user > plan > context priority when resuming after finish/abort
 - **Universal Skills ecosystem** — compatible with 5 major skill ecosystems (awesome-claude-skills, Minimax-skills, skills-main, kimi-agent-internals, academic-pptx); LLM-driven autonomous discovery and loading with multi-skill support and conflict detection
 - **Dual RAG knowledge architecture** — Code RAG (`CodeIngestionService`) + Data RAG (`RAGIngestionService`), both built on TF_G_IDF_RAG, with unified `query_knowledge_library` retrieval interface and injected retrieval guides in built-in skills
+- **Persistent Wiki RAG** — `WikiStore` compiles raw library sources into durable Markdown wiki pages (`sources/`, `entities/`, `concepts/`, `synthesis/overview.md`, `index.md`, `log.md`, `schema.md`) so retrieval can reuse accumulated synthesis before falling back to raw chunks
+- **Programming workflow memory** — `WorkflowMemoryStore` scores completed coding sessions and files accepted workflow cards into Code Wiki memory, making proven tool-use, handoff, validation, and implementation patterns retrievable through the `workflow` route
 - **Multi-factor priority context compression** — 10-factor message importance scoring (recency, role, task progress, errors, goal relevance, skills, compact-resume) replaces chronological-only trimming
 - Built-in Web UI + optional external Web UI loading
 - Skills Studio (separate UI/port) for skill scanning, editing, and generation
 - Ollama integration with model probing and catalog loading
 - OpenAI-compatible profile support via `LLM.config.json`
+- Private vLLM / OpenAI-compatible resilience: 5-attempt HTTP retry governance, 60s default retry interval, `Retry-After` / rate-limit-following, endpoint cooldowns, and transient nginx/upstream retry handling
 - Unified timeout scheduler (global run timeout, model-active spans excluded)
 - Truncation recovery loop with continuation passes, token/pass counters, and live UI status
 - Context compaction + recall archive mechanism with lossless state handoff
@@ -130,6 +134,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - SSE event stream with heartbeat and write-exception handling
 - Rich preview pipeline: markdown/html/code/PDF/CSV/Excel/Word/PPT/media preview + code stage preview
 - Frontend rendering controls for resource stability (live/static freeze, snapshot strategy, virtualized chat rows)
+- Importable architecture split tooling: `split_coder.py` regenerates `Code_Structure/` as an importable navigation package backed by `_source_bridge.py`
 - Scientific-work friendly output path: artifact-first steps, traceable stage outputs, and reproducibility-oriented persistence
 
 ## 3. Architecture Overview
@@ -630,18 +635,43 @@ sequenceDiagram
 
 Full trilingual details: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
 
+### 3.9 2026-05-02 Update: Persistent Wiki RAG + Workflow Memory + Provider Resilience + Importable Split Architecture
+
+**Persistent Wiki RAG**
+- `WikiStore` now compiles each RAG library into a durable Markdown wiki with `sources/`, `entities/`, `concepts/`, `synthesis/overview.md`, `index.md`, `log.md`, and `schema.md`.
+- Retrieval can use accumulated wiki synthesis first, then fall back to raw chunks when exact source evidence or line-level detail is needed.
+- Knowledge Wiki RAG and programming Code RAG are separated so general document synthesis and code retrieval can be tuned independently.
+
+**Programming Workflow Memory**
+- `WorkflowMemoryStore` captures completed coding-session patterns, scores them, and stores accepted workflows as Markdown cards under the Code Wiki workflow memory.
+- Code RAG can retrieve proven process patterns through the `workflow` route, including tool sequences, handoff patterns, todo structure, validation steps, and recovery signals.
+
+**Provider Resilience**
+- Private vLLM / OpenAI-compatible / LM Studio endpoints now use 5-attempt retry governance with a 60-second default interval.
+- Retry policy follows `Retry-After`, `X-RateLimit-Reset`, JSON retry hints, endpoint cooldown, and transient nginx/upstream-style failures.
+- Normal chat completion no longer adds an extra synthetic "task completed" summary bubble unless `AGENT_RUN_COMPLETION_SUMMARY=true`.
+
+**Split Architecture Tooling**
+- `split_coder.py` now emits an importable `Code_Structure/` package using `_source_bridge.py`, avoiding circular imports while preserving symbol coverage.
+- The self-check validates top-level symbol coverage, `py_compile`, stale generated files, package import walk, entry-point help, and generated cache cleanup.
+
+Full trilingual details: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
 ## 4. Key Runtime Components
 
 - `AppContext`: global runtime container (config, model catalog, server runtime state)
 - `SessionManager`: session lifecycle and lookup
 - `SessionState`: per-session agent loop state, tool execution state, context/truncation/runtime markers
 - `EventHub`: in-memory publish/subscribe event bus used by SSE and internal runtime events
-- `OllamaClient`: model request adapter with chat API handling/fallback logic
+- `OllamaClient`: model request adapter with chat API handling, provider retry governance, cooldowns, and fallback logic
 - `SkillStore`: local and provider-based skill registry/scan/load
 - `TodoManager` / `TaskManager` / `BackgroundManager`: planning and async execution
 - `WorktreeManager`: isolated work directory coordination for task execution
 - `Handler` / `SkillsHandler`: HTTP API endpoints for Agent UI and Skills Studio
 - `RAGIngestionService` (Data RAG) + `CodeIngestionService` (Code RAG): dual knowledge base ingestion and retrieval engines built on `TFGraphIDFIndex` / `CodeGraphIndex`
+- `WikiStore`: persistent Markdown wiki compiler for accumulated knowledge and code-library synthesis
+- `WorkflowMemoryStore`: scored programming workflow memory for reusable code-task patterns
+- `split_coder.py` / `Code_Structure`: importable split-architecture navigation package backed by `_source_bridge.py`
 
 ## 4.1 RAG Knowledge Architecture: TF-Graph_IDF Engine
 

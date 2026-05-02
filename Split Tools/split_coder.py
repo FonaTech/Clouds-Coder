@@ -1586,13 +1586,17 @@ class Splitter:
             old_node_map = {e.name: e.source_hash for e in old_manifest.nodes}
 
         # Collect all non-empty target modules
-        all_target_modules = [m for m in modules.keys() if m != "_imports"]
-        all_target_modules.append(CodeGenerator.SOURCE_BRIDGE_MODULE)
+        all_target_modules = [
+            m for m in modules.keys()
+            if m not in {"_imports", CodeGenerator.SOURCE_BRIDGE_MODULE}
+        ]
         # Add empty __init__.py entries from layout
         for mp in self.layout:
             if mp.endswith("__init__.py") and mp not in modules:
                 all_target_modules.append(mp)
-        expected_python_paths = _expected_python_output_paths(sorted(set(all_target_modules)))
+        expected_python_paths = _expected_python_output_paths(
+            sorted(set(all_target_modules + [CodeGenerator.SOURCE_BRIDGE_MODULE]))
+        )
 
         for mod_path in sorted(set(all_target_modules)):
             if mod_path == "_imports":

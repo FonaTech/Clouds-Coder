@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
@@ -29,7 +30,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-最新アーキテクチャ更新の三言語サマリー: [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | 前回: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+最新アーキテクチャ更新の三言語サマリー: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | 前回: [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -117,11 +118,14 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - **リスタート意図融合** — ユーザー意図 > plan 意図 > コンテキスト意図の優先度で融合
 - **Skills エコシステム全面対応** — 5 大エコシステム対応（awesome-claude-skills / MiniMax-skills / skills-main / kimi-agent-internals / academic-pptx）、LLM 自律発見・タスク別判断ロード、マルチ skill 同時起動 + コンフリクト検出
 - **デュアル RAG 知識アーキテクチャ** — Code RAG（`CodeIngestionService`）+ Data RAG（`RAGIngestionService`）、TF_G_IDF_RAG 基盤、統一検索インターフェース `query_knowledge_library`、内蔵 skills への RAG 検索ガイド注入
+- **永続 Wiki RAG** — `WikiStore` が raw library sources を Markdown Wiki（`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`）へコンパイルし、蓄積済み統合知識を優先検索してから raw chunks にフォールバック
+- **プログラミングワークフローメモリ** — `WorkflowMemoryStore` が完了済み coding session をスコアリングし、優れた workflow cards を Code Wiki memory に保存、`workflow` ルートでツール利用・引き継ぎ・検証・実装パターンを検索可能
 - **多因子優先度コンテキスト圧縮** — 10 因子メッセージ重要性スコアリング（近接性・役割・タスク進捗・エラー・目標関連性・skills・compact-resume）で時系列のみの切り捨てを置換
 - 内蔵 Web UI + 外部 Web UI の切替
 - Skills Studio（別ポート）で skill のスキャン/編集/生成/アップロード
 - Ollama モデル検出とカタログ読み込み
 - `LLM.config.json` による OpenAI-compatible プロファイル対応
+- プライベート vLLM / OpenAI-compatible 耐性：5 回 HTTP リトライ制御、60 秒デフォルト間隔、`Retry-After` / rate-limit 追従、endpoint cooldown、nginx/upstream 一時エラーリトライ
 - 統一 timeout 制御（グローバル超時、モデル active 区間除外）
 - 切断回復ループ（継続 pass/token を UI にリアルタイム表示）
 - コンテキスト圧縮 + アーカイブ再呼び出し + ロスレス状態引き継ぎ
@@ -130,6 +134,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - SSE ハートビートと書き込み例外処理
 - Markdown/HTML/コード/PDF/CSV/Excel/Word/PPT/メディア/コード段階プレビュー
 - フロントエンド負荷制御（live/static 凍結、スナップショット制御、��想リスト）
+- import 可能な分割アーキテクチャツール：`split_coder.py` が `_source_bridge.py` に支えられた `Code_Structure/` ナビゲーションパッケージを再生成
 - 研究ワークロード向け: 成果物中心、段階追跡可能、再現性重視の永続化設計
 
 ## 3. アーキテクチャ概要
@@ -613,17 +618,43 @@ sequenceDiagram
 
 三言語の完全版詳細: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
 
+### 3.9 2026-05-02 重大アップデート：永続 Wiki RAG + ワークフローメモリ + Provider 耐性 + import 可能な分割構造
+
+**永続 Wiki RAG**
+- `WikiStore` は各 RAG library を永続 Markdown Wiki としてコンパイルし、`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md` を生成します。
+- 検索は Wiki に蓄積された統合知識を先に使い、正確な証拠や行レベル詳細が必要な場合に raw chunks へフォールバックします。
+- Knowledge Wiki RAG と Programming Code RAG を構造上分離し、一般知識統合とコード検索を個別に調整できます。
+
+**プログラミングワークフローメモリ**
+- `WorkflowMemoryStore` は完了済み coding session のパターンを収集・スコアリングし、採用された workflow を Code Wiki workflow memory に保存します。
+- Code RAG は `workflow` ルートで、検証済みのツール順序、引き継ぎパターン、todo 構造、検証手順、回復シグナルを検索できます。
+
+**Provider 耐性**
+- プライベート vLLM / OpenAI-compatible / LM Studio endpoint は、デフォルト 5 回・60 秒間隔の HTTP リトライ制御を使用します。
+- リトライは `Retry-After`、`X-RateLimit-Reset`、JSON retry hints、endpoint cooldown、nginx/upstream 風の一時障害に従います。
+- 通常のチャット完了後、`AGENT_RUN_COMPLETION_SUMMARY=true` が明示されない限り、追加の「タスク完了」サマリーバブルは生成されません。
+
+**分割アーキテクチャツール**
+- `split_coder.py` は `_source_bridge.py` を使って import 可能な `Code_Structure/` package を生成し、循環 import を避けつつシンボル網羅性を保持します。
+- self-check はトップレベルシンボル一致、`py_compile`、古い生成ファイル、package import walk、entry-point help、生成キャッシュ削除を検証します。
+
+三言語の完全版詳細: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
 ## 4. 主要ランタイム構成
 
 - `AppContext`：全体設定・モデルカタログ・サーバ状態
 - `SessionManager`：セッション管理
 - `SessionState`：セッション単位の実行状態、ツール状態、切断/文脈/進行マーカー
 - `EventHub`：SSE/内部イベント配信
-- `OllamaClient`：モデル呼び出しアダプタとフォールバック
+- `OllamaClient`：モデル呼び出しアダプタ、provider retry governance、cooldown、フォールバック
 - `SkillStore`：ローカル/プロバイダ skill 登録・読み込み
 - `TodoManager` / `TaskManager` / `BackgroundManager`：計画と非同期処理
 - `WorktreeManager`：分離作業ディレクトリ
 - `Handler` / `SkillsHandler`：Agent UI/Skills Studio API
+- `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：`TFGraphIDFIndex` / `CodeGraphIndex` に基づくデュアル知識取り込み・検索エンジン
+- `WikiStore`：知識ライブラリとコードライブラリの蓄積統合を担う永続 Markdown Wiki コンパイラ
+- `WorkflowMemoryStore`：再利用可能なコードタスクパターンのためのスコアリング型プログラミングワークフローメモリ
+- `split_coder.py` / `Code_Structure`：`_source_bridge.py` に支えられた import 可能な分割アーキテクチャナビゲーションパッケージ
 
 ## 4.1 RAG 知識アーキテクチャ：TF-Graph_IDF エンジン
 

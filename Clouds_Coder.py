@@ -5612,7 +5612,6 @@ def build_code_preview_rows(
     sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
     max_rows = max(64, int(max_rows or CODE_PREVIEW_STAGE_MAX_ROWS))
     rows: list[dict] = []
-    dropped_head = 0
     has_changes = False
     opcodes = list(sm.get_opcodes())
     for tag, *_ in opcodes:
@@ -28972,7 +28971,7 @@ body{padding:18px}
             if core_c and len(core_c) >= 4:
                 _core_to_identity.setdefault(core_c, identity)
 
-
+        incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
             if isinstance(item, str):
                 raw = {"content": item, "status": "pending"}
@@ -51748,14 +51747,14 @@ def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
         text_lines: list[str] = []
         consecutive_blank = 0
         while i < len(lines):
-            l = lines[i]
-            ls = l.strip()
-            if re.match(r"^#{1,4}\s", l) or ls.startswith("```") or ls.startswith("~~~"):
+            line_text = lines[i]
+            stripped_line = line_text.strip()
+            if re.match(r"^#{1,4}\s", line_text) or stripped_line.startswith("```") or stripped_line.startswith("~~~"):
                 break
-            if ls.startswith("|") and "|" in ls[1:]:
+            if stripped_line.startswith("|") and "|" in stripped_line[1:]:
                 break
-            text_lines.append(l)
-            consecutive_blank = 0 if ls else consecutive_blank + 1
+            text_lines.append(line_text)
+            consecutive_blank = 0 if stripped_line else consecutive_blank + 1
             i += 1
             if consecutive_blank >= 2:
                 break
@@ -60724,11 +60723,13 @@ class AppContext:
         if not to_embed:
             return 0
         to_embed = to_embed[-max_chunks:]
-        anchor_text = lambda cid: (
-            str(all_chunks[cid].get("anchor", "") or "")
-            + "\n"
-            + str(all_chunks[cid].get("text", "") or "")
-        )[:2048]
+        def anchor_text(cid: str) -> str:
+            return (
+                str(all_chunks[cid].get("anchor", "") or "")
+                + "\n"
+                + str(all_chunks[cid].get("text", "") or "")
+            )[:2048]
+
         texts = [anchor_text(cid) for cid in to_embed]
         vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
