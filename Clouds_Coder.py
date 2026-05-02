@@ -8,6 +8,7 @@ import concurrent.futures
 import csv
 import difflib
 import errno
+from email.utils import parsedate_to_datetime
 import html
 import hashlib
 import hmac
@@ -38,12 +39,12 @@ import uuid
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 try:
     import certifi as _certifi
@@ -185,6 +186,8 @@ RAG_CONTEXT_BUDGETS = {
     "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
 }
 RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
+RAG_DENSE_DEFAULT_ENABLED = str(os.getenv("AGENT_RAG_DENSE_DEFAULT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
+RAG_EMBEDDING_MODE_VALUES = {"off", "sparse", "tfidf", "dense", "hybrid"}
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
@@ -202,11 +205,134 @@ CODE_PARSE_TIMEOUT_SECONDS = max(
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
 TOKEN_THRESHOLD = 1_000_000
+CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
+    0.01,
+    min(0.20, float(str(os.getenv("AGENT_CONTEXT_RESERVE_RATIO", "0.05") or "0.05"))),
+)
+CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
+    1.0,
+    min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
+)
+CONTEXT_USAGE_CALIBRATION_MAX = max(
+    CONTEXT_ESTIMATE_SAFETY_MULTIPLIER,
+    min(2.5, float(str(os.getenv("AGENT_CONTEXT_USAGE_CALIBRATION_MAX", "2.20") or "2.20"))),
+)
+CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
+    60,
+    min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
+)
+LARGE_FILE_AUTO_PAGE_BYTES = max(
+    32 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
+)
+LARGE_FILE_AUTO_PAGE_LINES = max(
+    1000,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
+)
+LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
+    1200,
+    int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
+)
+CHAT_UPLOAD_PARSE_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_QUEUE_MAX", "12") or "12"))),
+)
+CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS = max(
+    5,
+    min(180, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_TIMEOUT", "45") or "45"))),
+)
+CHAT_UPLOAD_INLINE_TEXT_BYTES = max(
+    16 * 1024,
+    min(512 * 1024, int(str(os.getenv("AGENT_CHAT_UPLOAD_INLINE_TEXT_BYTES", "131072") or "131072"))),
+)
+CHAT_UPLOAD_PARSE_MAX_BYTES = max(
+    256 * 1024,
+    min(
+        24 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_MAX_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))),
+    ),
+)
+CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
+    64 * 1024,
+    min(
+        4 * 1024 * 1024,
+        int(str(os.getenv("AGENT_CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES", str(768 * 1024)) or str(768 * 1024))),
+    ),
+)
+CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
+    1200,
+    min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
+)
+CHAT_UPLOAD_PROMPT_MAX_FILES = max(
+    2,
+    min(12, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_FILES", "6") or "6"))),
+)
+CHAT_UPLOAD_PROMPT_MAX_CHARS = max(
+    2400,
+    min(16_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_CHARS", "6000") or "6000"))),
+)
+CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
+    240,
+    min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
+)
+CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
+    1000,
+    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+)
+CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
+    str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+CHAT_UPLOAD_INGEST_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_INGEST_QUEUE_MAX", "8") or "8"))),
+)
+SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS = max(
+    0.05,
+    min(2.0, float(str(os.getenv("AGENT_SESSION_SUBMIT_LOCK_TIMEOUT", "0.08") or "0.08"))),
+)
+SESSION_DEFERRED_START_QUEUE_MAX = max(
+    4,
+    min(80, int(str(os.getenv("AGENT_SESSION_DEFERRED_START_QUEUE_MAX", "24") or "24"))),
+)
+SESSION_WATCHDOG_INTERVAL_SECONDS = max(
+    10,
+    min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
+)
+SESSION_HEARTBEAT_STALE_SECONDS = max(
+    60,
+    min(7200, int(str(os.getenv("AGENT_SESSION_HEARTBEAT_STALE_SECONDS", "900") or "900"))),
+)
+SESSION_LIST_DEFAULT_LIMIT = max(
+    50,
+    min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
+)
 IDLE_TIMEOUT = 60
 POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
 MODEL_CALL_PROGRESS_DELAY = 8.0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
+RUN_COMPLETION_SUMMARY_ENABLED = (
+    str(os.getenv("AGENT_RUN_COMPLETION_SUMMARY", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
+    0,
+    min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
+)
+LLM_HTTP_RETRY_DELAY_SECONDS = max(
+    1.0,
+    min(600.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_DELAY_SECONDS", "60") or "60"))),
+)
+LLM_HTTP_RETRY_MAX_SECONDS = max(
+    LLM_HTTP_RETRY_DELAY_SECONDS,
+    min(1800.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_SECONDS", "600") or "600"))),
+)
+LLM_HTTP_RETRY_404_ON_VLLM = (
+    str(os.getenv("AGENT_LLM_HTTP_RETRY_404_ON_VLLM", "true") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
@@ -835,6 +961,10 @@ CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
 CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
 CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
 CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
+CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
+CODE_PREVIEW_DIFF_MERGE_GAP = 10
+PREVIEW_DOWNLOAD_MAX_FILES = 500
+PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 RENDER_FRAME_MAX_POINTS = 12_000
 RENDER_FRAME_MAX_LINES = 2_000
@@ -5222,91 +5352,171 @@ def _compress_rows_keep_hotspot(
     return out, truncated
 
 
+def _focused_diff_rows_from_opcodes(
+    old_lines: list[str],
+    new_lines: list[str],
+    opcodes: list[tuple[str, int, int, int, int]],
+    *,
+    max_rows: int,
+    context_lines: int = CODE_PREVIEW_DIFF_CONTEXT_LINES,
+    merge_gap: int = CODE_PREVIEW_DIFF_MERGE_GAP,
+) -> tuple[list[dict], bool]:
+    context_lines = max(0, int(context_lines or 0))
+    merge_gap = max(0, int(merge_gap or 0))
+    max_rows = max(8, int(max_rows or 8))
+    hunks: list[dict] = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        old_start = max(0, i1 - context_lines)
+        old_end = min(len(old_lines), i2 + context_lines)
+        new_start = max(0, j1 - context_lines)
+        new_end = min(len(new_lines), j2 + context_lines)
+        if hunks and old_start <= (int(hunks[-1]["old_end"]) + merge_gap) and new_start <= (int(hunks[-1]["new_end"]) + merge_gap):
+            hunks[-1]["old_end"] = max(int(hunks[-1]["old_end"]), old_end)
+            hunks[-1]["new_end"] = max(int(hunks[-1]["new_end"]), new_end)
+            hunks[-1]["change_count"] = int(hunks[-1].get("change_count", 0)) + max(1, (i2 - i1) + (j2 - j1))
+        else:
+            hunks.append(
+                {
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": new_start,
+                    "new_end": new_end,
+                    "change_count": max(1, (i2 - i1) + (j2 - j1)),
+                }
+            )
+    if not hunks:
+        return [], False
+
+    rows: list[dict] = []
+    op_idx = 0
+    prev_old_end = 0
+    prev_new_end = 0
+
+    def _append_gap(old_start: int, new_start: int):
+        old_gap = max(0, int(old_start) - int(prev_old_end))
+        new_gap = max(0, int(new_start) - int(prev_new_end))
+        gap = max(old_gap, new_gap)
+        if gap > 0:
+            rows.append(_skip_row(f"⋮ ... ({gap} unchanged lines omitted)"))
+
+    for hunk in hunks:
+        h_old_start = int(hunk["old_start"])
+        h_old_end = int(hunk["old_end"])
+        h_new_start = int(hunk["new_start"])
+        h_new_end = int(hunk["new_end"])
+        _append_gap(h_old_start, h_new_start)
+        while op_idx < len(opcodes):
+            tag, i1, i2, j1, j2 = opcodes[op_idx]
+            if i2 <= h_old_start and j2 <= h_new_start:
+                op_idx += 1
+                continue
+            if i1 >= h_old_end and j1 >= h_new_end:
+                break
+            if tag == "equal":
+                start_old = max(i1, h_old_start)
+                end_old = min(i2, h_old_end)
+                offset = start_old - i1
+                for old_i in range(start_old, end_old):
+                    new_j = j1 + offset + (old_i - start_old)
+                    if new_j < h_new_start or new_j >= h_new_end or new_j >= len(new_lines):
+                        continue
+                    rows.append(
+                        {
+                            "kind": "context",
+                            "sign": " ",
+                            "old_line": old_i + 1,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "delete":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+            elif tag == "insert":
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "replace":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            if i2 <= h_old_end and j2 <= h_new_end:
+                op_idx += 1
+            else:
+                break
+        prev_old_end = h_old_end
+        prev_new_end = h_new_end
+    trailing_gap = max(len(old_lines) - prev_old_end, len(new_lines) - prev_new_end)
+    if trailing_gap > 0:
+        rows.append(_skip_row(f"⋮ ... ({trailing_gap} unchanged lines omitted)"))
+    out, truncated = _compress_rows_keep_hotspot(rows, max_rows)
+    return out, bool(truncated or len(out) < len(rows))
+
+
 def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
-    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
-    entries: list[dict] = []
     max_lines = max(16, int(max_lines or 320))
-    # Keep bounded memory on huge files while preserving latest/hot rows.
-    buffer_cap = max(max_lines + 256, min(6_000, max_lines * 6))
-    dropped_head = 0
-
-    def _push(row: dict):
-        nonlocal dropped_head
-        entries.append(row)
-        if len(entries) <= buffer_cap:
-            return
-        drop = len(entries) - buffer_cap
-        del entries[:drop]
-        dropped_head += drop
-
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for off in range(i2 - i1):
-                _push(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "old_col": 1,
-                        "new_col": 1,
-                        "text": old_lines[i1 + off],
-                    }
-                )
-        elif tag == "delete":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-        elif tag == "insert":
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-        elif tag == "replace":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-    out, _ = _compress_rows_keep_hotspot(entries, max_lines, prefix_omitted=dropped_head)
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    rows, _ = _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        list(sm.get_opcodes()),
+        max_rows=max_lines,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
+    if rows:
+        return rows
+    show = min(len(new_lines), max_lines)
+    out = [
+        {
+            "kind": "context",
+            "sign": " ",
+            "old_line": i + 1,
+            "new_line": i + 1,
+            "old_col": 1,
+            "new_col": 1,
+            "text": new_lines[i],
+        }
+        for i in range(show)
+    ]
+    if len(new_lines) > show:
+        out.append(_skip_row(f"⋮ ... ({len(new_lines) - show} lines omitted)"))
     return out
 
 def render_numbered_diff_text(entries: list[dict]) -> str:
@@ -5363,6 +5573,10 @@ def preview_kind_for_path(path_text: str) -> str:
         return "html"
     if rel.endswith((".md", ".markdown")):
         return "markdown"
+    if is_code_preview_candidate(rel):
+        return "code"
+    if rel.endswith(".txt"):
+        return "markdown"
     ext = PurePosixPath(rel).suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
@@ -5380,8 +5594,6 @@ def preview_kind_for_path(path_text: str) -> str:
         return "presentation"
     if ext in DOCUMENT_PREVIEW_EXTS:
         return "document"
-    if is_code_preview_candidate(rel):
-        return "code"
     return ""
 
 
@@ -5407,25 +5619,6 @@ def build_code_preview_rows(
         if tag != "equal":
             has_changes = True
             break
-    # Avoid unbounded memory for giant files while keeping recent/hot rows.
-    buffer_cap = max(max_rows + 2048, min(120_000, max_rows * 3))
-    context_window = 96
-
-    def _append(row: dict):
-        nonlocal dropped_head
-        rows.append(row)
-        if len(rows) <= buffer_cap:
-            return
-        drop = len(rows) - buffer_cap
-        del rows[:drop]
-        dropped_head += drop
-
-    def _append_skip(omitted_lines: int):
-        n = max(0, int(omitted_lines or 0))
-        if n <= 0:
-            return
-        _append(_skip_row(f"⋮ ... ({n} unchanged lines omitted)"))
-
     if not has_changes:
         total = len(new_lines)
         show = min(total, max_rows)
@@ -5444,132 +5637,14 @@ def build_code_preview_rows(
             rows.append(_skip_row(f"⋮ ... ({total - show} lines omitted)"))
         return rows, truncated
 
-    for idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag == "equal":
-            span = i2 - i1
-            if span <= 0:
-                continue
-            prev_changed = idx > 0 and opcodes[idx - 1][0] != "equal"
-            next_changed = idx + 1 < len(opcodes) and opcodes[idx + 1][0] != "equal"
-            if prev_changed and next_changed:
-                keep_head = min(context_window, span)
-                keep_tail = min(context_window, max(0, span - keep_head))
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if next_changed:
-                keep_tail = min(context_window, span)
-                _append_skip(span - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if prev_changed:
-                keep_head = min(context_window, span)
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head)
-                continue
-            keep = min(context_window * 2, span)
-            for off in range(keep):
-                _append(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "text": new_lines[j1 + off],
-                    }
-                )
-            _append_skip(span - keep)
-            continue
-        if tag == "delete":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            continue
-        if tag == "insert":
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-            continue
-        if tag == "replace":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-    out, truncated = _compress_rows_keep_hotspot(rows, max_rows, prefix_omitted=dropped_head)
-    if truncated and out and str(out[-1].get("kind", "")).lower() == "skip":
-        out[-1]["text"] = str(out[-1].get("text") or "").strip() or f"⋮ ... preview truncated at {max_rows} rows"
-    return out, truncated
+    return _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        opcodes,
+        max_rows=max_rows,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
 
 class EventHub:
     _MAXSIZE = 512
@@ -11825,12 +11900,31 @@ class WorktreeManager:
         return json_dumps(out, indent=2)
 
 class OllamaError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        *,
+        headers: dict | None = None,
+        body: str = "",
+        url: str = "",
+        retry_after: float | None = None,
+        retryable: bool | None = None,
+        transient: bool | None = None,
+    ):
         super().__init__(message)
         self.status = status
+        self.headers = dict(headers or {})
+        self.body = str(body or "")
+        self.url = str(url or "")
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.transient = transient
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
+    _retry_lock = threading.RLock()
+    _endpoint_cooldowns: dict[str, dict] = {}
 
     def __init__(
         self,
@@ -11862,6 +11956,174 @@ class OllamaClient:
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
+
+    def _http_retry_key(self, url: str) -> str:
+        parsed = urlparse(str(url or ""))
+        host = parsed.netloc or parsed.path
+        return "|".join(
+            [
+                normalize_openai_compat_provider_name(self.provider),
+                str(host or "").strip().lower(),
+                str(self.model or "").strip().lower(),
+            ]
+        )
+
+    def _provider_retry_label(self) -> str:
+        provider = normalize_openai_compat_provider_name(self.provider)
+        model = str(self.model or "").strip()
+        return f"{provider}/{model}" if model else provider
+
+    @staticmethod
+    def _headers_to_dict(headers: object) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            items = headers.items()  # type: ignore[attr-defined]
+        except Exception:
+            items = []
+        for key, value in items:
+            out[str(key)] = str(value)
+        return out
+
+    @staticmethod
+    def _parse_retry_after_seconds(headers: dict | None, body: str = "") -> float | None:
+        hdrs = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+        raw = hdrs.get("retry-after") or hdrs.get("x-retry-after")
+        if raw:
+            try:
+                value = float(raw)
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+            except Exception:
+                pass
+        reset = hdrs.get("x-ratelimit-reset") or hdrs.get("x-rate-limit-reset")
+        if reset:
+            try:
+                value = float(reset)
+                if value > 1_000_000_000:
+                    return max(0.0, value - time.time())
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+        parsed_body = parse_json_object(body, {})
+        if isinstance(parsed_body, dict):
+            for key in ("retry_after", "retryAfter", "retry_after_seconds", "wait_seconds"):
+                if key not in parsed_body:
+                    continue
+                try:
+                    value = float(parsed_body.get(key))
+                    if value >= 0:
+                        return value
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _looks_like_nginx_or_upstream(text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        markers = (
+            "nginx",
+            "openresty",
+            "upstream",
+            "bad gateway",
+            "gateway timeout",
+            "gateway error",
+            "service unavailable",
+            "temporarily unavailable",
+            "connection reset",
+            "connection refused",
+            "no healthy upstream",
+            "upstream request timeout",
+            "proxy error",
+            "reverse proxy",
+            "load balancer",
+            "envoy",
+            "traefik",
+            "the server encountered an internal error",
+        )
+        return any(marker in low for marker in markers)
+
+    def _is_retryable_http_error(self, exc: OllamaError, url: str) -> tuple[bool, bool]:
+        status = int(getattr(exc, "status", 0) or 0)
+        body = str(getattr(exc, "body", "") or str(exc))
+        provider = normalize_openai_compat_provider_name(self.provider)
+        if status in LLM_HTTP_RETRY_STATUSES:
+            return True, True
+        if status == 404 and LLM_HTTP_RETRY_404_ON_VLLM and provider in {"vllm", "openai_compat", "lmstudio"}:
+            path = str(urlparse(str(url or "")).path or "").lower()
+            if path.endswith("/chat/completions") and self._looks_like_nginx_or_upstream(body):
+                return True, True
+        return False, False
+
+    def _is_retryable_connection_error(self, exc: OllamaError) -> bool:
+        status = int(getattr(exc, "status", 0) or 0)
+        if status:
+            return False
+        text = str(exc).lower()
+        markers = (
+            "connection error",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "remote end closed",
+            "temporarily unavailable",
+            "service unavailable",
+        )
+        return any(marker in text for marker in markers)
+
+    def _http_retry_delay(self, exc: OllamaError, attempt_index: int) -> float:
+        retry_after = getattr(exc, "retry_after", None)
+        delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        try:
+            if retry_after is not None:
+                delay = max(delay, float(retry_after))
+        except Exception:
+            delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        return max(1.0, min(float(delay), float(LLM_HTTP_RETRY_MAX_SECONDS)))
+
+    def _cooldown_remaining(self, key: str) -> float:
+        with self._retry_lock:
+            row = self._endpoint_cooldowns.get(key, {})
+            until = float(row.get("until", 0.0) or 0.0) if isinstance(row, dict) else 0.0
+        return max(0.0, until - time.time())
+
+    def _set_endpoint_cooldown(self, key: str, delay: float, exc: OllamaError):
+        if delay <= 0:
+            return
+        with self._retry_lock:
+            self._endpoint_cooldowns[key] = {
+                "until": time.time() + float(delay),
+                "status": int(getattr(exc, "status", 0) or 0),
+                "error": trim(str(exc), 240),
+                "provider": normalize_openai_compat_provider_name(self.provider),
+                "model": str(self.model or ""),
+            }
+
+    def _wait_with_cancel(self, seconds: float, cancel_check=None):
+        deadline = time.time() + max(0.0, float(seconds or 0.0))
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        raise OllamaError("interrupted by user", status=499)
+                except OllamaError:
+                    raise
+                except Exception:
+                    pass
+            time.sleep(min(1.0, remaining))
 
     def apply_profile(self, profile: dict):
         self.provider = str(profile.get("provider", "ollama") or "ollama")
@@ -11971,9 +12233,83 @@ class OllamaClient:
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
+
+    def _post_json_url_with_retries(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        cancel_check=None,
+        on_retry=None,
+    ) -> dict:
+        retry_budget = LLM_HTTP_RETRY_MAX_ATTEMPTS if max_attempts is None else max(0, int(max_attempts or 0))
+        key = self._http_retry_key(url)
+        label = self._provider_retry_label()
+        last_exc: OllamaError | None = None
+        for attempt in range(0, retry_budget + 1):
+            cooldown = self._cooldown_remaining(key)
+            if cooldown > 0:
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt,
+                                "retry_budget": retry_budget,
+                                "delay": round(cooldown, 2),
+                                "reason": "endpoint cooldown",
+                                "status": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(cooldown, cancel_check=cancel_check)
+            try:
+                return self._post_json_url(url, payload, headers=headers)
+            except OllamaError as exc:
+                last_exc = exc
+                http_retryable, transient = self._is_retryable_http_error(exc, url)
+                conn_retryable = self._is_retryable_connection_error(exc)
+                retryable = bool(http_retryable or conn_retryable)
+                exc.retryable = retryable
+                exc.transient = bool(transient or conn_retryable)
+                if not retryable or attempt >= retry_budget:
+                    raise
+                delay = self._http_retry_delay(exc, attempt)
+                self._set_endpoint_cooldown(key, delay, exc)
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt + 1,
+                                "retry_budget": retry_budget,
+                                "delay": round(delay, 2),
+                                "reason": trim(str(exc), 240),
+                                "status": int(getattr(exc, "status", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(delay, cancel_check=cancel_check)
+        if last_exc is not None:
+            raise last_exc
+        raise OllamaError("model HTTP request failed", url=url)
 
     def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
         req_headers = {"Content-Type": "application/json"}
@@ -11992,9 +12328,17 @@ class OllamaClient:
                 return body, ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
         req = Request(url, headers=self._render_headers(), method="GET")
@@ -12004,9 +12348,17 @@ class OllamaClient:
                 return resp.read(), ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
         out = []
@@ -12567,6 +12919,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
         payload = {
@@ -12579,7 +12934,14 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
         try:
-            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+            raw = self._post_json_url_with_retries(
+                endpoint,
+                payload,
+                headers=self._render_headers(),
+                max_attempts=http_retry_attempts,
+                cancel_check=cancel_check,
+                on_retry=on_http_retry,
+            )
         except OllamaError as exc:
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
@@ -12590,7 +12952,14 @@ class OllamaClient:
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
                 fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
                 fallback_payload.pop("tools", None)
-                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
             else:
                 raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
@@ -12604,6 +12973,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -12630,7 +13002,14 @@ class OllamaClient:
             }
             if tools:
                 payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        raw = self._post_json_url_with_retries(
+            endpoint,
+            payload,
+            headers=self._render_headers(),
+            max_attempts=http_retry_attempts,
+            cancel_check=cancel_check,
+            on_retry=on_http_retry,
+        )
         if isinstance(raw, dict) and "choices" in raw:
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -12810,6 +13189,7 @@ class OllamaClient:
         full_thinking: list[str] = []
         tool_calls: list[dict] = []
         done_reason = ""
+        final_raw: dict = {}
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 while True:
@@ -12849,6 +13229,7 @@ class OllamaClient:
                     if tcs:
                         tool_calls = self._normalize_tool_calls(tcs)
                     if part.get("done"):
+                        final_raw = dict(part)
                         done_reason = str(part.get("done_reason") or "").strip().lower()
                         break
         except HTTPError as exc:
@@ -12862,7 +13243,16 @@ class OllamaClient:
             "content": content,
             "thinking": thinking_content,
             "tool_calls": tool_calls,
-            "raw": {"streamed": True, "done_reason": done_reason},
+            "raw": {
+                "streamed": True,
+                "done_reason": done_reason,
+                "prompt_eval_count": final_raw.get("prompt_eval_count"),
+                "eval_count": final_raw.get("eval_count"),
+                "total_duration": final_raw.get("total_duration"),
+                "load_duration": final_raw.get("load_duration"),
+                "prompt_eval_duration": final_raw.get("prompt_eval_duration"),
+                "eval_duration": final_raw.get("eval_duration"),
+            },
         }
 
     def chat(
@@ -12878,12 +13268,15 @@ class OllamaClient:
         on_thinking_chunk=None,
         media_inputs: list[dict] | None = None,
         probe_mode: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
         req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
+        http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
         # Some providers require all system messages at the beginning (or merged into one)
@@ -12902,7 +13295,14 @@ class OllamaClient:
                 req_messages = sys_msgs + non_sys_msgs
         if is_openai_compat_provider(provider):
             return self._chat_openai_compat(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
         if provider == "anthropic":
             return self._chat_anthropic(
@@ -12910,7 +13310,14 @@ class OllamaClient:
             )
         if provider == "custom_http":
             return self._chat_custom_http(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
         if stream_thinking:
             try:
@@ -13066,6 +13473,8 @@ TOOLS = [
             "route": {"type": "string", "enum": ["auto", "workflow", "wiki", "raw", "fast", "global", "hybrid"]},
             "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "language": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
         ["query"],
     ),
@@ -13084,6 +13493,8 @@ TOOLS = [
             "budget": {"type": "string", "enum": ["tight", "standard", "deep"]},
             "category": {"type": "string"},
             "kind": {"type": "string"},
+            "embed_model": {"type": "string"},
+            "embedding_mode": {"type": "string", "enum": ["sparse", "hybrid", "dense", "off"]},
         },
     ),
     tool_def(
@@ -13396,15 +13807,34 @@ class SessionState:
         self.operations: list[dict] = []
         self.code_preview_index: dict[str, list[dict]] = {}
         self.uploads: list[dict] = []
+        self.upload_parse_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_PARSE_QUEUE_MAX)
+        self.upload_parse_worker_started = False
+        self.upload_parse_worker_lock = threading.Lock()
+        self.upload_parse_last_heartbeat = 0.0
+        self.upload_parse_active_id = ""
+        self.upload_parse_active_started_at = 0.0
+        self.upload_ingest_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_INGEST_QUEUE_MAX)
+        self.upload_ingest_worker_started = False
+        self.upload_ingest_worker_lock = threading.Lock()
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
         self.runtime_knowledge_reference_text = ""
         self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
+        self.scheduler_starting = False
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
+        self.deferred_start_inputs: list[dict] = []
+        self.deferred_start_seq = 0
+        self.deferred_start_worker_started = False
+        self.deferred_start_worker_lock = threading.Lock()
+        self.scheduler_visible_inputs: list[dict] = []
         self.run_generation = 0
+        self.run_started_at = 0.0
+        self.run_last_heartbeat = 0.0
+        self.run_recovered_at = 0.0
+        self.run_recovered_reason = ""
         self.live_input_seq = 0
         self.agent_round_index = 0
         self.current_phase = "idle"
@@ -13496,6 +13926,14 @@ class SessionState:
         )
         self.context_limit_locked = bool(context_limit_locked)
         self.context_token_upper_bound = self.max_context_token_limit
+        self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+        self.last_context_actual_prompt_tokens = 0
+        self.last_context_actual_completion_tokens = 0
+        self.last_context_actual_total_tokens = 0
+        self.last_context_actual_source = ""
+        self.last_context_actual_context_label = ""
+        self.last_context_actual_ts = 0.0
+        self.last_context_estimated_prompt_tokens = 0
         self.max_agent_rounds = max(
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
@@ -14393,6 +14831,21 @@ class SessionState:
                 self.thinking = False
                 # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
                 # It will be reset to max after load (see below). Only exception: context_limit_locked.
+                usage_calibration = raw.get("context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                try:
+                    self.context_estimate_calibration = max(
+                        float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                        min(float(CONTEXT_USAGE_CALIBRATION_MAX), float(usage_calibration or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                    )
+                except Exception:
+                    self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                self.last_context_actual_prompt_tokens = max(0, int(raw.get("last_context_actual_prompt_tokens", 0) or 0))
+                self.last_context_actual_completion_tokens = max(0, int(raw.get("last_context_actual_completion_tokens", 0) or 0))
+                self.last_context_actual_total_tokens = max(0, int(raw.get("last_context_actual_total_tokens", 0) or 0))
+                self.last_context_actual_source = trim(str(raw.get("last_context_actual_source", "") or ""), 80)
+                self.last_context_actual_context_label = trim(str(raw.get("last_context_actual_context_label", "") or ""), 80)
+                self.last_context_actual_ts = max(0.0, float(raw.get("last_context_actual_ts", 0.0) or 0.0))
+                self.last_context_estimated_prompt_tokens = max(0, int(raw.get("last_context_estimated_prompt_tokens", 0) or 0))
                 self.truncation_count = int(raw.get("truncation_count", self.truncation_count) or 0)
                 self.last_truncation_ts = float(raw.get("last_truncation_ts", self.last_truncation_ts) or 0.0)
                 ids = raw.get("truncation_rescue_task_ids", [])
@@ -14480,6 +14933,57 @@ class SessionState:
                         except Exception:
                             continue
                     self.live_input_seq = max(self.live_input_seq, max_id)
+                deferred_inputs = raw.get("deferred_start_inputs", [])
+                if isinstance(deferred_inputs, list):
+                    clean_deferred: list[dict] = []
+                    for row in deferred_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        clean_deferred.append(
+                            {
+                                "id": int(row.get("id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "reason": trim(str(row.get("reason", "") or "session busy"), 120),
+                            }
+                        )
+                    self.deferred_start_inputs = clean_deferred[-SESSION_DEFERRED_START_QUEUE_MAX:]
+                    max_deferred_id = int(raw.get("deferred_start_seq", 0) or 0)
+                    for row in self.deferred_start_inputs:
+                        try:
+                            max_deferred_id = max(max_deferred_id, int(row.get("id", 0) or 0))
+                        except Exception:
+                            continue
+                    self.deferred_start_seq = max(self.deferred_start_seq, max_deferred_id)
+                scheduler_visible_inputs = raw.get("scheduler_visible_inputs", [])
+                if isinstance(scheduler_visible_inputs, list):
+                    clean_scheduler_visible: list[dict] = []
+                    for row in scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        status = str(row.get("scheduler_status", "queued") or "queued").strip().lower()
+                        if status not in {"queued", "started", "cancelled", "failed"}:
+                            status = "queued"
+                        clean_scheduler_visible.append(
+                            {
+                                "queue_id": int(row.get("queue_id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "started_at": float(row.get("started_at", 0.0) or 0.0),
+                                "finished_at": float(row.get("finished_at", 0.0) or 0.0),
+                                "queue_position": int(row.get("queue_position", 0) or 0),
+                                "queue_size": int(row.get("queue_size", 0) or 0),
+                                "scheduler_reason": trim(str(row.get("scheduler_reason", "") or ""), 120),
+                                "scheduler_status": status,
+                            }
+                        )
+                    self.scheduler_visible_inputs = clean_scheduler_visible[-SESSION_DEFERRED_START_QUEUE_MAX:]
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
@@ -14667,6 +15171,10 @@ class SessionState:
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
+        with self.deferred_start_worker_lock:
+            deferred_start_inputs_snapshot = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            deferred_start_seq_snapshot = int(self.deferred_start_seq)
+        scheduler_visible_inputs_snapshot = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
         data = {
             "id": self.id,
             "title": self.title,
@@ -14684,6 +15192,14 @@ class SessionState:
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
+            "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
+            "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_context_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_context_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_context_actual_ts": float(getattr(self, "last_context_actual_ts", 0.0) or 0.0),
+            "last_context_estimated_prompt_tokens": int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0),
             "truncation_count": self.truncation_count,
             "last_truncation_ts": self.last_truncation_ts,
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
@@ -14697,6 +15213,9 @@ class SessionState:
             "reviewer_debug_context": trim(str(self.reviewer_debug_context or ""), 1000),
             "developer_edit_fail_streaks": dict(self.developer_edit_fail_streaks) if self.developer_edit_fail_streaks else {},
             "pending_user_inputs": self.pending_user_inputs[-40:],
+            "deferred_start_inputs": deferred_start_inputs_snapshot,
+            "deferred_start_seq": int(deferred_start_seq_snapshot),
+            "scheduler_visible_inputs": scheduler_visible_inputs_snapshot,
             "run_generation": int(self.run_generation),
             "agent_round_index": int(self.agent_round_index),
             "current_phase": str(self.current_phase or "idle"),
@@ -14842,6 +15361,7 @@ class SessionState:
             if removed_hints > 0:
                 self.messages = kept[-400:]
         self.pending_user_inputs = []
+        self.deferred_start_worker_started = False
         self.cancel_requested = False
         self.current_phase = "idle"
         self.current_tool_name = ""
@@ -15062,6 +15582,11 @@ class SessionState:
             return int(self.event_seq)
 
     def _emit(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -15083,7 +15608,125 @@ class SessionState:
         )
         self.activity = self.activity[-300:]
 
+    def record_scheduler_queued_message(
+        self,
+        queue_id: int,
+        content: str,
+        *,
+        queue_position: int = 1,
+        queue_size: int = 1,
+        scheduler_reason: str = "",
+        queued_at: float | None = None,
+    ) -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        row = {
+            "queue_id": int(queue_id or 0),
+            "content": text,
+            "queued_at": float(queued_at or now_ts()),
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "queue_position": max(1, int(queue_position or 1)),
+            "queue_size": max(1, int(queue_size or 1)),
+            "scheduler_reason": trim(str(scheduler_reason or ""), 120),
+            "scheduler_status": "queued",
+        }
+        with self.lock:
+            replaced = False
+            for idx in range(len(self.scheduler_visible_inputs) - 1, -1, -1):
+                if int((self.scheduler_visible_inputs[idx] or {}).get("queue_id", 0) or 0) == int(queue_id or 0):
+                    self.scheduler_visible_inputs[idx] = row
+                    replaced = True
+                    break
+            if not replaced:
+                self.scheduler_visible_inputs.append(row)
+            self.scheduler_visible_inputs = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        self._emit(
+            "message",
+            {
+                "role": "user",
+                "text": text,
+                "summary": "queued user message",
+                "scheduler_status": "queued",
+                "scheduler_queue_id": int(queue_id or 0),
+                "queue_position": int(row["queue_position"]),
+                "queue_size": int(row["queue_size"]),
+                "scheduler_reason": row["scheduler_reason"],
+            },
+        )
+        return dict(row)
+
+    def update_scheduler_visible_message(
+        self,
+        queue_id: int,
+        *,
+        status: str = "",
+        queue_position: int | None = None,
+        queue_size: int | None = None,
+        scheduler_reason: str | None = None,
+    ) -> dict:
+        qid = int(queue_id or 0)
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"queued", "started", "cancelled", "failed"}:
+            clean_status = ""
+        out: dict = {}
+        now = now_ts()
+        with self.lock:
+            kept: list[dict] = []
+            for row in self.scheduler_visible_inputs:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("queue_id", 0) or 0) != qid:
+                    kept.append(row)
+                    continue
+                patched = dict(row)
+                if clean_status:
+                    patched["scheduler_status"] = clean_status
+                    if clean_status == "started":
+                        patched["started_at"] = now
+                    elif clean_status in {"cancelled", "failed"}:
+                        patched["finished_at"] = now
+                if queue_position is not None:
+                    patched["queue_position"] = max(0, int(queue_position or 0))
+                if queue_size is not None:
+                    patched["queue_size"] = max(0, int(queue_size or 0))
+                if scheduler_reason is not None:
+                    patched["scheduler_reason"] = trim(str(scheduler_reason or ""), 120)
+                out = patched
+                if clean_status not in {"started", "cancelled", "failed"}:
+                    kept.append(patched)
+            self.scheduler_visible_inputs = kept[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now
+            try:
+                self._persist()
+            except Exception:
+                pass
+        if out and clean_status:
+            try:
+                self._emit(
+                    "status",
+                    {
+                        "summary": f"scheduler task #{qid} {clean_status}",
+                        "scheduler_status": clean_status,
+                        "scheduler_queue_id": qid,
+                    },
+                )
+            except Exception:
+                pass
+        return out
+
     def _emit_transient(self, kind: str, data: dict):
+        try:
+            if bool(getattr(self, "running", False)):
+                self.run_last_heartbeat = now_ts()
+        except Exception:
+            pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -16141,7 +16784,8 @@ class SessionState:
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases inside final exported HTML. "
             f"Task level={runtime_level}, mode={runtime_mode}, "
             f"budget={'unlimited' if budget <= 0 else budget}. "
-            f"Context limit ~{self.context_token_upper_bound} tokens. "
+            f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
+            f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
             "Call finish_current_task only when the overall user task is done. "
@@ -16185,6 +16829,114 @@ class SessionState:
             return 3.0
         return 4.0
 
+    def _estimate_text_tokens_conservative(self, text: object, *, minimum: int = 0) -> int:
+        raw = str(text or "")
+        if not raw:
+            return max(0, int(minimum or 0))
+        base = int(math.ceil(len(raw) / max(1.0, self._char_token_divisor(raw))))
+        multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        return max(int(minimum or 0), int(math.ceil(base * multiplier)))
+
+    def _extract_model_usage_tokens(self, response: dict | None) -> dict:
+        """Extract provider-reported token counts when a backend returns them."""
+        if not isinstance(response, dict):
+            return {}
+        raw = response.get("raw")
+        if not isinstance(raw, dict):
+            raw = {}
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+
+        def _as_int(value: object) -> int:
+            try:
+                if value is None or value == "":
+                    return 0
+                return max(0, int(float(value)))
+            except Exception:
+                return 0
+
+        prompt = _as_int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or raw.get("prompt_eval_count")
+            or raw.get("input_tokens")
+        )
+        completion = _as_int(
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or raw.get("eval_count")
+            or raw.get("output_tokens")
+        )
+        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
+        if total <= 0 and (prompt or completion):
+            total = prompt + completion
+        if prompt <= 0 and total > completion:
+            prompt = total - completion
+        if not (prompt or completion or total):
+            return {}
+        source = "model-usage"
+        if usage:
+            if "input_tokens" in usage or "output_tokens" in usage:
+                source = "anthropic-usage"
+            else:
+                source = "openai-usage"
+        elif "prompt_eval_count" in raw or "eval_count" in raw:
+            source = "ollama-usage"
+        return {
+            "prompt_tokens": int(prompt),
+            "completion_tokens": int(completion),
+            "total_tokens": int(total),
+            "source": source,
+        }
+
+    def _record_model_usage(
+        self,
+        response: dict | None,
+        *,
+        estimated_prompt_tokens: int | None = None,
+        context_label: str = "",
+    ) -> dict:
+        usage = self._extract_model_usage_tokens(response)
+        prompt = int(usage.get("prompt_tokens", 0) or 0)
+        if prompt <= 0:
+            return usage
+        estimated = max(1, int(estimated_prompt_tokens or 0))
+        ratio = float(prompt) / float(estimated)
+        old_multiplier = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        # Only raise the calibration when reality exceeds the current estimate.
+        # A smaller provider count should not make future auto-compact optimistic.
+        new_multiplier = old_multiplier
+        if ratio > 1.02:
+            new_multiplier = min(float(CONTEXT_USAGE_CALIBRATION_MAX), max(old_multiplier, ratio * old_multiplier))
+        self.context_estimate_calibration = float(new_multiplier)
+        self.last_context_actual_prompt_tokens = prompt
+        self.last_context_actual_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_context_actual_total_tokens = int(usage.get("total_tokens", 0) or 0)
+        self.last_context_actual_source = str(usage.get("source", "model-usage") or "model-usage")
+        self.last_context_actual_context_label = trim(str(context_label or ""), 80)
+        self.last_context_actual_ts = now_ts()
+        self.last_context_estimated_prompt_tokens = estimated
+        if isinstance(response, dict):
+            response["usage_calibration"] = {
+                "estimated_prompt_tokens": estimated,
+                "actual_prompt_tokens": prompt,
+                "actual_total_tokens": self.last_context_actual_total_tokens,
+                "source": self.last_context_actual_source,
+                "calibration": round(float(self.context_estimate_calibration), 4),
+            }
+        return usage
+
     def _estimate_tokens(self) -> int:
         # Core: messages (global or agent context depending on mode)
         if self._is_multi_agent_mode():
@@ -16196,35 +16948,106 @@ class SessionState:
                 ctx = self._agent_context(role)
                 if ctx:
                     raw = json_dumps(ctx)
-                    cost = int(len(raw) / self._char_token_divisor(raw))
+                    cost = self._estimate_text_tokens_conservative(raw)
                     if cost > agent_max:
                         agent_max = cost
             msg_raw = json_dumps(self.messages)
-            msg_tokens = max(agent_max, int(len(msg_raw) / self._char_token_divisor(msg_raw)))
+            msg_tokens = max(agent_max, self._estimate_text_tokens_conservative(msg_raw))
         else:
             msg_raw = json_dumps(self.messages)
-            msg_tokens = int(len(msg_raw) / self._char_token_divisor(msg_raw))
+            msg_tokens = self._estimate_text_tokens_conservative(msg_raw)
         # Overhead: system prompt + tools (always present in API calls)
         try:
             sys_text = self._system_prompt()
-            sys_tokens = int(len(sys_text) / self._char_token_divisor(sys_text))
+            sys_tokens = self._estimate_text_tokens_conservative(sys_text)
         except Exception:
             sys_tokens = 300
-        tools_tokens = int(len(json_dumps(TOOLS)) / 4) if TOOLS else 0
+        tools_tokens = self._estimate_text_tokens_conservative(json_dumps(TOOLS)) if TOOLS else 0
         return msg_tokens + sys_tokens + tools_tokens
+
+    def _estimate_model_call_prompt_tokens(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        media_inputs: list[dict] | None = None,
+    ) -> int:
+        payload = {
+            "system": str(system or ""),
+            "messages": messages if isinstance(messages, list) else [],
+            "tools": tools or [],
+        }
+        if media_inputs:
+            media_rows = []
+            for item in media_inputs[:16]:
+                if not isinstance(item, dict):
+                    continue
+                media_rows.append(
+                    {
+                        "name": item.get("name") or item.get("filename") or "",
+                        "mime": item.get("mime") or item.get("content_type") or "",
+                        "size": item.get("size") or item.get("bytes") or 0,
+                    }
+                )
+            payload["media_inputs"] = media_rows
+        return self._estimate_text_tokens_conservative(json_dumps(payload), minimum=1)
 
     def _context_budget_metrics(self, token_estimate: int | None = None) -> dict:
         limit = max(1, int(self.context_token_upper_bound or 0))
-        used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
-        left = max(0, limit - used)
-        left_pct = max(0.0, min(100.0, (left * 100.0) / limit))
-        used_pct = max(0.0, min(100.0, (used * 100.0) / limit))
+        reserve = max(1, int(math.ceil(limit * CONTEXT_AUTO_COMPACT_RESERVE_RATIO)))
+        effective_limit = max(1, limit - reserve)
+        estimate_used = max(0, int(token_estimate if token_estimate is not None else self._estimate_tokens()))
+        used = estimate_used
+        actual_floor_applied = False
+        actual_age = max(0.0, now_ts() - float(getattr(self, "last_context_actual_ts", 0.0) or 0.0))
+        actual_prompt = max(0, int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0))
+        actual_estimate_at_call = max(0, int(getattr(self, "last_context_estimated_prompt_tokens", 0) or 0))
+        if (
+            token_estimate is None
+            and actual_prompt > 0
+            and actual_estimate_at_call > 0
+            and actual_age <= CONTEXT_ACTUAL_USAGE_RECENT_SECONDS
+            and estimate_used >= int(actual_estimate_at_call * 0.85)
+        ):
+            used = max(used, actual_prompt)
+            actual_floor_applied = used == actual_prompt or actual_prompt >= estimate_used
+        left = max(0, effective_limit - used)
+        raw_left = max(0, limit - used)
+        left_pct = max(0.0, min(100.0, (left * 100.0) / effective_limit))
+        used_pct = max(0.0, min(100.0, (used * 100.0) / effective_limit))
+        raw_left_pct = max(0.0, min(100.0, (raw_left * 100.0) / limit))
         return {
             "limit": limit,
+            "effective_limit": effective_limit,
+            "reserved": reserve,
+            "reserve_percent": round(float(CONTEXT_AUTO_COMPACT_RESERVE_RATIO * 100.0), 3),
             "used": used,
             "left": left,
+            "raw_left": raw_left,
             "left_percent": left_pct,
             "used_percent": used_pct,
+            "raw_left_percent": raw_left_pct,
+            "estimator": "char-cjk-conservative-v3-usage-calibrated",
+            "safety_multiplier": float(
+                max(
+                    float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    min(
+                        float(CONTEXT_USAGE_CALIBRATION_MAX),
+                        float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+                    ),
+                )
+            ),
+            "base_safety_multiplier": float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "actual_floor_applied": bool(actual_floor_applied),
+            "last_actual_prompt_tokens": int(actual_prompt),
+            "last_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
+            "last_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
+            "last_actual_source": str(getattr(self, "last_context_actual_source", "") or ""),
+            "last_actual_context_label": str(getattr(self, "last_context_actual_context_label", "") or ""),
+            "last_actual_age_seconds": round(float(actual_age), 3) if getattr(self, "last_context_actual_ts", 0.0) else None,
+            "last_estimated_prompt_tokens": int(actual_estimate_at_call),
+            "calibration_max": float(CONTEXT_USAGE_CALIBRATION_MAX),
         }
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
@@ -16372,11 +17195,12 @@ class SessionState:
         # Tier 2+: compact agent contexts proactively
         if tier >= 2:
             self._compact_agent_contexts(tier)
-        # Re-check after tier-based compression
+        # Re-check after tier-based compression. The effective limit keeps a
+        # small hard reserve so auto-compact still has room to run.
         metrics = self._context_budget_metrics()
         used = int(metrics.get("used", 0) or 0)
-        limit = max(1, int(metrics.get("limit", 0) or 0))
-        if used < limit:
+        effective_limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0))
+        if used < effective_limit:
             return False
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
@@ -19845,6 +20669,84 @@ body{padding:18px}
                 return self._preview_ppt_html(fp)
         raise ValueError(f"html preview not supported for: {rel}")
 
+    def preview_html_bundle(self, rel_path: str) -> bytes:
+        fp = self._session_path(rel_path)
+        rel = normalize_rel_preview_path(self._session_rel(fp))
+        if not rel:
+            raise ValueError("path required")
+        if not fp.exists() or not fp.is_file():
+            raise FileNotFoundError(f"file not found: {rel}")
+        if fp.suffix.lower() not in {".html", ".htm"}:
+            raise ValueError(f"html bundle not supported for: {rel}")
+        root = self.files_root.resolve()
+        html_text = try_read_text(fp, max_bytes=4_000_000) or ""
+        candidates: set[Path] = {fp.resolve()}
+        base_dir = fp.parent.resolve()
+        attr_re = re.compile(r'''(?is)\b(?:src|href|poster)\s*=\s*["']([^"']+)["']''')
+        css_re = re.compile(r'''(?is)url\(\s*["']?([^"')]+)["']?\s*\)''')
+        raw_refs = [m.group(1) for m in attr_re.finditer(html_text)]
+        raw_refs.extend(m.group(1) for m in css_re.finditer(html_text))
+        for raw_ref in raw_refs:
+            ref = html.unescape(str(raw_ref or "").strip())
+            if not ref or ref.startswith(("#", "data:", "javascript:", "mailto:", "tel:", "//")):
+                continue
+            if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", ref):
+                continue
+            ref = ref.split("#", 1)[0].split("?", 1)[0].strip()
+            if not ref:
+                continue
+            try:
+                candidate = (base_dir / unquote(ref)).resolve()
+                if not candidate.is_relative_to(root):
+                    continue
+                if candidate.exists() and candidate.is_file():
+                    candidates.add(candidate)
+            except Exception:
+                continue
+        # Include common same-directory asset folders for offline HTML exports.
+        for dirname in ("assets", "asset", "static", "js", "css", "images", "img", "media"):
+            d = base_dir / dirname
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for child in sorted(d.rglob("*")):
+                    if len(candidates) >= PREVIEW_DOWNLOAD_MAX_FILES:
+                        break
+                    if child.is_file() and child.resolve().is_relative_to(root):
+                        candidates.add(child.resolve())
+            except Exception:
+                continue
+        bio = io.BytesIO()
+        total_bytes = 0
+        written = 0
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(candidates, key=lambda p: p.relative_to(root).as_posix()):
+                if written >= PREVIEW_DOWNLOAD_MAX_FILES:
+                    break
+                try:
+                    size = int(item.stat().st_size)
+                except Exception:
+                    continue
+                if total_bytes + size > PREVIEW_DOWNLOAD_MAX_BYTES:
+                    continue
+                try:
+                    arc = item.relative_to(root).as_posix()
+                    zf.write(item, arc)
+                    total_bytes += size
+                    written += 1
+                except Exception:
+                    continue
+            manifest = {
+                "source": rel,
+                "files": written,
+                "max_files": PREVIEW_DOWNLOAD_MAX_FILES,
+                "max_bytes": PREVIEW_DOWNLOAD_MAX_BYTES,
+                "generated_at": now_ts(),
+            }
+            zf.writestr("clouds_preview_bundle.json", json_dumps(manifest, indent=2))
+        bio.seek(0)
+        return bio.read()
+
     def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
         root = self.files_root.resolve()
         max_nodes = max(100, min(8000, int(max_nodes or 1200)))
@@ -19969,11 +20871,81 @@ body{padding:18px}
                 continue
         return data.decode("latin-1", errors="ignore")
 
+    def _safe_read_head_bytes(self, fp: Path, max_bytes: int = CHAT_UPLOAD_PARSE_MAX_BYTES) -> bytes:
+        try:
+            cap = max(0, int(max_bytes or 0))
+        except Exception:
+            cap = CHAT_UPLOAD_PARSE_MAX_BYTES
+        if cap <= 0:
+            return b""
+        try:
+            with open(fp, "rb") as f:
+                return f.read(cap + 1)
+        except Exception:
+            return b""
+
+    def _upload_size(self, fp: Path) -> int:
+        try:
+            return int(fp.stat().st_size or 0)
+        except Exception:
+            return 0
+
+    def _zip_read_limited(self, zf: zipfile.ZipFile, name: str, limit: int = CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) -> str:
+        try:
+            info = zf.getinfo(name)
+            if int(info.file_size or 0) > int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES):
+                return ""
+            with zf.open(info, "r") as fh:
+                data = fh.read(int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES) + 1)
+            data = data[: int(limit or CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES)]
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _upload_kind_for(self, safe_name: str, mime: str = "") -> tuple[str, str]:
+        ext = Path(safe_name).suffix.lower()
+        mime_low = str(mime or "").strip().lower()
+        text_like_ext = {
+            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
+            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
+            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
+            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
+            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
+            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp", ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
+            ".asm", ".s", ".bas", ".vb", ".vbs", ".vba", ".bat", ".cmd", ".ps1", ".psm1", ".clj", ".cljs", ".cljc", ".edn",
+            ".coffee", ".cr", ".dart", ".dockerfile", ".erl", ".hrl", ".ex", ".exs", ".fs", ".fsi", ".fsx",
+            ".gradle", ".groovy", ".gvy", ".hs", ".lhs", ".jl", ".lua", ".lisp", ".cl", ".el", ".scm", ".rkt",
+            ".mk", ".cmake", ".ml", ".mli", ".nix", ".pas", ".pp", ".inc", ".pde", ".ino", ".proto", ".purs",
+            ".raku", ".p6", ".sol", ".sv", ".svh", ".vh", ".vhd", ".vhdl", ".tcl", ".tk", ".tf", ".tfvars", ".hcl",
+            ".tex", ".bib", ".sty", ".cls", ".typ", ".wat", ".diff", ".patch", ".graphql", ".gql", ".prisma", ".svg",
+        }
+        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
+            return "image", ext
+        if ext in VIDEO_EXTS or mime_low.startswith("video/"):
+            return "video", ext
+        if ext in AUDIO_EXTS or mime_low.startswith("audio/"):
+            return "audio", ext
+        if ext == ".pdf" or "pdf" in mime_low:
+            return "pdf", ext
+        if ext in (".csv", ".tsv"):
+            return "csv", ext
+        if ext in (".xlsx", ".xls"):
+            return "excel", ext
+        if ext in (".pptx", ".ppt"):
+            return "presentation", ext
+        if ext in (".docx", ".doc"):
+            return "document", ext
+        if ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low or "xml" in mime_low:
+            return "text", ext
+        return "binary", ext
+
     def _extract_pdf_text(self, pdf_path: Path) -> str:
+        if self._upload_size(pdf_path) > CHAT_UPLOAD_PARSE_MAX_BYTES:
+            return f"[skipped_large] PDF is larger than safe parse cap ({CHAT_UPLOAD_PARSE_MAX_BYTES} bytes). Use focused file tools or external extraction."
         # Prefer pdfminer.six first because it is pure Python and self-contained.
         try:
             from pdfminer.high_level import extract_text
-            text = extract_text(str(pdf_path))
+            text = extract_text(str(pdf_path), maxpages=30)
             if text and text.strip():
                 return text.strip()
         except ImportError:
@@ -19988,7 +20960,7 @@ body{padding:18px}
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
                     text=True,
-                    timeout=45,
+                    timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     return r.stdout.strip()
@@ -19996,7 +20968,7 @@ body{padding:18px}
                 pass
         # Final fallback: approximate text recovery from PDF string literals.
         try:
-            raw = pdf_path.read_bytes()
+            raw = self._safe_read_head_bytes(pdf_path, min(CHAT_UPLOAD_PARSE_MAX_BYTES, 2 * 1024 * 1024))
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
             merged = "\n".join(chunks)
@@ -20068,7 +21040,9 @@ body{padding:18px}
         return out
 
     def _extract_csv_text(self, raw: bytes) -> str:
-        text = self._decode_text_bytes(raw)
+        data = raw[: CHAT_UPLOAD_PARSE_MAX_BYTES + 1]
+        truncated = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES
+        text = self._decode_text_bytes(data)
         if not text:
             return ""
         lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -20086,24 +21060,38 @@ body{padding:18px}
             for i, row in enumerate(reader):
                 if i >= 180:
                     break
-                vals = [str(v).strip() for v in row]
+                vals = [str(v).strip()[:500] for v in row[:80]]
                 if any(vals):
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:180]
+        if truncated:
+            table_lines.insert(0, f"[truncated] CSV preview limited to {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes.")
         return trim("\n".join(table_lines), 24_000)
 
-    def _extract_xlsx_text(self, fp: Path) -> str:
+    def _upload_parse_deadline(self) -> float:
+        return time.time() + max(1.0, float(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
+
+    def _raise_if_upload_parse_expired(self, deadline: float):
+        if deadline and time.time() > float(deadline):
+            raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
+
+    def _extract_xlsx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("openpyxl"):
+            wb = None
             try:
                 import openpyxl  # type: ignore
 
                 wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
                 lines: list[str] = []
                 for ws in list(wb.worksheets)[:5]:
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Sheet] {ws.title}")
                     rows = 0
-                    for row in ws.iter_rows(min_row=1, max_row=200, values_only=True):
+                    for row in ws.iter_rows(min_row=1, max_row=200, max_col=80, values_only=True):
+                        if rows and rows % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals = [str(v).strip() for v in row if v not in (None, "")]
                         if not vals:
                             continue
@@ -20111,27 +21099,42 @@ body{padding:18px}
                         rows += 1
                         if rows >= 120:
                             break
-                wb.close()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
+            finally:
+                try:
+                    if wb is not None:
+                        wb.close()
+                except Exception:
+                    pass
         try:
             with zipfile.ZipFile(fp, "r") as zf:
                 shared: list[str] = []
-                if "xl/sharedStrings.xml" in zf.namelist():
-                    shared_xml = zf.read("xl/sharedStrings.xml").decode("utf-8", errors="ignore")
+                names = zf.namelist()
+                if "xl/sharedStrings.xml" in names:
+                    shared_xml = self._zip_read_limited(zf, "xl/sharedStrings.xml")
                     shared = self._extract_xml_text_tokens(shared_xml, ("t",))
                 lines: list[str] = []
-                for name in sorted(zf.namelist()):
+                sheet_count = 0
+                for name in sorted(names):
+                    self._raise_if_upload_parse_expired(deadline)
                     if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
                         continue
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
-                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text)
+                    sheet_count += 1
+                    if sheet_count > 5:
+                        break
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
+                    rows_raw = re.findall(r"(?is)<row\b[^>]*>(.*?)</row>", xml_text[:CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES])
                     lines.append(f"[Sheet] {Path(name).stem}")
                     taken = 0
                     for row_raw in rows_raw:
-                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)
+                        if taken and taken % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
+                        cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)[:80]
                         vals: list[str] = []
                         for attrs, body in cells:
                             ctype_m = re.search(r't\s*=\s*"([^"]+)"', attrs)
@@ -20154,7 +21157,7 @@ body{padding:18px}
                                         token = html.unescape(raw)
                             token = token.strip()
                             if token:
-                                vals.append(token)
+                                vals.append(token[:500])
                         if vals:
                             lines.append("\t".join(vals))
                             taken += 1
@@ -20168,49 +21171,65 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_xls_text(self, fp: Path) -> str:
+    def _extract_xls_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("xlrd"):
+            wb = None
             try:
                 import xlrd  # type: ignore
 
                 wb = xlrd.open_workbook(str(fp), on_demand=True)
                 lines: list[str] = []
                 for si in range(min(wb.nsheets, 5)):
+                    self._raise_if_upload_parse_expired(deadline)
                     sh = wb.sheet_by_index(si)
                     lines.append(f"[Sheet] {sh.name}")
                     for r in range(min(sh.nrows, 120)):
+                        if r and r % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals: list[str] = []
-                        for c in range(sh.ncols):
+                        for c in range(min(sh.ncols, 80)):
                             value = sh.cell_value(r, c)
                             if value in ("", None):
                                 continue
-                            vals.append(str(value).strip())
+                            vals.append(str(value).strip()[:500])
                         if vals:
                             lines.append("\t".join(vals))
-                wb.release_resources()
                 if lines:
                     return trim("\n".join(lines), 24_000)
             except Exception:
                 pass
-        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
+            finally:
+                try:
+                    if wb is not None:
+                        wb.release_resources()
+                except Exception:
+                    pass
+        xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
         if xls2csv_text:
             return trim(xls2csv_text, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_docx_text(self, fp: Path) -> str:
+    def _extract_docx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("docx"):
             try:
                 import docx  # type: ignore
 
                 doc = docx.Document(str(fp))
                 lines: list[str] = []
-                for p in doc.paragraphs:
+                for idx, p in enumerate(list(doc.paragraphs)[:1500]):
+                    if idx and idx % 100 == 0:
+                        self._raise_if_upload_parse_expired(deadline)
                     text = (p.text or "").strip()
                     if text:
                         lines.append(text)
-                for tb in doc.tables:
-                    for row in tb.rows:
-                        vals = [str(cell.text or "").strip() for cell in row.cells]
+                for tb_idx, tb in enumerate(list(doc.tables)[:40]):
+                    self._raise_if_upload_parse_expired(deadline)
+                    for row_idx, row in enumerate(list(tb.rows)[:120]):
+                        if row_idx and row_idx % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
+                        vals = [str(cell.text or "").strip()[:500] for cell in list(row.cells)[:40]]
                         vals = [v for v in vals if v]
                         if vals:
                             lines.append("\t".join(vals))
@@ -20223,7 +21242,10 @@ body{padding:18px}
                 parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
                 lines: list[str] = []
                 for name in sorted(parts):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                    self._raise_if_upload_parse_expired(deadline)
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Part] {Path(name).name}")
@@ -20236,27 +21258,31 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_doc_text(self, fp: Path) -> str:
+    def _extract_doc_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["antiword", str(fp)],
             ["catdoc", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_pptx_text(self, fp: Path) -> str:
+    def _extract_pptx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("pptx"):
             try:
                 import pptx  # type: ignore
 
                 pres = pptx.Presentation(str(fp))
                 lines: list[str] = []
-                for idx, slide in enumerate(pres.slides, 1):
+                for idx, slide in enumerate(list(pres.slides)[:80], 1):
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Slide {idx}]")
-                    for shape in slide.shapes:
+                    for shape_idx, shape in enumerate(list(slide.shapes)[:120]):
+                        if shape_idx and shape_idx % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         text = ""
                         if hasattr(shape, "text"):
                             text = str(getattr(shape, "text") or "").strip()
@@ -20270,8 +21296,11 @@ body{padding:18px}
             with zipfile.ZipFile(fp, "r") as zf:
                 slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
                 lines: list[str] = []
-                for name in sorted(slides):
-                    xml_text = zf.read(name).decode("utf-8", errors="ignore")
+                for name in sorted(slides)[:80]:
+                    self._raise_if_upload_parse_expired(deadline)
+                    xml_text = self._zip_read_limited(zf, name)
+                    if not xml_text:
+                        continue
                     tokens = self._extract_xml_text_tokens(xml_text, ("t",))
                     if tokens:
                         lines.append(f"[Slide] {Path(name).stem}")
@@ -20282,12 +21311,12 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_ppt_text(self, fp: Path) -> str:
+    def _extract_ppt_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["catppt", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
         ):
-            out = self._run_text_extractor_cmd(cmd, timeout=45)
+            out = self._run_text_extractor_cmd(cmd, timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
             if out:
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
@@ -20307,9 +21336,21 @@ body{padding:18px}
                 return test
             i += 1
 
-    def _uploads_prompt_block(self, max_chars: int = 24_000) -> str:
+    def _upload_parsed_ref(self, item: dict) -> str:
+        wp = str((item or {}).get("workspace_path", "") or "").strip()
+        if not wp:
+            return ""
+        item_kind = str((item or {}).get("kind", "file") or "file")
+        if item_kind not in ("text", "code"):
+            from pathlib import PurePosixPath
+            stem = PurePosixPath(wp).stem
+            parent = str(PurePosixPath(wp).parent)
+            return f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+        return wp
+
+    def _uploads_prompt_block(self, max_chars: int = CHAT_UPLOAD_PROMPT_MAX_CHARS) -> str:
         with self.lock:
-            items = list(self.uploads[-10:])
+            items = list(self.uploads[-CHAT_UPLOAD_PROMPT_MAX_FILES:])
         if not items:
             return "(none)"
         lines = []
@@ -20318,36 +21359,39 @@ body{padding:18px}
             item_kind = str(item.get("kind", "file") or "file")
             wp = str(item.get("workspace_path", "") or "")
             filename = str(item.get("filename", "") or "")
+            status = str(item.get("parse_status", "") or "").strip() or "unknown"
+            parse_error = trim(str(item.get("parse_error", "") or "").strip(), 180)
+            full_ref = self._upload_parsed_ref(item)
+            status_note = f", parse={status}"
+            if parse_error:
+                status_note += f", error={parse_error}"
             lines.append(
                 f"- {filename} => {wp} "
-                f"({item_kind}, {item.get('size',0)} bytes)"
+                f"({item_kind}, {item.get('size',0)} bytes{status_note})"
             )
-            excerpt = str(item.get("parsed_excerpt", "")).strip()
-            if not excerpt or remaining < 200:
-                full_ref = ""
-                if wp:
-                    if item_kind not in ("text", "code"):
-                        from pathlib import PurePosixPath
-                        stem = PurePosixPath(wp).stem
-                        parent = str(PurePosixPath(wp).parent)
-                        full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                    else:
-                        full_ref = wp
-                if full_ref:
-                    lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
+            if full_ref:
+                lines.append(f"  source: {full_ref} (use read_file for complete content)")
+            if status in {"pending", "failed_saved", "skipped_large", "skipped_timeout"}:
+                if status == "pending":
+                    lines.append("  note: parsing may still be running; do not claim full-file understanding until read_file succeeds.")
+                else:
+                    lines.append("  note: parser did not provide reliable full text; use the saved file/path and report uncertainty.")
                 continue
-            chunk_cap = min(2200, remaining)
+            excerpt = str(item.get("parsed_excerpt", "")).strip()
+            if not excerpt or remaining < 160:
+                continue
+            chunk_cap = min(CHAT_UPLOAD_PROMPT_PER_FILE_CHARS, remaining)
             if self._upload_is_code_like(item):
-                chunk_cap = min(1200, remaining)
+                chunk_cap = min(600, remaining)
             elif item_kind == "text":
-                chunk_cap = min(1600, remaining)
+                chunk_cap = min(800, remaining)
             chunk = self._prepare_upload_excerpt(
                 filename,
                 wp,
                 item_kind,
                 excerpt,
                 max_chars=chunk_cap,
-                max_lines=36 if self._upload_is_code_like(item) else 72,
+                max_lines=18 if self._upload_is_code_like(item) else 28,
             )
             if not chunk:
                 continue
@@ -20355,17 +21399,6 @@ body{padding:18px}
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
-            full_ref = ""
-            if wp:
-                if item_kind not in ("text", "code"):
-                    from pathlib import PurePosixPath
-                    stem = PurePosixPath(wp).stem
-                    parent = str(PurePosixPath(wp).parent)
-                    full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                else:
-                    full_ref = wp
-            if full_ref:
-                lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
         return "\n".join(lines)
 
     def _upload_is_code_like(self, item: dict | None = None, *, filename: str = "", workspace_path: str = "", kind: str = "") -> bool:
@@ -20417,84 +21450,71 @@ body{padding:18px}
             body = "\n".join(lines[:line_cap])
         return trim(body, max_chars)
 
+    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+        total_lines = len(lines)
+        try:
+            size = int(fp.stat().st_size)
+        except Exception:
+            size = 0
+        ext = fp.suffix.lower()
+        head = "\n".join(lines[:80])
+        symbols: list[str] = []
+        if ext in {".py", ".pyi"}:
+            for idx, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith(("class ", "def ", "async def ")):
+                    symbols.append(f"{idx}: {trim(stripped, 180)}")
+                if len(symbols) >= 80:
+                    break
+        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")
+            for idx, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    symbols.append(f"{idx}: {trim(line.strip(), 180)}")
+                if len(symbols) >= 80:
+                    break
+        next_limit = LONG_OUTPUT_READ_PAGE_LINES
+        out = [
+            (
+                f"[large_file_overview path={rel} bytes={size} lines={total_lines} "
+                f"auto_paged=true]"
+            ),
+            "This file is too large to inject fully into model context. Use paged read_file calls or RAG/code-library search for focused retrieval.",
+            f"First page: read_file path=\"{rel}\" offset=0 limit={next_limit}",
+        ]
+        if symbols:
+            out.append("\nSymbols:")
+            out.extend(symbols)
+        if head:
+            out.append("\nHead preview:")
+            out.append(head)
+        if total_lines > 80:
+            out.append(f"\n[next_page read_file path=\"{rel}\" offset=80 limit={next_limit}]")
+        return "\n".join(out)
+
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
         upload_id = make_id("upload")
         stored = self.uploads_dir / f"{upload_id}_{safe_name}"
         stored.parent.mkdir(parents=True, exist_ok=True)
         stored.write_bytes(raw)
-        ext = stored.suffix.lower()
-        text_like_ext = {
-            ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl",
-            ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh", ".fish", ".sql", ".html", ".htm",
-            ".css", ".sass", ".scss", ".less", ".styl", ".json", ".jsonc", ".yaml", ".yml", ".xml", ".xsd", ".xsl",
-            ".toml", ".ini", ".cfg", ".conf", ".env", ".properties", ".md", ".mdx", ".txt", ".rst", ".log",
-            ".ipynb", ".vue", ".svelte", ".cs", ".m", ".mm", ".r", ".pl", ".pm", ".csv", ".tsv",
-            # Fortran
-            ".f", ".f90", ".f95", ".f03", ".f08", ".for", ".fpp",
-            # Additional text-like source formats
-            ".zig", ".nim", ".v", ".d", ".ada", ".adb", ".ads",
-            ".asm", ".s",
-            ".bas", ".vb", ".vbs", ".vba",
-            ".bat", ".cmd", ".ps1", ".psm1",
-            ".clj", ".cljs", ".cljc", ".edn",
-            ".coffee", ".cr", ".dart",
-            ".dockerfile",
-            ".erl", ".hrl", ".ex", ".exs",
-            ".fs", ".fsi", ".fsx",
-            ".gradle", ".groovy", ".gvy",
-            ".hs", ".lhs",
-            ".jl", ".lua",
-            ".lisp", ".cl", ".el", ".scm", ".rkt",
-            ".mk", ".cmake",
-            ".ml", ".mli", ".nix",
-            ".pas", ".pp", ".inc",
-            ".pde", ".ino",
-            ".proto", ".purs",
-            ".raku", ".p6",
-            ".sol",
-            ".sv", ".svh", ".vh", ".vhd", ".vhdl",
-            ".tcl", ".tk",
-            ".tf", ".tfvars", ".hcl",
-            ".tex", ".bib", ".sty", ".cls", ".typ",
-            ".wat",
-            ".diff", ".patch",
-            ".graphql", ".gql",
-            ".prisma", ".svg",
-        }
-        # --- Fast phase: determine kind without heavy parsing ---
-        kind = "binary"
-        mime_low = str(mime or "").strip().lower()
-        if ext in IMAGE_EXTS or mime_low.startswith("image/"):
-            kind = "image"
-        elif ext in VIDEO_EXTS or mime_low.startswith("video/"):
-            kind = "video"
-        elif ext in AUDIO_EXTS or mime_low.startswith("audio/"):
-            kind = "audio"
-        elif ext == ".pdf" or "pdf" in mime_low:
-            kind = "pdf"
-        elif ext == ".csv":
-            kind = "csv"
-        elif ext in (".xlsx", ".xls"):
-            kind = "excel"
-        elif ext in (".pptx", ".ppt"):
-            kind = "presentation"
-        elif ext in (".docx", ".doc"):
-            kind = "document"
-        elif ext in text_like_ext or mime_low.startswith("text/") or "json" in mime_low:
-            kind = "text"
-        # For small text files, parse inline (fast); for everything else, defer
+        kind, ext = self._upload_kind_for(safe_name, mime)
         parsed_excerpt = ""
-        needs_async_parse = False
+        needs_parse = kind in {"text", "pdf", "csv", "excel", "presentation", "document"}
         if kind == "text":
-            excerpt_cap = 8_000 if self._upload_is_code_like(filename=safe_name, kind=kind) else 12_000
-            parsed_excerpt = trim(self._decode_text_bytes(raw), excerpt_cap)
-        elif kind in ("pdf", "csv", "excel", "presentation", "document"):
-            needs_async_parse = True
+            is_code_upload = self._upload_is_code_like(filename=safe_name, kind=kind)
+            excerpt_cap = LARGE_SOURCE_UPLOAD_EXCERPT_CHARS if (is_code_upload or len(raw) >= LARGE_FILE_AUTO_PAGE_BYTES) else CHAT_UPLOAD_TEXT_CONTEXT_CHARS
+            parsed_excerpt = trim(self._decode_text_bytes(raw[: CHAT_UPLOAD_INLINE_TEXT_BYTES + 1]), excerpt_cap)
         workspace_target = self._upload_workspace_target(safe_name)
         workspace_target.parent.mkdir(parents=True, exist_ok=True)
         workspace_target.write_bytes(raw)
         workspace_rel = self._session_rel(workspace_target)
+        too_large_for_parse = len(raw) > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}
+        parse_status = "skipped_large" if too_large_for_parse else ("pending" if needs_parse else "done")
+        parse_error = (
+            f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            if too_large_for_parse else ""
+        )
         meta = {
             "id": upload_id,
             "filename": safe_name,
@@ -20506,47 +21526,36 @@ body{padding:18px}
             "stored_path": str(stored),
             "workspace_path": workspace_rel,
             "parsed_excerpt": parsed_excerpt,
-            "parse_status": "pending" if needs_async_parse else "done",
-            "parse_error": "",
+            "parse_status": parse_status,
+            "parse_error": parse_error,
+            "parse_started_at": 0.0,
+            "parse_finished_at": now_ts() if parse_status in {"done", "skipped_large"} else 0.0,
         }
         with self.lock:
             self.uploads.append(meta)
             self.uploads = self.uploads[-80:]
             self.updated_at = now_ts()
             self._persist()
-        if parsed_excerpt:
-            bb_excerpt = self._prepare_upload_excerpt(
-                safe_name,
-                workspace_rel,
-                kind,
-                parsed_excerpt,
-                max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                max_lines=60,
-            )
-            if bb_excerpt:
-                bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                self._blackboard_append_section("research_notes", "system", bb_content)
-        if not needs_async_parse:
-            self._emit(
-                "upload",
-                {
-                    "id": upload_id,
-                    "filename": safe_name,
-                    "workspace_path": workspace_rel,
-                    "kind": kind,
-                    "size": len(raw),
-                    "parse_status": meta["parse_status"],
-                    "parse_error": "",
-                    "summary": f"upload: {safe_name} -> {workspace_rel}",
-                    "preview": trim(parsed_excerpt, 500),
-                },
-            )
+        self._emit(
+            "upload",
+            {
+                "id": upload_id,
+                "filename": safe_name,
+                "workspace_path": workspace_rel,
+                "kind": kind,
+                "size": len(raw),
+                "parse_status": meta["parse_status"],
+                "parse_error": parse_error,
+                "summary": f"upload saved: {safe_name} -> {workspace_rel}",
+                "preview": trim(parsed_excerpt, 500),
+            },
+        )
         # --- Config detection (kept synchronous as per user preference) ---
         loaded_config = None
         low_name = safe_name.lower()
         cfg_obj = {}
-        if ext == ".json" or "json" in (mime or "").lower() or "config" in low_name:
-            cfg_text = self._decode_text_bytes(raw)
+        if (ext == ".json" or "json" in (mime or "").lower() or "config" in low_name) and len(raw) <= CHAT_UPLOAD_INLINE_TEXT_BYTES:
+            cfg_text = self._decode_text_bytes(raw[:CHAT_UPLOAD_INLINE_TEXT_BYTES])
             cfg_obj = parse_json_object(cfg_text, {})
         named_config = (
             low_name == "llm.config.json"
@@ -20577,37 +21586,10 @@ body{padding:18px}
                 "summary": f"LLM config {'queued (agent running)' if config_delayed else 'applied'} from {safe_name}",
                 "delayed": config_delayed,
             })
-        # --- Slow phase: async parsing + library ingestion ---
-        if needs_async_parse:
-            threading.Thread(
-                target=self._parse_upload_async,
-                args=(upload_id, safe_name, stored, workspace_target, kind, ext, raw, mime),
-                daemon=True,
-            ).start()
+        if parse_status == "pending":
+            self._enqueue_upload_parse(upload_id, safe_name, stored, workspace_target, kind, ext, mime)
         else:
-            # Inline RAG/Code callback for already-parsed files
-            parsed_target: Path | None = None
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                meta["rag"] = dict(rag_info)
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, len(raw))
         return {
             "id": upload_id,
             "filename": safe_name,
@@ -20621,123 +21603,266 @@ body{padding:18px}
             "model_catalog": loaded_config,
         }
 
-    def _parse_upload_async(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, raw: bytes, mime: str):
-        """Async parsing phase — runs in background thread for heavy file types."""
+    def _enqueue_upload_parse(self, upload_id: str, safe_name: str, stored: Path, workspace_target: Path, kind: str, ext: str, mime: str):
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "stored": str(stored),
+            "workspace_target": str(workspace_target),
+            "kind": kind,
+            "ext": ext,
+            "mime": mime,
+            "queued_at": now_ts(),
+        }
+        try:
+            self.upload_parse_queue.put_nowait(job)
+            self._ensure_upload_parse_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                parse_status="skipped_timeout",
+                parse_error=f"upload parse queue is full ({CHAT_UPLOAD_PARSE_QUEUE_MAX}); file saved without parsing",
+                parse_finished_at=now_ts(),
+            )
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, 0, "skipped_timeout", "upload parse queue is full", "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, self._upload_size(workspace_target))
+
+    def _ensure_upload_parse_worker(self):
+        with self.upload_parse_worker_lock:
+            if self.upload_parse_worker_started:
+                return
+            self.upload_parse_worker_started = True
+            threading.Thread(target=self._upload_parse_worker_loop, name=f"upload-parse-{self.id}", daemon=True).start()
+
+    def _upload_parse_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_parse_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_parse_worker_lock:
+                    if self.upload_parse_queue.empty():
+                        self.upload_parse_worker_started = False
+                        return
+                    continue
+            try:
+                if isinstance(job, dict):
+                    self._parse_upload_job(job)
+            except Exception as exc:
+                try:
+                    upload_id = str((job or {}).get("id", ""))
+                    safe_name = str((job or {}).get("safe_name", "upload"))
+                    workspace_target = Path(str((job or {}).get("workspace_target", "")))
+                    kind = str((job or {}).get("kind", "file"))
+                    self._patch_upload_meta(
+                        upload_id,
+                        parse_status="failed_saved",
+                        parse_error=trim(str(exc), 300),
+                        parse_finished_at=now_ts(),
+                    )
+                    self._emit_upload_status(upload_id, safe_name, workspace_target, kind, self._upload_size(workspace_target), "failed_saved", trim(str(exc), 300), "")
+                except Exception:
+                    pass
+            finally:
+                with self.lock:
+                    self.upload_parse_active_id = ""
+                    self.upload_parse_active_started_at = 0.0
+                    self.upload_parse_last_heartbeat = now_ts()
+                try:
+                    self.upload_parse_queue.task_done()
+                except Exception:
+                    pass
+
+    def _patch_upload_meta(self, upload_id: str, **updates):
+        if not upload_id:
+            return
+        with self.lock:
+            for idx in range(len(self.uploads) - 1, -1, -1):
+                row = self.uploads[idx]
+                if str(row.get("id", "")) != upload_id:
+                    continue
+                patched = dict(row)
+                patched.update(updates)
+                self.uploads[idx] = patched
+                self.updated_at = now_ts()
+                self._persist()
+                break
+
+    def _emit_upload_status(self, upload_id: str, safe_name: str, workspace_target: Path, kind: str, size: int, status: str, error: str = "", preview: str = ""):
+        workspace_rel = self._session_rel(workspace_target) if workspace_target else ""
+        self._emit("upload", {
+            "id": upload_id,
+            "filename": safe_name,
+            "workspace_path": workspace_rel,
+            "kind": kind,
+            "size": int(size or 0),
+            "parse_status": status,
+            "parse_error": error,
+            "summary": f"upload: {safe_name} -> {workspace_rel} (parse {status})",
+            "preview": trim(preview, 180),
+        })
+
+    def _enqueue_upload_ingest(self, upload_id: str, safe_name: str, workspace_target: Path, parsed_target: Path | None, kind: str, mime: str, size: int):
+        if not bool(CHAT_UPLOAD_AUTO_LIBRARY_INGEST):
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "chat_upload_auto_library_ingest_disabled",
+                },
+            )
+            return
+        if not callable(self.upload_callback):
+            return
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "workspace_target": str(workspace_target),
+            "parsed_target": str(parsed_target) if parsed_target else "",
+            "kind": kind,
+            "mime": mime,
+            "size": int(size or 0),
+        }
+        try:
+            self.upload_ingest_queue.put_nowait(job)
+            self._ensure_upload_ingest_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": False,
+                    "skipped": True,
+                    "error": f"upload ingest queue is full ({CHAT_UPLOAD_INGEST_QUEUE_MAX}); file saved without library import",
+                },
+            )
+
+    def _ensure_upload_ingest_worker(self):
+        with self.upload_ingest_worker_lock:
+            if self.upload_ingest_worker_started:
+                return
+            self.upload_ingest_worker_started = True
+            threading.Thread(target=self._upload_ingest_worker_loop, name=f"upload-ingest-{self.id}", daemon=True).start()
+
+    def _upload_ingest_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_ingest_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_ingest_worker_lock:
+                    if self.upload_ingest_queue.empty():
+                        self.upload_ingest_worker_started = False
+                        return
+                    continue
+            try:
+                self._run_upload_ingest_job(job if isinstance(job, dict) else {})
+            finally:
+                try:
+                    self.upload_ingest_queue.task_done()
+                except Exception:
+                    pass
+
+    def _run_upload_ingest_job(self, job: dict):
+        if not callable(self.upload_callback):
+            return
+        upload_id = str(job.get("id", "") or "")
+        safe_name = str(job.get("safe_name", "upload") or "upload")
+        workspace_target = Path(str(job.get("workspace_target", "") or ""))
+        parsed_raw = str(job.get("parsed_target", "") or "")
+        parsed_target = Path(parsed_raw) if parsed_raw else None
+        kind = str(job.get("kind", "file") or "file")
+        mime = str(job.get("mime", "") or "")
+        size = int(job.get("size", 0) or 0)
+        def ingest():
+            rag_info: dict = {}
+            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": int(size or 0)}
+            try:
+                maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
+                if isinstance(maybe, dict):
+                    rag_info = dict(maybe)
+            except Exception as exc:
+                rag_info = {"ok": False, "error": trim(str(exc), 260)}
+            if rag_info:
+                self._patch_upload_meta(upload_id, rag=dict(rag_info))
+
+        ingest()
+
+    def _parse_upload_job(self, job: dict):
+        upload_id = str(job.get("id", ""))
+        safe_name = str(job.get("safe_name", "upload"))
+        stored = Path(str(job.get("stored", "")))
+        workspace_target = Path(str(job.get("workspace_target", "")))
+        kind = str(job.get("kind", "binary"))
+        ext = str(job.get("ext", ""))
+        mime = str(job.get("mime", ""))
+        started = now_ts()
+        with self.lock:
+            self.upload_parse_active_id = upload_id
+            self.upload_parse_active_started_at = started
+            self.upload_parse_last_heartbeat = started
+        self._patch_upload_meta(upload_id, parse_status="pending", parse_error="", parse_started_at=started)
+        size = self._upload_size(stored)
+        if size > CHAT_UPLOAD_PARSE_MAX_BYTES and kind in {"pdf", "excel", "presentation", "document"}:
+            msg = f"safe parser skipped file larger than {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes"
+            self._patch_upload_meta(upload_id, parse_status="skipped_large", parse_error=msg, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "skipped_large", msg, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
+            return
         try:
             parsed_excerpt = ""
+            deadline = self._upload_parse_deadline()
             if kind == "pdf":
                 parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
+            elif kind == "text":
+                raw_head = self._safe_read_head_bytes(stored, CHAT_UPLOAD_INLINE_TEXT_BYTES)
+                parsed_excerpt = trim(self._decode_text_bytes(raw_head), CHAT_UPLOAD_TEXT_CONTEXT_CHARS)
             elif kind == "csv":
-                parsed_excerpt = trim(self._extract_csv_text(raw), 24_000)
+                parsed_excerpt = trim(self._extract_csv_text(self._safe_read_head_bytes(stored, CHAT_UPLOAD_PARSE_MAX_BYTES)), 24_000)
             elif kind == "excel" and ext == ".xlsx":
-                parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xlsx_text(stored, deadline), 24_000)
             elif kind == "excel" and ext == ".xls":
-                parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xls_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".pptx":
-                parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_pptx_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".ppt":
-                parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_ppt_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".docx":
-                parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_docx_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".doc":
-                parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_doc_text(stored, deadline), 24_000)
+            self._raise_if_upload_parse_expired(deadline)
             # Save parsed.md
             parsed_target: Path | None = None
             if parsed_excerpt and kind not in ("text", "code"):
                 parsed_target = workspace_target.parent / f"{workspace_target.stem}.parsed.md"
                 try:
-                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({len(raw)} bytes)\n\n"
+                    header = f"# {safe_name}\n\n> Auto-parsed from uploaded {kind} file ({size} bytes)\n\n"
                     parsed_target.write_text(header + parsed_excerpt, encoding="utf-8")
                 except Exception:
                     parsed_target = None
             # Update meta in uploads list
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parsed_excerpt"] = parsed_excerpt
-                    patched["parse_status"] = "done"
-                    patched["parse_error"] = ""
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
+            self._patch_upload_meta(
+                upload_id,
+                parsed_excerpt=parsed_excerpt,
+                parse_status="done",
+                parse_error="",
+                parse_finished_at=now_ts(),
+            )
             if parsed_excerpt:
-                bb_excerpt = self._prepare_upload_excerpt(
-                    safe_name,
-                    self._session_rel(workspace_target),
-                    kind,
-                    parsed_excerpt,
-                    max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                    max_lines=60,
+                parsed_rel = self._session_rel(parsed_target) if parsed_target else self._session_rel(workspace_target)
+                bb_content = (
+                    f"[upload:{safe_name}] kind={kind} size={size} parse=done "
+                    f"chars={len(parsed_excerpt)} source={parsed_rel}"
                 )
-                if bb_excerpt:
-                    bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                    self._blackboard_append_section("research_notes", "system", bb_content)
+                self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "done",
-                "parse_error": "",
-                "summary": f"upload: {safe_name} -> {workspace_rel}" + (f" (parsed {len(parsed_excerpt)} chars)" if parsed_excerpt else " (no text extracted)"),
-                "preview": trim(parsed_excerpt, 500),
-            })
-            # RAG/Code library ingestion
-            meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": len(raw)}
-            rag_info: dict = {}
-            if callable(self.upload_callback):
-                try:
-                    maybe = self.upload_callback(self, dict(meta), workspace_target, parsed_target)
-                    if isinstance(maybe, dict):
-                        rag_info = dict(maybe)
-                except Exception as exc:
-                    rag_info = {"ok": False, "error": trim(str(exc), 260)}
-            if rag_info:
-                with self.lock:
-                    for idx in range(len(self.uploads) - 1, -1, -1):
-                        row = self.uploads[idx]
-                        if str(row.get("id", "")) != upload_id:
-                            continue
-                        patched = dict(row)
-                        patched["rag"] = dict(rag_info)
-                        self.uploads[idx] = patched
-                        self.updated_at = now_ts()
-                        self._persist()
-                        break
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "done", "", parsed_excerpt)
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, parsed_target, kind, mime, size)
         except Exception as exc:
             # Mark parse as failed
-            with self.lock:
-                for idx in range(len(self.uploads) - 1, -1, -1):
-                    row = self.uploads[idx]
-                    if str(row.get("id", "")) != upload_id:
-                        continue
-                    patched = dict(row)
-                    patched["parse_status"] = "failed"
-                    patched["parse_error"] = trim(str(exc), 300)
-                    self.uploads[idx] = patched
-                    self.updated_at = now_ts()
-                    self._persist()
-                    break
-            workspace_rel = self._session_rel(workspace_target)
-            self._emit("upload", {
-                "id": upload_id,
-                "filename": safe_name,
-                "workspace_path": workspace_rel,
-                "kind": kind,
-                "size": len(raw),
-                "parse_status": "failed",
-                "summary": f"upload: {safe_name} -> {workspace_rel} (parse failed)",
-                "error": trim(str(exc), 300),
-                "parse_error": trim(str(exc), 300),
-                "preview": "",
-            })
+            err = trim(str(exc), 300)
+            self._patch_upload_meta(upload_id, parse_status="failed_saved", parse_error=err, parse_finished_at=now_ts())
+            self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "failed_saved", err, "")
+            self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, None, kind, mime, size)
 
     def _auto_switch_model(self, reason: str) -> bool:
         if not bool(self.auto_model_switch):
@@ -21399,6 +22524,8 @@ body{padding:18px}
 
     def _generate_run_completion_summary(self):
         """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
+        if not RUN_COMPLETION_SUMMARY_ENABLED:
+            return
         if self.cancel_requested:
             return
         bb = self._ensure_blackboard()
@@ -22243,6 +23370,7 @@ body{padding:18px}
         with self.lock:
             self.current_phase = str(phase or "idle")
             self.current_tool_name = str(tool_name or "")
+            self.run_last_heartbeat = now_ts()
 
     def _startup_phase(self, step: str = "") -> str:
         label = trim(str(step or "").strip(), 80)
@@ -22288,6 +23416,10 @@ body{padding:18px}
                     break
                 if self.cancel_requested:
                     raise OllamaError("interrupted by user", status=499)
+                try:
+                    self.run_last_heartbeat = now_ts()
+                except Exception:
+                    pass
                 if interval > 0:
                     now = time.time()
                     if now - start_ts >= delay and now - last_progress_emit >= interval:
@@ -22344,9 +23476,48 @@ body{padding:18px}
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
         wake_attempted = False
+        estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+            messages,
+            tools=tools,
+            system=system,
+            media_inputs=media_inputs,
+        )
+
+        def _emit_http_retry(meta: dict):
+            try:
+                delay = float((meta or {}).get("delay", 0.0) or 0.0)
+            except Exception:
+                delay = 0.0
+            status = int((meta or {}).get("status", 0) or 0)
+            provider = str((meta or {}).get("provider", "") or pin).strip() or pin
+            attempt_no = int((meta or {}).get("attempt", 0) or 0)
+            retry_budget = int((meta or {}).get("retry_budget", 0) or 0)
+            reason = trim(str((meta or {}).get("reason", "") or ""), 160)
+            status_txt = f"HTTP {status}" if status else "network"
+            if attempt_no > 0:
+                label = f"retry {attempt_no}/{retry_budget}"
+            else:
+                label = "cooldown"
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{context_label} model call {status_txt} on {provider}; "
+                        f"{label} after {delay:.0f}s"
+                        + (f": {reason}" if reason else "")
+                    ),
+                    "llm_http_retry": True,
+                    "provider": provider,
+                    "status": status,
+                    "delay": delay,
+                    "attempt": attempt_no,
+                    "retry_budget": retry_budget,
+                },
+            )
+
         for attempt in range(1, retry_budget + 2):
             try:
-                return self._call_interruptible(
+                response = self._call_interruptible(
                     lambda: self.ollama.chat(
                         messages,
                         tools=tools,
@@ -22356,9 +23527,17 @@ body{padding:18px}
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
                         media_inputs=media_inputs,
+                        cancel_check=lambda: bool(self.cancel_requested),
+                        on_http_retry=_emit_http_retry,
                     ),
                     progress_label=f"{context_label} model call",
                 )
+                self._record_model_usage(
+                    response,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    context_label=context_label,
+                )
+                return response
             except OllamaError as exc:
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
@@ -22390,9 +23569,16 @@ body{padding:18px}
                         ),
                     }
                     try:
-                        return self._call_interruptible(
+                        fallback_messages = list(messages) + [fallback_note]
+                        fallback_estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
+                            fallback_messages,
+                            tools=tools,
+                            system=system,
+                            media_inputs=None,
+                        )
+                        response = self._call_interruptible(
                             lambda: self.ollama.chat(
-                                list(messages) + [fallback_note],
+                                fallback_messages,
                                 tools=tools,
                                 system=system,
                                 max_tokens=max_tokens,
@@ -22400,9 +23586,17 @@ body{padding:18px}
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
                                 media_inputs=None,
+                                cancel_check=lambda: bool(self.cancel_requested),
+                                on_http_retry=_emit_http_retry,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
+                        self._record_model_usage(
+                            response,
+                            estimated_prompt_tokens=fallback_estimated_prompt_tokens,
+                            context_label=f"{context_label}:no-media",
+                        )
+                        return response
                     except OllamaError:
                         pass  # fallback also failed, continue normal retry
                 wake_note = ""
@@ -23201,6 +24395,16 @@ body{padding:18px}
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
+            try:
+                file_size = int(fp.stat().st_size)
+            except Exception:
+                file_size = 0
+            if (
+                limit is None
+                and int(offset or 0) <= 0
+                and (file_size >= LARGE_FILE_AUTO_PAGE_BYTES or total_lines >= LARGE_FILE_AUTO_PAGE_LINES)
+            ):
+                return self._large_text_file_overview(fp, rel, lines)
             offset_val = max(0, int(offset or 0))
             requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
             if offset_val >= total_lines:
@@ -24467,10 +25671,12 @@ body{padding:18px}
         return float(difflib.SequenceMatcher(None, left, right).ratio())
 
     def _watchdog_context_near_limit(self) -> bool:
-        limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
         try:
-            used = int(self._estimate_tokens())
+            metrics = self._context_budget_metrics()
+            limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", TOKEN_THRESHOLD)) or TOKEN_THRESHOLD))
+            used = int(metrics.get("used", self._estimate_tokens()) or 0)
         except Exception:
+            limit = max(1, int(self.context_token_upper_bound or TOKEN_THRESHOLD))
             used = 0
         return bool(used >= int(limit * WATCHDOG_CONTEXT_NEAR_RATIO))
 
@@ -26642,6 +27848,10 @@ body{padding:18px}
         if next_step:
             next_step["status"] = "in_progress"
             next_step["activated_at"] = float(now_ts())
+            try:
+                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
+            except Exception:
+                pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -28006,8 +29216,8 @@ body{padding:18px}
         if missing_subtasks:
             return (
                 "<reminder>"
-                "Please call TodoWrite now to update the current subtask before continuing. "
-                "If it fails/repeats, switch to TodoWriteRescue."
+                "Current plan-step subtasks were missing or invalid. The runtime will bootstrap them when possible. "
+                "Continue with one concrete action for the active plan step; use TodoWriteRescue only if progress state is still wrong."
                 "</reminder>"
             )
         return (
@@ -28024,13 +29234,19 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 220)
         rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        if not rows:
+            try:
+                if self._ensure_worker_todos_for_plan_step(step, force_refresh=False, owner=self._current_plan_worker_owner()):
+                    rows = self._active_plan_worker_todo_rows(step_id, role=role)
+            except Exception:
+                rows = []
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks exist yet for this step. BEFORE any implementation work or step-advancing tool call, "
-                f"start with TodoWrite for THIS step only (parent_step_id='{step_id}') and create 3-5 subtasks with exactly one in_progress. "
+                f"No worker subtasks are available yet for this step. Continue the current plan step; the runtime will try to bootstrap subtasks automatically. "
+                f"Use TodoWrite only if you need to correct or refine progress state for parent_step_id='{step_id}'. "
             )
             subtasks_exist_ban = ""
         else:
@@ -28384,6 +29600,16 @@ body{padding:18px}
         _cur_step_id = str(current.get("id", "") or "")
         if _cur_step_id:
             _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+            if not _existing_subs:
+                try:
+                    if self._ensure_worker_todos_for_plan_step(current, force_refresh=False, owner=self._current_plan_worker_owner()):
+                        self._emit(
+                            "status",
+                            {"summary": "plan subtasks auto-created by runtime bootstrap"},
+                        )
+                        _existing_subs = self._active_plan_worker_todo_rows(_cur_step_id, role="")
+                except Exception as exc:
+                    self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
             if not _existing_subs:
                 _step_label_s = trim(str(current.get("content", "") or ""), 60)
                 _force_tw_msg = (
@@ -32832,10 +34058,11 @@ body{padding:18px}
             "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
-            "TODO TRACKING (mandatory): "
-            "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
-            "After completing ONE subtask, call TodoWrite immediately — mark that subtask as 'completed' and move the next one to 'in_progress' before doing more work. "
-            "Prefer TodoWrite items as objects with explicit fields: "
+                "TODO TRACKING: "
+                "When a plan step is active, follow the current todo subtask order instead of inventing a parallel path. "
+                "After completing ONE subtask, call TodoWrite when possible to mark that subtask as 'completed' and move the next one to 'in_progress'. "
+                "If TodoWrite fails, repeats unchanged, or is unavailable, do not loop on it; continue one concrete action or report the blocker with exact evidence. "
+                "Prefer TodoWrite items as objects with explicit fields: "
             "{content, status, owner?, parent_step_id?}. "
             "If you must use strings, use ONLY canonical prefixes: '[ ]', '[>]', '[x]'. "
             "Do not use emoji markers or free-form localized status labels in TodoWrite payloads. "
@@ -33765,7 +34992,16 @@ body{padding:18px}
                 )
             self._emit(
                 "file_read",
-                {"path": rel, "offset": offset_val, "limit": limit_val, "summary": summary},
+                {
+                    "path": rel,
+                    "offset": offset_val,
+                    "limit": limit_val,
+                    "summary": summary,
+                    "large_file_guard": bool(
+                        limit_val <= 0
+                        and str(out).startswith("[large_file_overview")
+                    ),
+                },
             )
             return out
         if name == "write_file":
@@ -34353,6 +35589,104 @@ body{padding:18px}
         )
         return row
 
+    def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            # Last-resort in-memory queue update. This keeps the HTTP request from
+            # hanging behind parser/session persistence locks.
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            if start_worker:
+                threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+            return row
+        try:
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+        self._emit("status", {"summary": f"user message queued until session lock is free (id={row['id']})"})
+        if start_worker:
+            threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+        return row
+
+    def _append_deferred_start_input_unlocked(self, text: str, reason: str) -> tuple[dict, bool]:
+        with self.deferred_start_worker_lock:
+            self.deferred_start_seq += 1
+            row = {
+                "id": int(self.deferred_start_seq),
+                "content": text,
+                "queued_at": now_ts(),
+                "reason": trim(str(reason or "session busy"), 120),
+            }
+            self.deferred_start_inputs.append(row)
+            self.deferred_start_inputs = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            start_worker = not self.deferred_start_worker_started
+            self.deferred_start_worker_started = True
+        return row, start_worker
+
+    def _deferred_start_worker_loop(self):
+        while True:
+            row = None
+            acquired = False
+            try:
+                acquired = bool(self.lock.acquire(timeout=0.5))
+            except Exception:
+                acquired = False
+            if not acquired:
+                time.sleep(0.1)
+                continue
+            try:
+                with self.deferred_start_worker_lock:
+                    has_deferred_inputs = bool(self.deferred_start_inputs)
+                    if not has_deferred_inputs:
+                        self.deferred_start_worker_started = False
+                        return
+                    row = self.deferred_start_inputs.pop(0)
+                if self.running:
+                    # Current run will pick up additional user input through the
+                    # normal live-input path after it releases the lock.
+                    text = str(row.get("content", "") or "")
+                    self.lock.release()
+                    acquired = False
+                    try:
+                        self._enqueue_running_user_input(text)
+                    except Exception:
+                        pass
+                    continue
+                self.updated_at = now_ts()
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+            finally:
+                if acquired:
+                    try:
+                        self.lock.release()
+                    except Exception:
+                        pass
+            if not row:
+                continue
+            try:
+                self.submit_user_message(str(row.get("content", "") or ""))
+            except Exception as exc:
+                try:
+                    self._emit("error", {"summary": f"queued user message failed to start: {trim(str(exc), 220)}"})
+                except Exception:
+                    pass
+
     def _inject_pending_user_inputs(self) -> int:
         injected: list[dict] = []
         with self.lock:
@@ -34609,7 +35943,22 @@ body{padding:18px}
         start_worker = False
         dropped_stale_inputs = 0
         removed_runtime_hints = 0
-        with self.lock:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS))
+        except Exception:
+            acquired = False
+        if not acquired:
+            row = self._enqueue_deferred_start_input(content, "session lock busy")
+            return {
+                "ok": True,
+                "queued": True,
+                "running": bool(getattr(self, "running", False)),
+                "queue_id": int(row.get("id", 0) or 0),
+                "delay_reason": str(row.get("reason", "session lock busy")),
+                "deferred_start": True,
+            }
+        try:
             if self.running:
                 pass
             else:
@@ -34664,12 +36013,21 @@ body{padding:18px}
                     self.runtime_reclassify_required = True
                 self.runtime_goal_reset_pending = True
                 self.running = True
+                self.run_started_at = now_ts()
+                self.run_last_heartbeat = self.run_started_at
+                self.run_recovered_at = 0.0
+                self.run_recovered_reason = ""
                 self.current_phase = "starting"
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
                 self._persist()
                 start_worker = True
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
         if dropped_stale_inputs > 0:
             self._emit(
                 "status",
@@ -38856,12 +40214,24 @@ body{padding:18px}
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        self._append_plan_guidance_bubble(
-                            "<reminder>Please call TodoWrite now to update the current subtask before continuing. If it fails/repeats, switch to TodoWriteRescue.</reminder>",
-                            summary="todo reminder",
-                        )
-                        self.last_todo_reminder_ts = now_tick
-                        self.todo_reminder_count += 1
+                        bootstrapped = False
+                        try:
+                            bootstrapped = self._ensure_worker_todos_for_plan_step(
+                                self._get_active_plan_step(),
+                                force_refresh=False,
+                                owner=single_role,
+                            )
+                        except Exception:
+                            bootstrapped = False
+                        if bootstrapped:
+                            self._emit("status", {"summary": "todo subtasks auto-bootstrapped after missing-progress detection"})
+                        else:
+                            self._append_plan_guidance_bubble(
+                                "<reminder>Plan subtasks are still unavailable. Continue with one concrete action for the active plan step, or report the blocker with exact evidence.</reminder>",
+                                summary="todo reminder",
+                            )
+                            self.last_todo_reminder_ts = now_tick
+                            self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
                         self._append_plan_guidance_bubble(
                             "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
@@ -38933,6 +40303,8 @@ body{padding:18px}
                     dropped_pending_inputs = len(self.pending_user_inputs)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
+                self.scheduler_starting = False
+                self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
             if dropped_pending_inputs > 0:
@@ -38978,7 +40350,7 @@ body{padding:18px}
         with self.lock:
             msg_window = 120 if lite else 200
             op_feed_window = 80 if lite else 240
-            upload_window = 16 if lite else 40
+            upload_window = 12 if lite else 40
             conversation_window = 160 if lite else 400
             activity_window = 40 if lite else 100
             ops_window = 60 if lite else 200
@@ -38989,6 +40361,29 @@ body{padding:18px}
                 if str((msg or {}).get("role", "")).strip() == "tool":
                     continue
                 total_message_count += 1
+            scheduler_feed_rows: list[dict] = []
+            for row in self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("content", "") or "").strip()
+                if not text:
+                    continue
+                qid = int(row.get("queue_id", 0) or 0)
+                scheduler_feed_rows.append(
+                    {
+                        "role": "user",
+                        "type": "scheduler_queued",
+                        "ts": float(row.get("queued_at", 0.0) or now_ts()),
+                        "text": text,
+                        "scheduler_status": str(row.get("scheduler_status", "queued") or "queued"),
+                        "scheduler_queue_id": qid,
+                        "queue_position": int(row.get("queue_position", 0) or 0),
+                        "queue_size": int(row.get("queue_size", 0) or 0),
+                        "scheduler_reason": str(row.get("scheduler_reason", "") or ""),
+                        "_vk": f"scheduler:{qid}:{len(text)}",
+                    }
+                )
+            total_message_count += len(scheduler_feed_rows)
             inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
             inferred_bus_target_role = ""
             for msg in self.messages[-msg_window:]:
@@ -39164,6 +40559,7 @@ body{padding:18px}
                     conversation_feed.append(
                         {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
                     )
+            conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
             upload_view = []
             for item in self.uploads[-upload_window:]:
@@ -39175,7 +40571,7 @@ body{padding:18px}
                         "kind": item.get("kind"),
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
-                        "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                        "preview": trim(item.get("parsed_excerpt", ""), 240 if lite else 700),
                         "parse_status": item.get("parse_status"),
                         "parse_error": item.get("parse_error"),
                     }
@@ -39258,15 +40654,36 @@ body{padding:18px}
                 "agent_active_tool": str(self.current_tool_name or ""),
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
+                "scheduler_queued_inputs_count": sum(
+                    1 for row in self.scheduler_visible_inputs
+                    if isinstance(row, dict) and str(row.get("scheduler_status", "queued") or "queued") == "queued"
+                ),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
+                "context_effective_token_limit": int(ctx.get("effective_limit", ctx.get("limit", 0))),
+                "context_reserved_tokens": int(ctx.get("reserved", 0)),
+                "context_reserve_percent": float(ctx.get("reserve_percent", 0.0)),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_estimator": str(ctx.get("estimator", "")),
+                "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
+                "context_actual_floor_applied": bool(ctx.get("actual_floor_applied", False)),
+                "context_last_actual_prompt_tokens": int(ctx.get("last_actual_prompt_tokens", 0) or 0),
+                "context_last_actual_completion_tokens": int(ctx.get("last_actual_completion_tokens", 0) or 0),
+                "context_last_actual_total_tokens": int(ctx.get("last_actual_total_tokens", 0) or 0),
+                "context_last_actual_source": str(ctx.get("last_actual_source", "") or ""),
+                "context_last_actual_context_label": str(ctx.get("last_actual_context_label", "") or ""),
+                "context_last_actual_age_seconds": ctx.get("last_actual_age_seconds"),
+                "context_last_estimated_prompt_tokens": int(ctx.get("last_estimated_prompt_tokens", 0) or 0),
+                "context_usage_calibration_max": float(ctx.get("calibration_max", CONTEXT_USAGE_CALIBRATION_MAX)),
                 "plan_mode_preference": str(self.plan_mode_user_preference or "auto"),
                 "user_task_level": int(self.user_task_level_override or 0),
                 "context_tokens_estimate": int(ctx.get("used", 0)),
                 "context_left_tokens": int(ctx.get("left", 0)),
+                "context_raw_left_tokens": int(ctx.get("raw_left", 0)),
                 "context_left_percent": round(float(ctx.get("left_percent", 0.0)), 2),
                 "context_used_percent": round(float(ctx.get("used_percent", 0.0)), 2),
+                "context_raw_left_percent": round(float(ctx.get("raw_left_percent", 0.0)), 2),
                 "truncation_count": int(self.truncation_count),
                 "compact_segments_count": len(self.context_archives),
                 "last_compact_reason": self.last_compact_reason,
@@ -39292,6 +40709,148 @@ body{padding:18px}
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
             }
+
+    def degraded_snapshot(self, reason: str = "session busy") -> dict:
+        uploads_view: list[dict] = []
+        try:
+            uploads_raw = list(getattr(self, "uploads", []) or [])[-12:]
+            for item in uploads_raw:
+                if not isinstance(item, dict):
+                    continue
+                uploads_view.append(
+                    {
+                        "id": item.get("id"),
+                        "filename": item.get("filename"),
+                        "workspace_path": item.get("workspace_path"),
+                        "kind": item.get("kind"),
+                        "size": item.get("size"),
+                        "uploaded_at": item.get("uploaded_at"),
+                        "preview": trim(item.get("parsed_excerpt", ""), 160),
+                        "parse_status": item.get("parse_status"),
+                        "parse_error": item.get("parse_error"),
+                    }
+                )
+        except Exception:
+            uploads_view = []
+        return {
+            "id": self.id,
+            "title": str(getattr(self, "title", self.id) or self.id),
+            "running": bool(getattr(self, "running", False)),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
+            "updated_at": float(getattr(self, "updated_at", 0.0) or 0.0),
+            "message_count": 0,
+            "model": str(getattr(getattr(self, "ollama", None), "model", "") or ""),
+            "provider": str(getattr(getattr(self, "ollama", None), "provider", "") or ""),
+            "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
+            "agent_phase": str(getattr(self, "current_phase", "busy") or "busy"),
+            "agent_active_tool": str(getattr(self, "current_tool_name", "") or ""),
+            "run_started_at": float(getattr(self, "run_started_at", 0.0) or 0.0),
+            "run_last_heartbeat": float(getattr(self, "run_last_heartbeat", 0.0) or 0.0),
+            "recovered_at": float(getattr(self, "run_recovered_at", 0.0) or 0.0),
+            "recovered_reason": str(getattr(self, "run_recovered_reason", "") or ""),
+            "degraded": True,
+            "degraded_reason": trim(reason, 220),
+            "messages": [],
+            "conversation_feed": [],
+            "uploads": uploads_view,
+            "todos": [],
+            "tasks": [],
+            "background": [],
+            "teammates": [],
+            "activity": [],
+            "operations": [],
+        }
+
+    def snapshot_safe(self, include_model_catalog: bool = False, lite: bool = False, lock_timeout: float = 0.4) -> dict:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=max(0.0, float(lock_timeout or 0.0))))
+        except Exception:
+            acquired = False
+        if not acquired:
+            return self.degraded_snapshot("session lock busy")
+        try:
+            return self.snapshot(include_model_catalog=include_model_catalog, lite=lite)
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+
+    def recover_if_stale(self, now_value: float | None = None, stale_seconds: int = SESSION_HEARTBEAT_STALE_SECONDS) -> bool:
+        now_value = float(now_value or now_ts())
+        acquired = False
+        restart_parse_worker = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            try:
+                    if bool(getattr(self, "running", False)):
+                        hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                        started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                        baseline = hb or started
+                        if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                            self.cancel_requested = True
+                            self.running = False
+                            self.scheduler_starting = False
+                            self.current_phase = "crashed_recovered"
+                        self.current_tool_name = ""
+                        self.run_recovered_at = now_value
+                        self.run_recovered_reason = (
+                            f"watchdog recovered lock-busy session after {int(now_value - baseline)}s without heartbeat"
+                        )
+                        self.updated_at = now_value
+                        return True
+            except Exception:
+                pass
+            return False
+        try:
+            changed = False
+            parse_active = str(getattr(self, "upload_parse_active_id", "") or "")
+            parse_started = float(getattr(self, "upload_parse_active_started_at", 0.0) or 0.0)
+            if parse_active and parse_started and (now_value - parse_started) > max(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS * 2, 60):
+                self._patch_upload_meta(
+                    parse_active,
+                    parse_status="skipped_timeout",
+                    parse_error=f"upload parser timed out after {int(now_value - parse_started)}s",
+                    parse_finished_at=now_value,
+                )
+                self.upload_parse_active_id = ""
+                self.upload_parse_active_started_at = 0.0
+                restart_parse_worker = True
+                changed = True
+            if bool(getattr(self, "running", False)):
+                hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                baseline = hb or started
+                if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                    self.cancel_requested = True
+                    self.running = False
+                    self.scheduler_starting = False
+                    self.current_phase = "crashed_recovered"
+                    self.current_tool_name = ""
+                    self.run_recovered_at = now_value
+                    self.run_recovered_reason = f"watchdog recovered stale session after {int(now_value - baseline)}s without heartbeat"
+                    self.updated_at = now_value
+                    changed = True
+            if changed:
+                self._persist()
+            return changed
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+            if restart_parse_worker:
+                try:
+                    with self.upload_parse_worker_lock:
+                        self.upload_parse_worker_started = False
+                    if not self.upload_parse_queue.empty():
+                        self._ensure_upload_parse_worker()
+                except Exception:
+                    pass
 
     def export_bundle(self) -> bytes:
         bio = io.BytesIO()
@@ -40273,27 +41832,75 @@ class SessionManager:
             raise FileNotFoundError(f"missing or invalid config: {LLM_CONFIG_PATH}")
         return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
 
-    def list(self) -> list[dict]:
+    def list(self, *, limit: int | None = None, offset: int = 0, search: str = "", status: str = "") -> list[dict] | dict:
         with self.lock:
-            items = []
-            for sess in self.sessions.values():
-                with sess.lock:
+            sessions = list(self.sessions.values())
+        rows: list[dict] = []
+        needle = str(search or "").strip().lower()
+        status_key = str(status or "").strip().lower()
+        for sess in sessions:
+            title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+            sid = str(getattr(sess, "id", "") or "")
+            running = bool(getattr(sess, "running", False))
+            if needle and needle not in title.lower() and needle not in sid.lower():
+                continue
+            if status_key in {"running", "active"} and not running:
+                continue
+            if status_key in {"idle", "stopped"} and running:
+                continue
+            degraded = False
+            try:
+                acquired = bool(sess.lock.acquire(timeout=0.03))
+            except Exception:
+                acquired = False
+            if acquired:
+                try:
+                    message_count = sum(
+                        1 for row in getattr(sess, "messages", [])
+                        if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
+                    )
+                    message_count += sum(
+                        1 for row in getattr(sess, "scheduler_visible_inputs", [])
+                        if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+                    )
+                    title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
+                    running = bool(getattr(sess, "running", False))
+                except Exception:
                     message_count = 0
-                    for row in sess.messages:
-                        if str(row.get("role", "")).strip() == "tool":
-                            continue
-                        message_count += 1
-                items.append(
-                    {
-                        "id": sess.id,
-                        "title": sess.title,
-                        "running": bool(sess.running),
-                        "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                        "updated_at": float(sess.updated_at),
-                        "message_count": int(message_count),
-                    }
-                )
-            return sorted(items, key=lambda x: x["updated_at"], reverse=True)
+                    degraded = True
+                finally:
+                    try:
+                        sess.lock.release()
+                    except Exception:
+                        pass
+            else:
+                message_count = 0
+                degraded = True
+            rows.append(
+                {
+                    "id": sid,
+                    "title": title,
+                    "running": running,
+                    "degraded": degraded,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
+                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
+                    "message_count": int(message_count),
+                }
+            )
+        rows.sort(key=lambda x: x["updated_at"], reverse=True)
+        if limit is None:
+            return rows
+        off = max(0, int(offset or 0))
+        lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT)))
+        return {
+            "sessions": rows[off: off + lim],
+            "total": len(rows),
+            "offset": off,
+            "limit": lim,
+            "has_more": off + lim < len(rows),
+        }
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -40442,6 +42049,8 @@ window.MathJax={
           <div id="previewStageStat" class="mono preview-stage-stat"></div>
         </div>
         <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
+        <button id="previewModeBtn" class="subtle hidden">Source</button>
+        <button id="previewDownloadBtn" class="subtle hidden">Download</button>
         <button id="previewReloadBtn" class="subtle">Reload</button>
       </div>
       <div id="previewBody" class="preview-body"></div>
@@ -40522,7 +42131,9 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
-.session-item{padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer}
+.session-item{padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:80px;min-height:80px;flex:0 0 80px;display:flex;flex-direction:column;justify-content:flex-start;gap:6px;overflow:hidden}
+.session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.session-item .mono{display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
 .chat #chat{flex:1;min-height:0;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:8px;background:#fff;border:1px solid var(--line);border-radius:12px;overscroll-behavior:contain;overflow-anchor:none}
 .chat-tabs{display:flex;align-items:center;gap:6px;min-height:38px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f6f9ff;margin-bottom:8px;overflow:auto}
@@ -40874,7 +42485,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -41086,10 +42697,12 @@ Object.assign(I18N['en'],{
   event_upload_title:'Upload',event_upload_path:'path',event_upload_filename:'filename',event_preview_unavailable:'Preview unavailable for this upload.',event_upload_parsing:'Parsing uploaded file in background. The bubble will refresh when parsing completes.',event_upload_failed:'Upload parsing failed',
   event_command_title:'Command',event_command_label:'command',event_cwd:'cwd',event_changed:'changed',event_command_empty:'No command output captured.',event_ui_truncated:'UI truncated',event_model_truncated:'Model truncated',event_temp_read_file:'Temp read_file',event_buffered:'Buffered',
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
-  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -41106,10 +42719,12 @@ Object.assign(I18N['zh-CN'],{
   event_upload_title:'上传',event_upload_path:'路径',event_upload_filename:'文件名',event_preview_unavailable:'该上传暂不支持预览。',event_upload_parsing:'正在后台解析上传文件。解析完成后气泡会自动刷新。',event_upload_failed:'上传解析失败',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目录',event_changed:'变更',event_command_empty:'未捕获到命令输出。',event_ui_truncated:'UI 截断',event_model_truncated:'模型截断',event_temp_read_file:'临时 read_file',event_buffered:'已缓冲',
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
-  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -41129,10 +42744,12 @@ Object.assign(I18N['zh-TW'],{
   event_upload_title:'上傳',event_upload_path:'路徑',event_upload_filename:'檔名',event_preview_unavailable:'此上傳暫時無法預覽。',event_upload_parsing:'正在背景解析上傳檔案。解析完成後氣泡會自動更新。',event_upload_failed:'上傳解析失敗',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目錄',event_changed:'變更',event_command_empty:'未擷取到命令輸出。',event_ui_truncated:'UI 截斷',event_model_truncated:'模型截斷',event_temp_read_file:'暫存 read_file',event_buffered:'已緩衝',
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
-  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -41150,10 +42767,12 @@ Object.assign(I18N['ja'],{
   event_upload_title:'アップロード',event_upload_path:'パス',event_upload_filename:'ファイル名',event_preview_unavailable:'このアップロードではプレビューを利用できません。',event_upload_parsing:'アップロードファイルをバックグラウンドで解析中です。完了するとバブルが更新されます。',event_upload_failed:'アップロード解析失敗',
   event_command_title:'コマンド',event_command_label:'コマンド',event_cwd:'作業ディレクトリ',event_changed:'変更',event_command_empty:'コマンド出力は取得されませんでした。',event_ui_truncated:'UI 切り詰め',event_model_truncated:'モデル切り詰め',event_temp_read_file:'一時 read_file',event_buffered:'バッファ済み',
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
-  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -41165,7 +42784,7 @@ function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
 function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
-async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();renderChat('language');renderSkillsEntryLink()}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const explicit=Number(o.timeoutMs);const timeoutMs=(Number.isFinite(explicit)&&explicit>0)?Math.max(1000,Math.min(86400000,Math.round(explicit))):globalApiTimeoutMs();delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
@@ -41242,6 +42861,39 @@ function _deltaPushLimited(arr,row,maxCount){if(!Array.isArray(arr))return;if(!r
 function _deltaAdoptAgentRole(data){if(!_deltaEnsureSnapshot())return'';const role=_chatVirtAgentRoleKey(data?.agent_role);if(!role)return'';S.snap.agent_active_role=role;return role}
 function _deltaAppendActivity(type,data,ts){if(!_deltaEnsureSnapshot())return;const d=(data&&typeof data==='object')?data:{};const summary=String(d.summary||d.text||d.name||type||'').trim();if(!summary)return;_deltaPushLimited(S.snap.activity,{ts:Number(ts||Date.now()/1000),type:String(type||''),summary:summary},DELTA_MAX_ACTIVITY)}
 function _deltaAppendConversationRow(row){if(!_deltaEnsureSnapshot())return;_deltaPushLimited(S.snap.conversation_feed,row,DELTA_MAX_FEED)}
+function _deltaRemoveSchedulerQueued(queueId=0,text=''){
+  if(!_deltaEnsureSnapshot())return 0;
+  const qid=Number(queueId||0);
+  const txt=String(text||'').trim();
+  const match=row=>{
+    if(!row||typeof row!=='object')return false;
+    if(String(row.type||'')!=='scheduler_queued')return false;
+    if(qid&&Number(row.scheduler_queue_id||0)===qid)return true;
+    if(!qid&&txt&&String(row.text||'').trim()===txt)return true;
+    return false;
+  };
+  let feedRemoved=0;
+  const removeFrom=(arr,limitOne=false)=>{
+    if(!Array.isArray(arr))return 0;
+    let n=0;
+    for(let i=arr.length-1;i>=0;i--){
+      if(!match(arr[i]))continue;
+      arr.splice(i,1);
+      n+=1;
+      if(limitOne&&!qid)break;
+    }
+    return n;
+  };
+  feedRemoved=removeFrom(S.snap.conversation_feed,true);
+  removeFrom(S.snap.messages,true);
+  if(feedRemoved>0){
+    const queued=Number(S.snap.scheduler_queued_inputs_count||0);
+    S.snap.scheduler_queued_inputs_count=Math.max(0,(Number.isFinite(queued)?queued:0)-feedRemoved);
+    const mc=Number(S.snap.message_count||0);
+    S.snap.message_count=Math.max(0,(Number.isFinite(mc)?mc:0)-feedRemoved);
+  }
+  return feedRemoved;
+}
 function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;const op={id:String(data?.id||''),seq:Number(data?.seq||0),ts:Number(ts||Date.now()/1000),type:String(type||''),data:(data&&typeof data==='object')?{...data}:{}};_deltaPushLimited(S.snap.operations,op,DELTA_MAX_OPERATIONS)}
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
@@ -41294,8 +42946,8 @@ function _deltaScheduleRender(flags={}){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('delta'));}
-        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');renderChat('delta');}
+        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
+        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');scheduleRenderChat('delta');}
       }
     }
     if(needBoards){
@@ -41306,6 +42958,19 @@ function _deltaScheduleRender(flags={}){
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
       }
     }
+  });
+}
+function scheduleRenderChat(reason='snapshot'){
+  const next=String(reason||'snapshot');
+  const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
+  const cur=String(S.chatRenderPendingReason||'');
+  if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
+  if(S.chatRenderRaf)return;
+  S.chatRenderRaf=requestAnimationFrame(()=>{
+    S.chatRenderRaf=0;
+    const runReason=String(S.chatRenderPendingReason||next||'snapshot');
+    S.chatRenderPendingReason='';
+    renderChat(runReason);
   });
 }
 function _deltaConsumeSeq(evt){
@@ -41392,13 +43057,23 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='message'){
     const role=String(data.role||'assistant').trim()||'assistant';
-    const rowType=String(data.type||'message').trim()||'message';
+    const schedulerStatus=String(data.scheduler_status||'').trim();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const rowType=(schedulerStatus&&schedulerQueueId)?'scheduler_queued':(String(data.type||'message').trim()||'message');
     let text=String(data.text||'');
     if(rowType==='plan_notice'&&!text&&data&&typeof data.data==='object'){
       text=String(data.data.body||'');
     }
     const msgRow={role:role,text:text,ts:ts,type:rowType};
     if(data&&typeof data==='object'&&data.data&&typeof data.data==='object')msgRow.data={...data.data};
+    if(rowType==='scheduler_queued'){
+      msgRow.scheduler_status=schedulerStatus||'queued';
+      msgRow.scheduler_queue_id=schedulerQueueId;
+      msgRow.queue_position=Number(data.queue_position||0);
+      msgRow.queue_size=Number(data.queue_size||0);
+      msgRow.scheduler_reason=String(data.scheduler_reason||'');
+      msgRow._vk=`scheduler:${schedulerQueueId}:${text.length}`;
+    }
     const ar=String(data.agent_role||'').trim();
     if(ar){
       msgRow.agent_role=ar;
@@ -41407,14 +43082,20 @@ function _deltaApplyRuntimeEvent(evt){
     }
     const thinking=String(data.thinking||'').trim();
     if(thinking)msgRow.thinking=thinking;
-    _deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
+    if(rowType!=='scheduler_queued'&&role==='user'){
+      _deltaRemoveSchedulerQueued(Number(data.scheduler_queue_id||0),text);
+    }
+    if(rowType!=='scheduler_queued')_deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
     _deltaAppendConversationRow(msgRow);
     _deltaAppendActivity(typ,data,ts);
     if(role!=='tool'){
       const cur=Number(S.snap.message_count||0);
       S.snap.message_count=(Number.isFinite(cur)?cur:0)+1;
     }
-    if(role==='user')S.snap.running=true;
+    if(rowType==='scheduler_queued'){
+      const curQueued=Number(S.snap.scheduler_queued_inputs_count||0);
+      S.snap.scheduler_queued_inputs_count=(Number.isFinite(curQueued)?curQueued:0)+1;
+    }else if(role==='user')S.snap.running=true;
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
@@ -41445,9 +43126,12 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='status'||typ==='tool_start'||typ==='tool_result'||typ==='error'||typ==='file_read'||typ==='agent_bus'||typ==='background'||typ==='inbox'||typ==='teammate'||typ==='task.completed'||typ==='model_config'||typ==='skill_write'||typ.startsWith('worktree.')){
     _deltaAppendActivity(typ,data,ts);
+    const schedulerStatus=String(data.scheduler_status||'').trim().toLowerCase();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
     if(summaryLow==='run finished')S.snap.running=false;
-    _deltaScheduleRender({boards:true,sessions:true});
+    _deltaScheduleRender({chat:removedScheduler>0,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
   return{handled:false,needsSnapshot:true};
@@ -41498,7 +43182,36 @@ function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const si
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;E('topStats').innerHTML=`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`}
-function renderSessions(){const html=S.sessions.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('');setPanelHtml('sessionList',html||`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);for(const el of document.querySelectorAll('#sessionList .session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}}
+function renderSessions(){
+  const host=E('sessionList');
+  if(!host)return;
+  const rows=Array.isArray(S.sessions)?S.sessions:[];
+  if(!rows.length){
+    setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
+    return;
+  }
+  const itemH=80;
+  const rowStride=88;
+  const viewportH=Math.max(240,Number(host.clientHeight||420));
+  const scrollTop=Math.max(0,Number(host.scrollTop||0));
+  const start=Math.max(0,Math.floor(scrollTop/rowStride)-8);
+  const count=Math.min(rows.length-start,Math.ceil(viewportH/rowStride)+18);
+  const visible=rows.slice(start,start+count);
+  const padTop=start*rowStride;
+  const padBottom=Math.max(0,(rows.length-start-count)*rowStride);
+  const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
+    visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"height:${itemH}px;min-height:${itemH}px;flex:0 0 ${itemH}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
+    `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
+  setPanelHtml('sessionList',html);
+  for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
+  if(!host._sessionVirtBound){
+    host._sessionVirtBound=true;
+    host.addEventListener('scroll',()=>{
+      if(host._sessionVirtRaf)return;
+      host._sessionVirtRaf=requestAnimationFrame(()=>{host._sessionVirtRaf=0;renderSessions()});
+    },{passive:true});
+  }
+}
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
 function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
@@ -42089,12 +43802,14 @@ function _mdWorkerQueue(text,key){
 }
 function renderMarkdownCached(text,key){const src=String(text||'');const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const jobId=_mdWorkerQueue(src,k);if(jobId>0){return `<div class=\"md-async-slot\" data-md-job=\"${jobId}\">${esc(src).replace(/\\n/g,'<br>')}</div>`}const html=renderMarkdown(src);if(k){_mdCacheSet(k,html)}return html}
 function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
-function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';if(ext==='.txt')return 'markdown';return ''}
 function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='image')return '🖼️';if(kind==='video')return '🎞️';if(kind==='audio')return '🔊';if(kind==='pdf')return '📕';if(kind==='csv')return '📊';if(kind==='excel')return '📗';if(kind==='document')return '📘';if(kind==='presentation')return '📽️';if(kind==='code')return '{}';return '📄'}
 function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
 function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
 function encodePreviewPath(path){return normalizePreviewPath(path).split('/').filter(Boolean).map(x=>encodeURIComponent(x)).join('/')}
 function previewFileUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-file/${rel}${ts}`}
+function previewDownloadUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-file/${rel}?download=1`}
+function previewHtmlBundleUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-html-bundle/${rel}`}
 function previewHtmlUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-html/${rel}${ts}`}
 function previewCodeStagesUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code-stages/${rel}${ts}`}
 function previewCodeUrl(sessionId,path,stage='latest',forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const st=encodeURIComponent(String(stage||'latest'));const ts=forceReload?`&ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code/${rel}?stage=${st}${ts}`}
@@ -42147,7 +43862,7 @@ function _previewRenderStageSelector(tab,stages,selectedReq,payload=null){
   const lineTail=(Number.isFinite(linesAfter)&&linesAfter>0)?` · lines=${linesAfter}`:'';
   stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
 }
-function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
+function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(ext==='.html'||ext==='.htm')return'html';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
 function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake'||v==='nim'||v==='julia'||v==='elixir'||v==='crystal')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql'||v==='haskell')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml'||v==='vhdl')return{hashComment:false,slashComment:false,dashComment:true,blockComment:false,xmlComment:true,backtick:false};if(v==='json'||v==='fortran'||v==='asm'||v==='protobuf'||v==='prisma'||v==='graphql'||v==='wgsl')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='lisp'||v==='clojure'||v==='racket')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
 function _codeWordSet(lang){return CODE_KEYWORDS[String(lang||'default')]||CODE_KEYWORDS.default}
 function _isWordStart(ch){return /[A-Za-z_$]/.test(ch)}
@@ -42413,13 +44128,33 @@ function _codeRowsToStageText(rows){
   }
   return out.join('\\n');
 }
-function _setPreviewCopyState(tab){
+function _setPreviewToolbarState(tab){
   const btn=E('previewCopyBtn');
-  if(!btn)return;
+  const modeBtn=E('previewModeBtn');
+  const dlBtn=E('previewDownloadBtn');
   const isCode=!!(tab&&tab.kind==='code');
-  btn.classList.toggle('hidden',!isCode);
-  btn.disabled=!isCode;
-  if(isCode)btn.textContent=t('copy_code');
+  const isHtml=!!(tab&&tab.kind==='html');
+  const hasDownload=!!(tab&&tab.path);
+  if(btn){
+    btn.classList.toggle('hidden',!isCode);
+    btn.disabled=!isCode;
+    if(isCode)btn.textContent=t('copy_code');
+  }
+  if(modeBtn){
+    modeBtn.classList.toggle('hidden',!isHtml);
+    modeBtn.disabled=!isHtml;
+    if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
+    modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
+  }
+  if(dlBtn){
+    dlBtn.classList.toggle('hidden',!hasDownload);
+    dlBtn.disabled=!hasDownload;
+    dlBtn.textContent=t('preview_download');
+    dlBtn.onclick=(ev)=>{ev.preventDefault();downloadActivePreview()};
+  }
+}
+function _setPreviewCopyState(tab){
+  _setPreviewToolbarState(tab);
 }
 function _selectedCodePreviewText(body,sel){
   if(!body||!sel||typeof sel.toString!=='function')return'';
@@ -42620,19 +44355,21 @@ async function _renderCodePreviewTab(tab,body,forceReload=false){
   }
 }
 function previewButtonHtml(path){const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return '';const title=rel.split('/').pop()||rel;return `<div class=\"msg-preview-row\"><button class=\"msg-preview-btn\" data-preview-path=\"${esc(rel)}\" title=\"${esc(title)}\">${previewKindIcon(kind)} ${esc(title)}</button></div>`}
-function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':'')};st.tabs.push(row)}st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':''),htmlMode:'preview'};st.tabs.push(row)}if(kind==='html'&&!row.htmlMode)row.htmlMode='preview';st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function closePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');const idx=st.tabs.findIndex(x=>x.id===id);if(idx<0)return;st.tabs.splice(idx,1);if(st.active===id)st.active='conversation';renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activatePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');if(id==='conversation'){st.active='conversation'}else if(st.tabs.some(x=>x.id===id)){st.active=id}else{st.active='conversation'}renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activePreviewTab(){if(!S.activeId)return null;const st=ensurePreviewState(S.activeId);if(st.active==='conversation')return null;return st.tabs.find(x=>x.id===st.active)||null}
 function renderPreviewTabs(){const host=E('chatTabs');if(!host)return;if(!S.activeId){host.innerHTML='';return}const st=ensurePreviewState(S.activeId);const convActive=st.active==='conversation';const tabs=[`<div class=\"chat-tab chat-tab-conversation${convActive?' active':''}\" data-tab-id=\"conversation\"><span class=\"chat-tab-title\">💬 ${esc(t('panel_conversation'))}</span><span class=\"chat-tab-close chat-tab-close-placeholder\" aria-hidden=\"true\">×</span></div>`];for(const tab of st.tabs){tabs.push(`<div class=\"chat-tab${st.active===tab.id?' active':''}\" data-tab-id=\"${esc(tab.id)}\"><span class=\"chat-tab-title\">${previewKindIcon(tab.kind)} ${esc(tab.title||tab.path)}</span><button class=\"chat-tab-close\" data-close-id=\"${esc(tab.id)}\">×</button></div>`)}host.innerHTML=tabs.join('');for(const el of host.querySelectorAll('[data-tab-id]')){el.onclick=()=>activatePreviewTab(el.getAttribute('data-tab-id')||'conversation')}for(const el of host.querySelectorAll('[data-close-id]')){el.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();closePreviewTab(el.getAttribute('data-close-id')||'')}}}
-function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewCopyState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewToolbarState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function togglePreviewMode(){const tab=activePreviewTab();if(!tab||tab.kind!=='html')return;tab.htmlMode=(String(tab.htmlMode||'preview')==='source')?'preview':'source';const body=E('previewBody');if(body){body.removeAttribute('data-preview-key');body.removeAttribute('data-preview-ready')}renderPreviewVisibility();renderActivePreview(false)}
+function downloadActivePreview(){const tab=activePreviewTab();if(!tab||!S.activeId||!tab.path)return;const url=(tab.kind==='html')?previewHtmlBundleUrl(S.activeId,tab.path):previewDownloadUrl(S.activeId,tab.path);const a=document.createElement('a');a.href=url;a.download='';a.rel='noreferrer';document.body.appendChild(a);a.click();setTimeout(()=>{try{document.body.removeChild(a)}catch(_){}},0)}
 function renderActivePreview(forceReload=false){
   const pv=E('previewView');
   const body=E('previewBody');
   const meta=E('previewMeta');
   if(!pv||!body||!meta)return;
   const tab=activePreviewTab();
-  _setPreviewCopyState(tab);
+  _setPreviewToolbarState(tab);
   if(!tab){
     meta.textContent='';
     body.innerHTML='';
@@ -42642,7 +44379,7 @@ function renderActivePreview(forceReload=false){
     _previewResetStageUi();
     return;
   }
-  meta.textContent=tab.path;
+  meta.textContent=tab.kind==='html'?`${tab.path} · ${String(tab.htmlMode||'preview')==='source'?'source':'preview'}`:tab.path;
   if(tab.kind==='code'){
     const req=String(tab.codeStageId||'latest');
     const hint=_previewLatestCodeStageHint(tab.path);
@@ -42656,12 +44393,30 @@ function renderActivePreview(forceReload=false){
   }
   body._previewCopyText='';
   _previewResetStageUi();
-  const key=`${tab.id}|${tab.kind}`;
+  const key=`${tab.id}|${tab.kind}|${tab.kind==='html'?String(tab.htmlMode||'preview'):''}`;
   if(!forceReload&&body.getAttribute('data-preview-key')===key)return;
   body.setAttribute('data-preview-key',key);
   body.removeAttribute('data-preview-ready');
   const url=previewFileUrl(S.activeId,tab.path,forceReload);
   if(tab.kind==='html'){
+    if(String(tab.htmlMode||'preview')==='source'){
+      body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
+      const ticket=String(++S.previewNonce);
+      body.setAttribute('data-preview-ticket',ticket);
+      fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{
+        if(body.getAttribute('data-preview-ticket')!==ticket)return;
+        body._previewCopyText=txt;
+        const lang=_previewLangFromPath(tab.path)||'html';
+        const rows=_codeRowsFromFullText(txt);
+        if(rows.length>=CODE_PREVIEW_VIRT_THRESHOLD){
+          _renderCodeRowsVirtual(body,rows,lang,1);
+        }else{
+          body.innerHTML=`<div class=\"preview-code-scroll\"><div class=\"preview-code-shell\">${_renderCodeRows(rows,lang)}</div></div>`;
+          _bindNestedScrollGuards(body);
+        }
+      }).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`});
+      return;
+    }
     body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
     return;
   }
@@ -42806,6 +44561,11 @@ function _chatVirtCollectRows(){
     });
   }
   return rows;
+}
+function _chatVirtRowsStableKey(rows){
+  const arr=Array.isArray(rows)?rows:[];
+  if(!arr.length)return'0';
+  return `${arr.length}|${arr.map(row=>String(row?._vk||'')).join('|')}`;
 }
 function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const totalLen=txtLen+thinkLen;const base=totalLen>1200?Math.max(400,Math.min(3200,120+Math.ceil(totalLen/60)*18)):Math.max(72,Math.min(560,80+Math.ceil(totalLen/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
 function _chatVirtBindPreviewButtons(root){if(!root)return;for(const btn of root.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}}
@@ -43104,9 +44864,9 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-math-request',key);
     return d;
   }
-  if(m.type==='live_run_notice'){
-    const label=String(m.label||'model call');
-    const elapsedNow=Math.max(0,Number(m.elapsed||0));
+	  if(m.type==='live_run_notice'){
+	    const label=String(m.label||'model call');
+	    const elapsedNow=Math.max(0,Number(m.elapsed||0));
     const startedAt=Number(m.startedAt||0);
     d.setAttribute('data-run-live','1');
     d.setAttribute('data-run-label',label);
@@ -43122,9 +44882,28 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
-    return d;
-  }
-  if(m.type==='plan_notice'){
+	    return d;
+	  }
+	  if(m.type==='scheduler_queued'){
+	    const status=String(m.scheduler_status||'queued').trim()||'queued';
+	    const qid=Number(m.scheduler_queue_id||0);
+	    const pos=Number(m.queue_position||0);
+	    const size=Number(m.queue_size||0);
+	    const reason=String(m.scheduler_reason||'').trim();
+	    const pills=[
+	      _chatVirtEventPillHtml(t('event_scheduler_queued_hint'),'warn'),
+	      qid?_chatVirtEventPillHtml(`#${qid}`,'neutral','mono'):'',
+	      pos?_chatVirtEventPillHtml(`${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`,'info'):'',
+	      reason?_chatVirtEventPillHtml(`${t('event_scheduler_reason')} ${reason}`,'neutral'):'',
+	    ];
+	    const key=`${String(m._vk||'')}:scheduler`;
+	    const noteHtml=`<div class="msg-event-note">${esc(t('event_scheduler_queued_note'))}</div>`;
+	    const bodyHtml=`<div class="msg-event-body">${noteHtml}<div class="msg-md">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+	    d.innerHTML=`${_chatVirtEventCardHtml(t('event_scheduler_queued_title'),status,pills,[],bodyHtml,'msg-event-card-plan')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(m.type==='plan_notice'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const title=String(info.title||'Plan Guidance').trim()||'Plan Guidance';
     const subtitle=String(info.subtitle||'').trim();
@@ -43301,7 +45080,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtRaf=requestAnimationFrame(()=>{
           chatEl._virtRaf=0;
           chatEl._virtLastScrollRenderTs=Date.now();
-          renderChat('scroll');
+          scheduleRenderChat('scroll');
         });
       },wait);
       return;
@@ -43310,7 +45089,7 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtRaf=requestAnimationFrame(()=>{
       chatEl._virtRaf=0;
       chatEl._virtLastScrollRenderTs=Date.now();
-      renderChat('scroll');
+      scheduleRenderChat('scroll');
     });
   };
   chatEl.addEventListener('wheel',ev=>{
@@ -43356,6 +45135,10 @@ function renderChat(reason='snapshot'){
   const c=E('chat');
   if(!c)return;
   _chatVirtBindScroll(c);
+  if(c._virtRendering){
+    scheduleRenderChat(reason==='scroll'?'scroll':'delta');
+    return;
+  }
   if(reason!=='scroll'){
     if(c._virtScrollRenderTimer){clearTimeout(c._virtScrollRenderTimer);c._virtScrollRenderTimer=0;}
     if(c._virtRaf){cancelAnimationFrame(c._virtRaf);c._virtRaf=0;}
@@ -43373,6 +45156,7 @@ function renderChat(reason='snapshot'){
     c._virtRowsCacheSig=feedSig;
     c._virtRowsCacheRows=rows;
   }
+  const rowsStableKey=_chatVirtRowsStableKey(rows);
   _chatVirtPruneHeightCache(rows);
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
@@ -43392,11 +45176,17 @@ function renderChat(reason='snapshot'){
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
+  const renderKey=`${rangeKey}|${rowsStableKey}|hv=${Number(CHAT_VIRT.heightVersion||0)}|running=${S.snap?.running?1:0}`;
   // Early exit BEFORE any layout queries (_chatVirtCaptureAnchor uses getBoundingClientRect).
   if(reason==='scroll'&&c._virtRangeKey===rangeKey){
     return;
   }
+  if(reason!=='scroll'&&c._chatHasRendered&&String(c._virtRenderKey||'')===renderKey){
+    _chatVirtSyncRunTicker(c);
+    return;
+  }
   c._virtRangeKey=rangeKey;
+  c._virtRenderKey=renderKey;
   // Layout reads below — only reached when DOM will actually change.
   const atBottomNow=nearBottom(c,6);
   if((!S.snap?.running)&&atBottomNow){
@@ -43408,6 +45198,32 @@ function renderChat(reason='snapshot'){
   c._virtRendering=true;
   const rendered=[];
   let usedIncrementalPatch=false;
+  if(
+    reason!=='scroll'&&
+    !first&&
+    rows.length+1===prevRows.length&&
+    prevWinStart===win.start&&
+    prevWinEnd===prevRows.length&&
+    win.end===rows.length
+  ){
+    let stableAll=true;
+    for(let i=0;i<rows.length;i++){
+      if(String(prevRows[i]?._vk||'')!==String(rows[i]?._vk||'')){
+        stableAll=false;
+        break;
+      }
+    }
+    const removedLast=String(prevRows[prevRows.length-1]?.type||'')==='live_run_notice';
+    if(stableAll&&removedLast){
+      const visibleNodes=c.querySelectorAll('.msg[data-vk]');
+      const lastNode=visibleNodes.length?visibleNodes[visibleNodes.length-1]:null;
+      if(lastNode&&String(lastNode.getAttribute('data-run-live')||'')==='1'){
+        _chatVirtReleaseNode(lastNode);
+        lastNode.remove();
+        usedIncrementalPatch=true;
+      }
+    }
+  }
   if(
     reason!=='scroll'&&
     !first&&
@@ -43508,7 +45324,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    c.scrollTop=maxTop;
+    if(Math.abs(Number(c.scrollTop||0)-maxTop)>0.75)c.scrollTop=maxTop;
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
   }
@@ -43519,9 +45335,9 @@ function renderChat(reason='snapshot'){
   c._virtLastWinEnd=win.end;
   c._virtLastTopOffset=Number(win.topOffset||0);
   c._virtLastEndOffset=Number(win.endOffset||0);
-  if(hasHeightChange&&reason!=='scroll'){
+  if(hasHeightChange&&reason!=='scroll'&&reason!=='measure'){
     if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
-    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
+    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;const now=Date.now();if(now-Number(c._virtLastMeasureRenderTs||0)>180){c._virtLastMeasureRenderTs=now;scheduleRenderChat('measure')}});
   }
   if(reason!=='scroll'){
     renderPreviewTabs();
@@ -43532,11 +45348,11 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(){const pending=S.uploadQueuePromise;if(pending&&typeof pending.then==='function')await pending}
+async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
-async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');if(named.size>20*1024*1024){showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});uploaded+=1;if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
+async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:false,allowWhenFrozen:true});return{uploaded,failed}}
 async function uploadFiles(fileList){if(!S.activeId){showError(t('select_session_first'));return}const files=Array.from(fileList||[]).filter(Boolean);if(!files.length)return;const run=async()=>{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0))+files.length;try{return await _uploadFilesNow(files)}finally{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0)-files.length)}};const prev=(S.uploadQueuePromise&&typeof S.uploadQueuePromise.then==='function')?S.uploadQueuePromise:Promise.resolve();const chained=prev.catch(()=>{}).then(run);const queued=chained.finally(()=>{if(S.uploadQueuePromise===queued)S.uploadQueuePromise=null});S.uploadQueuePromise=queued;return queued}
 function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
 function statusClass(status){return `st-${normalizeStatus(status)}`}
@@ -43607,7 +45423,7 @@ function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -43648,9 +45464,9 @@ async function refreshSessions(opt={}){
   const useProvidedRows=Object.prototype.hasOwnProperty.call(opt,'sessions');
   const autoSelect=opt.autoSelect!==false;
   const cfgPromise=useProvidedCfg?Promise.resolve(opt.statsConfig):api('/api/config?stats=1').catch(()=>null);
-  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions');
+  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions?limit=500');
   const [cfg,rowsRaw]=await Promise.all([cfgPromise,rowsPromise]);
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   applyRuntimeConfigStats(cfg);
   S.sessions=rows;
   const sig=sessionsSignature(rows);
@@ -43823,7 +45639,7 @@ async function refreshSnapshot(opt={}){
     if(needBoards)S.lastBoardsSig=boardSig;
     if(needChat||needBoards){
       const doRender=()=>{
-        if(needChat)renderChat('snapshot');
+        if(needChat)scheduleRenderChat('snapshot');
         if(needBoards)renderBoards();
       };
       if(scrolling&&chatEl){
@@ -43954,7 +45770,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await waitForPendingUploads();await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();if(out&&out.queued&&!out.scheduler_started){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})}else if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -43963,7 +45779,7 @@ async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
   const [cfg,rowsRaw,mc]=await Promise.all([
     api('/api/config'),
-    api('/api/sessions'),
+    api('/api/sessions?limit=500'),
     loadModelCatalog(forceProbe).catch(()=>null),
   ]);
   S.config=(cfg&&typeof cfg==='object')?cfg:{};
@@ -43973,7 +45789,7 @@ async function refreshAll(forceProbe=false){
   applyMainI18n();
   renderUploadList();
   renderSkillsEntryLink();
-  const rows=Array.isArray(rowsRaw)?rowsRaw:[];
+  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   const sessState=await refreshSessions({statsConfig:S.config,sessions:rows,autoSelect:true});
   if(!applyModelCatalog(mc)){renderModelControls()}
   refreshDeferredCatalogs().catch(()=>{});
@@ -56390,9 +58206,7 @@ function renderEmbedModelSelect(){
     op.textContent=String(m);
     sel.appendChild(op);
   }
-  const dflt=String(S.config?.default_embed_model||'').trim();
-  if(dflt&&!prev){sel.value=dflt}
-  else if(prev){sel.value=prev}
+  if(prev){sel.value=prev}
 }
 function normalizeUploadPath(v){return String(v||'').replace(/\\\\/g,'/').replace(/^[.][/]+/,'').replace(/^[/]+/,'').trim()}
 async function submitImportItems(items,batchIndex,batchCount){
@@ -58037,7 +59851,8 @@ async function runImportText(){
 }
 async function runQuery(){
   setChip('queryStatus','running');
-  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:selectedEmbedModel()})});
+  const embedModel=selectedEmbedModel();
+  const out=await api('/api/rag/query',{method:'POST',body:JSON.stringify({query:String(E('queryInput')?.value||'').trim(),top_k:Number(E('topKInput')?.value||10),route:selectedQueryRoute(),budget:selectedQueryBudget(),session_id:selectedSession(),synthesize:Boolean(E('querySynthesize')?.checked),embed_model:embedModel,embedding_mode:embedModel?'hybrid':'sparse'})});
   S.query=out; renderQuery(); setChip('queryStatus','done');
 }
 async function rebuildIndex(){
@@ -58309,6 +60124,57 @@ class AppContext:
             wiki_store=self.code_wiki,
         )
         self.code_source_roots = self._discover_external_code_source_roots()
+        self._session_watchdog_stop = threading.Event()
+        self._session_watchdog_thread = threading.Thread(
+            target=self._session_watchdog_loop,
+            name="session-watchdog",
+            daemon=True,
+        )
+        self._session_watchdog_thread.start()
+
+    def _session_watchdog_loop(self):
+        while not self._session_watchdog_stop.is_set():
+            try:
+                self._session_watchdog_scan()
+            except Exception:
+                pass
+            self._session_watchdog_stop.wait(float(SESSION_WATCHDOG_INTERVAL_SECONDS))
+
+    def _session_watchdog_scan(self):
+        now_value = now_ts()
+        with self._lock:
+            managers = list(self._session_mgrs.values())
+        recovered_rows: list[tuple[str, str]] = []
+        for mgr in managers:
+            try:
+                with mgr.lock:
+                    sessions = list(mgr.sessions.values())
+            except Exception:
+                continue
+            for sess in sessions:
+                try:
+                    if sess.recover_if_stale(now_value, SESSION_HEARTBEAT_STALE_SECONDS):
+                        recovered_rows.append((str(getattr(mgr, "user_id", "") or ""), str(getattr(sess, "id", "") or "")))
+                        try:
+                            sess._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        str(getattr(sess, "run_recovered_reason", "") or "")
+                                        or "session recovered by watchdog"
+                                    )
+                                },
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        if recovered_rows and self.scheduler_limits_enabled():
+            for uid, sid in recovered_rows[:16]:
+                try:
+                    self._on_session_run_finished(uid, sid)
+                except Exception:
+                    continue
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
         return {
@@ -58707,6 +60573,8 @@ class AppContext:
                 "filename_entities": bool(self.rag_include_filename_entities),
                 "wiki_first_rag": True,
                 "high_recall_fusion": True,
+                "dense_default_enabled": bool(RAG_DENSE_DEFAULT_ENABLED),
+                "default_embedding_calls": False,
             },
             "embedding_models": self._get_embedding_models(session),
             "default_embed_model": self._get_default_embed_model(session),
@@ -58728,6 +60596,34 @@ class AppContext:
             return str(getattr(ollama_obj, "embed_model", "") or "").strip()
         except Exception:
             return ""
+
+    def _embedding_request_mode(self, body: dict, embed_model_override: str) -> tuple[bool, str, str]:
+        raw_mode = str(
+            body.get(
+                "embedding_mode",
+                body.get("dense_mode", body.get("retrieval_embedding_mode", "")),
+            )
+            or ""
+        ).strip().lower()
+        if raw_mode not in RAG_EMBEDDING_MODE_VALUES:
+            raw_mode = ""
+        explicit_embed_model = bool(str(embed_model_override or "").strip())
+        explicit_dense_flag = any(
+            _to_bool_like(body.get(key), default=False)
+            for key in ("use_embeddings", "use_dense", "dense", "hybrid_dense")
+            if key in body
+        )
+        if raw_mode in {"off", "sparse", "tfidf"}:
+            return False, "sparse", "explicit-off"
+        if raw_mode in {"dense", "hybrid"}:
+            if explicit_embed_model:
+                return True, raw_mode, "explicit-mode"
+            return False, "sparse", "embedding-model-required"
+        if explicit_embed_model and explicit_dense_flag:
+            return True, "hybrid", "explicit-flag"
+        if RAG_DENSE_DEFAULT_ENABLED and explicit_embed_model:
+            return True, "hybrid", "env-default"
+        return False, "sparse", "default-no-embedding"
 
     def rag_library_payload(self, limit: int = 240, offset: int = 0) -> dict:
         return self.rag_store.library_payload(limit=limit, offset=offset)
@@ -58791,7 +60687,7 @@ class AppContext:
             "session_id": str(getattr(session, "id", "") or ""),
         }
 
-    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_rag_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks RAG chunks that don't yet have embeddings.
 
         Called lazily on the first query when an embedding model is available.
@@ -58806,7 +60702,7 @@ class AppContext:
         # Prioritise most recently added chunks; embed up to max_chunks
         to_embed = to_embed[-max_chunks:]
         texts = [str(all_chunks[cid].get("text", "") or "")[:2048] for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -58819,7 +60715,7 @@ class AppContext:
                 pass
         return count
 
-    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300) -> int:
+    def _build_code_embeddings_batch(self, session: object, *, max_chunks: int = 300, model: str = "") -> int:
         """Embed up to max_chunks Code Library chunks that don't yet have embeddings."""
         with self.code_store.lock:
             all_chunks = dict(self.code_store.chunks)
@@ -58834,7 +60730,7 @@ class AppContext:
             + str(all_chunks[cid].get("text", "") or "")
         )[:2048]
         texts = [anchor_text(cid) for cid in to_embed]
-        vecs = _rag_embed_batch(texts, session)
+        vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
         for cid, vec in zip(to_embed, vecs):
             if vec:
@@ -59200,22 +61096,25 @@ class AppContext:
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Generate query embedding for hybrid dense+sparse retrieval when model is available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Generate query embedding only when explicitly requested. Default RAG stays sparse.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
-            # Lazy-populate embeddings on first query if store has chunks but no embeddings yet
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.rag_store.index.has_dense_index()
                 and self.rag_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_rag_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_rag_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.rag_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
         requested_route = route if route in {"auto", "wiki", "raw", "fast", "global", "hybrid"} else "auto"
@@ -59293,6 +61192,20 @@ class AppContext:
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
@@ -59532,21 +61445,25 @@ class AppContext:
         language_filter = str(body.get("language", "") or "").strip().lower()
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        # Dense embedding for code query when available
+        dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
+        embedding_used = False
+        embeddings_built = 0
+        # Dense embedding for code query only when explicitly requested.
         qvec: list[float] | None = None
-        if isinstance(session, SessionState):
+        if dense_enabled and isinstance(session, SessionState):
             if (
                 not self.code_store.index.has_dense_index()
                 and self.code_store.chunks
-                and self._get_default_embed_model(session)
+                and embed_model_override
             ):
                 try:
-                    self._build_code_embeddings_batch(session, max_chunks=300)
+                    embeddings_built = self._build_code_embeddings_batch(session, max_chunks=300, model=embed_model_override)
                 except Exception:
                     pass
             if self.code_store.index.has_dense_index():
                 try:
                     qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
         requested_route = route if route in {"auto", "wiki", "workflow", "raw", "fast", "global", "hybrid"} else "auto"
@@ -59641,6 +61558,20 @@ class AppContext:
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        meta = result.get("route_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(
+            {
+                "retrieval_mode": retrieval_mode,
+                "embedding_used": bool(embedding_used),
+                "embedding_reason": embedding_reason,
+                "embeddings_built": int(embeddings_built),
+            }
+        )
+        result["route_meta"] = meta
+        result["retrieval_mode"] = retrieval_mode
+        result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
         if synthesize:
@@ -59933,6 +61864,8 @@ class AppContext:
                 "route": str((args or {}).get("route", "auto") or "auto"),
                 "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "language": str((args or {}).get("language", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
@@ -59955,6 +61888,8 @@ class AppContext:
             f"route={str(result.get('route', '') or '')} "
             f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
             f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
             f"results={len(rows)}"
         )
         if not rows:
@@ -59997,6 +61932,8 @@ class AppContext:
                 "budget": str((args or {}).get("budget", "standard") or "standard"),
                 "category": str((args or {}).get("category", "") or ""),
                 "kind": str((args or {}).get("kind", "") or ""),
+                "embed_model": str((args or {}).get("embed_model", "") or ""),
+                "embedding_mode": str((args or {}).get("embedding_mode", "sparse") or "sparse"),
                 "session_id": str(getattr(session, "id", "") or ""),
             },
         )
@@ -60005,6 +61942,8 @@ class AppContext:
             f"route={str(result.get('route', '') or '')} "
             f"evidence_status={str(result.get('evidence_status', 'miss') or 'miss')} "
             f"confidence={float(result.get('confidence', 0.0) or 0.0):.2f} "
+            f"retrieval_mode={str(result.get('retrieval_mode', 'sparse') or 'sparse')} "
+            f"embedding_used={'yes' if bool(result.get('embedding_used', False)) else 'no'} "
             f"results={len(rows)}"
         )
         if not rows:
@@ -60152,7 +62091,7 @@ class AppContext:
             running = 0
             for sess in sessions:
                 try:
-                    if bool(getattr(sess, "running", False)):
+                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
                         running += 1
                 except Exception:
                     continue
@@ -60176,6 +62115,11 @@ class AppContext:
             sess = row.get("session")
             if not isinstance(sess, SessionState):
                 continue
+            qid = int(req.get("id", 0) or 0)
+            try:
+                sess.update_scheduler_visible_message(qid, status="started", queue_position=0, queue_size=0)
+            except Exception:
+                pass
             wait_sec = max(0.0, now_ts() - float(req.get("queued_at", 0.0) or 0.0))
             try:
                 sess._emit(
@@ -60183,7 +62127,7 @@ class AppContext:
                     {
                         "summary": (
                             "scheduler started queued task "
-                            f"#{int(req.get('id', 0) or 0)} after {wait_sec:.1f}s"
+                            f"#{qid} after {wait_sec:.1f}s"
                         )
                     },
                 )
@@ -60194,30 +62138,87 @@ class AppContext:
         started: list[dict] = []
         if not self.scheduler_limits_enabled():
             return started
-        while self._task_queue:
-            req = self._task_queue[0] if self._task_queue else {}
+        if not self._task_queue:
+            return started
+        total_running, per_user = self._running_counts_locked()
+        remaining: deque[dict] = deque()
+        selected_sessions: set[tuple[str, str]] = set()
+        for req in list(self._task_queue):
+            if not isinstance(req, dict):
+                continue
             uid = str(req.get("user_id", "") or "")
             sid = str(req.get("session_id", "") or "")
             mgr = self._session_mgrs.get(uid)
             if not mgr:
-                self._task_queue.popleft()
                 continue
             sess = mgr.get(sid)
             if not sess:
-                self._task_queue.popleft()
                 continue
-            if bool(getattr(sess, "running", False)):
-                break
-            ok, _, _, _ = self._can_start_for_user_locked(uid)
-            if not ok:
-                break
-            self._task_queue.popleft()
+            session_key = (uid, sid)
+            if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+                remaining.append(req)
+                continue
+            if session_key in selected_sessions:
+                remaining.append(req)
+                continue
+            user_running = int(per_user.get(uid, 0) or 0)
+            if self.max_user > 0 and total_running >= self.max_user:
+                remaining.append(req)
+                continue
+            if self.max_user_sessions > 0 and user_running >= self.max_user_sessions:
+                remaining.append(req)
+                continue
+            try:
+                setattr(sess, "scheduler_starting", True)
+            except Exception:
+                pass
+            started.append({"request": req, "session": sess})
+            selected_sessions.add(session_key)
+            total_running += 1
+            per_user[uid] = user_running + 1
+        self._task_queue = remaining
+        return started
+
+    def _start_scheduler_rows(self, rows: list[dict]) -> list[dict]:
+        started: list[dict] = []
+        for row in rows:
+            req = row.get("request", {}) if isinstance(row, dict) else {}
+            sess = row.get("session")
+            if not isinstance(sess, SessionState):
+                continue
             try:
                 out = sess.submit_user_message(str(req.get("content", "") or ""))
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
+                try:
+                    sess.update_scheduler_visible_message(int(req.get("id", 0) or 0), status="failed")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if not bool(getattr(sess, "running", False)):
+                        setattr(sess, "scheduler_starting", False)
+                except Exception:
+                    pass
             started.append({"request": req, "result": out, "session": sess})
         return started
+
+    def _refresh_scheduler_visible_positions(self):
+        queue_rows: list[dict] = []
+        with self._lock:
+            queue_rows = [dict(row) for row in self._task_queue if isinstance(row, dict)]
+            queue_size = len(queue_rows)
+        for idx, row in enumerate(queue_rows):
+            uid = str(row.get("user_id", "") or "")
+            sid = str(row.get("session_id", "") or "")
+            qid = int(row.get("id", 0) or 0)
+            try:
+                mgr = self.manager_for_user(uid)
+                sess = mgr.get(sid)
+                if sess:
+                    sess.update_scheduler_visible_message(qid, queue_position=idx + 1, queue_size=queue_size)
+            except Exception:
+                continue
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
         sess = None
@@ -60239,6 +62240,8 @@ class AppContext:
         started_rows: list[dict] = []
         with self._lock:
             started_rows = self._drain_task_queue_locked()
+        started_rows = self._start_scheduler_rows(started_rows)
+        self._refresh_scheduler_visible_positions()
         if started_rows:
             self._emit_scheduler_started(started_rows)
 
@@ -60269,9 +62272,10 @@ class AppContext:
         if not self.scheduler_limits_enabled():
             return sess.submit_user_message(text)
 
-        started_rows: list[dict] = []
+        selected_rows: list[dict] = []
         response: dict = {"ok": True, "queued": True}
         queue_id = 0
+        record_visible = False
         with self._lock:
             self._task_queue_seq = int(self._task_queue_seq) + 1
             queue_id = int(self._task_queue_seq)
@@ -60283,23 +62287,14 @@ class AppContext:
                 "queued_at": now_ts(),
             }
             self._task_queue.append(req)
-            started_rows = self._drain_task_queue_locked()
+            selected_rows = self._drain_task_queue_locked()
             started_self = None
-            for row in started_rows:
+            for row in selected_rows:
                 row_req = row.get("request", {}) if isinstance(row, dict) else {}
                 if int(row_req.get("id", 0) or 0) == queue_id:
                     started_self = row
                     break
             if started_self is not None:
-                out = started_self.get("result")
-                if isinstance(out, dict):
-                    response = dict(out)
-                else:
-                    response = {"ok": True, "result": out}
-                response.setdefault("ok", True)
-                response["queued"] = bool(response.get("queued", False))
-                response["running"] = bool(response.get("running", True))
-                response["scheduler_started"] = True
                 response["queue_id"] = queue_id
                 response["queue_position"] = 0
                 response["limits"] = {
@@ -60329,6 +62324,43 @@ class AppContext:
                         "running_user": int(per_user.get(str(user_id or ""), 0)),
                     },
                 }
+                record_visible = True
+        if record_visible:
+            try:
+                sess.record_scheduler_queued_message(
+                    queue_id,
+                    text,
+                    queue_position=int(response.get("queue_position", 1) or 1),
+                    queue_size=int(response.get("queue_size", 1) or 1),
+                    scheduler_reason=str(response.get("scheduler_reason", "") or ""),
+                    queued_at=now_ts(),
+                )
+            except Exception:
+                pass
+        started_rows = self._start_scheduler_rows(selected_rows)
+        self._refresh_scheduler_visible_positions()
+        started_self_result = None
+        for row in started_rows:
+            row_req = row.get("request", {}) if isinstance(row, dict) else {}
+            if int(row_req.get("id", 0) or 0) == queue_id:
+                started_self_result = row
+                break
+        if started_self_result is not None:
+            out = started_self_result.get("result")
+            if isinstance(out, dict):
+                response = dict(out)
+            else:
+                response = {"ok": True, "result": out}
+            response.setdefault("ok", True)
+            response["queued"] = bool(response.get("queued", False))
+            response["running"] = bool(response.get("running", True))
+            response["scheduler_started"] = True
+            response["queue_id"] = queue_id
+            response["queue_position"] = 0
+            response["limits"] = {
+                "max_user": int(self.max_user),
+                "max_user_sessions": int(self.max_user_sessions),
+            }
         if started_rows:
             self._emit_scheduler_started(started_rows)
         if bool(response.get("queued")) and not bool(response.get("scheduler_started")):
@@ -61374,9 +63406,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_bytes(self, data: bytes, content_type: str, filename: str):
         try:
+            raw_name = Path(str(filename or "download.bin")).name or "download.bin"
+            ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
+            ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
+            encoded_name = quote(raw_name.encode("utf-8"), safe="")
+            disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", disposition)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -61658,6 +63695,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/skills/protocol-examples":
             return self._send_json(self.app.skill_protocol_examples())
         if path == "/api/sessions":
+            page_like = any(k in query for k in ("limit", "offset", "page", "page_size", "search", "status", "paged"))
+            if page_like:
+                try:
+                    page_size = int((query.get("page_size", query.get("limit", [str(SESSION_LIST_DEFAULT_LIMIT)])) or [str(SESSION_LIST_DEFAULT_LIMIT)])[0] or SESSION_LIST_DEFAULT_LIMIT)
+                except Exception:
+                    page_size = SESSION_LIST_DEFAULT_LIMIT
+                try:
+                    page = int((query.get("page", ["1"]) or ["1"])[0] or 1)
+                except Exception:
+                    page = 1
+                try:
+                    offset = int((query.get("offset", [str(max(0, page - 1) * page_size)]) or [str(max(0, page - 1) * page_size)])[0] or 0)
+                except Exception:
+                    offset = max(0, page - 1) * page_size
+                search = str((query.get("search", [""]) or [""])[0] or "")
+                status = str((query.get("status", [""]) or [""])[0] or "")
+                return self._send_json(mgr.list(limit=page_size, offset=offset, search=search, status=status))
             return self._send_json(mgr.list())
         if path == "/api/export/source.zip":
             return self._send_json({"error": "Use /api/sessions/{id}/export.zip for current user session export."}, status=400)
@@ -61725,6 +63779,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
+        m = re.match(r"^/api/sessions/([^/]+)/preview-html-bundle/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                data = sess.preview_html_bundle(rel)
+                name = Path(normalize_rel_preview_path(rel)).name or "preview.html"
+                stem = Path(name).stem or "preview"
+                return self._send_bytes(data, "application/zip", f"{stem}_html_bundle.zip")
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -61746,6 +63817,8 @@ class Handler(BaseHTTPRequestHandler):
             content_type = guess_mime_from_name(fp.name, "application/octet-stream")
             if content_type.startswith("text/") and "charset=" not in content_type.lower():
                 content_type = f"{content_type}; charset=utf-8"
+            if _to_bool_like((query.get("download", ["0"]) or ["0"])[0], default=False):
+                return self._send_bytes(data, content_type, fp.name)
             return self._send_inline_bytes(data, content_type)
         m = re.match(r"^/api/sessions/([^/]+)/render-state$", path)
         if m:
@@ -61766,8 +63839,9 @@ class Handler(BaseHTTPRequestHandler):
             include_model_catalog = _to_bool_like(
                 (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
             ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
+            lock_timeout = 0.08 if lite_snapshot else 0.4
             return self._send_json(
-                sess.snapshot(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot, lock_timeout=lock_timeout)
             )
         m = re.match(r"^/api/sessions/([^/]+)/events$", path)
         if m:
