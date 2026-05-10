@@ -8,6 +8,7 @@ import concurrent.futures
 import csv
 import difflib
 import errno
+from email.utils import parsedate_to_datetime
 import html
 import hashlib
 import hmac
@@ -38,12 +39,12 @@ import uuid
 import zipfile
 import zlib
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 try:
     import certifi as _certifi
@@ -262,6 +263,38 @@ CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
     1200,
     min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
 )
+CHAT_UPLOAD_PROMPT_MAX_FILES = max(
+    2,
+    min(12, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_FILES", "6") or "6"))),
+)
+CHAT_UPLOAD_PROMPT_MAX_CHARS = max(
+    2400,
+    min(16_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_CHARS", "6000") or "6000"))),
+)
+CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
+    240,
+    min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
+)
+CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
+    1000,
+    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+)
+CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
+    str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+CHAT_UPLOAD_INGEST_QUEUE_MAX = max(
+    2,
+    min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_INGEST_QUEUE_MAX", "8") or "8"))),
+)
+SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS = max(
+    0.05,
+    min(2.0, float(str(os.getenv("AGENT_SESSION_SUBMIT_LOCK_TIMEOUT", "0.08") or "0.08"))),
+)
+SESSION_DEFERRED_START_QUEUE_MAX = max(
+    4,
+    min(80, int(str(os.getenv("AGENT_SESSION_DEFERRED_START_QUEUE_MAX", "24") or "24"))),
+)
 SESSION_WATCHDOG_INTERVAL_SECONDS = max(
     10,
     min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
@@ -279,6 +312,27 @@ POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
 MODEL_CALL_PROGRESS_DELAY = 8.0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
+RUN_COMPLETION_SUMMARY_ENABLED = (
+    str(os.getenv("AGENT_RUN_COMPLETION_SUMMARY", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
+    0,
+    min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
+)
+LLM_HTTP_RETRY_DELAY_SECONDS = max(
+    1.0,
+    min(600.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_DELAY_SECONDS", "60") or "60"))),
+)
+LLM_HTTP_RETRY_MAX_SECONDS = max(
+    LLM_HTTP_RETRY_DELAY_SECONDS,
+    min(1800.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_SECONDS", "600") or "600"))),
+)
+LLM_HTTP_RETRY_404_ON_VLLM = (
+    str(os.getenv("AGENT_LLM_HTTP_RETRY_404_ON_VLLM", "true") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
@@ -907,6 +961,10 @@ CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
 CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
 CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
 CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
+CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
+CODE_PREVIEW_DIFF_MERGE_GAP = 10
+PREVIEW_DOWNLOAD_MAX_FILES = 500
+PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 RENDER_FRAME_MAX_POINTS = 12_000
 RENDER_FRAME_MAX_LINES = 2_000
@@ -3862,7 +3920,7 @@ def extract_base_url(endpoint_or_base: str) -> str:
     if not s:
         return ""
     low = s.lower()
-    for suffix in ("/v1/chat/completions", "/chat/completions"):
+    for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/messages", "/messages", "/v1/responses", "/responses"):
         if low.endswith(suffix):
             return s[: -len(suffix)] or s
     return s
@@ -3877,6 +3935,21 @@ def complete_chat_endpoint(endpoint_or_base: str) -> str:
     if low.endswith("/v1"):
         return s.rstrip("/") + "/chat/completions"
     return s.rstrip("/") + "/v1/chat/completions"
+
+def complete_responses_endpoint(endpoint_or_base: str) -> str:
+    s = (endpoint_or_base or "").strip()
+    if not s:
+        return ""
+    low = s.lower().rstrip("/")
+    if low.endswith("/responses") or low.endswith("/v1/responses"):
+        return s
+    if low.endswith("/chat/completions"):
+        root = s[: -len("/chat/completions")].rstrip("/")
+        if root:
+            return root + "/responses"
+    if low.endswith("/v1"):
+        return s.rstrip("/") + "/responses"
+    return s.rstrip("/") + "/v1/responses"
 
 def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
@@ -3948,6 +4021,7 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
     aliases = {
         "openai": "openai_compat",
         "openai_compat": "openai_compat",
+        "openai_chat": "openai_compat",
         "siliconflow": "siliconflow",
         "vllm": "vllm",
         "lmstudio": "lmstudio",
@@ -3955,6 +4029,11 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
         "kimi": "kimi",
         "moonshot": "kimi",
         "openrouter": "openrouter",
+        "opencode": "opencode",
+        "open_code": "opencode",
+        "openclaw": "openclaw",
+        "open_claw": "openclaw",
+        "hermes": "hermes",
         "custom": "custom_http",
         "custom_http": "custom_http",
     }
@@ -3968,9 +4047,149 @@ OPENAI_COMPAT_PROVIDER_NAMES = {
     "glm",
     "kimi",
     "openrouter",
+    "opencode",
+    "openclaw",
+    "hermes",
 }
 
 OPENAI_LIKE_PROVIDER_NAMES = OPENAI_COMPAT_PROVIDER_NAMES | {"custom_http"}
+
+API_PROTOCOLS = {
+    "auto",
+    "openai_chat",
+    "openai_responses",
+    "anthropic_messages",
+    "ollama_chat",
+    "custom_http",
+}
+
+TOOL_PROTOCOLS = {
+    "auto",
+    "openai_tools",
+    "anthropic_tools",
+    "ollama_tools",
+    "hermes_tool_text",
+    "json_tool_text",
+    "none",
+}
+
+PROTOCOL_DETECTION_MODES = {"auto", "off"}
+
+def normalize_api_protocol(raw: object, default: str = "auto") -> str:
+    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": default,
+        "chat": "openai_chat",
+        "openai": "openai_chat",
+        "openai_compat": "openai_chat",
+        "openai_compatible": "openai_chat",
+        "openai_chat_completions": "openai_chat",
+        "chat_completions": "openai_chat",
+        "responses": "openai_responses",
+        "openai_response": "openai_responses",
+        "openai_responses_api": "openai_responses",
+        "anthropic": "anthropic_messages",
+        "claude": "anthropic_messages",
+        "claude_code": "anthropic_messages",
+        "anthropic_messages_api": "anthropic_messages",
+        "ollama": "ollama_chat",
+        "ollama_native": "ollama_chat",
+        "ollama_api_chat": "ollama_chat",
+        "custom": "custom_http",
+    }
+    value = aliases.get(value, value)
+    return value if value in API_PROTOCOLS else default
+
+def normalize_tool_protocol(raw: object, default: str = "auto") -> str:
+    if isinstance(raw, bool):
+        return "auto" if raw else "none"
+    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": default,
+        "off": "none",
+        "false": "none",
+        "disabled": "none",
+        "no_tools": "none",
+        "openai": "openai_tools",
+        "openai_tool": "openai_tools",
+        "function_calling": "openai_tools",
+        "functions": "openai_tools",
+        "anthropic": "anthropic_tools",
+        "claude": "anthropic_tools",
+        "claude_code": "anthropic_tools",
+        "ollama": "ollama_tools",
+        "ollama_native": "ollama_tools",
+        "hermes": "hermes_tool_text",
+        "hermes_text": "hermes_tool_text",
+        "xml_tool_text": "hermes_tool_text",
+        "text": "json_tool_text",
+        "json": "json_tool_text",
+        "json_text": "json_tool_text",
+    }
+    value = aliases.get(value, value)
+    return value if value in TOOL_PROTOCOLS else default
+
+def normalize_protocol_detection(raw: object, default: str = "auto") -> str:
+    if isinstance(raw, bool):
+        return "auto" if raw else "off"
+    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {"": default, "true": "auto", "yes": "auto", "enabled": "auto", "false": "off", "disabled": "off"}
+    value = aliases.get(value, value)
+    return value if value in PROTOCOL_DETECTION_MODES else default
+
+def infer_api_protocol(
+    provider: str,
+    endpoint: str = "",
+    base_url: str = "",
+    model: str = "",
+    requested: object = "auto",
+    protocol_detection: object = "auto",
+) -> str:
+    explicit = normalize_api_protocol(requested, default="auto")
+    if explicit != "auto":
+        return explicit
+    detection = normalize_protocol_detection(protocol_detection, default="auto")
+    normalized_provider = normalize_openai_compat_provider_name(provider)
+    provider_low = str(provider or "").strip().lower().replace("-", "_")
+    text = " ".join(str(x or "").strip().lower() for x in (endpoint, base_url, model, provider_low, normalized_provider))
+    if detection == "auto":
+        if "/v1/messages" in text or "anthropic" in text or "claude" in text:
+            return "anthropic_messages"
+        if "/v1/responses" in text or text.endswith("/responses"):
+            return "openai_responses"
+        if "ollama" in text and not any(x in text for x in ("/v1/chat/completions", "/chat/completions")):
+            return "ollama_chat"
+        if "custom_http" in text:
+            return "custom_http"
+    if provider_low in {"anthropic", "claude", "claude_code"}:
+        return "anthropic_messages"
+    if normalized_provider == "custom_http":
+        return "custom_http"
+    if provider_low == "ollama":
+        return "ollama_chat"
+    return "openai_chat"
+
+def infer_tool_protocol(
+    provider: str,
+    model: str = "",
+    requested: object = "auto",
+    api_protocol: object = "auto",
+    protocol_detection: object = "auto",
+) -> str:
+    explicit = normalize_tool_protocol(requested, default="auto")
+    if explicit != "auto":
+        return explicit
+    detection = normalize_protocol_detection(protocol_detection, default="auto")
+    api = normalize_api_protocol(api_protocol, default="auto")
+    normalized_provider = normalize_openai_compat_provider_name(provider)
+    text = f"{provider or ''} {model or ''}".strip().lower().replace("-", "_")
+    if api == "anthropic_messages" or "anthropic" in text or "claude" in text:
+        return "anthropic_tools"
+    if api == "ollama_chat":
+        return "ollama_tools"
+    if detection == "auto" and (normalized_provider == "hermes" or "hermes" in text):
+        return "hermes_tool_text"
+    return "openai_tools"
 
 def is_openai_compat_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_COMPAT_PROVIDER_NAMES
@@ -4011,6 +4230,9 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         "glm": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "kimi": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "openrouter": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "opencode": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "openclaw": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
+        "hermes": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "custom_http": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
     }
     for candidate in provider_specific.get(normalized_provider, provider_specific["openai_compat"]):
@@ -4207,9 +4429,13 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             "vllm": "auto",
             "lmstudio": "auto",
             "anthropic": "claude-sonnet-4-20250514",
+            "claude_code": "claude-sonnet-4-20250514",
             "glm": "glm-4-flash",
             "kimi": "moonshot-v1-8k",
             "openrouter": "meta-llama/llama-3.1-8b-instruct",
+            "opencode": "auto",
+            "openclaw": "auto",
+            "hermes": "NousResearch/Hermes-3-Llama-3.1-8B",
             "custom_http": "custom-model",
         }
         return defaults.get(normalized, "model")
@@ -4220,7 +4446,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             return ""
         if value == "ollama":
             return "ollama"
-        if value == "anthropic":
+        if value in {"anthropic", "claude", "claude_code"}:
             return "anthropic"
         if is_openai_like_provider(value):
             return normalize_openai_compat_provider_name(value)
@@ -4252,8 +4478,23 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         capabilities: dict | None = None,
         media_endpoints: dict | None = None,
+        api_protocol: object = None,
+        tool_protocol: object = None,
+        protocol_detection: object = None,
         source: str = "config",
     ):
+        protocol_detection_norm = normalize_protocol_detection(
+            global_protocol_detection if protocol_detection is None else protocol_detection,
+            default="auto",
+        )
+        api_protocol_norm = normalize_api_protocol(
+            global_api_protocol if api_protocol is None else api_protocol,
+            default="auto",
+        )
+        tool_protocol_norm = normalize_tool_protocol(
+            global_tool_protocol if tool_protocol is None else tool_protocol,
+            default="auto",
+        )
         out.append(
             {
                 "id": profile_id,
@@ -4275,6 +4516,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 ),
                 "capabilities": capabilities or default_multimodal_capabilities(),
                 "media_endpoints": media_endpoints or {},
+                "api_protocol": api_protocol_norm,
+                "tool_protocol": tool_protocol_norm,
+                "protocol_detection": protocol_detection_norm,
                 "source": source,
             }
         )
@@ -4290,6 +4534,18 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
     )
     thinking_stream_default = bool(
         config.get("thinking_stream", config.get("stream_thinking", False))
+    )
+    global_api_protocol = normalize_api_protocol(
+        config.get("api_protocol", config.get("api_type", config.get("api_mode", "auto"))),
+        default="auto",
+    )
+    global_tool_protocol = normalize_tool_protocol(
+        config.get("tool_protocol", config.get("tool_type", config.get("function_calling", "auto"))),
+        default="auto",
+    )
+    global_protocol_detection = normalize_protocol_detection(
+        config.get("protocol_detection", config.get("auto_detect_protocol", "auto")),
+        default="auto",
     )
     explicit_default_profile_id = sanitize_profile_id(
         str(
@@ -4353,6 +4609,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         endpoint = str(
             raw_profile.get("endpoint")
             or raw_profile.get("chat_endpoint")
+            or raw_profile.get("responses_endpoint")
             or raw_profile.get("completion_endpoint")
             or ""
         ).strip()
@@ -4401,12 +4658,27 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             or raw_profile.get("template")
             or ""
         ).strip()
+        api_protocol = normalize_api_protocol(
+            raw_profile.get("api_protocol", raw_profile.get("api_type", raw_profile.get("api_mode", global_api_protocol))),
+            default=global_api_protocol,
+        )
+        tool_protocol = normalize_tool_protocol(
+            raw_profile.get("tool_protocol", raw_profile.get("tool_type", raw_profile.get("function_calling", global_tool_protocol))),
+            default=global_tool_protocol,
+        )
+        protocol_detection = normalize_protocol_detection(
+            raw_profile.get("protocol_detection", raw_profile.get("auto_detect_protocol", global_protocol_detection)),
+            default=global_protocol_detection,
+        )
         if provider == "anthropic":
             anth_base = base_url or "https://api.anthropic.com"
             endpoint = endpoint or anth_base.rstrip("/") + "/v1/messages"
             base_url = extract_base_url(anth_base)
         elif is_openai_like_provider(provider):
-            endpoint = endpoint or complete_chat_endpoint(base_url)
+            if normalize_api_protocol(api_protocol, default="auto") == "openai_responses":
+                endpoint = endpoint or complete_responses_endpoint(base_url)
+            else:
+                endpoint = endpoint or complete_chat_endpoint(base_url)
         caps_key = str(raw_profile.get("capabilities_key") or profile_id or provider)
         capabilities = build_profile_capabilities(caps_key, provider, model)
         if raw_profile.get("capabilities") is not None:
@@ -4449,6 +4721,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             request_timeout=raw_profile.get("request_timeout", timeout),
             capabilities=capabilities,
             media_endpoints=media_endpoints,
+            api_protocol=api_protocol,
+            tool_protocol=tool_protocol,
+            protocol_detection=protocol_detection,
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -4646,6 +4921,94 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
+    # ── OpenCode / OpenClaw / Hermes presets ───────────────────────
+    opencode_url = str(config.get("opencode_url", "")).strip()
+    opencode_model = str(config.get("opencode_model", "")).strip()
+    opencode_key = str(config.get("opencode_key", "")).strip()
+    if opencode_url or opencode_model or opencode_key:
+        _opencode_default = "http://localhost:4096/v1"
+        add_profile(
+            profiles,
+            profile_id="opencode",
+            provider=normalize_profile_provider("opencode"),
+            label="OpenCode",
+            model=opencode_model or "auto",
+            base_url=extract_base_url(opencode_url or _opencode_default),
+            endpoint=complete_chat_endpoint(opencode_url or _opencode_default),
+            api_key=opencode_key,
+            thinking_stream=bool(config.get("opencode_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("opencode", normalize_profile_provider("opencode"), opencode_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("opencode"),
+        )
+
+    openclaw_url = str(config.get("openclaw_url", "")).strip()
+    openclaw_model = str(config.get("openclaw_model", "")).strip()
+    openclaw_key = str(config.get("openclaw_key", "")).strip()
+    if openclaw_url or openclaw_model or openclaw_key:
+        _openclaw_default = "http://localhost:4097/v1"
+        add_profile(
+            profiles,
+            profile_id="openclaw",
+            provider=normalize_profile_provider("openclaw"),
+            label="OpenClaw",
+            model=openclaw_model or "auto",
+            base_url=extract_base_url(openclaw_url or _openclaw_default),
+            endpoint=complete_chat_endpoint(openclaw_url or _openclaw_default),
+            api_key=openclaw_key,
+            thinking_stream=bool(config.get("openclaw_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("openclaw", normalize_profile_provider("openclaw"), openclaw_model or "auto"),
+            media_endpoints=build_profile_media_endpoints("openclaw"),
+        )
+
+    hermes_url = str(config.get("hermes_url", "")).strip()
+    hermes_model = str(config.get("hermes_model", "")).strip()
+    hermes_key = str(config.get("hermes_key", "")).strip()
+    if hermes_url or hermes_model or hermes_key:
+        _hermes_default = "http://localhost:8000/v1"
+        add_profile(
+            profiles,
+            profile_id="hermes",
+            provider=normalize_profile_provider("hermes"),
+            label="Hermes",
+            model=hermes_model or "NousResearch/Hermes-3-Llama-3.1-8B",
+            base_url=extract_base_url(hermes_url or _hermes_default),
+            endpoint=complete_chat_endpoint(hermes_url or _hermes_default),
+            api_key=hermes_key,
+            thinking_stream=bool(config.get("hermes_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("hermes", normalize_profile_provider("hermes"), hermes_model or "NousResearch/Hermes-3-Llama-3.1-8B"),
+            media_endpoints=build_profile_media_endpoints("hermes"),
+            tool_protocol=config.get("hermes_tool_protocol", config.get("tool_protocol", "hermes_tool_text")),
+        )
+
+    claude_code_url = str(config.get("claude_code_url", "")).strip()
+    claude_code_model = str(config.get("claude_code_model", "")).strip()
+    claude_code_key = str(config.get("claude_code_key", "")).strip()
+    if claude_code_url or claude_code_model or claude_code_key:
+        _claude_code_base = claude_code_url or "https://api.anthropic.com"
+        add_profile(
+            profiles,
+            profile_id="claude_code",
+            provider=normalize_profile_provider("claude_code"),
+            label="Claude Code",
+            model=claude_code_model or "claude-sonnet-4-20250514",
+            base_url=extract_base_url(_claude_code_base),
+            endpoint=_claude_code_base.rstrip("/") + "/v1/messages",
+            api_key=claude_code_key,
+            thinking_stream=bool(config.get("claude_code_thinking_stream", thinking_stream_default)),
+            temperature=temp,
+            request_timeout=timeout,
+            capabilities=build_profile_capabilities("claude_code", "anthropic", claude_code_model or "claude-sonnet-4-20250514"),
+            media_endpoints=build_profile_media_endpoints("claude_code"),
+            api_protocol=config.get("claude_code_api_protocol", config.get("api_protocol", "anthropic_messages")),
+            tool_protocol=config.get("claude_code_tool_protocol", config.get("tool_protocol", "anthropic_tools")),
+        )
+
     custom_url = str(config.get("custom_url", "")).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
@@ -4692,9 +5055,13 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         "vllm": "vllm",
         "lmstudio": "lmstudio",
         "anthropic": "anthropic",
+        "claude_code": "claude_code",
         "glm": "glm",
         "kimi": "kimi",
         "openrouter": "openrouter",
+        "opencode": "opencode",
+        "openclaw": "openclaw",
+        "hermes": "hermes",
         "custom": "custom",
     }
     profile_ids = {p["id"] for p in profiles}
@@ -4752,6 +5119,21 @@ def looks_like_llm_config(config: dict) -> bool:
         "openrouter_url",
         "openrouter_model",
         "openrouter_key",
+        "opencode_url",
+        "opencode_model",
+        "opencode_key",
+        "openclaw_url",
+        "openclaw_model",
+        "openclaw_key",
+        "hermes_url",
+        "hermes_model",
+        "hermes_key",
+        "claude_code_url",
+        "claude_code_model",
+        "claude_code_key",
+        "api_protocol",
+        "tool_protocol",
+        "protocol_detection",
         "custom_url",
         "custom_model",
         "custom_key",
@@ -5294,91 +5676,171 @@ def _compress_rows_keep_hotspot(
     return out, truncated
 
 
+def _focused_diff_rows_from_opcodes(
+    old_lines: list[str],
+    new_lines: list[str],
+    opcodes: list[tuple[str, int, int, int, int]],
+    *,
+    max_rows: int,
+    context_lines: int = CODE_PREVIEW_DIFF_CONTEXT_LINES,
+    merge_gap: int = CODE_PREVIEW_DIFF_MERGE_GAP,
+) -> tuple[list[dict], bool]:
+    context_lines = max(0, int(context_lines or 0))
+    merge_gap = max(0, int(merge_gap or 0))
+    max_rows = max(8, int(max_rows or 8))
+    hunks: list[dict] = []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        old_start = max(0, i1 - context_lines)
+        old_end = min(len(old_lines), i2 + context_lines)
+        new_start = max(0, j1 - context_lines)
+        new_end = min(len(new_lines), j2 + context_lines)
+        if hunks and old_start <= (int(hunks[-1]["old_end"]) + merge_gap) and new_start <= (int(hunks[-1]["new_end"]) + merge_gap):
+            hunks[-1]["old_end"] = max(int(hunks[-1]["old_end"]), old_end)
+            hunks[-1]["new_end"] = max(int(hunks[-1]["new_end"]), new_end)
+            hunks[-1]["change_count"] = int(hunks[-1].get("change_count", 0)) + max(1, (i2 - i1) + (j2 - j1))
+        else:
+            hunks.append(
+                {
+                    "old_start": old_start,
+                    "old_end": old_end,
+                    "new_start": new_start,
+                    "new_end": new_end,
+                    "change_count": max(1, (i2 - i1) + (j2 - j1)),
+                }
+            )
+    if not hunks:
+        return [], False
+
+    rows: list[dict] = []
+    op_idx = 0
+    prev_old_end = 0
+    prev_new_end = 0
+
+    def _append_gap(old_start: int, new_start: int):
+        old_gap = max(0, int(old_start) - int(prev_old_end))
+        new_gap = max(0, int(new_start) - int(prev_new_end))
+        gap = max(old_gap, new_gap)
+        if gap > 0:
+            rows.append(_skip_row(f"⋮ ... ({gap} unchanged lines omitted)"))
+
+    for hunk in hunks:
+        h_old_start = int(hunk["old_start"])
+        h_old_end = int(hunk["old_end"])
+        h_new_start = int(hunk["new_start"])
+        h_new_end = int(hunk["new_end"])
+        _append_gap(h_old_start, h_new_start)
+        while op_idx < len(opcodes):
+            tag, i1, i2, j1, j2 = opcodes[op_idx]
+            if i2 <= h_old_start and j2 <= h_new_start:
+                op_idx += 1
+                continue
+            if i1 >= h_old_end and j1 >= h_new_end:
+                break
+            if tag == "equal":
+                start_old = max(i1, h_old_start)
+                end_old = min(i2, h_old_end)
+                offset = start_old - i1
+                for old_i in range(start_old, end_old):
+                    new_j = j1 + offset + (old_i - start_old)
+                    if new_j < h_new_start or new_j >= h_new_end or new_j >= len(new_lines):
+                        continue
+                    rows.append(
+                        {
+                            "kind": "context",
+                            "sign": " ",
+                            "old_line": old_i + 1,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "delete":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+            elif tag == "insert":
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            elif tag == "replace":
+                for old_i in range(max(i1, h_old_start), min(i2, h_old_end)):
+                    rows.append(
+                        {
+                            "kind": "delete",
+                            "sign": "-",
+                            "old_line": old_i + 1,
+                            "new_line": None,
+                            "text": old_lines[old_i],
+                        }
+                    )
+                for new_j in range(max(j1, h_new_start), min(j2, h_new_end)):
+                    rows.append(
+                        {
+                            "kind": "add",
+                            "sign": "+",
+                            "old_line": None,
+                            "new_line": new_j + 1,
+                            "text": new_lines[new_j],
+                        }
+                    )
+            if i2 <= h_old_end and j2 <= h_new_end:
+                op_idx += 1
+            else:
+                break
+        prev_old_end = h_old_end
+        prev_new_end = h_new_end
+    trailing_gap = max(len(old_lines) - prev_old_end, len(new_lines) - prev_new_end)
+    if trailing_gap > 0:
+        rows.append(_skip_row(f"⋮ ... ({trailing_gap} unchanged lines omitted)"))
+    out, truncated = _compress_rows_keep_hotspot(rows, max_rows)
+    return out, bool(truncated or len(out) < len(rows))
+
+
 def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
     old_lines = old_text.splitlines()
     new_lines = new_text.splitlines()
-    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
-    entries: list[dict] = []
     max_lines = max(16, int(max_lines or 320))
-    # Keep bounded memory on huge files while preserving latest/hot rows.
-    buffer_cap = max(max_lines + 256, min(6_000, max_lines * 6))
-    dropped_head = 0
-
-    def _push(row: dict):
-        nonlocal dropped_head
-        entries.append(row)
-        if len(entries) <= buffer_cap:
-            return
-        drop = len(entries) - buffer_cap
-        del entries[:drop]
-        dropped_head += drop
-
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for off in range(i2 - i1):
-                _push(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "old_col": 1,
-                        "new_col": 1,
-                        "text": old_lines[i1 + off],
-                    }
-                )
-        elif tag == "delete":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-        elif tag == "insert":
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-        elif tag == "replace":
-            for idx in range(i1, i2):
-                _push(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": idx + 1,
-                        "new_line": None,
-                        "old_col": 1,
-                        "new_col": None,
-                        "text": old_lines[idx],
-                    }
-                )
-            for idx in range(j1, j2):
-                _push(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": idx + 1,
-                        "old_col": None,
-                        "new_col": 1,
-                        "text": new_lines[idx],
-                    }
-                )
-    out, _ = _compress_rows_keep_hotspot(entries, max_lines, prefix_omitted=dropped_head)
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    rows, _ = _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        list(sm.get_opcodes()),
+        max_rows=max_lines,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
+    if rows:
+        return rows
+    show = min(len(new_lines), max_lines)
+    out = [
+        {
+            "kind": "context",
+            "sign": " ",
+            "old_line": i + 1,
+            "new_line": i + 1,
+            "old_col": 1,
+            "new_col": 1,
+            "text": new_lines[i],
+        }
+        for i in range(show)
+    ]
+    if len(new_lines) > show:
+        out.append(_skip_row(f"⋮ ... ({len(new_lines) - show} lines omitted)"))
     return out
 
 def render_numbered_diff_text(entries: list[dict]) -> str:
@@ -5435,6 +5897,10 @@ def preview_kind_for_path(path_text: str) -> str:
         return "html"
     if rel.endswith((".md", ".markdown")):
         return "markdown"
+    if is_code_preview_candidate(rel):
+        return "code"
+    if rel.endswith(".txt"):
+        return "markdown"
     ext = PurePosixPath(rel).suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
@@ -5452,8 +5918,6 @@ def preview_kind_for_path(path_text: str) -> str:
         return "presentation"
     if ext in DOCUMENT_PREVIEW_EXTS:
         return "document"
-    if is_code_preview_candidate(rel):
-        return "code"
     return ""
 
 
@@ -5472,32 +5936,12 @@ def build_code_preview_rows(
     sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
     max_rows = max(64, int(max_rows or CODE_PREVIEW_STAGE_MAX_ROWS))
     rows: list[dict] = []
-    dropped_head = 0
     has_changes = False
     opcodes = list(sm.get_opcodes())
     for tag, *_ in opcodes:
         if tag != "equal":
             has_changes = True
             break
-    # Avoid unbounded memory for giant files while keeping recent/hot rows.
-    buffer_cap = max(max_rows + 2048, min(120_000, max_rows * 3))
-    context_window = 96
-
-    def _append(row: dict):
-        nonlocal dropped_head
-        rows.append(row)
-        if len(rows) <= buffer_cap:
-            return
-        drop = len(rows) - buffer_cap
-        del rows[:drop]
-        dropped_head += drop
-
-    def _append_skip(omitted_lines: int):
-        n = max(0, int(omitted_lines or 0))
-        if n <= 0:
-            return
-        _append(_skip_row(f"⋮ ... ({n} unchanged lines omitted)"))
-
     if not has_changes:
         total = len(new_lines)
         show = min(total, max_rows)
@@ -5516,132 +5960,14 @@ def build_code_preview_rows(
             rows.append(_skip_row(f"⋮ ... ({total - show} lines omitted)"))
         return rows, truncated
 
-    for idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag == "equal":
-            span = i2 - i1
-            if span <= 0:
-                continue
-            prev_changed = idx > 0 and opcodes[idx - 1][0] != "equal"
-            next_changed = idx + 1 < len(opcodes) and opcodes[idx + 1][0] != "equal"
-            if prev_changed and next_changed:
-                keep_head = min(context_window, span)
-                keep_tail = min(context_window, max(0, span - keep_head))
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if next_changed:
-                keep_tail = min(context_window, span)
-                _append_skip(span - keep_tail)
-                for off in range(keep_tail):
-                    old_idx = i2 - keep_tail + off
-                    new_idx = j2 - keep_tail + off
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": old_idx + 1,
-                            "new_line": new_idx + 1,
-                            "text": new_lines[new_idx],
-                        }
-                    )
-                continue
-            if prev_changed:
-                keep_head = min(context_window, span)
-                for off in range(keep_head):
-                    _append(
-                        {
-                            "kind": "context",
-                            "sign": " ",
-                            "old_line": i1 + off + 1,
-                            "new_line": j1 + off + 1,
-                            "text": new_lines[j1 + off],
-                        }
-                    )
-                _append_skip(span - keep_head)
-                continue
-            keep = min(context_window * 2, span)
-            for off in range(keep):
-                _append(
-                    {
-                        "kind": "context",
-                        "sign": " ",
-                        "old_line": i1 + off + 1,
-                        "new_line": j1 + off + 1,
-                        "text": new_lines[j1 + off],
-                    }
-                )
-            _append_skip(span - keep)
-            continue
-        if tag == "delete":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            continue
-        if tag == "insert":
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-            continue
-        if tag == "replace":
-            for i in range(i1, i2):
-                _append(
-                    {
-                        "kind": "delete",
-                        "sign": "-",
-                        "old_line": i + 1,
-                        "new_line": None,
-                        "text": old_lines[i],
-                    }
-                )
-            for j in range(j1, j2):
-                _append(
-                    {
-                        "kind": "add",
-                        "sign": "+",
-                        "old_line": None,
-                        "new_line": j + 1,
-                        "text": new_lines[j],
-                    }
-                )
-    out, truncated = _compress_rows_keep_hotspot(rows, max_rows, prefix_omitted=dropped_head)
-    if truncated and out and str(out[-1].get("kind", "")).lower() == "skip":
-        out[-1]["text"] = str(out[-1].get("text") or "").strip() or f"⋮ ... preview truncated at {max_rows} rows"
-    return out, truncated
+    return _focused_diff_rows_from_opcodes(
+        old_lines,
+        new_lines,
+        opcodes,
+        max_rows=max_rows,
+        context_lines=CODE_PREVIEW_DIFF_CONTEXT_LINES,
+        merge_gap=CODE_PREVIEW_DIFF_MERGE_GAP,
+    )
 
 class EventHub:
     _MAXSIZE = 512
@@ -11897,12 +12223,31 @@ class WorktreeManager:
         return json_dumps(out, indent=2)
 
 class OllamaError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        *,
+        headers: dict | None = None,
+        body: str = "",
+        url: str = "",
+        retry_after: float | None = None,
+        retryable: bool | None = None,
+        transient: bool | None = None,
+    ):
         super().__init__(message)
         self.status = status
+        self.headers = dict(headers or {})
+        self.body = str(body or "")
+        self.url = str(url or "")
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.transient = transient
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
+    _retry_lock = threading.RLock()
+    _endpoint_cooldowns: dict[str, dict] = {}
 
     def __init__(
         self,
@@ -11916,6 +12261,9 @@ class OllamaClient:
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
+        api_protocol: str = "auto",
+        tool_protocol: str = "auto",
+        protocol_detection: str = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -11931,9 +12279,180 @@ class OllamaClient:
         self.headers = headers or {}
         self.payload_template = payload_template
         self.thinking_stream = bool(thinking_stream)
+        self.api_protocol = normalize_api_protocol(api_protocol, default="auto")
+        self.tool_protocol = normalize_tool_protocol(tool_protocol, default="auto")
+        self.protocol_detection = normalize_protocol_detection(protocol_detection, default="auto")
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
+
+    def _http_retry_key(self, url: str) -> str:
+        parsed = urlparse(str(url or ""))
+        host = parsed.netloc or parsed.path
+        return "|".join(
+            [
+                normalize_openai_compat_provider_name(self.provider),
+                str(host or "").strip().lower(),
+                str(self.model or "").strip().lower(),
+            ]
+        )
+
+    def _provider_retry_label(self) -> str:
+        provider = normalize_openai_compat_provider_name(self.provider)
+        model = str(self.model or "").strip()
+        return f"{provider}/{model}" if model else provider
+
+    @staticmethod
+    def _headers_to_dict(headers: object) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            items = headers.items()  # type: ignore[attr-defined]
+        except Exception:
+            items = []
+        for key, value in items:
+            out[str(key)] = str(value)
+        return out
+
+    @staticmethod
+    def _parse_retry_after_seconds(headers: dict | None, body: str = "") -> float | None:
+        hdrs = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items()}
+        raw = hdrs.get("retry-after") or hdrs.get("x-retry-after")
+        if raw:
+            try:
+                value = float(raw)
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+            except Exception:
+                pass
+        reset = hdrs.get("x-ratelimit-reset") or hdrs.get("x-rate-limit-reset")
+        if reset:
+            try:
+                value = float(reset)
+                if value > 1_000_000_000:
+                    return max(0.0, value - time.time())
+                if value >= 0:
+                    return value
+            except Exception:
+                pass
+        parsed_body = parse_json_object(body, {})
+        if isinstance(parsed_body, dict):
+            for key in ("retry_after", "retryAfter", "retry_after_seconds", "wait_seconds"):
+                if key not in parsed_body:
+                    continue
+                try:
+                    value = float(parsed_body.get(key))
+                    if value >= 0:
+                        return value
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def _looks_like_nginx_or_upstream(text: str) -> bool:
+        low = str(text or "").strip().lower()
+        if not low:
+            return False
+        markers = (
+            "nginx",
+            "openresty",
+            "upstream",
+            "bad gateway",
+            "gateway timeout",
+            "gateway error",
+            "service unavailable",
+            "temporarily unavailable",
+            "connection reset",
+            "connection refused",
+            "no healthy upstream",
+            "upstream request timeout",
+            "proxy error",
+            "reverse proxy",
+            "load balancer",
+            "envoy",
+            "traefik",
+            "the server encountered an internal error",
+        )
+        return any(marker in low for marker in markers)
+
+    def _is_retryable_http_error(self, exc: OllamaError, url: str) -> tuple[bool, bool]:
+        status = int(getattr(exc, "status", 0) or 0)
+        body = str(getattr(exc, "body", "") or str(exc))
+        provider = normalize_openai_compat_provider_name(self.provider)
+        if status in LLM_HTTP_RETRY_STATUSES:
+            return True, True
+        if status == 404 and LLM_HTTP_RETRY_404_ON_VLLM and provider in {"vllm", "openai_compat", "lmstudio"}:
+            path = str(urlparse(str(url or "")).path or "").lower()
+            if path.endswith("/chat/completions") and self._looks_like_nginx_or_upstream(body):
+                return True, True
+        return False, False
+
+    def _is_retryable_connection_error(self, exc: OllamaError) -> bool:
+        status = int(getattr(exc, "status", 0) or 0)
+        if status:
+            return False
+        text = str(exc).lower()
+        markers = (
+            "connection error",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "remote end closed",
+            "temporarily unavailable",
+            "service unavailable",
+        )
+        return any(marker in text for marker in markers)
+
+    def _http_retry_delay(self, exc: OllamaError, attempt_index: int) -> float:
+        retry_after = getattr(exc, "retry_after", None)
+        delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        try:
+            if retry_after is not None:
+                delay = max(delay, float(retry_after))
+        except Exception:
+            delay = LLM_HTTP_RETRY_DELAY_SECONDS
+        return max(1.0, min(float(delay), float(LLM_HTTP_RETRY_MAX_SECONDS)))
+
+    def _cooldown_remaining(self, key: str) -> float:
+        with self._retry_lock:
+            row = self._endpoint_cooldowns.get(key, {})
+            until = float(row.get("until", 0.0) or 0.0) if isinstance(row, dict) else 0.0
+        return max(0.0, until - time.time())
+
+    def _set_endpoint_cooldown(self, key: str, delay: float, exc: OllamaError):
+        if delay <= 0:
+            return
+        with self._retry_lock:
+            self._endpoint_cooldowns[key] = {
+                "until": time.time() + float(delay),
+                "status": int(getattr(exc, "status", 0) or 0),
+                "error": trim(str(exc), 240),
+                "provider": normalize_openai_compat_provider_name(self.provider),
+                "model": str(self.model or ""),
+            }
+
+    def _wait_with_cancel(self, seconds: float, cancel_check=None):
+        deadline = time.time() + max(0.0, float(seconds or 0.0))
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if cancel_check is not None:
+                try:
+                    if cancel_check():
+                        raise OllamaError("interrupted by user", status=499)
+                except OllamaError:
+                    raise
+                except Exception:
+                    pass
+            time.sleep(min(1.0, remaining))
 
     def apply_profile(self, profile: dict):
         self.provider = str(profile.get("provider", "ollama") or "ollama")
@@ -11952,6 +12471,17 @@ class OllamaClient:
         )
         self.payload_template = str(profile.get("payload_template", self.payload_template) or self.payload_template)
         self.thinking_stream = bool(profile.get("thinking_stream", self.thinking_stream))
+        self.api_protocol = normalize_api_protocol(profile.get("api_protocol", self.api_protocol), default="auto")
+        self.tool_protocol = normalize_tool_protocol(profile.get("tool_protocol", self.tool_protocol), default="auto")
+        self.protocol_detection = normalize_protocol_detection(
+            profile.get("protocol_detection", self.protocol_detection),
+            default="auto",
+        )
+        effective_api = self._effective_api_protocol()
+        if effective_api == "openai_responses" and self.endpoint:
+            self.endpoint = complete_responses_endpoint(self.endpoint)
+        elif effective_api == "openai_chat" and self.endpoint:
+            self.endpoint = complete_chat_endpoint(self.endpoint)
         declared_caps = parse_capability_overrides(profile.get("capabilities", {}))
         self.capabilities = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(self.provider, self.model),
@@ -12043,9 +12573,83 @@ class OllamaClient:
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
+
+    def _post_json_url_with_retries(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        cancel_check=None,
+        on_retry=None,
+    ) -> dict:
+        retry_budget = LLM_HTTP_RETRY_MAX_ATTEMPTS if max_attempts is None else max(0, int(max_attempts or 0))
+        key = self._http_retry_key(url)
+        label = self._provider_retry_label()
+        last_exc: OllamaError | None = None
+        for attempt in range(0, retry_budget + 1):
+            cooldown = self._cooldown_remaining(key)
+            if cooldown > 0:
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt,
+                                "retry_budget": retry_budget,
+                                "delay": round(cooldown, 2),
+                                "reason": "endpoint cooldown",
+                                "status": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(cooldown, cancel_check=cancel_check)
+            try:
+                return self._post_json_url(url, payload, headers=headers)
+            except OllamaError as exc:
+                last_exc = exc
+                http_retryable, transient = self._is_retryable_http_error(exc, url)
+                conn_retryable = self._is_retryable_connection_error(exc)
+                retryable = bool(http_retryable or conn_retryable)
+                exc.retryable = retryable
+                exc.transient = bool(transient or conn_retryable)
+                if not retryable or attempt >= retry_budget:
+                    raise
+                delay = self._http_retry_delay(exc, attempt)
+                self._set_endpoint_cooldown(key, delay, exc)
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt + 1,
+                                "retry_budget": retry_budget,
+                                "delay": round(delay, 2),
+                                "reason": trim(str(exc), 240),
+                                "status": int(getattr(exc, "status", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(delay, cancel_check=cancel_check)
+        if last_exc is not None:
+            raise last_exc
+        raise OllamaError("model HTTP request failed", url=url)
 
     def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
         req_headers = {"Content-Type": "application/json"}
@@ -12064,9 +12668,17 @@ class OllamaClient:
                 return body, ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
         req = Request(url, headers=self._render_headers(), method="GET")
@@ -12076,14 +12688,26 @@ class OllamaClient:
                 return resp.read(), ctype
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
         out = []
         for call in tool_calls or []:
+            if not isinstance(call, dict):
+                continue
             function = call.get("function", {})
+            if not isinstance(function, dict):
+                function = {}
             name = canonicalize_tool_name(function.get("name") or call.get("name"))
             raw_args = function.get("arguments", {})
             args, args_error = parse_tool_arguments_with_error(raw_args)
@@ -12102,6 +12726,173 @@ class OllamaClient:
                 row["raw_arguments"] = trim(raw_args, 1200)
             out.append(row)
         return out
+
+    def _effective_api_protocol(self) -> str:
+        return infer_api_protocol(
+            self.provider,
+            endpoint=self.endpoint,
+            base_url=self.base_url,
+            model=self.model,
+            requested=self.api_protocol,
+            protocol_detection=self.protocol_detection,
+        )
+
+    def _effective_tool_protocol(self, api_protocol: str | None = None) -> str:
+        return infer_tool_protocol(
+            self.provider,
+            model=self.model,
+            requested=self.tool_protocol,
+            api_protocol=api_protocol or self._effective_api_protocol(),
+            protocol_detection=self.protocol_detection,
+        )
+
+    def _tool_schema_prompt(self, tools: list[dict] | None, tool_protocol: str) -> str:
+        if not tools or tool_protocol in {"none", "openai_tools", "anthropic_tools", "ollama_tools"}:
+            return ""
+        rows: list[dict] = []
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+            name = canonicalize_tool_name(fn.get("name"))
+            if not name:
+                continue
+            rows.append(
+                {
+                    "name": name,
+                    "description": str(fn.get("description", "") or ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
+        if not rows:
+            return ""
+        schema_text = json_dumps(rows, indent=2)
+        if tool_protocol == "hermes_tool_text":
+            return (
+                "Tools are available, but this endpoint expects text-form tool calls. "
+                "When you need a tool, reply with only one or more XML blocks in this exact form:\n"
+                "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
+                "Do not wrap the JSON in markdown. Available tools:\n"
+                f"{schema_text}"
+            )
+        return (
+            "Tools are available, but this endpoint expects JSON text tool calls. "
+            "When you need a tool, reply with only JSON in this exact form:\n"
+            "{\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{...}}]}\n"
+            "Available tools:\n"
+            f"{schema_text}"
+        )
+
+    def _messages_with_tool_prompt(
+        self,
+        req_messages: list[dict],
+        tools: list[dict] | None,
+        tool_protocol: str,
+    ) -> tuple[list[dict], list[dict] | None]:
+        prompt = self._tool_schema_prompt(tools, tool_protocol)
+        if not prompt:
+            return req_messages, tools
+        out = [{"role": "system", "content": prompt}] + list(req_messages or [])
+        return out, None
+
+    def _tools_for_protocol(
+        self,
+        tools: list[dict] | None,
+        tool_protocol: str,
+        api_protocol: str = "",
+    ) -> list[dict] | None:
+        if not tools or tool_protocol in {"none", "hermes_tool_text", "json_tool_text"}:
+            return None
+        if tool_protocol == "anthropic_tools":
+            return self._convert_tools_to_anthropic(tools)
+        if normalize_api_protocol(api_protocol, default="") == "openai_responses":
+            return self._convert_tools_to_openai_responses(tools)
+        return tools
+
+    @staticmethod
+    def _iter_json_objects_from_text(text: str):
+        raw = str(text or "")
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"[\[{]", raw):
+            idx = match.start()
+            try:
+                obj, _end = decoder.raw_decode(raw[idx:])
+            except Exception:
+                continue
+            yield obj
+
+    def _tool_calls_from_text_object(self, obj: object) -> list[dict]:
+        rows: list[dict] = []
+        candidates: list[object] = []
+        if isinstance(obj, dict):
+            if isinstance(obj.get("tool_calls"), list):
+                candidates.extend(obj.get("tool_calls") or [])
+            elif isinstance(obj.get("tools"), list):
+                candidates.extend(obj.get("tools") or [])
+            elif isinstance(obj.get("function"), dict) or obj.get("name") or obj.get("tool"):
+                candidates.append(obj)
+        elif isinstance(obj, list):
+            candidates.extend(obj)
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+            name = (
+                fn.get("name")
+                or item.get("name")
+                or item.get("tool")
+                or item.get("tool_name")
+                or item.get("function_name")
+            )
+            name = canonicalize_tool_name(name)
+            if not name:
+                continue
+            raw_args = (
+                fn.get("arguments")
+                if "arguments" in fn
+                else item.get("arguments", item.get("args", item.get("input", {})))
+            )
+            args, args_error = parse_tool_arguments_with_error(raw_args)
+            row = {
+                "id": str(item.get("id") or item.get("tool_call_id") or make_id("tool")),
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            }
+            if args_error:
+                row["args_error"] = args_error
+                row["raw_arguments"] = trim(raw_args, 1200)
+            rows.append(row)
+        return rows
+
+    def _extract_text_tool_calls(self, content: str) -> tuple[str, list[dict]]:
+        text = str(content or "")
+        tool_calls: list[dict] = []
+
+        def _replace_xml(match: re.Match) -> str:
+            payload = match.group(1) or ""
+            obj = parse_json_object(payload, {})
+            tool_calls.extend(self._tool_calls_from_text_object(obj))
+            return ""
+
+        cleaned = re.sub(r"<tool_call>\s*(.*?)\s*</tool_call>", _replace_xml, text, flags=re.IGNORECASE | re.DOTALL)
+        for fence in re.finditer(r"```(?:json|tool|tool_call)?\s*(.*?)```", cleaned, re.IGNORECASE | re.DOTALL):
+            obj = parse_json_object(fence.group(1) or "", {})
+            tool_calls.extend(self._tool_calls_from_text_object(obj))
+        if not tool_calls:
+            for obj in self._iter_json_objects_from_text(cleaned):
+                tool_calls.extend(self._tool_calls_from_text_object(obj))
+                if tool_calls:
+                    break
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict] = []
+        for call in tool_calls:
+            fn = call.get("function", {}) if isinstance(call, dict) else {}
+            key = (str(fn.get("name", "")), json_dumps(fn.get("arguments", {})))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(call)
+        return cleaned.strip(), unique
 
     def _audio_format_from_mime(self, mime: str) -> str:
         m = str(mime or "").strip().lower()
@@ -12264,6 +13055,61 @@ class OllamaClient:
         thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
         return main, tool_calls, thinking
+
+    def _extract_openai_responses_message(self, raw: dict) -> tuple[str, list[dict], str]:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls_raw: list[dict] = []
+
+        def _walk(node: object):
+            if isinstance(node, list):
+                for item in node:
+                    _walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            ntype = str(node.get("type", "") or "").strip().lower()
+            if ntype in {"output_text", "text"}:
+                txt = node.get("text") or node.get("content") or ""
+                if txt:
+                    text_parts.append(str(txt))
+            elif ntype in {"reasoning", "thinking"}:
+                txt = node.get("summary") or node.get("text") or node.get("content") or ""
+                if isinstance(txt, list):
+                    for item in txt:
+                        if isinstance(item, dict):
+                            thinking_parts.append(str(item.get("text") or item.get("content") or ""))
+                        elif item:
+                            thinking_parts.append(str(item))
+                elif txt:
+                    thinking_parts.append(str(txt))
+            elif ntype in {"function_call", "tool_call"} or node.get("call_id") or node.get("name"):
+                name = node.get("name") or node.get("tool_name") or node.get("function_name")
+                if name:
+                    args = node.get("arguments", node.get("input", {}))
+                    tool_calls_raw.append(
+                        {
+                            "id": node.get("call_id") or node.get("id") or make_id("tool"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        }
+                    )
+            content = node.get("content")
+            if isinstance(content, (list, dict)):
+                _walk(content)
+
+        if isinstance(raw.get("choices"), list):
+            return self._extract_openai_message(raw)
+        if raw.get("output_text"):
+            text_parts.append(str(raw.get("output_text") or ""))
+        _walk(raw.get("output", []))
+        if not text_parts and isinstance(raw.get("content"), (list, dict)):
+            _walk(raw.get("content"))
+        content, thinking_inline = split_thinking_content("\n".join(x for x in text_parts if str(x).strip()))
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
+        return content, self._normalize_tool_calls(tool_calls_raw), thinking
 
     def _render_headers(self) -> dict:
         out = {}
@@ -12639,6 +13485,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
         payload = {
@@ -12651,7 +13500,14 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
         try:
-            raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+            raw = self._post_json_url_with_retries(
+                endpoint,
+                payload,
+                headers=self._render_headers(),
+                max_attempts=http_retry_attempts,
+                cancel_check=cancel_check,
+                on_retry=on_http_retry,
+            )
         except OllamaError as exc:
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
@@ -12662,10 +13518,49 @@ class OllamaClient:
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
                 fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
                 fallback_payload.pop("tools", None)
-                raw = self._post_json_url(endpoint, fallback_payload, headers=self._render_headers())
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
             else:
                 raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
+        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def _chat_openai_responses(
+        self,
+        req_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
+    ) -> dict:
+        endpoint = complete_responses_endpoint(self.endpoint.strip() or self.base_url)
+        payload: dict = {
+            "model": self.model,
+            "input": req_messages,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+        raw = self._post_json_url_with_retries(
+            endpoint,
+            payload,
+            headers=self._render_headers(),
+            max_attempts=http_retry_attempts,
+            cancel_check=cancel_check,
+            on_retry=on_http_retry,
+        )
+        content, tool_calls, thinking_content = self._extract_openai_responses_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
     def _chat_custom_http(
@@ -12676,6 +13571,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -12702,7 +13600,14 @@ class OllamaClient:
             }
             if tools:
                 payload["tools"] = tools
-        raw = self._post_json_url(endpoint, payload, headers=self._render_headers())
+        raw = self._post_json_url_with_retries(
+            endpoint,
+            payload,
+            headers=self._render_headers(),
+            max_attempts=http_retry_attempts,
+            cancel_check=cancel_check,
+            on_retry=on_http_retry,
+        )
         if isinstance(raw, dict) and "choices" in raw:
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -12727,6 +13632,9 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -12790,18 +13698,36 @@ class OllamaClient:
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
-            payload["tools"] = self._convert_tools_to_anthropic(tools)
+            first_tool = tools[0] if isinstance(tools, list) and tools else {}
+            if isinstance(first_tool, dict) and "input_schema" in first_tool:
+                payload["tools"] = tools
+            else:
+                payload["tools"] = self._convert_tools_to_anthropic(tools)
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        raw = self._post_json_url(endpoint, payload, headers=headers)
+        raw = self._post_json_url_with_retries(
+            endpoint,
+            payload,
+            headers=headers,
+            max_attempts=http_retry_attempts,
+            cancel_check=cancel_check,
+            on_retry=on_http_retry,
+        )
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
         if isinstance(raw.get("choices"), list) and tools:
             payload["tools"] = tools  # original OpenAI-format tools
-            raw = self._post_json_url(endpoint, payload, headers=headers)
+            raw = self._post_json_url_with_retries(
+                endpoint,
+                payload,
+                headers=headers,
+                max_attempts=http_retry_attempts,
+                cancel_check=cancel_check,
+                on_retry=on_http_retry,
+            )
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -12849,6 +13775,29 @@ class OllamaClient:
                 "description": str(fn.get("description", "") or ""),
                 "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
             })
+        return out
+
+    def _convert_tools_to_openai_responses(self, openai_tools: list[dict]) -> list[dict]:
+        """Convert Chat Completions tool definitions to OpenAI Responses format."""
+        out: list[dict] = []
+        for item in openai_tools or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function" and item.get("name"):
+                out.append(dict(item))
+                continue
+            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+            name = canonicalize_tool_name(fn.get("name"))
+            if not name:
+                continue
+            out.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": str(fn.get("description", "") or ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                }
+            )
         return out
 
     def _chat_ollama_stream_native(
@@ -12961,16 +13910,24 @@ class OllamaClient:
         on_thinking_chunk=None,
         media_inputs: list[dict] | None = None,
         probe_mode: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
-        req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
+        api_protocol = self._effective_api_protocol()
+        tool_protocol = self._effective_tool_protocol(api_protocol)
+        prep_provider = "ollama" if api_protocol == "ollama_chat" else provider
+        req_messages = self._prepare_request_messages(messages, prep_provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
+        http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
+        req_messages, request_tools = self._messages_with_tool_prompt(req_messages, tools, tool_protocol)
+        protocol_tools = self._tools_for_protocol(request_tools, tool_protocol, api_protocol)
         # Some providers require all system messages at the beginning (or merged into one)
-        if is_openai_like_provider(provider):
+        if api_protocol in {"openai_chat", "openai_responses", "custom_http"} or is_openai_like_provider(provider):
             sys_msgs = [m for m in req_messages if m.get("role") == "system"]
             non_sys_msgs = [m for m in req_messages if m.get("role") != "system"]
             if len(sys_msgs) > 1:
@@ -12983,23 +13940,70 @@ class OllamaClient:
                 req_messages = [{"role": "system", "content": merged_system}] + non_sys_msgs
             elif sys_msgs:
                 req_messages = sys_msgs + non_sys_msgs
-        if is_openai_compat_provider(provider):
-            return self._chat_openai_compat(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+        if api_protocol == "openai_responses":
+            result = self._chat_openai_responses(
+                req_messages,
+                tools=protocol_tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
-        if provider == "anthropic":
+            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
+                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
+                result["content"] = content
+                result["tool_calls"] = text_tool_calls
+            return result
+        if api_protocol == "openai_chat":
+            result = self._chat_openai_compat(
+                req_messages,
+                tools=protocol_tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
+            )
+            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
+                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
+                result["content"] = content
+                result["tool_calls"] = text_tool_calls
+            return result
+        if api_protocol == "anthropic_messages":
             return self._chat_anthropic(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=protocol_tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
-        if provider == "custom_http":
-            return self._chat_custom_http(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+        if api_protocol == "custom_http" or provider == "custom_http":
+            result = self._chat_custom_http(
+                req_messages,
+                tools=protocol_tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                http_retry_attempts=http_retry_attempts,
             )
+            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
+                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
+                result["content"] = content
+                result["tool_calls"] = text_tool_calls
+            return result
         if stream_thinking:
             try:
                 return self._chat_ollama_stream_native(
                     req_messages,
-                    tools=tools,
+                    tools=protocol_tools,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     think=False,
@@ -13014,12 +14018,17 @@ class OllamaClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if tools:
-            openai_payload["tools"] = tools
+        if protocol_tools:
+            openai_payload["tools"] = protocol_tools
         try:
             raw = self._post_json("/v1/chat/completions", openai_payload)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
-            return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+            result = {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not tool_calls:
+                content, text_tool_calls = self._extract_text_tool_calls(content)
+                result["content"] = content
+                result["tool_calls"] = text_tool_calls
+            return result
         except OllamaError as exc:
             status = int(getattr(exc, "status", 0) or 0)
             # Some Ollama deployments expose /v1 but may intermittently return 5xx.
@@ -13028,7 +14037,7 @@ class OllamaClient:
             if status not in fallback_status:
                 raise
         effective_max_native = max_tokens
-        if tools:
+        if protocol_tools:
             effective_max_native = max(max_tokens, max_tokens + OLLAMA_THINKING_TOOL_BUFFER)
         native_payload = {
             "model": self.model,
@@ -13036,8 +14045,8 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
-        if tools:
-            native_payload["tools"] = tools
+        if protocol_tools:
+            native_payload["tools"] = protocol_tools
         raw = self._post_json("/api/chat", native_payload)
         msg = raw.get("message", {})
         if not isinstance(msg, dict):
@@ -13064,6 +14073,8 @@ class OllamaClient:
         if not raw_tool_calls and isinstance(raw, dict):
             raw_tool_calls = raw.get("tool_calls", [])
         tool_calls = self._normalize_tool_calls(raw_tool_calls)
+        if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not tool_calls:
+            content, tool_calls = self._extract_text_tool_calls(content)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
@@ -13489,14 +14500,23 @@ class SessionState:
         self.upload_parse_last_heartbeat = 0.0
         self.upload_parse_active_id = ""
         self.upload_parse_active_started_at = 0.0
+        self.upload_ingest_queue: queue.Queue[dict] = queue.Queue(maxsize=CHAT_UPLOAD_INGEST_QUEUE_MAX)
+        self.upload_ingest_worker_started = False
+        self.upload_ingest_worker_lock = threading.Lock()
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta: dict = {}
         self.runtime_knowledge_reference_text = ""
         self.runtime_knowledge_reference_meta: dict = {}
         self.teammates: dict[str, dict] = {}
         self.running = False
+        self.scheduler_starting = False
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
+        self.deferred_start_inputs: list[dict] = []
+        self.deferred_start_seq = 0
+        self.deferred_start_worker_started = False
+        self.deferred_start_worker_lock = threading.Lock()
+        self.scheduler_visible_inputs: list[dict] = []
         self.run_generation = 0
         self.run_started_at = 0.0
         self.run_last_heartbeat = 0.0
@@ -14194,6 +15214,31 @@ class SessionState:
                     "model": model,
                     "label": label,
                     "source": profile.get("source", ""),
+                    "api_protocol": profile.get("api_protocol", "auto"),
+                    "tool_protocol": profile.get("tool_protocol", "auto"),
+                    "protocol_detection": profile.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(profile.get("provider", "")),
+                        endpoint=str(profile.get("endpoint", "")),
+                        base_url=str(profile.get("base_url", "")),
+                        model=model,
+                        requested=profile.get("api_protocol", "auto"),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(profile.get("provider", "")),
+                        model=model,
+                        requested=profile.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(profile.get("provider", "")),
+                            endpoint=str(profile.get("endpoint", "")),
+                            base_url=str(profile.get("base_url", "")),
+                            model=model,
+                            requested=profile.get("api_protocol", "auto"),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "capabilities": caps,
@@ -14236,6 +15281,31 @@ class SessionState:
                         "model": tag,
                         "label": f"{profile.get('label', 'Ollama')} | {tag}",
                         "source": "ollama-tags",
+                        "api_protocol": profile.get("api_protocol", "auto"),
+                        "tool_protocol": profile.get("tool_protocol", "auto"),
+                        "protocol_detection": profile.get("protocol_detection", "auto"),
+                        "effective_api_protocol": infer_api_protocol(
+                            "ollama",
+                            endpoint=str(profile.get("endpoint", "")),
+                            base_url=str(profile.get("base_url", "")),
+                            model=tag,
+                            requested=profile.get("api_protocol", "auto"),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
+                        "effective_tool_protocol": infer_tool_protocol(
+                            "ollama",
+                            model=tag,
+                            requested=profile.get("tool_protocol", "auto"),
+                            api_protocol=infer_api_protocol(
+                                "ollama",
+                                endpoint=str(profile.get("endpoint", "")),
+                                base_url=str(profile.get("base_url", "")),
+                                model=tag,
+                                requested=profile.get("api_protocol", "auto"),
+                                protocol_detection=profile.get("protocol_detection", "auto"),
+                            ),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
                         "capabilities": tag_caps,
@@ -14263,6 +15333,31 @@ class SessionState:
                     "model": str(active.get("model", "") or ""),
                     "label": f"{active.get('label', self.active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
                     "source": active.get("source", "active-profile"),
+                    "api_protocol": active.get("api_protocol", "auto"),
+                    "tool_protocol": active.get("tool_protocol", "auto"),
+                    "protocol_detection": active.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(active.get("provider", "")),
+                        endpoint=str(active.get("endpoint", "")),
+                        base_url=str(active.get("base_url", "")),
+                        model=str(active.get("model", "") or ""),
+                        requested=active.get("api_protocol", "auto"),
+                        protocol_detection=active.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(active.get("provider", "")),
+                        model=str(active.get("model", "") or ""),
+                        requested=active.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(active.get("provider", "")),
+                            endpoint=str(active.get("endpoint", "")),
+                            base_url=str(active.get("base_url", "")),
+                            model=str(active.get("model", "") or ""),
+                            requested=active.get("api_protocol", "auto"),
+                            protocol_detection=active.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=active.get("protocol_detection", "auto"),
+                    ),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
@@ -14600,6 +15695,57 @@ class SessionState:
                         except Exception:
                             continue
                     self.live_input_seq = max(self.live_input_seq, max_id)
+                deferred_inputs = raw.get("deferred_start_inputs", [])
+                if isinstance(deferred_inputs, list):
+                    clean_deferred: list[dict] = []
+                    for row in deferred_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        clean_deferred.append(
+                            {
+                                "id": int(row.get("id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "reason": trim(str(row.get("reason", "") or "session busy"), 120),
+                            }
+                        )
+                    self.deferred_start_inputs = clean_deferred[-SESSION_DEFERRED_START_QUEUE_MAX:]
+                    max_deferred_id = int(raw.get("deferred_start_seq", 0) or 0)
+                    for row in self.deferred_start_inputs:
+                        try:
+                            max_deferred_id = max(max_deferred_id, int(row.get("id", 0) or 0))
+                        except Exception:
+                            continue
+                    self.deferred_start_seq = max(self.deferred_start_seq, max_deferred_id)
+                scheduler_visible_inputs = raw.get("scheduler_visible_inputs", [])
+                if isinstance(scheduler_visible_inputs, list):
+                    clean_scheduler_visible: list[dict] = []
+                    for row in scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                        if not isinstance(row, dict):
+                            continue
+                        text = trim(str(row.get("content", "") or "").strip(), 6000)
+                        if not text:
+                            continue
+                        status = str(row.get("scheduler_status", "queued") or "queued").strip().lower()
+                        if status not in {"queued", "started", "cancelled", "failed"}:
+                            status = "queued"
+                        clean_scheduler_visible.append(
+                            {
+                                "queue_id": int(row.get("queue_id", 0) or 0),
+                                "content": text,
+                                "queued_at": float(row.get("queued_at", 0.0) or 0.0),
+                                "started_at": float(row.get("started_at", 0.0) or 0.0),
+                                "finished_at": float(row.get("finished_at", 0.0) or 0.0),
+                                "queue_position": int(row.get("queue_position", 0) or 0),
+                                "queue_size": int(row.get("queue_size", 0) or 0),
+                                "scheduler_reason": trim(str(row.get("scheduler_reason", "") or ""), 120),
+                                "scheduler_status": status,
+                            }
+                        )
+                    self.scheduler_visible_inputs = clean_scheduler_visible[-SESSION_DEFERRED_START_QUEUE_MAX:]
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
@@ -14787,6 +15933,10 @@ class SessionState:
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
+        with self.deferred_start_worker_lock:
+            deferred_start_inputs_snapshot = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            deferred_start_seq_snapshot = int(self.deferred_start_seq)
+        scheduler_visible_inputs_snapshot = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
         data = {
             "id": self.id,
             "title": self.title,
@@ -14825,6 +15975,9 @@ class SessionState:
             "reviewer_debug_context": trim(str(self.reviewer_debug_context or ""), 1000),
             "developer_edit_fail_streaks": dict(self.developer_edit_fail_streaks) if self.developer_edit_fail_streaks else {},
             "pending_user_inputs": self.pending_user_inputs[-40:],
+            "deferred_start_inputs": deferred_start_inputs_snapshot,
+            "deferred_start_seq": int(deferred_start_seq_snapshot),
+            "scheduler_visible_inputs": scheduler_visible_inputs_snapshot,
             "run_generation": int(self.run_generation),
             "agent_round_index": int(self.agent_round_index),
             "current_phase": str(self.current_phase or "idle"),
@@ -14970,6 +16123,7 @@ class SessionState:
             if removed_hints > 0:
                 self.messages = kept[-400:]
         self.pending_user_inputs = []
+        self.deferred_start_worker_started = False
         self.cancel_requested = False
         self.current_phase = "idle"
         self.current_tool_name = ""
@@ -15215,6 +16369,119 @@ class SessionState:
             }
         )
         self.activity = self.activity[-300:]
+
+    def record_scheduler_queued_message(
+        self,
+        queue_id: int,
+        content: str,
+        *,
+        queue_position: int = 1,
+        queue_size: int = 1,
+        scheduler_reason: str = "",
+        queued_at: float | None = None,
+    ) -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        row = {
+            "queue_id": int(queue_id or 0),
+            "content": text,
+            "queued_at": float(queued_at or now_ts()),
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "queue_position": max(1, int(queue_position or 1)),
+            "queue_size": max(1, int(queue_size or 1)),
+            "scheduler_reason": trim(str(scheduler_reason or ""), 120),
+            "scheduler_status": "queued",
+        }
+        with self.lock:
+            replaced = False
+            for idx in range(len(self.scheduler_visible_inputs) - 1, -1, -1):
+                if int((self.scheduler_visible_inputs[idx] or {}).get("queue_id", 0) or 0) == int(queue_id or 0):
+                    self.scheduler_visible_inputs[idx] = row
+                    replaced = True
+                    break
+            if not replaced:
+                self.scheduler_visible_inputs.append(row)
+            self.scheduler_visible_inputs = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        self._emit(
+            "message",
+            {
+                "role": "user",
+                "text": text,
+                "summary": "queued user message",
+                "scheduler_status": "queued",
+                "scheduler_queue_id": int(queue_id or 0),
+                "queue_position": int(row["queue_position"]),
+                "queue_size": int(row["queue_size"]),
+                "scheduler_reason": row["scheduler_reason"],
+            },
+        )
+        return dict(row)
+
+    def update_scheduler_visible_message(
+        self,
+        queue_id: int,
+        *,
+        status: str = "",
+        queue_position: int | None = None,
+        queue_size: int | None = None,
+        scheduler_reason: str | None = None,
+    ) -> dict:
+        qid = int(queue_id or 0)
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"queued", "started", "cancelled", "failed"}:
+            clean_status = ""
+        out: dict = {}
+        now = now_ts()
+        with self.lock:
+            kept: list[dict] = []
+            for row in self.scheduler_visible_inputs:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("queue_id", 0) or 0) != qid:
+                    kept.append(row)
+                    continue
+                patched = dict(row)
+                if clean_status:
+                    patched["scheduler_status"] = clean_status
+                    if clean_status == "started":
+                        patched["started_at"] = now
+                    elif clean_status in {"cancelled", "failed"}:
+                        patched["finished_at"] = now
+                if queue_position is not None:
+                    patched["queue_position"] = max(0, int(queue_position or 0))
+                if queue_size is not None:
+                    patched["queue_size"] = max(0, int(queue_size or 0))
+                if scheduler_reason is not None:
+                    patched["scheduler_reason"] = trim(str(scheduler_reason or ""), 120)
+                out = patched
+                if clean_status not in {"started", "cancelled", "failed"}:
+                    kept.append(patched)
+            self.scheduler_visible_inputs = kept[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            self.updated_at = now
+            try:
+                self._persist()
+            except Exception:
+                pass
+        if out and clean_status:
+            try:
+                self._emit(
+                    "status",
+                    {
+                        "summary": f"scheduler task #{qid} {clean_status}",
+                        "scheduler_status": clean_status,
+                        "scheduler_queue_id": qid,
+                    },
+                )
+            except Exception:
+                pass
+        return out
 
     def _emit_transient(self, kind: str, data: dict):
         try:
@@ -20164,6 +21431,84 @@ body{padding:18px}
                 return self._preview_ppt_html(fp)
         raise ValueError(f"html preview not supported for: {rel}")
 
+    def preview_html_bundle(self, rel_path: str) -> bytes:
+        fp = self._session_path(rel_path)
+        rel = normalize_rel_preview_path(self._session_rel(fp))
+        if not rel:
+            raise ValueError("path required")
+        if not fp.exists() or not fp.is_file():
+            raise FileNotFoundError(f"file not found: {rel}")
+        if fp.suffix.lower() not in {".html", ".htm"}:
+            raise ValueError(f"html bundle not supported for: {rel}")
+        root = self.files_root.resolve()
+        html_text = try_read_text(fp, max_bytes=4_000_000) or ""
+        candidates: set[Path] = {fp.resolve()}
+        base_dir = fp.parent.resolve()
+        attr_re = re.compile(r'''(?is)\b(?:src|href|poster)\s*=\s*["']([^"']+)["']''')
+        css_re = re.compile(r'''(?is)url\(\s*["']?([^"')]+)["']?\s*\)''')
+        raw_refs = [m.group(1) for m in attr_re.finditer(html_text)]
+        raw_refs.extend(m.group(1) for m in css_re.finditer(html_text))
+        for raw_ref in raw_refs:
+            ref = html.unescape(str(raw_ref or "").strip())
+            if not ref or ref.startswith(("#", "data:", "javascript:", "mailto:", "tel:", "//")):
+                continue
+            if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", ref):
+                continue
+            ref = ref.split("#", 1)[0].split("?", 1)[0].strip()
+            if not ref:
+                continue
+            try:
+                candidate = (base_dir / unquote(ref)).resolve()
+                if not candidate.is_relative_to(root):
+                    continue
+                if candidate.exists() and candidate.is_file():
+                    candidates.add(candidate)
+            except Exception:
+                continue
+        # Include common same-directory asset folders for offline HTML exports.
+        for dirname in ("assets", "asset", "static", "js", "css", "images", "img", "media"):
+            d = base_dir / dirname
+            if not d.exists() or not d.is_dir():
+                continue
+            try:
+                for child in sorted(d.rglob("*")):
+                    if len(candidates) >= PREVIEW_DOWNLOAD_MAX_FILES:
+                        break
+                    if child.is_file() and child.resolve().is_relative_to(root):
+                        candidates.add(child.resolve())
+            except Exception:
+                continue
+        bio = io.BytesIO()
+        total_bytes = 0
+        written = 0
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(candidates, key=lambda p: p.relative_to(root).as_posix()):
+                if written >= PREVIEW_DOWNLOAD_MAX_FILES:
+                    break
+                try:
+                    size = int(item.stat().st_size)
+                except Exception:
+                    continue
+                if total_bytes + size > PREVIEW_DOWNLOAD_MAX_BYTES:
+                    continue
+                try:
+                    arc = item.relative_to(root).as_posix()
+                    zf.write(item, arc)
+                    total_bytes += size
+                    written += 1
+                except Exception:
+                    continue
+            manifest = {
+                "source": rel,
+                "files": written,
+                "max_files": PREVIEW_DOWNLOAD_MAX_FILES,
+                "max_bytes": PREVIEW_DOWNLOAD_MAX_BYTES,
+                "generated_at": now_ts(),
+            }
+            zf.writestr("clouds_preview_bundle.json", json_dumps(manifest, indent=2))
+        bio.seek(0)
+        return bio.read()
+
     def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
         root = self.files_root.resolve()
         max_nodes = max(100, min(8000, int(max_nodes or 1200)))
@@ -20486,7 +21831,15 @@ body{padding:18px}
             table_lines.insert(0, f"[truncated] CSV preview limited to {CHAT_UPLOAD_PARSE_MAX_BYTES} bytes.")
         return trim("\n".join(table_lines), 24_000)
 
-    def _extract_xlsx_text(self, fp: Path) -> str:
+    def _upload_parse_deadline(self) -> float:
+        return time.time() + max(1.0, float(CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS))
+
+    def _raise_if_upload_parse_expired(self, deadline: float):
+        if deadline and time.time() > float(deadline):
+            raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
+
+    def _extract_xlsx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("openpyxl"):
             wb = None
             try:
@@ -20495,9 +21848,12 @@ body{padding:18px}
                 wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
                 lines: list[str] = []
                 for ws in list(wb.worksheets)[:5]:
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Sheet] {ws.title}")
                     rows = 0
                     for row in ws.iter_rows(min_row=1, max_row=200, max_col=80, values_only=True):
+                        if rows and rows % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals = [str(v).strip() for v in row if v not in (None, "")]
                         if not vals:
                             continue
@@ -20525,6 +21881,7 @@ body{padding:18px}
                 lines: list[str] = []
                 sheet_count = 0
                 for name in sorted(names):
+                    self._raise_if_upload_parse_expired(deadline)
                     if not re.match(r"^xl/worksheets/sheet\d+\.xml$", name):
                         continue
                     sheet_count += 1
@@ -20537,6 +21894,8 @@ body{padding:18px}
                     lines.append(f"[Sheet] {Path(name).stem}")
                     taken = 0
                     for row_raw in rows_raw:
+                        if taken and taken % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         cells = re.findall(r'(?is)<c\b([^>]*)>(.*?)</c>', row_raw)[:80]
                         vals: list[str] = []
                         for attrs, body in cells:
@@ -20574,7 +21933,8 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_xls_text(self, fp: Path) -> str:
+    def _extract_xls_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("xlrd"):
             wb = None
             try:
@@ -20583,9 +21943,12 @@ body{padding:18px}
                 wb = xlrd.open_workbook(str(fp), on_demand=True)
                 lines: list[str] = []
                 for si in range(min(wb.nsheets, 5)):
+                    self._raise_if_upload_parse_expired(deadline)
                     sh = wb.sheet_by_index(si)
                     lines.append(f"[Sheet] {sh.name}")
                     for r in range(min(sh.nrows, 120)):
+                        if r and r % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals: list[str] = []
                         for c in range(min(sh.ncols, 80)):
                             value = sh.cell_value(r, c)
@@ -20609,19 +21972,25 @@ body{padding:18px}
             return trim(xls2csv_text, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_docx_text(self, fp: Path) -> str:
+    def _extract_docx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("docx"):
             try:
                 import docx  # type: ignore
 
                 doc = docx.Document(str(fp))
                 lines: list[str] = []
-                for p in list(doc.paragraphs)[:1500]:
+                for idx, p in enumerate(list(doc.paragraphs)[:1500]):
+                    if idx and idx % 100 == 0:
+                        self._raise_if_upload_parse_expired(deadline)
                     text = (p.text or "").strip()
                     if text:
                         lines.append(text)
-                for tb in list(doc.tables)[:40]:
-                    for row in list(tb.rows)[:120]:
+                for tb_idx, tb in enumerate(list(doc.tables)[:40]):
+                    self._raise_if_upload_parse_expired(deadline)
+                    for row_idx, row in enumerate(list(tb.rows)[:120]):
+                        if row_idx and row_idx % 20 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         vals = [str(cell.text or "").strip()[:500] for cell in list(row.cells)[:40]]
                         vals = [v for v in vals if v]
                         if vals:
@@ -20635,6 +22004,7 @@ body{padding:18px}
                 parts = [n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")]
                 lines: list[str] = []
                 for name in sorted(parts):
+                    self._raise_if_upload_parse_expired(deadline)
                     xml_text = self._zip_read_limited(zf, name)
                     if not xml_text:
                         continue
@@ -20650,7 +22020,7 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_doc_text(self, fp: Path) -> str:
+    def _extract_doc_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["antiword", str(fp)],
             ["catdoc", str(fp)],
@@ -20661,7 +22031,8 @@ body{padding:18px}
                 return trim(out, 24_000)
         return self._extract_strings_fallback(fp)
 
-    def _extract_pptx_text(self, fp: Path) -> str:
+    def _extract_pptx_text(self, fp: Path, deadline: float | None = None) -> str:
+        deadline = float(deadline or self._upload_parse_deadline())
         if self._module_available("pptx"):
             try:
                 import pptx  # type: ignore
@@ -20669,8 +22040,11 @@ body{padding:18px}
                 pres = pptx.Presentation(str(fp))
                 lines: list[str] = []
                 for idx, slide in enumerate(list(pres.slides)[:80], 1):
+                    self._raise_if_upload_parse_expired(deadline)
                     lines.append(f"[Slide {idx}]")
-                    for shape in list(slide.shapes)[:120]:
+                    for shape_idx, shape in enumerate(list(slide.shapes)[:120]):
+                        if shape_idx and shape_idx % 30 == 0:
+                            self._raise_if_upload_parse_expired(deadline)
                         text = ""
                         if hasattr(shape, "text"):
                             text = str(getattr(shape, "text") or "").strip()
@@ -20685,6 +22059,7 @@ body{padding:18px}
                 slides = [n for n in zf.namelist() if re.match(r"^ppt/slides/slide\d+\.xml$", n)]
                 lines: list[str] = []
                 for name in sorted(slides)[:80]:
+                    self._raise_if_upload_parse_expired(deadline)
                     xml_text = self._zip_read_limited(zf, name)
                     if not xml_text:
                         continue
@@ -20698,7 +22073,7 @@ body{padding:18px}
             pass
         return self._extract_strings_fallback(fp)
 
-    def _extract_ppt_text(self, fp: Path) -> str:
+    def _extract_ppt_text(self, fp: Path, deadline: float | None = None) -> str:
         for cmd in (
             ["catppt", str(fp)],
             ["textutil", "-convert", "txt", "-stdout", str(fp)],
@@ -20723,9 +22098,21 @@ body{padding:18px}
                 return test
             i += 1
 
-    def _uploads_prompt_block(self, max_chars: int = 24_000) -> str:
+    def _upload_parsed_ref(self, item: dict) -> str:
+        wp = str((item or {}).get("workspace_path", "") or "").strip()
+        if not wp:
+            return ""
+        item_kind = str((item or {}).get("kind", "file") or "file")
+        if item_kind not in ("text", "code"):
+            from pathlib import PurePosixPath
+            stem = PurePosixPath(wp).stem
+            parent = str(PurePosixPath(wp).parent)
+            return f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
+        return wp
+
+    def _uploads_prompt_block(self, max_chars: int = CHAT_UPLOAD_PROMPT_MAX_CHARS) -> str:
         with self.lock:
-            items = list(self.uploads[-10:])
+            items = list(self.uploads[-CHAT_UPLOAD_PROMPT_MAX_FILES:])
         if not items:
             return "(none)"
         lines = []
@@ -20734,36 +22121,39 @@ body{padding:18px}
             item_kind = str(item.get("kind", "file") or "file")
             wp = str(item.get("workspace_path", "") or "")
             filename = str(item.get("filename", "") or "")
+            status = str(item.get("parse_status", "") or "").strip() or "unknown"
+            parse_error = trim(str(item.get("parse_error", "") or "").strip(), 180)
+            full_ref = self._upload_parsed_ref(item)
+            status_note = f", parse={status}"
+            if parse_error:
+                status_note += f", error={parse_error}"
             lines.append(
                 f"- {filename} => {wp} "
-                f"({item_kind}, {item.get('size',0)} bytes)"
+                f"({item_kind}, {item.get('size',0)} bytes{status_note})"
             )
-            excerpt = str(item.get("parsed_excerpt", "")).strip()
-            if not excerpt or remaining < 200:
-                full_ref = ""
-                if wp:
-                    if item_kind not in ("text", "code"):
-                        from pathlib import PurePosixPath
-                        stem = PurePosixPath(wp).stem
-                        parent = str(PurePosixPath(wp).parent)
-                        full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                    else:
-                        full_ref = wp
-                if full_ref:
-                    lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
+            if full_ref:
+                lines.append(f"  source: {full_ref} (use read_file for complete content)")
+            if status in {"pending", "failed_saved", "skipped_large", "skipped_timeout"}:
+                if status == "pending":
+                    lines.append("  note: parsing may still be running; do not claim full-file understanding until read_file succeeds.")
+                else:
+                    lines.append("  note: parser did not provide reliable full text; use the saved file/path and report uncertainty.")
                 continue
-            chunk_cap = min(2200, remaining)
+            excerpt = str(item.get("parsed_excerpt", "")).strip()
+            if not excerpt or remaining < 160:
+                continue
+            chunk_cap = min(CHAT_UPLOAD_PROMPT_PER_FILE_CHARS, remaining)
             if self._upload_is_code_like(item):
-                chunk_cap = min(1200, remaining)
+                chunk_cap = min(600, remaining)
             elif item_kind == "text":
-                chunk_cap = min(1600, remaining)
+                chunk_cap = min(800, remaining)
             chunk = self._prepare_upload_excerpt(
                 filename,
                 wp,
                 item_kind,
                 excerpt,
                 max_chars=chunk_cap,
-                max_lines=36 if self._upload_is_code_like(item) else 72,
+                max_lines=18 if self._upload_is_code_like(item) else 28,
             )
             if not chunk:
                 continue
@@ -20771,17 +22161,6 @@ body{padding:18px}
             lines.append(chunk)
             lines.append("</uploaded_excerpt>")
             remaining -= len(chunk)
-            full_ref = ""
-            if wp:
-                if item_kind not in ("text", "code"):
-                    from pathlib import PurePosixPath
-                    stem = PurePosixPath(wp).stem
-                    parent = str(PurePosixPath(wp).parent)
-                    full_ref = f"{parent}/{stem}.parsed.md" if parent != "." else f"{stem}.parsed.md"
-                else:
-                    full_ref = wp
-            if full_ref:
-                lines.append(f"  (full content available at: {full_ref} — use read_file for the complete source/text)")
         return "\n".join(lines)
 
     def _upload_is_code_like(self, item: dict | None = None, *, filename: str = "", workspace_path: str = "", kind: str = "") -> bool:
@@ -21081,13 +22460,80 @@ body{padding:18px}
             "parse_status": status,
             "parse_error": error,
             "summary": f"upload: {safe_name} -> {workspace_rel} (parse {status})",
-            "preview": trim(preview, 500),
+            "preview": trim(preview, 180),
         })
 
     def _enqueue_upload_ingest(self, upload_id: str, safe_name: str, workspace_target: Path, parsed_target: Path | None, kind: str, mime: str, size: int):
+        if not bool(CHAT_UPLOAD_AUTO_LIBRARY_INGEST):
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "chat_upload_auto_library_ingest_disabled",
+                },
+            )
+            return
         if not callable(self.upload_callback):
             return
+        job = {
+            "id": upload_id,
+            "safe_name": safe_name,
+            "workspace_target": str(workspace_target),
+            "parsed_target": str(parsed_target) if parsed_target else "",
+            "kind": kind,
+            "mime": mime,
+            "size": int(size or 0),
+        }
+        try:
+            self.upload_ingest_queue.put_nowait(job)
+            self._ensure_upload_ingest_worker()
+        except queue.Full:
+            self._patch_upload_meta(
+                upload_id,
+                rag={
+                    "ok": False,
+                    "skipped": True,
+                    "error": f"upload ingest queue is full ({CHAT_UPLOAD_INGEST_QUEUE_MAX}); file saved without library import",
+                },
+            )
 
+    def _ensure_upload_ingest_worker(self):
+        with self.upload_ingest_worker_lock:
+            if self.upload_ingest_worker_started:
+                return
+            self.upload_ingest_worker_started = True
+            threading.Thread(target=self._upload_ingest_worker_loop, name=f"upload-ingest-{self.id}", daemon=True).start()
+
+    def _upload_ingest_worker_loop(self):
+        while True:
+            try:
+                job = self.upload_ingest_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self.upload_ingest_worker_lock:
+                    if self.upload_ingest_queue.empty():
+                        self.upload_ingest_worker_started = False
+                        return
+                    continue
+            try:
+                self._run_upload_ingest_job(job if isinstance(job, dict) else {})
+            finally:
+                try:
+                    self.upload_ingest_queue.task_done()
+                except Exception:
+                    pass
+
+    def _run_upload_ingest_job(self, job: dict):
+        if not callable(self.upload_callback):
+            return
+        upload_id = str(job.get("id", "") or "")
+        safe_name = str(job.get("safe_name", "upload") or "upload")
+        workspace_target = Path(str(job.get("workspace_target", "") or ""))
+        parsed_raw = str(job.get("parsed_target", "") or "")
+        parsed_target = Path(parsed_raw) if parsed_raw else None
+        kind = str(job.get("kind", "file") or "file")
+        mime = str(job.get("mime", "") or "")
+        size = int(job.get("size", 0) or 0)
         def ingest():
             rag_info: dict = {}
             meta = {"id": upload_id, "filename": safe_name, "mime": mime, "kind": kind, "size": int(size or 0)}
@@ -21100,7 +22546,7 @@ body{padding:18px}
             if rag_info:
                 self._patch_upload_meta(upload_id, rag=dict(rag_info))
 
-        threading.Thread(target=ingest, name=f"upload-ingest-{self.id}", daemon=True).start()
+        ingest()
 
     def _parse_upload_job(self, job: dict):
         upload_id = str(job.get("id", ""))
@@ -21125,7 +22571,7 @@ body{padding:18px}
             return
         try:
             parsed_excerpt = ""
-            deadline = time.time() + CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS
+            deadline = self._upload_parse_deadline()
             if kind == "pdf":
                 parsed_excerpt = trim(self._extract_pdf_text(stored), 24_000)
             elif kind == "text":
@@ -21134,19 +22580,18 @@ body{padding:18px}
             elif kind == "csv":
                 parsed_excerpt = trim(self._extract_csv_text(self._safe_read_head_bytes(stored, CHAT_UPLOAD_PARSE_MAX_BYTES)), 24_000)
             elif kind == "excel" and ext == ".xlsx":
-                parsed_excerpt = trim(self._extract_xlsx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xlsx_text(stored, deadline), 24_000)
             elif kind == "excel" and ext == ".xls":
-                parsed_excerpt = trim(self._extract_xls_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_xls_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".pptx":
-                parsed_excerpt = trim(self._extract_pptx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_pptx_text(stored, deadline), 24_000)
             elif kind == "presentation" and ext == ".ppt":
-                parsed_excerpt = trim(self._extract_ppt_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_ppt_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".docx":
-                parsed_excerpt = trim(self._extract_docx_text(stored), 24_000)
+                parsed_excerpt = trim(self._extract_docx_text(stored, deadline), 24_000)
             elif kind == "document" and ext == ".doc":
-                parsed_excerpt = trim(self._extract_doc_text(stored), 24_000)
-            if time.time() > deadline:
-                raise TimeoutError(f"parse timeout after {CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS}s")
+                parsed_excerpt = trim(self._extract_doc_text(stored, deadline), 24_000)
+            self._raise_if_upload_parse_expired(deadline)
             # Save parsed.md
             parsed_target: Path | None = None
             if parsed_excerpt and kind not in ("text", "code"):
@@ -21165,17 +22610,12 @@ body{padding:18px}
                 parse_finished_at=now_ts(),
             )
             if parsed_excerpt:
-                bb_excerpt = self._prepare_upload_excerpt(
-                    safe_name,
-                    self._session_rel(workspace_target),
-                    kind,
-                    parsed_excerpt,
-                    max_chars=min(4000, max(1200, BLACKBOARD_MAX_TEXT - 200)),
-                    max_lines=60,
+                parsed_rel = self._session_rel(parsed_target) if parsed_target else self._session_rel(workspace_target)
+                bb_content = (
+                    f"[upload:{safe_name}] kind={kind} size={size} parse=done "
+                    f"chars={len(parsed_excerpt)} source={parsed_rel}"
                 )
-                if bb_excerpt:
-                    bb_content = f"[upload:{safe_name}]\n{bb_excerpt}"
-                    self._blackboard_append_section("research_notes", "system", bb_content)
+                self._blackboard_append_section("research_notes", "system", bb_content)
             # Emit parse completed event
             self._emit_upload_status(upload_id, safe_name, workspace_target, kind, size, "done", "", parsed_excerpt)
             self._enqueue_upload_ingest(upload_id, safe_name, workspace_target, parsed_target, kind, mime, size)
@@ -21846,6 +23286,8 @@ body{padding:18px}
 
     def _generate_run_completion_summary(self):
         """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
+        if not RUN_COMPLETION_SUMMARY_ENABLED:
+            return
         if self.cancel_requested:
             return
         bb = self._ensure_blackboard()
@@ -22802,6 +24244,39 @@ body{padding:18px}
             system=system,
             media_inputs=media_inputs,
         )
+
+        def _emit_http_retry(meta: dict):
+            try:
+                delay = float((meta or {}).get("delay", 0.0) or 0.0)
+            except Exception:
+                delay = 0.0
+            status = int((meta or {}).get("status", 0) or 0)
+            provider = str((meta or {}).get("provider", "") or pin).strip() or pin
+            attempt_no = int((meta or {}).get("attempt", 0) or 0)
+            retry_budget = int((meta or {}).get("retry_budget", 0) or 0)
+            reason = trim(str((meta or {}).get("reason", "") or ""), 160)
+            status_txt = f"HTTP {status}" if status else "network"
+            if attempt_no > 0:
+                label = f"retry {attempt_no}/{retry_budget}"
+            else:
+                label = "cooldown"
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"{context_label} model call {status_txt} on {provider}; "
+                        f"{label} after {delay:.0f}s"
+                        + (f": {reason}" if reason else "")
+                    ),
+                    "llm_http_retry": True,
+                    "provider": provider,
+                    "status": status,
+                    "delay": delay,
+                    "attempt": attempt_no,
+                    "retry_budget": retry_budget,
+                },
+            )
+
         for attempt in range(1, retry_budget + 2):
             try:
                 response = self._call_interruptible(
@@ -22814,6 +24289,8 @@ body{padding:18px}
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
                         media_inputs=media_inputs,
+                        cancel_check=lambda: bool(self.cancel_requested),
+                        on_http_retry=_emit_http_retry,
                     ),
                     progress_label=f"{context_label} model call",
                 )
@@ -22871,6 +24348,8 @@ body{padding:18px}
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
                                 media_inputs=None,
+                                cancel_check=lambda: bool(self.cancel_requested),
+                                on_http_retry=_emit_http_retry,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
@@ -28255,7 +29734,7 @@ body{padding:18px}
             if core_c and len(core_c) >= 4:
                 _core_to_identity.setdefault(core_c, identity)
 
-
+        incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
             if isinstance(item, str):
                 raw = {"content": item, "status": "pending"}
@@ -34872,6 +36351,104 @@ body{padding:18px}
         )
         return row
 
+    def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
+        text = trim(str(content or "").strip(), 6000)
+        if not text:
+            raise ValueError("content required")
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=0.05))
+        except Exception:
+            acquired = False
+        if not acquired:
+            # Last-resort in-memory queue update. This keeps the HTTP request from
+            # hanging behind parser/session persistence locks.
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            if start_worker:
+                threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+            return row
+        try:
+            row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
+            self.updated_at = now_ts()
+            try:
+                self._persist()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
+        self._emit("status", {"summary": f"user message queued until session lock is free (id={row['id']})"})
+        if start_worker:
+            threading.Thread(target=self._deferred_start_worker_loop, name=f"deferred-start-{self.id}", daemon=True).start()
+        return row
+
+    def _append_deferred_start_input_unlocked(self, text: str, reason: str) -> tuple[dict, bool]:
+        with self.deferred_start_worker_lock:
+            self.deferred_start_seq += 1
+            row = {
+                "id": int(self.deferred_start_seq),
+                "content": text,
+                "queued_at": now_ts(),
+                "reason": trim(str(reason or "session busy"), 120),
+            }
+            self.deferred_start_inputs.append(row)
+            self.deferred_start_inputs = self.deferred_start_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
+            start_worker = not self.deferred_start_worker_started
+            self.deferred_start_worker_started = True
+        return row, start_worker
+
+    def _deferred_start_worker_loop(self):
+        while True:
+            row = None
+            acquired = False
+            try:
+                acquired = bool(self.lock.acquire(timeout=0.5))
+            except Exception:
+                acquired = False
+            if not acquired:
+                time.sleep(0.1)
+                continue
+            try:
+                with self.deferred_start_worker_lock:
+                    has_deferred_inputs = bool(self.deferred_start_inputs)
+                    if not has_deferred_inputs:
+                        self.deferred_start_worker_started = False
+                        return
+                    row = self.deferred_start_inputs.pop(0)
+                if self.running:
+                    # Current run will pick up additional user input through the
+                    # normal live-input path after it releases the lock.
+                    text = str(row.get("content", "") or "")
+                    self.lock.release()
+                    acquired = False
+                    try:
+                        self._enqueue_running_user_input(text)
+                    except Exception:
+                        pass
+                    continue
+                self.updated_at = now_ts()
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+            finally:
+                if acquired:
+                    try:
+                        self.lock.release()
+                    except Exception:
+                        pass
+            if not row:
+                continue
+            try:
+                self.submit_user_message(str(row.get("content", "") or ""))
+            except Exception as exc:
+                try:
+                    self._emit("error", {"summary": f"queued user message failed to start: {trim(str(exc), 220)}"})
+                except Exception:
+                    pass
+
     def _inject_pending_user_inputs(self) -> int:
         injected: list[dict] = []
         with self.lock:
@@ -35128,7 +36705,22 @@ body{padding:18px}
         start_worker = False
         dropped_stale_inputs = 0
         removed_runtime_hints = 0
-        with self.lock:
+        acquired = False
+        try:
+            acquired = bool(self.lock.acquire(timeout=SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS))
+        except Exception:
+            acquired = False
+        if not acquired:
+            row = self._enqueue_deferred_start_input(content, "session lock busy")
+            return {
+                "ok": True,
+                "queued": True,
+                "running": bool(getattr(self, "running", False)),
+                "queue_id": int(row.get("id", 0) or 0),
+                "delay_reason": str(row.get("reason", "session lock busy")),
+                "deferred_start": True,
+            }
+        try:
             if self.running:
                 pass
             else:
@@ -35193,6 +36785,11 @@ body{padding:18px}
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
                 self._persist()
                 start_worker = True
+        finally:
+            try:
+                self.lock.release()
+            except Exception:
+                pass
         if dropped_stale_inputs > 0:
             self._emit(
                 "status",
@@ -39468,6 +41065,7 @@ body{padding:18px}
                     dropped_pending_inputs = len(self.pending_user_inputs)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
+                self.scheduler_starting = False
                 self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
@@ -39514,7 +41112,7 @@ body{padding:18px}
         with self.lock:
             msg_window = 120 if lite else 200
             op_feed_window = 80 if lite else 240
-            upload_window = 16 if lite else 40
+            upload_window = 12 if lite else 40
             conversation_window = 160 if lite else 400
             activity_window = 40 if lite else 100
             ops_window = 60 if lite else 200
@@ -39525,6 +41123,29 @@ body{padding:18px}
                 if str((msg or {}).get("role", "")).strip() == "tool":
                     continue
                 total_message_count += 1
+            scheduler_feed_rows: list[dict] = []
+            for row in self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("content", "") or "").strip()
+                if not text:
+                    continue
+                qid = int(row.get("queue_id", 0) or 0)
+                scheduler_feed_rows.append(
+                    {
+                        "role": "user",
+                        "type": "scheduler_queued",
+                        "ts": float(row.get("queued_at", 0.0) or now_ts()),
+                        "text": text,
+                        "scheduler_status": str(row.get("scheduler_status", "queued") or "queued"),
+                        "scheduler_queue_id": qid,
+                        "queue_position": int(row.get("queue_position", 0) or 0),
+                        "queue_size": int(row.get("queue_size", 0) or 0),
+                        "scheduler_reason": str(row.get("scheduler_reason", "") or ""),
+                        "_vk": f"scheduler:{qid}:{len(text)}",
+                    }
+                )
+            total_message_count += len(scheduler_feed_rows)
             inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
             inferred_bus_target_role = ""
             for msg in self.messages[-msg_window:]:
@@ -39700,6 +41321,7 @@ body{padding:18px}
                     conversation_feed.append(
                         {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
                     )
+            conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
             upload_view = []
             for item in self.uploads[-upload_window:]:
@@ -39711,7 +41333,7 @@ body{padding:18px}
                         "kind": item.get("kind"),
                         "size": item.get("size"),
                         "uploaded_at": item.get("uploaded_at"),
-                        "preview": trim(item.get("parsed_excerpt", ""), 1200),
+                        "preview": trim(item.get("parsed_excerpt", ""), 240 if lite else 700),
                         "parse_status": item.get("parse_status"),
                         "parse_error": item.get("parse_error"),
                     }
@@ -39794,6 +41416,10 @@ body{padding:18px}
                 "agent_active_tool": str(self.current_tool_name or ""),
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
+                "scheduler_queued_inputs_count": sum(
+                    1 for row in self.scheduler_visible_inputs
+                    if isinstance(row, dict) and str(row.get("scheduler_status", "queued") or "queued") == "queued"
+                ),
                 "context_token_upper_bound": int(self.context_token_upper_bound),
                 "context_effective_token_limit": int(ctx.get("effective_limit", ctx.get("limit", 0))),
                 "context_reserved_tokens": int(ctx.get("reserved", 0)),
@@ -39847,6 +41473,27 @@ body{padding:18px}
             }
 
     def degraded_snapshot(self, reason: str = "session busy") -> dict:
+        uploads_view: list[dict] = []
+        try:
+            uploads_raw = list(getattr(self, "uploads", []) or [])[-12:]
+            for item in uploads_raw:
+                if not isinstance(item, dict):
+                    continue
+                uploads_view.append(
+                    {
+                        "id": item.get("id"),
+                        "filename": item.get("filename"),
+                        "workspace_path": item.get("workspace_path"),
+                        "kind": item.get("kind"),
+                        "size": item.get("size"),
+                        "uploaded_at": item.get("uploaded_at"),
+                        "preview": trim(item.get("parsed_excerpt", ""), 160),
+                        "parse_status": item.get("parse_status"),
+                        "parse_error": item.get("parse_error"),
+                    }
+                )
+        except Exception:
+            uploads_view = []
         return {
             "id": self.id,
             "title": str(getattr(self, "title", self.id) or self.id),
@@ -39867,7 +41514,7 @@ body{padding:18px}
             "degraded_reason": trim(reason, 220),
             "messages": [],
             "conversation_feed": [],
-            "uploads": [],
+            "uploads": uploads_view,
             "todos": [],
             "tasks": [],
             "background": [],
@@ -39902,14 +41549,15 @@ body{padding:18px}
             acquired = False
         if not acquired:
             try:
-                if bool(getattr(self, "running", False)):
-                    hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
-                    started = float(getattr(self, "run_started_at", 0.0) or 0.0)
-                    baseline = hb or started
-                    if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
-                        self.cancel_requested = True
-                        self.running = False
-                        self.current_phase = "crashed_recovered"
+                    if bool(getattr(self, "running", False)):
+                        hb = float(getattr(self, "run_last_heartbeat", 0.0) or 0.0)
+                        started = float(getattr(self, "run_started_at", 0.0) or 0.0)
+                        baseline = hb or started
+                        if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
+                            self.cancel_requested = True
+                            self.running = False
+                            self.scheduler_starting = False
+                            self.current_phase = "crashed_recovered"
                         self.current_tool_name = ""
                         self.run_recovered_at = now_value
                         self.run_recovered_reason = (
@@ -39942,6 +41590,7 @@ body{padding:18px}
                 if baseline and (now_value - baseline) > max(60, int(stale_seconds or SESSION_HEARTBEAT_STALE_SECONDS)):
                     self.cancel_requested = True
                     self.running = False
+                    self.scheduler_starting = False
                     self.current_phase = "crashed_recovered"
                     self.current_tool_name = ""
                     self.run_recovered_at = now_value
@@ -40656,6 +42305,9 @@ class SessionManager:
             headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
             payload_template=str(profile.get("payload_template", "") or ""),
             thinking_stream=bool(profile.get("thinking_stream", False)),
+            api_protocol=str(profile.get("api_protocol", "auto") or "auto"),
+            tool_protocol=str(profile.get("tool_protocol", "auto") or "auto"),
+            protocol_detection=str(profile.get("protocol_detection", "auto") or "auto"),
         )
         client.apply_profile(profile)
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
@@ -40719,6 +42371,31 @@ class SessionManager:
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model or '(no-model)'}",
                     "source": profile.get("source", ""),
+                    "api_protocol": profile.get("api_protocol", "auto"),
+                    "tool_protocol": profile.get("tool_protocol", "auto"),
+                    "protocol_detection": profile.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(profile.get("provider", "")),
+                        endpoint=str(profile.get("endpoint", "")),
+                        base_url=str(profile.get("base_url", "")),
+                        model=model,
+                        requested=profile.get("api_protocol", "auto"),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(profile.get("provider", "")),
+                        model=model,
+                        requested=profile.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(profile.get("provider", "")),
+                            endpoint=str(profile.get("endpoint", "")),
+                            base_url=str(profile.get("base_url", "")),
+                            model=model,
+                            requested=profile.get("api_protocol", "auto"),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "capabilities": caps,
@@ -40756,6 +42433,31 @@ class SessionManager:
                         "model": tag,
                         "label": f"{profile.get('label', 'Ollama')} | {tag}",
                         "source": "ollama-tags",
+                        "api_protocol": profile.get("api_protocol", "auto"),
+                        "tool_protocol": profile.get("tool_protocol", "auto"),
+                        "protocol_detection": profile.get("protocol_detection", "auto"),
+                        "effective_api_protocol": infer_api_protocol(
+                            "ollama",
+                            endpoint=str(profile.get("endpoint", "")),
+                            base_url=str(profile.get("base_url", "")),
+                            model=tag,
+                            requested=profile.get("api_protocol", "auto"),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
+                        "effective_tool_protocol": infer_tool_protocol(
+                            "ollama",
+                            model=tag,
+                            requested=profile.get("tool_protocol", "auto"),
+                            api_protocol=infer_api_protocol(
+                                "ollama",
+                                endpoint=str(profile.get("endpoint", "")),
+                                base_url=str(profile.get("base_url", "")),
+                                model=tag,
+                                requested=profile.get("api_protocol", "auto"),
+                                protocol_detection=profile.get("protocol_detection", "auto"),
+                            ),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
                         "capabilities": tag_caps,
@@ -40781,6 +42483,31 @@ class SessionManager:
                     "model": str(active.get("model", "") or ""),
                     "label": f"{active.get('label', self.user_active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
                     "source": active.get("source", "active-profile"),
+                    "api_protocol": active.get("api_protocol", "auto"),
+                    "tool_protocol": active.get("tool_protocol", "auto"),
+                    "protocol_detection": active.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(active.get("provider", "")),
+                        endpoint=str(active.get("endpoint", "")),
+                        base_url=str(active.get("base_url", "")),
+                        model=str(active.get("model", "") or ""),
+                        requested=active.get("api_protocol", "auto"),
+                        protocol_detection=active.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(active.get("provider", "")),
+                        model=str(active.get("model", "") or ""),
+                        requested=active.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(active.get("provider", "")),
+                            endpoint=str(active.get("endpoint", "")),
+                            base_url=str(active.get("base_url", "")),
+                            model=str(active.get("model", "") or ""),
+                            requested=active.get("api_protocol", "auto"),
+                            protocol_detection=active.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=active.get("protocol_detection", "auto"),
+                    ),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "capabilities": active_caps,
@@ -40972,6 +42699,10 @@ class SessionManager:
                         1 for row in getattr(sess, "messages", [])
                         if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
                     )
+                    message_count += sum(
+                        1 for row in getattr(sess, "scheduler_visible_inputs", [])
+                        if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+                    )
                     title = str(getattr(sess, "title", "") or getattr(sess, "id", ""))
                     running = bool(getattr(sess, "running", False))
                 except Exception:
@@ -41063,6 +42794,10 @@ window.MathJax={
             <option value="lmstudio">LM Studio (Local)</option>
             <option value="openai_compat">OpenAI Compatible</option>
             <option value="anthropic">Anthropic</option>
+            <option value="claude_code">Claude Code / Anthropic</option>
+            <option value="opencode">OpenCode</option>
+            <option value="openclaw">OpenClaw</option>
+            <option value="hermes">Hermes</option>
             <option value="glm">GLM</option>
             <option value="kimi">KIMI (Moonshot)</option>
             <option value="openrouter">OpenRouter</option>
@@ -41158,6 +42893,8 @@ window.MathJax={
           <div id="previewStageStat" class="mono preview-stage-stat"></div>
         </div>
         <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
+        <button id="previewModeBtn" class="subtle hidden">Source</button>
+        <button id="previewDownloadBtn" class="subtle hidden">Download</button>
         <button id="previewReloadBtn" class="subtle">Reload</button>
       </div>
       <div id="previewBody" class="preview-body"></div>
@@ -41238,7 +42975,7 @@ body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-sh
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
-.session-item{padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:94px;min-height:94px;flex:0 0 94px;display:flex;flex-direction:column;justify-content:flex-start;gap:7px;overflow:hidden}
+.session-item{padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:80px;min-height:80px;flex:0 0 80px;display:flex;flex-direction:column;justify-content:flex-start;gap:6px;overflow:hidden}
 .session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
 .session-item .mono{display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .session-item.active{border-color:var(--brand);box-shadow:inset 0 0 0 1px var(--brand),0 0 0 2px rgba(31,111,235,.16)}
@@ -41592,7 +43329,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -41636,11 +43373,12 @@ const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case',
 S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
-const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],claude_code:[{key:'claude_code_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Claude Code / Anthropic Messages endpoint root'},{key:'claude_code_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic-compatible API key'},{key:'claude_code_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'Claude model identifier'}],opencode:[{key:'opencode_url',label:'API Base URL',type:'url',placeholder:'http://localhost:4096/v1',hint:'OpenCode-compatible OpenAI-style endpoint'},{key:'opencode_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'opencode_model',label:'Model',type:'text',placeholder:'auto',hint:'Model identifier'}],openclaw:[{key:'openclaw_url',label:'API Base URL',type:'url',placeholder:'http://localhost:4097/v1',hint:'OpenClaw-compatible OpenAI-style endpoint'},{key:'openclaw_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'openclaw_model',label:'Model',type:'text',placeholder:'auto',hint:'Model identifier'}],hermes:[{key:'hermes_url',label:'API Base URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'Hermes model endpoint, usually OpenAI-compatible HTTP'},{key:'hermes_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'hermes_model',label:'Model',type:'text',placeholder:'NousResearch/Hermes-3-Llama-3.1-8B',hint:'Hermes model identifier'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+const LLM_PROTOCOL_DEFAULTS={ollama:{api:'ollama_chat',tool:'ollama_tools'},anthropic:{api:'anthropic_messages',tool:'anthropic_tools'},claude_code:{api:'anthropic_messages',tool:'anthropic_tools'},hermes:{api:'openai_chat',tool:'hermes_tool_text'},opencode:{api:'openai_chat',tool:'openai_tools'},openclaw:{api:'openai_chat',tool:'openai_tools'},custom_http:{api:'custom_http',tool:'auto'}};
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http','opencode','openclaw','hermes']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}const proto=LLM_PROTOCOL_DEFAULTS[provider]||{api:'auto',tool:'auto'};html+='<div class=\"llm-field\"><label>API Protocol</label><select id=\"llmF_api_protocol\"><option value=\"auto\">Auto detect</option><option value=\"openai_chat\">OpenAI Chat Completions</option><option value=\"openai_responses\">OpenAI Responses</option><option value=\"anthropic_messages\">Anthropic Messages</option><option value=\"ollama_chat\">Ollama Native Chat</option><option value=\"custom_http\">Custom HTTP</option></select><div class=\"llm-hint\">Auto keeps legacy config behavior; manual selection overrides provider inference.</div></div>';html+='<div class=\"llm-field\"><label>Tool Protocol</label><select id=\"llmF_tool_protocol\"><option value=\"auto\">Auto detect</option><option value=\"openai_tools\">OpenAI tools</option><option value=\"anthropic_tools\">Anthropic tools</option><option value=\"ollama_tools\">Ollama tools</option><option value=\"hermes_tool_text\">Hermes text tool calls</option><option value=\"json_tool_text\">JSON text tool calls</option><option value=\"none\">No tools</option></select><div class=\"llm-hint\">Controls how tool schemas are sent and how tool calls are parsed.</div></div>';html+='<div class=\"llm-field\"><label>Protocol Detection</label><select id=\"llmF_protocol_detection\"><option value=\"auto\">Auto</option><option value=\"off\">Off</option></select><div class=\"llm-hint\">Off disables heuristic protocol inference unless explicit protocol fields are selected.</div></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;const apiSel=E('llmF_api_protocol');const toolSel=E('llmF_tool_protocol');if(apiSel)apiSel.value=proto.api||'auto';if(toolSel)toolSel.value=proto.tool||'auto';if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
+async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},opencode:{urlKey:'opencode_url',modelKey:'opencode_model',keyKey:'opencode_key',defaultUrl:'http://localhost:4096/v1'},openclaw:{urlKey:'openclaw_url',modelKey:'openclaw_model',keyKey:'openclaw_key',defaultUrl:'http://localhost:4097/v1'},hermes:{urlKey:'hermes_url',modelKey:'hermes_model',keyKey:'hermes_key',defaultUrl:'http://localhost:8000/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.api_protocol=E('llmF_api_protocol')?.value||'auto';config.tool_protocol=E('llmF_tool_protocol')?.value||'auto';config.protocol_detection=E('llmF_protocol_detection')?.value||'auto';config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
@@ -41804,10 +43542,12 @@ Object.assign(I18N['en'],{
   event_upload_title:'Upload',event_upload_path:'path',event_upload_filename:'filename',event_preview_unavailable:'Preview unavailable for this upload.',event_upload_parsing:'Parsing uploaded file in background. The bubble will refresh when parsing completes.',event_upload_failed:'Upload parsing failed',
   event_command_title:'Command',event_command_label:'command',event_cwd:'cwd',event_changed:'changed',event_command_empty:'No command output captured.',event_ui_truncated:'UI truncated',event_model_truncated:'Model truncated',event_temp_read_file:'Temp read_file',event_buffered:'Buffered',
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
-  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+	  event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -41824,10 +43564,12 @@ Object.assign(I18N['zh-CN'],{
   event_upload_title:'上传',event_upload_path:'路径',event_upload_filename:'文件名',event_preview_unavailable:'该上传暂不支持预览。',event_upload_parsing:'正在后台解析上传文件。解析完成后气泡会自动刷新。',event_upload_failed:'上传解析失败',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目录',event_changed:'变更',event_command_empty:'未捕获到命令输出。',event_ui_truncated:'UI 截断',event_model_truncated:'模型截断',event_temp_read_file:'临时 read_file',event_buffered:'已缓冲',
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
-  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+	  event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -41847,10 +43589,12 @@ Object.assign(I18N['zh-TW'],{
   event_upload_title:'上傳',event_upload_path:'路徑',event_upload_filename:'檔名',event_preview_unavailable:'此上傳暫時無法預覽。',event_upload_parsing:'正在背景解析上傳檔案。解析完成後氣泡會自動更新。',event_upload_failed:'上傳解析失敗',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目錄',event_changed:'變更',event_command_empty:'未擷取到命令輸出。',event_ui_truncated:'UI 截斷',event_model_truncated:'模型截斷',event_temp_read_file:'暫存 read_file',event_buffered:'已緩衝',
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
-  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+	  event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -41868,10 +43612,12 @@ Object.assign(I18N['ja'],{
   event_upload_title:'アップロード',event_upload_path:'パス',event_upload_filename:'ファイル名',event_preview_unavailable:'このアップロードではプレビューを利用できません。',event_upload_parsing:'アップロードファイルをバックグラウンドで解析中です。完了するとバブルが更新されます。',event_upload_failed:'アップロード解析失敗',
   event_command_title:'コマンド',event_command_label:'コマンド',event_cwd:'作業ディレクトリ',event_changed:'変更',event_command_empty:'コマンド出力は取得されませんでした。',event_ui_truncated:'UI 切り詰め',event_model_truncated:'モデル切り詰め',event_temp_read_file:'一時 read_file',event_buffered:'バッファ済み',
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
-  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+	  event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -41883,7 +43629,7 @@ function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
 function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
-async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();renderChat('language');renderSkillsEntryLink()}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const explicit=Number(o.timeoutMs);const timeoutMs=(Number.isFinite(explicit)&&explicit>0)?Math.max(1000,Math.min(86400000,Math.round(explicit))):globalApiTimeoutMs();delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
@@ -41960,6 +43706,39 @@ function _deltaPushLimited(arr,row,maxCount){if(!Array.isArray(arr))return;if(!r
 function _deltaAdoptAgentRole(data){if(!_deltaEnsureSnapshot())return'';const role=_chatVirtAgentRoleKey(data?.agent_role);if(!role)return'';S.snap.agent_active_role=role;return role}
 function _deltaAppendActivity(type,data,ts){if(!_deltaEnsureSnapshot())return;const d=(data&&typeof data==='object')?data:{};const summary=String(d.summary||d.text||d.name||type||'').trim();if(!summary)return;_deltaPushLimited(S.snap.activity,{ts:Number(ts||Date.now()/1000),type:String(type||''),summary:summary},DELTA_MAX_ACTIVITY)}
 function _deltaAppendConversationRow(row){if(!_deltaEnsureSnapshot())return;_deltaPushLimited(S.snap.conversation_feed,row,DELTA_MAX_FEED)}
+function _deltaRemoveSchedulerQueued(queueId=0,text=''){
+  if(!_deltaEnsureSnapshot())return 0;
+  const qid=Number(queueId||0);
+  const txt=String(text||'').trim();
+  const match=row=>{
+    if(!row||typeof row!=='object')return false;
+    if(String(row.type||'')!=='scheduler_queued')return false;
+    if(qid&&Number(row.scheduler_queue_id||0)===qid)return true;
+    if(!qid&&txt&&String(row.text||'').trim()===txt)return true;
+    return false;
+  };
+  let feedRemoved=0;
+  const removeFrom=(arr,limitOne=false)=>{
+    if(!Array.isArray(arr))return 0;
+    let n=0;
+    for(let i=arr.length-1;i>=0;i--){
+      if(!match(arr[i]))continue;
+      arr.splice(i,1);
+      n+=1;
+      if(limitOne&&!qid)break;
+    }
+    return n;
+  };
+  feedRemoved=removeFrom(S.snap.conversation_feed,true);
+  removeFrom(S.snap.messages,true);
+  if(feedRemoved>0){
+    const queued=Number(S.snap.scheduler_queued_inputs_count||0);
+    S.snap.scheduler_queued_inputs_count=Math.max(0,(Number.isFinite(queued)?queued:0)-feedRemoved);
+    const mc=Number(S.snap.message_count||0);
+    S.snap.message_count=Math.max(0,(Number.isFinite(mc)?mc:0)-feedRemoved);
+  }
+  return feedRemoved;
+}
 function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;const op={id:String(data?.id||''),seq:Number(data?.seq||0),ts:Number(ts||Date.now()/1000),type:String(type||''),data:(data&&typeof data==='object')?{...data}:{}};_deltaPushLimited(S.snap.operations,op,DELTA_MAX_OPERATIONS)}
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
@@ -42012,8 +43791,8 @@ function _deltaScheduleRender(flags={}){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>renderChat('delta'));}
-        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');renderChat('delta');}
+        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
+        else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');scheduleRenderChat('delta');}
       }
     }
     if(needBoards){
@@ -42024,6 +43803,19 @@ function _deltaScheduleRender(flags={}){
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
       }
     }
+  });
+}
+function scheduleRenderChat(reason='snapshot'){
+  const next=String(reason||'snapshot');
+  const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
+  const cur=String(S.chatRenderPendingReason||'');
+  if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
+  if(S.chatRenderRaf)return;
+  S.chatRenderRaf=requestAnimationFrame(()=>{
+    S.chatRenderRaf=0;
+    const runReason=String(S.chatRenderPendingReason||next||'snapshot');
+    S.chatRenderPendingReason='';
+    renderChat(runReason);
   });
 }
 function _deltaConsumeSeq(evt){
@@ -42110,13 +43902,23 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='message'){
     const role=String(data.role||'assistant').trim()||'assistant';
-    const rowType=String(data.type||'message').trim()||'message';
+    const schedulerStatus=String(data.scheduler_status||'').trim();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const rowType=(schedulerStatus&&schedulerQueueId)?'scheduler_queued':(String(data.type||'message').trim()||'message');
     let text=String(data.text||'');
     if(rowType==='plan_notice'&&!text&&data&&typeof data.data==='object'){
       text=String(data.data.body||'');
     }
     const msgRow={role:role,text:text,ts:ts,type:rowType};
     if(data&&typeof data==='object'&&data.data&&typeof data.data==='object')msgRow.data={...data.data};
+    if(rowType==='scheduler_queued'){
+      msgRow.scheduler_status=schedulerStatus||'queued';
+      msgRow.scheduler_queue_id=schedulerQueueId;
+      msgRow.queue_position=Number(data.queue_position||0);
+      msgRow.queue_size=Number(data.queue_size||0);
+      msgRow.scheduler_reason=String(data.scheduler_reason||'');
+      msgRow._vk=`scheduler:${schedulerQueueId}:${text.length}`;
+    }
     const ar=String(data.agent_role||'').trim();
     if(ar){
       msgRow.agent_role=ar;
@@ -42125,14 +43927,20 @@ function _deltaApplyRuntimeEvent(evt){
     }
     const thinking=String(data.thinking||'').trim();
     if(thinking)msgRow.thinking=thinking;
-    _deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
+    if(rowType!=='scheduler_queued'&&role==='user'){
+      _deltaRemoveSchedulerQueued(Number(data.scheduler_queue_id||0),text);
+    }
+    if(rowType!=='scheduler_queued')_deltaPushLimited(S.snap.messages,msgRow,DELTA_MAX_MESSAGES);
     _deltaAppendConversationRow(msgRow);
     _deltaAppendActivity(typ,data,ts);
     if(role!=='tool'){
       const cur=Number(S.snap.message_count||0);
       S.snap.message_count=(Number.isFinite(cur)?cur:0)+1;
     }
-    if(role==='user')S.snap.running=true;
+    if(rowType==='scheduler_queued'){
+      const curQueued=Number(S.snap.scheduler_queued_inputs_count||0);
+      S.snap.scheduler_queued_inputs_count=(Number.isFinite(curQueued)?curQueued:0)+1;
+    }else if(role==='user')S.snap.running=true;
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
@@ -42163,9 +43971,12 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='status'||typ==='tool_start'||typ==='tool_result'||typ==='error'||typ==='file_read'||typ==='agent_bus'||typ==='background'||typ==='inbox'||typ==='teammate'||typ==='task.completed'||typ==='model_config'||typ==='skill_write'||typ.startsWith('worktree.')){
     _deltaAppendActivity(typ,data,ts);
+    const schedulerStatus=String(data.scheduler_status||'').trim().toLowerCase();
+    const schedulerQueueId=Number(data.scheduler_queue_id||0);
+    const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
     if(summaryLow==='run finished')S.snap.running=false;
-    _deltaScheduleRender({boards:true,sessions:true});
+    _deltaScheduleRender({chat:removedScheduler>0,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
   return{handled:false,needsSnapshot:true};
@@ -42224,8 +44035,8 @@ function renderSessions(){
     setPanelHtml('sessionList',`<div class=\"mono\">${esc(t('no_sessions'))}</div>`);
     return;
   }
-  const itemH=94;
-  const rowStride=102;
+  const itemH=80;
+  const rowStride=88;
   const viewportH=Math.max(240,Number(host.clientHeight||420));
   const scrollTop=Math.max(0,Number(host.scrollTop||0));
   const start=Math.max(0,Math.floor(scrollTop/rowStride)-8);
@@ -42836,12 +44647,14 @@ function _mdWorkerQueue(text,key){
 }
 function renderMarkdownCached(text,key){const src=String(text||'');const k=String(key||'');if(k){const hit=MD_CACHE.get(k);if(hit)return hit}const jobId=_mdWorkerQueue(src,k);if(jobId>0){return `<div class=\"md-async-slot\" data-md-job=\"${jobId}\">${esc(src).replace(/\\n/g,'<br>')}</div>`}const html=renderMarkdown(src);if(k){_mdCacheSet(k,html)}return html}
 function normalizePreviewPath(path){return String(path||'').replace(/\\\\/g,'/').replace(/^\\.\\//,'').replace(/^\\/+/, '').trim()}
-function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';return ''}
+function previewModeFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();if(rel.endsWith('.html')||rel.endsWith('.htm'))return 'html';if(rel.endsWith('.md')||rel.endsWith('.markdown'))return 'markdown';const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return 'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return 'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return 'audio';if(ext==='.pdf')return 'pdf';if(['.csv','.tsv'].includes(ext))return 'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return 'excel';if(['.docx','.doc','.docm'].includes(ext))return 'document';if(['.pptx','.ppt','.pptm'].includes(ext))return 'presentation';if(CODE_PREVIEW_EXTS.has(ext)||CODE_PREVIEW_FILENAMES.has(name))return 'code';if(ext==='.txt')return 'markdown';return ''}
 function previewKindIcon(kind){if(kind==='html')return '🌐';if(kind==='markdown')return '📝';if(kind==='image')return '🖼️';if(kind==='video')return '🎞️';if(kind==='audio')return '🔊';if(kind==='pdf')return '📕';if(kind==='csv')return '📊';if(kind==='excel')return '📗';if(kind==='document')return '📘';if(kind==='presentation')return '📽️';if(kind==='code')return '{}';return '📄'}
 function previewTabId(path){return 'p:'+normalizePreviewPath(path).toLowerCase()}
 function ensurePreviewState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return{tabs:[],active:'conversation'};if(!S.previewBySession)S.previewBySession={};if(!S.previewBySession[sid]||!Array.isArray(S.previewBySession[sid].tabs)){S.previewBySession[sid]={tabs:[],active:'conversation'}}return S.previewBySession[sid]}
 function encodePreviewPath(path){return normalizePreviewPath(path).split('/').filter(Boolean).map(x=>encodeURIComponent(x)).join('/')}
 function previewFileUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-file/${rel}${ts}`}
+function previewDownloadUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-file/${rel}?download=1`}
+function previewHtmlBundleUrl(sessionId,path){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);return `/api/sessions/${sid}/preview-html-bundle/${rel}`}
 function previewHtmlUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-html/${rel}${ts}`}
 function previewCodeStagesUrl(sessionId,path,forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const ts=forceReload?`?ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code-stages/${rel}${ts}`}
 function previewCodeUrl(sessionId,path,stage='latest',forceReload=false){const sid=encodeURIComponent(String(sessionId||''));const rel=encodePreviewPath(path);const st=encodeURIComponent(String(stage||'latest'));const ts=forceReload?`&ts=${Date.now()}`:'';return `/api/sessions/${sid}/preview-code/${rel}?stage=${st}${ts}`}
@@ -42894,7 +44707,7 @@ function _previewRenderStageSelector(tab,stages,selectedReq,payload=null){
   const lineTail=(Number.isFinite(linesAfter)&&linesAfter>0)?` · lines=${linesAfter}`:'';
   stat.textContent=`stage ${idx}/${total} · +${add}/-${del}${lineTail}`;
 }
-function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
+function _previewLangFromPath(path){const rel=normalizePreviewPath(path).toLowerCase();const name=rel.split('/').pop()||'';const dot=name.lastIndexOf('.');const ext=dot>=0?name.slice(dot):'';if(ext==='.html'||ext==='.htm')return'html';return CODE_LANG_BY_EXT[ext]||CODE_LANG_BY_NAME[name]||'default'}
 function _codeLangConfig(lang){const v=String(lang||'default');if(v==='python'||v==='shell'||v==='ruby'||v==='yaml'||v==='toml'||v==='ini'||v==='r'||v==='perl'||v==='makefile'||v==='cmake'||v==='nim'||v==='julia'||v==='elixir'||v==='crystal')return{hashComment:true,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='sql'||v==='haskell')return{hashComment:false,slashComment:false,dashComment:true,blockComment:true,xmlComment:false,backtick:false};if(v==='xml'||v==='vhdl')return{hashComment:false,slashComment:false,dashComment:true,blockComment:false,xmlComment:true,backtick:false};if(v==='json'||v==='fortran'||v==='asm'||v==='protobuf'||v==='prisma'||v==='graphql'||v==='wgsl')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};if(v==='lisp'||v==='clojure'||v==='racket')return{hashComment:false,slashComment:false,dashComment:false,blockComment:false,xmlComment:false,backtick:false};return{hashComment:false,slashComment:true,dashComment:false,blockComment:true,xmlComment:false,backtick:true}}
 function _codeWordSet(lang){return CODE_KEYWORDS[String(lang||'default')]||CODE_KEYWORDS.default}
 function _isWordStart(ch){return /[A-Za-z_$]/.test(ch)}
@@ -43160,13 +44973,33 @@ function _codeRowsToStageText(rows){
   }
   return out.join('\\n');
 }
-function _setPreviewCopyState(tab){
+function _setPreviewToolbarState(tab){
   const btn=E('previewCopyBtn');
-  if(!btn)return;
+  const modeBtn=E('previewModeBtn');
+  const dlBtn=E('previewDownloadBtn');
   const isCode=!!(tab&&tab.kind==='code');
-  btn.classList.toggle('hidden',!isCode);
-  btn.disabled=!isCode;
-  if(isCode)btn.textContent=t('copy_code');
+  const isHtml=!!(tab&&tab.kind==='html');
+  const hasDownload=!!(tab&&tab.path);
+  if(btn){
+    btn.classList.toggle('hidden',!isCode);
+    btn.disabled=!isCode;
+    if(isCode)btn.textContent=t('copy_code');
+  }
+  if(modeBtn){
+    modeBtn.classList.toggle('hidden',!isHtml);
+    modeBtn.disabled=!isHtml;
+    if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
+    modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
+  }
+  if(dlBtn){
+    dlBtn.classList.toggle('hidden',!hasDownload);
+    dlBtn.disabled=!hasDownload;
+    dlBtn.textContent=t('preview_download');
+    dlBtn.onclick=(ev)=>{ev.preventDefault();downloadActivePreview()};
+  }
+}
+function _setPreviewCopyState(tab){
+  _setPreviewToolbarState(tab);
 }
 function _selectedCodePreviewText(body,sel){
   if(!body||!sel||typeof sel.toString!=='function')return'';
@@ -43367,19 +45200,21 @@ async function _renderCodePreviewTab(tab,body,forceReload=false){
   }
 }
 function previewButtonHtml(path){const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return '';const title=rel.split('/').pop()||rel;return `<div class=\"msg-preview-row\"><button class=\"msg-preview-btn\" data-preview-path=\"${esc(rel)}\" title=\"${esc(title)}\">${previewKindIcon(kind)} ${esc(title)}</button></div>`}
-function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':'')};st.tabs.push(row)}st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function openPreviewTab(path){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewModeFromPath(rel);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':''),htmlMode:'preview'};st.tabs.push(row)}if(kind==='html'&&!row.htmlMode)row.htmlMode='preview';st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function closePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');const idx=st.tabs.findIndex(x=>x.id===id);if(idx<0)return;st.tabs.splice(idx,1);if(st.active===id)st.active='conversation';renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activatePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');if(id==='conversation'){st.active='conversation'}else if(st.tabs.some(x=>x.id===id)){st.active=id}else{st.active='conversation'}renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activePreviewTab(){if(!S.activeId)return null;const st=ensurePreviewState(S.activeId);if(st.active==='conversation')return null;return st.tabs.find(x=>x.id===st.active)||null}
 function renderPreviewTabs(){const host=E('chatTabs');if(!host)return;if(!S.activeId){host.innerHTML='';return}const st=ensurePreviewState(S.activeId);const convActive=st.active==='conversation';const tabs=[`<div class=\"chat-tab chat-tab-conversation${convActive?' active':''}\" data-tab-id=\"conversation\"><span class=\"chat-tab-title\">💬 ${esc(t('panel_conversation'))}</span><span class=\"chat-tab-close chat-tab-close-placeholder\" aria-hidden=\"true\">×</span></div>`];for(const tab of st.tabs){tabs.push(`<div class=\"chat-tab${st.active===tab.id?' active':''}\" data-tab-id=\"${esc(tab.id)}\"><span class=\"chat-tab-title\">${previewKindIcon(tab.kind)} ${esc(tab.title||tab.path)}</span><button class=\"chat-tab-close\" data-close-id=\"${esc(tab.id)}\">×</button></div>`)}host.innerHTML=tabs.join('');for(const el of host.querySelectorAll('[data-tab-id]')){el.onclick=()=>activatePreviewTab(el.getAttribute('data-tab-id')||'conversation')}for(const el of host.querySelectorAll('[data-close-id]')){el.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();closePreviewTab(el.getAttribute('data-close-id')||'')}}}
-function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewCopyState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewToolbarState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
+function togglePreviewMode(){const tab=activePreviewTab();if(!tab||tab.kind!=='html')return;tab.htmlMode=(String(tab.htmlMode||'preview')==='source')?'preview':'source';const body=E('previewBody');if(body){body.removeAttribute('data-preview-key');body.removeAttribute('data-preview-ready')}renderPreviewVisibility();renderActivePreview(false)}
+function downloadActivePreview(){const tab=activePreviewTab();if(!tab||!S.activeId||!tab.path)return;const url=(tab.kind==='html')?previewHtmlBundleUrl(S.activeId,tab.path):previewDownloadUrl(S.activeId,tab.path);const a=document.createElement('a');a.href=url;a.download='';a.rel='noreferrer';document.body.appendChild(a);a.click();setTimeout(()=>{try{document.body.removeChild(a)}catch(_){}},0)}
 function renderActivePreview(forceReload=false){
   const pv=E('previewView');
   const body=E('previewBody');
   const meta=E('previewMeta');
   if(!pv||!body||!meta)return;
   const tab=activePreviewTab();
-  _setPreviewCopyState(tab);
+  _setPreviewToolbarState(tab);
   if(!tab){
     meta.textContent='';
     body.innerHTML='';
@@ -43389,7 +45224,7 @@ function renderActivePreview(forceReload=false){
     _previewResetStageUi();
     return;
   }
-  meta.textContent=tab.path;
+  meta.textContent=tab.kind==='html'?`${tab.path} · ${String(tab.htmlMode||'preview')==='source'?'source':'preview'}`:tab.path;
   if(tab.kind==='code'){
     const req=String(tab.codeStageId||'latest');
     const hint=_previewLatestCodeStageHint(tab.path);
@@ -43403,12 +45238,30 @@ function renderActivePreview(forceReload=false){
   }
   body._previewCopyText='';
   _previewResetStageUi();
-  const key=`${tab.id}|${tab.kind}`;
+  const key=`${tab.id}|${tab.kind}|${tab.kind==='html'?String(tab.htmlMode||'preview'):''}`;
   if(!forceReload&&body.getAttribute('data-preview-key')===key)return;
   body.setAttribute('data-preview-key',key);
   body.removeAttribute('data-preview-ready');
   const url=previewFileUrl(S.activeId,tab.path,forceReload);
   if(tab.kind==='html'){
+    if(String(tab.htmlMode||'preview')==='source'){
+      body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
+      const ticket=String(++S.previewNonce);
+      body.setAttribute('data-preview-ticket',ticket);
+      fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{
+        if(body.getAttribute('data-preview-ticket')!==ticket)return;
+        body._previewCopyText=txt;
+        const lang=_previewLangFromPath(tab.path)||'html';
+        const rows=_codeRowsFromFullText(txt);
+        if(rows.length>=CODE_PREVIEW_VIRT_THRESHOLD){
+          _renderCodeRowsVirtual(body,rows,lang,1);
+        }else{
+          body.innerHTML=`<div class=\"preview-code-scroll\"><div class=\"preview-code-shell\">${_renderCodeRows(rows,lang)}</div></div>`;
+          _bindNestedScrollGuards(body);
+        }
+      }).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`});
+      return;
+    }
     body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
     return;
   }
@@ -43553,6 +45406,11 @@ function _chatVirtCollectRows(){
     });
   }
   return rows;
+}
+function _chatVirtRowsStableKey(rows){
+  const arr=Array.isArray(rows)?rows:[];
+  if(!arr.length)return'0';
+  return `${arr.length}|${arr.map(row=>String(row?._vk||'')).join('|')}`;
 }
 function _chatVirtEstimatedHeight(row){const key=String(row?._vk||'');const known=Number(CHAT_VIRT.heights[key]||0);if(known>0)return known;const txtLen=String(row?.text||'').length;const thinkLen=String(row?.thinking||'').length;const totalLen=txtLen+thinkLen;const base=totalLen>1200?Math.max(400,Math.min(3200,120+Math.ceil(totalLen/60)*18)):Math.max(72,Math.min(560,80+Math.ceil(totalLen/90)*20));return Math.max(base,Number(CHAT_VIRT.avgHeight||140))}
 function _chatVirtBindPreviewButtons(root){if(!root)return;for(const btn of root.querySelectorAll('.msg-preview-btn')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();openPreviewTab(btn.getAttribute('data-preview-path')||'')}}}
@@ -43851,9 +45709,9 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-math-request',key);
     return d;
   }
-  if(m.type==='live_run_notice'){
-    const label=String(m.label||'model call');
-    const elapsedNow=Math.max(0,Number(m.elapsed||0));
+	  if(m.type==='live_run_notice'){
+	    const label=String(m.label||'model call');
+	    const elapsedNow=Math.max(0,Number(m.elapsed||0));
     const startedAt=Number(m.startedAt||0);
     d.setAttribute('data-run-live','1');
     d.setAttribute('data-run-label',label);
@@ -43869,9 +45727,28 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
-    return d;
-  }
-  if(m.type==='plan_notice'){
+	    return d;
+	  }
+	  if(m.type==='scheduler_queued'){
+	    const status=String(m.scheduler_status||'queued').trim()||'queued';
+	    const qid=Number(m.scheduler_queue_id||0);
+	    const pos=Number(m.queue_position||0);
+	    const size=Number(m.queue_size||0);
+	    const reason=String(m.scheduler_reason||'').trim();
+	    const pills=[
+	      _chatVirtEventPillHtml(t('event_scheduler_queued_hint'),'warn'),
+	      qid?_chatVirtEventPillHtml(`#${qid}`,'neutral','mono'):'',
+	      pos?_chatVirtEventPillHtml(`${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`,'info'):'',
+	      reason?_chatVirtEventPillHtml(`${t('event_scheduler_reason')} ${reason}`,'neutral'):'',
+	    ];
+	    const key=`${String(m._vk||'')}:scheduler`;
+	    const noteHtml=`<div class="msg-event-note">${esc(t('event_scheduler_queued_note'))}</div>`;
+	    const bodyHtml=`<div class="msg-event-body">${noteHtml}<div class="msg-md">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+	    d.innerHTML=`${_chatVirtEventCardHtml(t('event_scheduler_queued_title'),status,pills,[],bodyHtml,'msg-event-card-plan')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(m.type==='plan_notice'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const title=String(info.title||'Plan Guidance').trim()||'Plan Guidance';
     const subtitle=String(info.subtitle||'').trim();
@@ -44048,7 +45925,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtRaf=requestAnimationFrame(()=>{
           chatEl._virtRaf=0;
           chatEl._virtLastScrollRenderTs=Date.now();
-          renderChat('scroll');
+          scheduleRenderChat('scroll');
         });
       },wait);
       return;
@@ -44057,7 +45934,7 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtRaf=requestAnimationFrame(()=>{
       chatEl._virtRaf=0;
       chatEl._virtLastScrollRenderTs=Date.now();
-      renderChat('scroll');
+      scheduleRenderChat('scroll');
     });
   };
   chatEl.addEventListener('wheel',ev=>{
@@ -44103,6 +45980,10 @@ function renderChat(reason='snapshot'){
   const c=E('chat');
   if(!c)return;
   _chatVirtBindScroll(c);
+  if(c._virtRendering){
+    scheduleRenderChat(reason==='scroll'?'scroll':'delta');
+    return;
+  }
   if(reason!=='scroll'){
     if(c._virtScrollRenderTimer){clearTimeout(c._virtScrollRenderTimer);c._virtScrollRenderTimer=0;}
     if(c._virtRaf){cancelAnimationFrame(c._virtRaf);c._virtRaf=0;}
@@ -44120,6 +46001,7 @@ function renderChat(reason='snapshot'){
     c._virtRowsCacheSig=feedSig;
     c._virtRowsCacheRows=rows;
   }
+  const rowsStableKey=_chatVirtRowsStableKey(rows);
   _chatVirtPruneHeightCache(rows);
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
@@ -44139,11 +46021,17 @@ function renderChat(reason='snapshot'){
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
+  const renderKey=`${rangeKey}|${rowsStableKey}|hv=${Number(CHAT_VIRT.heightVersion||0)}|running=${S.snap?.running?1:0}`;
   // Early exit BEFORE any layout queries (_chatVirtCaptureAnchor uses getBoundingClientRect).
   if(reason==='scroll'&&c._virtRangeKey===rangeKey){
     return;
   }
+  if(reason!=='scroll'&&c._chatHasRendered&&String(c._virtRenderKey||'')===renderKey){
+    _chatVirtSyncRunTicker(c);
+    return;
+  }
   c._virtRangeKey=rangeKey;
+  c._virtRenderKey=renderKey;
   // Layout reads below — only reached when DOM will actually change.
   const atBottomNow=nearBottom(c,6);
   if((!S.snap?.running)&&atBottomNow){
@@ -44155,6 +46043,32 @@ function renderChat(reason='snapshot'){
   c._virtRendering=true;
   const rendered=[];
   let usedIncrementalPatch=false;
+  if(
+    reason!=='scroll'&&
+    !first&&
+    rows.length+1===prevRows.length&&
+    prevWinStart===win.start&&
+    prevWinEnd===prevRows.length&&
+    win.end===rows.length
+  ){
+    let stableAll=true;
+    for(let i=0;i<rows.length;i++){
+      if(String(prevRows[i]?._vk||'')!==String(rows[i]?._vk||'')){
+        stableAll=false;
+        break;
+      }
+    }
+    const removedLast=String(prevRows[prevRows.length-1]?.type||'')==='live_run_notice';
+    if(stableAll&&removedLast){
+      const visibleNodes=c.querySelectorAll('.msg[data-vk]');
+      const lastNode=visibleNodes.length?visibleNodes[visibleNodes.length-1]:null;
+      if(lastNode&&String(lastNode.getAttribute('data-run-live')||'')==='1'){
+        _chatVirtReleaseNode(lastNode);
+        lastNode.remove();
+        usedIncrementalPatch=true;
+      }
+    }
+  }
   if(
     reason!=='scroll'&&
     !first&&
@@ -44255,7 +46169,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    c.scrollTop=maxTop;
+    if(Math.abs(Number(c.scrollTop||0)-maxTop)>0.75)c.scrollTop=maxTop;
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     c.scrollTop=Math.max(0,Math.min(oldScrollTop,maxTop));
   }
@@ -44266,9 +46180,9 @@ function renderChat(reason='snapshot'){
   c._virtLastWinEnd=win.end;
   c._virtLastTopOffset=Number(win.topOffset||0);
   c._virtLastEndOffset=Number(win.endOffset||0);
-  if(hasHeightChange&&reason!=='scroll'){
+  if(hasHeightChange&&reason!=='scroll'&&reason!=='measure'){
     if(c._virtMeasureRaf)cancelAnimationFrame(c._virtMeasureRaf);
-    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;renderChat('measure')});
+    c._virtMeasureRaf=requestAnimationFrame(()=>{c._virtMeasureRaf=0;const now=Date.now();if(now-Number(c._virtLastMeasureRenderTs||0)>180){c._virtLastMeasureRenderTs=now;scheduleRenderChat('measure')}});
   }
   if(reason!=='scroll'){
     renderPreviewTabs();
@@ -44279,11 +46193,11 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(){const pending=S.uploadQueuePromise;if(pending&&typeof pending.then==='function')await pending}
+async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
-async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:true,allowWhenFrozen:true});return{uploaded,failed}}
+async function _uploadFilesNow(fileList){if(S.staticMode&&S.frozen)resumeAutoUpdates();let uploaded=0;let failed=0;const files=Array.from(fileList||[]).filter(Boolean);for(let i=0;i<files.length;i+=1){const named=ensureNamedUploadFile(files[i],i,'upload');try{if(named.size>20*1024*1024){failed+=1;showError(`${t('file_too_large')}: ${named.name} (>20MB)`);continue}const payload={filename:named.name,mime:named.type||'',content_b64:await blobToBase64(named)};await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',timeoutMs:30000,body:JSON.stringify(payload)});uploaded+=1}catch(err){failed+=1;showError(`${named.name}: ${err.message||String(err)}`)}if(i<files.length-1)await uiYield()}if(uploaded>0)await refreshSnapshot({forceFull:false,allowWhenFrozen:true});return{uploaded,failed}}
 async function uploadFiles(fileList){if(!S.activeId){showError(t('select_session_first'));return}const files=Array.from(fileList||[]).filter(Boolean);if(!files.length)return;const run=async()=>{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0))+files.length;try{return await _uploadFilesNow(files)}finally{S.uploadInFlight=Math.max(0,Number(S.uploadInFlight||0)-files.length)}};const prev=(S.uploadQueuePromise&&typeof S.uploadQueuePromise.then==='function')?S.uploadQueuePromise:Promise.resolve();const chained=prev.catch(()=>{}).then(run);const queued=chained.finally(()=>{if(S.uploadQueuePromise===queued)S.uploadQueuePromise=null});S.uploadQueuePromise=queued;return queued}
 function normalizeStatus(raw,fallback='pending'){const key=String(raw||'').trim().toLowerCase();const aliases={todo:'pending',doing:'in_progress',inprogress:'in_progress','in-progress':'in_progress',done:'completed',finish:'completed',finished:'completed'};const status=aliases[key]||key||fallback;if(['pending','in_progress','completed','blocked','deleted'].includes(status))return status;return fallback}
 function statusClass(status){return `st-${normalizeStatus(status)}`}
@@ -44570,7 +46484,7 @@ async function refreshSnapshot(opt={}){
     if(needBoards)S.lastBoardsSig=boardSig;
     if(needChat||needBoards){
       const doRender=()=>{
-        if(needChat)renderChat('snapshot');
+        if(needChat)scheduleRenderChat('snapshot');
         if(needBoards)renderBoards();
       };
       if(scrolling&&chatEl){
@@ -44701,7 +46615,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const t=E('prompt').value.trim();if(!t||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:t})});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();if(out&&out.queued&&!out.scheduler_started){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})}else if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -50679,14 +52593,14 @@ def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
         text_lines: list[str] = []
         consecutive_blank = 0
         while i < len(lines):
-            l = lines[i]
-            ls = l.strip()
-            if re.match(r"^#{1,4}\s", l) or ls.startswith("```") or ls.startswith("~~~"):
+            line_text = lines[i]
+            stripped_line = line_text.strip()
+            if re.match(r"^#{1,4}\s", line_text) or stripped_line.startswith("```") or stripped_line.startswith("~~~"):
                 break
-            if ls.startswith("|") and "|" in ls[1:]:
+            if stripped_line.startswith("|") and "|" in stripped_line[1:]:
                 break
-            text_lines.append(l)
-            consecutive_blank = 0 if ls else consecutive_blank + 1
+            text_lines.append(line_text)
+            consecutive_blank = 0 if stripped_line else consecutive_blank + 1
             i += 1
             if consecutive_blank >= 2:
                 break
@@ -59075,6 +60989,7 @@ class AppContext:
         now_value = now_ts()
         with self._lock:
             managers = list(self._session_mgrs.values())
+        recovered_rows: list[tuple[str, str]] = []
         for mgr in managers:
             try:
                 with mgr.lock:
@@ -59084,6 +60999,7 @@ class AppContext:
             for sess in sessions:
                 try:
                     if sess.recover_if_stale(now_value, SESSION_HEARTBEAT_STALE_SECONDS):
+                        recovered_rows.append((str(getattr(mgr, "user_id", "") or ""), str(getattr(sess, "id", "") or "")))
                         try:
                             sess._emit(
                                 "status",
@@ -59096,6 +61012,12 @@ class AppContext:
                             )
                         except Exception:
                             pass
+                except Exception:
+                    continue
+        if recovered_rows and self.scheduler_limits_enabled():
+            for uid, sid in recovered_rows[:16]:
+                try:
+                    self._on_session_run_finished(uid, sid)
                 except Exception:
                     continue
 
@@ -59647,11 +61569,13 @@ class AppContext:
         if not to_embed:
             return 0
         to_embed = to_embed[-max_chunks:]
-        anchor_text = lambda cid: (
-            str(all_chunks[cid].get("anchor", "") or "")
-            + "\n"
-            + str(all_chunks[cid].get("text", "") or "")
-        )[:2048]
+        def anchor_text(cid: str) -> str:
+            return (
+                str(all_chunks[cid].get("anchor", "") or "")
+                + "\n"
+                + str(all_chunks[cid].get("text", "") or "")
+            )[:2048]
+
         texts = [anchor_text(cid) for cid in to_embed]
         vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
@@ -61014,7 +62938,7 @@ class AppContext:
             running = 0
             for sess in sessions:
                 try:
-                    if bool(getattr(sess, "running", False)):
+                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
                         running += 1
                 except Exception:
                     continue
@@ -61038,6 +62962,11 @@ class AppContext:
             sess = row.get("session")
             if not isinstance(sess, SessionState):
                 continue
+            qid = int(req.get("id", 0) or 0)
+            try:
+                sess.update_scheduler_visible_message(qid, status="started", queue_position=0, queue_size=0)
+            except Exception:
+                pass
             wait_sec = max(0.0, now_ts() - float(req.get("queued_at", 0.0) or 0.0))
             try:
                 sess._emit(
@@ -61045,7 +62974,7 @@ class AppContext:
                     {
                         "summary": (
                             "scheduler started queued task "
-                            f"#{int(req.get('id', 0) or 0)} after {wait_sec:.1f}s"
+                            f"#{qid} after {wait_sec:.1f}s"
                         )
                     },
                 )
@@ -61056,30 +62985,87 @@ class AppContext:
         started: list[dict] = []
         if not self.scheduler_limits_enabled():
             return started
-        while self._task_queue:
-            req = self._task_queue[0] if self._task_queue else {}
+        if not self._task_queue:
+            return started
+        total_running, per_user = self._running_counts_locked()
+        remaining: deque[dict] = deque()
+        selected_sessions: set[tuple[str, str]] = set()
+        for req in list(self._task_queue):
+            if not isinstance(req, dict):
+                continue
             uid = str(req.get("user_id", "") or "")
             sid = str(req.get("session_id", "") or "")
             mgr = self._session_mgrs.get(uid)
             if not mgr:
-                self._task_queue.popleft()
                 continue
             sess = mgr.get(sid)
             if not sess:
-                self._task_queue.popleft()
                 continue
-            if bool(getattr(sess, "running", False)):
-                break
-            ok, _, _, _ = self._can_start_for_user_locked(uid)
-            if not ok:
-                break
-            self._task_queue.popleft()
+            session_key = (uid, sid)
+            if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+                remaining.append(req)
+                continue
+            if session_key in selected_sessions:
+                remaining.append(req)
+                continue
+            user_running = int(per_user.get(uid, 0) or 0)
+            if self.max_user > 0 and total_running >= self.max_user:
+                remaining.append(req)
+                continue
+            if self.max_user_sessions > 0 and user_running >= self.max_user_sessions:
+                remaining.append(req)
+                continue
+            try:
+                setattr(sess, "scheduler_starting", True)
+            except Exception:
+                pass
+            started.append({"request": req, "session": sess})
+            selected_sessions.add(session_key)
+            total_running += 1
+            per_user[uid] = user_running + 1
+        self._task_queue = remaining
+        return started
+
+    def _start_scheduler_rows(self, rows: list[dict]) -> list[dict]:
+        started: list[dict] = []
+        for row in rows:
+            req = row.get("request", {}) if isinstance(row, dict) else {}
+            sess = row.get("session")
+            if not isinstance(sess, SessionState):
+                continue
             try:
                 out = sess.submit_user_message(str(req.get("content", "") or ""))
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
+                try:
+                    sess.update_scheduler_visible_message(int(req.get("id", 0) or 0), status="failed")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if not bool(getattr(sess, "running", False)):
+                        setattr(sess, "scheduler_starting", False)
+                except Exception:
+                    pass
             started.append({"request": req, "result": out, "session": sess})
         return started
+
+    def _refresh_scheduler_visible_positions(self):
+        queue_rows: list[dict] = []
+        with self._lock:
+            queue_rows = [dict(row) for row in self._task_queue if isinstance(row, dict)]
+            queue_size = len(queue_rows)
+        for idx, row in enumerate(queue_rows):
+            uid = str(row.get("user_id", "") or "")
+            sid = str(row.get("session_id", "") or "")
+            qid = int(row.get("id", 0) or 0)
+            try:
+                mgr = self.manager_for_user(uid)
+                sess = mgr.get(sid)
+                if sess:
+                    sess.update_scheduler_visible_message(qid, queue_position=idx + 1, queue_size=queue_size)
+            except Exception:
+                continue
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
         sess = None
@@ -61101,6 +63087,8 @@ class AppContext:
         started_rows: list[dict] = []
         with self._lock:
             started_rows = self._drain_task_queue_locked()
+        started_rows = self._start_scheduler_rows(started_rows)
+        self._refresh_scheduler_visible_positions()
         if started_rows:
             self._emit_scheduler_started(started_rows)
 
@@ -61131,9 +63119,10 @@ class AppContext:
         if not self.scheduler_limits_enabled():
             return sess.submit_user_message(text)
 
-        started_rows: list[dict] = []
+        selected_rows: list[dict] = []
         response: dict = {"ok": True, "queued": True}
         queue_id = 0
+        record_visible = False
         with self._lock:
             self._task_queue_seq = int(self._task_queue_seq) + 1
             queue_id = int(self._task_queue_seq)
@@ -61145,23 +63134,14 @@ class AppContext:
                 "queued_at": now_ts(),
             }
             self._task_queue.append(req)
-            started_rows = self._drain_task_queue_locked()
+            selected_rows = self._drain_task_queue_locked()
             started_self = None
-            for row in started_rows:
+            for row in selected_rows:
                 row_req = row.get("request", {}) if isinstance(row, dict) else {}
                 if int(row_req.get("id", 0) or 0) == queue_id:
                     started_self = row
                     break
             if started_self is not None:
-                out = started_self.get("result")
-                if isinstance(out, dict):
-                    response = dict(out)
-                else:
-                    response = {"ok": True, "result": out}
-                response.setdefault("ok", True)
-                response["queued"] = bool(response.get("queued", False))
-                response["running"] = bool(response.get("running", True))
-                response["scheduler_started"] = True
                 response["queue_id"] = queue_id
                 response["queue_position"] = 0
                 response["limits"] = {
@@ -61191,6 +63171,43 @@ class AppContext:
                         "running_user": int(per_user.get(str(user_id or ""), 0)),
                     },
                 }
+                record_visible = True
+        if record_visible:
+            try:
+                sess.record_scheduler_queued_message(
+                    queue_id,
+                    text,
+                    queue_position=int(response.get("queue_position", 1) or 1),
+                    queue_size=int(response.get("queue_size", 1) or 1),
+                    scheduler_reason=str(response.get("scheduler_reason", "") or ""),
+                    queued_at=now_ts(),
+                )
+            except Exception:
+                pass
+        started_rows = self._start_scheduler_rows(selected_rows)
+        self._refresh_scheduler_visible_positions()
+        started_self_result = None
+        for row in started_rows:
+            row_req = row.get("request", {}) if isinstance(row, dict) else {}
+            if int(row_req.get("id", 0) or 0) == queue_id:
+                started_self_result = row
+                break
+        if started_self_result is not None:
+            out = started_self_result.get("result")
+            if isinstance(out, dict):
+                response = dict(out)
+            else:
+                response = {"ok": True, "result": out}
+            response.setdefault("ok", True)
+            response["queued"] = bool(response.get("queued", False))
+            response["running"] = bool(response.get("running", True))
+            response["scheduler_started"] = True
+            response["queue_id"] = queue_id
+            response["queue_position"] = 0
+            response["limits"] = {
+                "max_user": int(self.max_user),
+                "max_user_sessions": int(self.max_user_sessions),
+            }
         if started_rows:
             self._emit_scheduler_started(started_rows)
         if bool(response.get("queued")) and not bool(response.get("scheduler_started")):
@@ -61858,6 +63875,9 @@ class AppContext:
             headers=active.get("headers", {}) if isinstance(active.get("headers"), dict) else {},
             payload_template=str(active.get("payload_template", "") or ""),
             thinking_stream=bool(active.get("thinking_stream", False)),
+            api_protocol=str(active.get("api_protocol", "auto") or "auto"),
+            tool_protocol=str(active.get("tool_protocol", "auto") or "auto"),
+            protocol_detection=str(active.get("protocol_detection", "auto") or "auto"),
         )
         client.apply_profile(active)
         think = False
@@ -62044,6 +64064,31 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model}",
                     "source": profile.get("source", ""),
+                    "api_protocol": profile.get("api_protocol", "auto"),
+                    "tool_protocol": profile.get("tool_protocol", "auto"),
+                    "protocol_detection": profile.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(profile.get("provider", "")),
+                        endpoint=str(profile.get("endpoint", "")),
+                        base_url=str(profile.get("base_url", "")),
+                        model=model,
+                        requested=profile.get("api_protocol", "auto"),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(profile.get("provider", "")),
+                        model=model,
+                        requested=profile.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(profile.get("provider", "")),
+                            endpoint=str(profile.get("endpoint", "")),
+                            base_url=str(profile.get("base_url", "")),
+                            model=model,
+                            requested=profile.get("api_protocol", "auto"),
+                            protocol_detection=profile.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=profile.get("protocol_detection", "auto"),
+                    ),
                     "capabilities": caps,
                 }
             )
@@ -62060,6 +64105,31 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": str(selected_profile.get("model", self.model) or self.model),
                     "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
                     "source": selected_profile.get("source", "active-profile"),
+                    "api_protocol": selected_profile.get("api_protocol", "auto"),
+                    "tool_protocol": selected_profile.get("tool_protocol", "auto"),
+                    "protocol_detection": selected_profile.get("protocol_detection", "auto"),
+                    "effective_api_protocol": infer_api_protocol(
+                        str(selected_profile.get("provider", "")),
+                        endpoint=str(selected_profile.get("endpoint", "")),
+                        base_url=str(selected_profile.get("base_url", "")),
+                        model=str(selected_profile.get("model", self.model) or self.model),
+                        requested=selected_profile.get("api_protocol", "auto"),
+                        protocol_detection=selected_profile.get("protocol_detection", "auto"),
+                    ),
+                    "effective_tool_protocol": infer_tool_protocol(
+                        str(selected_profile.get("provider", "")),
+                        model=str(selected_profile.get("model", self.model) or self.model),
+                        requested=selected_profile.get("tool_protocol", "auto"),
+                        api_protocol=infer_api_protocol(
+                            str(selected_profile.get("provider", "")),
+                            endpoint=str(selected_profile.get("endpoint", "")),
+                            base_url=str(selected_profile.get("base_url", "")),
+                            model=str(selected_profile.get("model", self.model) or self.model),
+                            requested=selected_profile.get("api_protocol", "auto"),
+                            protocol_detection=selected_profile.get("protocol_detection", "auto"),
+                        ),
+                        protocol_detection=selected_profile.get("protocol_detection", "auto"),
+                    ),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -62236,9 +64306,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_bytes(self, data: bytes, content_type: str, filename: str):
         try:
+            raw_name = Path(str(filename or "download.bin")).name or "download.bin"
+            ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
+            ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
+            encoded_name = quote(raw_name.encode("utf-8"), safe="")
+            disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", disposition)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -62604,6 +64679,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
+        m = re.match(r"^/api/sessions/([^/]+)/preview-html-bundle/(.+)$", path)
+        if m:
+            sess = mgr.get(m.group(1))
+            if not sess:
+                return self._send_json({"error": "session not found"}, status=404)
+            rel = str(m.group(2) or "").strip()
+            if not rel:
+                return self._send_json({"error": "path required"}, status=400)
+            try:
+                data = sess.preview_html_bundle(rel)
+                name = Path(normalize_rel_preview_path(rel)).name or "preview.html"
+                stem = Path(name).stem or "preview"
+                return self._send_bytes(data, "application/zip", f"{stem}_html_bundle.zip")
+            except FileNotFoundError as exc:
+                return self._send_json({"error": str(exc)}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)/preview-file/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -62625,6 +64717,8 @@ class Handler(BaseHTTPRequestHandler):
             content_type = guess_mime_from_name(fp.name, "application/octet-stream")
             if content_type.startswith("text/") and "charset=" not in content_type.lower():
                 content_type = f"{content_type}; charset=utf-8"
+            if _to_bool_like((query.get("download", ["0"]) or ["0"])[0], default=False):
+                return self._send_bytes(data, content_type, fp.name)
             return self._send_inline_bytes(data, content_type)
         m = re.match(r"^/api/sessions/([^/]+)/render-state$", path)
         if m:
@@ -62645,8 +64739,9 @@ class Handler(BaseHTTPRequestHandler):
             include_model_catalog = _to_bool_like(
                 (query.get("include_model_catalog", ["0"]) or ["0"])[0], default=False
             ) or _to_bool_like((query.get("models", ["0"]) or ["0"])[0], default=False)
+            lock_timeout = 0.08 if lite_snapshot else 0.4
             return self._send_json(
-                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot)
+                sess.snapshot_safe(include_model_catalog=include_model_catalog, lite=lite_snapshot, lock_timeout=lock_timeout)
             )
         m = re.match(r"^/api/sessions/([^/]+)/events$", path)
         if m:
