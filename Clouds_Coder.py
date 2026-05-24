@@ -22891,18 +22891,28 @@ body{padding:18px}
             return {"status": "ARBITER_ERROR", "reasoning": trim(str(err), 220), "raw": ""}
         rsp = box.get("rsp") if isinstance(box.get("rsp"), dict) else {}
         raw_content = trim(str((rsp or {}).get("content", "") or ""), 2000)
+        raw_thinking = trim(str((rsp or {}).get("thinking", "") or ""), 1200)
+        status_source = raw_content or raw_thinking
         payload = extract_json_object_from_text(raw_content, {})
-        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), raw_content)
+        if not payload and raw_thinking:
+            payload = extract_json_object_from_text(raw_thinking, {})
+        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), status_source)
         if not status:
-            status = self._infer_arbiter_status_from_text(raw_content)
+            status = self._infer_arbiter_status_from_text(status_source)
+        if (
+            (not status or status == "UNKNOWN")
+            and self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}\n{status_source}")
+        ):
+            status = "ACTION_REQUIRED"
         reasoning = trim(
             str(payload.get("reasoning", payload.get("reason", "")) or ""),
             280,
-        ) or trim(raw_content, 280)
+        ) or trim(status_source, 280)
         return {
             "status": status or "UNKNOWN",
             "reasoning": reasoning,
             "raw": raw_content,
+            "raw_thinking": raw_thinking,
             "model": str(self.arbiter_model or self.ollama.model or "").strip(),
         }
 
