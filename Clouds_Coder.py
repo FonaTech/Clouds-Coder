@@ -142,6 +142,10 @@ LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
 LONG_OUTPUT_READ_PAGE_LINES = 240
 LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
 LONG_OUTPUT_TEMP_MAX_FILES = 160
+READ_FILE_DEFAULT_MAX_CHARS = 50_000
+READ_FILE_HARD_MAX_CHARS = 120_000
+READ_FILE_OVERVIEW_HEAD_LINES = 80
+READ_FILE_SEARCH_MAX_MATCHES = 24
 JSON_FSYNC_ENABLED = str(os.getenv("AGENT_JSON_FSYNC", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 RAG_LIBRARY_DIRNAME = "RAG_Library"
 RAG_ADMIN_PORT_OFFSET = 2
@@ -312,6 +316,10 @@ POLL_INTERVAL = 5
 SSE_HEARTBEAT_SECONDS = 15
 MODEL_CALL_PROGRESS_DELAY = 8.0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
+RUN_COMPLETION_SUMMARY_ENABLED = (
+    str(os.getenv("AGENT_RUN_COMPLETION_SUMMARY", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
     0,
     min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
@@ -5608,7 +5616,6 @@ def build_code_preview_rows(
     sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
     max_rows = max(64, int(max_rows or CODE_PREVIEW_STAGE_MAX_ROWS))
     rows: list[dict] = []
-    dropped_head = 0
     has_changes = False
     opcodes = list(sm.get_opcodes())
     for tag, *_ in opcodes:
@@ -6947,7 +6954,7 @@ Use this skill when the agent shows model degradation symptoms:
 2. Record concrete evidence (exact errors / statuses / turn pattern) before changing strategy.
 
 ## Recovery Workflow (Mandatory Order)
-1. If context may be missing, call `context_recall` first.
+1. If context may be missing, call `context_recall` with `mode="summary"` first, then use `mode="search"` or `mode="window"` for focused evidence.
 2. Build or repair todo plan with 3-7 items (one `in_progress`) via `TodoWrite` or `TodoWriteRescue`.
 3. Enter strict execution mode:
    - execute exactly ONE tool call per round,
@@ -6979,7 +6986,7 @@ Return:
 
 # Fast Decision Rules
 
-1. Missing context -> `context_recall`.
+1. Missing context -> `context_recall mode="summary"`, then `mode="search"` or `mode="window"` for focused evidence.
 2. No todo plan -> `TodoWriteRescue`.
 3. Repeated tool failure -> one-tool strict retry with smaller chunk.
 4. Still failing -> explicit blocker, stop loop.
@@ -7022,7 +7029,7 @@ Assess the error and pick the matching depth. This is the single most important 
 | Signal | Depth | Budget | Strategy |
 |--------|-------|--------|----------|
 | Typo, missing import, syntax error | **Shallow** | 1-2 tool calls | Pattern-match fix directly from error message |
-| Single clear exception with traceback | **Standard** | 3-6 tool calls | Trace call chain, read crash site ±20 lines, fix + verify |
+| Single clear exception with traceback | **Standard** | 3-6 tool calls | Trace call chain, read the exact crash construct, fix + verify |
 | Intermittent / multi-component / no clear trace | **Deep** | 8-15 tool calls | Hypothesize → isolate → instrument → validate causal chain |
 | Reproduces only under specific state / concurrency | **Forensic** | 15-25 tool calls | State reconstruction, bisect, invariant analysis |
 
@@ -7044,7 +7051,7 @@ Every bug has a causal chain: **trigger → propagation → manifestation**. Mos
 
 ### Step 3: Targeted Investigation
 - Read ONLY the code that your hypothesis predicts is involved.
-- Use `read_file` with offset/limit — read the crash site ±20 lines, not the whole file.
+- Use `read_file` in the smallest mode that fits the question: `window` for file:line, `symbol` for functions/classes, `search` for locating evidence, and `full` only when exact broad context is needed.
 - If hypothesis is wrong, update it based on what you learned. Don't restart from scratch.
 
 ### Step 4: Fix at the Trigger, Not the Symptom
@@ -7401,7 +7408,7 @@ def ensure_generated_smart_file_navigation_skill(skills_root: Path):
     root = generated_root / "smart-file-navigation"
     skill_md = """---
 name: smart-file-navigation
-description: Adaptive codebase exploration engine that scales reading strategy to project size and task scope — from surgical line-range reads to systematic dependency-graph traversal, with built-in loop prevention and workspace awareness.
+description: Adaptive codebase exploration engine that scales reading strategy to project size and task scope — from surgical symbol/window reads to systematic dependency-graph traversal, with question-driven navigation and workspace awareness.
 ---
 
 # Smart File Navigation
@@ -7415,7 +7422,7 @@ Decide your reading strategy BEFORE opening any file. Wrong strategy wastes your
 
 | Task Scope | Strategy | Read Budget | Key Principle |
 |-----------|----------|-------------|---------------|
-| Fix a specific error with file:line | **Surgical** | 2-4 reads | Read crash site ±20 lines. Follow ONE call chain. |
+| Fix a specific error with file:line | **Surgical** | 2-4 reads | Read the exact crash construct. Follow ONE call chain. |
 | Implement feature in known area | **Focused** | 5-10 reads | Scan interfaces of affected modules. Read implementations you'll modify. |
 | Understand unfamiliar module | **Exploratory** | 8-15 reads | Structure scan → entry points → data flow → key abstractions. |
 | Full codebase assessment | **Systematic** | 15-25 reads | Top-down: build config → architecture → module boundaries → hot paths. |
@@ -7427,7 +7434,7 @@ Decide your reading strategy BEFORE opening any file. Wrong strategy wastes your
 ### The Navigation Loop
 1. **State your question**: "What does function X do?" / "Where is Y defined?" / "How does data flow from A to B?"
 2. **Predict the answer's location**: Based on naming conventions, directory structure, imports.
-3. **Read the minimum needed**: Use offset/limit. Never read 500 lines when 30 suffice.
+3. **Read the right shape of context**: use `overview`, `symbol`, `search`, `window`, or `full` according to the question.
 4. **Record the answer**: Note it in your reasoning. Don't re-read to "remember".
 5. **Derive the next question**: Each answer either resolves your task or generates a more specific question.
 
@@ -7437,10 +7444,10 @@ If step 5 generates the SAME question you already answered → you're in a loop.
 
 | File Size | Strategy |
 |-----------|----------|
-| < 150 lines | Read entire file — it's cheap |
-| 150-500 lines | Read first 30 lines (imports, class defs), then jump to target with offset |
-| 500-2000 lines | Grep for the specific function/class, read 50-line window around match |
-| 2000+ lines | NEVER read more than 100 lines at a time. Grep → offset → targeted read |
+| < 150 lines | Read the whole file if that answers the question |
+| 150-500 lines | Read the relevant symbol or window around the target |
+| 500-2000 lines | Use `search` or `symbol` to locate the exact region, then read a focused window |
+| 2000+ lines | Use `overview` first, then `search`, `symbol`, or `window` for the exact region |
 
 ## Dependency Tracing
 
@@ -7464,7 +7471,7 @@ When you see an import, make a TRIAGE decision:
 ## Error-Driven Navigation
 
 When you have an error with a location:
-1. Read `file:line` with offset = line-10, limit = 30. This gives you the crash site with context.
+1. Read `file:line` with `mode="window"` and enough context to see the surrounding construct.
 2. Identify the VARIABLE or EXPRESSION that caused the error.
 3. Trace BACKWARD: where was that variable last assigned? Read THAT location.
 4. If the assignment depends on another function's return value, read THAT function (just the return statements).
@@ -7474,11 +7481,8 @@ When you have an error with a location:
 
 ### Self-Monitoring Rules
 - **Track what you've read**: After each read, note "file X, lines Y-Z, learned: ...".
-- **Never re-read the same file range**: If you already read lines 50-100 of foo.py, you have that information. Use it.
-- **The 3-read limit**: If you've read 3 different files without taking ANY action (write, edit, bash), you're probably lost. Stop reading and:
-  1. Write down what you know so far.
-  2. Identify the SPECIFIC gap in your knowledge.
-  3. Take an action based on what you know (even if imperfect).
+- **Avoid pointless rereads**: If you already know the answer from a range, move to the next missing question instead of reopening the same slice.
+- **If you keep circling the same question**, pause, summarize what you know, and take an action based on the current hypothesis.
 
 ### Recovery from Navigation Dead Ends
 If you can't find what you're looking for:
@@ -8818,7 +8822,7 @@ clouds_coder:
     - bash
 description: >
   Specialized guide for code library retrieval. Code-specific query patterns,
-  language filtering, symbol-aware search, and integration with read_file for full context.
+  language filtering, symbol-aware search, and integration with read_file for focused context.
   TRIGGER when: looking up code implementations, function signatures, API patterns, code review.
   DO NOT TRIGGER for: knowledge/document retrieval (use rag-retrieval-mastery),
   general research (use research-orchestrator-pro).
@@ -8883,7 +8887,7 @@ Code library returns **snippets** (320 chars max). To get full context:
 
 1. **Query**: `result = query_code_library(query="parse config file", top_k=5)`
 2. **Extract path**: Read `citation` field → contains file path
-3. **Read full file**: `read_file` on the extracted path
+3. **Read the best context**: use `read_file` with `mode="symbol"` for named code, `mode="window"` for nearby lines, `mode="search"` for evidence, or `mode="full"` when broad exact context is needed
 4. **Analyze**: Now you have the full function/class context
 
 This is the core workflow: **search → locate → read → understand**.
@@ -10059,7 +10063,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "# Context Management Guide\n"
             "- Context has a token upper bound; keep steps compact.\n"
             "- When <compact-resume> hint appears, inherit pending todos and continue immediately.\n"
-            "- After compaction, use context_recall to fetch archived messages by segment_id/query.\n"
+            "- After compaction, use context_recall mode='summary' to map archived messages, then mode='search' or mode='window' for focused evidence.\n"
             "- Do not guess content that was compacted away—recall it first.\n"
             "- For large tasks, break into subtasks to avoid context overflow.\n"
         ),
@@ -11673,6 +11677,16 @@ class MessageBus:
                 out.append(row)
         return out
 
+    def peek_inbox(self, name: str) -> list[dict]:
+        path = self._path(name)
+        if not path.exists():
+            return []
+        with self.lock:
+            payload = self.crypto.read_json(path, [])
+            if not isinstance(payload, list):
+                payload = []
+        return [row for row in payload if isinstance(row, dict)]
+
     def broadcast(self, sender: str, content: str, names: list[str]) -> str:
         count = 0
         for name in names:
@@ -11894,6 +11908,10 @@ class WorktreeManager:
         payload = self.crypto.read_json(self.events_path, [])
         out = payload[-n:] if isinstance(payload, list) else []
         return json_dumps(out, indent=2)
+
+    def events_objects(self) -> list[dict]:
+        payload = self.crypto.read_json(self.events_path, [])
+        return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
 
 class OllamaError(RuntimeError):
     def __init__(
@@ -13404,8 +13422,30 @@ TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
     tool_def(
         "read_file",
-        "Read file content with optional line pagination.",
-        {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+        (
+            "Read files or directories with structure-aware modes. "
+            "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
+            "app.py line 240 -> mode='window' line=240 context=5; "
+            "run.txt E123 -> mode='search' query='E123'. "
+            "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
+            "and mode='full' when complete content is explicitly needed."
+        ),
+        {
+            "path": {"type": "string"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+            },
+            "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+            "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+            "line": {"type": "integer", "description": "1-based center line for mode='window'."},
+            "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
+            "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
+            "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
+            "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
+            "offset": {"type": "integer", "description": "Legacy 0-based line offset for compatibility; prefer mode='window' with line/context."},
+        },
         ["path"],
     ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
@@ -13450,13 +13490,23 @@ TOOLS = [
     tool_def("compress", "Compress conversation context.", {}),
     tool_def(
         "context_recall",
-        "Recall archived compacted context by segment id, query, or recent segments.",
+        (
+            "Recall archived compacted context with focused modes. "
+            "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
+            "or 'window' with around_index/context for nearby messages."
+        ),
         {
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
             "segment_id": {"type": "string"},
             "query": {"type": "string"},
+            "role": {"type": "string"},
+            "tool_name": {"type": "string"},
+            "around_index": {"type": "integer"},
+            "context": {"type": "integer"},
+            "max_chars": {"type": "integer"},
             "recent_segments": {"type": "integer"},
             "max_messages": {"type": "integer"},
-            "offset": {"type": "integer"},
+            "offset": {"type": "integer", "description": "Legacy offset for compatibility; prefer query or around_index/context."},
             "include_tools": {"type": "boolean"},
         },
     ),
@@ -13508,11 +13558,33 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-    tool_def("check_background", "Check background tasks.", {"task_id": {"type": "string"}}),
+    tool_def(
+        "check_background",
+        "Inspect background tasks with summary/search/detail/tail modes.",
+        {
+            "task_id": {"type": "string"},
+            "mode": {"type": "string", "enum": ["summary", "search", "detail", "tail"]},
+            "query": {"type": "string"},
+            "status": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("task_create", "Create task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
     tool_def("task_get", "Get task.", {"task_id": {"type": "integer"}}, ["task_id"]),
     tool_def("task_update", "Update task.", {"task_id": {"type": "integer"}, "status": {"type": "string"}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}}, ["task_id"]),
-    tool_def("task_list", "List tasks.", {}),
+    tool_def(
+        "task_list",
+        "List tasks with optional status/owner/query filters and summary/detail modes.",
+        {
+            "mode": {"type": "string", "enum": ["summary", "search", "detail", "recent"]},
+            "query": {"type": "string"},
+            "status": {"type": "string"},
+            "owner": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("claim_task", "Claim task.", {"task_id": {"type": "integer"}}, ["task_id"]),
     tool_def("spawn_teammate", "Spawn teammate thread.", {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, ["name", "role", "prompt"]),
     tool_def("list_teammates", "List teammates.", {}),
@@ -13528,7 +13600,7 @@ TOOLS = [
     ),
     tool_def(
         "read_from_blackboard",
-        "Read current shared blackboard state or one section.",
+        "Read blackboard state with summary/search/recent/window/detail modes.",
         {
             "section": {
                 "type": "string",
@@ -13543,6 +13615,13 @@ TOOLS = [
                     "status",
                 ],
             },
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
+            "query": {"type": "string"},
+            "actor": {"type": "string"},
+            "status": {"type": "string"},
+            "around_index": {"type": "integer"},
+            "context": {"type": "integer"},
+            "max_chars": {"type": "integer"},
             "limit": {"type": "integer"},
         },
     ),
@@ -13571,7 +13650,18 @@ TOOLS = [
         ["section", "content"],
     ),
     tool_def("send_message", "Send message.", {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string"}}, ["to", "content"]),
-    tool_def("read_inbox", "Read lead inbox.", {}),
+    tool_def(
+        "read_inbox",
+        "Read lead inbox. Use mode='peek' to inspect without draining, mode='search' to find messages, or mode='drain' to consume them.",
+        {
+            "mode": {"type": "string", "enum": ["peek", "drain", "search", "summary"]},
+            "query": {"type": "string"},
+            "from": {"type": "string"},
+            "type": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("broadcast", "Broadcast to teammates.", {"content": {"type": "string"}}, ["content"]),
     tool_def("shutdown_request", "Request teammate shutdown.", {"teammate": {"type": "string"}}, ["teammate"]),
     tool_def("plan_approval", "Respond to plan approval request.", {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, ["request_id", "approve"]),
@@ -13581,7 +13671,19 @@ TOOLS = [
     tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
-    tool_def("worktree_events", "Read worktree lifecycle events.", {"limit": {"type": "integer"}}),
+    tool_def(
+        "worktree_events",
+        "Read worktree lifecycle events with summary/search/detail modes.",
+        {
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
+            "query": {"type": "string"},
+            "event": {"type": "string"},
+            "worktree": {"type": "string"},
+            "task_id": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
 ]
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
@@ -16784,6 +16886,8 @@ class SessionState:
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When inspecting collections or memory, use focused modes too: context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
             f"{mm_hint}"
@@ -18217,7 +18321,7 @@ class SessionState:
         if len(model_pages) > 1 or should_temp:
             model_truncated = True
             preview = (
-                self._run_read(temp_output_path, LONG_OUTPUT_READ_PAGE_LINES, 0)
+                self._run_read(temp_output_path, mode="overview", max_chars=LONG_OUTPUT_MODEL_PAGE_CHARS)
                 if temp_output_path
                 else model_pages[0]
             )
@@ -18229,7 +18333,11 @@ class SessionState:
             ]
             if temp_output_path:
                 parts.append(
-                    f"use read_file path=\"{temp_output_path}\" offset=0 limit={LONG_OUTPUT_READ_PAGE_LINES}"
+                    f"full_output_path={temp_output_path}"
+                )
+                parts.append(
+                    "Use read_file on full_output_path with mode=\"search\" for a keyword/error, "
+                    "mode=\"window\" with line/context for nearby lines, or mode=\"full\" with max_chars when broad exact output is needed."
                 )
             if buffer_ref:
                 parts.append(f"buffer_ref={buffer_ref}")
@@ -18572,9 +18680,9 @@ class SessionState:
         seg_msg_count = int(seg.get("messages", 0) or 0) if isinstance(seg, dict) else 0
         seg_path = str(seg.get("path", "")) if isinstance(seg, dict) else ""
         continuation = (
-            f"If details are missing, call context_recall with segment_id='{seg_id}', max_messages=40, offset=0."
+            f"If details are missing, call context_recall with segment_id='{seg_id}', mode='search' and a specific query, or mode='window' with around_index/context."
             if seg_id
-            else "If details are missing, call context_recall with recent_segments=2."
+            else "If details are missing, call context_recall with mode='summary' first, then mode='search' or mode='window' for focused evidence."
         )
         # Create checkpoint before compaction
         self._maybe_create_checkpoint()
@@ -21446,47 +21554,315 @@ body{padding:18px}
             body = "\n".join(lines[:line_cap])
         return trim(body, max_chars)
 
-    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+    def _read_file_int_arg(self, value: object, default: int, minimum: int, maximum: int) -> int:
+        try:
+            iv = int(value)
+        except Exception:
+            iv = int(default)
+        return max(int(minimum), min(int(maximum), iv))
+
+    def _read_file_max_chars(self, value: object = None, default: int = READ_FILE_DEFAULT_MAX_CHARS) -> int:
+        if value is None or str(value).strip() == "":
+            raw = int(default)
+        else:
+            raw = self._read_file_int_arg(value, int(default), 1200, READ_FILE_HARD_MAX_CHARS)
+        return max(1200, min(int(READ_FILE_HARD_MAX_CHARS), int(raw)))
+
+    def _clip_read_file_output(self, text: str, max_chars: int, hint: str = "") -> str:
+        cap = self._read_file_max_chars(max_chars)
+        raw = str(text or "")
+        if len(raw) <= cap:
+            return raw
+        default_hint = 'Use mode="search", mode="symbol", mode="window", or raise max_chars for a wider read.'
+        suffix = (
+            f"\n[read_file clipped chars=1-{cap} of {len(raw)} by max_chars. "
+            f"{hint or default_hint}]"
+        )
+        return raw[:cap].rstrip() + suffix
+
+    def _tool_int_arg(self, value: object, default: int, minimum: int, maximum: int) -> int:
+        try:
+            iv = int(value)
+        except Exception:
+            iv = int(default)
+        return max(int(minimum), min(int(maximum), iv))
+
+    def _tool_max_chars(self, value: object = None, default: int = 24000) -> int:
+        return self._tool_int_arg(value, default, 1200, READ_FILE_HARD_MAX_CHARS)
+
+    def _row_text_for_search(self, row: object) -> str:
+        try:
+            return json_dumps(row, indent=0)
+        except Exception:
+            return str(row or "")
+
+    def _row_field_value(self, row: object, field: str) -> str:
+        if not isinstance(row, dict):
+            return ""
+        cur: object = row
+        for part in str(field or "").split("."):
+            if not isinstance(cur, dict):
+                return ""
+            cur = cur.get(part)
+        if isinstance(cur, (dict, list)):
+            return self._row_text_for_search(cur)
+        return str(cur or "")
+
+    def _collection_filter_rows(
+        self,
+        rows: list[dict],
+        *,
+        query: str = "",
+        filters: dict[str, object] | None = None,
+    ) -> list[dict]:
+        q = str(query or "").strip().lower()
+        clean_filters = {
+            str(k): str(v).strip().lower()
+            for k, v in (filters or {}).items()
+            if str(v or "").strip()
+        }
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if clean_filters:
+                ok = True
+                for key, wanted in clean_filters.items():
+                    actual = self._row_field_value(row, key).strip().lower()
+                    if wanted not in actual:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+            if q and q not in self._row_text_for_search(row).lower():
+                continue
+            out.append(row)
+        return out
+
+    def _render_collection_tool_payload(
+        self,
+        *,
+        tool: str,
+        rows: list[dict],
+        mode: object = None,
+        query: object = "",
+        limit: object = None,
+        around_index: object = None,
+        context: object = None,
+        max_chars: object = None,
+        filters: dict[str, object] | None = None,
+        summary_fields: list[str] | None = None,
+        detail_fields: list[str] | None = None,
+        default_limit: int = 12,
+    ) -> str:
+        mode_text = str(mode or "").strip().lower() or ("search" if str(query or "").strip() else "summary")
+        if mode_text not in {"summary", "search", "recent", "window", "detail", "tail", "peek", "drain"}:
+            mode_text = "summary"
+        cap = self._tool_max_chars(max_chars)
+        all_rows = [row for row in rows if isinstance(row, dict)]
+        filtered = self._collection_filter_rows(all_rows, query=str(query or ""), filters=filters)
+        n = self._tool_int_arg(limit, default_limit, 1, 200)
+        if mode_text in {"recent", "tail", "peek", "drain"}:
+            selected = filtered[-n:]
+        elif mode_text == "window":
+            if around_index is None or str(around_index).strip() == "":
+                selected = filtered[-n:]
+            else:
+                idx = self._tool_int_arg(around_index, 0, 0, max(0, len(filtered) - 1))
+                ctx = self._tool_int_arg(context, 4, 0, 80)
+                selected = filtered[max(0, idx - ctx): min(len(filtered), idx + ctx + 1)]
+        elif mode_text == "detail":
+            selected = filtered[:n] if str(query or "").strip() else filtered[-n:]
+        else:
+            selected = filtered[:n] if str(query or "").strip() else filtered[-n:]
+
+        def compact(row: dict, idx: int) -> dict:
+            if mode_text == "detail":
+                if detail_fields:
+                    return {k: row.get(k) for k in detail_fields if k in row}
+                return row
+            fields = summary_fields or list(row.keys())[:8]
+            item = {"index": idx}
+            for key in fields:
+                if key in row:
+                    val = row.get(key)
+                    item[key] = trim(val if not isinstance(val, (dict, list)) else json_dumps(val), 800)
+            return item
+
+        index_by_identity = {id(row): idx for idx, row in enumerate(filtered)}
+        rendered = [
+            compact(row, int(index_by_identity.get(id(row), 0)))
+            for row in selected
+        ]
+        payload = {
+            "tool": tool,
+            "mode": mode_text,
+            "query": str(query or ""),
+            "filters": {k: v for k, v in (filters or {}).items() if str(v or "").strip()},
+            "total_rows": len(all_rows),
+            "matched_rows": len(filtered),
+            "returned": len(rendered),
+            "items": rendered,
+            "focused_reads": [
+                f"{tool} mode='search' query='<term>'",
+                f"{tool} mode='window' around_index=<index> context=4",
+                f"{tool} mode='detail' query='<specific id/name/status>'",
+            ],
+        }
+        return trim(json_dumps(payload, indent=2), cap)
+
+    def _read_file_code_data(self, fp: Path, lines: list[str]) -> dict:
+        text = "\n".join(lines)
+        language = ""
+        imports: list[str] = []
+        symbols: list[dict] = []
+        try:
+            parser = CodeContentParser()
+            language = parser.detect_language(fp, text=text[:120_000]) or ""
+            imports = parser._extract_imports(text[:240_000], language) if language else []
+            if language == "python":
+                _, symbols = parser._python_chunks(text)
+            else:
+                _, symbols = parser._generic_code_chunks(text, language)
+        except Exception:
+            symbols = []
+        if not symbols:
+            symbols = self._read_file_fallback_symbols(fp, lines, language)
+        total = len(lines)
+        clean: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for row in symbols:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "") or "").strip()
+            kind = str(row.get("kind", "") or row.get("symbol_kind", "") or "symbol").strip() or "symbol"
+            start = self._read_file_int_arg(row.get("line_start", 1), 1, 1, max(1, total))
+            end = self._read_file_int_arg(row.get("line_end", start), start, start, max(start, total))
+            sig = str(row.get("signature", "") or "").strip()
+            if not sig and 1 <= start <= total:
+                sig = lines[start - 1].strip()
+            key = (name.lower(), start)
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(
+                {
+                    "name": name or sig[:80],
+                    "kind": kind,
+                    "line_start": start,
+                    "line_end": end,
+                    "signature": trim(sig, 180),
+                }
+            )
+        clean.sort(key=lambda r: (int(r.get("line_start", 0) or 0), str(r.get("name", ""))))
+        return {"language": language or "text", "imports": imports[:64], "symbols": clean[:240]}
+
+    def _read_file_fallback_symbols(self, fp: Path, lines: list[str], language: str = "") -> list[dict]:
+        symbols: list[dict] = []
+        ext = fp.suffix.lower()
+        patterns: list[tuple[re.Pattern[str], str]] = []
+        if ext in {".py", ".pyi"} or language == "python":
+            patterns = [
+                (re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "class"),
+                (re.compile(r"^\s*async\s+def\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "async_function"),
+                (re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "function"),
+            ]
+        else:
+            try:
+                patterns = CodeContentParser()._decl_matchers(language or "")
+            except Exception:
+                patterns = []
+            if not patterns:
+                patterns = [
+                    (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b"), "function"),
+                    (re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b"), "class"),
+                    (re.compile(r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\("), "function"),
+                ]
+        for idx, line in enumerate(lines, 1):
+            for pattern, kind in patterns:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                name = str(m.group(1) if m.groups() else "").strip()
+                if not name:
+                    continue
+                symbols.append(
+                    {
+                        "name": name,
+                        "kind": kind,
+                        "line_start": idx,
+                        "line_end": idx,
+                        "signature": trim(line.strip(), 180),
+                    }
+                )
+                break
+            if len(symbols) >= 240:
+                break
+        for pos, row in enumerate(symbols):
+            start = int(row.get("line_start", 1) or 1)
+            next_start = int(symbols[pos + 1].get("line_start", 0) or 0) if pos + 1 < len(symbols) else 0
+            row["line_end"] = max(start, (next_start - 1) if next_start > start else min(len(lines), start + 120))
+        return symbols
+
+    def _render_text_overview(
+        self,
+        fp: Path,
+        rel: str,
+        lines: list[str],
+        *,
+        max_chars: int | None = None,
+    ) -> str:
         total_lines = len(lines)
         try:
             size = int(fp.stat().st_size)
         except Exception:
             size = 0
-        ext = fp.suffix.lower()
-        head = "\n".join(lines[:80])
-        symbols: list[str] = []
-        if ext in {".py", ".pyi"}:
-            for idx, line in enumerate(lines, 1):
-                stripped = line.strip()
-                if stripped.startswith(("class ", "def ", "async def ")):
-                    symbols.append(f"{idx}: {trim(stripped, 180)}")
-                if len(symbols) >= 80:
-                    break
-        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
-            pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")
-            for idx, line in enumerate(lines, 1):
-                if pattern.search(line):
-                    symbols.append(f"{idx}: {trim(line.strip(), 180)}")
-                if len(symbols) >= 80:
-                    break
-        next_limit = LONG_OUTPUT_READ_PAGE_LINES
+        cap = self._read_file_max_chars(max_chars, default=READ_FILE_DEFAULT_MAX_CHARS)
+        code_data = self._read_file_code_data(fp, lines)
+        language = str(code_data.get("language", "") or "text")
+        symbols = code_data.get("symbols", []) if isinstance(code_data.get("symbols"), list) else []
+        imports = code_data.get("imports", []) if isinstance(code_data.get("imports"), list) else []
+        is_code = bool(symbols) or (language and language != "text")
         out = [
+            f"[read_file overview path={rel} bytes={size} lines={total_lines} language={language}]",
             (
-                f"[large_file_overview path={rel} bytes={size} lines={total_lines} "
-                f"auto_paged=true]"
+                "Choose a focused read that matches the question. "
+                "Prefer symbol/search/window for investigation; use full only when exact broad context is needed."
             ),
-            "This file is too large to inject fully into model context. Use paged read_file calls or RAG/code-library search for focused retrieval.",
-            f"First page: read_file path=\"{rel}\" offset=0 limit={next_limit}",
         ]
+        if imports:
+            out.append("\nImports:")
+            out.append(", ".join(str(x) for x in imports[:24]))
         if symbols:
             out.append("\nSymbols:")
-            out.extend(symbols)
+            for row in symbols[:120]:
+                start = int(row.get("line_start", 0) or 0)
+                end = int(row.get("line_end", start) or start)
+                name = str(row.get("name", "") or "").strip()
+                kind = str(row.get("kind", "symbol") or "symbol")
+                sig = str(row.get("signature", "") or "").strip()
+                suffix = f" — {sig}" if sig and sig != name else ""
+                out.append(f"L{start}-{end} {kind} {name}{suffix}")
+            if len(symbols) > 120:
+                out.append(f"... {len(symbols) - 120} more symbols omitted; use mode=\"search\" or mode=\"symbol\".")
+        head = "\n".join(lines[:READ_FILE_OVERVIEW_HEAD_LINES]).strip("\n")
         if head:
             out.append("\nHead preview:")
             out.append(head)
-        if total_lines > 80:
-            out.append(f"\n[next_page read_file path=\"{rel}\" offset=80 limit={next_limit}]")
-        return "\n".join(out)
+        out.append("\nFocused reads:")
+        if symbols:
+            first_symbol = str(symbols[0].get("name", "") or "").strip()
+            if first_symbol:
+                out.append(f"- read_file path=\"{rel}\" mode=\"symbol\" target=\"{first_symbol}\"")
+        out.append(f"- read_file path=\"{rel}\" mode=\"search\" query=\"<term>\" context=6")
+        out.append(f"- read_file path=\"{rel}\" mode=\"window\" line=<line> context=80")
+        out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
+        if not is_code:
+            out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
+        return self._clip_read_file_output("\n".join(out), cap)
+
+    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+        return self._render_text_overview(fp, rel, lines)
 
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
@@ -22520,6 +22896,8 @@ body{padding:18px}
 
     def _generate_run_completion_summary(self):
         """Generate a brief summary bubble when a run completes, so user isn't left without feedback."""
+        if not RUN_COMPLETION_SUMMARY_ENABLED:
+            return
         if self.cancel_requested:
             return
         bb = self._ensure_blackboard()
@@ -24304,7 +24682,16 @@ body{padding:18px}
         scored.sort(key=lambda row: (-row[0], len(row[1]), row[1]))
         return [path for _, path in scored[: max(1, int(limit or 1))]]
 
-    def _render_directory_read(self, fp: Path, rel: str, limit: int | None = None, offset: int | None = None) -> str:
+    def _render_directory_read(
+        self,
+        fp: Path,
+        rel: str,
+        limit: int | None = None,
+        offset: int | None = None,
+        *,
+        query: object = "",
+        max_chars: object = None,
+    ) -> str:
         entries = sorted(
             list(fp.iterdir()),
             key=lambda p: (0 if p.is_dir() else 1, p.name.lower()),
@@ -24312,16 +24699,26 @@ body{padding:18px}
         total = len(entries)
         if total == 0:
             return f"[read_file directory path={rel} entries=0]\n(empty directory)"
-        offset_val = max(0, int(offset or 0))
-        requested_limit = max(1, int(limit or 60))
-        if offset_val >= total:
+        query_text = str(query or "").strip().lower()
+        if query_text:
+            filtered = [p for p in entries if query_text in p.name.lower() or query_text in p.as_posix().lower()]
+        else:
+            filtered = entries
+        filtered_total = len(filtered)
+        offset_val = self._read_file_int_arg(offset, 0, 0, max(0, filtered_total))
+        requested_limit = self._read_file_int_arg(limit, 200 if query_text else 120, 1, 500)
+        if offset_val >= filtered_total:
             return (
-                f"[read_file directory path={rel} entries=0 of {total} offset={offset_val}]\n"
+                f"[read_file directory path={rel} entries=0 of {filtered_total} total={total} offset={offset_val}]\n"
                 "[end_of_directory]"
             )
-        page = entries[offset_val: offset_val + requested_limit]
+        page = filtered[offset_val: offset_val + requested_limit]
         lines = [
-            f"[read_file directory path={rel} entries={offset_val + 1}-{offset_val + len(page)} of {total} offset={offset_val} limit={requested_limit}]"
+            (
+                f"[read_file directory path={rel} entries={offset_val + 1}-{offset_val + len(page)} "
+                f"of {filtered_total} total={total} mode=directory"
+                f"{f' query={query_text!r}' if query_text else ''}]"
+            )
         ]
         for child in page:
             kind = "dir" if child.is_dir() else "file"
@@ -24330,13 +24727,15 @@ body{padding:18px}
             except Exception:
                 size_text = ""
             lines.append(f"{kind} {child.name}{size_text}")
-        next_offset = offset_val + len(page)
-        if next_offset < total:
-            lines.append(f"[next_page read_file path=\"{rel}\" offset={next_offset} limit={requested_limit}]")
-        if offset_val > 0:
-            prev_offset = max(0, offset_val - requested_limit)
-            lines.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
-        return "\n".join(lines)
+        remaining = max(0, filtered_total - (offset_val + len(page)))
+        if remaining > 0:
+            lines.append(
+                f"[directory has {remaining} more matching entries. Use query to narrow results, "
+                "or read a specific subdirectory/file.]"
+            )
+        if not query_text and total > requested_limit:
+            lines.append(f"[tip read_file path=\"{rel}\" mode=\"directory\" query=\"<name-fragment>\" narrows large directories]")
+        return self._clip_read_file_output("\n".join(lines), self._read_file_max_chars(max_chars))
 
     def _read_text_with_fallback(self, fp: Path) -> str:
         tried: list[str] = []
@@ -24368,7 +24767,176 @@ body{padding:18px}
         )
         return "\n".join(lines)
 
-    def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
+    def _render_full_text_read(self, rel: str, lines: list[str], *, max_chars: object = None) -> str:
+        full_text = "\n".join(lines)
+        cap = self._read_file_max_chars(max_chars)
+        if len(full_text) <= cap:
+            return full_text
+        header = (
+            f"[read_file full path={rel} chars=1-{cap} of {len(full_text)} max_chars={cap}]\n"
+        )
+        return header + self._clip_read_file_output(
+            full_text,
+            cap,
+            "For exact focused context, use mode=\"search\", mode=\"symbol\", or mode=\"window\"; "
+            "for a wider full read, set a larger max_chars value.",
+        )
+
+    def _render_window_text_read(
+        self,
+        rel: str,
+        lines: list[str],
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        line: object = None,
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        total = len(lines)
+        if total <= 0:
+            return f"[read_file window path={rel} lines=0]\n[end_of_file]"
+        ctx = self._read_file_int_arg(context, 60, 0, 2000)
+        default_limit = ctx * 2 + 1 if line not in (None, "") else LONG_OUTPUT_READ_PAGE_LINES
+        requested_limit = self._read_file_int_arg(limit, default_limit, 1, 4000)
+        line_val = self._read_file_int_arg(line, 0, 0, max(1, total)) if line not in (None, "") else 0
+        if line_val > 0:
+            start = max(0, line_val - ctx - 1)
+        else:
+            start = self._read_file_int_arg(offset, 0, 0, max(0, total))
+        end = min(total, start + requested_limit)
+        if start >= total:
+            return f"[read_file window path={rel} lines=0 of {total} start={start + 1}]\n[end_of_file]"
+        body = "\n".join(lines[start:end])
+        header = f"[read_file window path={rel} lines={start + 1}-{end} of {total}]\n"
+        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
+
+    def _render_search_text_read(
+        self,
+        rel: str,
+        lines: list[str],
+        *,
+        query: object = "",
+        regex: object = False,
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        needle = str(query or "").strip()
+        if not needle:
+            return (
+                f"[read_file search path={rel}]\n"
+                "Error: query is required for mode=\"search\". Use mode=\"overview\" to inspect available structure."
+            )
+        ctx = self._read_file_int_arg(context, 6, 0, 80)
+        total = len(lines)
+        matches: list[int] = []
+        if bool(regex):
+            try:
+                pattern = re.compile(needle)
+            except re.error as exc:
+                return f"Error: invalid regex for read_file search: {exc}"
+            for idx, row in enumerate(lines):
+                if pattern.search(row):
+                    matches.append(idx)
+                if len(matches) >= READ_FILE_SEARCH_MAX_MATCHES:
+                    break
+        else:
+            low = needle.lower()
+            for idx, row in enumerate(lines):
+                if low in row.lower():
+                    matches.append(idx)
+                if len(matches) >= READ_FILE_SEARCH_MAX_MATCHES:
+                    break
+        if not matches:
+            return f"[read_file search path={rel} query={needle!r} matches=0]\n(no matches)"
+        ranges: list[tuple[int, int]] = []
+        for idx in matches:
+            start = max(0, idx - ctx)
+            end = min(total, idx + ctx + 1)
+            if ranges and start <= ranges[-1][1]:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+        out = [
+            (
+                f"[read_file search path={rel} query={needle!r} matches_returned={len(matches)} "
+                f"windows={len(ranges)} total_lines={total}]"
+            )
+        ]
+        for start, end in ranges:
+            out.append(f"\n@@ lines {start + 1}-{end} @@")
+            for line_no in range(start, end):
+                out.append(f"{line_no + 1:>6}: {lines[line_no]}")
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+
+    def _render_symbol_text_read(
+        self,
+        fp: Path,
+        rel: str,
+        lines: list[str],
+        *,
+        target: object = "",
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        symbol_name = str(target or "").strip()
+        if not symbol_name:
+            return (
+                f"[read_file symbol path={rel}]\n"
+                "Error: target is required for mode=\"symbol\".\n"
+                + self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            )
+        data = self._read_file_code_data(fp, lines)
+        symbols = data.get("symbols", []) if isinstance(data.get("symbols"), list) else []
+        wanted = symbol_name.lower()
+
+        def score(row: dict) -> int:
+            name = str(row.get("name", "") or "").strip().lower()
+            sig = str(row.get("signature", "") or "").strip().lower()
+            if name == wanted:
+                return 100
+            if name.endswith("." + wanted):
+                return 90
+            if wanted in name:
+                return 70
+            if wanted in sig:
+                return 50
+            return 0
+
+        ranked = sorted(((score(row), row) for row in symbols), key=lambda x: (-x[0], int(x[1].get("line_start", 0) or 0)))
+        match = next((row for sc, row in ranked if sc > 0), None)
+        if not match:
+            available = ", ".join(str(row.get("name", "")) for row in symbols[:40] if str(row.get("name", "")).strip())
+            return (
+                f"[read_file symbol path={rel} target={symbol_name!r} matches=0]\n"
+                f"Available symbols: {available or '(none detected)'}\n"
+                f"Try read_file path=\"{rel}\" mode=\"search\" query=\"{symbol_name}\""
+            )
+        total = len(lines)
+        ctx = self._read_file_int_arg(context, 0, 0, 1000)
+        start = max(1, int(match.get("line_start", 1) or 1) - ctx)
+        end = min(total, int(match.get("line_end", start) or start) + ctx)
+        body = "\n".join(lines[start - 1:end])
+        header = (
+            f"[read_file symbol path={rel} target={symbol_name!r} "
+            f"matched={match.get('kind', 'symbol')} {match.get('name', '')} lines={start}-{end} of {total}]\n"
+        )
+        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
+
+    def _run_read(
+        self,
+        path: str,
+        limit: int | None = None,
+        offset: int | None = None,
+        *,
+        mode: object = None,
+        target: object = "",
+        query: object = "",
+        line: object = None,
+        context: object = None,
+        regex: object = False,
+        max_chars: object = None,
+    ) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
@@ -24376,7 +24944,7 @@ body{padding:18px}
             if not fp.exists():
                 return self._render_missing_read_hint(rel)
             if fp.is_dir():
-                return self._render_directory_read(fp, rel, limit=limit, offset=offset)
+                return self._render_directory_read(fp, rel, limit=limit, offset=offset, query=query, max_chars=max_chars)
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -24393,54 +24961,65 @@ body{padding:18px}
                 file_size = int(fp.stat().st_size)
             except Exception:
                 file_size = 0
+            mode_text = str(mode or "auto").strip().lower() or "auto"
+            if mode_text not in {"auto", "full", "overview", "window", "symbol", "search", "directory"}:
+                mode_text = "auto"
+            if mode_text == "auto":
+                if str(target or "").strip():
+                    mode_text = "symbol"
+                elif str(query or "").strip():
+                    mode_text = "search"
+                elif line not in (None, ""):
+                    mode_text = "window"
+            if mode_text == "directory":
+                return f"Error: path is a file, not a directory: {rel}"
+            if mode_text == "overview":
+                return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            if mode_text == "full":
+                return self._render_full_text_read(rel, lines, max_chars=max_chars)
+            if mode_text == "search":
+                return self._render_search_text_read(
+                    rel,
+                    lines,
+                    query=query or target,
+                    regex=regex,
+                    context=context,
+                    max_chars=max_chars,
+                )
+            if mode_text == "symbol":
+                return self._render_symbol_text_read(
+                    fp,
+                    rel,
+                    lines,
+                    target=target or query,
+                    context=context,
+                    max_chars=max_chars,
+                )
+            if (
+                mode_text == "window"
+                or limit is not None
+                or self._read_file_int_arg(offset, 0, 0, 1_000_000) > 0
+                or line not in (None, "")
+            ):
+                return self._render_window_text_read(
+                    rel,
+                    lines,
+                    limit=limit,
+                    offset=offset,
+                    line=line,
+                    context=context,
+                    max_chars=max_chars,
+                )
             if (
                 limit is None
-                and int(offset or 0) <= 0
+                and self._read_file_int_arg(offset, 0, 0, 1_000_000) <= 0
                 and (file_size >= LARGE_FILE_AUTO_PAGE_BYTES or total_lines >= LARGE_FILE_AUTO_PAGE_LINES)
             ):
-                return self._large_text_file_overview(fp, rel, lines)
-            offset_val = max(0, int(offset or 0))
-            requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
-            if offset_val >= total_lines:
-                return (
-                    f"[read_file page path={rel} lines=0 of {total_lines} offset={offset_val}]\n"
-                    "[end_of_file]"
-                )
+                return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
             full_text = "\n".join(lines)
-            auto_paginate = limit is None and offset_val == 0 and len(full_text) > LONG_OUTPUT_READ_PAGE_MAX_CHARS
-            if not auto_paginate and limit is None and offset_val == 0 and len(full_text) <= MAX_TOOL_OUTPUT:
+            if len(full_text) <= self._read_file_max_chars(max_chars):
                 return full_text
-            page_parts: list[str] = []
-            chars = 0
-            idx = offset_val
-            while idx < total_lines and len(page_parts) < requested_limit:
-                line = lines[idx]
-                piece = line if not page_parts else "\n" + line
-                if page_parts and (chars + len(piece)) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
-                    break
-                if (not page_parts) and len(line) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
-                    page_parts.append(line[:LONG_OUTPUT_READ_PAGE_MAX_CHARS])
-                    idx += 1
-                    break
-                page_parts.append(piece if page_parts else line)
-                chars += len(piece)
-                idx += 1
-            body = "".join(page_parts)
-            page_no = (offset_val // requested_limit) + 1
-            total_pages = max(1, (total_lines + requested_limit - 1) // requested_limit)
-            out = [
-                (
-                    f"[read_file page path={rel} lines={offset_val + 1}-{idx} of {total_lines} "
-                    f"page={page_no}/{total_pages} offset={offset_val} limit={requested_limit}]"
-                ),
-                body,
-            ]
-            if idx < total_lines:
-                out.append(f"[next_page read_file path=\"{rel}\" offset={idx} limit={requested_limit}]")
-            if offset_val > 0:
-                prev_offset = max(0, offset_val - requested_limit)
-                out.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
-            return "\n".join(part for part in out if part != "")
+            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
@@ -24508,6 +25087,22 @@ body{padding:18px}
                 f"Note: {reason} native {media_type} input. "
                 f"File exists at {fp}. Use bash tools to process it if needed."
             )
+
+    def _tool_result_context_content(
+        self,
+        name: str,
+        args: dict | None,
+        output: object,
+        default_limit: int = MAX_TOOL_OUTPUT,
+    ) -> str:
+        text = str(output or "")
+        tool_name = canonicalize_tool_name(name)
+        if tool_name == "read_file":
+            req = (args or {}).get("max_chars") if isinstance(args, dict) else None
+            requested = self._read_file_max_chars(req, default=READ_FILE_DEFAULT_MAX_CHARS)
+            cap = max(int(default_limit or 0), min(int(READ_FILE_HARD_MAX_CHARS), requested))
+            return trim(text, cap)
+        return trim(text, int(default_limit or MAX_TOOL_OUTPUT))
 
     def _is_html_file_rel(self, path: str) -> bool:
         low = str(path or "").strip().lower()
@@ -24766,8 +25361,29 @@ body{padding:18px}
             tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
             tool_def(
                 "read_file",
-                "Read file with optional line pagination.",
-                {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+                (
+                    "Read files or directories with structure-aware modes. "
+                    "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
+                    "app.py line 240 -> mode='window' line=240 context=5; "
+                    "run.txt E123 -> mode='search' query='E123'. "
+                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed."
+                ),
+                {
+                    "path": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
+                        "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                    },
+                    "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+                    "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+                    "line": {"type": "integer", "description": "1-based center line for mode='window'."},
+                    "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
+                    "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
+                    "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
+                    "offset": {"type": "integer", "description": "Legacy 0-based line offset for compatibility; prefer mode='window' with line/context."},
+                },
                 ["path"],
             ),
         ]
@@ -24843,14 +25459,30 @@ body{padding:18px}
                 if name == "bash":
                     out = self._run_bash(args.get("command", ""))
                 elif name == "read_file":
-                    out = self._run_read(args.get("path", ""), args.get("limit"), args.get("offset"))
+                    out = self._run_read(
+                        args.get("path", ""),
+                        args.get("limit"),
+                        args.get("offset"),
+                        mode=args.get("mode"),
+                        target=args.get("target"),
+                        query=args.get("query"),
+                        line=args.get("line"),
+                        context=args.get("context"),
+                        regex=args.get("regex"),
+                        max_chars=args.get("max_chars"),
+                    )
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
                 elif name == "edit_file":
                     out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
                 else:
                     out = f"Unknown tool: {name}"
-                msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": name,
+                    "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, out),
+                })
         return last_text or "(subagent done)"
 
     def _spawn_teammate(self, name: str, role: str, prompt: str) -> str:
@@ -28966,7 +29598,7 @@ body{padding:18px}
             if core_c and len(core_c) >= 4:
                 _core_to_identity.setdefault(core_c, identity)
 
-
+        incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
             if isinstance(item, str):
                 raw = {"content": item, "status": "pending"}
@@ -33994,6 +34626,8 @@ body{padding:18px}
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases in final exported HTML. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When inspecting collections or memory, use focused modes too: context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             f"{code_note + ' ' if code_note else ''}"
             f"{engineering_note + ' ' if engineering_note else ''}"
             f"{html_note + ' ' if html_note else ''}"
@@ -34063,13 +34697,13 @@ body{padding:18px}
             "Do not silently batch multiple subtasks and do not delay todo updates until the end of the step. "
             "This manual update is critical because skill re-evaluation is triggered by actual todo progress. "
             "EDIT METHODOLOGY (follow strictly): "
-            "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
+            "1) Read the EXACT target location using read_file before any edit — prefer mode='symbol', mode='search', or mode='window' to get the right context directly; never edit from memory. "
             "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
             "3) Keep old_text as SHORT as possible while still unique (1-3 lines ideal). "
             "4) If edit_file fails 'text not found': IMMEDIATELY re-read the file, compare whitespace, retry with exact content. "
             "5) If edit_file fails 2+ times on same file: switch to write_file to rewrite entire file. "
             "6) After every successful edit, run build/test to verify. "
-            "NEVER loop on read_file without attempting a concrete edit_file, write_file, path reconciliation, or verification call. "
+            "If read_file is not answering the question, change the read shape (overview/symbol/search/window/full), form a sharper hypothesis, then attempt a concrete edit_file, write_file, path reconciliation, or verification call. "
             "PROBLEM-SOLVING (critical): "
             "When you discover missing files, broken imports, or incomplete source code: "
             "A) Think deeply about what the missing content should contain based on ALL available context "
@@ -34077,7 +34711,7 @@ body{padding:18px}
             "B) CREATE the missing files yourself using write_file — do not wait or re-read. "
             "C) If compilation fails due to missing dependencies, write stub implementations. "
             "D) If read_file or bash says a path is missing, empty, or mismatched, reconcile the path against uploads, recent files, and close matches before trying again. "
-            "E) NEVER re-read the same directory/file more than twice — after 2 reads, you MUST act. "
+            "E) Avoid repeated identical reads; when you need more evidence, ask a more specific read_file question instead of reopening the same context. "
             "F) Do not declare success until at least one fix-and-verify cycle is complete and the evidence is observable. "
             "G) If truly blocked, explain WHY to the user and propose alternatives. "
         )
@@ -34480,7 +35114,7 @@ body{padding:18px}
             actions.append("split into smaller subtasks and regenerate full tool JSON")
         if compact_hints > 0:
             causes.append("context may be compacted")
-            actions.append("call context_recall first for latest segment details")
+            actions.append("call context_recall mode='summary', then mode='search' or mode='window' for focused details")
         if tool_errors > 0:
             causes.append("recent tool execution errors")
             actions.append("repair arguments for one failing tool and retry only that tool")
@@ -34522,7 +35156,7 @@ body{padding:18px}
             seg_id = str(seg.get("id", "")).strip()
             if seg_id:
                 recall_hint = (
-                    f"Call context_recall first with segment_id='{seg_id}', max_messages=40, offset=0. "
+                    f"Call context_recall with segment_id='{seg_id}' and mode='summary' to map the segment, then mode='search' for the missing topic or mode='window' with around_index/context for nearby messages. "
                 )
         self._prune_runtime_retry_hints()
         self.messages.append(
@@ -34688,7 +35322,7 @@ body{padding:18px}
             if "<auto-context-recall>" in content:
                 return False
         try:
-            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "offset": 0})
+            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "mode": "summary"})
         except Exception:
             return False
         text = str(recalled or "").strip()
@@ -34786,13 +35420,13 @@ body{padding:18px}
     def _context_recall(self, args: dict) -> str:
         segment_id = str(args.get("segment_id", "") or "").strip()
         query = str(args.get("query", "") or "").strip()
-        recent_segments = int(args.get("recent_segments", 2) or 2)
-        max_messages = int(args.get("max_messages", 30) or 30)
-        offset = int(args.get("offset", 0) or 0)
+        mode = str(args.get("mode", "") or "").strip().lower()
+        role_filter = str(args.get("role", "") or "").strip()
+        tool_filter = str(args.get("tool_name", "") or "").strip()
+        recent_segments = self._tool_int_arg(args.get("recent_segments", 2), 2, 1, 20)
+        max_messages = self._tool_int_arg(args.get("max_messages", 30), 30, 1, 120)
+        offset = self._tool_int_arg(args.get("offset", 0), 0, 0, 100000)
         include_tools = bool(args.get("include_tools", True))
-        recent_segments = max(1, min(20, recent_segments))
-        max_messages = max(1, min(120, max_messages))
-        offset = max(0, offset)
 
         segments: list[dict] = []
         if segment_id:
@@ -34814,16 +35448,21 @@ body{padding:18px}
                 role = str(row.get("role", ""))
                 if not include_tools and role == "tool":
                     continue
+                if role_filter and role_filter.lower() not in role.lower():
+                    continue
+                name = str(row.get("name", "") or "")
+                if tool_filter and tool_filter.lower() not in name.lower():
+                    continue
                 content = str(row.get("content", ""))
                 if query_low:
-                    pool = f"{role}\n{row.get('name', '')}\n{content}".lower()
+                    pool = f"{role}\n{name}\n{content}".lower()
                     if query_low not in pool:
                         continue
                 out_row = {
                     "segment_id": seg_id,
                     "index": idx,
                     "role": role,
-                    "name": row.get("name", ""),
+                    "name": name,
                     "tool_call_id": row.get("tool_call_id", ""),
                     "ts": float(row.get("ts", 0.0) or 0.0),
                     "content": trim(content, 6000),
@@ -34832,8 +35471,6 @@ body{padding:18px}
                     out_row["thinking"] = trim(row.get("thinking", ""), 2500)
                 matches.append(out_row)
 
-        total = len(matches)
-        page = matches[offset : offset + max_messages]
         selected_segments = [
             {
                 "id": str(seg.get("id", "")),
@@ -34844,17 +35481,236 @@ body{padding:18px}
             }
             for seg in segments
         ]
-        payload = {
-            "query": query,
-            "segment_id": segment_id or "",
-            "segments_considered": selected_segments,
-            "total_matches": total,
-            "offset": offset,
-            "returned": len(page),
-            "next_offset": (offset + len(page)) if (offset + len(page)) < total else None,
-            "matches": page,
+        if not mode and (args.get("offset") is not None):
+            page = matches[offset : offset + max_messages]
+            payload = {
+                "mode": "legacy",
+                "query": query,
+                "segment_id": segment_id or "",
+                "segments_considered": selected_segments,
+                "total_matches": len(matches),
+                "offset": offset,
+                "returned": len(page),
+                "matches": page,
+                "focused_reads": [
+                    "context_recall mode='search' query='<term>'",
+                    "context_recall mode='window' around_index=<index> context=4",
+                    "context_recall mode='detail' query='<exact evidence>'",
+                ],
+            }
+            return trim(json_dumps(payload, indent=2), self._tool_max_chars(args.get("max_chars"), 24000))
+        rendered = self._render_collection_tool_payload(
+            tool="context_recall",
+            rows=matches,
+            mode=mode or ("search" if query else "summary"),
+            query="",
+            limit=max_messages,
+            around_index=args.get("around_index"),
+            context=args.get("context"),
+            max_chars=args.get("max_chars"),
+            filters={},
+            summary_fields=["segment_id", "index", "role", "name", "content"],
+            detail_fields=["segment_id", "index", "role", "name", "tool_call_id", "ts", "content", "thinking"],
+            default_limit=12,
+        )
+        try:
+            payload = parse_json_object(rendered, {})
+            if isinstance(payload, dict):
+                payload["query"] = query
+                payload["role"] = role_filter
+                payload["tool_name"] = tool_filter
+                payload["segments_considered"] = selected_segments
+                return trim(json_dumps(payload, indent=2), self._tool_max_chars(args.get("max_chars"), 24000))
+        except Exception:
+            pass
+        return rendered
+
+    def _read_blackboard_enhanced(self, args: dict) -> str:
+        section = str(args.get("section", "all") or "all").strip().lower()
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 6), 6, 1, 80)
+        board = self._ensure_blackboard()
+        if section in {"", "all"} and not mode and not query and not args.get("actor") and not args.get("around_index"):
+            return self._blackboard_read_state_markdown(max_items=min(20, limit))
+        if section == "original_goal":
+            return trim(str(board.get("original_goal", "") or "").strip(), self._tool_max_chars(args.get("max_chars"), 4000)) or "(empty)"
+        if section == "status":
+            wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
+            dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
+            return trim(json_dumps(
+                {
+                    "status": board.get("status", "INITIALIZING"),
+                    "active_agent": board.get("active_agent", ""),
+                    "manager_cycles": int(board.get("manager_cycles", 0) or 0),
+                    "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
+                    "approval": board.get("approval", {}),
+                    "last_delegate": board.get("last_delegate", {}),
+                    "watchdog": {
+                        "intent_no_tool_streak": int(wd.get("intent_no_tool_streak", 0) or 0),
+                        "repeat_no_tool_streak": int(wd.get("repeat_no_tool_streak", 0) or 0),
+                        "state_unchanged_streak": int(wd.get("state_unchanged_streak", 0) or 0),
+                        "trigger_count": int(wd.get("trigger_count", 0) or 0),
+                        "last_trigger_reason": trim(str(wd.get("last_trigger_reason", "") or "").strip(), 160),
+                    },
+                    "decomposition_queue": {
+                        "active": bool(dq.get("active", False)),
+                        "trigger_reason": trim(str(dq.get("trigger_reason", "") or "").strip(), 160),
+                        "cursor": int(dq.get("cursor", 0) or 0),
+                        "total": len(dq.get("steps", []) or []),
+                        "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
+                    },
+                },
+                indent=2,
+            ), self._tool_max_chars(args.get("max_chars"), 12000))
+        sections = ["research_notes", "execution_logs", "review_feedback", "conversation_history"]
+        rows: list[dict] = []
+        if section == "code_artifacts":
+            artifacts = board.get("code_artifacts", {})
+            if not isinstance(artifacts, dict):
+                artifacts = {}
+            for key, value in artifacts.items():
+                row = dict(value) if isinstance(value, dict) else {"value": value}
+                row["key"] = key
+                rows.append(row)
+        elif section in sections:
+            raw_rows = board.get(section, [])
+            rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+        elif section in {"", "all"}:
+            for sec in sections:
+                raw_rows = board.get(sec, [])
+                if isinstance(raw_rows, list):
+                    for row in raw_rows:
+                        if isinstance(row, dict):
+                            item = dict(row)
+                            item["section"] = sec
+                            rows.append(item)
+            artifacts = board.get("code_artifacts", {})
+            if isinstance(artifacts, dict):
+                for key, value in artifacts.items():
+                    item = dict(value) if isinstance(value, dict) else {"value": value}
+                    item["section"] = "code_artifacts"
+                    item["key"] = key
+                    rows.append(item)
+        else:
+            return f"Error: unsupported blackboard section '{section}'"
+        return self._render_collection_tool_payload(
+            tool="read_from_blackboard",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            around_index=args.get("around_index"),
+            context=args.get("context"),
+            max_chars=args.get("max_chars"),
+            filters={"actor": args.get("actor"), "status": args.get("status")},
+            summary_fields=["section", "key", "actor", "status", "content", "summary", "path"],
+            detail_fields=[],
+            default_limit=limit,
+        )
+
+    def _task_list_enhanced(self, args: dict) -> str:
+        rows = []
+        for task in self.tasks.list_objects():
+            if isinstance(task, dict):
+                rows.append(dict(task))
+        if not rows:
+            return "No tasks."
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 30), 30, 1, 200)
+        if not mode and not query and not args.get("status") and not args.get("owner"):
+            return self.tasks.list_all()
+        return self._render_collection_tool_payload(
+            tool="task_list",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            max_chars=args.get("max_chars"),
+            filters={"status": args.get("status"), "owner": args.get("owner")},
+            summary_fields=["id", "status", "owner", "subject", "blockedBy", "worktree", "updated_at"],
+            detail_fields=[],
+            default_limit=limit,
+        )
+
+    def _check_background_enhanced(self, args: dict) -> str:
+        task_id = str(args.get("task_id", "") or "").strip()
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        if task_id and not mode and not query:
+            return self.bg.check(task_id)
+        rows = self.bg.list_objects()
+        if not rows:
+            return "No bg tasks."
+        if not task_id and not mode and not query and not args.get("status"):
+            return self.bg.check(None)
+        filters = {"status": args.get("status")}
+        if task_id:
+            filters["id"] = task_id
+        return self._render_collection_tool_payload(
+            tool="check_background",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=args.get("limit", 20),
+            max_chars=args.get("max_chars"),
+            filters=filters,
+            summary_fields=["id", "status", "command", "started_at", "finished_at"],
+            detail_fields=[],
+            default_limit=20,
+        )
+
+    def _read_inbox_enhanced(self, args: dict) -> str:
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        # Backward compatibility: no arguments means consume the inbox as before.
+        if not args or (not mode and not query and not args.get("from") and not args.get("type")):
+            return json_dumps(self.bus.read_inbox("lead"), indent=2)
+        rows = self.bus.peek_inbox("lead")
+        if mode == "drain":
+            rows = self.bus.read_inbox("lead")
+        if not rows:
+            return "[]"
+        return self._render_collection_tool_payload(
+            tool="read_inbox",
+            rows=rows,
+            mode=mode or ("search" if query else "peek"),
+            query=query,
+            limit=args.get("limit", 20),
+            max_chars=args.get("max_chars"),
+            filters={"from": args.get("from"), "type": args.get("type")},
+            summary_fields=["timestamp", "from", "type", "content"],
+            detail_fields=[],
+            default_limit=20,
+        )
+
+    def _worktree_events_enhanced(self, args: dict) -> str:
+        rows = self.worktrees.events_objects()
+        if not rows:
+            return "[]"
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 20), 20, 1, 200)
+        if not mode and not query and not args.get("event") and not args.get("worktree") and not args.get("task_id"):
+            return self.worktrees.events_recent(limit)
+        filters = {
+            "event": args.get("event"),
+            "worktree.name": args.get("worktree"),
+            "task.id": args.get("task_id"),
         }
-        return json_dumps(payload, indent=2)
+        return self._render_collection_tool_payload(
+            tool="worktree_events",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            max_chars=args.get("max_chars"),
+            filters=filters,
+            summary_fields=["ts", "event", "task", "worktree", "error"],
+            detail_fields=[],
+            default_limit=limit,
+        )
 
     def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
@@ -34975,10 +35831,24 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
-            out = self._run_read(rel, args.get("limit"), args.get("offset"))
-            limit_val = int(args.get("limit", 0) or 0) if args.get("limit") is not None else 0
-            offset_val = int(args.get("offset", 0) or 0) if args.get("offset") is not None else 0
+            out = self._run_read(
+                rel,
+                args.get("limit"),
+                args.get("offset"),
+                mode=args.get("mode"),
+                target=args.get("target"),
+                query=args.get("query"),
+                line=args.get("line"),
+                context=args.get("context"),
+                regex=args.get("regex"),
+                max_chars=args.get("max_chars"),
+            )
+            limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
+            offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
+            mode_val = str(args.get("mode", "") or "").strip()
             summary = f"read file: {rel}"
+            if mode_val:
+                summary += f" mode={mode_val}"
             if offset_val > 0 or limit_val > 0:
                 summary += (
                     f" offset={offset_val}"
@@ -34988,12 +35858,13 @@ body{padding:18px}
                 "file_read",
                 {
                     "path": rel,
+                    "mode": mode_val or "auto",
                     "offset": offset_val,
                     "limit": limit_val,
                     "summary": summary,
                     "large_file_guard": bool(
                         limit_val <= 0
-                        and str(out).startswith("[large_file_overview")
+                        and str(out).startswith("[read_file overview")
                     ),
                 },
             )
@@ -35200,8 +36071,9 @@ body{padding:18px}
                 ):
                     return (
                         "Error: reviewer finalization requires blackboard evidence read. "
-                        "Call read_from_blackboard first (sections: code_artifacts, execution_logs, "
-                        "review_feedback, status), then call finish_task with structured summary."
+                        "Call read_from_blackboard with mode='summary' or mode='search' "
+                        "(sections: code_artifacts, execution_logs, review_feedback, status), "
+                        "then call finish_task with structured summary."
                     )
                 if not self._final_summary_sufficient(summary, strict=True):
                     return (
@@ -35210,7 +36082,8 @@ body{padding:18px}
                         "(1) changes/files touched, "
                         "(2) validation evidence (tests/commands/results), "
                         "(3) residual risks or next steps. "
-                        "If evidence is missing, read_from_blackboard first or ask Explorer for final_summary_request."
+                        "If evidence is missing, use read_from_blackboard mode='summary' or mode='search', "
+                        "or ask Explorer for final_summary_request."
                     )
             if name == "finish_task":
                 todo_mark = self.todo.complete_all_open(summary)
@@ -35346,7 +36219,7 @@ body{padding:18px}
             )
             return str(payload.get("output", out_filtered or "(no output)"))
         if name == "check_background":
-            return self.bg.check(args.get("task_id"))
+            return self._check_background_enhanced(args)
         if name == "task_create":
             return self.tasks.create(args["subject"], args.get("description", ""))
         if name == "task_get":
@@ -35354,7 +36227,7 @@ body{padding:18px}
         if name == "task_update":
             return self.tasks.update(int(args["task_id"]), args.get("status"), args.get("add_blocked_by"), args.get("add_blocks"))
         if name == "task_list":
-            return self.tasks.list_all()
+            return self._task_list_enhanced(args)
         if name == "claim_task":
             return self.tasks.claim(int(args["task_id"]), "lead")
         if name == "spawn_teammate":
@@ -35397,57 +36270,7 @@ body{padding:18px}
                 f"intent={env.get('intent')}, id={env.get('id')})"
             )
         if name == "read_from_blackboard":
-            section = str(args.get("section", "all") or "all").strip().lower()
-            limit = max(1, min(20, int(args.get("limit", 6) or 6)))
-            board = self._ensure_blackboard()
-            if section in {"", "all"}:
-                return self._blackboard_read_state_markdown(max_items=limit)
-            if section == "original_goal":
-                return trim(str(board.get("original_goal", "") or "").strip(), 4000) or "(empty)"
-            if section == "status":
-                wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
-                dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
-                return json_dumps(
-                    {
-                        "status": board.get("status", "INITIALIZING"),
-                        "active_agent": board.get("active_agent", ""),
-                        "manager_cycles": int(board.get("manager_cycles", 0) or 0),
-                        "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
-                        "approval": board.get("approval", {}),
-                        "last_delegate": board.get("last_delegate", {}),
-                        "watchdog": {
-                            "intent_no_tool_streak": int(wd.get("intent_no_tool_streak", 0) or 0),
-                            "repeat_no_tool_streak": int(wd.get("repeat_no_tool_streak", 0) or 0),
-                            "state_unchanged_streak": int(wd.get("state_unchanged_streak", 0) or 0),
-                            "trigger_count": int(wd.get("trigger_count", 0) or 0),
-                            "last_trigger_reason": trim(str(wd.get("last_trigger_reason", "") or "").strip(), 160),
-                        },
-                        "decomposition_queue": {
-                            "active": bool(dq.get("active", False)),
-                            "trigger_reason": trim(str(dq.get("trigger_reason", "") or "").strip(), 160),
-                            "cursor": int(dq.get("cursor", 0) or 0),
-                            "total": len(dq.get("steps", []) or []),
-                            "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
-                        },
-                    },
-                    indent=2,
-                )
-            if section == "code_artifacts":
-                artifacts = board.get("code_artifacts", {})
-                if not isinstance(artifacts, dict):
-                    artifacts = {}
-                rows = sorted(
-                    list(artifacts.items()),
-                    key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
-                    reverse=True,
-                )
-                return json_dumps({k: v for k, v in rows[:limit]}, indent=2)
-            if section in {"research_notes", "execution_logs", "review_feedback", "conversation_history"}:
-                rows = board.get(section, [])
-                if not isinstance(rows, list):
-                    rows = []
-                return json_dumps(rows[-limit:], indent=2)
-            return f"Error: unsupported blackboard section '{section}'"
+            return self._read_blackboard_enhanced(args)
         if name == "write_to_blackboard":
             section = str(args.get("section", "") or "").strip().lower()
             content = trim(str(args.get("content", "") or "").strip(), BLACKBOARD_MAX_TEXT)
@@ -35477,7 +36300,7 @@ body{padding:18px}
         if name == "send_message":
             return self.bus.send("lead", args["to"], args["content"], args.get("msg_type", "message"))
         if name == "read_inbox":
-            return json_dumps(self.bus.read_inbox("lead"), indent=2)
+            return self._read_inbox_enhanced(args)
         if name == "broadcast":
             return self.bus.broadcast("lead", args["content"], list(self.teammates.keys()))
         if name == "shutdown_request":
@@ -35536,7 +36359,7 @@ body{padding:18px}
         if name == "worktree_remove":
             return self.worktrees.remove(args["name"], bool(args.get("force", False)), bool(args.get("complete_task", False)))
         if name == "worktree_events":
-            return self.worktrees.events_recent(int(args.get("limit", 20)))
+            return self._worktree_events_enhanced(args)
         return f"Unknown tool: {name}"
 
     def _live_input_delay_locked(self) -> tuple[int, str]:
@@ -36285,7 +37108,7 @@ body{padding:18px}
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "name": name,
-                    "content": trim(output),
+                    "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                     "ts": now_ts(),
                     "agent_role": role_key,
                 },
@@ -37158,13 +37981,15 @@ body{padding:18px}
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
-                "You are Explorer in plan-mode (read-only research). "
-                "Analyze the codebase to understand the task scope. "
-                "Do NOT modify any files. Use read_file, bash (read-only commands), "
-                "list_skills, load_skill, and blackboard tools only. "
-                f"{skills_block}"
-                "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
-                "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
+            "You are Explorer in plan-mode (read-only research). "
+            "Analyze the codebase to understand the task scope. "
+            "Do NOT modify any files. Use read_file, bash (read-only commands), "
+            "list_skills, load_skill, and blackboard tools only. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
+            f"{skills_block}"
+            "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
+            "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -37204,6 +38029,8 @@ body{padding:18px}
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+                "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+                "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
                 f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
@@ -37287,7 +38114,12 @@ body{padding:18px}
             self._append_agent_context_message("explorer", {
                 "role": "tool",
                 "tool_call_id": tc["id"],
-                "content": trim(result_content, 8000),
+                "content": self._tool_result_context_content(
+                    fn_name,
+                    fn_args if isinstance(fn_args, dict) else {},
+                    result_content,
+                    8000,
+                ),
                 "ts": now_ts(),
                 "agent_role": "explorer",
             }, mirror_to_global=False)
@@ -39827,7 +40659,13 @@ body{padding:18px}
                         manual_compact = True
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and not str(output).startswith("Error:"):
                         stop_due_to_finish_task = True
-                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(output), "ts": now_ts()})
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": name,
+                        "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
+                        "ts": now_ts(),
+                    })
                     single_round_tool_results.append(
                         {
                             "name": dispatched_name or name,
@@ -40009,12 +40847,10 @@ body{padding:18px}
                         "content": (
                             "<read-loop-intervention>"
                             f"{_read_loop_reason} "
-                            "MANDATORY: Stop reading and take ONE concrete action: "
-                            "1) If files are MISSING: create them based on context (docs, Makefile, imports). "
-                            "2) If compilation FAILS: fix the error, do not re-read the same file. "
-                            "3) If you are STUCK: report the blocker to the user and stop. "
-                            "4) Think deeply about the user's goal and the project structure to find the solution. "
-                            "Do NOT run ls, cat, find, or head on the same paths again."
+                            "Change strategy now: state the exact unanswered question, then use a more focused tool call "
+                            "(read_file mode='overview', 'symbol', 'search', or 'window'), reconcile the path, "
+                            "or take a concrete edit/verification action based on the current evidence. "
+                            "Think about the user's goal and project structure before opening more broad listings."
                             "</read-loop-intervention>"
                         ),
                         "ts": now_ts(),
@@ -42308,8 +43144,9 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-run-dot{width:8px;height:8px;border-radius:999px;background:#13b8a6;box-shadow:0 0 0 0 rgba(19,184,166,.38);animation:msgRunPulse 1.6s ease-out infinite}
 @keyframes msgRunPulse{0%{box-shadow:0 0 0 0 rgba(19,184,166,.36)}70%{box-shadow:0 0 0 9px rgba(19,184,166,0)}100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}}
 @media (prefers-reduced-motion:reduce){.msg-run-dot{animation:none}}
-.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
-.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;white-space:pre;tab-size:4;word-break:normal;overflow-wrap:normal;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;white-space:pre;tab-size:4;word-break:normal;overflow-wrap:normal;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-diff-shell .diff-row{display:block;min-width:max-content;white-space:pre;tab-size:4}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
 .composer-shell{position:relative;border:1px solid var(--control-line);border-radius:16px;background:linear-gradient(180deg,var(--control-panel),var(--control-panel-soft));box-shadow:inset 0 1px 0 rgba(255,255,255,.7),0 10px 22px rgba(15,23,42,.05);overflow:hidden;transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease}
 .composer-shell:focus-within{border-color:var(--focus-border);box-shadow:0 0 0 4px var(--focus-ring),inset 0 1px 0 rgba(255,255,255,.78),0 16px 34px rgba(15,23,42,.08)}
@@ -42429,6 +43266,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff;min-width:0}
 .diff-head{font-weight:600;margin-bottom:4px;overflow-wrap:anywhere;word-break:break-word}
 .diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
+.diff-body .diff-row{display:block;min-width:max-content;white-space:pre;tab-size:4}
 .diff-line-add{background:#eaffea;color:#0f6a1b}
 .diff-line-del{background:#ffeaea;color:#8a1d1d}
 .diff-line-hunk{background:#edf4ff;color:#1f4b8f}
@@ -43208,7 +44046,7 @@ function renderSessions(){
 }
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
-function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
+function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"diff-row ${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
 function _scrollContainerToNodeCenter(container,target){
   if(!container||!target)return;
   const maxTop=Math.max(0,Number(container.scrollHeight||0)-Number(container.clientHeight||0));
@@ -51742,14 +52580,14 @@ def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
         text_lines: list[str] = []
         consecutive_blank = 0
         while i < len(lines):
-            l = lines[i]
-            ls = l.strip()
-            if re.match(r"^#{1,4}\s", l) or ls.startswith("```") or ls.startswith("~~~"):
+            line_text = lines[i]
+            stripped_line = line_text.strip()
+            if re.match(r"^#{1,4}\s", line_text) or stripped_line.startswith("```") or stripped_line.startswith("~~~"):
                 break
-            if ls.startswith("|") and "|" in ls[1:]:
+            if stripped_line.startswith("|") and "|" in stripped_line[1:]:
                 break
-            text_lines.append(l)
-            consecutive_blank = 0 if ls else consecutive_blank + 1
+            text_lines.append(line_text)
+            consecutive_blank = 0 if stripped_line else consecutive_blank + 1
             i += 1
             if consecutive_blank >= 2:
                 break
@@ -60718,11 +61556,13 @@ class AppContext:
         if not to_embed:
             return 0
         to_embed = to_embed[-max_chunks:]
-        anchor_text = lambda cid: (
-            str(all_chunks[cid].get("anchor", "") or "")
-            + "\n"
-            + str(all_chunks[cid].get("text", "") or "")
-        )[:2048]
+        def anchor_text(cid: str) -> str:
+            return (
+                str(all_chunks[cid].get("anchor", "") or "")
+                + "\n"
+                + str(all_chunks[cid].get("text", "") or "")
+            )[:2048]
+
         texts = [anchor_text(cid) for cid in to_embed]
         vecs = _rag_embed_batch(texts, session, model=model)
         count = 0
