@@ -142,6 +142,10 @@ LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
 LONG_OUTPUT_READ_PAGE_LINES = 240
 LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
 LONG_OUTPUT_TEMP_MAX_FILES = 160
+READ_FILE_DEFAULT_MAX_CHARS = 50_000
+READ_FILE_HARD_MAX_CHARS = 120_000
+READ_FILE_OVERVIEW_HEAD_LINES = 80
+READ_FILE_SEARCH_MAX_MATCHES = 24
 JSON_FSYNC_ENABLED = str(os.getenv("AGENT_JSON_FSYNC", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 RAG_LIBRARY_DIRNAME = "RAG_Library"
 RAG_ADMIN_PORT_OFFSET = 2
@@ -3920,7 +3924,7 @@ def extract_base_url(endpoint_or_base: str) -> str:
     if not s:
         return ""
     low = s.lower()
-    for suffix in ("/v1/chat/completions", "/chat/completions", "/v1/messages", "/messages", "/v1/responses", "/responses"):
+    for suffix in ("/v1/chat/completions", "/chat/completions"):
         if low.endswith(suffix):
             return s[: -len(suffix)] or s
     return s
@@ -3935,21 +3939,6 @@ def complete_chat_endpoint(endpoint_or_base: str) -> str:
     if low.endswith("/v1"):
         return s.rstrip("/") + "/chat/completions"
     return s.rstrip("/") + "/v1/chat/completions"
-
-def complete_responses_endpoint(endpoint_or_base: str) -> str:
-    s = (endpoint_or_base or "").strip()
-    if not s:
-        return ""
-    low = s.lower().rstrip("/")
-    if low.endswith("/responses") or low.endswith("/v1/responses"):
-        return s
-    if low.endswith("/chat/completions"):
-        root = s[: -len("/chat/completions")].rstrip("/")
-        if root:
-            return root + "/responses"
-    if low.endswith("/v1"):
-        return s.rstrip("/") + "/responses"
-    return s.rstrip("/") + "/v1/responses"
 
 def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
@@ -4021,7 +4010,6 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
     aliases = {
         "openai": "openai_compat",
         "openai_compat": "openai_compat",
-        "openai_chat": "openai_compat",
         "siliconflow": "siliconflow",
         "vllm": "vllm",
         "lmstudio": "lmstudio",
@@ -4029,11 +4017,6 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
         "kimi": "kimi",
         "moonshot": "kimi",
         "openrouter": "openrouter",
-        "opencode": "opencode",
-        "open_code": "opencode",
-        "openclaw": "openclaw",
-        "open_claw": "openclaw",
-        "hermes": "hermes",
         "custom": "custom_http",
         "custom_http": "custom_http",
     }
@@ -4047,149 +4030,9 @@ OPENAI_COMPAT_PROVIDER_NAMES = {
     "glm",
     "kimi",
     "openrouter",
-    "opencode",
-    "openclaw",
-    "hermes",
 }
 
 OPENAI_LIKE_PROVIDER_NAMES = OPENAI_COMPAT_PROVIDER_NAMES | {"custom_http"}
-
-API_PROTOCOLS = {
-    "auto",
-    "openai_chat",
-    "openai_responses",
-    "anthropic_messages",
-    "ollama_chat",
-    "custom_http",
-}
-
-TOOL_PROTOCOLS = {
-    "auto",
-    "openai_tools",
-    "anthropic_tools",
-    "ollama_tools",
-    "hermes_tool_text",
-    "json_tool_text",
-    "none",
-}
-
-PROTOCOL_DETECTION_MODES = {"auto", "off"}
-
-def normalize_api_protocol(raw: object, default: str = "auto") -> str:
-    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "": default,
-        "chat": "openai_chat",
-        "openai": "openai_chat",
-        "openai_compat": "openai_chat",
-        "openai_compatible": "openai_chat",
-        "openai_chat_completions": "openai_chat",
-        "chat_completions": "openai_chat",
-        "responses": "openai_responses",
-        "openai_response": "openai_responses",
-        "openai_responses_api": "openai_responses",
-        "anthropic": "anthropic_messages",
-        "claude": "anthropic_messages",
-        "claude_code": "anthropic_messages",
-        "anthropic_messages_api": "anthropic_messages",
-        "ollama": "ollama_chat",
-        "ollama_native": "ollama_chat",
-        "ollama_api_chat": "ollama_chat",
-        "custom": "custom_http",
-    }
-    value = aliases.get(value, value)
-    return value if value in API_PROTOCOLS else default
-
-def normalize_tool_protocol(raw: object, default: str = "auto") -> str:
-    if isinstance(raw, bool):
-        return "auto" if raw else "none"
-    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "": default,
-        "off": "none",
-        "false": "none",
-        "disabled": "none",
-        "no_tools": "none",
-        "openai": "openai_tools",
-        "openai_tool": "openai_tools",
-        "function_calling": "openai_tools",
-        "functions": "openai_tools",
-        "anthropic": "anthropic_tools",
-        "claude": "anthropic_tools",
-        "claude_code": "anthropic_tools",
-        "ollama": "ollama_tools",
-        "ollama_native": "ollama_tools",
-        "hermes": "hermes_tool_text",
-        "hermes_text": "hermes_tool_text",
-        "xml_tool_text": "hermes_tool_text",
-        "text": "json_tool_text",
-        "json": "json_tool_text",
-        "json_text": "json_tool_text",
-    }
-    value = aliases.get(value, value)
-    return value if value in TOOL_PROTOCOLS else default
-
-def normalize_protocol_detection(raw: object, default: str = "auto") -> str:
-    if isinstance(raw, bool):
-        return "auto" if raw else "off"
-    value = str(raw if raw is not None else "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {"": default, "true": "auto", "yes": "auto", "enabled": "auto", "false": "off", "disabled": "off"}
-    value = aliases.get(value, value)
-    return value if value in PROTOCOL_DETECTION_MODES else default
-
-def infer_api_protocol(
-    provider: str,
-    endpoint: str = "",
-    base_url: str = "",
-    model: str = "",
-    requested: object = "auto",
-    protocol_detection: object = "auto",
-) -> str:
-    explicit = normalize_api_protocol(requested, default="auto")
-    if explicit != "auto":
-        return explicit
-    detection = normalize_protocol_detection(protocol_detection, default="auto")
-    normalized_provider = normalize_openai_compat_provider_name(provider)
-    provider_low = str(provider or "").strip().lower().replace("-", "_")
-    text = " ".join(str(x or "").strip().lower() for x in (endpoint, base_url, model, provider_low, normalized_provider))
-    if detection == "auto":
-        if "/v1/messages" in text or "anthropic" in text or "claude" in text:
-            return "anthropic_messages"
-        if "/v1/responses" in text or text.endswith("/responses"):
-            return "openai_responses"
-        if "ollama" in text and not any(x in text for x in ("/v1/chat/completions", "/chat/completions")):
-            return "ollama_chat"
-        if "custom_http" in text:
-            return "custom_http"
-    if provider_low in {"anthropic", "claude", "claude_code"}:
-        return "anthropic_messages"
-    if normalized_provider == "custom_http":
-        return "custom_http"
-    if provider_low == "ollama":
-        return "ollama_chat"
-    return "openai_chat"
-
-def infer_tool_protocol(
-    provider: str,
-    model: str = "",
-    requested: object = "auto",
-    api_protocol: object = "auto",
-    protocol_detection: object = "auto",
-) -> str:
-    explicit = normalize_tool_protocol(requested, default="auto")
-    if explicit != "auto":
-        return explicit
-    detection = normalize_protocol_detection(protocol_detection, default="auto")
-    api = normalize_api_protocol(api_protocol, default="auto")
-    normalized_provider = normalize_openai_compat_provider_name(provider)
-    text = f"{provider or ''} {model or ''}".strip().lower().replace("-", "_")
-    if api == "anthropic_messages" or "anthropic" in text or "claude" in text:
-        return "anthropic_tools"
-    if api == "ollama_chat":
-        return "ollama_tools"
-    if detection == "auto" and (normalized_provider == "hermes" or "hermes" in text):
-        return "hermes_tool_text"
-    return "openai_tools"
 
 def is_openai_compat_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_COMPAT_PROVIDER_NAMES
@@ -4230,9 +4073,6 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         "glm": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "kimi": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "openrouter": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
-        "opencode": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
-        "openclaw": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
-        "hermes": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
         "custom_http": [base.rstrip("/") + "/models", base.rstrip("/") + "/v1/models"],
     }
     for candidate in provider_specific.get(normalized_provider, provider_specific["openai_compat"]):
@@ -4429,13 +4269,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             "vllm": "auto",
             "lmstudio": "auto",
             "anthropic": "claude-sonnet-4-20250514",
-            "claude_code": "claude-sonnet-4-20250514",
             "glm": "glm-4-flash",
             "kimi": "moonshot-v1-8k",
             "openrouter": "meta-llama/llama-3.1-8b-instruct",
-            "opencode": "auto",
-            "openclaw": "auto",
-            "hermes": "NousResearch/Hermes-3-Llama-3.1-8B",
             "custom_http": "custom-model",
         }
         return defaults.get(normalized, "model")
@@ -4446,7 +4282,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             return ""
         if value == "ollama":
             return "ollama"
-        if value in {"anthropic", "claude", "claude_code"}:
+        if value == "anthropic":
             return "anthropic"
         if is_openai_like_provider(value):
             return normalize_openai_compat_provider_name(value)
@@ -4478,23 +4314,8 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         capabilities: dict | None = None,
         media_endpoints: dict | None = None,
-        api_protocol: object = None,
-        tool_protocol: object = None,
-        protocol_detection: object = None,
         source: str = "config",
     ):
-        protocol_detection_norm = normalize_protocol_detection(
-            global_protocol_detection if protocol_detection is None else protocol_detection,
-            default="auto",
-        )
-        api_protocol_norm = normalize_api_protocol(
-            global_api_protocol if api_protocol is None else api_protocol,
-            default="auto",
-        )
-        tool_protocol_norm = normalize_tool_protocol(
-            global_tool_protocol if tool_protocol is None else tool_protocol,
-            default="auto",
-        )
         out.append(
             {
                 "id": profile_id,
@@ -4516,9 +4337,6 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 ),
                 "capabilities": capabilities or default_multimodal_capabilities(),
                 "media_endpoints": media_endpoints or {},
-                "api_protocol": api_protocol_norm,
-                "tool_protocol": tool_protocol_norm,
-                "protocol_detection": protocol_detection_norm,
                 "source": source,
             }
         )
@@ -4534,18 +4352,6 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
     )
     thinking_stream_default = bool(
         config.get("thinking_stream", config.get("stream_thinking", False))
-    )
-    global_api_protocol = normalize_api_protocol(
-        config.get("api_protocol", config.get("api_type", config.get("api_mode", "auto"))),
-        default="auto",
-    )
-    global_tool_protocol = normalize_tool_protocol(
-        config.get("tool_protocol", config.get("tool_type", config.get("function_calling", "auto"))),
-        default="auto",
-    )
-    global_protocol_detection = normalize_protocol_detection(
-        config.get("protocol_detection", config.get("auto_detect_protocol", "auto")),
-        default="auto",
     )
     explicit_default_profile_id = sanitize_profile_id(
         str(
@@ -4609,7 +4415,6 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         endpoint = str(
             raw_profile.get("endpoint")
             or raw_profile.get("chat_endpoint")
-            or raw_profile.get("responses_endpoint")
             or raw_profile.get("completion_endpoint")
             or ""
         ).strip()
@@ -4658,27 +4463,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             or raw_profile.get("template")
             or ""
         ).strip()
-        api_protocol = normalize_api_protocol(
-            raw_profile.get("api_protocol", raw_profile.get("api_type", raw_profile.get("api_mode", global_api_protocol))),
-            default=global_api_protocol,
-        )
-        tool_protocol = normalize_tool_protocol(
-            raw_profile.get("tool_protocol", raw_profile.get("tool_type", raw_profile.get("function_calling", global_tool_protocol))),
-            default=global_tool_protocol,
-        )
-        protocol_detection = normalize_protocol_detection(
-            raw_profile.get("protocol_detection", raw_profile.get("auto_detect_protocol", global_protocol_detection)),
-            default=global_protocol_detection,
-        )
         if provider == "anthropic":
             anth_base = base_url or "https://api.anthropic.com"
             endpoint = endpoint or anth_base.rstrip("/") + "/v1/messages"
             base_url = extract_base_url(anth_base)
         elif is_openai_like_provider(provider):
-            if normalize_api_protocol(api_protocol, default="auto") == "openai_responses":
-                endpoint = endpoint or complete_responses_endpoint(base_url)
-            else:
-                endpoint = endpoint or complete_chat_endpoint(base_url)
+            endpoint = endpoint or complete_chat_endpoint(base_url)
         caps_key = str(raw_profile.get("capabilities_key") or profile_id or provider)
         capabilities = build_profile_capabilities(caps_key, provider, model)
         if raw_profile.get("capabilities") is not None:
@@ -4721,9 +4511,6 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             request_timeout=raw_profile.get("request_timeout", timeout),
             capabilities=capabilities,
             media_endpoints=media_endpoints,
-            api_protocol=api_protocol,
-            tool_protocol=tool_protocol,
-            protocol_detection=protocol_detection,
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -4921,94 +4708,6 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
-    # ── OpenCode / OpenClaw / Hermes presets ───────────────────────
-    opencode_url = str(config.get("opencode_url", "")).strip()
-    opencode_model = str(config.get("opencode_model", "")).strip()
-    opencode_key = str(config.get("opencode_key", "")).strip()
-    if opencode_url or opencode_model or opencode_key:
-        _opencode_default = "http://localhost:4096/v1"
-        add_profile(
-            profiles,
-            profile_id="opencode",
-            provider=normalize_profile_provider("opencode"),
-            label="OpenCode",
-            model=opencode_model or "auto",
-            base_url=extract_base_url(opencode_url or _opencode_default),
-            endpoint=complete_chat_endpoint(opencode_url or _opencode_default),
-            api_key=opencode_key,
-            thinking_stream=bool(config.get("opencode_thinking_stream", thinking_stream_default)),
-            temperature=temp,
-            request_timeout=timeout,
-            capabilities=build_profile_capabilities("opencode", normalize_profile_provider("opencode"), opencode_model or "auto"),
-            media_endpoints=build_profile_media_endpoints("opencode"),
-        )
-
-    openclaw_url = str(config.get("openclaw_url", "")).strip()
-    openclaw_model = str(config.get("openclaw_model", "")).strip()
-    openclaw_key = str(config.get("openclaw_key", "")).strip()
-    if openclaw_url or openclaw_model or openclaw_key:
-        _openclaw_default = "http://localhost:4097/v1"
-        add_profile(
-            profiles,
-            profile_id="openclaw",
-            provider=normalize_profile_provider("openclaw"),
-            label="OpenClaw",
-            model=openclaw_model or "auto",
-            base_url=extract_base_url(openclaw_url or _openclaw_default),
-            endpoint=complete_chat_endpoint(openclaw_url or _openclaw_default),
-            api_key=openclaw_key,
-            thinking_stream=bool(config.get("openclaw_thinking_stream", thinking_stream_default)),
-            temperature=temp,
-            request_timeout=timeout,
-            capabilities=build_profile_capabilities("openclaw", normalize_profile_provider("openclaw"), openclaw_model or "auto"),
-            media_endpoints=build_profile_media_endpoints("openclaw"),
-        )
-
-    hermes_url = str(config.get("hermes_url", "")).strip()
-    hermes_model = str(config.get("hermes_model", "")).strip()
-    hermes_key = str(config.get("hermes_key", "")).strip()
-    if hermes_url or hermes_model or hermes_key:
-        _hermes_default = "http://localhost:8000/v1"
-        add_profile(
-            profiles,
-            profile_id="hermes",
-            provider=normalize_profile_provider("hermes"),
-            label="Hermes",
-            model=hermes_model or "NousResearch/Hermes-3-Llama-3.1-8B",
-            base_url=extract_base_url(hermes_url or _hermes_default),
-            endpoint=complete_chat_endpoint(hermes_url or _hermes_default),
-            api_key=hermes_key,
-            thinking_stream=bool(config.get("hermes_thinking_stream", thinking_stream_default)),
-            temperature=temp,
-            request_timeout=timeout,
-            capabilities=build_profile_capabilities("hermes", normalize_profile_provider("hermes"), hermes_model or "NousResearch/Hermes-3-Llama-3.1-8B"),
-            media_endpoints=build_profile_media_endpoints("hermes"),
-            tool_protocol=config.get("hermes_tool_protocol", config.get("tool_protocol", "hermes_tool_text")),
-        )
-
-    claude_code_url = str(config.get("claude_code_url", "")).strip()
-    claude_code_model = str(config.get("claude_code_model", "")).strip()
-    claude_code_key = str(config.get("claude_code_key", "")).strip()
-    if claude_code_url or claude_code_model or claude_code_key:
-        _claude_code_base = claude_code_url or "https://api.anthropic.com"
-        add_profile(
-            profiles,
-            profile_id="claude_code",
-            provider=normalize_profile_provider("claude_code"),
-            label="Claude Code",
-            model=claude_code_model or "claude-sonnet-4-20250514",
-            base_url=extract_base_url(_claude_code_base),
-            endpoint=_claude_code_base.rstrip("/") + "/v1/messages",
-            api_key=claude_code_key,
-            thinking_stream=bool(config.get("claude_code_thinking_stream", thinking_stream_default)),
-            temperature=temp,
-            request_timeout=timeout,
-            capabilities=build_profile_capabilities("claude_code", "anthropic", claude_code_model or "claude-sonnet-4-20250514"),
-            media_endpoints=build_profile_media_endpoints("claude_code"),
-            api_protocol=config.get("claude_code_api_protocol", config.get("api_protocol", "anthropic_messages")),
-            tool_protocol=config.get("claude_code_tool_protocol", config.get("tool_protocol", "anthropic_tools")),
-        )
-
     custom_url = str(config.get("custom_url", "")).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
@@ -5055,13 +4754,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         "vllm": "vllm",
         "lmstudio": "lmstudio",
         "anthropic": "anthropic",
-        "claude_code": "claude_code",
         "glm": "glm",
         "kimi": "kimi",
         "openrouter": "openrouter",
-        "opencode": "opencode",
-        "openclaw": "openclaw",
-        "hermes": "hermes",
         "custom": "custom",
     }
     profile_ids = {p["id"] for p in profiles}
@@ -5119,21 +4814,6 @@ def looks_like_llm_config(config: dict) -> bool:
         "openrouter_url",
         "openrouter_model",
         "openrouter_key",
-        "opencode_url",
-        "opencode_model",
-        "opencode_key",
-        "openclaw_url",
-        "openclaw_model",
-        "openclaw_key",
-        "hermes_url",
-        "hermes_model",
-        "hermes_key",
-        "claude_code_url",
-        "claude_code_model",
-        "claude_code_key",
-        "api_protocol",
-        "tool_protocol",
-        "protocol_detection",
         "custom_url",
         "custom_model",
         "custom_key",
@@ -7349,7 +7029,7 @@ Assess the error and pick the matching depth. This is the single most important 
 | Signal | Depth | Budget | Strategy |
 |--------|-------|--------|----------|
 | Typo, missing import, syntax error | **Shallow** | 1-2 tool calls | Pattern-match fix directly from error message |
-| Single clear exception with traceback | **Standard** | 3-6 tool calls | Trace call chain, read crash site ±20 lines, fix + verify |
+| Single clear exception with traceback | **Standard** | 3-6 tool calls | Trace call chain, read the exact crash construct, fix + verify |
 | Intermittent / multi-component / no clear trace | **Deep** | 8-15 tool calls | Hypothesize → isolate → instrument → validate causal chain |
 | Reproduces only under specific state / concurrency | **Forensic** | 15-25 tool calls | State reconstruction, bisect, invariant analysis |
 
@@ -7371,7 +7051,7 @@ Every bug has a causal chain: **trigger → propagation → manifestation**. Mos
 
 ### Step 3: Targeted Investigation
 - Read ONLY the code that your hypothesis predicts is involved.
-- Use `read_file` with offset/limit — read the crash site ±20 lines, not the whole file.
+- Use `read_file` in the smallest mode that fits the question: `window` for file:line, `symbol` for functions/classes, `search` for locating evidence, and `full` only when exact broad context is needed.
 - If hypothesis is wrong, update it based on what you learned. Don't restart from scratch.
 
 ### Step 4: Fix at the Trigger, Not the Symptom
@@ -7728,7 +7408,7 @@ def ensure_generated_smart_file_navigation_skill(skills_root: Path):
     root = generated_root / "smart-file-navigation"
     skill_md = """---
 name: smart-file-navigation
-description: Adaptive codebase exploration engine that scales reading strategy to project size and task scope — from surgical line-range reads to systematic dependency-graph traversal, with built-in loop prevention and workspace awareness.
+description: Adaptive codebase exploration engine that scales reading strategy to project size and task scope — from surgical symbol/window reads to systematic dependency-graph traversal, with question-driven navigation and workspace awareness.
 ---
 
 # Smart File Navigation
@@ -7742,7 +7422,7 @@ Decide your reading strategy BEFORE opening any file. Wrong strategy wastes your
 
 | Task Scope | Strategy | Read Budget | Key Principle |
 |-----------|----------|-------------|---------------|
-| Fix a specific error with file:line | **Surgical** | 2-4 reads | Read crash site ±20 lines. Follow ONE call chain. |
+| Fix a specific error with file:line | **Surgical** | 2-4 reads | Read the exact crash construct. Follow ONE call chain. |
 | Implement feature in known area | **Focused** | 5-10 reads | Scan interfaces of affected modules. Read implementations you'll modify. |
 | Understand unfamiliar module | **Exploratory** | 8-15 reads | Structure scan → entry points → data flow → key abstractions. |
 | Full codebase assessment | **Systematic** | 15-25 reads | Top-down: build config → architecture → module boundaries → hot paths. |
@@ -7754,7 +7434,7 @@ Decide your reading strategy BEFORE opening any file. Wrong strategy wastes your
 ### The Navigation Loop
 1. **State your question**: "What does function X do?" / "Where is Y defined?" / "How does data flow from A to B?"
 2. **Predict the answer's location**: Based on naming conventions, directory structure, imports.
-3. **Read the minimum needed**: Use offset/limit. Never read 500 lines when 30 suffice.
+3. **Read the right shape of context**: use `overview`, `symbol`, `search`, `window`, or `full` according to the question.
 4. **Record the answer**: Note it in your reasoning. Don't re-read to "remember".
 5. **Derive the next question**: Each answer either resolves your task or generates a more specific question.
 
@@ -7764,10 +7444,10 @@ If step 5 generates the SAME question you already answered → you're in a loop.
 
 | File Size | Strategy |
 |-----------|----------|
-| < 150 lines | Read entire file — it's cheap |
-| 150-500 lines | Read first 30 lines (imports, class defs), then jump to target with offset |
-| 500-2000 lines | Grep for the specific function/class, read 50-line window around match |
-| 2000+ lines | NEVER read more than 100 lines at a time. Grep → offset → targeted read |
+| < 150 lines | Read the whole file if that answers the question |
+| 150-500 lines | Read the relevant symbol or window around the target |
+| 500-2000 lines | Use `search` or `symbol` to locate the exact region, then read a focused window |
+| 2000+ lines | Use `overview` first, then `search`, `symbol`, or `window` for the exact region |
 
 ## Dependency Tracing
 
@@ -7791,7 +7471,7 @@ When you see an import, make a TRIAGE decision:
 ## Error-Driven Navigation
 
 When you have an error with a location:
-1. Read `file:line` with offset = line-10, limit = 30. This gives you the crash site with context.
+1. Read `file:line` with `mode="window"` and enough context to see the surrounding construct.
 2. Identify the VARIABLE or EXPRESSION that caused the error.
 3. Trace BACKWARD: where was that variable last assigned? Read THAT location.
 4. If the assignment depends on another function's return value, read THAT function (just the return statements).
@@ -7801,11 +7481,8 @@ When you have an error with a location:
 
 ### Self-Monitoring Rules
 - **Track what you've read**: After each read, note "file X, lines Y-Z, learned: ...".
-- **Never re-read the same file range**: If you already read lines 50-100 of foo.py, you have that information. Use it.
-- **The 3-read limit**: If you've read 3 different files without taking ANY action (write, edit, bash), you're probably lost. Stop reading and:
-  1. Write down what you know so far.
-  2. Identify the SPECIFIC gap in your knowledge.
-  3. Take an action based on what you know (even if imperfect).
+- **Avoid pointless rereads**: If you already know the answer from a range, move to the next missing question instead of reopening the same slice.
+- **If you keep circling the same question**, pause, summarize what you know, and take an action based on the current hypothesis.
 
 ### Recovery from Navigation Dead Ends
 If you can't find what you're looking for:
@@ -9145,7 +8822,7 @@ clouds_coder:
     - bash
 description: >
   Specialized guide for code library retrieval. Code-specific query patterns,
-  language filtering, symbol-aware search, and integration with read_file for full context.
+  language filtering, symbol-aware search, and integration with read_file for focused context.
   TRIGGER when: looking up code implementations, function signatures, API patterns, code review.
   DO NOT TRIGGER for: knowledge/document retrieval (use rag-retrieval-mastery),
   general research (use research-orchestrator-pro).
@@ -9210,7 +8887,7 @@ Code library returns **snippets** (320 chars max). To get full context:
 
 1. **Query**: `result = query_code_library(query="parse config file", top_k=5)`
 2. **Extract path**: Read `citation` field → contains file path
-3. **Read full file**: `read_file` on the extracted path
+3. **Read the best context**: use `read_file` with `mode="symbol"` for named code, `mode="window"` for nearby lines, `mode="search"` for evidence, or `mode="full"` when broad exact context is needed
 4. **Analyze**: Now you have the full function/class context
 
 This is the core workflow: **search → locate → read → understand**.
@@ -12261,9 +11938,6 @@ class OllamaClient:
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
-        api_protocol: str = "auto",
-        tool_protocol: str = "auto",
-        protocol_detection: str = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -12279,9 +11953,6 @@ class OllamaClient:
         self.headers = headers or {}
         self.payload_template = payload_template
         self.thinking_stream = bool(thinking_stream)
-        self.api_protocol = normalize_api_protocol(api_protocol, default="auto")
-        self.tool_protocol = normalize_tool_protocol(tool_protocol, default="auto")
-        self.protocol_detection = normalize_protocol_detection(protocol_detection, default="auto")
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
@@ -12471,17 +12142,6 @@ class OllamaClient:
         )
         self.payload_template = str(profile.get("payload_template", self.payload_template) or self.payload_template)
         self.thinking_stream = bool(profile.get("thinking_stream", self.thinking_stream))
-        self.api_protocol = normalize_api_protocol(profile.get("api_protocol", self.api_protocol), default="auto")
-        self.tool_protocol = normalize_tool_protocol(profile.get("tool_protocol", self.tool_protocol), default="auto")
-        self.protocol_detection = normalize_protocol_detection(
-            profile.get("protocol_detection", self.protocol_detection),
-            default="auto",
-        )
-        effective_api = self._effective_api_protocol()
-        if effective_api == "openai_responses" and self.endpoint:
-            self.endpoint = complete_responses_endpoint(self.endpoint)
-        elif effective_api == "openai_chat" and self.endpoint:
-            self.endpoint = complete_chat_endpoint(self.endpoint)
         declared_caps = parse_capability_overrides(profile.get("capabilities", {}))
         self.capabilities = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(self.provider, self.model),
@@ -12703,11 +12363,7 @@ class OllamaClient:
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
         out = []
         for call in tool_calls or []:
-            if not isinstance(call, dict):
-                continue
             function = call.get("function", {})
-            if not isinstance(function, dict):
-                function = {}
             name = canonicalize_tool_name(function.get("name") or call.get("name"))
             raw_args = function.get("arguments", {})
             args, args_error = parse_tool_arguments_with_error(raw_args)
@@ -12726,173 +12382,6 @@ class OllamaClient:
                 row["raw_arguments"] = trim(raw_args, 1200)
             out.append(row)
         return out
-
-    def _effective_api_protocol(self) -> str:
-        return infer_api_protocol(
-            self.provider,
-            endpoint=self.endpoint,
-            base_url=self.base_url,
-            model=self.model,
-            requested=self.api_protocol,
-            protocol_detection=self.protocol_detection,
-        )
-
-    def _effective_tool_protocol(self, api_protocol: str | None = None) -> str:
-        return infer_tool_protocol(
-            self.provider,
-            model=self.model,
-            requested=self.tool_protocol,
-            api_protocol=api_protocol or self._effective_api_protocol(),
-            protocol_detection=self.protocol_detection,
-        )
-
-    def _tool_schema_prompt(self, tools: list[dict] | None, tool_protocol: str) -> str:
-        if not tools or tool_protocol in {"none", "openai_tools", "anthropic_tools", "ollama_tools"}:
-            return ""
-        rows: list[dict] = []
-        for item in tools:
-            if not isinstance(item, dict):
-                continue
-            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
-            name = canonicalize_tool_name(fn.get("name"))
-            if not name:
-                continue
-            rows.append(
-                {
-                    "name": name,
-                    "description": str(fn.get("description", "") or ""),
-                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-                }
-            )
-        if not rows:
-            return ""
-        schema_text = json_dumps(rows, indent=2)
-        if tool_protocol == "hermes_tool_text":
-            return (
-                "Tools are available, but this endpoint expects text-form tool calls. "
-                "When you need a tool, reply with only one or more XML blocks in this exact form:\n"
-                "<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n"
-                "Do not wrap the JSON in markdown. Available tools:\n"
-                f"{schema_text}"
-            )
-        return (
-            "Tools are available, but this endpoint expects JSON text tool calls. "
-            "When you need a tool, reply with only JSON in this exact form:\n"
-            "{\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{...}}]}\n"
-            "Available tools:\n"
-            f"{schema_text}"
-        )
-
-    def _messages_with_tool_prompt(
-        self,
-        req_messages: list[dict],
-        tools: list[dict] | None,
-        tool_protocol: str,
-    ) -> tuple[list[dict], list[dict] | None]:
-        prompt = self._tool_schema_prompt(tools, tool_protocol)
-        if not prompt:
-            return req_messages, tools
-        out = [{"role": "system", "content": prompt}] + list(req_messages or [])
-        return out, None
-
-    def _tools_for_protocol(
-        self,
-        tools: list[dict] | None,
-        tool_protocol: str,
-        api_protocol: str = "",
-    ) -> list[dict] | None:
-        if not tools or tool_protocol in {"none", "hermes_tool_text", "json_tool_text"}:
-            return None
-        if tool_protocol == "anthropic_tools":
-            return self._convert_tools_to_anthropic(tools)
-        if normalize_api_protocol(api_protocol, default="") == "openai_responses":
-            return self._convert_tools_to_openai_responses(tools)
-        return tools
-
-    @staticmethod
-    def _iter_json_objects_from_text(text: str):
-        raw = str(text or "")
-        decoder = json.JSONDecoder()
-        for match in re.finditer(r"[\[{]", raw):
-            idx = match.start()
-            try:
-                obj, _end = decoder.raw_decode(raw[idx:])
-            except Exception:
-                continue
-            yield obj
-
-    def _tool_calls_from_text_object(self, obj: object) -> list[dict]:
-        rows: list[dict] = []
-        candidates: list[object] = []
-        if isinstance(obj, dict):
-            if isinstance(obj.get("tool_calls"), list):
-                candidates.extend(obj.get("tool_calls") or [])
-            elif isinstance(obj.get("tools"), list):
-                candidates.extend(obj.get("tools") or [])
-            elif isinstance(obj.get("function"), dict) or obj.get("name") or obj.get("tool"):
-                candidates.append(obj)
-        elif isinstance(obj, list):
-            candidates.extend(obj)
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
-            name = (
-                fn.get("name")
-                or item.get("name")
-                or item.get("tool")
-                or item.get("tool_name")
-                or item.get("function_name")
-            )
-            name = canonicalize_tool_name(name)
-            if not name:
-                continue
-            raw_args = (
-                fn.get("arguments")
-                if "arguments" in fn
-                else item.get("arguments", item.get("args", item.get("input", {})))
-            )
-            args, args_error = parse_tool_arguments_with_error(raw_args)
-            row = {
-                "id": str(item.get("id") or item.get("tool_call_id") or make_id("tool")),
-                "type": "function",
-                "function": {"name": name, "arguments": args},
-            }
-            if args_error:
-                row["args_error"] = args_error
-                row["raw_arguments"] = trim(raw_args, 1200)
-            rows.append(row)
-        return rows
-
-    def _extract_text_tool_calls(self, content: str) -> tuple[str, list[dict]]:
-        text = str(content or "")
-        tool_calls: list[dict] = []
-
-        def _replace_xml(match: re.Match) -> str:
-            payload = match.group(1) or ""
-            obj = parse_json_object(payload, {})
-            tool_calls.extend(self._tool_calls_from_text_object(obj))
-            return ""
-
-        cleaned = re.sub(r"<tool_call>\s*(.*?)\s*</tool_call>", _replace_xml, text, flags=re.IGNORECASE | re.DOTALL)
-        for fence in re.finditer(r"```(?:json|tool|tool_call)?\s*(.*?)```", cleaned, re.IGNORECASE | re.DOTALL):
-            obj = parse_json_object(fence.group(1) or "", {})
-            tool_calls.extend(self._tool_calls_from_text_object(obj))
-        if not tool_calls:
-            for obj in self._iter_json_objects_from_text(cleaned):
-                tool_calls.extend(self._tool_calls_from_text_object(obj))
-                if tool_calls:
-                    break
-        seen: set[tuple[str, str]] = set()
-        unique: list[dict] = []
-        for call in tool_calls:
-            fn = call.get("function", {}) if isinstance(call, dict) else {}
-            key = (str(fn.get("name", "")), json_dumps(fn.get("arguments", {})))
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(call)
-        return cleaned.strip(), unique
 
     def _audio_format_from_mime(self, mime: str) -> str:
         m = str(mime or "").strip().lower()
@@ -13055,61 +12544,6 @@ class OllamaClient:
         thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
         return main, tool_calls, thinking
-
-    def _extract_openai_responses_message(self, raw: dict) -> tuple[str, list[dict], str]:
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        tool_calls_raw: list[dict] = []
-
-        def _walk(node: object):
-            if isinstance(node, list):
-                for item in node:
-                    _walk(item)
-                return
-            if not isinstance(node, dict):
-                return
-            ntype = str(node.get("type", "") or "").strip().lower()
-            if ntype in {"output_text", "text"}:
-                txt = node.get("text") or node.get("content") or ""
-                if txt:
-                    text_parts.append(str(txt))
-            elif ntype in {"reasoning", "thinking"}:
-                txt = node.get("summary") or node.get("text") or node.get("content") or ""
-                if isinstance(txt, list):
-                    for item in txt:
-                        if isinstance(item, dict):
-                            thinking_parts.append(str(item.get("text") or item.get("content") or ""))
-                        elif item:
-                            thinking_parts.append(str(item))
-                elif txt:
-                    thinking_parts.append(str(txt))
-            elif ntype in {"function_call", "tool_call"} or node.get("call_id") or node.get("name"):
-                name = node.get("name") or node.get("tool_name") or node.get("function_name")
-                if name:
-                    args = node.get("arguments", node.get("input", {}))
-                    tool_calls_raw.append(
-                        {
-                            "id": node.get("call_id") or node.get("id") or make_id("tool"),
-                            "type": "function",
-                            "function": {"name": name, "arguments": args},
-                        }
-                    )
-            content = node.get("content")
-            if isinstance(content, (list, dict)):
-                _walk(content)
-
-        if isinstance(raw.get("choices"), list):
-            return self._extract_openai_message(raw)
-        if raw.get("output_text"):
-            text_parts.append(str(raw.get("output_text") or ""))
-        _walk(raw.get("output", []))
-        if not text_parts and isinstance(raw.get("content"), (list, dict)):
-            _walk(raw.get("content"))
-        content, thinking_inline = split_thinking_content("\n".join(x for x in text_parts if str(x).strip()))
-        if thinking_inline:
-            thinking_parts.append(thinking_inline)
-        thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
-        return content, self._normalize_tool_calls(tool_calls_raw), thinking
 
     def _render_headers(self) -> dict:
         out = {}
@@ -13531,38 +12965,6 @@ class OllamaClient:
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
-    def _chat_openai_responses(
-        self,
-        req_messages: list[dict],
-        *,
-        tools: list[dict] | None = None,
-        max_tokens: int = 2000,
-        temperature: float = 0.2,
-        think: bool = False,
-        cancel_check=None,
-        on_http_retry=None,
-        http_retry_attempts: int | None = None,
-    ) -> dict:
-        endpoint = complete_responses_endpoint(self.endpoint.strip() or self.base_url)
-        payload: dict = {
-            "model": self.model,
-            "input": req_messages,
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-        if tools:
-            payload["tools"] = tools
-        raw = self._post_json_url_with_retries(
-            endpoint,
-            payload,
-            headers=self._render_headers(),
-            max_attempts=http_retry_attempts,
-            cancel_check=cancel_check,
-            on_retry=on_http_retry,
-        )
-        content, tool_calls, thinking_content = self._extract_openai_responses_message(raw)
-        return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
-
     def _chat_custom_http(
         self,
         req_messages: list[dict],
@@ -13632,9 +13034,6 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
-        cancel_check=None,
-        on_http_retry=None,
-        http_retry_attempts: int | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -13698,36 +13097,18 @@ class OllamaClient:
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
-            first_tool = tools[0] if isinstance(tools, list) and tools else {}
-            if isinstance(first_tool, dict) and "input_schema" in first_tool:
-                payload["tools"] = tools
-            else:
-                payload["tools"] = self._convert_tools_to_anthropic(tools)
+            payload["tools"] = self._convert_tools_to_anthropic(tools)
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        raw = self._post_json_url_with_retries(
-            endpoint,
-            payload,
-            headers=headers,
-            max_attempts=http_retry_attempts,
-            cancel_check=cancel_check,
-            on_retry=on_http_retry,
-        )
+        raw = self._post_json_url(endpoint, payload, headers=headers)
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
         if isinstance(raw.get("choices"), list) and tools:
             payload["tools"] = tools  # original OpenAI-format tools
-            raw = self._post_json_url_with_retries(
-                endpoint,
-                payload,
-                headers=headers,
-                max_attempts=http_retry_attempts,
-                cancel_check=cancel_check,
-                on_retry=on_http_retry,
-            )
+            raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
@@ -13775,29 +13156,6 @@ class OllamaClient:
                 "description": str(fn.get("description", "") or ""),
                 "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
             })
-        return out
-
-    def _convert_tools_to_openai_responses(self, openai_tools: list[dict]) -> list[dict]:
-        """Convert Chat Completions tool definitions to OpenAI Responses format."""
-        out: list[dict] = []
-        for item in openai_tools or []:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "function" and item.get("name"):
-                out.append(dict(item))
-                continue
-            fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
-            name = canonicalize_tool_name(fn.get("name"))
-            if not name:
-                continue
-            out.append(
-                {
-                    "type": "function",
-                    "name": name,
-                    "description": str(fn.get("description", "") or ""),
-                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-                }
-            )
         return out
 
     def _chat_ollama_stream_native(
@@ -13914,20 +13272,15 @@ class OllamaClient:
         on_http_retry=None,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
-        api_protocol = self._effective_api_protocol()
-        tool_protocol = self._effective_tool_protocol(api_protocol)
-        prep_provider = "ollama" if api_protocol == "ollama_chat" else provider
-        req_messages = self._prepare_request_messages(messages, prep_provider, media_inputs=media_inputs)
+        req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
         http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
-        req_messages, request_tools = self._messages_with_tool_prompt(req_messages, tools, tool_protocol)
-        protocol_tools = self._tools_for_protocol(request_tools, tool_protocol, api_protocol)
         # Some providers require all system messages at the beginning (or merged into one)
-        if api_protocol in {"openai_chat", "openai_responses", "custom_http"} or is_openai_like_provider(provider):
+        if is_openai_like_provider(provider):
             sys_msgs = [m for m in req_messages if m.get("role") == "system"]
             non_sys_msgs = [m for m in req_messages if m.get("role") != "system"]
             if len(sys_msgs) > 1:
@@ -13940,10 +13293,10 @@ class OllamaClient:
                 req_messages = [{"role": "system", "content": merged_system}] + non_sys_msgs
             elif sys_msgs:
                 req_messages = sys_msgs + non_sys_msgs
-        if api_protocol == "openai_responses":
-            result = self._chat_openai_responses(
+        if is_openai_compat_provider(provider):
+            return self._chat_openai_compat(
                 req_messages,
-                tools=protocol_tools,
+                tools=tools,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -13951,31 +13304,14 @@ class OllamaClient:
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
             )
-            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
-                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
-                result["content"] = content
-                result["tool_calls"] = text_tool_calls
-            return result
-        if api_protocol == "openai_chat":
-            result = self._chat_openai_compat(
-                req_messages,
-                tools=protocol_tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                think=False,
-                cancel_check=cancel_check,
-                on_http_retry=on_http_retry,
-                http_retry_attempts=http_retry_attempts,
-            )
-            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
-                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
-                result["content"] = content
-                result["tool_calls"] = text_tool_calls
-            return result
-        if api_protocol == "anthropic_messages":
+        if provider == "anthropic":
             return self._chat_anthropic(
+                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+            )
+        if provider == "custom_http":
+            return self._chat_custom_http(
                 req_messages,
-                tools=protocol_tools,
+                tools=tools,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -13983,27 +13319,11 @@ class OllamaClient:
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
             )
-        if api_protocol == "custom_http" or provider == "custom_http":
-            result = self._chat_custom_http(
-                req_messages,
-                tools=protocol_tools,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                think=False,
-                cancel_check=cancel_check,
-                on_http_retry=on_http_retry,
-                http_retry_attempts=http_retry_attempts,
-            )
-            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not result.get("tool_calls"):
-                content, text_tool_calls = self._extract_text_tool_calls(str(result.get("content", "") or ""))
-                result["content"] = content
-                result["tool_calls"] = text_tool_calls
-            return result
         if stream_thinking:
             try:
                 return self._chat_ollama_stream_native(
                     req_messages,
-                    tools=protocol_tools,
+                    tools=tools,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     think=False,
@@ -14018,17 +13338,12 @@ class OllamaClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if protocol_tools:
-            openai_payload["tools"] = protocol_tools
+        if tools:
+            openai_payload["tools"] = tools
         try:
             raw = self._post_json("/v1/chat/completions", openai_payload)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
-            result = {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
-            if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not tool_calls:
-                content, text_tool_calls = self._extract_text_tool_calls(content)
-                result["content"] = content
-                result["tool_calls"] = text_tool_calls
-            return result
+            return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
         except OllamaError as exc:
             status = int(getattr(exc, "status", 0) or 0)
             # Some Ollama deployments expose /v1 but may intermittently return 5xx.
@@ -14037,7 +13352,7 @@ class OllamaClient:
             if status not in fallback_status:
                 raise
         effective_max_native = max_tokens
-        if protocol_tools:
+        if tools:
             effective_max_native = max(max_tokens, max_tokens + OLLAMA_THINKING_TOOL_BUFFER)
         native_payload = {
             "model": self.model,
@@ -14045,8 +13360,8 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
-        if protocol_tools:
-            native_payload["tools"] = protocol_tools
+        if tools:
+            native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
         msg = raw.get("message", {})
         if not isinstance(msg, dict):
@@ -14073,8 +13388,6 @@ class OllamaClient:
         if not raw_tool_calls and isinstance(raw, dict):
             raw_tool_calls = raw.get("tool_calls", [])
         tool_calls = self._normalize_tool_calls(raw_tool_calls)
-        if tool_protocol in {"hermes_tool_text", "json_tool_text"} and not tool_calls:
-            content, tool_calls = self._extract_text_tool_calls(content)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
@@ -14095,8 +13408,30 @@ TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
     tool_def(
         "read_file",
-        "Read file content with optional line pagination.",
-        {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+        (
+            "Read files or directories with structure-aware modes. "
+            "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
+            "app.py line 240 -> mode='window' line=240 context=5; "
+            "run.txt E123 -> mode='search' query='E123'. "
+            "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
+            "and mode='full' when complete content is explicitly needed."
+        ),
+        {
+            "path": {"type": "string"},
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+            },
+            "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+            "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+            "line": {"type": "integer", "description": "1-based center line for mode='window'."},
+            "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
+            "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
+            "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
+            "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
+            "offset": {"type": "integer", "description": "Legacy 0-based line offset for compatibility; prefer mode='window' with line/context."},
+        },
         ["path"],
     ),
     tool_def("write_file", "Write file content.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
@@ -15214,31 +14549,6 @@ class SessionState:
                     "model": model,
                     "label": label,
                     "source": profile.get("source", ""),
-                    "api_protocol": profile.get("api_protocol", "auto"),
-                    "tool_protocol": profile.get("tool_protocol", "auto"),
-                    "protocol_detection": profile.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(profile.get("provider", "")),
-                        endpoint=str(profile.get("endpoint", "")),
-                        base_url=str(profile.get("base_url", "")),
-                        model=model,
-                        requested=profile.get("api_protocol", "auto"),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(profile.get("provider", "")),
-                        model=model,
-                        requested=profile.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(profile.get("provider", "")),
-                            endpoint=str(profile.get("endpoint", "")),
-                            base_url=str(profile.get("base_url", "")),
-                            model=model,
-                            requested=profile.get("api_protocol", "auto"),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "capabilities": caps,
@@ -15281,31 +14591,6 @@ class SessionState:
                         "model": tag,
                         "label": f"{profile.get('label', 'Ollama')} | {tag}",
                         "source": "ollama-tags",
-                        "api_protocol": profile.get("api_protocol", "auto"),
-                        "tool_protocol": profile.get("tool_protocol", "auto"),
-                        "protocol_detection": profile.get("protocol_detection", "auto"),
-                        "effective_api_protocol": infer_api_protocol(
-                            "ollama",
-                            endpoint=str(profile.get("endpoint", "")),
-                            base_url=str(profile.get("base_url", "")),
-                            model=tag,
-                            requested=profile.get("api_protocol", "auto"),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
-                        "effective_tool_protocol": infer_tool_protocol(
-                            "ollama",
-                            model=tag,
-                            requested=profile.get("tool_protocol", "auto"),
-                            api_protocol=infer_api_protocol(
-                                "ollama",
-                                endpoint=str(profile.get("endpoint", "")),
-                                base_url=str(profile.get("base_url", "")),
-                                model=tag,
-                                requested=profile.get("api_protocol", "auto"),
-                                protocol_detection=profile.get("protocol_detection", "auto"),
-                            ),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
                         "capabilities": tag_caps,
@@ -15333,31 +14618,6 @@ class SessionState:
                     "model": str(active.get("model", "") or ""),
                     "label": f"{active.get('label', self.active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
                     "source": active.get("source", "active-profile"),
-                    "api_protocol": active.get("api_protocol", "auto"),
-                    "tool_protocol": active.get("tool_protocol", "auto"),
-                    "protocol_detection": active.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(active.get("provider", "")),
-                        endpoint=str(active.get("endpoint", "")),
-                        base_url=str(active.get("base_url", "")),
-                        model=str(active.get("model", "") or ""),
-                        requested=active.get("api_protocol", "auto"),
-                        protocol_detection=active.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(active.get("provider", "")),
-                        model=str(active.get("model", "") or ""),
-                        requested=active.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(active.get("provider", "")),
-                            endpoint=str(active.get("endpoint", "")),
-                            base_url=str(active.get("base_url", "")),
-                            model=str(active.get("model", "") or ""),
-                            requested=active.get("api_protocol", "auto"),
-                            protocol_detection=active.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=active.get("protocol_detection", "auto"),
-                    ),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
@@ -17550,6 +16810,7 @@ class SessionState:
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
             "Use tools to inspect, edit, and execute. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
             f"{mm_hint}"
@@ -18983,7 +18244,7 @@ class SessionState:
         if len(model_pages) > 1 or should_temp:
             model_truncated = True
             preview = (
-                self._run_read(temp_output_path, LONG_OUTPUT_READ_PAGE_LINES, 0)
+                self._run_read(temp_output_path, mode="overview", max_chars=LONG_OUTPUT_MODEL_PAGE_CHARS)
                 if temp_output_path
                 else model_pages[0]
             )
@@ -18995,7 +18256,11 @@ class SessionState:
             ]
             if temp_output_path:
                 parts.append(
-                    f"use read_file path=\"{temp_output_path}\" offset=0 limit={LONG_OUTPUT_READ_PAGE_LINES}"
+                    f"full_output_path={temp_output_path}"
+                )
+                parts.append(
+                    "Use read_file on full_output_path with mode=\"search\" for a keyword/error, "
+                    "mode=\"window\" with line/context for nearby lines, or mode=\"full\" with max_chars when broad exact output is needed."
                 )
             if buffer_ref:
                 parts.append(f"buffer_ref={buffer_ref}")
@@ -22212,47 +21477,184 @@ body{padding:18px}
             body = "\n".join(lines[:line_cap])
         return trim(body, max_chars)
 
-    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+    def _read_file_int_arg(self, value: object, default: int, minimum: int, maximum: int) -> int:
+        try:
+            iv = int(value)
+        except Exception:
+            iv = int(default)
+        return max(int(minimum), min(int(maximum), iv))
+
+    def _read_file_max_chars(self, value: object = None, default: int = READ_FILE_DEFAULT_MAX_CHARS) -> int:
+        if value is None or str(value).strip() == "":
+            raw = int(default)
+        else:
+            raw = self._read_file_int_arg(value, int(default), 1200, READ_FILE_HARD_MAX_CHARS)
+        return max(1200, min(int(READ_FILE_HARD_MAX_CHARS), int(raw)))
+
+    def _clip_read_file_output(self, text: str, max_chars: int, hint: str = "") -> str:
+        cap = self._read_file_max_chars(max_chars)
+        raw = str(text or "")
+        if len(raw) <= cap:
+            return raw
+        default_hint = 'Use mode="search", mode="symbol", mode="window", or raise max_chars for a wider read.'
+        suffix = (
+            f"\n[read_file clipped chars=1-{cap} of {len(raw)} by max_chars. "
+            f"{hint or default_hint}]"
+        )
+        return raw[:cap].rstrip() + suffix
+
+    def _read_file_code_data(self, fp: Path, lines: list[str]) -> dict:
+        text = "\n".join(lines)
+        language = ""
+        imports: list[str] = []
+        symbols: list[dict] = []
+        try:
+            parser = CodeContentParser()
+            language = parser.detect_language(fp, text=text[:120_000]) or ""
+            imports = parser._extract_imports(text[:240_000], language) if language else []
+            if language == "python":
+                _, symbols = parser._python_chunks(text)
+            else:
+                _, symbols = parser._generic_code_chunks(text, language)
+        except Exception:
+            symbols = []
+        if not symbols:
+            symbols = self._read_file_fallback_symbols(fp, lines, language)
+        total = len(lines)
+        clean: list[dict] = []
+        seen: set[tuple[str, int]] = set()
+        for row in symbols:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "") or "").strip()
+            kind = str(row.get("kind", "") or row.get("symbol_kind", "") or "symbol").strip() or "symbol"
+            start = self._read_file_int_arg(row.get("line_start", 1), 1, 1, max(1, total))
+            end = self._read_file_int_arg(row.get("line_end", start), start, start, max(start, total))
+            sig = str(row.get("signature", "") or "").strip()
+            if not sig and 1 <= start <= total:
+                sig = lines[start - 1].strip()
+            key = (name.lower(), start)
+            if key in seen:
+                continue
+            seen.add(key)
+            clean.append(
+                {
+                    "name": name or sig[:80],
+                    "kind": kind,
+                    "line_start": start,
+                    "line_end": end,
+                    "signature": trim(sig, 180),
+                }
+            )
+        clean.sort(key=lambda r: (int(r.get("line_start", 0) or 0), str(r.get("name", ""))))
+        return {"language": language or "text", "imports": imports[:64], "symbols": clean[:240]}
+
+    def _read_file_fallback_symbols(self, fp: Path, lines: list[str], language: str = "") -> list[dict]:
+        symbols: list[dict] = []
+        ext = fp.suffix.lower()
+        patterns: list[tuple[re.Pattern[str], str]] = []
+        if ext in {".py", ".pyi"} or language == "python":
+            patterns = [
+                (re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "class"),
+                (re.compile(r"^\s*async\s+def\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "async_function"),
+                (re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "function"),
+            ]
+        else:
+            try:
+                patterns = CodeContentParser()._decl_matchers(language or "")
+            except Exception:
+                patterns = []
+            if not patterns:
+                patterns = [
+                    (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b"), "function"),
+                    (re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b"), "class"),
+                    (re.compile(r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\("), "function"),
+                ]
+        for idx, line in enumerate(lines, 1):
+            for pattern, kind in patterns:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                name = str(m.group(1) if m.groups() else "").strip()
+                if not name:
+                    continue
+                symbols.append(
+                    {
+                        "name": name,
+                        "kind": kind,
+                        "line_start": idx,
+                        "line_end": idx,
+                        "signature": trim(line.strip(), 180),
+                    }
+                )
+                break
+            if len(symbols) >= 240:
+                break
+        for pos, row in enumerate(symbols):
+            start = int(row.get("line_start", 1) or 1)
+            next_start = int(symbols[pos + 1].get("line_start", 0) or 0) if pos + 1 < len(symbols) else 0
+            row["line_end"] = max(start, (next_start - 1) if next_start > start else min(len(lines), start + 120))
+        return symbols
+
+    def _render_text_overview(
+        self,
+        fp: Path,
+        rel: str,
+        lines: list[str],
+        *,
+        max_chars: int | None = None,
+    ) -> str:
         total_lines = len(lines)
         try:
             size = int(fp.stat().st_size)
         except Exception:
             size = 0
-        ext = fp.suffix.lower()
-        head = "\n".join(lines[:80])
-        symbols: list[str] = []
-        if ext in {".py", ".pyi"}:
-            for idx, line in enumerate(lines, 1):
-                stripped = line.strip()
-                if stripped.startswith(("class ", "def ", "async def ")):
-                    symbols.append(f"{idx}: {trim(stripped, 180)}")
-                if len(symbols) >= 80:
-                    break
-        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
-            pattern = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)|^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(")
-            for idx, line in enumerate(lines, 1):
-                if pattern.search(line):
-                    symbols.append(f"{idx}: {trim(line.strip(), 180)}")
-                if len(symbols) >= 80:
-                    break
-        next_limit = LONG_OUTPUT_READ_PAGE_LINES
+        cap = self._read_file_max_chars(max_chars, default=READ_FILE_DEFAULT_MAX_CHARS)
+        code_data = self._read_file_code_data(fp, lines)
+        language = str(code_data.get("language", "") or "text")
+        symbols = code_data.get("symbols", []) if isinstance(code_data.get("symbols"), list) else []
+        imports = code_data.get("imports", []) if isinstance(code_data.get("imports"), list) else []
+        is_code = bool(symbols) or (language and language != "text")
         out = [
+            f"[read_file overview path={rel} bytes={size} lines={total_lines} language={language}]",
             (
-                f"[large_file_overview path={rel} bytes={size} lines={total_lines} "
-                f"auto_paged=true]"
+                "Choose a focused read that matches the question. "
+                "Prefer symbol/search/window for investigation; use full only when exact broad context is needed."
             ),
-            "This file is too large to inject fully into model context. Use paged read_file calls or RAG/code-library search for focused retrieval.",
-            f"First page: read_file path=\"{rel}\" offset=0 limit={next_limit}",
         ]
+        if imports:
+            out.append("\nImports:")
+            out.append(", ".join(str(x) for x in imports[:24]))
         if symbols:
             out.append("\nSymbols:")
-            out.extend(symbols)
+            for row in symbols[:120]:
+                start = int(row.get("line_start", 0) or 0)
+                end = int(row.get("line_end", start) or start)
+                name = str(row.get("name", "") or "").strip()
+                kind = str(row.get("kind", "symbol") or "symbol")
+                sig = str(row.get("signature", "") or "").strip()
+                suffix = f" — {sig}" if sig and sig != name else ""
+                out.append(f"L{start}-{end} {kind} {name}{suffix}")
+            if len(symbols) > 120:
+                out.append(f"... {len(symbols) - 120} more symbols omitted; use mode=\"search\" or mode=\"symbol\".")
+        head = "\n".join(lines[:READ_FILE_OVERVIEW_HEAD_LINES]).strip("\n")
         if head:
             out.append("\nHead preview:")
             out.append(head)
-        if total_lines > 80:
-            out.append(f"\n[next_page read_file path=\"{rel}\" offset=80 limit={next_limit}]")
-        return "\n".join(out)
+        out.append("\nFocused reads:")
+        if symbols:
+            first_symbol = str(symbols[0].get("name", "") or "").strip()
+            if first_symbol:
+                out.append(f"- read_file path=\"{rel}\" mode=\"symbol\" target=\"{first_symbol}\"")
+        out.append(f"- read_file path=\"{rel}\" mode=\"search\" query=\"<term>\" context=6")
+        out.append(f"- read_file path=\"{rel}\" mode=\"window\" line=<line> context=80")
+        out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
+        if not is_code:
+            out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
+        return self._clip_read_file_output("\n".join(out), cap)
+
+    def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
+        return self._render_text_overview(fp, rel, lines)
 
     def add_upload(self, filename: str, raw: bytes, mime: str = "") -> dict:
         safe_name = self._safe_upload_name(filename)
@@ -25072,7 +24474,16 @@ body{padding:18px}
         scored.sort(key=lambda row: (-row[0], len(row[1]), row[1]))
         return [path for _, path in scored[: max(1, int(limit or 1))]]
 
-    def _render_directory_read(self, fp: Path, rel: str, limit: int | None = None, offset: int | None = None) -> str:
+    def _render_directory_read(
+        self,
+        fp: Path,
+        rel: str,
+        limit: int | None = None,
+        offset: int | None = None,
+        *,
+        query: object = "",
+        max_chars: object = None,
+    ) -> str:
         entries = sorted(
             list(fp.iterdir()),
             key=lambda p: (0 if p.is_dir() else 1, p.name.lower()),
@@ -25080,16 +24491,26 @@ body{padding:18px}
         total = len(entries)
         if total == 0:
             return f"[read_file directory path={rel} entries=0]\n(empty directory)"
-        offset_val = max(0, int(offset or 0))
-        requested_limit = max(1, int(limit or 60))
-        if offset_val >= total:
+        query_text = str(query or "").strip().lower()
+        if query_text:
+            filtered = [p for p in entries if query_text in p.name.lower() or query_text in p.as_posix().lower()]
+        else:
+            filtered = entries
+        filtered_total = len(filtered)
+        offset_val = self._read_file_int_arg(offset, 0, 0, max(0, filtered_total))
+        requested_limit = self._read_file_int_arg(limit, 200 if query_text else 120, 1, 500)
+        if offset_val >= filtered_total:
             return (
-                f"[read_file directory path={rel} entries=0 of {total} offset={offset_val}]\n"
+                f"[read_file directory path={rel} entries=0 of {filtered_total} total={total} offset={offset_val}]\n"
                 "[end_of_directory]"
             )
-        page = entries[offset_val: offset_val + requested_limit]
+        page = filtered[offset_val: offset_val + requested_limit]
         lines = [
-            f"[read_file directory path={rel} entries={offset_val + 1}-{offset_val + len(page)} of {total} offset={offset_val} limit={requested_limit}]"
+            (
+                f"[read_file directory path={rel} entries={offset_val + 1}-{offset_val + len(page)} "
+                f"of {filtered_total} total={total} mode=directory"
+                f"{f' query={query_text!r}' if query_text else ''}]"
+            )
         ]
         for child in page:
             kind = "dir" if child.is_dir() else "file"
@@ -25098,13 +24519,15 @@ body{padding:18px}
             except Exception:
                 size_text = ""
             lines.append(f"{kind} {child.name}{size_text}")
-        next_offset = offset_val + len(page)
-        if next_offset < total:
-            lines.append(f"[next_page read_file path=\"{rel}\" offset={next_offset} limit={requested_limit}]")
-        if offset_val > 0:
-            prev_offset = max(0, offset_val - requested_limit)
-            lines.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
-        return "\n".join(lines)
+        remaining = max(0, filtered_total - (offset_val + len(page)))
+        if remaining > 0:
+            lines.append(
+                f"[directory has {remaining} more matching entries. Use query to narrow results, "
+                "or read a specific subdirectory/file.]"
+            )
+        if not query_text and total > requested_limit:
+            lines.append(f"[tip read_file path=\"{rel}\" mode=\"directory\" query=\"<name-fragment>\" narrows large directories]")
+        return self._clip_read_file_output("\n".join(lines), self._read_file_max_chars(max_chars))
 
     def _read_text_with_fallback(self, fp: Path) -> str:
         tried: list[str] = []
@@ -25136,7 +24559,176 @@ body{padding:18px}
         )
         return "\n".join(lines)
 
-    def _run_read(self, path: str, limit: int | None = None, offset: int | None = None) -> str:
+    def _render_full_text_read(self, rel: str, lines: list[str], *, max_chars: object = None) -> str:
+        full_text = "\n".join(lines)
+        cap = self._read_file_max_chars(max_chars)
+        if len(full_text) <= cap:
+            return full_text
+        header = (
+            f"[read_file full path={rel} chars=1-{cap} of {len(full_text)} max_chars={cap}]\n"
+        )
+        return header + self._clip_read_file_output(
+            full_text,
+            cap,
+            "For exact focused context, use mode=\"search\", mode=\"symbol\", or mode=\"window\"; "
+            "for a wider full read, set a larger max_chars value.",
+        )
+
+    def _render_window_text_read(
+        self,
+        rel: str,
+        lines: list[str],
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        line: object = None,
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        total = len(lines)
+        if total <= 0:
+            return f"[read_file window path={rel} lines=0]\n[end_of_file]"
+        ctx = self._read_file_int_arg(context, 60, 0, 2000)
+        default_limit = ctx * 2 + 1 if line not in (None, "") else LONG_OUTPUT_READ_PAGE_LINES
+        requested_limit = self._read_file_int_arg(limit, default_limit, 1, 4000)
+        line_val = self._read_file_int_arg(line, 0, 0, max(1, total)) if line not in (None, "") else 0
+        if line_val > 0:
+            start = max(0, line_val - ctx - 1)
+        else:
+            start = self._read_file_int_arg(offset, 0, 0, max(0, total))
+        end = min(total, start + requested_limit)
+        if start >= total:
+            return f"[read_file window path={rel} lines=0 of {total} start={start + 1}]\n[end_of_file]"
+        body = "\n".join(lines[start:end])
+        header = f"[read_file window path={rel} lines={start + 1}-{end} of {total}]\n"
+        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
+
+    def _render_search_text_read(
+        self,
+        rel: str,
+        lines: list[str],
+        *,
+        query: object = "",
+        regex: object = False,
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        needle = str(query or "").strip()
+        if not needle:
+            return (
+                f"[read_file search path={rel}]\n"
+                "Error: query is required for mode=\"search\". Use mode=\"overview\" to inspect available structure."
+            )
+        ctx = self._read_file_int_arg(context, 6, 0, 80)
+        total = len(lines)
+        matches: list[int] = []
+        if bool(regex):
+            try:
+                pattern = re.compile(needle)
+            except re.error as exc:
+                return f"Error: invalid regex for read_file search: {exc}"
+            for idx, row in enumerate(lines):
+                if pattern.search(row):
+                    matches.append(idx)
+                if len(matches) >= READ_FILE_SEARCH_MAX_MATCHES:
+                    break
+        else:
+            low = needle.lower()
+            for idx, row in enumerate(lines):
+                if low in row.lower():
+                    matches.append(idx)
+                if len(matches) >= READ_FILE_SEARCH_MAX_MATCHES:
+                    break
+        if not matches:
+            return f"[read_file search path={rel} query={needle!r} matches=0]\n(no matches)"
+        ranges: list[tuple[int, int]] = []
+        for idx in matches:
+            start = max(0, idx - ctx)
+            end = min(total, idx + ctx + 1)
+            if ranges and start <= ranges[-1][1]:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+        out = [
+            (
+                f"[read_file search path={rel} query={needle!r} matches_returned={len(matches)} "
+                f"windows={len(ranges)} total_lines={total}]"
+            )
+        ]
+        for start, end in ranges:
+            out.append(f"\n@@ lines {start + 1}-{end} @@")
+            for line_no in range(start, end):
+                out.append(f"{line_no + 1:>6}: {lines[line_no]}")
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+
+    def _render_symbol_text_read(
+        self,
+        fp: Path,
+        rel: str,
+        lines: list[str],
+        *,
+        target: object = "",
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        symbol_name = str(target or "").strip()
+        if not symbol_name:
+            return (
+                f"[read_file symbol path={rel}]\n"
+                "Error: target is required for mode=\"symbol\".\n"
+                + self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            )
+        data = self._read_file_code_data(fp, lines)
+        symbols = data.get("symbols", []) if isinstance(data.get("symbols"), list) else []
+        wanted = symbol_name.lower()
+
+        def score(row: dict) -> int:
+            name = str(row.get("name", "") or "").strip().lower()
+            sig = str(row.get("signature", "") or "").strip().lower()
+            if name == wanted:
+                return 100
+            if name.endswith("." + wanted):
+                return 90
+            if wanted in name:
+                return 70
+            if wanted in sig:
+                return 50
+            return 0
+
+        ranked = sorted(((score(row), row) for row in symbols), key=lambda x: (-x[0], int(x[1].get("line_start", 0) or 0)))
+        match = next((row for sc, row in ranked if sc > 0), None)
+        if not match:
+            available = ", ".join(str(row.get("name", "")) for row in symbols[:40] if str(row.get("name", "")).strip())
+            return (
+                f"[read_file symbol path={rel} target={symbol_name!r} matches=0]\n"
+                f"Available symbols: {available or '(none detected)'}\n"
+                f"Try read_file path=\"{rel}\" mode=\"search\" query=\"{symbol_name}\""
+            )
+        total = len(lines)
+        ctx = self._read_file_int_arg(context, 0, 0, 1000)
+        start = max(1, int(match.get("line_start", 1) or 1) - ctx)
+        end = min(total, int(match.get("line_end", start) or start) + ctx)
+        body = "\n".join(lines[start - 1:end])
+        header = (
+            f"[read_file symbol path={rel} target={symbol_name!r} "
+            f"matched={match.get('kind', 'symbol')} {match.get('name', '')} lines={start}-{end} of {total}]\n"
+        )
+        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
+
+    def _run_read(
+        self,
+        path: str,
+        limit: int | None = None,
+        offset: int | None = None,
+        *,
+        mode: object = None,
+        target: object = "",
+        query: object = "",
+        line: object = None,
+        context: object = None,
+        regex: object = False,
+        max_chars: object = None,
+    ) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
@@ -25144,7 +24736,7 @@ body{padding:18px}
             if not fp.exists():
                 return self._render_missing_read_hint(rel)
             if fp.is_dir():
-                return self._render_directory_read(fp, rel, limit=limit, offset=offset)
+                return self._render_directory_read(fp, rel, limit=limit, offset=offset, query=query, max_chars=max_chars)
             # Multimodal: detect image/audio/video files and handle natively
             ext = fp.suffix.lower() if fp.suffix else ""
             if ext in IMAGE_EXTS:
@@ -25161,54 +24753,65 @@ body{padding:18px}
                 file_size = int(fp.stat().st_size)
             except Exception:
                 file_size = 0
+            mode_text = str(mode or "auto").strip().lower() or "auto"
+            if mode_text not in {"auto", "full", "overview", "window", "symbol", "search", "directory"}:
+                mode_text = "auto"
+            if mode_text == "auto":
+                if str(target or "").strip():
+                    mode_text = "symbol"
+                elif str(query or "").strip():
+                    mode_text = "search"
+                elif line not in (None, ""):
+                    mode_text = "window"
+            if mode_text == "directory":
+                return f"Error: path is a file, not a directory: {rel}"
+            if mode_text == "overview":
+                return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            if mode_text == "full":
+                return self._render_full_text_read(rel, lines, max_chars=max_chars)
+            if mode_text == "search":
+                return self._render_search_text_read(
+                    rel,
+                    lines,
+                    query=query or target,
+                    regex=regex,
+                    context=context,
+                    max_chars=max_chars,
+                )
+            if mode_text == "symbol":
+                return self._render_symbol_text_read(
+                    fp,
+                    rel,
+                    lines,
+                    target=target or query,
+                    context=context,
+                    max_chars=max_chars,
+                )
+            if (
+                mode_text == "window"
+                or limit is not None
+                or self._read_file_int_arg(offset, 0, 0, 1_000_000) > 0
+                or line not in (None, "")
+            ):
+                return self._render_window_text_read(
+                    rel,
+                    lines,
+                    limit=limit,
+                    offset=offset,
+                    line=line,
+                    context=context,
+                    max_chars=max_chars,
+                )
             if (
                 limit is None
-                and int(offset or 0) <= 0
+                and self._read_file_int_arg(offset, 0, 0, 1_000_000) <= 0
                 and (file_size >= LARGE_FILE_AUTO_PAGE_BYTES or total_lines >= LARGE_FILE_AUTO_PAGE_LINES)
             ):
-                return self._large_text_file_overview(fp, rel, lines)
-            offset_val = max(0, int(offset or 0))
-            requested_limit = max(1, int(limit or LONG_OUTPUT_READ_PAGE_LINES))
-            if offset_val >= total_lines:
-                return (
-                    f"[read_file page path={rel} lines=0 of {total_lines} offset={offset_val}]\n"
-                    "[end_of_file]"
-                )
+                return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
             full_text = "\n".join(lines)
-            auto_paginate = limit is None and offset_val == 0 and len(full_text) > LONG_OUTPUT_READ_PAGE_MAX_CHARS
-            if not auto_paginate and limit is None and offset_val == 0 and len(full_text) <= MAX_TOOL_OUTPUT:
+            if len(full_text) <= self._read_file_max_chars(max_chars):
                 return full_text
-            page_parts: list[str] = []
-            chars = 0
-            idx = offset_val
-            while idx < total_lines and len(page_parts) < requested_limit:
-                line = lines[idx]
-                piece = line if not page_parts else "\n" + line
-                if page_parts and (chars + len(piece)) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
-                    break
-                if (not page_parts) and len(line) > LONG_OUTPUT_READ_PAGE_MAX_CHARS:
-                    page_parts.append(line[:LONG_OUTPUT_READ_PAGE_MAX_CHARS])
-                    idx += 1
-                    break
-                page_parts.append(piece if page_parts else line)
-                chars += len(piece)
-                idx += 1
-            body = "".join(page_parts)
-            page_no = (offset_val // requested_limit) + 1
-            total_pages = max(1, (total_lines + requested_limit - 1) // requested_limit)
-            out = [
-                (
-                    f"[read_file page path={rel} lines={offset_val + 1}-{idx} of {total_lines} "
-                    f"page={page_no}/{total_pages} offset={offset_val} limit={requested_limit}]"
-                ),
-                body,
-            ]
-            if idx < total_lines:
-                out.append(f"[next_page read_file path=\"{rel}\" offset={idx} limit={requested_limit}]")
-            if offset_val > 0:
-                prev_offset = max(0, offset_val - requested_limit)
-                out.append(f"[prev_page read_file path=\"{rel}\" offset={prev_offset} limit={requested_limit}]")
-            return "\n".join(part for part in out if part != "")
+            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
@@ -25276,6 +24879,22 @@ body{padding:18px}
                 f"Note: {reason} native {media_type} input. "
                 f"File exists at {fp}. Use bash tools to process it if needed."
             )
+
+    def _tool_result_context_content(
+        self,
+        name: str,
+        args: dict | None,
+        output: object,
+        default_limit: int = MAX_TOOL_OUTPUT,
+    ) -> str:
+        text = str(output or "")
+        tool_name = canonicalize_tool_name(name)
+        if tool_name == "read_file":
+            req = (args or {}).get("max_chars") if isinstance(args, dict) else None
+            requested = self._read_file_max_chars(req, default=READ_FILE_DEFAULT_MAX_CHARS)
+            cap = max(int(default_limit or 0), min(int(READ_FILE_HARD_MAX_CHARS), requested))
+            return trim(text, cap)
+        return trim(text, int(default_limit or MAX_TOOL_OUTPUT))
 
     def _is_html_file_rel(self, path: str) -> bool:
         low = str(path or "").strip().lower()
@@ -25534,8 +25153,29 @@ body{padding:18px}
             tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
             tool_def(
                 "read_file",
-                "Read file with optional line pagination.",
-                {"path": {"type": "string"}, "limit": {"type": "integer"}, "offset": {"type": "integer"}},
+                (
+                    "Read files or directories with structure-aware modes. "
+                    "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
+                    "app.py line 240 -> mode='window' line=240 context=5; "
+                    "run.txt E123 -> mode='search' query='E123'. "
+                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed."
+                ),
+                {
+                    "path": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
+                        "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                    },
+                    "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+                    "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+                    "line": {"type": "integer", "description": "1-based center line for mode='window'."},
+                    "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
+                    "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
+                    "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
+                    "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
+                    "offset": {"type": "integer", "description": "Legacy 0-based line offset for compatibility; prefer mode='window' with line/context."},
+                },
                 ["path"],
             ),
         ]
@@ -25611,14 +25251,30 @@ body{padding:18px}
                 if name == "bash":
                     out = self._run_bash(args.get("command", ""))
                 elif name == "read_file":
-                    out = self._run_read(args.get("path", ""), args.get("limit"), args.get("offset"))
+                    out = self._run_read(
+                        args.get("path", ""),
+                        args.get("limit"),
+                        args.get("offset"),
+                        mode=args.get("mode"),
+                        target=args.get("target"),
+                        query=args.get("query"),
+                        line=args.get("line"),
+                        context=args.get("context"),
+                        regex=args.get("regex"),
+                        max_chars=args.get("max_chars"),
+                    )
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
                 elif name == "edit_file":
                     out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
                 else:
                     out = f"Unknown tool: {name}"
-                msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": name,
+                    "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, out),
+                })
         return last_text or "(subagent done)"
 
     def _spawn_teammate(self, name: str, role: str, prompt: str) -> str:
@@ -34762,6 +34418,7 @@ body{padding:18px}
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases in final exported HTML. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             f"{code_note + ' ' if code_note else ''}"
             f"{engineering_note + ' ' if engineering_note else ''}"
             f"{html_note + ' ' if html_note else ''}"
@@ -34831,13 +34488,13 @@ body{padding:18px}
             "Do not silently batch multiple subtasks and do not delay todo updates until the end of the step. "
             "This manual update is critical because skill re-evaluation is triggered by actual todo progress. "
             "EDIT METHODOLOGY (follow strictly): "
-            "1) Read the EXACT target location using read_file before any edit — never edit from memory. "
+            "1) Read the EXACT target location using read_file before any edit — prefer mode='symbol', mode='search', or mode='window' to get the right context directly; never edit from memory. "
             "2) Copy EXACT text into old_text (preserve all whitespace/indentation/line breaks). "
             "3) Keep old_text as SHORT as possible while still unique (1-3 lines ideal). "
             "4) If edit_file fails 'text not found': IMMEDIATELY re-read the file, compare whitespace, retry with exact content. "
             "5) If edit_file fails 2+ times on same file: switch to write_file to rewrite entire file. "
             "6) After every successful edit, run build/test to verify. "
-            "NEVER loop on read_file without attempting a concrete edit_file, write_file, path reconciliation, or verification call. "
+            "If read_file is not answering the question, change the read shape (overview/symbol/search/window/full), form a sharper hypothesis, then attempt a concrete edit_file, write_file, path reconciliation, or verification call. "
             "PROBLEM-SOLVING (critical): "
             "When you discover missing files, broken imports, or incomplete source code: "
             "A) Think deeply about what the missing content should contain based on ALL available context "
@@ -34845,7 +34502,7 @@ body{padding:18px}
             "B) CREATE the missing files yourself using write_file — do not wait or re-read. "
             "C) If compilation fails due to missing dependencies, write stub implementations. "
             "D) If read_file or bash says a path is missing, empty, or mismatched, reconcile the path against uploads, recent files, and close matches before trying again. "
-            "E) NEVER re-read the same directory/file more than twice — after 2 reads, you MUST act. "
+            "E) Avoid repeated identical reads; when you need more evidence, ask a more specific read_file question instead of reopening the same context. "
             "F) Do not declare success until at least one fix-and-verify cycle is complete and the evidence is observable. "
             "G) If truly blocked, explain WHY to the user and propose alternatives. "
         )
@@ -35743,10 +35400,24 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
-            out = self._run_read(rel, args.get("limit"), args.get("offset"))
-            limit_val = int(args.get("limit", 0) or 0) if args.get("limit") is not None else 0
-            offset_val = int(args.get("offset", 0) or 0) if args.get("offset") is not None else 0
+            out = self._run_read(
+                rel,
+                args.get("limit"),
+                args.get("offset"),
+                mode=args.get("mode"),
+                target=args.get("target"),
+                query=args.get("query"),
+                line=args.get("line"),
+                context=args.get("context"),
+                regex=args.get("regex"),
+                max_chars=args.get("max_chars"),
+            )
+            limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
+            offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
+            mode_val = str(args.get("mode", "") or "").strip()
             summary = f"read file: {rel}"
+            if mode_val:
+                summary += f" mode={mode_val}"
             if offset_val > 0 or limit_val > 0:
                 summary += (
                     f" offset={offset_val}"
@@ -35756,12 +35427,13 @@ body{padding:18px}
                 "file_read",
                 {
                     "path": rel,
+                    "mode": mode_val or "auto",
                     "offset": offset_val,
                     "limit": limit_val,
                     "summary": summary,
                     "large_file_guard": bool(
                         limit_val <= 0
-                        and str(out).startswith("[large_file_overview")
+                        and str(out).startswith("[read_file overview")
                     ),
                 },
             )
@@ -37053,7 +36725,7 @@ body{padding:18px}
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "name": name,
-                    "content": trim(output),
+                    "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                     "ts": now_ts(),
                     "agent_role": role_key,
                 },
@@ -37926,13 +37598,14 @@ body{padding:18px}
         self._append_agent_context_message("explorer", {
             "role": "system",
             "content": (
-                "You are Explorer in plan-mode (read-only research). "
-                "Analyze the codebase to understand the task scope. "
-                "Do NOT modify any files. Use read_file, bash (read-only commands), "
-                "list_skills, load_skill, and blackboard tools only. "
-                f"{skills_block}"
-                "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
-                "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
+            "You are Explorer in plan-mode (read-only research). "
+            "Analyze the codebase to understand the task scope. "
+            "Do NOT modify any files. Use read_file, bash (read-only commands), "
+            "list_skills, load_skill, and blackboard tools only. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            f"{skills_block}"
+            "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
+            "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -37972,6 +37645,7 @@ body{padding:18px}
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
+                "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
                 f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
@@ -38055,7 +37729,12 @@ body{padding:18px}
             self._append_agent_context_message("explorer", {
                 "role": "tool",
                 "tool_call_id": tc["id"],
-                "content": trim(result_content, 8000),
+                "content": self._tool_result_context_content(
+                    fn_name,
+                    fn_args if isinstance(fn_args, dict) else {},
+                    result_content,
+                    8000,
+                ),
                 "ts": now_ts(),
                 "agent_role": "explorer",
             }, mirror_to_global=False)
@@ -40595,7 +40274,13 @@ body{padding:18px}
                         manual_compact = True
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and not str(output).startswith("Error:"):
                         stop_due_to_finish_task = True
-                    self.messages.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(output), "ts": now_ts()})
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": name,
+                        "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
+                        "ts": now_ts(),
+                    })
                     single_round_tool_results.append(
                         {
                             "name": dispatched_name or name,
@@ -40777,12 +40462,10 @@ body{padding:18px}
                         "content": (
                             "<read-loop-intervention>"
                             f"{_read_loop_reason} "
-                            "MANDATORY: Stop reading and take ONE concrete action: "
-                            "1) If files are MISSING: create them based on context (docs, Makefile, imports). "
-                            "2) If compilation FAILS: fix the error, do not re-read the same file. "
-                            "3) If you are STUCK: report the blocker to the user and stop. "
-                            "4) Think deeply about the user's goal and the project structure to find the solution. "
-                            "Do NOT run ls, cat, find, or head on the same paths again."
+                            "Change strategy now: state the exact unanswered question, then use a more focused tool call "
+                            "(read_file mode='overview', 'symbol', 'search', or 'window'), reconcile the path, "
+                            "or take a concrete edit/verification action based on the current evidence. "
+                            "Think about the user's goal and project structure before opening more broad listings."
                             "</read-loop-intervention>"
                         ),
                         "ts": now_ts(),
@@ -42305,9 +41988,6 @@ class SessionManager:
             headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
             payload_template=str(profile.get("payload_template", "") or ""),
             thinking_stream=bool(profile.get("thinking_stream", False)),
-            api_protocol=str(profile.get("api_protocol", "auto") or "auto"),
-            tool_protocol=str(profile.get("tool_protocol", "auto") or "auto"),
-            protocol_detection=str(profile.get("protocol_detection", "auto") or "auto"),
         )
         client.apply_profile(profile)
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
@@ -42371,31 +42051,6 @@ class SessionManager:
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model or '(no-model)'}",
                     "source": profile.get("source", ""),
-                    "api_protocol": profile.get("api_protocol", "auto"),
-                    "tool_protocol": profile.get("tool_protocol", "auto"),
-                    "protocol_detection": profile.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(profile.get("provider", "")),
-                        endpoint=str(profile.get("endpoint", "")),
-                        base_url=str(profile.get("base_url", "")),
-                        model=model,
-                        requested=profile.get("api_protocol", "auto"),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(profile.get("provider", "")),
-                        model=model,
-                        requested=profile.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(profile.get("provider", "")),
-                            endpoint=str(profile.get("endpoint", "")),
-                            base_url=str(profile.get("base_url", "")),
-                            model=model,
-                            requested=profile.get("api_protocol", "auto"),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "capabilities": caps,
@@ -42433,31 +42088,6 @@ class SessionManager:
                         "model": tag,
                         "label": f"{profile.get('label', 'Ollama')} | {tag}",
                         "source": "ollama-tags",
-                        "api_protocol": profile.get("api_protocol", "auto"),
-                        "tool_protocol": profile.get("tool_protocol", "auto"),
-                        "protocol_detection": profile.get("protocol_detection", "auto"),
-                        "effective_api_protocol": infer_api_protocol(
-                            "ollama",
-                            endpoint=str(profile.get("endpoint", "")),
-                            base_url=str(profile.get("base_url", "")),
-                            model=tag,
-                            requested=profile.get("api_protocol", "auto"),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
-                        "effective_tool_protocol": infer_tool_protocol(
-                            "ollama",
-                            model=tag,
-                            requested=profile.get("tool_protocol", "auto"),
-                            api_protocol=infer_api_protocol(
-                                "ollama",
-                                endpoint=str(profile.get("endpoint", "")),
-                                base_url=str(profile.get("base_url", "")),
-                                model=tag,
-                                requested=profile.get("api_protocol", "auto"),
-                                protocol_detection=profile.get("protocol_detection", "auto"),
-                            ),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
                         "capabilities": tag_caps,
@@ -42483,31 +42113,6 @@ class SessionManager:
                     "model": str(active.get("model", "") or ""),
                     "label": f"{active.get('label', self.user_active_profile_id)} | {str(active.get('model', '') or '(no-model)')}",
                     "source": active.get("source", "active-profile"),
-                    "api_protocol": active.get("api_protocol", "auto"),
-                    "tool_protocol": active.get("tool_protocol", "auto"),
-                    "protocol_detection": active.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(active.get("provider", "")),
-                        endpoint=str(active.get("endpoint", "")),
-                        base_url=str(active.get("base_url", "")),
-                        model=str(active.get("model", "") or ""),
-                        requested=active.get("api_protocol", "auto"),
-                        protocol_detection=active.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(active.get("provider", "")),
-                        model=str(active.get("model", "") or ""),
-                        requested=active.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(active.get("provider", "")),
-                            endpoint=str(active.get("endpoint", "")),
-                            base_url=str(active.get("base_url", "")),
-                            model=str(active.get("model", "") or ""),
-                            requested=active.get("api_protocol", "auto"),
-                            protocol_detection=active.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=active.get("protocol_detection", "auto"),
-                    ),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "capabilities": active_caps,
@@ -42794,10 +42399,6 @@ window.MathJax={
             <option value="lmstudio">LM Studio (Local)</option>
             <option value="openai_compat">OpenAI Compatible</option>
             <option value="anthropic">Anthropic</option>
-            <option value="claude_code">Claude Code / Anthropic</option>
-            <option value="opencode">OpenCode</option>
-            <option value="openclaw">OpenClaw</option>
-            <option value="hermes">Hermes</option>
             <option value="glm">GLM</option>
             <option value="kimi">KIMI (Moonshot)</option>
             <option value="openrouter">OpenRouter</option>
@@ -43158,8 +42759,9 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-run-dot{width:8px;height:8px;border-radius:999px;background:#13b8a6;box-shadow:0 0 0 0 rgba(19,184,166,.38);animation:msgRunPulse 1.6s ease-out infinite}
 @keyframes msgRunPulse{0%{box-shadow:0 0 0 0 rgba(19,184,166,.36)}70%{box-shadow:0 0 0 9px rgba(19,184,166,0)}100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}}
 @media (prefers-reduced-motion:reduce){.msg-run-dot{animation:none}}
-.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
-.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-code-shell{margin:0;max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;white-space:pre;tab-size:4;word-break:normal;overflow-wrap:normal;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-diff-shell{max-height:210px;overflow:auto;padding:8px;border:1px solid #dfe6ef;border-radius:8px;background:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;line-height:1.35;white-space:pre;tab-size:4;word-break:normal;overflow-wrap:normal;overscroll-behavior:contain;scrollbar-gutter:stable}
+.msg-diff-shell .diff-row{display:block;min-width:max-content;white-space:pre;tab-size:4}
 .composer{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
 .composer-shell{position:relative;border:1px solid var(--control-line);border-radius:16px;background:linear-gradient(180deg,var(--control-panel),var(--control-panel-soft));box-shadow:inset 0 1px 0 rgba(255,255,255,.7),0 10px 22px rgba(15,23,42,.05);overflow:hidden;transition:border-color .18s ease,box-shadow .18s ease,transform .18s ease}
 .composer-shell:focus-within{border-color:var(--focus-border);box-shadow:0 0 0 4px var(--focus-ring),inset 0 1px 0 rgba(255,255,255,.78),0 16px 34px rgba(15,23,42,.08)}
@@ -43279,6 +42881,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .diff-item{margin-bottom:8px;padding:6px;border:1px solid #e7edf5;border-radius:8px;background:#fff;min-width:0}
 .diff-head{font-weight:600;margin-bottom:4px;overflow-wrap:anywhere;word-break:break-word}
 .diff-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;white-space:pre;overflow:auto;max-height:220px;background:#f8fafc;border-radius:6px;padding:6px}
+.diff-body .diff-row{display:block;min-width:max-content;white-space:pre;tab-size:4}
 .diff-line-add{background:#eaffea;color:#0f6a1b}
 .diff-line-del{background:#ffeaea;color:#8a1d1d}
 .diff-line-hunk{background:#edf4ff;color:#1f4b8f}
@@ -43373,12 +42976,11 @@ const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case',
 S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){btn.textContent=t('btn_level')+': '+t('level_auto')}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};btn.textContent=t('btn_level')+': '+(labels[level]||t('level_auto'))}}
-const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],claude_code:[{key:'claude_code_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Claude Code / Anthropic Messages endpoint root'},{key:'claude_code_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic-compatible API key'},{key:'claude_code_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'Claude model identifier'}],opencode:[{key:'opencode_url',label:'API Base URL',type:'url',placeholder:'http://localhost:4096/v1',hint:'OpenCode-compatible OpenAI-style endpoint'},{key:'opencode_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'opencode_model',label:'Model',type:'text',placeholder:'auto',hint:'Model identifier'}],openclaw:[{key:'openclaw_url',label:'API Base URL',type:'url',placeholder:'http://localhost:4097/v1',hint:'OpenClaw-compatible OpenAI-style endpoint'},{key:'openclaw_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'openclaw_model',label:'Model',type:'text',placeholder:'auto',hint:'Model identifier'}],hermes:[{key:'hermes_url',label:'API Base URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'Hermes model endpoint, usually OpenAI-compatible HTTP'},{key:'hermes_key',label:'API Key',type:'password',placeholder:'',hint:'Optional bearer token'},{key:'hermes_model',label:'Model',type:'text',placeholder:'NousResearch/Hermes-3-Llama-3.1-8B',hint:'Hermes model identifier'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-const LLM_PROTOCOL_DEFAULTS={ollama:{api:'ollama_chat',tool:'ollama_tools'},anthropic:{api:'anthropic_messages',tool:'anthropic_tools'},claude_code:{api:'anthropic_messages',tool:'anthropic_tools'},hermes:{api:'openai_chat',tool:'hermes_tool_text'},opencode:{api:'openai_chat',tool:'openai_tools'},openclaw:{api:'openai_chat',tool:'openai_tools'},custom_http:{api:'custom_http',tool:'auto'}};
-function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http','opencode','openclaw','hermes']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}const proto=LLM_PROTOCOL_DEFAULTS[provider]||{api:'auto',tool:'auto'};html+='<div class=\"llm-field\"><label>API Protocol</label><select id=\"llmF_api_protocol\"><option value=\"auto\">Auto detect</option><option value=\"openai_chat\">OpenAI Chat Completions</option><option value=\"openai_responses\">OpenAI Responses</option><option value=\"anthropic_messages\">Anthropic Messages</option><option value=\"ollama_chat\">Ollama Native Chat</option><option value=\"custom_http\">Custom HTTP</option></select><div class=\"llm-hint\">Auto keeps legacy config behavior; manual selection overrides provider inference.</div></div>';html+='<div class=\"llm-field\"><label>Tool Protocol</label><select id=\"llmF_tool_protocol\"><option value=\"auto\">Auto detect</option><option value=\"openai_tools\">OpenAI tools</option><option value=\"anthropic_tools\">Anthropic tools</option><option value=\"ollama_tools\">Ollama tools</option><option value=\"hermes_tool_text\">Hermes text tool calls</option><option value=\"json_tool_text\">JSON text tool calls</option><option value=\"none\">No tools</option></select><div class=\"llm-hint\">Controls how tool schemas are sent and how tool calls are parsed.</div></div>';html+='<div class=\"llm-field\"><label>Protocol Detection</label><select id=\"llmF_protocol_detection\"><option value=\"auto\">Auto</option><option value=\"off\">Off</option></select><div class=\"llm-hint\">Off disables heuristic protocol inference unless explicit protocol fields are selected.</div></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;const apiSel=E('llmF_api_protocol');const toolSel=E('llmF_tool_protocol');if(apiSel)apiSel.value=proto.api||'auto';if(toolSel)toolSel.value=proto.tool||'auto';if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},opencode:{urlKey:'opencode_url',modelKey:'opencode_model',keyKey:'opencode_key',defaultUrl:'http://localhost:4096/v1'},openclaw:{urlKey:'openclaw_url',modelKey:'openclaw_model',keyKey:'openclaw_key',defaultUrl:'http://localhost:4097/v1'},hermes:{urlKey:'hermes_url',modelKey:'hermes_model',keyKey:'hermes_key',defaultUrl:'http://localhost:8000/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.api_protocol=E('llmF_api_protocol')?.value||'auto';config.tool_protocol=E('llmF_tool_protocol')?.value||'auto';config.protocol_detection=E('llmF_protocol_detection')?.value||'auto';config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
+async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
@@ -44059,7 +43661,7 @@ function renderSessions(){
 }
 function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
-function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
+function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"diff-row ${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
 function _scrollContainerToNodeCenter(container,target){
   if(!container||!target)return;
   const maxTop=Math.max(0,Number(container.scrollHeight||0)-Number(container.clientHeight||0));
@@ -63875,9 +63477,6 @@ class AppContext:
             headers=active.get("headers", {}) if isinstance(active.get("headers"), dict) else {},
             payload_template=str(active.get("payload_template", "") or ""),
             thinking_stream=bool(active.get("thinking_stream", False)),
-            api_protocol=str(active.get("api_protocol", "auto") or "auto"),
-            tool_protocol=str(active.get("tool_protocol", "auto") or "auto"),
-            protocol_detection=str(active.get("protocol_detection", "auto") or "auto"),
         )
         client.apply_profile(active)
         think = False
@@ -64064,31 +63663,6 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model}",
                     "source": profile.get("source", ""),
-                    "api_protocol": profile.get("api_protocol", "auto"),
-                    "tool_protocol": profile.get("tool_protocol", "auto"),
-                    "protocol_detection": profile.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(profile.get("provider", "")),
-                        endpoint=str(profile.get("endpoint", "")),
-                        base_url=str(profile.get("base_url", "")),
-                        model=model,
-                        requested=profile.get("api_protocol", "auto"),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(profile.get("provider", "")),
-                        model=model,
-                        requested=profile.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(profile.get("provider", "")),
-                            endpoint=str(profile.get("endpoint", "")),
-                            base_url=str(profile.get("base_url", "")),
-                            model=model,
-                            requested=profile.get("api_protocol", "auto"),
-                            protocol_detection=profile.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=profile.get("protocol_detection", "auto"),
-                    ),
                     "capabilities": caps,
                 }
             )
@@ -64105,31 +63679,6 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": str(selected_profile.get("model", self.model) or self.model),
                     "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
                     "source": selected_profile.get("source", "active-profile"),
-                    "api_protocol": selected_profile.get("api_protocol", "auto"),
-                    "tool_protocol": selected_profile.get("tool_protocol", "auto"),
-                    "protocol_detection": selected_profile.get("protocol_detection", "auto"),
-                    "effective_api_protocol": infer_api_protocol(
-                        str(selected_profile.get("provider", "")),
-                        endpoint=str(selected_profile.get("endpoint", "")),
-                        base_url=str(selected_profile.get("base_url", "")),
-                        model=str(selected_profile.get("model", self.model) or self.model),
-                        requested=selected_profile.get("api_protocol", "auto"),
-                        protocol_detection=selected_profile.get("protocol_detection", "auto"),
-                    ),
-                    "effective_tool_protocol": infer_tool_protocol(
-                        str(selected_profile.get("provider", "")),
-                        model=str(selected_profile.get("model", self.model) or self.model),
-                        requested=selected_profile.get("tool_protocol", "auto"),
-                        api_protocol=infer_api_protocol(
-                            str(selected_profile.get("provider", "")),
-                            endpoint=str(selected_profile.get("endpoint", "")),
-                            base_url=str(selected_profile.get("base_url", "")),
-                            model=str(selected_profile.get("model", self.model) or self.model),
-                            requested=selected_profile.get("api_protocol", "auto"),
-                            protocol_detection=selected_profile.get("protocol_detection", "auto"),
-                        ),
-                        protocol_detection=selected_profile.get("protocol_detection", "auto"),
-                    ),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
