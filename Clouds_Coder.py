@@ -451,6 +451,13 @@ COMPACT_TIER3_PCT = 0.10   # <10%: tier 3 heavy
 # Absolute minimums — prevent percentage instability at low ctx_left
 COMPACT_TIER1_ABS = 3000
 COMPACT_TIER2_ABS = 1500
+CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
+    5.0,
+    min(
+        300.0,
+        float(str(os.getenv("AGENT_CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN", "45") or "45")),
+    ),
+)
 # File buffer
 FILE_BUFFER_CONTENT_THRESHOLD = 2000  # chars: content larger than this gets offloaded
 FILE_BUFFER_MAX_FILES = 500
@@ -13488,13 +13495,14 @@ TOOLS = [
     ),
     tool_def("scan_skills", "Force reload skills from ./skills and return summary.", {}),
     tool_def("compress", "Compress conversation context.", {}),
-    tool_def(
-        "context_recall",
-        (
-            "Recall archived compacted context with focused modes. "
-            "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
-            "or 'window' with around_index/context for nearby messages."
-        ),
+	    tool_def(
+	        "context_recall",
+	        (
+	            "Recall archived compacted context with focused modes. "
+	            "Use this tool, not read_from_blackboard, when the user says archived context, compacted context, previous segment, or context segment. "
+	            "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
+	            "or 'window' with around_index/context for nearby messages."
+	        ),
         {
             "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
             "segment_id": {"type": "string"},
@@ -13558,9 +13566,13 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-    tool_def(
-        "check_background",
-        "Inspect background tasks with summary/search/detail/tail modes.",
+	    tool_def(
+	        "check_background",
+	        (
+	            "Inspect background tasks with summary/search/detail/tail modes. "
+	            "If the user names an error token, command text, or output text such as E123 or pytest, use mode='search' with query. "
+	            "Use tail only for recent jobs when no query is known."
+	        ),
         {
             "task_id": {"type": "string"},
             "mode": {"type": "string", "enum": ["summary", "search", "detail", "tail"]},
@@ -13598,9 +13610,13 @@ TOOLS = [
         },
         ["to", "intent", "content"],
     ),
-    tool_def(
-        "read_from_blackboard",
-        "Read blackboard state with summary/search/recent/window/detail modes.",
+	    tool_def(
+	        "read_from_blackboard",
+	        (
+	            "Read shared multi-agent blackboard state with summary/search/recent/window/detail modes. "
+	            "Use this for research_notes, execution_logs, review_feedback, code_artifacts, and status; "
+	            "use context_recall instead for archived or compacted conversation context."
+	        ),
         {
             "section": {
                 "type": "string",
@@ -13671,9 +13687,13 @@ TOOLS = [
     tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
-    tool_def(
-        "worktree_events",
-        "Read worktree lifecycle events with summary/search/detail modes.",
+	    tool_def(
+	        "worktree_events",
+	        (
+	            "Read worktree lifecycle events with summary/search/detail modes. "
+	            "For a worktree name like alpha, set worktree='alpha'; do not put worktree names in event. "
+	            "For known failure text use mode='search' and query='failed' or the exact error; event is for lifecycle names like worktree.remove.failed."
+	        ),
         {
             "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
             "query": {"type": "string"},
@@ -14025,6 +14045,15 @@ class SessionState:
         self.context_limit_locked = bool(context_limit_locked)
         self.context_token_upper_bound = self.max_context_token_limit
         self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+        self.context_limit_source = "configured"
+        self.context_last_compact_before: dict = {}
+        self.context_last_compact_after: dict = {}
+        self.context_last_compact_effective = True
+        self.context_last_compact_used_reduction = 0
+        self.context_last_compact_skip_ts = 0.0
+        self.context_last_compact_skip_reason = ""
+        self.context_last_next_call_estimate = 0
+        self.context_last_next_call_label = ""
         self.last_context_actual_prompt_tokens = 0
         self.last_context_actual_completion_tokens = 0
         self.last_context_actual_total_tokens = 0
@@ -14937,6 +14966,35 @@ class SessionState:
                     )
                 except Exception:
                     self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                self.context_limit_source = trim(str(raw.get("context_limit_source", self.context_limit_source) or "configured"), 80)
+                self.context_last_compact_before = (
+                    dict(raw.get("context_last_compact_before", {}) or {})
+                    if isinstance(raw.get("context_last_compact_before", {}), dict)
+                    else {}
+                )
+                self.context_last_compact_after = (
+                    dict(raw.get("context_last_compact_after", {}) or {})
+                    if isinstance(raw.get("context_last_compact_after", {}), dict)
+                    else {}
+                )
+                self.context_last_compact_effective = bool(
+                    raw.get("context_last_compact_effective", self.context_last_compact_effective)
+                )
+                self.context_last_compact_used_reduction = max(
+                    0, int(raw.get("context_last_compact_used_reduction", 0) or 0)
+                )
+                self.context_last_compact_skip_ts = max(
+                    0.0, float(raw.get("context_last_compact_skip_ts", 0.0) or 0.0)
+                )
+                self.context_last_compact_skip_reason = trim(
+                    str(raw.get("context_last_compact_skip_reason", "") or ""), 160
+                )
+                self.context_last_next_call_estimate = max(
+                    0, int(raw.get("context_last_next_call_estimate", 0) or 0)
+                )
+                self.context_last_next_call_label = trim(
+                    str(raw.get("context_last_next_call_label", "") or ""), 80
+                )
                 self.last_context_actual_prompt_tokens = max(0, int(raw.get("last_context_actual_prompt_tokens", 0) or 0))
                 self.last_context_actual_completion_tokens = max(0, int(raw.get("last_context_actual_completion_tokens", 0) or 0))
                 self.last_context_actual_total_tokens = max(0, int(raw.get("last_context_actual_total_tokens", 0) or 0))
@@ -15291,6 +15349,15 @@ class SessionState:
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
             "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "context_limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
+            "context_last_compact_before": dict(getattr(self, "context_last_compact_before", {}) or {}),
+            "context_last_compact_after": dict(getattr(self, "context_last_compact_after", {}) or {}),
+            "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
+            "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
+            "context_last_compact_skip_ts": float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0),
+            "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+            "context_last_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
+            "context_last_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
             "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
             "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
             "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
@@ -16885,8 +16952,9 @@ class SessionState:
             f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
-            "Use tools to inspect, edit, and execute. "
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+	            "Use tools to inspect, edit, and execute. "
+	            "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
+	            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
@@ -17148,7 +17216,108 @@ class SessionState:
             "last_actual_age_seconds": round(float(actual_age), 3) if getattr(self, "last_context_actual_ts", 0.0) else None,
             "last_estimated_prompt_tokens": int(actual_estimate_at_call),
             "calibration_max": float(CONTEXT_USAGE_CALIBRATION_MAX),
+            "limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
         }
+
+    def _context_window_error_hint(self, exc: Exception | str) -> bool:
+        text = str(exc or "").lower()
+        if not text:
+            return False
+        markers = (
+            "context length",
+            "context window",
+            "maximum context",
+            "max context",
+            "num_ctx",
+            "prompt too long",
+            "too many tokens",
+            "token limit",
+            "input is too long",
+            "reduce the length",
+            "exceeds the context",
+            "exceeded context",
+            "context overflow",
+        )
+        return any(marker in text for marker in markers)
+
+    def _shrink_context_upper_bound_from_actual_pressure(
+        self,
+        *,
+        estimated_prompt_tokens: int,
+        reason: str,
+    ) -> bool:
+        if self.context_limit_locked:
+            return False
+        old_bound = int(self.context_token_upper_bound or self.max_context_token_limit)
+        prompt = max(MIN_CONTEXT_TOKEN_LIMIT, int(estimated_prompt_tokens or 0))
+        if prompt <= 0:
+            return False
+        # This is only used after the provider reports a context-window failure.
+        # Leave enough room for recovery prompts, but never infer model context from output length.
+        new_bound = max(MIN_CONTEXT_TOKEN_LIMIT, min(old_bound - 1, int(prompt * 0.96)))
+        if new_bound >= old_bound:
+            return False
+        self.context_token_upper_bound = new_bound
+        self.context_limit_source = f"provider-context-error:{trim(str(reason or 'unknown'), 48)}"
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "context upper bound adjusted from provider context error "
+                    f"{old_bound}->{new_bound} (estimated_prompt≈{prompt})"
+                )
+            },
+        )
+        return True
+
+    def _context_metrics_for_model_call(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        media_inputs: list[dict] | None = None,
+        label: str = "",
+    ) -> dict:
+        estimate = self._estimate_model_call_prompt_tokens(
+            messages if isinstance(messages, list) else [],
+            tools=tools,
+            system=system,
+            media_inputs=media_inputs,
+        )
+        self.context_last_next_call_estimate = int(estimate)
+        self.context_last_next_call_label = trim(str(label or ""), 80)
+        metrics = self._context_budget_metrics(token_estimate=estimate)
+        metrics["estimate_source"] = "next-model-call"
+        metrics["next_call_label"] = self.context_last_next_call_label
+        return metrics
+
+    def _active_next_call_context_metrics(self, role: str = "", media_inputs: list[dict] | None = None) -> dict:
+        raw_role = str(role or self.active_agent_role or "").strip().lower()
+        if raw_role == "manager":
+            return self._context_metrics_for_model_call(
+                self.manager_context,
+                tools=self._manager_route_tools(),
+                system=self._manager_system_prompt(),
+                media_inputs=media_inputs,
+                label="manager next turn",
+            )
+        role_key = self._sanitize_agent_role(raw_role)
+        if role_key in AGENT_ROLES and self._is_multi_agent_mode():
+            return self._context_metrics_for_model_call(
+                self._agent_context(role_key),
+                tools=self._tools_for_agent(role_key),
+                system=self._agent_role_system_prompt(role_key),
+                media_inputs=media_inputs,
+                label=f"{role_key} next turn",
+            )
+        return self._context_metrics_for_model_call(
+            self.messages,
+            tools=TOOLS,
+            system=self._system_prompt(),
+            media_inputs=media_inputs,
+            label="single-agent next turn",
+        )
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
         """Return compression tier 0-3 based on context budget.
@@ -17283,8 +17452,15 @@ class SessionState:
                 if plan_phase not in ("executing", "awaiting_choice"):
                     self.runtime_plan_proposal = {}
 
-    def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
-        metrics = self._context_budget_metrics()
+    def _apply_auto_compact_if_needed(
+        self,
+        reason: str = "auto",
+        *,
+        metrics: dict | None = None,
+        role: str = "",
+        media_inputs: list[dict] | None = None,
+    ) -> bool:
+        metrics = metrics or self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         tier = self._context_compression_tier(metrics)
         # Tier 1+: apply progressively aggressive microcompact
         if tier >= 1:
@@ -17297,7 +17473,7 @@ class SessionState:
             self._compact_agent_contexts(tier)
         # Re-check after tier-based compression. The effective limit keeps a
         # small hard reserve so auto-compact still has room to run.
-        metrics = self._context_budget_metrics()
+        metrics = self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         used = int(metrics.get("used", 0) or 0)
         effective_limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0))
         if used < effective_limit:
@@ -17305,7 +17481,13 @@ class SessionState:
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
             return False
-        self._auto_compact(reason)
+        if (
+            not bool(getattr(self, "context_last_compact_effective", True))
+            and (now_tick - float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0))
+            < float(CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS)
+        ):
+            return False
+        self._auto_compact(reason, metrics=metrics, role=role, media_inputs=media_inputs)
         return True
 
     def _estimate_output_tokens(self, text: str, thinking_text: str = "", tool_calls: list | None = None) -> int:
@@ -17320,10 +17502,9 @@ class SessionState:
         return max(1, t_main + t_think + t_tools)
 
     def _derive_context_limit_from_output(self, output_tokens: int) -> int:
-        estimated = int(
-            max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, output_tokens * 12))
-        )
-        return max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, estimated))
+        # Kept for compatibility with older call sites. Output length is not a
+        # reliable proxy for input context capacity, so never shrink from it.
+        return max(MIN_CONTEXT_TOKEN_LIMIT, int(self.max_context_token_limit))
 
     def _trim_truncated_tail_line(self, text: str) -> str:
         src = str(text or "")
@@ -17531,9 +17712,9 @@ class SessionState:
         if now_tick - self.last_truncation_ts >= 0.2:
             self.truncation_count += 1
         self.last_truncation_ts = now_tick
-        old_bound = int(self.context_token_upper_bound)
-        new_bound = self._derive_context_limit_from_output(tokens_now)
-        self.context_token_upper_bound = min(old_bound, new_bound)
+        # Output truncation is a generation-budget signal, not proof that the
+        # prompt context window is smaller. Keep the configured/adaptive input
+        # context bound intact; only provider context-window errors may shrink it.
 
         self._publish_live_truncation(
             text=working,
@@ -17962,22 +18143,13 @@ class SessionState:
             return
         self.truncation_count += 1
         self.last_truncation_ts = now_tick
-        old_bound = self.context_token_upper_bound
-        if not self.context_limit_locked:
-            new_bound = self._derive_context_limit_from_output(output_tokens)
-            self.context_token_upper_bound = min(old_bound, new_bound)
-            if self.context_token_upper_bound < old_bound:
-                self._emit(
-                    "status",
-                    {
-                        "summary": (
-                            f"context upper bound adjusted {old_bound}->{self.context_token_upper_bound} "
-                            f"(output_tokens≈{output_tokens})"
-                        )
-                    },
+        if allow_compact:
+            metrics = self._active_next_call_context_metrics()
+            if int(metrics.get("used", 0) or 0) >= int(metrics.get("effective_limit", 0) or 0):
+                self._apply_auto_compact_if_needed(
+                    f"truncation-rescue:{source or 'auto'}",
+                    metrics=metrics,
                 )
-        if allow_compact and self._estimate_tokens() > self.context_token_upper_bound:
-            self._auto_compact(f"truncation-rescue:{source or 'auto'}")
         self._ensure_truncation_todos()
         task_ids = self._create_truncation_subtasks(reason)
         self._inject_truncation_rescue_hint(reason, output_tokens, task_ids)
@@ -18654,8 +18826,29 @@ class SessionState:
         kept.sort(key=lambda x: x[0])
         return [msg for _, msg in kept]
 
-    def _auto_compact(self, reason: str):
-        context_before = self._context_budget_metrics()
+    def _strip_archival_runtime_hints(self, rows: list[dict]) -> list[dict]:
+        cleaned: list[dict] = []
+        for row in rows or []:
+            item = dict(row) if isinstance(row, dict) else {"role": "", "content": str(row or "")}
+            role = str(item.get("role", "") or "")
+            content = str(item.get("content", "") or "")
+            low = content.strip().lower()
+            if role == "user" and any(low.startswith(prefix) for prefix in RETRY_RUNTIME_HINT_PREFIXES):
+                continue
+            if "<compact-resume>" in low or "<state_handoff>" in low:
+                item["content"] = "[previous compact-resume archived; use context_recall for details]"
+            cleaned.append(item)
+        return cleaned
+
+    def _auto_compact(
+        self,
+        reason: str,
+        *,
+        metrics: dict | None = None,
+        role: str = "",
+        media_inputs: list[dict] | None = None,
+    ):
+        context_before = metrics or self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         tier = self._context_compression_tier(context_before)
         transcript_dir = self.root / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -18674,6 +18867,7 @@ class SessionState:
         if len(tail) >= len(self.messages):
             tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
         archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
+        tail = self._strip_archival_runtime_hints(tail)
         seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
         summary = self._summarize_compact_rows(archived_rows)
         seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
@@ -18735,6 +18929,21 @@ class SessionState:
                 c = msg.get("content", "")
                 if isinstance(c, str) and len(c) >= FILE_BUFFER_CONTENT_THRESHOLD * 2:
                     msg["content"] = self._offload_to_file_buffer(c, label="compact-msg")
+        context_after = self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
+        before_used = int(context_before.get("used", 0) or 0)
+        after_used = int(context_after.get("used", 0) or 0)
+        reduction = max(0, before_used - after_used)
+        effective = bool(reduction >= max(400, int(before_used * 0.05)) or after_used < int(context_after.get("effective_limit", 0) or 0))
+        self.context_last_compact_before = dict(context_before)
+        self.context_last_compact_after = dict(context_after)
+        self.context_last_compact_effective = bool(effective)
+        self.context_last_compact_used_reduction = int(reduction)
+        if not effective:
+            self.context_last_compact_skip_ts = now_ts()
+            self.context_last_compact_skip_reason = (
+                f"compact ineffective: used {before_used}->{after_used}, "
+                f"limit={int(context_after.get('effective_limit', 0) or 0)}"
+            )
         self.last_compact_reason = str(reason or "")
         self.last_compact_ts = now_ts()
         self._emit(
@@ -18749,6 +18958,12 @@ class SessionState:
                 "context_used_before": int(context_before.get("used", 0)),
                 "context_left_before": int(context_before.get("left", 0)),
                 "context_left_percent_before": round(float(context_before.get("left_percent", 0.0)), 2),
+                "context_used_after": int(context_after.get("used", 0)),
+                "context_left_after": int(context_after.get("left", 0)),
+                "context_left_percent_after": round(float(context_after.get("left_percent", 0.0)), 2),
+                "context_used_reduction": int(reduction),
+                "effective": bool(effective),
+                "next_call_label": str(context_after.get("next_call_label", "") or ""),
             },
         )
 
@@ -22351,6 +22566,29 @@ body{padding:18px}
         ]
         return any(x in t for x in continue_markers)
 
+    def _looks_like_action_promise_without_tool(self, text: str) -> bool:
+        raw = strip_thinking_content(str(text or "")).strip()
+        if not raw:
+            return False
+        low = raw.lower()
+        if self._looks_like_conclusive_reply(raw) or self._looks_like_user_decision_needed(raw):
+            return False
+        promise_markers = (
+            "现在创建", "现在开始", "开始构建", "开始编写", "开始生成", "我将创建", "我会创建",
+            "我将编写", "我会编写", "接下来创建", "接下来构建", "让我创建", "让我开始",
+            "现在建立", "開始建立", "開始編寫", "我將建立", "我會建立", "接下來建立",
+            "now create", "now build", "now write", "i will create", "i will build", "i will write",
+            "i'll create", "i'll build", "i'll write", "let me create", "let me build", "let me write",
+            "next i will create", "next i will build",
+        )
+        if not any(marker in low for marker in promise_markers):
+            return False
+        artifact_markers = (
+            "html", "报告", "報告", "交互", "interactive", "file", "文件", "script", "代码", "程式",
+            ".html", ".js", ".css", "write_file", "edit_file", "bash", "生成", "创建", "建立", "构建", "編寫",
+        )
+        return any(marker in low for marker in artifact_markers)
+
     def _looks_like_user_decision_needed(self, text: str) -> bool:
         t = (text or "").strip().lower()
         if not t:
@@ -22664,6 +22902,27 @@ body{padding:18px}
         if any(
             x in low
             for x in [
+                "action_required",
+                "action required",
+                "tool_required",
+                "tool required",
+                "execute_tool",
+                "execute tool",
+                "needs tool",
+                "needs_action",
+                "needs action",
+                "需要工具",
+                "需要执行",
+                "需要執行",
+                "需要動作",
+                "工具が必要",
+                "実行が必要",
+            ]
+        ):
+            return "ACTION_REQUIRED"
+        if any(
+            x in low
+            for x in [
                 "valid_planning",
                 "valid planning",
                 "plan",
@@ -22708,12 +22967,18 @@ body{padding:18px}
             "VALID_PLAN": "VALID_PLANNING",
             "PLANNING": "VALID_PLANNING",
             "PLAN": "VALID_PLANNING",
+            "ACTION": "ACTION_REQUIRED",
+            "REQUIRES_ACTION": "ACTION_REQUIRED",
+            "NEEDS_ACTION": "ACTION_REQUIRED",
+            "TOOL_REQUIRED": "ACTION_REQUIRED",
+            "NEEDS_TOOL": "ACTION_REQUIRED",
+            "EXECUTE_TOOL": "ACTION_REQUIRED",
             "EMPTY": "EMPTY_RAMBLING",
             "RAMBLING": "EMPTY_RAMBLING",
             "IDLE": "EMPTY_RAMBLING",
         }
         status = aliases.get(key, key)
-        if status in {"TASK_COMPLETED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
+        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
             return status
         inferred = self._infer_arbiter_status_from_text(fallback_text)
         return inferred or ""
@@ -22772,25 +23037,32 @@ body{padding:18px}
 
     def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "") -> dict:
         clean = strip_thinking_content(str(assistant_text or "")).strip()
+        thinking_clean = str(thinking_text or "").strip()
         if not self.arbiter_enabled:
             return {"status": "DISABLED", "reasoning": "arbiter disabled", "raw": ""}
-        if len(clean) < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
+        probe_len = max(len(clean), len(thinking_clean))
+        if (
+            probe_len < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+            and not self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}")
+        ):
             return {"status": "SKIP_SHORT", "reasoning": "content too short", "raw": ""}
         snapshot = self._arbiter_context_snapshot(clean, thinking_text)
         arbiter_system = (
             "You are a task-state arbiter. "
             "Classify worker output into exactly one status: "
-            "TASK_COMPLETED, VALID_PLANNING, or EMPTY_RAMBLING. "
+            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
         arbiter_user = (
             "Read the snapshot and classify the worker state.\n"
             "Status definitions:\n"
             "- TASK_COMPLETED: worker already completed user's target and gave final deliverable/summary.\n"
-            "- VALID_PLANNING: worker output is meaningful planning/analysis that should continue into execution.\n"
+            "- ACTION_REQUIRED: worker has decided or promised to create/write/modify/run/verify something, or thinking contains a concrete next tool action, but no tool call was emitted.\n"
+            "- VALID_PLANNING: worker output is useful high-level analysis or design that still needs more reasoning before a concrete tool action.\n"
             "- EMPTY_RAMBLING: worker is stalling, repeating, or hallucinating with no actionable progress.\n"
+            "Prefer ACTION_REQUIRED over VALID_PLANNING when the next step is already a concrete artifact/action.\n"
             "Output JSON only:\n"
-            "{\"status\":\"TASK_COMPLETED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
+            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
@@ -22820,18 +23092,28 @@ body{padding:18px}
             return {"status": "ARBITER_ERROR", "reasoning": trim(str(err), 220), "raw": ""}
         rsp = box.get("rsp") if isinstance(box.get("rsp"), dict) else {}
         raw_content = trim(str((rsp or {}).get("content", "") or ""), 2000)
+        raw_thinking = trim(str((rsp or {}).get("thinking", "") or ""), 1200)
+        status_source = raw_content or raw_thinking
         payload = extract_json_object_from_text(raw_content, {})
-        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), raw_content)
+        if not payload and raw_thinking:
+            payload = extract_json_object_from_text(raw_thinking, {})
+        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), status_source)
         if not status:
-            status = self._infer_arbiter_status_from_text(raw_content)
+            status = self._infer_arbiter_status_from_text(status_source)
+        if (
+            (not status or status == "UNKNOWN")
+            and self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}\n{status_source}")
+        ):
+            status = "ACTION_REQUIRED"
         reasoning = trim(
             str(payload.get("reasoning", payload.get("reason", "")) or ""),
             280,
-        ) or trim(raw_content, 280)
+        ) or trim(status_source, 280)
         return {
             "status": status or "UNKNOWN",
             "reasoning": reasoning,
             "raw": raw_content,
+            "raw_thinking": raw_thinking,
             "model": str(self.arbiter_model or self.ollama.model or "").strip(),
         }
 
@@ -22846,6 +23128,26 @@ body{padding:18px}
                     "系统仲裁判定：当前回复属于有效计划。请立即推进执行：下一轮必须调用一个具体工具，"
                     "不要重复口头计划，不要新增无意义 Todo。"
                     f"{(' 判定依据: ' + reasoning + '。') if reasoning else ''}"
+                    "</arbiter-continue>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+
+    def _inject_arbiter_action_required_hint(self, decision: dict, assistant_text: str = ""):
+        reasoning = trim(str(decision.get("reasoning", "") or "").strip(), 180)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 420)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<arbiter-continue>"
+                    "系统仲裁判定：当前回复已经到了需要执行工具的阶段，但没有发出工具调用。"
+                    "下一轮必须只调用一个具体工具来推进，例如 write_file/edit_file/bash/read_file/check_background；"
+                    "如果确实已经完成，则调用 finish_task 并提供文件路径和验证证据。不要再输出计划性说明。"
+                    f"{(' 判定依据: ' + reasoning + '。') if reasoning else ''}"
+                    f"{(' 上一条文本: ' + latest) if latest else ''}"
                     "</arbiter-continue>"
                 ),
                 "ts": now_ts(),
@@ -23914,6 +24216,27 @@ body{padding:18px}
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
+                if self._context_window_error_hint(exc):
+                    if self._shrink_context_upper_bound_from_actual_pressure(
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        reason=f"{context_label}:{trim(str(exc), 80)}",
+                    ):
+                        self._apply_auto_compact_if_needed(
+                            f"provider-context-error:{context_label}",
+                            metrics=self._context_budget_metrics(token_estimate=estimated_prompt_tokens),
+                        )
+                        if attempt <= retry_budget:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        f"{context_label} context-window retry after compact "
+                                        f"({attempt}/{retry_budget})"
+                                    )
+                                },
+                            )
+                            time.sleep(min(1.0, 0.25 * attempt))
+                            continue
                 # Detect media format incompatibility and auto-fallback
                 exc_str = str(exc).lower()
                 _media_fmt_err = media_inputs and any(
@@ -34946,23 +35269,9 @@ body{padding:18px}
         )
 
     def _tighten_context_for_segmented_retry(self, reason: str, output_tokens: int):
-        if self.context_limit_locked:
-            return
-        old_bound = int(self.context_token_upper_bound)
-        reduced = int(max(MIN_CONTEXT_TOKEN_LIMIT, min(old_bound - 1200, old_bound * 0.78)))
-        derived = self._derive_context_limit_from_output(max(1, output_tokens))
-        new_bound = min(old_bound, reduced, derived)
-        if new_bound < old_bound:
-            self.context_token_upper_bound = new_bound
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        "context upper bound reduced for segmented retry "
-                        f"{old_bound}->{new_bound} ({trim(reason, 90)})"
-                    )
-                },
-            )
+        # Segmented retry is an execution-shaping signal. It should not shrink
+        # the input context window unless a provider reports a real context error.
+        self.context_limit_source = str(getattr(self, "context_limit_source", "") or "configured")
 
     def _inject_segmented_retry_hint(self, name: str, reason: str):
         goal = self._latest_user_goal_text()
@@ -35183,6 +35492,30 @@ body{padding:18px}
                     f"(streak={streak}; causes={trim(causes, 120)})"
                 )
             },
+        )
+
+    def _inject_action_promise_recovery_hint(self, assistant_text: str):
+        goal = trim(str(self._latest_user_goal_text() or ""), 500)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 500)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<no-tool-recovery>"
+                    "你刚才说明要开始创建/编写/构建产物，但没有调用任何工具，因此产物并未创建。"
+                    "如果任务已完成，请调用 finish_task 并给出文件路径和验证证据；"
+                    "否则下一轮必须只执行一个具体工具调用来推进，例如 write_file 创建 HTML、"
+                    "edit_file 修改文件、或 bash 运行必要的复制/验证命令。不要再输出计划性说明。"
+                    f"目标: {goal}. 上一条文本: {latest}"
+                    "</no-tool-recovery>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": "no-tool action promise detected; forcing one concrete tool turn"},
         )
 
     def _inject_thinking_empty_recovery_hint(self, streak: int = 1, budget_forced: bool = False):
@@ -35645,6 +35978,13 @@ body{padding:18px}
             return "No bg tasks."
         if not task_id and not mode and not query and not args.get("status"):
             return self.bg.check(None)
+        known_ids = {str(row.get("id", "") or "").strip() for row in rows if isinstance(row, dict)}
+        if task_id and task_id not in known_ids and (mode or query or args.get("status")):
+            if not query:
+                query = task_id
+            task_id = ""
+        if query and mode in {"tail", "recent"}:
+            mode = "search"
         filters = {"status": args.get("status")}
         if task_id:
             filters["id"] = task_id
@@ -35691,12 +36031,25 @@ body{padding:18px}
             return "[]"
         mode = str(args.get("mode", "") or "").strip().lower()
         query = str(args.get("query", "") or "").strip()
+        event_arg = str(args.get("event", "") or "").strip()
+        worktree_arg = str(args.get("worktree", "") or "").strip()
         limit = self._tool_int_arg(args.get("limit", 20), 20, 1, 200)
-        if not mode and not query and not args.get("event") and not args.get("worktree") and not args.get("task_id"):
+        known_events = {
+            str(row.get("event", "") or "").strip().lower()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("event", "") or "").strip()
+        }
+        if event_arg and event_arg.lower() not in known_events and "." not in event_arg:
+            if not worktree_arg:
+                worktree_arg = event_arg
+            elif not query:
+                query = event_arg
+            event_arg = ""
+        if not mode and not query and not event_arg and not worktree_arg and not args.get("task_id"):
             return self.worktrees.events_recent(limit)
         filters = {
-            "event": args.get("event"),
-            "worktree.name": args.get("worktree"),
+            "event": event_arg,
+            "worktree.name": worktree_arg,
             "task.id": args.get("task_id"),
         }
         return self._render_collection_tool_payload(
@@ -37363,7 +37716,7 @@ body{padding:18px}
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
             self._inject_pending_user_inputs()
-            self._apply_auto_compact_if_needed("auto:multi-sync")
+            self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
                 self._maybe_create_checkpoint()
@@ -37716,7 +38069,7 @@ body{padding:18px}
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
-            self._apply_auto_compact_if_needed("auto:multi-seq")
+            self._apply_auto_compact_if_needed("auto:multi-seq", role=current_role)
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
             latest_user_ts = self._latest_user_message_ts()
@@ -39881,7 +40234,7 @@ body{padding:18px}
                             },
                         )
                         break
-                self._apply_auto_compact_if_needed("auto")
+                self._apply_auto_compact_if_needed("auto", role=single_role)
                 # Periodic checkpoint in single-agent loop
                 _sa_round = int(getattr(self, "agent_round_index", 0) or 0)
                 if _sa_round > 0 and _sa_round % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -40170,7 +40523,12 @@ body{padding:18px}
                         )
                         continue
                     clean_decision_probe = strip_thinking_content(decision_probe).strip()
-                    if bool(self.arbiter_enabled) and len(clean_decision_probe) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
+                    arbiter_probe_len = max(len(clean_decision_probe), len(str(thinking_text or "").strip()))
+                    arbiter_should_run = bool(self.arbiter_enabled) and (
+                        arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+                        or self._looks_like_action_promise_without_tool(done_probe)
+                    )
+                    if arbiter_should_run:
                         arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
                         arbiter_status = str(arbiter_decision.get("status", "") or "").strip().upper()
                         if arbiter_status == "TASK_COMPLETED":
@@ -40189,6 +40547,35 @@ body{padding:18px}
                                 },
                             )
                             break
+                        if arbiter_status == "ACTION_REQUIRED":
+                            arbiter_planning_rounds = 0
+                            no_tool_rounds = 0
+                            fault_counter = 0
+                            last_fault_reason = ""
+                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                            self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
+                            if auto_continue_budget > 0:
+                                auto_continue_budget -= 1
+                                self._emit(
+                                    "status",
+                                    {
+                                        "summary": (
+                                            "arbiter decision=ACTION_REQUIRED; "
+                                            "auto-continue to concrete tool execution "
+                                            f"(remaining={auto_continue_budget})"
+                                        )
+                                    },
+                                )
+                                continue
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "arbiter decision=ACTION_REQUIRED but auto-continue budget exhausted; "
+                                        "falling back to no-tool handling"
+                                    )
+                                },
+                            )
                         if arbiter_status == "VALID_PLANNING":
                             arbiter_planning_rounds += 1
                             if arbiter_planning_rounds <= int(ARBITER_VALID_PLANNING_STREAK_LIMIT):
@@ -40265,6 +40652,7 @@ body{padding:18px}
                     substantial_reply = self._looks_like_substantial_informative_reply(done_probe)
                     done_like = self._looks_like_conclusive_reply(done_probe)
                     todo_blocking = self._todo_should_block_auto_continue(done_probe)
+                    action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
                     endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
                     if bool(endpoint.get("matched", False)):
                         arbiter_planning_rounds = 0
@@ -40320,7 +40708,7 @@ body{padding:18px}
                         break
                     no_tool_rounds += 1
                     diagnosis = self._diagnose_no_tool_idle(decision_probe, no_tool_rounds)
-                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking
+                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking or action_promise_pending
                     if no_tool_rounds >= 2 and pending_like:
                         fault_counter += 1
                         last_fault_reason = f"no-tool-idle(streak={no_tool_rounds})"
@@ -40342,7 +40730,11 @@ body{padding:18px}
                     if (not done_like) and no_tool_rounds >= 1 and pending_like:
                         if auto_continue_budget > 0:
                             auto_continue_budget -= 1
-                            if no_tool_rounds >= 2:
+                            if action_promise_pending:
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                self._inject_action_promise_recovery_hint(done_probe)
+                                summary = "no-tool action promise recovered"
+                            elif no_tool_rounds >= 2:
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                                 self._inject_no_tool_recovery_hint(diagnosis)
                                 summary = "no-tool recovery mode engaged"
@@ -40362,7 +40754,7 @@ body{padding:18px}
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
-                        todo_blocking or self._looks_like_incomplete_reply(text)
+                        todo_blocking or action_promise_pending or self._looks_like_incomplete_reply(text)
                     )
                     if can_continue:
                         if self.cancel_requested:
@@ -41494,6 +41886,12 @@ body{padding:18px}
                 "context_reserve_percent": float(ctx.get("reserve_percent", 0.0)),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
+                "context_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
+                "context_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
+                "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
+                "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
+                "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
                 "context_estimator": str(ctx.get("estimator", "")),
                 "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
                 "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
