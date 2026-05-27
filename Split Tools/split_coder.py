@@ -157,6 +157,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "backend_i18n_text", "backend_role_label",
         "infer_user_complexity_value", "normalize_task_complexity",
         "task_complexity_rank", "task_complexity_at_least", "max_task_complexity",
+        "normalize_read_context_policy", "normalize_auto_task_level_ceiling",
         "normalize_execution_mode", "model_language_instruction", "_detect_os_shell_instruction",
         "resolve_web_ui_dir_path", "resolve_optional_file_path", "resolve_skills_root_path",
         "_count_skill_markdown_files", "select_preferred_skills_root",
@@ -1764,6 +1765,8 @@ class AutoLayoutGenerator:
         "backend_i18n_text": "config/settings.py",
         "backend_role_label": "config/settings.py",
         "infer_user_complexity_value": "config/settings.py",
+        "normalize_read_context_policy": "config/settings.py",
+        "normalize_auto_task_level_ceiling": "config/settings.py",
         "normalize_openai_compat_provider_name": "llm/utils.py",
         "is_openai_compat_provider": "llm/utils.py",
         "is_openai_like_provider": "llm/utils.py",
@@ -1881,6 +1884,7 @@ class AutoLayoutGenerator:
 
     FUNCTION_REGEX_RULES: List[Tuple[str, str]] = [
         (r"^extract_.*_setting$", "config/settings.py"),
+        (r"^normalize_.*(?:policy|ceiling|setting)$", "config/settings.py"),
         (r"^(?:load|parse)_.*config(?:_from_.*)?$", "config/settings.py"),
         (r"^backend_(?:i18n|role)_.*$", "config/settings.py"),
         (r"^resolve_.*(?:path|dir|root)$", "config/paths.py"),
