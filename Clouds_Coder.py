@@ -342,6 +342,15 @@ MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 3
+READ_FILE_LOOP_THRESHOLD = 6
+READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
+READ_FILE_COMPACT_PIN_DISTINCT = 8
+READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
+READ_CONTEXT_REGISTRY_MAX = 80
+READ_CONTEXT_PROMPT_MAX_ITEMS = 14
+READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
+READ_CONTEXT_SUMMARY_MAX_CHARS = 520
+READ_CONTEXT_SHARED_MAX_ITEMS = 4
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 15
@@ -13435,7 +13444,8 @@ TOOLS = [
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
-            "and mode='full' when complete content is explicitly needed."
+            "and mode='full' when complete content is explicitly needed. Successful reads are remembered in "
+            "the read-context registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
@@ -13494,7 +13504,22 @@ TOOLS = [
         ["path", "content"],
     ),
     tool_def("scan_skills", "Force reload skills from ./skills and return summary.", {}),
-    tool_def("compress", "Compress conversation context.", {}),
+    tool_def(
+        "compress",
+        "Compress conversation context and optionally pin/drop remembered read contexts.",
+        {
+            "keep_read_context": {
+                "type": "array",
+                "items": {},
+                "description": "Read-context ids, paths, signatures, or objects to keep/pin across compact.",
+            },
+            "drop_read_context": {
+                "type": "array",
+                "items": {},
+                "description": "Read-context ids, paths, signatures, or objects to remove from future prompt summaries.",
+            },
+        },
+    ),
 	    tool_def(
 	        "context_recall",
 	        (
@@ -13998,6 +14023,11 @@ class SessionState:
         self.last_explorer_instruction_hash = ""
         self.bash_read_loop_fp = ""
         self.bash_read_loop_count = 0
+        self.read_file_loop_recent: list[str] = []
+        self.read_file_loop_state: dict[str, dict] = {}
+        self.read_file_loop_count = 0
+        self.read_file_loop_last_intervention_ts = 0.0
+        self.read_context_registry: dict[str, dict] = {}
         self.stall_severity_score = 0
         self.stall_severity_sources: list[dict] = []
         self.stall_escalation_triggered = False
@@ -15049,6 +15079,9 @@ class SessionState:
                                 "summary": trim(str(entry.get("summary", "") or ""), 200),
                             }
                     self.file_buffer_index = clean_fbi
+                self.read_context_registry = self._normalize_read_context_registry(
+                    raw.get("read_context_registry", {})
+                )
                 self.last_compact_reason = str(raw.get("last_compact_reason", self.last_compact_reason) or "")
                 self.last_compact_ts = float(raw.get("last_compact_ts", self.last_compact_ts) or 0.0)
                 pref = str(raw.get("plan_mode_user_preference", "auto") or "auto").lower()
@@ -15370,6 +15403,9 @@ class SessionState:
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
             "context_archives": self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:],
             "file_buffer_index": dict(self.file_buffer_index) if self.file_buffer_index else {},
+            "read_context_registry": self._normalize_read_context_registry(
+                getattr(self, "read_context_registry", {})
+            ),
             "last_compact_reason": self.last_compact_reason,
             "last_compact_ts": self.last_compact_ts,
             "plan_mode_user_preference": str(self.plan_mode_user_preference or "auto"),
@@ -15539,6 +15575,10 @@ class SessionState:
         self.tool_retry_counts = {}
         self.bash_read_loop_fp = ""
         self.bash_read_loop_count = 0
+        self.read_file_loop_recent = []
+        self.read_file_loop_state = {}
+        self.read_file_loop_count = 0
+        self.read_file_loop_last_intervention_ts = 0.0
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
@@ -16992,6 +17032,8 @@ class SessionState:
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
         knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
+        read_context_block = self._read_context_prompt_block(max_chars=READ_CONTEXT_PROMPT_MAX_CHARS)
+        read_context_text = f"{read_context_block}\n\n" if read_context_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
             and not self.single_advance_prompt_enhance
@@ -17043,6 +17085,7 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{read_context_text}"
             f"{knowledge_ref_block_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
@@ -18443,8 +18486,542 @@ class SessionState:
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
-                        return str(block.get("name", ""))
+                            return str(block.get("name", ""))
         return ""
+
+    def _find_tool_call_details_by_id(self, messages: list[dict], tool_use_id: str) -> tuple[str, dict]:
+        """Find tool name and parsed arguments from a preceding assistant tool call."""
+        if not tool_use_id:
+            return "", {}
+
+        def _parse_args(raw: object) -> dict:
+            if isinstance(raw, dict):
+                return dict(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    return dict(parsed) if isinstance(parsed, dict) else {}
+                except Exception:
+                    return {}
+            return {}
+
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls", []):
+                if not isinstance(tc, dict) or tc.get("id") != tool_use_id:
+                    continue
+                fn = tc.get("function", {})
+                if not isinstance(fn, dict):
+                    return "", {}
+                return str(fn.get("name", "") or ""), _parse_args(fn.get("arguments", {}))
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use" or block.get("id") != tool_use_id:
+                        continue
+                    return str(block.get("name", "") or ""), _parse_args(block.get("input", {}))
+        return "", {}
+
+    def _read_file_signature_from_args(self, args: dict | None) -> str:
+        src = args if isinstance(args, dict) else {}
+        path = trim(str(src.get("path", "") or "").replace("\\", "/"), 240)
+        mode = str(src.get("mode", "") or "auto").strip().lower() or "auto"
+        parts = [f"path={path}", f"mode={mode}"]
+        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars"):
+            value = src.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={trim(str(value), 120)}")
+        return "|".join(parts)
+
+    def _read_context_key(self, role: str, signature: str) -> str:
+        role_key = self._sanitize_agent_role(role) or "single"
+        raw = f"{role_key}|{signature}".encode("utf-8", errors="replace")
+        return hashlib.sha1(raw).hexdigest()[:16]
+
+    def _normalize_read_context_registry(self, raw: object) -> dict[str, dict]:
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, dict] = {}
+        for raw_key, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            signature = trim(str(raw_entry.get("signature", "") or ""), 1000)
+            path = trim(str(raw_entry.get("path", "") or "").replace("\\", "/"), 300)
+            if not signature or not path:
+                continue
+            role_key = self._sanitize_agent_role(raw_entry.get("agent_role", "")) or "single"
+            key = trim(str(raw_entry.get("key", "") or raw_key or ""), 40)
+            if not key:
+                key = self._read_context_key(role_key, signature)
+            status = str(raw_entry.get("status", "active") or "active").strip().lower()
+            if status not in {"active", "pinned", "stale", "dropped"}:
+                status = "active"
+            args = raw_entry.get("args", {}) if isinstance(raw_entry.get("args", {}), dict) else {}
+            clean[key] = {
+                "key": key,
+                "source_tool": str(raw_entry.get("source_tool", "read_file") or "read_file"),
+                "path": path,
+                "mode": trim(str(raw_entry.get("mode", args.get("mode", "auto")) or "auto"), 40).lower(),
+                "signature": signature,
+                "agent_role": role_key,
+                "status": status,
+                "chars": max(0, int(raw_entry.get("chars", 0) or 0)),
+                "lines": max(0, int(raw_entry.get("lines", 0) or 0)),
+                "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
+                "summary": trim(str(raw_entry.get("summary", "") or ""), READ_CONTEXT_SUMMARY_MAX_CHARS),
+                "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "args": {
+                    k: v
+                    for k, v in dict(args).items()
+                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                },
+                "hit_count": max(1, int(raw_entry.get("hit_count", 1) or 1)),
+                "first_read_ts": max(0.0, float(raw_entry.get("first_read_ts", 0.0) or 0.0)),
+                "last_read_ts": max(0.0, float(raw_entry.get("last_read_ts", 0.0) or 0.0)),
+                "last_used_ts": max(0.0, float(raw_entry.get("last_used_ts", 0.0) or 0.0)),
+                "last_stale_ts": max(0.0, float(raw_entry.get("last_stale_ts", 0.0) or 0.0)),
+                "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
+            }
+        return self._pruned_read_context_registry(clean)
+
+    def _read_context_sort_key(self, item: tuple[str, dict]) -> tuple[int, float, int, str]:
+        _key, entry = item
+        status_rank = {"pinned": 0, "active": 1, "stale": 2, "dropped": 3}
+        status = str(entry.get("status", "active") or "active").lower()
+        return (
+            int(status_rank.get(status, 1)),
+            -float(entry.get("last_read_ts", 0.0) or 0.0),
+            -int(entry.get("hit_count", 0) or 0),
+            str(entry.get("path", "")),
+        )
+
+    def _pruned_read_context_registry(self, registry: dict[str, dict] | None = None) -> dict[str, dict]:
+        src = registry if isinstance(registry, dict) else getattr(self, "read_context_registry", {})
+        rows = [(str(k), v) for k, v in dict(src or {}).items() if isinstance(v, dict)]
+        rows.sort(key=self._read_context_sort_key)
+        keep = rows[: int(READ_CONTEXT_REGISTRY_MAX)]
+        return {k: v for k, v in keep}
+
+    def _read_context_summary_from_output(self, output: str) -> str:
+        text = str(output or "").replace("\r\n", "\n")
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return ""
+        picked: list[str] = []
+        for ln in lines[:10]:
+            if ln.startswith("[read_file clipped"):
+                continue
+            picked.append(ln)
+            if len(" ".join(picked)) >= READ_CONTEXT_SUMMARY_MAX_CHARS:
+                break
+        return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
+
+    def _record_read_context(self, rel_path: str, args: dict, output: str, role: str = "") -> None:
+        if str(output or "").startswith("Error:"):
+            return
+        rel = trim(str(rel_path or "").replace("\\", "/"), 300)
+        if not rel:
+            return
+        src_args = dict(args or {})
+        src_args["path"] = rel
+        mode = str(src_args.get("mode", "") or "auto").strip().lower() or "auto"
+        signature = self._read_file_signature_from_args(src_args)
+        role_key = self._sanitize_agent_role(role) or "single"
+        key = self._read_context_key(role_key, signature)
+        content = str(output or "")
+        now = now_ts()
+        old = self.read_context_registry.get(key, {}) if isinstance(getattr(self, "read_context_registry", {}), dict) else {}
+        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        cache_path = str(old.get("cache_path", "") or "")
+        if len(content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
+            not cache_path or str(old.get("sha256", "") or "") != sha
+        ):
+            try:
+                entry = self._write_file_buffer_entry(content, label=f"read_file:{rel}")
+                cache_path = str(entry.get("path", "") or "")
+            except Exception:
+                cache_path = ""
+        previous_status = str(old.get("status", "active") or "active").lower()
+        status = "pinned" if previous_status == "pinned" else "active"
+        self.read_context_registry[key] = {
+            "key": key,
+            "source_tool": "read_file",
+            "path": rel,
+            "mode": mode,
+            "signature": signature,
+            "agent_role": role_key,
+            "status": status,
+            "chars": len(content),
+            "lines": content.count("\n") + (1 if content else 0),
+            "sha256": sha,
+            "summary": self._read_context_summary_from_output(content),
+            "cache_path": cache_path,
+            "args": {
+                k: v
+                for k, v in src_args.items()
+                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+            },
+            "hit_count": int(old.get("hit_count", 0) or 0) + 1,
+            "first_read_ts": float(old.get("first_read_ts", now) or now),
+            "last_read_ts": now,
+            "last_used_ts": float(old.get("last_used_ts", 0.0) or 0.0),
+            "last_stale_ts": 0.0,
+            "stale_reason": "",
+        }
+        self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
+
+    def _mark_read_context_stale(self, rel_path: str, reason: str = "") -> int:
+        rel = trim(str(rel_path or "").replace("\\", "/"), 300)
+        if not rel or not isinstance(getattr(self, "read_context_registry", {}), dict):
+            return 0
+        changed = 0
+        now = now_ts()
+        for entry in self.read_context_registry.values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("path", "") or "").replace("\\", "/") != rel:
+                continue
+            if str(entry.get("status", "") or "").lower() == "dropped":
+                continue
+            entry["status"] = "stale"
+            entry["last_stale_ts"] = now
+            entry["stale_reason"] = trim(str(reason or "file changed after read"), 180)
+            changed += 1
+        return changed
+
+    def _read_context_matches_token(self, entry: dict, token: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if isinstance(token, dict):
+            candidates = [
+                token.get("id"),
+                token.get("key"),
+                token.get("signature"),
+                token.get("path"),
+            ]
+            return any(self._read_context_matches_token(entry, x) for x in candidates if x not in (None, ""))
+        needle = str(token or "").strip()
+        if not needle:
+            return False
+        key = str(entry.get("key", "") or "")
+        path = str(entry.get("path", "") or "")
+        sig = str(entry.get("signature", "") or "")
+        return (
+            key == needle
+            or key.startswith(needle)
+            or path == needle
+            or path.endswith(needle)
+            or sig == needle
+            or needle in sig
+        )
+
+    def _apply_read_context_policy(self, args: dict | None, role: str = "") -> str:
+        src = args if isinstance(args, dict) else {}
+        role_key = self._sanitize_agent_role(role) or ""
+        keep_items = src.get("keep_read_context", [])
+        drop_items = src.get("drop_read_context", [])
+        if isinstance(keep_items, (str, dict)):
+            keep_items = [keep_items]
+        if isinstance(drop_items, (str, dict)):
+            drop_items = [drop_items]
+        if not isinstance(keep_items, list):
+            keep_items = []
+        if not isinstance(drop_items, list):
+            drop_items = []
+        if not keep_items and not drop_items:
+            return "read_context policy unchanged"
+        kept = 0
+        dropped = 0
+        now = now_ts()
+        for entry in self.read_context_registry.values():
+            if not isinstance(entry, dict):
+                continue
+            if role_key and str(entry.get("agent_role", "") or "") not in {role_key, "single"}:
+                # A role may still refer to a shared path/signature explicitly.
+                pass
+            if any(self._read_context_matches_token(entry, token) for token in keep_items):
+                entry["status"] = "pinned"
+                entry["last_used_ts"] = now
+                kept += 1
+            if any(self._read_context_matches_token(entry, token) for token in drop_items):
+                entry["status"] = "dropped"
+                entry["last_used_ts"] = now
+                dropped += 1
+        self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
+        return f"read_context policy applied: pinned={kept}, dropped={dropped}"
+
+    def _read_context_prompt_block(
+        self,
+        *,
+        for_role: str = "",
+        max_items: int = READ_CONTEXT_PROMPT_MAX_ITEMS,
+        max_chars: int = READ_CONTEXT_PROMPT_MAX_CHARS,
+    ) -> str:
+        registry = getattr(self, "read_context_registry", {})
+        if not isinstance(registry, dict) or not registry:
+            return ""
+        role_key = self._sanitize_agent_role(for_role) or ""
+        entries = [
+            dict(v)
+            for _k, v in sorted(registry.items(), key=self._read_context_sort_key)
+            if isinstance(v, dict) and str(v.get("status", "") or "active").lower() != "dropped"
+        ]
+        if not entries:
+            return ""
+        if role_key:
+            own = [e for e in entries if str(e.get("agent_role", "") or "") in {role_key, "single"}]
+            shared = [
+                e
+                for e in entries
+                if str(e.get("agent_role", "") or "") not in {role_key, "single"}
+                and str(e.get("status", "") or "active").lower() in {"pinned", "active"}
+            ]
+            selected = own[:max_items] + shared[: int(READ_CONTEXT_SHARED_MAX_ITEMS)]
+        else:
+            selected = entries[:max_items]
+        if not selected:
+            return ""
+        now = now_ts()
+
+        def _age(ts: object) -> str:
+            try:
+                seconds = max(0, int(now - float(ts or 0.0)))
+            except Exception:
+                seconds = 0
+            if seconds < 90:
+                return f"{seconds}s"
+            if seconds < 7200:
+                return f"{seconds // 60}m"
+            return f"{seconds // 3600}h"
+
+        rows = [
+            "<read-context-registry>",
+            "Recent successful file reads are retained here outside raw tool results. Use them as remembered evidence; do not repeat the same broad read when an active/pinned entry already answers the question. If an entry is stale, re-read with a focused mode before relying on exact text.",
+        ]
+        for entry in selected:
+            status = str(entry.get("status", "active") or "active")
+            cache = str(entry.get("cache_path", "") or "")
+            args = entry.get("args", {}) if isinstance(entry.get("args", {}), dict) else {}
+            detail_parts = []
+            for key in ("target", "query", "line", "context"):
+                value = args.get(key)
+                if value not in (None, ""):
+                    detail_parts.append(f"{key}={trim(str(value), 80)}")
+            detail = " " + " ".join(detail_parts) if detail_parts else ""
+            rows.append(
+                "- "
+                f"id={entry.get('key','')} status={status} role={entry.get('agent_role','')} "
+                f"path={entry.get('path','')} mode={entry.get('mode','auto')}{detail} "
+                f"chars={int(entry.get('chars', 0) or 0)} hits={int(entry.get('hit_count', 0) or 0)} "
+                f"age={_age(entry.get('last_read_ts', 0.0))} "
+                f"summary={trim(str(entry.get('summary','') or ''), 260)}"
+                + (f" cache={cache}" if cache else "")
+                + (f" stale_reason={trim(str(entry.get('stale_reason','') or ''), 120)}" if status == "stale" else "")
+            )
+            if len("\n".join(rows)) >= max_chars:
+                break
+        rows.append(
+            "When a phase changes, call compress with keep_read_context=[ids/paths/signatures] "
+            "and drop_read_context=[ids/paths/signatures] to pin useful evidence and remove obsolete reads from future prompts."
+        )
+        rows.append("</read-context-registry>")
+        return trim("\n".join(rows), max_chars)
+
+    def _reset_read_file_loop_tracking(self, role: str = "") -> None:
+        role_key = self._sanitize_agent_role(role) or "single"
+        if isinstance(getattr(self, "read_file_loop_state", {}), dict):
+            self.read_file_loop_state.pop(role_key, None)
+        self.read_file_loop_recent = []
+        self.read_file_loop_count = 0
+
+    def _maybe_inject_read_file_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
+        rows = [r for r in (tool_results or []) if isinstance(r, dict)]
+        if not rows:
+            return False
+        read_rows = [
+            r for r in rows
+            if str(r.get("name", "") or "") == "read_file" and bool(r.get("ok", False))
+        ]
+        if not read_rows or len(read_rows) != len(rows):
+            if any(bool(r.get("ok", False)) and str(r.get("name", "") or "") != "read_file" for r in rows):
+                self._reset_read_file_loop_tracking(role)
+            return False
+        role_key = self._sanitize_agent_role(role) or "single"
+        state = self.read_file_loop_state.get(role_key, {}) if isinstance(getattr(self, "read_file_loop_state", {}), dict) else {}
+        signatures = [self._read_file_signature_from_args(r.get("args", {})) for r in read_rows]
+        signatures = [s for s in signatures if s]
+        if not signatures:
+            return False
+        round_key = hashlib.sha1("\n".join(sorted(signatures)).encode("utf-8", errors="replace")).hexdigest()[:16]
+        recent = list(state.get("recent", []))[-48:]
+        recent.extend(signatures)
+        repeat_rounds = int(state.get("repeat_rounds", 0) or 0) + 1 if state.get("last_round_key") == round_key else 1
+        read_only_rounds = int(state.get("read_only_rounds", 0) or 0) + 1
+        state = {
+            "recent": recent[-64:],
+            "last_round_key": round_key,
+            "repeat_rounds": repeat_rounds,
+            "read_only_rounds": read_only_rounds,
+            "last_ts": now_ts(),
+        }
+        self.read_file_loop_state[role_key] = state
+        self.read_file_loop_recent = recent[-64:]
+        self.read_file_loop_count = read_only_rounds
+        distinct_recent = len(set(recent[-(READ_FILE_LOOP_THRESHOLD * READ_FILE_LOOP_DISTINCT_SOFT_LIMIT):]))
+        repeated_small_set = (
+            read_only_rounds >= max(3, int(READ_FILE_LOOP_THRESHOLD // 2))
+            and distinct_recent <= int(READ_FILE_LOOP_DISTINCT_SOFT_LIMIT)
+        )
+        repeated_same_round = repeat_rounds >= 3 and len(recent) >= int(READ_FILE_LOOP_THRESHOLD)
+        too_many_reads_small_set = (
+            len(recent) >= int(READ_FILE_LOOP_THRESHOLD * 2)
+            and distinct_recent <= int(READ_FILE_LOOP_DISTINCT_SOFT_LIMIT)
+        )
+        if not (repeated_small_set or repeated_same_round or too_many_reads_small_set):
+            return False
+        now = now_ts()
+        if now - float(state.get("last_intervention_ts", 0.0) or 0.0) < 12.0:
+            return False
+        state["last_intervention_ts"] = now
+        self.read_file_loop_state[role_key] = state
+        self.read_file_loop_last_intervention_ts = now
+        context_block = self._read_context_prompt_block(for_role=role_key if role_key != "single" else "", max_chars=2600)
+        paths = []
+        for r in read_rows:
+            args = r.get("args", {}) if isinstance(r.get("args", {}), dict) else {}
+            p = trim(str(args.get("path", "") or ""), 180)
+            if p and p not in paths:
+                paths.append(p)
+        payload = (
+            "<read-context-strategy>\n"
+            f"The last {read_only_rounds} tool round(s) for {role_key} only performed successful read_file calls "
+            f"over a small/repeated evidence set (distinct_recent={distinct_recent}, repeat_rounds={repeat_rounds}). "
+            "This is a strategy warning, not a stop. Decide what evidence is already sufficient, then either edit/write/verify, "
+            "or ask one narrower read question using mode='search', 'symbol', or 'window'. "
+            "Avoid reopening the same full files unless their content changed or a new exact question requires it. "
+            "If useful evidence should persist, call compress with keep_read_context; drop obsolete read contexts with drop_read_context.\n"
+            f"recent_paths={', '.join(paths[:8])}\n"
+            f"{context_block}\n"
+            "</read-context-strategy>"
+        )
+        if role_key != "single":
+            self._append_agent_context_message(
+                role_key,
+                {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
+                mirror_to_global=False,
+            )
+        else:
+            self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+        self._ledger_record_stall(
+            f"read-file-loop({role_key}:{read_only_rounds})",
+            "injected read-context strategy intervention",
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"read_file strategy intervention injected "
+                    f"(role={role_key}, rounds={read_only_rounds}, distinct={distinct_recent})"
+                )
+            },
+        )
+        # Give the next round a clean counter while retaining recent signatures for diagnostics.
+        state["read_only_rounds"] = 0
+        state["repeat_rounds"] = 0
+        self.read_file_loop_state[role_key] = state
+        return True
+
+    def _tool_message_name_args(self, messages: list[dict], index: int, msg: dict) -> tuple[str, dict]:
+        name = str(msg.get("name", "") or "").strip()
+        args: dict = {}
+        tool_id = str(msg.get("tool_call_id", "") or msg.get("tool_use_id", "") or "").strip()
+        if tool_id:
+            found_name, found_args = self._find_tool_call_details_by_id(messages[:index], tool_id)
+            if found_name:
+                name = found_name
+            if found_args:
+                args = found_args
+        return name, args
+
+    def _read_file_pinned_tool_message_ids(self, messages: list[dict]) -> set[int]:
+        """Keep recent distinct read_file outputs available across microcompact.
+
+        This is the important part of preventing read_file loops under compact:
+        the model can compare several recently read files at once instead of
+        losing the previous file every time a new read succeeds.
+        """
+        keep: set[int] = set()
+        seen: set[str] = set()
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            name, args = self._tool_message_name_args(messages, idx, msg)
+            if name != "read_file":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith("[cleared by microcompact]") or content.startswith("[read_file cached"):
+                continue
+            if len(content) > int(READ_FILE_COMPACT_PIN_MAX_CHARS):
+                continue
+            sig = self._read_file_signature_from_args(args)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            keep.add(id(msg))
+            if len(seen) >= int(READ_FILE_COMPACT_PIN_DISTINCT):
+                break
+        return keep
+
+    def _compact_read_file_tool_content(self, messages: list[dict], index: int, msg: dict) -> str:
+        content = str(msg.get("content", "") or "")
+        if not content or content.startswith("[read_file cached"):
+            return content
+        name, args = self._tool_message_name_args(messages, index, msg)
+        if name != "read_file":
+            return "[cleared by microcompact]"
+        path = trim(str(args.get("path", "") or "").replace("\\", "/"), 240) if isinstance(args, dict) else ""
+        mode = str((args if isinstance(args, dict) else {}).get("mode", "") or "auto").strip().lower() or "auto"
+        sig = self._read_file_signature_from_args(args)
+        registry_entry = None
+        for entry in getattr(self, "read_context_registry", {}).values():
+            if isinstance(entry, dict) and str(entry.get("signature", "") or "") == sig:
+                registry_entry = entry
+                break
+        lines = [ln.strip() for ln in content.replace("\r\n", "\n").split("\n") if ln.strip()]
+        summary = trim(" ".join(lines[:6]), 700)
+        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+        cached_path = str((registry_entry or {}).get("cache_path", "") or "")
+        if len(content) >= FILE_BUFFER_CONTENT_THRESHOLD:
+            try:
+                if not cached_path:
+                    entry = self._write_file_buffer_entry(content, label=f"read_file:{path or mode}")
+                    cached_path = str(entry.get("path", "") or "")
+            except Exception:
+                cached_path = ""
+        rows = [
+            f"[read_file cached path={path or '-'} mode={mode} chars={len(content)} sha256={sha}]",
+            f"signature: {sig}",
+        ]
+        if registry_entry:
+            rows.append(
+                f"registry_id: {registry_entry.get('key','')} status={registry_entry.get('status','active')} "
+                f"role={registry_entry.get('agent_role','')}"
+            )
+        if cached_path:
+            rows.append(f"cached_copy: {cached_path}")
+        if summary:
+            rows.append(f"summary: {summary}")
+        rows.append(
+            "Use this cached evidence to continue. Re-read the original path only with a narrower "
+            "mode='search', 'symbol', or 'window' for a new exact question."
+        )
+        return "\n".join(rows)
 
     def _microcompact(self, keep_recent: int = 3):
         """Replace old tool results with compact placeholders to save tokens.
@@ -18454,14 +19031,19 @@ class SessionState:
         """
         # Phase 1: OpenAI-style role=tool messages
         tool_messages = [m for m in self.messages if m.get("role") == "tool"]
+        pinned_read_ids = self._read_file_pinned_tool_message_ids(self.messages)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
-            keep_ids = {id(x) for x in kept}
-            for msg in self.messages:
+            keep_ids = {id(x) for x in kept} | pinned_read_ids
+            for idx, msg in enumerate(self.messages):
                 if msg.get("role") == "tool" and id(msg) not in keep_ids:
                     content = msg.get("content", "")
                     if isinstance(content, str) and len(content) > 120:
-                        msg["content"] = "[cleared by microcompact]"
+                        name, _args = self._tool_message_name_args(self.messages, idx, msg)
+                        if name == "read_file":
+                            msg["content"] = self._compact_read_file_tool_content(self.messages, idx, msg)
+                        else:
+                            msg["content"] = "[cleared by microcompact]"
 
         # Phase 2: Anthropic-style tool_result blocks in user messages
         assistant_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "assistant"]
@@ -18495,14 +19077,19 @@ class SessionState:
     def _microcompact_agent_messages(self, messages: list[dict], keep_recent: int = 3):
         """Apply microcompact to an agent-specific message list (e.g. agent_messages filtered by role)."""
         tool_messages = [m for m in messages if m.get("role") == "tool"]
+        pinned_read_ids = self._read_file_pinned_tool_message_ids(messages)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
-            keep_ids = {id(x) for x in kept}
-            for msg in messages:
+            keep_ids = {id(x) for x in kept} | pinned_read_ids
+            for idx, msg in enumerate(messages):
                 if msg.get("role") == "tool" and id(msg) not in keep_ids:
                     content = msg.get("content", "")
                     if isinstance(content, str) and len(content) > 120:
-                        msg["content"] = "[cleared by microcompact]"
+                        name, _args = self._tool_message_name_args(messages, idx, msg)
+                        if name == "read_file":
+                            msg["content"] = self._compact_read_file_tool_content(messages, idx, msg)
+                        else:
+                            msg["content"] = "[cleared by microcompact]"
         assistant_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
         if len(assistant_indices) <= keep_recent:
             return
@@ -25983,7 +26570,8 @@ body{padding:18px}
                     "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
                     "app.py line 240 -> mode='window' line=240 context=5; "
                     "run.txt E123 -> mode='search' query='E123'. "
-                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed."
+                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed. "
+                    "Successful reads are remembered in the read-context registry."
                 ),
                 {
                     "path": {"type": "string"},
@@ -26088,10 +26676,27 @@ body{padding:18px}
                         regex=args.get("regex"),
                         max_chars=args.get("max_chars"),
                     )
+                    try:
+                        rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                        self._record_read_context(rel, args if isinstance(args, dict) else {}, out, role="single")
+                    except Exception:
+                        pass
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
+                    if not str(out).startswith("Error:"):
+                        try:
+                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                            self._mark_read_context_stale(rel, reason="subagent write_file changed file")
+                        except Exception:
+                            pass
                 elif name == "edit_file":
                     out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
+                    if not str(out).startswith("Error:"):
+                        try:
+                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                            self._mark_read_context_stale(rel, reason="subagent edit_file changed file")
+                        except Exception:
+                            pass
                 else:
                     out = f"Unknown tool: {name}"
                 msgs.append({
@@ -29203,6 +29808,7 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
+        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -29237,6 +29843,11 @@ body{padding:18px}
             and todo_progress_signal
             and self._step_has_accumulated_evidence(current, bb)
         )
+        explicit_verified_path = (
+            subtasks_all_done
+            and verified_tag_current
+            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
+        )
         has_strong_evidence = (
             validation_ok and (
                 (
@@ -29249,7 +29860,7 @@ body{padding:18px}
                     and validation_ok_blackboard
                 )
             )
-        ) or accumulated_evidence_path
+        ) or accumulated_evidence_path or explicit_verified_path
         if has_strong_evidence:
             # Sync mode exec gate: when all subtasks done for implement/test/deploy phases,
             # require at least some execution evidence (bash/test/compile ran at any point).
@@ -29260,7 +29871,7 @@ body{padding:18px}
             )
             if _exec_gate_needed:
                 # Require model's explicit <step-verified/> tag in agent_messages since step activation
-                _has_verified = self._check_step_verified_tag(current, messages=self.agent_messages)
+                _has_verified = verified_tag_current
                 if not _has_verified:
                     _sync_n_flag = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
                     _sync_n = int(getattr(self, _sync_n_flag, 0))
@@ -30822,7 +31433,7 @@ body{padding:18px}
         if not any("<verification-required>" in str(m.get("content", "") or "") for m in _recent if isinstance(m, dict)):
             self.agent_messages.append({"role": "user", "content": msg, "ts": now_ts()})
 
-    def _single_agent_plan_step_check(self, tool_results: list[dict]):
+    def _single_agent_plan_step_check(self, tool_results: list[dict]) -> bool:
         """In single-agent mode, check if current plan step should be advanced based on tool results."""
         bb = self._ensure_blackboard()
         todos = bb.get("project_todos", [])
@@ -30830,7 +31441,7 @@ body{padding:18px}
         if not plan_steps:
             # No plan steps — just sync todos
             self._sync_todos_from_blackboard(reason="single-agent-round")
-            return
+            return False
         current = None
         for t in plan_steps:
             if t.get("status") == "in_progress":
@@ -30838,7 +31449,7 @@ body{padding:18px}
                 break
         if not current:
             self._sync_todos_from_blackboard(reason="single-agent-round")
-            return
+            return False
         # When a new step is activated with no subtasks yet, require TodoWrite first
         _cur_step_id = str(current.get("id", "") or "")
         if _cur_step_id:
@@ -30866,7 +31477,7 @@ body{padding:18px}
                 _recent_msgs = self.messages[-4:]
                 if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
                     self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
-                return  # Wait for TodoWrite before doing other checks
+                return False  # Wait for TodoWrite before doing other checks
         # Heuristic: check if tool results indicate step completion
         step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
@@ -30922,27 +31533,30 @@ body{padding:18px}
                     or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
                 ):
                     should_advance = True
-        # Also check if the agent explicitly mentioned step completion
-        # Also blocked by validation gate when subtasks_done path was blocked
+        # Also allow the explicit post-message verification contract to advance
+        # when there are no linked subtasks. Natural-language completion claims
+        # are intentionally ignored here; advancement must be backed by plan
+        # state, validation evidence, or the structured verification tag.
         if not should_advance and not _gate_blocked:
-            # Check last assistant message for step completion signals
-            last_text = ""
-            for msg in reversed(self.messages[-3:]):
-                if msg.get("role") == "assistant":
-                    last_text = str(msg.get("content", "") or "").lower()
-                    break
-            step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一",
-                                 "全部完成", "✅", "all subtasks")
-            if validation_ok and any(sig in last_text for sig in step_done_signals):
+            _has_subtasks_s2 = bool(self._active_plan_worker_todo_rows(
+                str(current.get("id", "") or ""), role=""
+            ))
+            if (
+                self._check_step_verified_tag(current)
+                and (subtasks_done or not _has_subtasks_s2)
+                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
+            ):
                 should_advance = True
         if should_advance:
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
-            self._advance_plan_step(evidence=evidence, actor="single")
-            try:
-                self._inject_current_plan_step_execution_hints()
-            except Exception:
-                pass
+            advanced = self._advance_plan_step(evidence=evidence, actor="single")
+            if advanced:
+                try:
+                    self._inject_current_plan_step_execution_hints()
+                except Exception:
+                    pass
+                return True
+            return False
         else:
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
@@ -30963,6 +31577,7 @@ body{padding:18px}
                     recent = self.messages[-6:]
                     if not any(str(msg.get("content", "") or "").strip() == focus_msg for msg in recent if isinstance(msg, dict)):
                         self._append_plan_guidance_bubble(focus_msg, summary="todo focus: continue current subtask")
+            return False
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -35252,6 +35867,7 @@ body{padding:18px}
         engineering_note = self._engineering_execution_boost_instruction()
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
+        read_context_note = self._read_context_prompt_block(for_role=role_key, max_chars=READ_CONTEXT_PROMPT_MAX_CHARS)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
@@ -35277,6 +35893,8 @@ body{padding:18px}
         if mm_note:
             base = base + mm_note
         base = base + skills_block
+        if read_context_note:
+            base = base + read_context_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
         if role_key == "explorer":
@@ -36512,6 +37130,7 @@ body{padding:18px}
                 regex=args.get("regex"),
                 max_chars=args.get("max_chars"),
             )
+            self._record_read_context(rel, args, out, role=role_key)
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
             offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
             mode_val = str(args.get("mode", "") or "").strip()
@@ -36565,6 +37184,7 @@ body{padding:18px}
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
             if not out.startswith("Error"):
+                self._mark_read_context_stale(rel, reason="write_file changed file after previous read")
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
                 if summary:
@@ -36619,6 +37239,7 @@ body{padding:18px}
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_edit(rel, args["old_text"], args["new_text"])
             if not out.startswith("Error"):
+                self._mark_read_context_stale(rel, reason="edit_file changed file after previous read")
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
                 if summary:
@@ -36795,7 +37416,8 @@ body{padding:18px}
         if name == "scan_skills":
             return self._scan_global_skills()
         if name == "compress":
-            return "Compress requested."
+            policy_note = self._apply_read_context_policy(args, role=role_key)
+            return f"Compress requested. {policy_note}"
         if name == "context_recall":
             return self._context_recall(args)
         if name == "query_code_library":
@@ -37833,6 +38455,7 @@ body{padding:18px}
         with self.lock:
             self.current_phase = f"agent:{role_key}:post-tools"
             self.current_tool_name = ""
+        self._maybe_inject_read_file_strategy_intervention(tool_results, role=role_key)
         return {
             "status": "tools",
             "role": role_key,
@@ -40891,6 +41514,46 @@ body{padding:18px}
                     repeated_tool_rounds = 0
                     decision_probe = text if str(text or "").strip() else thinking_text
                     done_probe = f"{text}\n{thinking_text}".strip()
+                    post_message_plan_advanced = False
+                    try:
+                        post_message_plan_advanced = self._single_agent_plan_step_check([])
+                    except Exception as exc:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "post-message plan step check failed: "
+                                    f"{trim(str(exc), 120)}"
+                                )
+                            },
+                        )
+                    if post_message_plan_advanced:
+                        no_tool_rounds = 0
+                        arbiter_planning_rounds = 0
+                        fault_counter = 0
+                        last_fault_reason = ""
+                        self._prune_runtime_retry_hints()
+                        if self._get_active_plan_step(self._ensure_blackboard()):
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "plan step verified after assistant message; "
+                                        "continuing next step"
+                                    )
+                                },
+                            )
+                            continue
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "plan step verified after assistant message; "
+                                    "all plan steps complete"
+                                )
+                            },
+                        )
+                        break
                     decision_needed = self._looks_like_user_decision_needed(decision_probe)
                     if decision_needed:
                         arbiter_planning_rounds = 0
@@ -41543,6 +42206,9 @@ body{padding:18px}
                 )
                 # Single-agent plan step tracking: sync todos and auto-advance
                 self._single_agent_plan_step_check(single_round_tool_results)
+                if self._maybe_inject_read_file_strategy_intervention(single_round_tool_results, role=single_role):
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                    retry_requested_this_round = True
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
