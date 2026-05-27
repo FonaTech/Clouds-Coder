@@ -7,10 +7,18 @@
   <a href="./README-ja.md">日本語</a>
 </p>
 <p align="center">
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/v/clouds-coder.svg" alt="PyPI 版本" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/pyversions/clouds-coder.svg" alt="Python 版本" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
+</p>
+<p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-  <a href="./CHANGELOG-2026-03-20.md">2026-03-20 更新日志（EN/中文/日本語）</a> ·
-  <a href="./CHANGELOG-2026-03-16.md">2026-03-16 更新日志</a> ·
-  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 更新日志</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 更新日志</a> ·
+  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 更新日志</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -22,7 +30,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-本次架构更新三语总览见：[`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md) | 上期：[`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
+架构更新日志归档：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -71,6 +79,12 @@ Skills 复用说明：
 - `skills/generated/*` 为本项目扩展的场景化 skills（报告、退化恢复、HTML 管线、上传解析等）
 - 运行时工具接口与 skill 链路保持兼容（如 `load_skill`、`list_skills`、`write_skill`）
 
+MiniMax skills 来源说明：
+
+- 本仓库内 `skills` 下打包的本地 skill 套件，基于 MiniMax AI 的开源 skills 仓库改编而来：https://github.com/MiniMax-AI/skills
+- 上游原始源码依据 MIT License 使用
+- 感谢 MiniMax AI 及其上游贡献者提供原始 skill 内容、结构设计与生态建设
+
 ## 1.2 超越编程 CLI：面向通用任务的内核定位
 
 Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可在单会话中执行并审计复合知识工作流的通用智能体运行时：
@@ -95,25 +109,34 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - 内置 `LLM -> Coding -> LLM` 三阶段执行模式，适配复杂多步骤工作
 - **Plan Mode** — UI 开关（Auto/On/Off），研究 → 方案 → 用户选择 → 逐步执行，Single 和 Sync 模式均支持
 - **多智能体协作** — 4 角色（manager/explorer/developer/reviewer）+ blackboard 中心化协调
+- **短上下文模型的长线处理能力放大** — 多 Agent 将任务拆成分角色上下文，让较小的本地模型也能连续完成调研、实现、审查与修复链路，而不依赖单次巨大 prompt
 - **Reviewer Debug Mode** — 检测到错误时 reviewer 获得写权限，独立诊断修复 bug
 - **6 类通用错误检测**（test/lint/compilation/build/deploy/runtime）+ 统一 failure ledger
 - **4 级分层上下文压缩**（normal → light → medium → heavy）+ 文件缓冲卸载，支持 4K 到 1M token
+- **分 Agent 独立压缩** — Manager / Explorer / Developer / Reviewer 上下文通道在同一分层 compact 框架下独立压缩，简单 single 任务保持原有单一全局上下文通道
 - **任务阶段感知委派** — manager 根据当前阶段（research/design/implement/test/review/deploy）路由到合适的 agent
 - **原生多模态支持** — read_file 自动检测图片/音频/视频，模型支持时作为原生输入注入
 - **实时用户输入合并** — 执行中途的反馈可调整 plan 方向，无需重启
 - **Restart 意图融合** — 恢复时按 用户意图 > plan 意图 > 上下文意图 优先级融合
+- **Skills 生态全面兼容** — 兼容 5 大生态系统（awesome-claude-skills / Minimax-skills / skills-main / kimi-agent-internals / academic-pptx），LLM 自主判断按任务类型加载，支持多 skills 并发 + 冲突检测
+- **双库 RAG 知识架构** — Code RAG（`CodeIngestionService`）+ Data RAG（`RAGIngestionService`），均基于 TF_G_IDF_RAG，统一检索接口 `query_knowledge_library`，RAG 检索指南注入到内置 skills
+- **持久化 Wiki RAG** — `WikiStore` 将 raw library sources 编译为长期维护的 Markdown Wiki（`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`），检索优先复用累计综合，再回退 raw chunks
+- **编程工作流记忆** — `WorkflowMemoryStore` 对完成的编程 session 自动评分，把优质工作流卡片收录到 Code Wiki memory，通过 `workflow` 路由召回工具调用、任务交接、验证和实现模式
+- **多因素优先级上下文压缩** — 10 因素消息重要性评分（时间近因、角色权重、任务进度、错误、目标相关性、skills、compact-resume），替代纯时序裁剪
 - 内置 Web UI + 可选外部 Web UI
 - Skills Studio（独立端口）用于扫描/编辑/生成/上传 skills
 - Ollama 探测与模型目录加载
 - 通过 `LLM.config.json` 支持 OpenAI-compatible 多配置
+- 私有 vLLM / OpenAI-compatible 韧性：5 次 HTTP 重试治理、默认 60 秒间隔、遵循 `Retry-After` / 限流恢复信号、endpoint cooldown、nginx/upstream 临时错误重试
 - 统一 timeout 调度（全局超时，模型 active 时段排除）
 - 截断恢复循环（续写 pass/token 计数 + UI 实时展示）
 - 上下文压缩 + 历史归档召回 + 无损状态衔接
 - 无工具空转诊断与恢复提示
 - Task/Todo/Background/Team/Worktree 一体化机制
 - SSE 心跳与写入异常处理
-- 预览链路：Markdown/HTML/文件/代码阶段预览
+- 预览链路：Markdown/HTML/代码/PDF/CSV/Excel/Word/PPT/媒体/代码阶段预览
 - 前端资源控制：live/static 冻结、快照调度、对话虚拟化
+- 可导入架构拆分工具：`split_coder.py` 通过 `_source_bridge.py` 重新生成可 import 的 `Code_Structure/` 导航包
 - 科研��务友好：工件优先、阶段可追溯、可复现持久化链路
 
 ## 3. 架构总览
@@ -123,7 +146,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 │                            Clouds Coder                              │
 ├───────────────────────────────────────────────────────────────────────┤
 │ 体验与溯源层                                                         │
-│  - 多预览中心（Markdown / 代码 / HTML）                              │
+│  - 多预览中心（Markdown / HTML / 代码 / PDF / Office / 媒体）        │
 │  - 阶段化代码历史备份 + 差异/溯源时间线                              │
 │  - 运行进度卡片（thinking/run/truncation/recovery）                 │
 │  - Skills 可视化流程构建 + SKILL.md 生成注入                         │
@@ -164,8 +187,8 @@ flowchart TB
   UI["展示层<br/>Agent Web UI + Plan Mode 开关 + Skills Studio"]
   API["API 与流式层<br/>REST（含 plan-mode）+ SSE + render-state/frame"]
   ORCH["编排与控制层<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree<br/>Plan Mode / 阶段感知委派"]
-  AGENT["多智能体协作层<br/>Manager / Explorer / Developer / Reviewer"]
-  EXEC["模型与工具执行层<br/>OllamaClient + tool dispatch<br/>原生多模态 + 6 类错误检测 + 4 级压缩"]
+  AGENT["多智能体协作层<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + 分角色工作上下文"]
+  EXEC["模型与工具执行层<br/>OllamaClient + tool dispatch<br/>原生多模态 + 6 类错误检测 + 全局/分 Agent 分层压缩"]
   DATA["工件与持久化层<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations / file_buffer"]
   UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
@@ -297,6 +320,15 @@ Clouds Coder 已支持在单体内核中进行角色专职协作：
 - 无跨服务 RPC 开销，协同延迟更低
 - 黑板状态可快照、可重放，Manager 决策更稳定
 - 任一环节报错时可快速中断并重路由
+- 通过分角色工作记忆，显著提升短上下文模型的长线任务连续性
+
+上下文拓扑：
+
+- Single 模式保持单一全局上下文通道和单条上下文进度条。
+- Multi-agent 模式只为 Manager 与真实参与的 agent 创建活跃角色通道。
+- 每个角色通道都按同一分层压缩策略独立估算与 compact。
+- 下一次模型调用只注入当前角色相关通道，而不是重新加载所有角色完整历史。
+- UI 只有在真实进入 multi-agent 后才显示嵌套角色上下文条；L1/L2 single 任务保持原有单条进度条。
 
 黑板核心切片（Single Source of Truth）：
 
@@ -342,6 +374,26 @@ flowchart LR
   M -->|delegate_task + mandatory + budget update| E
   M -->|delegate_task + mandatory + budget update| D
   M -->|delegate_task + mandatory + budget update| R
+```
+
+Mermaid（上下文生命周期与 compact 拓扑）：
+
+```mermaid
+flowchart TB
+  S["Single / L1-L2<br/>单一全局上下文通道"] -->|任务升级到 sync/sequential| A["多 Agent 激活"]
+  A --> MCTX["Manager 上下文<br/>路由 / 阶段 / 通过门禁"]
+  A --> ECTX["Explorer 上下文<br/>调研 / 证据 / 路径"]
+  A --> DCTX["Developer 上下文<br/>实现 / 工具结果"]
+  A --> RCTX["Reviewer 上下文<br/>验证 / 缺陷 / 修复"]
+  MCTX --> MC["分层 compact<br/>独立执行"]
+  ECTX --> EC["分层 compact<br/>独立执行"]
+  DCTX --> DC["分层 compact<br/>独立执行"]
+  RCTX --> RC["分层 compact<br/>独立执行"]
+  MC --> N["下一次模型调用<br/>只注入角色相关通道"]
+  EC --> N
+  DC --> N
+  RC --> N
+  N --> UICTX["UI 上下文指示器<br/>默认 single 单条<br/>仅 multi-agent 显示嵌套角色条"]
 ```
 
 Mermaid（动态路由与中途打断）：
@@ -445,9 +497,9 @@ stateDiagram-v2
 - 新增系统级依赖导入：`deque`、`selectors`、`signal`、`shlex`，用于调度与非阻塞控制路径。
 - 扩展 `RUNTIME_CONTROL_HINT_PREFIXES`：新增 `<arbiter-continue>` 与 `<fault-prefill>`，增强恢复闭环表达力。
 
-完整三语更新日志见：[`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)。
+完整三语更新日志见：[`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)。
 
-### 3.6 2026-03-16 重要修复：Single 模式 Agent 泄漏 & 终止信号失效
+### 3.6 2026-03-16 严重修复：Single 模式 Agent 泄漏 & 终止信号失效
 
 多智能体编排层修复了两个互相关联的严重 bug：
 
@@ -463,7 +515,7 @@ stateDiagram-v2
   - 第 3 层 — Sync 循环拦截：每个 Agent turn 完成后检测结论性回复，满足条件立即 break 并自动 approve。
 - 安全守卫：存在错误日志或待办事项时，结论检测不会触发 finish（避免误杀）。
 
-完整三语详情见：[`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md)
+完整三语详情见：[`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
 
 ### 3.7 2026-03-20 重大更新：Plan Mode 架构 & 内核全面升级
 
@@ -502,21 +554,358 @@ stateDiagram-v2
 - `_run_read()` 检测图片/音频/视频文件，模型支持时作为原生多模态输入注入。
 - Plan mode 下 TodoWrite 创建带 owner 标记的子任务，不覆盖 plan_step。
 
-完整三语详情见：[`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md)
+完整三语详情见：[`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+
+### 3.8 2026-03-25 重大更新：Skills 生态系统兼容 & 双库 RAG 架构 & 内核修复
+
+**Skills 生态系统全面兼容**
+- 现支持 5 大 skill 生态系统，无需 per-provider 适配器：
+  - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — 社区 Claude skills 精选集合
+  - [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax 官方 skills（前端/全栈/iOS/Android/PDF/PPTX）
+  - [anthropics/skills](https://github.com/anthropics/skills) — Anthropic 官方 skills 仓库（`skills-main`）
+  - [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent skill 系统分析与提取的 skill 产物
+  - [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — 学术演示 skill（行动标题、引用规范、论证结构）
+- 此前失败根因修复：Execution Guide 注入（已删除）强制对虚拟 skill 路径发起 `read_file` 导致模型循环。
+- Chain Tracking 系统删除（7 个方法）；`_broadcast_loaded_skill` 黑板字段 16→6；`_loaded_skills_prompt_hint` 约 350→120 tokens。
+- LLM 自主发现：模型根据任务类型判断调用哪个 skill，而非关键词强触发。支持多 skill 并发加载 + 冲突对检测。
+- Sync 模式 Manager 获得 `TodoWrite` 能力。新增 `_preload_skills_from_plan_steps`，扫描 plan steps 中的 skill 名称并提前预加载。
+- Plan steps 上限 10→20；单步字符 400→600；Plan 合成新增反幻觉约束。
+
+**双库 RAG 知识架构**
+- `RAGIngestionService`（Data RAG）：文档/PDF/结构化数据 — 通用知识库。
+- `CodeIngestionService`（Code RAG）：代码文件，代码感知分词 — 代码知识库。
+- 两库均基于 TF_G_IDF_RAG；`query_knowledge_library(query, top_k)` 并行检索两库，返回合并排序结果。
+- RAG 检索指南注入 `research-orchestrator-pro` 和 `scientific-reasoning-lab`。
+
+双库 RAG 架构：
+
+```mermaid
+flowchart TB
+  subgraph 摄取层 Ingestion
+    DF["文档/PDF/数据文件<br/>Document/PDF/Data"]
+    CF["代码文件<br/>Code Files"]
+    DR["RAGIngestionService<br/>Data RAG"]
+    CR["CodeIngestionService<br/>Code RAG"]
+    DF --> DR
+    CF --> CR
+  end
+  subgraph 存储层 Storage
+    TG1["TF_G_IDF_RAG<br/>（数据知识库）"]
+    TG2["TF_G_IDF_RAG<br/>（代码知识库）"]
+    DR --> TG1
+    CR --> TG2
+  end
+  subgraph 检索层 Retrieval
+    Q["query_knowledge_library(query, top_k)"]
+    TG1 -->|并行检索| Q
+    TG2 -->|并行检索| Q
+    Q --> R["合并排序结果<br/>Merged Ranked Results"]
+  end
+  subgraph 消费层 Consumption
+    SK1["research-orchestrator-pro<br/>内置 RAG 检索指南"]
+    SK2["scientific-reasoning-lab<br/>内置 RAG 检索指南"]
+    AG["Agent（模型）"]
+    R --> SK1
+    R --> SK2
+    SK1 --> AG
+    SK2 --> AG
+  end
+```
+
+RAG 调取流程：
+
+```mermaid
+sequenceDiagram
+  participant M as 模型（LLM）
+  participant S as 内置 Skill（RAG 指南）
+  participant Q as query_knowledge_library
+  participant DR as Data RAG (RAGIngestionService)
+  participant CR as Code RAG (CodeIngestionService)
+  participant BB as Blackboard
+
+  M->>S: 执行任务（已加载 skill）
+  S->>Q: query_knowledge_library("检索关键词", top_k=5)
+  Q->>DR: 并行检索文档/PDF 知识库
+  Q->>CR: 并行检索代码知识库
+  DR-->>Q: 匹配结果（TF_G_IDF 排序）
+  CR-->>Q: 匹配结果（TF_G_IDF 排序）
+  Q-->>S: 合并排序结果（top_k 条）
+  S->>M: 注入检索结果作为背景知识
+  M->>BB: write(research_notes / code_artifacts)
+```
+
+**内置 Skills 重写**
+- `research-orchestrator-pro`：协作型决策中枢，与输出型 skills 协作而非冲突，内置 RAG 检索指南，反幻觉姿态。
+- `scientific-reasoning-lab`：5 阶段自迭代推理引擎（分解→推导→验证→评估→整合），嵌入为 research-orchestrator-pro Phase 2 子引擎，内置 RAG 检索指南。
+
+**多因素优先级上下文压缩**
+- `_classify_message_priority`：10 因素评分（时间近因 0–3、角色权重、任务进度标记 +2、错误 +2、目标相关性 +1、skill 相关 +1、compact-resume=10）。
+- `_priority_compress_messages`：高分（≥7）完整保留，中分（4–6）压缩至 500 字符，低分（0–3）折叠为单行。
+- `_build_state_handoff` 增强：PLAN_PROGRESS、CURRENT_STEP、ACTIVE_SKILLS、RECENT_TOOLS 字段。
+- `_auto_compact` 整合：优先级压缩优先，保底 `pop(0)` fallback。
+
+**Anti-stall 机制优化**
+- 阈值 2→3 次连续相同 target 才触发。
+- 指令从 "CHANGE YOUR APPROACH" 改为协作性引导（建议 ask_colleague / 换工具 / finish_current_task）。
+
+**关键 Bug 修复**
+- `CodeIngestionService._flush_lock`：添加缺失的 `threading.Lock()` — 修复向代码库上传文件时的 `AttributeError`。
+- 前端 `setTaskLevel()`：在级别更新后添加 `scheduleSnapshot()` — 修复任务级别选择器在下次 SSE 刷新时回弹至 "Auto"。
+- `_sync_todos_from_blackboard`：worker items（`owner ∈ {developer, explorer, reviewer}`)现在单独收集并优先保留 — 修复每次黑板同步都丢失 TodoWrite 条目的问题。
+
+完整三语详情见：[`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
+
+### 3.9 2026-05-02 重大更新：持久化 Wiki RAG + 工作流记忆 + Provider 韧性 + 可导入拆分架构
+
+**持久化 Wiki RAG**
+- `WikiStore` 现在会把每个 RAG library 编译为持久化 Markdown Wiki，包含 `sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`。
+- 检索可以先读取 Wiki 中已经积累的综合知识，再在需要精确证据或行级细节时回退到 raw chunks。
+- 知识 Wiki RAG 与编程 Code RAG 在架构上分离，便于分别优化通用知识综合与代码检索。
+
+**编程工作流记忆**
+- `WorkflowMemoryStore` 会捕获完成后的编程 session 模式，自动评分，并把通过阈值的工作流写入 Code Wiki workflow memory。
+- Code RAG 可通过 `workflow` 路由检索已经验证过的流程模式，包括工具调用顺序、节点交接、todo 结构、验证步骤和恢复信号。
+
+**Provider 韧性**
+- 私有 vLLM / OpenAI-compatible / LM Studio endpoint 现在默认采用 5 次重试、60 秒间隔的 HTTP 重试治理。
+- 重试策略会遵循 `Retry-After`、`X-RateLimit-Reset`、JSON retry hints、endpoint cooldown，并处理 nginx/upstream 风格的临时故障。
+- 正常对话完成后不再额外追加“任务执行完成”的合成 summary 气泡，除非显式设置 `AGENT_RUN_COMPLETION_SUMMARY=true`。
+
+**拆分架构工具**
+- `split_coder.py` 现在通过 `_source_bridge.py` 生成可导入的 `Code_Structure/` 包，避免循环 import，同时保留符号覆盖。
+- self-check 覆盖顶层符号一致性、`py_compile`、陈旧生成文件、package import walk、entry-point help 和生成缓存清理。
+
+完整三语详情见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## 4. 关键运行时组件
-
-主入口：`Clouds_Coder.py`。
 
 - `AppContext`：全局运行时容器（配置、模型目录、服务状态）
 - `SessionManager`：会话生命周期管理
 - `SessionState`：单会话 agent 状态、工具执行状态、上下文/截断/运行时标记
 - `EventHub`：SSE 与内部事件的发布订阅总线
-- `OllamaClient`：模型调用适配与回退逻辑
+- `OllamaClient`：模型调用适配、provider 重试治理、cooldown 与回退逻辑
 - `SkillStore`：本地/Provider skills 注册与扫描加载
 - `TodoManager` / `TaskManager` / `BackgroundManager`：规划与异步执行
 - `WorktreeManager`：隔离工作目录管理
 - `Handler` / `SkillsHandler`：Agent UI 与 Skills Studio 的 API 入口
+- `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：基于 `TFGraphIDFIndex` / `CodeGraphIndex` 的双库知识摄取与检索引擎
+- `WikiStore`：面向知识库和代码库累计综合的持久化 Markdown Wiki 编译器
+- `WorkflowMemoryStore`：面向可复用代码任务模式的评分式编程工作流记忆
+- `split_coder.py` / `Code_Structure`：由 `_source_bridge.py` 支撑的可导入拆分架构导航包
+
+## 4.1 RAG 知识架构：TF-Graph_IDF 引擎
+
+Clouds Coder 内置了名为 **TF-Graph_IDF** 的检索引擎，融合了词法评分、知识图谱拓扑、自动社区检测和多路由查询编排，在召回质量上显著优于标准 TF-IDF 或 BM25。
+
+### 双库设计架构
+
+```mermaid
+flowchart TB
+  subgraph INPUT["输入来源"]
+    D["文档 / PDF / CSV\n（上传文件或会话文件）"]
+    C["源代码文件\n（.py .js .ts .go .java ...）"]
+  end
+
+  subgraph INGEST["摄取层"]
+    direction TB
+    RI["RAGIngestionService\n(Data RAG)\n4 工作线程 + 批量刷新"]
+    CI["CodeIngestionService\n(Code RAG)\n代码感知分词 + 符号提取器"]
+  end
+
+  subgraph INDEX["TF-Graph_IDF 索引层"]
+    direction TB
+    TGI["TFGraphIDFIndex\n─────────────────────────\n① 词法层\n  倒排索引 · IDF · chunk_norms\n② 图层\n  entity_to_docs · related_docs · graph_degree\n③ 社区层\n  自动检测 · community_reports\n  community_inverted · 跨社区桥接\n④ 动态噪声层\n  hard_tokens · soft_penalties[0.1–1.0]"]
+    CGI["CodeGraphIndex ⊇ TFGraphIDFIndex\n─────────────────────────\n+ import_edges（模块依赖图）\n+ symbol_to_docs（函数/类→文件）\n+ path_to_doc（文件路径→doc_id）\n+ 块级：line_start/end · symbol · kind"]
+  end
+
+  subgraph QUERY["查询层"]
+    direction TB
+    QR["查询路由器\n_decide_query_route()\nglobal_score vs local_score"]
+    F["FAST 路径\n向量检索\nlexical × 0.82 + graph_bonus"]
+    G["GLOBAL 路径\n社区排序\n→ Map：社区内检索\n→ Bridge：跨社区实体链接\n→ Reduce：全局综合行"]
+    H["HYBRID 路径\n1 global + 2 fast\n交错合并"]
+  end
+
+  subgraph OUT["消费层"]
+    SK["内置 Skills\nresearch-orchestrator-pro\nscientific-reasoning-lab"]
+    AG["Agent（模型）"]
+  end
+
+  D --> RI --> TGI
+  C --> CI --> CGI
+  TGI & CGI --> QR
+  QR -->|"局部查询\n短/精确"| F
+  QR -->|"跨域查询\nglobal_score ≥ 5"| G
+  QR -->|"平衡查询\nglobal_score 3–4"| H
+  F & G & H --> SK --> AG
+```
+
+### TF-Graph_IDF 评分公式
+
+每个检索到的 chunk 的分数由**词法分量**和**图奖励**组成：
+
+```
+final_score = lexical × 0.82 + graph_bonus         （Data RAG）
+final_score = lexical × 0.78 + graph_bonus         （Code RAG — 图奖励权重更高）
+
+lexical     = Σ(q_weight_i × c_weight_i) / (query_norm × chunk_norm)
+
+graph_bonus = 0.18 × entity_overlap                 （共享命名实体）
+            + 0.10 × doc_entity_overlap              （文档级实体匹配）
+            + min(0.16, log(doc_graph_degree+1)/12) （中心文档提升）
+            + 0.08  （查询类别 == 文档类别时）
+            + min(0.08, log(community_doc_count+1)/16)
+
+Code RAG 额外奖励：
+            + 0.16 × symbol_overlap                  （函数/类名匹配）
+            + 0.28  （查询中出现文件完整路径）
+            + 0.20  （查询中出现文件名）
+            + 0.14  （查询中出现模块名）
+            + min(0.12, log(import_degree+1)/9)      （导入图中心性）
+```
+
+带动态噪声的 token 权重：
+
+```
+idf[token]    = log((1 + N_chunks) / (1 + df[token])) + 1.0
+tf_weight     = (1 + log(freq)) × idf[token] × dynamic_noise_penalty[token]
+chunk_norm    = √Σ(tf_weight²)
+
+dynamic_noise_penalty ∈ [0.10, 1.0]  — 基于语料库计算，非静态停用词表
+```
+
+### 动态噪声抑制 — 语料库自适应 Token 权重
+
+```mermaid
+flowchart LR
+  T["Token: 't'"] --> A{"doc_ratio ≥ 65%\nAND\ncommunity_ratio\n≥ 90%?"}
+  A -->|"是（两个都满足）"| HT["硬 token\npenalty = 0（完全过滤）"]
+  A -->|"否"| B{"doc_ratio ≥ 55%\nOR\ncommunity_ratio\n≥ 85%?"}
+  B -->|"是"| C["计算压力：\n= max(doc_pressure, community_pressure)"]
+  C --> D["penalty = max(0.10, 0.58 − 0.42 × pressure)\n→ 范围 [0.10, 0.58]"]
+  B -->|"否"| E["penalty = 1.0\n（无惩罚）"]
+```
+
+这替代了标准 TF-IDF 中的硬编码停用词表：token 的惩罚来自**该知识库的实际语料分布**而非通用列表。"model"在代码 RAG 中是关键词，在某些论文语料中则可能是高频噪声——两种情况的惩罚因子自动不同。
+
+### 三路由查询编排
+
+```mermaid
+flowchart TD
+  Q["用户查询"] --> W["_query_weights()\nTokenize + 应用噪声惩罚"]
+  W --> RD["_decide_query_route()\n计算 global_score vs local_score"]
+
+  RD -->|"global_score ≥ 5\nAND > local_score+1"| G
+  RD -->|"global_score 3–4\nAND > local_score"| H
+  RD -->|"其他情况\n或社区数 ≤ 1"| F
+
+  subgraph F["FAST — 精确检索"]
+    F1["倒排索引点积"] --> F2["评分：lexical × 0.82 + graph_bonus"]
+    F2 --> F3["返回 top-K chunks"]
+  end
+
+  subgraph G["GLOBAL — 跨社区综合"]
+    G1["在 community_inverted 上排序社区"] --> G2["选择 top-3 社区"]
+    G2 --> G3["MAP：在每个社区内执行 FAST 查询"]
+    G3 --> G4["BRIDGE：遍历跨社区实体链接\nscore = 0.26 + log(link_weight+1)/5.2"]
+    G4 --> G5["REDUCE：全局综合行\n= [Map rows + Bridge rows + 支撑 chunks]"]
+  end
+
+  subgraph H["HYBRID — 平衡"]
+    H1["FAST top-8"] & H2["GLOBAL top-6"]
+    H1 & H2 --> H3["交错：1 global + 2 fast + 1 global + 2 fast ..."]
+  end
+
+  F & G & H --> OUT["去重 → 排序 → 返回 top-K"]
+```
+
+**路由决策信号：**
+- 全局倾向（+分）：查询长度 ≥ 18 tokens、≥ 2 个命名实体、出现 "compare"/"overall"/"trend"/"综述" 等关键词
+- 局部倾向（+分）：出现 "what is"/"哪篇"/"文件扩展名"，查询长度 ≤ 10 tokens
+
+### 自动社区检测
+
+文档按 `(category, language, top_entities)` 自动分组为社区，无需手动分类：
+
+```mermaid
+flowchart LR
+  subgraph Docs["已摄取文档"]
+    D1["paper_A.pdf\ncategory=research\nlang=en\nentities=[ML,LSTM]"]
+    D2["paper_B.pdf\ncategory=research\nlang=en\nentities=[ML,CNN]"]
+    D3["train.py\ncategory=code\nlang=python\nentities=[model,dataset]"]
+  end
+
+  subgraph Communities["自动检测社区"]
+    C1["research:en:ML\n= D1 + D2\n跨链接：CNN↔LSTM 共享实体"]
+    C2["code:python:model\n= D3"]
+  end
+
+  subgraph Reports["社区报告（用于 GLOBAL 查询）"]
+    R1["Community: research:en:ML\nDocs: 2, Top entities: ML, CNN, LSTM\nBridge → code:python:model (共享: model)"]
+  end
+
+  D1 & D2 --> C1
+  D3 --> C2
+  C1 --> R1
+```
+
+每个社区生成一份**社区报告**——包含成员文档摘要、顶部实体和跨社区链接的结构化文本。GLOBAL 查询先在社区级检索，再下钻到 chunks。
+
+### Code RAG：模块依赖图
+
+`CodeGraphIndex` 在 `TFGraphIDFIndex` 基础上增加了代码原生知识图谱：
+
+```mermaid
+flowchart LR
+  subgraph FILES["源文件"]
+    A["session_state.py\nimports: threading, json\nexports: SessionState\nsymbols: 847"]
+    B["rag_service.py\nimports: threading, json, session_state\nexports: RAGIngestionService\nsymbols: 312"]
+  end
+
+  subgraph GRAPH["导入依赖图"]
+    N1["session_state"] -->|"import weight: 3"| N2["threading"]
+    N4["rag_service"] -->|"weight: 1"| N1
+    N4 -->|"weight: 1"| N3["json"]
+  end
+
+  subgraph SYMBOLS["符号索引"]
+    S1["SessionState → session_state.py"]
+    S2["RAGIngestionService → rag_service.py"]
+    S3["_run_bash:L1842 → session_state.py"]
+  end
+
+  A --> N1 & SYMBOLS
+  B --> N4 & SYMBOLS
+```
+
+当查询提到 `"RAGIngestionService"` 时，符号索引直接定位 `rag_service.py`，导入图中心性高的文件（被大量其他文件 import）即使词法匹配不强也能排到靠前。
+
+### 与主流 RAG 方案的优势对比
+
+| 能力维度 | 标准 TF-IDF | BM25 | Embedding/向量 RAG | **TF-Graph_IDF（Clouds Coder）** |
+|---|---|---|---|---|
+| 停用词处理 | 静态列表 | 静态列表 | 嵌入空间隐式 | **语料库自适应动态惩罚** |
+| IDF 平滑 | `log(N/df)` | BM25 饱和曲线 | 无 | `log((1+N)/(1+df)) + 1.0` |
+| 知识图谱 | ✗ | ✗ | ✗ | **实体重叠 + 文档图度 + 社区拓扑** |
+| 多层检索 | 平铺 | 平铺 | 平铺 | **chunk → document → community** |
+| 跨域综合 | ✗ | ✗ | ✗ | **自动社区检测 + Map-Reduce** |
+| 跨社区桥接 | ✗ | ✗ | ✗ | **实体链接社区 Bridge** |
+| 代码原生图 | ✗ | ✗ | ✗ | **导入边 + 符号表 + 行号范围** |
+| 查询路由 | 固定 | 固定 | 固定 | **自动：fast / global / hybrid** |
+| 无 GPU/嵌入模型 | ✓ | ✓ | ✗（必需） | **✓ — 纯进程内，无外部模型** |
+| 可解释性 | 分数可分解 | 分数可分解 | 黑盒 | **完整分解：lexical + entity + graph + community** |
+
+**核心设计抉择与理由：**
+
+1. **无嵌入模型** — TF-Graph_IDF 完全在进程内运行（Python + JSON 快照），无 GPU、无 API 调用、无向量数据库。典型知识库的检索延迟低于毫秒级。
+
+2. **动态噪声 > 静态停用词** — 同一个 token 在代码 RAG 和文档 RAG 中的信息量完全不同。基于语料库的自适应惩罚比通用停用词列表更准确，领域特定高频词也能获得恰当的惩罚系数。
+
+3. **图奖励让中心文档可被发现** — 被大量其他文件导入（`graph_degree` 高）的核心模块，即使词法匹配不强也能排到靠前，解决了纯词法检索中"重要文件被淹没"的问题。
+
+4. **社区 Map-Reduce 应对综合查询** — 当用户询问"比较各项目中的 ML 框架"时，FAST 检索返回零散 chunks；GLOBAL 检索按社区分组，生成 per-community 摘要，再综合为统一视图——更接近人类分析师的做法。
+
+5. **Code RAG 路径匹配奖励（+0.28）** — 当查询明确提到文件路径时，检索几乎必然将该文件排到第一，消除同名 token 导致的无关结果干扰。
 
 ## 5. 复杂任务可靠性设计
 
@@ -581,19 +970,30 @@ stateDiagram-v2
 
 两层能力：
 
-- 运行时加载层：本地 skill + provider 协议
-- Skills Studio 创作层：扫描、生成、保存、上传
+- **运行时加载层**：本地 skill 文件 + HTTP JSON provider manifest 协议
+- **Skills Studio 创作层**：扫描、生成、保存、上传
+
+**生态兼容性** — 以下 5 大生态系统的 skills 均可原生加载执行：
+- [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — 社区 Claude skills 精选集合
+- [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax 官方 skills（前端/全栈/iOS/Android/PDF/PPTX）
+- [anthropics/skills](https://github.com/anthropics/skills) — Anthropic 官方 skills 仓库
+- [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent skill 系统分析与提取的 skill 产物
+- [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — 学术演示 skill（行动标题、引用规范、论证结构）
+
+**加载机制**：
+- LLM 自主发现：模型根据任务类型判断调用哪个 skill，非关键词强触发
+- 多 skill 并发：多个 skills 可同时激活；直接冲突的 skill 对被自动阻止
+- Plan steps 预加载：`_preload_skills_from_plan_steps` 扫描 plan steps 文本，执行前提前预加载引用的 skills
+
+**内置 skills**（本次发布重写）：
+- `research-orchestrator-pro`：协作型分析决策中枢，内置 RAG 检索指南
+- `scientific-reasoning-lab`：5 阶段自迭代推理引擎，内置 RAG 检索指南
 
 仓库内 skills 组成：
 
 - 基础可复用：`skills/code-review`、`skills/agent-builder`、`skills/mcp-builder`、`skills/pdf`
 - 扩展生成：`skills/generated/*`
 - 协议与索引资产：`skills/clawhub/`、`skills/skills_Gen/`
-
-协议方向：
-
-- 本地文件协议
-- HTTP JSON provider manifest 协议
 
 ## 8. API 概览
 
@@ -609,17 +1009,45 @@ stateDiagram-v2
 
 ## 9. 快速开始
 
-### 9.1 环境要求
+### 9.0 PyPI 安装（推荐）
+
+```bash
+pip install clouds-coder
+```
+
+安装后直接启动：
+
+```bash
+clouds-coder --host 0.0.0.0 --port 8080
+```
+
+- Agent UI：`http://127.0.0.1:8080`
+- Skills Studio：`http://127.0.0.1:8081`（可关闭）
+
+> PyPI 页面：https://pypi.org/project/clouds-coder/
+
+### 9.1 环境要求（源码安装）
 
 - Python 3.10+
 - Ollama（推荐，用于本地模型）
-- 安装依赖：
+- 安装依赖（启用完整源码模式文件预览/解析能力）：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 9.2 启动
+这套源码安装依赖会启用运行时使用的富预览解析栈：
+
+- PDF：`pdfminer.six`、`PyMuPDF`
+- CSV / 分析表格：`pandas`
+- Excel：`openpyxl`、`xlrd`
+- Word：`python-docx`
+- PowerPoint：`python-pptx`
+- 图片资源处理：`Pillow`
+
+可选的系统级辅助工具如 `pdftotext`、`xls2csv`、`antiword`、`catdoc`、`catppt`、`textutil` 仍可增强老格式 fallback 解析，但不是源码安装必需项。
+
+### 9.2 启动（源码安装）
 
 ```bash
 python Clouds_Coder.py --host 0.0.0.0 --port 8080
@@ -699,7 +1127,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 ## 11.1 架构优势
 
 - All-in-one 单文件内核（`Clouds_Coder.py`）：agent loop、工具路由、会话状态机、HTTP API、SSE 流、Web UI bridge、Skills Studio 在同一进程协作，减少跨服务编排与分布式故障点。
-- 轻量与易部署：依赖面小（`requirements.txt` 极简），单命令启动，同时支持 PyInstaller/Nuitka 的 onedir/onefile 打包路径，适配本地与分发部署。
+- 部署形态灵活：PyPI 安装保持基础运行时轻量；源码安装通过 `requirements.txt` 启用更完整的 PDF / Office / 表格 / 图片预览依赖栈；同时继续支持 PyInstaller/Nuitka 的 onedir/onefile 打包路径。
 - 原生多模态支持：provider 能力推断与 media endpoint 路由在 profile 解析阶段内建，无需额外多模态网关即可对接图像/音频/视频工作流。
 - 本地+Web 模型广覆盖并针对小模型优化：同时支持 Ollama 与 OpenAI-compatible 后端；针对小模型增加 context 预算控制、截断续写、空转恢复、统一 timeout 调度等保护机制。
 

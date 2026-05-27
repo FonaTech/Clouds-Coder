@@ -7,10 +7,18 @@
   <a href="./README-ja.md">日本語</a>
 </p>
 <p align="center">
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/v/clouds-coder.svg" alt="PyPI バージョン" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/pyversions/clouds-coder.svg" alt="Python バージョン" /></a>
+  <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
+</p>
+<p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
-  <a href="./CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
-  <a href="./CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
-  <a href="./CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
+  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
   <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
@@ -22,7 +30,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-最新アーキテクチャ更新の三言語サマリー: [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md) | 前回: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -71,6 +79,12 @@ Skills 再利用について：
 - `skills/generated/*` は Clouds Coder 向けに拡張生成された skill 群
 - 実行時ツール契約（`load_skill`、`list_skills`、`write_skill` など）との互換性を維持
 
+MiniMax skills の出典表記:
+
+- 本リポジトリ内の `skills` に含まれるローカル skill パックは、MiniMax AI の公開 skills リポジトリをもとに適用・改変しています: https://github.com/MiniMax-AI/skills
+- 上流の原典ソースは MIT License に基づいて利用しています
+- 元の skill コンテンツ、構成、エコシステム整備を提供した MiniMax AI と上流コントリビューターに感謝します
+
 ## 1.2 コーディング CLI を超える汎用タスクカーネル
 
 Clouds Coder は「コードを書くためだけの CLI ラッパー」ではなく、単一セッション内で複合的な知的作業を実行・監査できる汎用エージェントランタイムとして設計されています。
@@ -95,25 +109,34 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - 複雑タスク向け `LLM -> Coding -> LLM` 実行パターンを標準搭載
 - **Plan Mode** — UI トグル（Auto/On/Off）、調査 → 提案 → ユーザー選択 → ステップ実行、Single/Sync 両対応
 - **マルチエージェント協調** — 4 ロール（manager/explorer/developer/reviewer）+ blackboard 中心協調
+- **短コンテキストモデルの長期処理強化** — マルチエージェント mode は作業をロール別コンテキストへ分割し、小さなローカルモデルでも調査・実装・レビュー・修復ループを継続しやすくします
 - **Reviewer Debug Mode** — エラー検出時に reviewer が書き込み権限を取得し、独立してバグ修正
 - **6 カテゴリ統一エラー検出**（test/lint/compilation/build/deploy/runtime）+ 統一 failure ledger
 - **4 段階コンテキスト圧縮**（normal → light → medium → heavy）+ ファイルバッファ、4K〜1M トークン対応
+- **Agent 別独立 compact** — Manager / Explorer / Developer / Reviewer のコンテキストレーンは同じ階層 compact フレームワークで個別に圧縮され、single task は従来の単一グローバルレーンを維持します
 - **タスクフェーズ認識委任** — manager が現在フェーズ（research/design/implement/test/review/deploy）に基づき適切な agent にルーティング
 - **ネイティブマルチモーダルサポート** — read_file が画像/音声/動画を自動検出、モデル対応時にネイティブ入力として注入
 - **リアルタイムユーザー入力マージ** — 実行中のフィードバックで plan 方向を調整、再起動不要
 - **リスタート意図融合** — ユーザー意図 > plan 意図 > コンテキスト意図の優先度で融合
+- **Skills エコシステム全面対応** — 5 大エコシステム対応（awesome-claude-skills / MiniMax-skills / skills-main / kimi-agent-internals / academic-pptx）、LLM 自律発見・タスク別判断ロード、マルチ skill 同時起動 + コンフリクト検出
+- **デュアル RAG 知識アーキテクチャ** — Code RAG（`CodeIngestionService`）+ Data RAG（`RAGIngestionService`）、TF_G_IDF_RAG 基盤、統一検索インターフェース `query_knowledge_library`、内蔵 skills への RAG 検索ガイド注入
+- **永続 Wiki RAG** — `WikiStore` が raw library sources を Markdown Wiki（`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md`）へコンパイルし、蓄積済み統合知識を優先検索してから raw chunks にフォールバック
+- **プログラミングワークフローメモリ** — `WorkflowMemoryStore` が完了済み coding session をスコアリングし、優れた workflow cards を Code Wiki memory に保存、`workflow` ルートでツール利用・引き継ぎ・検証・実装パターンを検索可能
+- **多因子優先度コンテキスト圧縮** — 10 因子メッセージ重要性スコアリング（近接性・役割・タスク進捗・エラー・目標関連性・skills・compact-resume）で時系列のみの切り捨てを置換
 - 内蔵 Web UI + 外部 Web UI の切替
 - Skills Studio（別ポート）で skill のスキャン/編集/生成/アップロード
 - Ollama モデル検出とカタログ読み込み
 - `LLM.config.json` による OpenAI-compatible プロファイル対応
+- プライベート vLLM / OpenAI-compatible 耐性：5 回 HTTP リトライ制御、60 秒デフォルト間隔、`Retry-After` / rate-limit 追従、endpoint cooldown、nginx/upstream 一時エラーリトライ
 - 統一 timeout 制御（グローバル超時、モデル active 区間除外）
 - 切断回復ループ（継続 pass/token を UI にリアルタイム表示）
 - コンテキスト圧縮 + アーカイブ再呼び出し + ロスレス状態引き継ぎ
 - no-tool idle 診断と回復ヒント
 - Task/Todo/Background/Team/Worktree を一体実装
 - SSE ハートビートと書き込み例外処理
-- Markdown/HTML/ファイル/コード段階プレビュー
+- Markdown/HTML/コード/PDF/CSV/Excel/Word/PPT/メディア/コード段階プレビュー
 - フロントエンド負荷制御（live/static 凍結、スナップショット制御、��想リスト）
+- import 可能な分割アーキテクチャツール：`split_coder.py` が `_source_bridge.py` に支えられた `Code_Structure/` ナビゲーションパッケージを再生成
 - 研究ワークロード向け: 成果物中心、段階追跡可能、再現性重視の永続化設計
 
 ## 3. アーキテクチャ概要
@@ -123,7 +146,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 │                            Clouds Coder                              │
 ├───────────────────────────────────────────────────────────────────────┤
 │ 体験・追跡レイヤー                                                    │
-│  - マルチプレビュー（Markdown / コード / HTML）                      │
+│  - マルチプレビュー（Markdown / HTML / コード / PDF / Office / Media）│
 │  - 段階コード履歴バックアップ + 差分/追跡タイムライン                │
 │  - 実行進捗カード（thinking/run/truncation/recovery）               │
 │  - Skills 可視フロー設計 + SKILL.md 生成/注入                        │
@@ -165,8 +188,8 @@ flowchart TB
   UI["表示レイヤー<br/>Agent Web UI + Plan Mode トグル + Skills Studio"]
   API["API・ストリームレイヤー<br/>REST + SSE + render-state/frame + plan-mode"]
   ORCH["オーケストレーション・制御<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree<br/>Plan Mode / フェーズ認識委任"]
-  AGENT["マルチエージェント協調<br/>Manager / Explorer / Developer / Reviewer"]
-  EXEC["モデル・ツール実行<br/>OllamaClient + tool dispatch<br/>ネイティブマルチモーダル + 6カテゴリエラー検出 + 4段階圧縮<br/>bash/read/write/edit/skills/context/task"]
+  AGENT["マルチエージェント協調<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + ロール別作業コンテキスト"]
+  EXEC["モデル・ツール実行<br/>OllamaClient + tool dispatch<br/>ネイティブマルチモーダル + 6カテゴリエラー検出 + グローバル/Agent別階層圧縮<br/>bash/read/write/edit/skills/context/task"]
   DATA["アーティファクト永続化<br/>files / uploads / context_archive / code_preview / file_buffer<br/>conversation / activity / operations"]
   UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
@@ -298,6 +321,15 @@ Clouds Coder は単一プロセスのモノリシック・ランタイム内で�
 - サービス間 RPC 不要で協調レイテンシを低減
 - Blackboard スナップショットによる Manager 判断の安定化
 - 実行途中エラー時の高速な中断・再ルーティング
+- ロール別作業メモリにより、短コンテキストモデルでも長いタスクの継続性を高める
+
+コンテキストトポロジ:
+
+- Single mode は単一グローバルコンテキストレーンと単一進捗バーを維持します。
+- Multi-agent mode は Manager と実際の参加 agent にだけ active role lane を作成します。
+- 各 role lane は同じ階層圧縮ポリシーで個別に見積もり、compact されます。
+- 次のモデル呼び出しには、すべてのロール履歴ではなく、そのロールに必要な lane だけを注入します。
+- UI は実際に multi-agent mode が有効になった後だけネスト role context bar を表示し、L1/L2 single task は従来の single bar のままです。
 
 Blackboard の主要スライス:
 
@@ -339,6 +371,26 @@ flowchart LR
   M -->|delegate_task + mandatory flags + budget update| E
   M -->|delegate_task + mandatory flags + budget update| D
   M -->|delegate_task + mandatory flags + budget update| R
+```
+
+Mermaid（コンテキストライフサイクルと compact トポロジ）:
+
+```mermaid
+flowchart TB
+  S["Single / L1-L2<br/>単一グローバルコンテキストレーン"] -->|task が sync/sequential へ上がる| A["マルチエージェント有効化"]
+  A --> MCTX["Manager context<br/>ルーティング / フェーズ / 承認"]
+  A --> ECTX["Explorer context<br/>調査 / 証拠 / パス"]
+  A --> DCTX["Developer context<br/>実装 / ツール結果"]
+  A --> RCTX["Reviewer context<br/>検証 / 欠陥 / 修正"]
+  MCTX --> MC["階層 compact<br/>独立実行"]
+  ECTX --> EC["階層 compact<br/>独立実行"]
+  DCTX --> DC["階層 compact<br/>独立実行"]
+  RCTX --> RC["階層 compact<br/>独立実行"]
+  MC --> N["次のモデル呼び出し<br/>必要なロールレーンだけ注入"]
+  EC --> N
+  DC --> N
+  RC --> N
+  N --> UICTX["UI コンテキスト表示<br/>既定は single bar<br/>multi-agent 時のみネスト role bars"]
 ```
 
 Mermaid（動的ルーティングと中断回帰）:
@@ -439,7 +491,7 @@ stateDiagram-v2
 - オーケストレーションと非ブロッキング制御のため `deque`、`selectors`、`signal`、`shlex` を導入。
 - `RUNTIME_CONTROL_HINT_PREFIXES` に `<arbiter-continue>` と `<fault-prefill>` を追加し、回復ヒント表現を拡張。
 
-三言語の完全版更新ログ: [`CHANGELOG-2026-03-07.md`](./CHANGELOG-2026-03-07.md)
+三言語の完全版更新ログ: [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ### 3.6 2026-03-16 重大修正：Single モード Agent リーク & 終了シグナル無視
 
@@ -457,7 +509,7 @@ stateDiagram-v2
   - 第 3 層 — Sync ループインターセプト：各 Agent ターン完了後に結論的応答を検出し、条件を満たせば即座に break し自動承認。
 - セーフガード：エラーログまたは未完了タスクが存在する場合、結論検出は finish をトリガーしない（誤終了防止）。
 
-三言語の完全版詳細: [`CHANGELOG-2026-03-16.md`](./CHANGELOG-2026-03-16.md)
+三言語の完全版詳細: [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
 
 ### 3.7 2026-03-20 大規模更新：Plan Mode アーキテクチャ & コア全面刷新
 
@@ -496,21 +548,368 @@ stateDiagram-v2
 - `_run_read()` が画像/音声/動画ファイルを検出、モデル対応時にネイティブマルチモ���ダル入力として注入。
 - Plan mode 下の TodoWrite は owner タグ付きサブタスクを���成、plan_step を上書きしない。
 
-三言語の完全版詳細: [`CHANGELOG-2026-03-20.md`](./CHANGELOG-2026-03-20.md)
+三言語の完全版詳細: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+
+### 3.8 2026-03-25 重大アップデート：Skills エコシステム互換 & デュアル RAG アーキテクチャ & コア修正
+
+**Skills エコシステム全面対応**
+- 5 大 skill エコシステムに対応、per-provider アダプター不要：
+  - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — コミュニティ Claude skills キュレーションコレクション
+  - [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax 公式 skills（フロントエンド/フルスタック/iOS/Android/PDF/PPTX）
+  - [anthropics/skills](https://github.com/anthropics/skills) — Anthropic 公式 skills リポジトリ（`skills-main`）
+  - [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent スキルシステム解析と抽出 skill アーティファクト
+  - [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — アカデミック発表 skill（アクションタイトル・引用規格・論理構造）
+- 以前の失敗の根本原因を修正：Execution Guide インジェクション（削除済み）が存在しない仮想 skill パスに `read_file` を強制し無限ループ。
+- Chain Tracking システム削除（7 メソッド）；`_broadcast_loaded_skill` を 16→6 フィールドに簡素化；`_loaded_skills_prompt_hint` を約 350→120 tokens に削減。
+- LLM 自律発見：タスクタイプに基づき適切な skill を自律選択。マルチ skill 同時ロード + コンフリクト検出。
+- Sync モード Manager が `TodoWrite` を取得。新規 `_preload_skills_from_plan_steps` で plan steps から skill 名を事前スキャン。
+- Plan steps 上限 10→20；1 ステップ文字数 400→600；反幻覚制約を追加。
+
+**デュアル RAG 知識アーキテクチャ**
+- `RAGIngestionService`（Data RAG）：ドキュメント・PDF・構造化データ — 汎用知識ベース。
+- `CodeIngestionService`（Code RAG）：ソースコードファイル、コード認識トークナイザー — コード知識ベース。
+- 両ライブラリとも TF_G_IDF_RAG 基盤；`query_knowledge_library(query, top_k)` が両ライブラリを並列検索しマージ結果を返す。
+- `research-orchestrator-pro` と `scientific-reasoning-lab` に完全な RAG 検索ガイドを注入。
+
+デュアル RAG アーキテクチャ：
+
+```mermaid
+flowchart TB
+  subgraph 取り込み層 Ingestion
+    DF["ドキュメント / PDF / データファイル"]
+    CF["ソースコードファイル"]
+    DR["RAGIngestionService<br/>(Data RAG)"]
+    CR["CodeIngestionService<br/>(Code RAG)"]
+    DF --> DR
+    CF --> CR
+  end
+  subgraph ストレージ層 Storage
+    TG1["TF_G_IDF_RAG<br/>（データ知識ベース）"]
+    TG2["TF_G_IDF_RAG<br/>（コード知識ベース）"]
+    DR --> TG1
+    CR --> TG2
+  end
+  subgraph 検索層 Retrieval
+    Q["query_knowledge_library(query, top_k)"]
+    TG1 -->|並列検索| Q
+    TG2 -->|並列検索| Q
+    Q --> R["マージランク結果"]
+  end
+  subgraph 消費層 Consumption
+    SK1["research-orchestrator-pro<br/>（RAG ガイド注入済み）"]
+    SK2["scientific-reasoning-lab<br/>（RAG ガイド注入済み）"]
+    AG["Agent（LLM）"]
+    R --> SK1
+    R --> SK2
+    SK1 --> AG
+    SK2 --> AG
+  end
+```
+
+RAG 検索フロー：
+
+```mermaid
+sequenceDiagram
+  participant M as エージェント（LLM）
+  participant S as 内蔵 Skill（RAG ガイド）
+  participant Q as query_knowledge_library
+  participant DR as Data RAG (RAGIngestionService)
+  participant CR as Code RAG (CodeIngestionService)
+  participant BB as ブラックボード
+
+  M->>S: タスク実行（skill ロード済み）
+  S->>Q: query_knowledge_library("検索キーワード", top_k=5)
+  Q->>DR: 並列検索 — ドキュメント/PDF 知識ベース
+  Q->>CR: 並列検索 — コード知識ベース
+  DR-->>Q: マッチ結果（TF_G_IDF ランキング）
+  CR-->>Q: マッチ結果（TF_G_IDF ランキング）
+  Q-->>S: マージ top_k 結果
+  S->>M: バックグラウンド知識として注入
+  M->>BB: write(research_notes / code_artifacts)
+```
+
+**内蔵 Skills 全面リライト**
+- `research-orchestrator-pro`：協調型分析決定ハブ、出力型 skill と協調（干渉しない）、RAG 検索ガイド内蔵、反幻覚スタンス。
+- `scientific-reasoning-lab`：5 フェーズ自己反復推論エンジン（分解→導出→検証→評価→統合）、research-orchestrator-pro Phase 2 サブエンジンとして統合、RAG 検索ガイド内蔵。
+
+**多因子優先度コンテキスト圧縮**
+- `_classify_message_priority`：10 因子スコアリング（近接性 0–3、役割重み、タスク進捗 +2、エラー +2、目標関連性 +1、skill +1、compact-resume=10）。
+- `_priority_compress_messages`：高スコア（≥7）保持、中スコア（4–6）500 文字に圧縮、低スコア（0–3）1 行サマリー。
+- `_build_state_handoff` 強化：PLAN_PROGRESS、CURRENT_STEP、ACTIVE_SKILLS、RECENT_TOOLS フィールド追加。
+- `_auto_compact` に優先度圧縮を統合、`pop(0)` セーフティフォールバック維持。
+
+**Anti-stall メカニズム最適化**
+- 閾値 2→3 回連続同一ターゲット委任で発動に引き上げ。
+- "CHANGE YOUR APPROACH" を協調的ガイダンス（ask_colleague / 別ツール試行 / finish_current_task 呼び出し）に軟化。
+
+**重大バグ修正**
+- `CodeIngestionService._flush_lock`：`threading.Lock()` 追加 — コードライブラリへのアップロード時の `AttributeError` を修正。
+- フロントエンド `setTaskLevel()`：レベル更新後に `scheduleSnapshot()` 追加 — 次の SSE 更新でタスクレベルセレクターが "Auto" に戻る問題を修正。
+- `_sync_todos_from_blackboard`：worker items（`owner ∈ {developer, explorer, reviewer}`) をブラックボード同期をまたいで保護 — 毎回のサイクルで TodoWrite アイテムが消失する問題を修正。
+
+三言語の完全版詳細: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
+
+### 3.9 2026-05-02 重大アップデート：永続 Wiki RAG + ワークフローメモリ + Provider 耐性 + import 可能な分割構造
+
+**永続 Wiki RAG**
+- `WikiStore` は各 RAG library を永続 Markdown Wiki としてコンパイルし、`sources/`、`entities/`、`concepts/`、`synthesis/overview.md`、`index.md`、`log.md`、`schema.md` を生成します。
+- 検索は Wiki に蓄積された統合知識を先に使い、正確な証拠や行レベル詳細が必要な場合に raw chunks へフォールバックします。
+- Knowledge Wiki RAG と Programming Code RAG を構造上分離し、一般知識統合とコード検索を個別に調整できます。
+
+**プログラミングワークフローメモリ**
+- `WorkflowMemoryStore` は完了済み coding session のパターンを収集・スコアリングし、採用された workflow を Code Wiki workflow memory に保存します。
+- Code RAG は `workflow` ルートで、検証済みのツール順序、引き継ぎパターン、todo 構造、検証手順、回復シグナルを検索できます。
+
+**Provider 耐性**
+- プライベート vLLM / OpenAI-compatible / LM Studio endpoint は、デフォルト 5 回・60 秒間隔の HTTP リトライ制御を使用します。
+- リトライは `Retry-After`、`X-RateLimit-Reset`、JSON retry hints、endpoint cooldown、nginx/upstream 風の一時障害に従います。
+- 通常のチャット完了後、`AGENT_RUN_COMPLETION_SUMMARY=true` が明示されない限り、追加の「タスク完了」サマリーバブルは生成されません。
+
+**分割アーキテクチャツール**
+- `split_coder.py` は `_source_bridge.py` を使って import 可能な `Code_Structure/` package を生成し、循環 import を避けつつシンボル網羅性を保持します。
+- self-check はトップレベルシンボル一致、`py_compile`、古い生成ファイル、package import walk、entry-point help、生成キャッシュ削除を検証します。
+
+三言語の完全版詳細: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## 4. 主要ランタイム構成
-
-メイン実装：`Clouds_Coder.py`。
 
 - `AppContext`：全体設定・モデルカタログ・サーバ状態
 - `SessionManager`：セッション管理
 - `SessionState`：セッション単位の実行状態、ツール状態、切断/文脈/進行マーカー
 - `EventHub`：SSE/内部イベント配信
-- `OllamaClient`：モデル呼び出しアダプタとフォールバック
+- `OllamaClient`：モデル呼び出しアダプタ、provider retry governance、cooldown、フォールバック
 - `SkillStore`：ローカル/プロバイダ skill 登録・読み込み
 - `TodoManager` / `TaskManager` / `BackgroundManager`：計画と非同期処理
 - `WorktreeManager`：分離作業ディレクトリ
 - `Handler` / `SkillsHandler`：Agent UI/Skills Studio API
+- `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：`TFGraphIDFIndex` / `CodeGraphIndex` に基づくデュアル知識取り込み・検索エンジン
+- `WikiStore`：知識ライブラリとコードライブラリの蓄積統合を担う永続 Markdown Wiki コンパイラ
+- `WorkflowMemoryStore`：再利用可能なコードタスクパターンのためのスコアリング型プログラミングワークフローメモリ
+- `split_coder.py` / `Code_Structure`：`_source_bridge.py` に支えられた import 可能な分割アーキテクチャナビゲーションパッケージ
+
+## 4.1 RAG 知識アーキテクチャ：TF-Graph_IDF エンジン
+
+Clouds Coder には **TF-Graph_IDF** と呼ぶ検索エンジンが内蔵されています。語彙スコアリング・知識グラフ位相・自動コミュニティ検出・マルチルートクエリオーケストレーションを組み合わせ、標準的な TF-IDF や BM25 に比べて召回品質が大きく向上しています。
+
+### デュアルライブラリ設計
+
+```mermaid
+flowchart TB
+  subgraph INPUT["入力ソース"]
+    D["ドキュメント / PDF / CSV<br/>（アップロード済みまたはセッションファイル）"]
+    C["ソースコードファイル<br/>(.py .js .ts .go .java ...)"]
+  end
+
+  subgraph INGEST["インジェストレイヤー"]
+    direction TB
+    RI["RAGIngestionService<br/>（Data RAG）<br/>4 ワーカースレッド・バッチフラッシュ"]
+    CI["CodeIngestionService<br/>（Code RAG）<br/>コード対応トークナイザ + シンボル抽出"]
+  end
+
+  subgraph INDEX["TF-Graph_IDF インデックスレイヤー"]
+    direction TB
+    TGI["TFGraphIDFIndex<br/>─────────────────────────────<br/>① 語彙レイヤー<br/>  転置インデックス · IDF · chunk_norms<br/>② グラフレイヤー<br/>  entity_to_docs · related_docs · graph_degree<br/>③ コミュニティレイヤー<br/>  自動検出 · community_reports<br/>  community_inverted · クロスコミュニティブリッジ<br/>④ 動的ノイズレイヤー<br/>  hard_tokens · soft_penalties[0.1–1.0]"]
+    CGI["CodeGraphIndex ⊇ TFGraphIDFIndex<br/>─────────────────────────────<br/>+ import_edges（モジュール依存グラフ）<br/>+ symbol_to_docs（関数/クラス → ファイル）<br/>+ path_to_doc（ファイルパス → doc_id）<br/>+ チャンク単位：line_start/end · symbol · kind"]
+  end
+
+  subgraph QUERY["クエリレイヤー"]
+    direction TB
+    QR["クエリルーター<br/>_decide_query_route()<br/>global_score vs local_score"]
+    F["FAST パス<br/>ベクトル検索<br/>語彙 × 0.82 + graph_bonus"]
+    G["GLOBAL パス<br/>コミュニティランキング<br/>→ Map: コミュニティ内検索<br/>→ Bridge: クロスコミュニティリンク<br/>→ Reduce: グローバル合成行"]
+    H["HYBRID パス<br/>1 global + 2 fast<br/>インターリーブマージ"]
+  end
+
+  subgraph OUT["消費側"]
+    SK["内蔵スキル<br/>research-orchestrator-pro<br/>scientific-reasoning-lab"]
+    AG["エージェント（LLM）"]
+  end
+
+  D --> RI --> TGI
+  C --> CI --> CGI
+  TGI & CGI --> QR
+  QR -->|"ローカルクエリ<br/>短い/精確"| F
+  QR -->|"クロスドメイン<br/>global_score ≥ 5"| G
+  QR -->|"バランス型<br/>global_score 3–4"| H
+  F & G & H --> SK --> AG
+```
+
+### TF-Graph_IDF スコアリング式
+
+検索された各チャンクは **語彙コンポーネント** と **グラフボーナス** で構成されるスコアを受け取ります：
+
+```
+final_score = 語彙 × 0.82 + graph_bonus         （Data RAG）
+final_score = 語彙 × 0.78 + graph_bonus         （Code RAG — グラフ重み増加）
+
+語彙        = Σ(q_weight_i × c_weight_i) / (query_norm × chunk_norm)
+
+graph_bonus = 0.18 × entity_overlap                 （共有固有表現）
+            + 0.10 × doc_entity_overlap              （ドキュメントレベル固有表現一致）
+            + min(0.16, log(doc_graph_degree+1)/12)  （ハブドキュメントブースト）
+            + 0.08  （クエリカテゴリ == ドキュメントカテゴリの場合）
+            + min(0.08, log(community_doc_count+1)/16)
+
+Code RAG 追加ボーナス：
+            + 0.16 × symbol_overlap                  （関数/クラス名一致）
+            + 0.28  （ファイルパスがクエリに含まれる場合）
+            + 0.20  （ファイル名がクエリに含まれる場合）
+            + 0.14  （モジュール名がクエリに含まれる場合）
+            + min(0.12, log(import_degree+1)/9)      （インポートグラフ中心性）
+```
+
+動的ノイズによるトークン重み：
+
+```
+idf[token]    = log((1 + N_chunks) / (1 + df[token])) + 1.0
+tf_weight     = (1 + log(freq)) × idf[token] × dynamic_noise_penalty[token]
+chunk_norm    = √Σ(tf_weight²)
+
+dynamic_noise_penalty ∈ [0.10, 1.0]  — 静的ストップワードリストではなくコーパス単位で計算
+```
+
+### 動的ノイズ抑制 — コーパス適応型トークン重み付け
+
+```mermaid
+flowchart LR
+  T["トークン: 't'"] --> A{"doc_ratio\n≥ 65%\nかつ\ncommunity_ratio\n≥ 90%?"}
+  A -->|"YES（両方）"| HT["ハードトークン\npenalty = 0（除外）"]
+  A -->|"NO"| B{"doc_ratio ≥ 55%\nまたは\ncommunity_ratio\n≥ 85%?"}
+  B -->|"YES"| C["pressure を計算：\n= max(doc_pressure, community_pressure)"]
+  C --> D["penalty = max(0.10, 0.58 − 0.42 × pressure)\n→ 範囲 [0.10, 0.58]"]
+  B -->|"NO"| E["penalty = 1.0\n（抑制なし）"]
+```
+
+これは標準 TF-IDF で使用されるハードコードされたストップワードリストを置き換えます。"the" や "and" のようなトークンは、事前に作成されたリストではなく、**この特定の知識ベースにおいて情報を持たない**とコーパス証拠が確認した場合にペナルティが課されます。ドメイン固有の一般的な用語は、実際のドキュメント分布から導出された適切なペナルティレベルを受け取ります。
+
+### 3ルートクエリオーケストレーション
+
+```mermaid
+flowchart TD
+  Q["ユーザークエリ"] --> W["_query_weights()\nトークン化 + ノイズペナルティ適用"]
+  W --> RD["_decide_query_route()\nスコア: グローバル指標 vs ローカル指標"]
+
+  RD -->|"global_score ≥ 5\nかつ > local_score+1"| G
+  RD -->|"global_score 3–4\nかつ > local_score"| H
+  RD -->|"それ以外\nまたは ≤1 コミュニティ"| F
+
+  subgraph F["FAST — 精確検索"]
+    F1["転置インデックスでドット積"] --> F2["スコア: 語彙 × 0.82 + graph_bonus"]
+    F2 --> F3["上位 K チャンクを返す"]
+  end
+
+  subgraph G["GLOBAL — クロスコミュニティ合成"]
+    G1["community_inverted でコミュニティをランキング"] --> G2["上位 3 コミュニティを選択"]
+    G2 --> G3["MAP: 各コミュニティ内で FAST クエリ"]
+    G3 --> G4["BRIDGE: クロスコミュニティエンティティリンクを走査\nスコア = 0.26 + log(link_weight+1)/5.2"]
+    G4 --> G5["REDUCE: グローバル合成行\n= [map 行 + bridge 行 + サポートチャンク]"]
+  end
+
+  subgraph H["HYBRID — バランス型"]
+    H1["FAST 実行（上位 8）"] & H2["GLOBAL 実行（上位 6）"]
+    H1 & H2 --> H3["インターリーブ: 1 global + 2 fast + 1 global + 2 fast ..."]
+  end
+
+  F & G & H --> OUT["重複排除 → ソート → 上位 K を返す"]
+```
+
+**ルート決定シグナル：**
+- グローバル指標（+スコア）：クエリ長 ≥ 18 トークン、固有表現 ≥ 2、"compare"/"overall"/"trend"/"survey" などのキーワード
+- ローカル指標（+スコア）："what is"/"which file"/クエリ内ファイル拡張子、短いクエリ ≤ 10 トークン
+
+### 自動コミュニティ検出
+
+ドキュメントは `(category, language, top_entities)` に基づいて自動的にコミュニティにグループ化されます — 手動分類は不要です。
+
+```mermaid
+flowchart LR
+  subgraph Docs["インジェスト済みドキュメント"]
+    D1["paper_A.pdf\ncategory=research\nlang=en\nentities=[ML,LSTM]"]
+    D2["paper_B.pdf\ncategory=research\nlang=en\nentities=[ML,CNN]"]
+    D3["train.py\ncategory=code\nlang=python\nentities=[model,dataset]"]
+    D4["data_analysis.py\ncategory=code\nlang=python\nentities=[pandas,numpy]"]
+  end
+
+  subgraph Communities["自動検出コミュニティ"]
+    C1["research:en:ML\n= D1 + D2\nクロスリンク: CNN↔LSTM 共有エンティティ"]
+    C2["code:python:model\n= D3"]
+    C3["code:python:pandas\n= D4"]
+  end
+
+  subgraph Reports["コミュニティレポート（GLOBAL クエリ用）"]
+    R1["コミュニティ: research:en:ML\nDocs: 2, トップエンティティ: ML, CNN, LSTM\nブリッジ → code:python:model（共有: model）"]
+  end
+
+  D1 & D2 --> C1
+  D3 --> C2
+  D4 --> C3
+  C1 --> R1
+```
+
+各コミュニティは **コミュニティレポート** を生成します — メンバードキュメント、トップエンティティ、クロスコミュニティリンクの構造化テキスト要約。GLOBAL クエリはまずコミュニティレベルで検索し、その後チャンクにドリルインします。
+
+### Code RAG：モジュール依存グラフ
+
+`CodeGraphIndex` は `TFGraphIDFIndex` をコードネイティブ知識グラフで拡張します：
+
+```mermaid
+flowchart LR
+  subgraph FILES["ソースファイル"]
+    A["session_state.py\nimports: threading, json\nexports: SessionState, _run_bash\nsymbols: 847（メソッド + クラス）"]
+    B["event_hub.py\nimports: threading, queue\nexports: EventHub, publish\nsymbols: 124"]
+    C["rag_service.py\nimports: threading, json, session_state\nexports: RAGIngestionService\nsymbols: 312"]
+  end
+
+  subgraph GRAPH["インポート依存グラフ"]
+    N1["session_state"] -->|"インポート重み: 3"| N2["threading"]
+    N1 -->|"重み: 1"| N3["json"]
+    N4["rag_service"] -->|"重み: 1"| N1
+    N4 -->|"重み: 1"| N3
+    N5["event_hub"] -->|"重み: 2"| N2
+  end
+
+  subgraph SYMBOLS["シンボルインデックス"]
+    S1["SessionState → session_state.py"]
+    S2["EventHub → event_hub.py"]
+    S3["RAGIngestionService → rag_service.py"]
+    S4["_run_bash:L1842 → session_state.py"]
+  end
+
+  A --> N1 & SYMBOLS
+  B --> N5 & SYMBOLS
+  C --> N4 & SYMBOLS
+```
+
+クエリが `"RAGIngestionService"` に言及すると、シンボルインデックスが直接 `rag_service.py` を特定し、インポートグラフ中心性のボーナススコアを付与します（高インポートファイルは上位にランク）。
+
+### 標準 RAG アプローチとの比較優位性
+
+| 機能 | 標準 TF-IDF | BM25 | 埋め込み / ベクター RAG | **TF-Graph_IDF（Clouds Coder）** |
+|---|---|---|---|---|
+| ストップワード処理 | 静的リスト | 静的リスト | 暗黙的（埋め込み空間） | **コーパス適応型動的ペナルティ** |
+| IDF スムージング | `log(N/df)` | 飽和 BM25 | N/A | `log((1+N)/(1+df)) + 1.0` |
+| TF 飽和 | なし | BM25 k₁ パラメータ | N/A | `log(freq)` + ノイズペナルティ |
+| 知識グラフ | ✗ | ✗ | ✗ | **エンティティ重複 + ドキュメントグラフ次数 + コミュニティ位相** |
+| 多階層検索 | フラット | フラット | フラット | **チャンク → ドキュメント → コミュニティ** |
+| コミュニティ合成 | ✗ | ✗ | ✗ | **自動コミュニティ検出 + コミュニティ横断 Map-Reduce** |
+| クロスドメインブリッジ | ✗ | ✗ | ✗ | **エンティティ連結コミュニティブリッジ** |
+| コードネイティブグラフ | ✗ | ✗ | ✗ | **インポートエッジ + シンボルテーブル + 行範囲** |
+| クエリルーティング | 固定 | 固定 | 固定 | **自動: fast / global / hybrid** |
+| 未知語処理 | 失敗 | 失敗 | 埋め込みで対応 | エンティティ抽出で対応 |
+| 説明可能性 | スコア分解 | スコア分解 | ブラックボックス | **完全スコア内訳: 語彙 + エンティティ + グラフ + コミュニティ** |
+| GPU/埋め込みモデル要件 | ✗ | ✗ | ✓（必須） | **✗ — 完全インプロセス、外部モデル不要** |
+
+**主要な設計選択とその根拠：**
+
+1. **埋め込みモデル不要** — TF-Graph_IDF は完全インプロセス（Python + JSON スナップショット）。GPU・API 呼び出し・ベクター DB なし。一般的な知識ベースでの検索レイテンシはサブミリ秒。
+
+2. **動的ノイズ > 静的ストップワード** — "model" というトークンはコード RAG コンテキストでは必須ですが、すべてのドキュメントが "models" を論じるドメインでは無関係なノイズ。コーパス由来のペナルティが普遍的なリストではなく実際の知識ベースに適応します。
+
+3. **グラフボーナスがハブドキュメントを発見可能に** — 他の多くのファイルからインポートされる中心ファイル（高 `graph_degree`）は、ルーズにマッチするクエリでも自然に上位に表示。純粋な語彙検索に共通する「重要ファイルが結果に埋もれる」問題を解決。
+
+4. **合成クエリのためのコミュニティ Map-Reduce** — ユーザーが「ML フレームワークをプロジェクト横断で比較して」と質問すると、FAST 検索は散在するチャンクを返します。GLOBAL 検索はコミュニティ別にグループ化し、コミュニティごとのサマリーを生成し、統一されたビューを合成 — 人間のアナリストが行うことに近い。
+
+5. **Code RAG パスマッチボーナス（+0.28）** — クエリが明示的にファイルパスを名指しすると、検索はそのファイルをほぼ確実に上位1位に重み付けし、ファイル間のトークン内容の重複による無関係な結果を排除。
 
 ## 5. 複雑タスク信頼性設計
 
@@ -575,19 +974,30 @@ stateDiagram-v2
 
 2 層構造：
 
-- 実行時ロード層：ローカル skill + provider プロトコル
-- Skills Studio 制作層：スキャン、生成、保存、アップロード
+- **実行時ロード層**：ローカル skill ファイル + HTTP JSON provider manifest プロトコル
+- **Skills Studio 制作層**：スキャン、生成、保存、アップロード
+
+**エコシステム互換性** — 以下 5 大エコシステムの skills をアダプターなしでロード・実行：
+- [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — コミュニティ Claude skills キュレーションコレクション
+- [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills) — MiniMax 公式 skills（フロントエンド/フルスタック/iOS/Android/PDF/PPTX）
+- [anthropics/skills](https://github.com/anthropics/skills) — Anthropic 公式 skills リポジトリ
+- [kimi-agent-internals](https://github.com/dnnyngyen/kimi-agent-internals) — Kimi agent スキルシステム解析と抽出 skill アーティファクト
+- [academic-pptx-skill](https://github.com/Gabberflast/academic-pptx-skill) — アカデミック発表 skill（アクションタイトル・引用規格・論理構造）
+
+**ロードメカニズム**：
+- LLM 自律発見：モデルがタスクタイプに基づき適切な skill を判断、キーワード強制トリガーなし
+- マルチ skill：複数の skills を同時起動可能；直接競合する skill ペアはブロック
+- Plan steps 先行ロード：`_preload_skills_from_plan_steps` が plan steps テキストをスキャンし実行前に先行プリロード
+
+**内蔵 skills**（本リリースでリライト）：
+- `research-orchestrator-pro`：協調型分析決定ハブ、RAG 検索ガイド内蔵
+- `scientific-reasoning-lab`：5 フェーズ自己反復推論エンジン、RAG 検索ガイド内蔵
 
 本リポジトリの skill 構成：
 
 - 再利用基盤：`skills/code-review`、`skills/agent-builder`、`skills/mcp-builder`、`skills/pdf`
 - 拡張生成：`skills/generated/*`
 - プロトコル/インデックス：`skills/clawhub/`、`skills/skills_Gen/`
-
-対応プロトコル：
-
-- ローカルファイル型
-- HTTP JSON provider manifest 型
 
 ## 8. API サマリ
 
@@ -603,17 +1013,45 @@ stateDiagram-v2
 
 ## 9. クイックスタート
 
-### 9.1 必要環境
+### 9.0 PyPI インストール（推奨）
+
+```bash
+pip install clouds-coder
+```
+
+インストール後、直接起動：
+
+```bash
+clouds-coder --host 0.0.0.0 --port 8080
+```
+
+- Agent UI：`http://127.0.0.1:8080`
+- Skills Studio：`http://127.0.0.1:8081`（無効化可能）
+
+> PyPI ページ：https://pypi.org/project/clouds-coder/
+
+### 9.1 必要環境（ソースインストール）
 
 - Python 3.10+
 - Ollama（ローカルモデル運用向け、推奨）
-- 依存インストール：
+- 依存インストール（フルのソース導入プレビュー / 解析対応を有効化）：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 9.2 起動
+このソース導入依存で、ランタイムが使うリッチプレビュー解析スタックを有効化します。
+
+- PDF: `pdfminer.six`, `PyMuPDF`
+- CSV / 分析テーブル: `pandas`
+- Excel: `openpyxl`, `xlrd`
+- Word: `python-docx`
+- PowerPoint: `python-pptx`
+- 画像アセット処理: `Pillow`
+
+`pdftotext`、`xls2csv`、`antiword`、`catdoc`、`catppt`、`textutil` などの OS 補助ツールは旧形式 fallback の品質を上げますが、基本のソース導入必須条件ではありません。
+
+### 9.2 起動（ソースインストール）
 
 ```bash
 python Clouds_Coder.py --host 0.0.0.0 --port 8080
@@ -693,7 +1131,7 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 ## 11.1 アーキテクチャ上の優位性
 
 - All-in-one 単一ファイルカーネル（`Clouds_Coder.py`）：agent loop、ツールルータ、セッション状態機械、HTTP API、SSE、Web UI bridge、Skills Studio を同一プロセスに統合し、サービス間オーケストレーション負荷と分散障害点を削減。
-- 軽量かつ展開容易：依存は最小限（`requirements.txt`）、単一コマンドで起動可能。さらに PyInstaller/Nuitka の onedir/onefile 配布経路を標準化。
+- 柔軟な導入プロファイル：PyPI 導入は軽量なベースランタイムを維持し、ソース導入では `requirements.txt` により PDF / Office / 表計算 / 画像プレビュー依存を有効化できます。さらに PyInstaller/Nuitka の onedir/onefile 配布経路も維持しています。
 - ネイティブなマルチモーダル対応：プロバイダ能力推定と media endpoint ルーティングをプロファイル解析に内蔵し、画像/音声/動画ワークフローを追加プロキシなしで扱える。
 - ローカル + Web モデル広域対応と小規模モデル最適化：Ollama と OpenAI-compatible を併用しつつ、context 予算制御、切断継続、idle 回復、統一 timeout により小モデル運用時の失敗率を抑制。
 

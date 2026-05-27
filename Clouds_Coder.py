@@ -208,6 +208,7 @@ CODE_PARSE_TIMEOUT_SECONDS = max(
     10,
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
+DEFAULT_CONTEXT_TOKEN_LIMIT = 200_000
 TOKEN_THRESHOLD = 1_000_000
 CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
     0.01,
@@ -342,6 +343,18 @@ MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 3
+READ_FILE_LOOP_THRESHOLD = 6
+READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
+READ_FILE_COMPACT_PIN_DISTINCT = 8
+READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
+READ_CONTEXT_REGISTRY_MAX = 80
+READ_CONTEXT_PROMPT_MAX_ITEMS = 14
+READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
+READ_CONTEXT_SUMMARY_MAX_CHARS = 520
+READ_CONTEXT_SHARED_MAX_ITEMS = 4
+READ_CONTEXT_POLICY_CHOICES = {"auto", "conservative", "balanced", "wide"}
+DEFAULT_READ_CONTEXT_POLICY = "auto"
+DEFAULT_AUTO_TASK_LEVEL_CEILING = 0  # 0 = no cap; applies only to automatic L1-L5 classification.
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 15
@@ -451,6 +464,13 @@ COMPACT_TIER3_PCT = 0.10   # <10%: tier 3 heavy
 # Absolute minimums — prevent percentage instability at low ctx_left
 COMPACT_TIER1_ABS = 3000
 COMPACT_TIER2_ABS = 1500
+CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
+    5.0,
+    min(
+        300.0,
+        float(str(os.getenv("AGENT_CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN", "45") or "45")),
+    ),
+)
 # File buffer
 FILE_BUFFER_CONTENT_THRESHOLD = 2000  # chars: content larger than this gets offloaded
 FILE_BUFFER_MAX_FILES = 500
@@ -2300,6 +2320,138 @@ def extract_shell_command_timeout_setting(raw: object) -> int | None:
         for key in keys:
             if key in section:
                 return _parse_timeout(section.get(key))
+    return None
+
+
+def extract_context_token_limit_setting(raw: object) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+
+    def _parse_limit(value: object) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            text = str(value).strip().replace("_", "")
+            if not text:
+                return None
+            return int(float(text))
+        except Exception:
+            return None
+
+    keys = (
+        "ctx_limit",
+        "context_token_limit",
+        "context_limit",
+        "max_context_tokens",
+        "session_context_token_limit",
+    )
+    for key in keys:
+        if key in raw:
+            return _parse_limit(raw.get(key))
+    for section_key in ("startup", "runtime", "context", "compact", "limits"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return _parse_limit(section.get(key))
+    return None
+
+
+def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO_TASK_LEVEL_CEILING) -> int:
+    """Normalize automatic task-complexity cap.
+
+    Returns 0 for no cap, or 1-5. This is intentionally separate from
+    runtime_task_level_ceiling, which is a per-run plan/risk lock.
+    """
+    try:
+        if value is None or isinstance(value, bool):
+            raw = int(default or 0)
+        else:
+            text = str(value).strip().upper().replace("LEVEL", "").replace("L", "")
+            if text in {"", "NONE", "NO", "OFF", "FALSE", "UNLIMITED", "AUTO"}:
+                raw = 0
+            else:
+                raw = int(float(text))
+    except Exception:
+        raw = int(default or 0)
+    if raw in TASK_LEVEL_CHOICES:
+        return int(raw)
+    return 0
+
+
+def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = (
+        "auto_task_level_ceiling",
+        "autoTaskLevelCeiling",
+        "task_level_ceiling",
+        "taskLevelCeiling",
+        "max_auto_task_level",
+        "maxAutoTaskLevel",
+        "complexity_ceiling",
+        "complexityCeiling",
+        "auto_complexity_ceiling",
+        "autoComplexityCeiling",
+        "max_auto_complexity",
+        "maxAutoComplexity",
+    )
+    for key in keys:
+        if key in raw:
+            return normalize_auto_task_level_ceiling(raw.get(key))
+    for section_key in ("startup", "runtime", "classification", "manager", "agent", "limits"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_auto_task_level_ceiling(section.get(key))
+    return None
+
+
+def normalize_read_context_policy(value: object, default: str = DEFAULT_READ_CONTEXT_POLICY) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    alias = {
+        "adaptive": "auto",
+        "tier": "auto",
+        "tiered": "auto",
+        "compact": "conservative",
+        "strict": "conservative",
+        "safe": "conservative",
+        "normal": "balanced",
+        "default": "balanced",
+        "loose": "wide",
+        "expanded": "wide",
+        "rich": "wide",
+    }
+    raw = alias.get(raw, raw)
+    if raw in READ_CONTEXT_POLICY_CHOICES:
+        return raw
+    return normalize_read_context_policy(default, "auto") if str(default or "").strip().lower() != raw else "auto"
+
+
+def extract_read_context_policy_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = (
+        "read_context_policy",
+        "readContextPolicy",
+        "read_context_mode",
+        "readContextMode",
+        "read_context_budget",
+        "readContextBudget",
+    )
+    for key in keys:
+        if key in raw:
+            return normalize_read_context_policy(raw.get(key))
+    for section_key in ("startup", "runtime", "context", "compact", "tools", "agent"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_read_context_policy(section.get(key))
     return None
 
 
@@ -6954,7 +7106,7 @@ Use this skill when the agent shows model degradation symptoms:
 2. Record concrete evidence (exact errors / statuses / turn pattern) before changing strategy.
 
 ## Recovery Workflow (Mandatory Order)
-1. If context may be missing, call `context_recall` first.
+1. If context may be missing, call `context_recall` with `mode="summary"` first, then use `mode="search"` or `mode="window"` for focused evidence.
 2. Build or repair todo plan with 3-7 items (one `in_progress`) via `TodoWrite` or `TodoWriteRescue`.
 3. Enter strict execution mode:
    - execute exactly ONE tool call per round,
@@ -6986,7 +7138,7 @@ Return:
 
 # Fast Decision Rules
 
-1. Missing context -> `context_recall`.
+1. Missing context -> `context_recall mode="summary"`, then `mode="search"` or `mode="window"` for focused evidence.
 2. No todo plan -> `TodoWriteRescue`.
 3. Repeated tool failure -> one-tool strict retry with smaller chunk.
 4. Still failing -> explicit blocker, stop loop.
@@ -10063,7 +10215,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "# Context Management Guide\n"
             "- Context has a token upper bound; keep steps compact.\n"
             "- When <compact-resume> hint appears, inherit pending todos and continue immediately.\n"
-            "- After compaction, use context_recall to fetch archived messages by segment_id/query.\n"
+            "- After compaction, use context_recall mode='summary' to map archived messages, then mode='search' or mode='window' for focused evidence.\n"
             "- Do not guess content that was compacted away—recall it first.\n"
             "- For large tasks, break into subtasks to avoid context overflow.\n"
         ),
@@ -11677,6 +11829,16 @@ class MessageBus:
                 out.append(row)
         return out
 
+    def peek_inbox(self, name: str) -> list[dict]:
+        path = self._path(name)
+        if not path.exists():
+            return []
+        with self.lock:
+            payload = self.crypto.read_json(path, [])
+            if not isinstance(payload, list):
+                payload = []
+        return [row for row in payload if isinstance(row, dict)]
+
     def broadcast(self, sender: str, content: str, names: list[str]) -> str:
         count = 0
         for name in names:
@@ -11898,6 +12060,10 @@ class WorktreeManager:
         payload = self.crypto.read_json(self.events_path, [])
         out = payload[-n:] if isinstance(payload, list) else []
         return json_dumps(out, indent=2)
+
+    def events_objects(self) -> list[dict]:
+        payload = self.crypto.read_json(self.events_path, [])
+        return [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
 
 class OllamaError(RuntimeError):
     def __init__(
@@ -13414,7 +13580,8 @@ TOOLS = [
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
-            "and mode='full' when complete content is explicitly needed."
+            "and mode='full' when complete content is explicitly needed. Successful reads are remembered in "
+            "the read-context registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
@@ -13473,16 +13640,42 @@ TOOLS = [
         ["path", "content"],
     ),
     tool_def("scan_skills", "Force reload skills from ./skills and return summary.", {}),
-    tool_def("compress", "Compress conversation context.", {}),
     tool_def(
-        "context_recall",
-        "Recall archived compacted context by segment id, query, or recent segments.",
+        "compress",
+        "Compress conversation context and optionally pin/drop remembered read contexts.",
         {
+            "keep_read_context": {
+                "type": "array",
+                "items": {},
+                "description": "Read-context ids, paths, signatures, or objects to keep/pin across compact.",
+            },
+            "drop_read_context": {
+                "type": "array",
+                "items": {},
+                "description": "Read-context ids, paths, signatures, or objects to remove from future prompt summaries.",
+            },
+        },
+    ),
+	    tool_def(
+	        "context_recall",
+	        (
+	            "Recall archived compacted context with focused modes. "
+	            "Use this tool, not read_from_blackboard, when the user says archived context, compacted context, previous segment, or context segment. "
+	            "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
+	            "or 'window' with around_index/context for nearby messages."
+	        ),
+        {
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
             "segment_id": {"type": "string"},
             "query": {"type": "string"},
+            "role": {"type": "string"},
+            "tool_name": {"type": "string"},
+            "around_index": {"type": "integer"},
+            "context": {"type": "integer"},
+            "max_chars": {"type": "integer"},
             "recent_segments": {"type": "integer"},
             "max_messages": {"type": "integer"},
-            "offset": {"type": "integer"},
+            "offset": {"type": "integer", "description": "Legacy offset for compatibility; prefer query or around_index/context."},
             "include_tools": {"type": "boolean"},
         },
     ),
@@ -13534,11 +13727,37 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-    tool_def("check_background", "Check background tasks.", {"task_id": {"type": "string"}}),
+	    tool_def(
+	        "check_background",
+	        (
+	            "Inspect background tasks with summary/search/detail/tail modes. "
+	            "If the user names an error token, command text, or output text such as E123 or pytest, use mode='search' with query. "
+	            "Use tail only for recent jobs when no query is known."
+	        ),
+        {
+            "task_id": {"type": "string"},
+            "mode": {"type": "string", "enum": ["summary", "search", "detail", "tail"]},
+            "query": {"type": "string"},
+            "status": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("task_create", "Create task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
     tool_def("task_get", "Get task.", {"task_id": {"type": "integer"}}, ["task_id"]),
     tool_def("task_update", "Update task.", {"task_id": {"type": "integer"}, "status": {"type": "string"}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "add_blocks": {"type": "array", "items": {"type": "integer"}}}, ["task_id"]),
-    tool_def("task_list", "List tasks.", {}),
+    tool_def(
+        "task_list",
+        "List tasks with optional status/owner/query filters and summary/detail modes.",
+        {
+            "mode": {"type": "string", "enum": ["summary", "search", "detail", "recent"]},
+            "query": {"type": "string"},
+            "status": {"type": "string"},
+            "owner": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("claim_task", "Claim task.", {"task_id": {"type": "integer"}}, ["task_id"]),
     tool_def("spawn_teammate", "Spawn teammate thread.", {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, ["name", "role", "prompt"]),
     tool_def("list_teammates", "List teammates.", {}),
@@ -13552,9 +13771,13 @@ TOOLS = [
         },
         ["to", "intent", "content"],
     ),
-    tool_def(
-        "read_from_blackboard",
-        "Read current shared blackboard state or one section.",
+	    tool_def(
+	        "read_from_blackboard",
+	        (
+	            "Read shared multi-agent blackboard state with summary/search/recent/window/detail modes. "
+	            "Use this for research_notes, execution_logs, review_feedback, code_artifacts, and status; "
+	            "use context_recall instead for archived or compacted conversation context."
+	        ),
         {
             "section": {
                 "type": "string",
@@ -13569,6 +13792,13 @@ TOOLS = [
                     "status",
                 ],
             },
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
+            "query": {"type": "string"},
+            "actor": {"type": "string"},
+            "status": {"type": "string"},
+            "around_index": {"type": "integer"},
+            "context": {"type": "integer"},
+            "max_chars": {"type": "integer"},
             "limit": {"type": "integer"},
         },
     ),
@@ -13597,7 +13827,18 @@ TOOLS = [
         ["section", "content"],
     ),
     tool_def("send_message", "Send message.", {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string"}}, ["to", "content"]),
-    tool_def("read_inbox", "Read lead inbox.", {}),
+    tool_def(
+        "read_inbox",
+        "Read lead inbox. Use mode='peek' to inspect without draining, mode='search' to find messages, or mode='drain' to consume them.",
+        {
+            "mode": {"type": "string", "enum": ["peek", "drain", "search", "summary"]},
+            "query": {"type": "string"},
+            "from": {"type": "string"},
+            "type": {"type": "string"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
     tool_def("broadcast", "Broadcast to teammates.", {"content": {"type": "string"}}, ["content"]),
     tool_def("shutdown_request", "Request teammate shutdown.", {"teammate": {"type": "string"}}, ["teammate"]),
     tool_def("plan_approval", "Respond to plan approval request.", {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, ["request_id", "approve"]),
@@ -13607,7 +13848,23 @@ TOOLS = [
     tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
-    tool_def("worktree_events", "Read worktree lifecycle events.", {"limit": {"type": "integer"}}),
+	    tool_def(
+	        "worktree_events",
+	        (
+	            "Read worktree lifecycle events with summary/search/detail modes. "
+	            "For a worktree name like alpha, set worktree='alpha'; do not put worktree names in event. "
+	            "For known failure text use mode='search' and query='failed' or the exact error; event is for lifecycle names like worktree.remove.failed."
+	        ),
+        {
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
+            "query": {"type": "string"},
+            "event": {"type": "string"},
+            "worktree": {"type": "string"},
+            "task_id": {"type": "integer"},
+            "limit": {"type": "integer"},
+            "max_chars": {"type": "integer"},
+        },
+    ),
 ]
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
@@ -13721,11 +13978,12 @@ class SessionState:
         repo_root: Path,
         thinking: bool = False,
         default_llm_config: dict | None = None,
-        context_token_limit: int = TOKEN_THRESHOLD,
+        context_token_limit: int = DEFAULT_CONTEXT_TOKEN_LIMIT,
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -13875,6 +14133,7 @@ class SessionState:
         self.runtime_complexity_floor = ""
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
+        self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
@@ -13902,6 +14161,11 @@ class SessionState:
         self.last_explorer_instruction_hash = ""
         self.bash_read_loop_fp = ""
         self.bash_read_loop_count = 0
+        self.read_file_loop_recent: list[str] = []
+        self.read_file_loop_state: dict[str, dict] = {}
+        self.read_file_loop_count = 0
+        self.read_file_loop_last_intervention_ts = 0.0
+        self.read_context_registry: dict[str, dict] = {}
         self.stall_severity_score = 0
         self.stall_severity_sources: list[dict] = []
         self.stall_escalation_triggered = False
@@ -13949,6 +14213,16 @@ class SessionState:
         self.context_limit_locked = bool(context_limit_locked)
         self.context_token_upper_bound = self.max_context_token_limit
         self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+        self.context_limit_source = "configured"
+        self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
+        self.context_last_compact_before: dict = {}
+        self.context_last_compact_after: dict = {}
+        self.context_last_compact_effective = True
+        self.context_last_compact_used_reduction = 0
+        self.context_last_compact_skip_ts = 0.0
+        self.context_last_compact_skip_reason = ""
+        self.context_last_next_call_estimate = 0
+        self.context_last_next_call_label = ""
         self.last_context_actual_prompt_tokens = 0
         self.last_context_actual_completion_tokens = 0
         self.last_context_actual_total_tokens = 0
@@ -14703,6 +14977,9 @@ class SessionState:
             self.failed_selections = []
         self._apply_active_profile()
         self._ensure_active_profile_capabilities(force_probe=False)
+        cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(config)
+        if cfg_auto_task_level_ceiling is not None:
+            self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
         self.updated_at = now_ts()
         self._persist()
         self._emit(
@@ -14861,6 +15138,44 @@ class SessionState:
                     )
                 except Exception:
                     self.context_estimate_calibration = float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)
+                self.context_limit_source = trim(str(raw.get("context_limit_source", self.context_limit_source) or "configured"), 80)
+                self.read_context_policy = normalize_read_context_policy(
+                    raw.get("read_context_policy", getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
+                )
+                self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                    raw.get(
+                        "auto_task_level_ceiling",
+                        getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
+                    )
+                )
+                self.context_last_compact_before = (
+                    dict(raw.get("context_last_compact_before", {}) or {})
+                    if isinstance(raw.get("context_last_compact_before", {}), dict)
+                    else {}
+                )
+                self.context_last_compact_after = (
+                    dict(raw.get("context_last_compact_after", {}) or {})
+                    if isinstance(raw.get("context_last_compact_after", {}), dict)
+                    else {}
+                )
+                self.context_last_compact_effective = bool(
+                    raw.get("context_last_compact_effective", self.context_last_compact_effective)
+                )
+                self.context_last_compact_used_reduction = max(
+                    0, int(raw.get("context_last_compact_used_reduction", 0) or 0)
+                )
+                self.context_last_compact_skip_ts = max(
+                    0.0, float(raw.get("context_last_compact_skip_ts", 0.0) or 0.0)
+                )
+                self.context_last_compact_skip_reason = trim(
+                    str(raw.get("context_last_compact_skip_reason", "") or ""), 160
+                )
+                self.context_last_next_call_estimate = max(
+                    0, int(raw.get("context_last_next_call_estimate", 0) or 0)
+                )
+                self.context_last_next_call_label = trim(
+                    str(raw.get("context_last_next_call_label", "") or ""), 80
+                )
                 self.last_context_actual_prompt_tokens = max(0, int(raw.get("last_context_actual_prompt_tokens", 0) or 0))
                 self.last_context_actual_completion_tokens = max(0, int(raw.get("last_context_actual_completion_tokens", 0) or 0))
                 self.last_context_actual_total_tokens = max(0, int(raw.get("last_context_actual_total_tokens", 0) or 0))
@@ -14915,6 +15230,9 @@ class SessionState:
                                 "summary": trim(str(entry.get("summary", "") or ""), 200),
                             }
                     self.file_buffer_index = clean_fbi
+                self.read_context_registry = self._normalize_read_context_registry(
+                    raw.get("read_context_registry", {})
+                )
                 self.last_compact_reason = str(raw.get("last_compact_reason", self.last_compact_reason) or "")
                 self.last_compact_ts = float(raw.get("last_compact_ts", self.last_compact_ts) or 0.0)
                 pref = str(raw.get("plan_mode_user_preference", "auto") or "auto").lower()
@@ -15080,6 +15398,12 @@ class SessionState:
                 self.runtime_task_level_ceiling = int(
                     raw.get("runtime_task_level_ceiling", self.runtime_task_level_ceiling) or 0
                 )
+                self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                    raw.get(
+                        "auto_task_level_ceiling",
+                        getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
+                    )
+                )
                 self.runtime_goal_reset_pending = bool(
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
@@ -15215,6 +15539,18 @@ class SessionState:
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
             "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            "context_limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
+            "context_last_compact_before": dict(getattr(self, "context_last_compact_before", {}) or {}),
+            "context_last_compact_after": dict(getattr(self, "context_last_compact_after", {}) or {}),
+            "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
+            "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
+            "context_last_compact_skip_ts": float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0),
+            "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+            "context_last_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
+            "context_last_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
+            "read_context_policy": normalize_read_context_policy(
+                getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+            ),
             "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
             "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
             "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
@@ -15227,6 +15563,9 @@ class SessionState:
             "truncation_rescue_task_ids": self.truncation_rescue_task_ids[:12],
             "context_archives": self.context_archives[-MAX_CONTEXT_ARCHIVE_SEGMENTS:],
             "file_buffer_index": dict(self.file_buffer_index) if self.file_buffer_index else {},
+            "read_context_registry": self._normalize_read_context_registry(
+                getattr(self, "read_context_registry", {})
+            ),
             "last_compact_reason": self.last_compact_reason,
             "last_compact_ts": self.last_compact_ts,
             "plan_mode_user_preference": str(self.plan_mode_user_preference or "auto"),
@@ -15271,6 +15610,9 @@ class SessionState:
             "runtime_complexity_floor": str(self.runtime_complexity_floor or ""),
             "runtime_task_level_floor": int(self.runtime_task_level_floor or 0),
             "runtime_task_level_ceiling": int(self.runtime_task_level_ceiling or 0),
+            "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            ),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
             "runtime_plan_mode_needed": bool(self.runtime_plan_mode_needed),
             "runtime_plan_approved": bool(self.runtime_plan_approved),
@@ -15396,6 +15738,10 @@ class SessionState:
         self.tool_retry_counts = {}
         self.bash_read_loop_fp = ""
         self.bash_read_loop_count = 0
+        self.read_file_loop_recent = []
+        self.read_file_loop_state = {}
+        self.read_file_loop_count = 0
+        self.read_file_loop_last_intervention_ts = 0.0
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
@@ -16151,6 +16497,80 @@ class SessionState:
         loaded = bb.get("loaded_skills", {})
         return loaded if isinstance(loaded, dict) else {}
 
+    def _loaded_skill_body_from_cache(self, skill_key: str, row: dict | None = None) -> str:
+        key = str(skill_key or "").strip()
+        if not key:
+            return ""
+        cache_row = self.skill_load_cache.get(key, {})
+        if isinstance(cache_row, dict):
+            body_z = str(cache_row.get("body_z", "") or "")
+            if body_z:
+                body = decompress_text_blob(body_z)
+                if body:
+                    return body
+        meta_row = row if isinstance(row, dict) else {}
+        skill_path = str(meta_row.get("skill_path", "") or "").strip()
+        if skill_path:
+            try:
+                path_obj = Path(skill_path)
+                if path_obj.exists() and path_obj.is_file():
+                    return path_obj.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        return ""
+
+    def _loaded_skills_context_block(self, *, for_role: str = "", max_chars: int = 7000) -> str:
+        """Bounded active-skill instructions rehydrated on every prompt.
+
+        The original <loaded-skill> message may be compacted, so each model
+        call gets a small workflow-critical copy from the skill cache/path.
+        """
+        loaded = self._loaded_skill_rows()
+        if not loaded:
+            return ""
+        budget = max(800, int(max_chars or 7000))
+        parts: list[str] = [
+            "ACTIVE SKILL WORKFLOWS (rehydrated):",
+            "Treat these instructions as active operating procedure for matching steps. "
+            "If they conflict with a generic plan, the skill workflow wins.",
+        ]
+        remaining = budget
+        for skill_key, row_obj in list(loaded.items())[:5]:
+            row = row_obj if isinstance(row_obj, dict) else {}
+            skill_name = str(row.get("skill_name", skill_key) or skill_key).strip() or skill_key
+            skill_path = str(row.get("skill_path", "") or "").strip()
+            body = self._loaded_skill_body_from_cache(str(skill_key), row)
+            preview = trim(str(row.get("preview", "") or ""), 600)
+            source = body or preview
+            if not source:
+                continue
+            per_skill = max(600, min(2600, remaining // max(1, len(loaded))))
+            excerpt = trim(source, per_skill)
+            header = f"\n<active-skill name=\"{skill_name}\" key=\"{skill_key}\""
+            if skill_path:
+                header += f" path=\"{skill_path}\""
+            header += ">"
+            block = f"{header}\n{excerpt}\n</active-skill>"
+            parts.append(block)
+            remaining -= max(1, len(block))
+            if remaining <= 600:
+                break
+        if len(parts) <= 2:
+            return ""
+        role_note = ""
+        role_key = str(for_role or "").strip().lower()
+        if role_key == "manager":
+            role_note = (
+                "\nManager duty: delegate with the concrete tools/scripts/files from the active skill; "
+                "do not replace the skill workflow with a generic approach."
+            )
+        elif role_key:
+            role_note = (
+                "\nWorker duty: before acting, map the current step to the active skill workflow and "
+                "use the specified tools/scripts/files when applicable."
+            )
+        return trim("\n".join(parts) + role_note + "\n", budget)
+
     def _clear_loaded_skill_contexts(self):
         def _filter_rows(rows: list[dict]) -> list[dict]:
             kept: list[dict] = []
@@ -16428,8 +16848,6 @@ class SessionState:
             ({"ppt", "ppt-master", "pptx", "academic-pptx", "slide-making-skill"}, "Presentation/PPT processing"),
             # Research orchestrators
             ({"deep-research-orchestrator", "research-orchestrator-pro"}, "Research orchestration"),
-            # Frontend design
-            ({"frontend-design", "frontend-composition-algorithm", "canvas-design", "web-artifacts-builder"}, "Frontend/web design"),
         ]
         # Normalize: strip common prefixes/suffixes for matching
         def _norm(name: str) -> set[str]:
@@ -16561,7 +16979,9 @@ class SessionState:
         Keeps all three modes in sync — change here propagates everywhere.
         """
         hint = self._loaded_skills_prompt_hint(for_role=for_role)
-        return f"{hint}\nSkills:\n{self.skills.descriptions()}\n"
+        active = self._loaded_skills_context_block(for_role=for_role, max_chars=6500)
+        active_block = f"\n{active}\n" if active else "\n"
+        return f"{hint}{active_block}Skills:\n{self.skills.descriptions()}\n"
 
     def _refresh_runtime_code_reference(self, text: str):
         cb = getattr(self, "reference_prepare_callback", None)
@@ -16775,6 +17195,8 @@ class SessionState:
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
         knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
+        read_context_block = self._read_context_prompt_block()
+        read_context_text = f"{read_context_block}\n\n" if read_context_block else ""
         _is_single_no_enhance = (
             runtime_mode == EXECUTION_MODE_SINGLE
             and not self.single_advance_prompt_enhance
@@ -16786,6 +17208,8 @@ class SessionState:
                 "Use load_skill for workspace-paths and tool-best-practices if needed. "
                 "Use list_skills to discover available skills for specific tasks. "
             )
+        skill_context_block = self._loaded_skills_context_block(for_role="developer", max_chars=7000)
+        skill_context = f"{skill_context_block}\n" if skill_context_block else ""
         plan_steps_block = ""
         plan_ctx = self._plan_steps_context_for_manager()
         if plan_ctx:
@@ -16809,10 +17233,13 @@ class SessionState:
             f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{_detect_os_shell_instruction()} "
-            "Use tools to inspect, edit, and execute. "
+	            "Use tools to inspect, edit, and execute. "
+	            "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When inspecting collections or memory, use focused modes too: context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
+            f"{skill_context}"
             f"{mm_hint}"
             f"{plan_steps_block}"
             f"{plan_todo_block}"
@@ -16821,6 +17248,7 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{read_context_text}"
             f"{knowledge_ref_block_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
@@ -17071,7 +17499,198 @@ class SessionState:
             "last_actual_age_seconds": round(float(actual_age), 3) if getattr(self, "last_context_actual_ts", 0.0) else None,
             "last_estimated_prompt_tokens": int(actual_estimate_at_call),
             "calibration_max": float(CONTEXT_USAGE_CALIBRATION_MAX),
+            "limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
         }
+
+    def _context_window_error_hint(self, exc: Exception | str) -> bool:
+        text = str(exc or "").lower()
+        if not text:
+            return False
+        markers = (
+            "context length",
+            "context window",
+            "maximum context",
+            "max context",
+            "num_ctx",
+            "prompt too long",
+            "too many tokens",
+            "token limit",
+            "input is too long",
+            "reduce the length",
+            "exceeds the context",
+            "exceeded context",
+            "context overflow",
+        )
+        return any(marker in text for marker in markers)
+
+    def _shrink_context_upper_bound_from_actual_pressure(
+        self,
+        *,
+        estimated_prompt_tokens: int,
+        reason: str,
+    ) -> bool:
+        if self.context_limit_locked:
+            return False
+        old_bound = int(self.context_token_upper_bound or self.max_context_token_limit)
+        prompt = max(MIN_CONTEXT_TOKEN_LIMIT, int(estimated_prompt_tokens or 0))
+        if prompt <= 0:
+            return False
+        # This is only used after the provider reports a context-window failure.
+        # Leave enough room for recovery prompts, but never infer model context from output length.
+        new_bound = max(MIN_CONTEXT_TOKEN_LIMIT, min(old_bound - 1, int(prompt * 0.96)))
+        if new_bound >= old_bound:
+            return False
+        self.context_token_upper_bound = new_bound
+        self.context_limit_source = f"provider-context-error:{trim(str(reason or 'unknown'), 48)}"
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "context upper bound adjusted from provider context error "
+                    f"{old_bound}->{new_bound} (estimated_prompt≈{prompt})"
+                )
+            },
+        )
+        return True
+
+    def _context_metrics_for_model_call(
+        self,
+        messages: list[dict],
+        *,
+        tools: list | None = None,
+        system: str = "",
+        media_inputs: list[dict] | None = None,
+        label: str = "",
+        record: bool = True,
+    ) -> dict:
+        estimate = self._estimate_model_call_prompt_tokens(
+            messages if isinstance(messages, list) else [],
+            tools=tools,
+            system=system,
+            media_inputs=media_inputs,
+        )
+        label_text = trim(str(label or ""), 80)
+        if record:
+            self.context_last_next_call_estimate = int(estimate)
+            self.context_last_next_call_label = label_text
+        metrics = self._context_budget_metrics(token_estimate=estimate)
+        metrics["estimate_source"] = "next-model-call"
+        metrics["next_call_label"] = label_text
+        return metrics
+
+    def _role_specific_context_is_live_call(self, role: str) -> bool:
+        role_key = self._sanitize_agent_role(role)
+        if not role_key:
+            return False
+        if self._is_multi_agent_mode():
+            return True
+        phase = str(self.current_phase or "").strip().lower()
+        active = str(self.active_agent_role or "").strip().lower()
+        return bool(
+            phase.startswith("plan-mode:")
+            and active == role_key
+            and bool(self._agent_context(role_key))
+        )
+
+    def _active_next_call_context_metrics(self, role: str = "", media_inputs: list[dict] | None = None) -> dict:
+        raw_role = str(role or self.active_agent_role or "").strip().lower()
+        if raw_role == "manager":
+            return self._context_metrics_for_model_call(
+                self.manager_context,
+                tools=self._manager_route_tools(),
+                system=self._manager_system_prompt(),
+                media_inputs=media_inputs,
+                label="manager next turn",
+            )
+        role_key = self._sanitize_agent_role(raw_role)
+        role_ctx = self._agent_context(role_key) if role_key in AGENT_ROLES else []
+        if role_key in AGENT_ROLES and self._role_specific_context_is_live_call(role_key):
+            return self._context_metrics_for_model_call(
+                role_ctx,
+                tools=self._tools_for_agent(role_key),
+                system=self._agent_role_system_prompt(role_key),
+                media_inputs=media_inputs,
+                label=f"{role_key} next turn",
+            )
+        return self._context_metrics_for_model_call(
+            self.messages,
+            tools=TOOLS,
+            system=self._system_prompt(),
+            media_inputs=media_inputs,
+            label="single-agent next turn",
+        )
+
+    def _agent_context_budget_metrics_snapshot(self) -> list[dict]:
+        rows: list[dict] = []
+        active = str(self.active_agent_role or "").strip().lower()
+        candidates: list[str] = []
+        multi_mode = self._is_multi_agent_mode()
+        plan_role_active = bool(
+            (not multi_mode)
+            and active in AGENT_ROLES
+            and str(self.current_phase or "").strip().lower().startswith("plan-mode:")
+        )
+        if multi_mode:
+            candidates.append("manager")
+        if multi_mode:
+            role_order = list(self.runtime_participants or [])
+            for role in role_order:
+                role_key = self._sanitize_agent_role(role)
+                if role_key and role_key not in candidates:
+                    candidates.append(role_key)
+        elif plan_role_active:
+            candidates.append(active)
+        if not candidates:
+            candidates = ["single"]
+        for role in candidates:
+            try:
+                if role == "manager":
+                    messages = self.manager_context
+                    tools = self._manager_route_tools()
+                    system = self._manager_system_prompt()
+                    label = "manager next turn"
+                    msg_count = len(self.manager_context)
+                    display = backend_role_label("manager", getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+                elif role in AGENT_ROLES:
+                    ctx = self._agent_context(role)
+                    messages = ctx
+                    tools = self._tools_for_agent(role)
+                    system = self._agent_role_system_prompt(role)
+                    label = f"{role} next turn"
+                    msg_count = len(ctx)
+                    display = self._agent_display_name(role)
+                else:
+                    messages = self.messages
+                    tools = TOOLS
+                    system = self._system_prompt()
+                    label = "single-agent next turn"
+                    msg_count = len(self.messages)
+                    display = "Single"
+                metrics = self._context_metrics_for_model_call(
+                    messages,
+                    tools=tools,
+                    system=system,
+                    label=label,
+                    record=False,
+                )
+                rows.append(
+                    {
+                        "role": role,
+                        "label": display,
+                        "active": bool(active == role),
+                        "used": int(metrics.get("used", 0) or 0),
+                        "left": int(metrics.get("left", 0) or 0),
+                        "left_percent": round(float(metrics.get("left_percent", 0.0)), 2),
+                        "effective_limit": int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0),
+                        "tier": int(self._context_compression_tier(metrics)),
+                        "message_count": int(msg_count),
+                        "next_call_label": str(metrics.get("next_call_label", "") or label),
+                    }
+                )
+            except Exception:
+                continue
+        rows.sort(key=lambda x: (float(x.get("left_percent", 100.0)), int(x.get("left", 0) or 0)))
+        return rows
 
     def _context_compression_tier(self, metrics: dict | None = None) -> int:
         """Return compression tier 0-3 based on context budget.
@@ -17104,43 +17723,137 @@ class SessionState:
             "manager_context": [MANAGER_CTX_LIMIT_TIER0, MANAGER_CTX_LIMIT_TIER1, MANAGER_CTX_LIMIT_TIER2, MANAGER_CTX_LIMIT_TIER3][t],
         }
 
-    def _compact_agent_contexts(self, tier: int):
-        """Compress agent_messages, manager_context, and per-role contexts based on tier."""
-        limits = self._tier_agent_context_limits(tier)
-        am_limit = limits["agent_messages"]
-        ctx_limit = limits["context_per_role"]
-        mgr_limit = limits["manager_context"]
-        # 1. Microcompact agent messages (tier >= 1)
-        if tier >= 1:
-            keep = max(1, 3 - tier)  # tier1=2, tier2=1, tier3=0(but min 1)
-            self._microcompact_agent_messages(self.agent_messages, keep_recent=keep)
-        # 2. Trim agent_messages to limit
-        if len(self.agent_messages) > am_limit:
-            self.agent_messages = self.agent_messages[-am_limit:]
-        # 3. Trim manager_context
-        if len(self.manager_context) > mgr_limit:
-            self.manager_context = self.manager_context[-mgr_limit:]
-        # 4. Trim per-role contexts
-        for role in AGENT_ROLES:
-            ctx = self.contexts.get(role, [])
-            if len(ctx) > ctx_limit:
-                self.contexts[role] = ctx[-ctx_limit:]
-        # 5. Tier 2+: offload large content in agent messages to file buffer
+    def _loaded_skill_stub_content(self, content: str) -> str:
+        raw = str(content or "")
+        if "<loaded-skill name=" not in raw:
+            return raw
+        match = re.search(r'<loaded-skill\s+name=["\']([^"\']+)["\']', raw)
+        key = str(match.group(1) if match else "").strip()
+        row = self._loaded_skill_rows().get(key, {}) if key else {}
+        skill_name = str((row if isinstance(row, dict) else {}).get("skill_name", key) or key or "skill").strip()
+        skill_path = str((row if isinstance(row, dict) else {}).get("skill_path", "") or "").strip()
+        preview = trim(str((row if isinstance(row, dict) else {}).get("preview", "") or ""), 500)
+        path_note = f"\npath: {skill_path}" if skill_path else ""
+        preview_note = f"\npreview: {preview}" if preview else ""
+        return (
+            f"<loaded-skill-stub name=\"{skill_name}\" key=\"{key}\">"
+            f"{path_note}{preview_note}\n"
+            "Full skill instructions are rehydrated in the system prompt as ACTIVE SKILL WORKFLOWS. "
+            "Follow that workflow for matching steps."
+            "\n</loaded-skill-stub>"
+        )
+
+    def _compact_shared_context(self, tier: int):
+        if tier <= 0:
+            return
+        for msg in self.agent_messages:
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("agent_role", "") or "") != "shared":
+                continue
+            content = str(msg.get("content", "") or "")
+            if "<loaded-skill name=" in content:
+                msg["content"] = self._loaded_skill_stub_content(content)
+            elif tier >= 3 and len(content) > 1000:
+                msg["content"] = trim(content, 1000)
         if tier >= 2:
-            self._offload_agent_message_content(self.agent_messages)
-            self._offload_agent_message_content(self.manager_context)
-        # 6. Tier 3: aggressive content trimming
-        if tier >= 3:
+            self._compact_plan_context(tier)
+
+    def _compact_role_context(self, role: str, tier: int):
+        """Compact one model-call context without globally erasing peer roles."""
+        t = min(max(int(tier or 0), 0), 3)
+        if t <= 0:
+            return
+        role_raw = str(role or "").strip().lower()
+        limits = self._tier_agent_context_limits(t)
+        keep_recent = max(1, 3 - t)
+        if role_raw == "manager":
+            self._microcompact_agent_messages(self.manager_context, keep_recent=keep_recent)
+            if len(self.manager_context) > limits["manager_context"]:
+                self.manager_context = self.manager_context[-limits["manager_context"]:]
+            if t >= 2:
+                self._offload_agent_message_content(self.manager_context)
+            if t >= 3:
+                for msg in self.manager_context:
+                    content = str(msg.get("content", "") or "")
+                    if len(content) > 700:
+                        msg["content"] = trim(content, 700)
+            return
+
+        role_key = self._sanitize_agent_role(role_raw)
+        if not role_key:
+            return
+        scoped_rows = [
+            m for m in self.agent_messages
+            if isinstance(m, dict)
+            and (
+                str(m.get("agent_role", "") or "") == role_key
+                or (str(m.get("role", "") or "") == "user" and not str(m.get("agent_role", "") or "").strip())
+                or str(m.get("agent_role", "") or "") == "shared"
+            )
+        ]
+        self._microcompact_agent_messages(scoped_rows, keep_recent=keep_recent)
+        if t >= 2:
+            self._compact_shared_context(t)
+            self._offload_agent_message_content(
+                [
+                    m for m in self.agent_messages
+                    if isinstance(m, dict)
+                    and (
+                        str(m.get("agent_role", "") or "") == role_key
+                        or (str(m.get("role", "") or "") == "user" and not str(m.get("agent_role", "") or "").strip())
+                    )
+                ]
+            )
+        if t >= 3:
             for msg in self.agent_messages:
-                c = msg.get("content", "")
-                if isinstance(c, str) and len(c) > 600:
-                    msg["content"] = trim(c, 600)
-            for msg in self.manager_context:
-                c = msg.get("content", "")
-                if isinstance(c, str) and len(c) > 600:
-                    msg["content"] = trim(c, 600)
-        # 7. Plan mode context compression — tiered by ctx_left
-        self._compact_plan_context(tier)
+                if not isinstance(msg, dict):
+                    continue
+                msg_role = str(msg.get("agent_role", "") or "")
+                in_scope = msg_role == role_key or (str(msg.get("role", "") or "") == "user" and not msg_role)
+                if not in_scope:
+                    continue
+                content = str(msg.get("content", "") or "")
+                if len(content) > 700:
+                    msg["content"] = trim(content, 700)
+        role_limit = limits["context_per_role"]
+        scoped_indices = [
+            i for i, m in enumerate(self.agent_messages)
+            if isinstance(m, dict)
+            and (
+                str(m.get("agent_role", "") or "") == role_key
+                or (str(m.get("role", "") or "") == "user" and not str(m.get("agent_role", "") or "").strip())
+            )
+        ]
+        if len(scoped_indices) > role_limit:
+            keep = set(scoped_indices[-role_limit:])
+            self.agent_messages = [
+                m for i, m in enumerate(self.agent_messages)
+                if i not in scoped_indices or i in keep
+            ]
+        self.contexts[role_key] = self._agent_context(role_key)[-400:]
+
+    def _compact_agent_contexts(self, tier: int):
+        """Compress shared state and each role without flattening all agents together."""
+        t = min(max(int(tier or 0), 0), 3)
+        if t <= 0:
+            return
+        limits = self._tier_agent_context_limits(t)
+        self._compact_shared_context(t)
+        self._compact_role_context("manager", t)
+        for role in AGENT_ROLES:
+            self._compact_role_context(role, t)
+        am_limit = int(limits["agent_messages"])
+        if len(self.agent_messages) > int(am_limit * 1.5):
+            shared_rows = [
+                m for m in self.agent_messages
+                if isinstance(m, dict) and str(m.get("agent_role", "") or "") == "shared"
+            ][-12:]
+            tail = self.agent_messages[-am_limit:]
+            existing_ids = {id(m) for m in tail}
+            preserved = [m for m in shared_rows if id(m) not in existing_ids]
+            self.agent_messages = (preserved + tail)[-int(am_limit + len(preserved)):]
+        self._compact_plan_context(t)
 
     def _compact_plan_context(self, tier: int):
         """Compress plan mode context based on tier.
@@ -17206,21 +17919,41 @@ class SessionState:
                 if plan_phase not in ("executing", "awaiting_choice"):
                     self.runtime_plan_proposal = {}
 
-    def _apply_auto_compact_if_needed(self, reason: str = "auto") -> bool:
-        metrics = self._context_budget_metrics()
+    def _apply_auto_compact_if_needed(
+        self,
+        reason: str = "auto",
+        *,
+        metrics: dict | None = None,
+        role: str = "",
+        media_inputs: list[dict] | None = None,
+    ) -> bool:
+        metrics = metrics or self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         tier = self._context_compression_tier(metrics)
+        role_raw = str(role or self.active_agent_role or "").strip().lower()
+        role_key = "manager" if role_raw == "manager" else self._sanitize_agent_role(role_raw)
+        if role_key in AGENT_ROLES and not self._role_specific_context_is_live_call(role_key):
+            role_key = ""
         # Tier 1+: apply progressively aggressive microcompact
-        if tier >= 1:
+        if role_key and tier >= 1:
+            self._compact_role_context(role_key, tier)
+            if tier >= 2:
+                self._compact_shared_context(tier)
+        elif role_key:
+            if role_key == "manager":
+                self._microcompact_agent_messages(self.manager_context, keep_recent=3)
+            else:
+                self._microcompact_agent_messages(self._agent_context(role_key), keep_recent=3)
+        elif tier >= 1:
             keep = max(1, 3 - tier)
             self._microcompact(keep_recent=keep)
         else:
             self._microcompact()
         # Tier 2+: compact agent contexts proactively
-        if tier >= 2:
+        if tier >= 2 and not role_key:
             self._compact_agent_contexts(tier)
         # Re-check after tier-based compression. The effective limit keeps a
         # small hard reserve so auto-compact still has room to run.
-        metrics = self._context_budget_metrics()
+        metrics = self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         used = int(metrics.get("used", 0) or 0)
         effective_limit = max(1, int(metrics.get("effective_limit", metrics.get("limit", 0)) or 0))
         if used < effective_limit:
@@ -17228,7 +17961,13 @@ class SessionState:
         now_tick = now_ts()
         if (now_tick - float(self.last_compact_ts or 0.0)) < 0.8:
             return False
-        self._auto_compact(reason)
+        if (
+            not bool(getattr(self, "context_last_compact_effective", True))
+            and (now_tick - float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0))
+            < float(CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS)
+        ):
+            return False
+        self._auto_compact(reason, metrics=metrics, role=role, media_inputs=media_inputs)
         return True
 
     def _estimate_output_tokens(self, text: str, thinking_text: str = "", tool_calls: list | None = None) -> int:
@@ -17243,10 +17982,9 @@ class SessionState:
         return max(1, t_main + t_think + t_tools)
 
     def _derive_context_limit_from_output(self, output_tokens: int) -> int:
-        estimated = int(
-            max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, output_tokens * 12))
-        )
-        return max(MIN_CONTEXT_TOKEN_LIMIT, min(self.max_context_token_limit, estimated))
+        # Kept for compatibility with older call sites. Output length is not a
+        # reliable proxy for input context capacity, so never shrink from it.
+        return max(MIN_CONTEXT_TOKEN_LIMIT, int(self.max_context_token_limit))
 
     def _trim_truncated_tail_line(self, text: str) -> str:
         src = str(text or "")
@@ -17454,9 +18192,9 @@ class SessionState:
         if now_tick - self.last_truncation_ts >= 0.2:
             self.truncation_count += 1
         self.last_truncation_ts = now_tick
-        old_bound = int(self.context_token_upper_bound)
-        new_bound = self._derive_context_limit_from_output(tokens_now)
-        self.context_token_upper_bound = min(old_bound, new_bound)
+        # Output truncation is a generation-budget signal, not proof that the
+        # prompt context window is smaller. Keep the configured/adaptive input
+        # context bound intact; only provider context-window errors may shrink it.
 
         self._publish_live_truncation(
             text=working,
@@ -17885,22 +18623,13 @@ class SessionState:
             return
         self.truncation_count += 1
         self.last_truncation_ts = now_tick
-        old_bound = self.context_token_upper_bound
-        if not self.context_limit_locked:
-            new_bound = self._derive_context_limit_from_output(output_tokens)
-            self.context_token_upper_bound = min(old_bound, new_bound)
-            if self.context_token_upper_bound < old_bound:
-                self._emit(
-                    "status",
-                    {
-                        "summary": (
-                            f"context upper bound adjusted {old_bound}->{self.context_token_upper_bound} "
-                            f"(output_tokens≈{output_tokens})"
-                        )
-                    },
+        if allow_compact:
+            metrics = self._active_next_call_context_metrics()
+            if int(metrics.get("used", 0) or 0) >= int(metrics.get("effective_limit", 0) or 0):
+                self._apply_auto_compact_if_needed(
+                    f"truncation-rescue:{source or 'auto'}",
+                    metrics=metrics,
                 )
-        if allow_compact and self._estimate_tokens() > self.context_token_upper_bound:
-            self._auto_compact(f"truncation-rescue:{source or 'auto'}")
         self._ensure_truncation_todos()
         task_ids = self._create_truncation_subtasks(reason)
         self._inject_truncation_rescue_hint(reason, output_tokens, task_ids)
@@ -17920,8 +18649,600 @@ class SessionState:
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
-                        return str(block.get("name", ""))
+                            return str(block.get("name", ""))
         return ""
+
+    def _find_tool_call_details_by_id(self, messages: list[dict], tool_use_id: str) -> tuple[str, dict]:
+        """Find tool name and parsed arguments from a preceding assistant tool call."""
+        if not tool_use_id:
+            return "", {}
+
+        def _parse_args(raw: object) -> dict:
+            if isinstance(raw, dict):
+                return dict(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    return dict(parsed) if isinstance(parsed, dict) else {}
+                except Exception:
+                    return {}
+            return {}
+
+        for msg in reversed(messages):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls", []):
+                if not isinstance(tc, dict) or tc.get("id") != tool_use_id:
+                    continue
+                fn = tc.get("function", {})
+                if not isinstance(fn, dict):
+                    return "", {}
+                return str(fn.get("name", "") or ""), _parse_args(fn.get("arguments", {}))
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use" or block.get("id") != tool_use_id:
+                        continue
+                    return str(block.get("name", "") or ""), _parse_args(block.get("input", {}))
+        return "", {}
+
+    def _read_file_signature_from_args(self, args: dict | None) -> str:
+        src = args if isinstance(args, dict) else {}
+        path = trim(str(src.get("path", "") or "").replace("\\", "/"), 240)
+        mode = str(src.get("mode", "") or "auto").strip().lower() or "auto"
+        parts = [f"path={path}", f"mode={mode}"]
+        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars"):
+            value = src.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={trim(str(value), 120)}")
+        return "|".join(parts)
+
+    def _read_context_key(self, role: str, signature: str) -> str:
+        role_key = self._sanitize_agent_role(role) or "single"
+        raw = f"{role_key}|{signature}".encode("utf-8", errors="replace")
+        return hashlib.sha1(raw).hexdigest()[:16]
+
+    def _normalize_read_context_registry(self, raw: object) -> dict[str, dict]:
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, dict] = {}
+        for raw_key, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            signature = trim(str(raw_entry.get("signature", "") or ""), 1000)
+            path = trim(str(raw_entry.get("path", "") or "").replace("\\", "/"), 300)
+            if not signature or not path:
+                continue
+            role_key = self._sanitize_agent_role(raw_entry.get("agent_role", "")) or "single"
+            key = trim(str(raw_entry.get("key", "") or raw_key or ""), 40)
+            if not key:
+                key = self._read_context_key(role_key, signature)
+            status = str(raw_entry.get("status", "active") or "active").strip().lower()
+            if status not in {"active", "pinned", "stale", "dropped"}:
+                status = "active"
+            args = raw_entry.get("args", {}) if isinstance(raw_entry.get("args", {}), dict) else {}
+            clean[key] = {
+                "key": key,
+                "source_tool": str(raw_entry.get("source_tool", "read_file") or "read_file"),
+                "path": path,
+                "mode": trim(str(raw_entry.get("mode", args.get("mode", "auto")) or "auto"), 40).lower(),
+                "signature": signature,
+                "agent_role": role_key,
+                "status": status,
+                "chars": max(0, int(raw_entry.get("chars", 0) or 0)),
+                "lines": max(0, int(raw_entry.get("lines", 0) or 0)),
+                "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
+                "summary": trim(str(raw_entry.get("summary", "") or ""), READ_CONTEXT_SUMMARY_MAX_CHARS),
+                "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "args": {
+                    k: v
+                    for k, v in dict(args).items()
+                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                },
+                "hit_count": max(1, int(raw_entry.get("hit_count", 1) or 1)),
+                "first_read_ts": max(0.0, float(raw_entry.get("first_read_ts", 0.0) or 0.0)),
+                "last_read_ts": max(0.0, float(raw_entry.get("last_read_ts", 0.0) or 0.0)),
+                "last_used_ts": max(0.0, float(raw_entry.get("last_used_ts", 0.0) or 0.0)),
+                "last_stale_ts": max(0.0, float(raw_entry.get("last_stale_ts", 0.0) or 0.0)),
+                "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
+            }
+        return self._pruned_read_context_registry(clean)
+
+    def _read_context_sort_key(self, item: tuple[str, dict]) -> tuple[int, float, int, str]:
+        _key, entry = item
+        status_rank = {"pinned": 0, "active": 1, "stale": 2, "dropped": 3}
+        status = str(entry.get("status", "active") or "active").lower()
+        return (
+            int(status_rank.get(status, 1)),
+            -float(entry.get("last_read_ts", 0.0) or 0.0),
+            -int(entry.get("hit_count", 0) or 0),
+            str(entry.get("path", "")),
+        )
+
+    def _pruned_read_context_registry(self, registry: dict[str, dict] | None = None) -> dict[str, dict]:
+        src = registry if isinstance(registry, dict) else getattr(self, "read_context_registry", {})
+        rows = [(str(k), v) for k, v in dict(src or {}).items() if isinstance(v, dict)]
+        rows.sort(key=self._read_context_sort_key)
+        keep = rows[: int(self._read_context_budget().get("registry_max", READ_CONTEXT_REGISTRY_MAX))]
+        return {k: v for k, v in keep}
+
+    def _read_context_budget(self, tier: int | None = None) -> dict[str, int | str]:
+        policy = normalize_read_context_policy(getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
+        if tier is None:
+            try:
+                tier = self._context_compression_tier()
+            except Exception:
+                tier = 0
+        t = min(max(int(tier or 0), 0), 3)
+        base = {
+            "conservative": {
+                "items": [8, 6, 4, 2],
+                "chars": [3000, 2200, 1400, 900],
+                "shared": [2, 2, 1, 0],
+                "registry_max": 48,
+                "pin_distinct": [4, 3, 2, 1],
+                "pin_chars": [6000, 4500, 2500, 1200],
+            },
+            "balanced": {
+                "items": [14, 10, 6, 3],
+                "chars": [5000, 3800, 2400, 1200],
+                "shared": [4, 3, 2, 1],
+                "registry_max": 80,
+                "pin_distinct": [8, 6, 4, 2],
+                "pin_chars": [12000, 9000, 5000, 2000],
+            },
+            "wide": {
+                "items": [22, 16, 10, 5],
+                "chars": [8000, 6200, 3600, 1800],
+                "shared": [8, 6, 3, 2],
+                "registry_max": 120,
+                "pin_distinct": [12, 8, 5, 3],
+                "pin_chars": [18000, 14000, 7000, 3000],
+            },
+        }
+        effective = "balanced" if policy == "auto" else policy
+        cfg = base.get(effective, base["balanced"])
+        return {
+            "policy": policy,
+            "effective_policy": effective,
+            "tier": t,
+            "items": int(cfg["items"][t]),
+            "chars": int(cfg["chars"][t]),
+            "shared": int(cfg["shared"][t]),
+            "registry_max": int(cfg["registry_max"]),
+            "pin_distinct": int(cfg["pin_distinct"][t]),
+            "pin_chars": int(cfg["pin_chars"][t]),
+        }
+
+    def _read_context_summary_from_output(self, output: str) -> str:
+        text = str(output or "").replace("\r\n", "\n")
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return ""
+        picked: list[str] = []
+        for ln in lines[:10]:
+            if ln.startswith("[read_file clipped"):
+                continue
+            picked.append(ln)
+            if len(" ".join(picked)) >= READ_CONTEXT_SUMMARY_MAX_CHARS:
+                break
+        return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
+
+    def _record_read_context(self, rel_path: str, args: dict, output: str, role: str = "") -> None:
+        if str(output or "").startswith("Error:"):
+            return
+        rel = trim(str(rel_path or "").replace("\\", "/"), 300)
+        if not rel:
+            return
+        src_args = dict(args or {})
+        src_args["path"] = rel
+        mode = str(src_args.get("mode", "") or "auto").strip().lower() or "auto"
+        signature = self._read_file_signature_from_args(src_args)
+        role_key = self._sanitize_agent_role(role) or "single"
+        key = self._read_context_key(role_key, signature)
+        content = str(output or "")
+        now = now_ts()
+        old = self.read_context_registry.get(key, {}) if isinstance(getattr(self, "read_context_registry", {}), dict) else {}
+        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        cache_path = str(old.get("cache_path", "") or "")
+        if len(content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
+            not cache_path or str(old.get("sha256", "") or "") != sha
+        ):
+            try:
+                entry = self._write_file_buffer_entry(content, label=f"read_file:{rel}")
+                cache_path = str(entry.get("path", "") or "")
+            except Exception:
+                cache_path = ""
+        previous_status = str(old.get("status", "active") or "active").lower()
+        status = "pinned" if previous_status == "pinned" else "active"
+        self.read_context_registry[key] = {
+            "key": key,
+            "source_tool": "read_file",
+            "path": rel,
+            "mode": mode,
+            "signature": signature,
+            "agent_role": role_key,
+            "status": status,
+            "chars": len(content),
+            "lines": content.count("\n") + (1 if content else 0),
+            "sha256": sha,
+            "summary": self._read_context_summary_from_output(content),
+            "cache_path": cache_path,
+            "args": {
+                k: v
+                for k, v in src_args.items()
+                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+            },
+            "hit_count": int(old.get("hit_count", 0) or 0) + 1,
+            "first_read_ts": float(old.get("first_read_ts", now) or now),
+            "last_read_ts": now,
+            "last_used_ts": float(old.get("last_used_ts", 0.0) or 0.0),
+            "last_stale_ts": 0.0,
+            "stale_reason": "",
+        }
+        self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
+
+    def _mark_read_context_stale(self, rel_path: str, reason: str = "") -> int:
+        rel = trim(str(rel_path or "").replace("\\", "/"), 300)
+        if not rel or not isinstance(getattr(self, "read_context_registry", {}), dict):
+            return 0
+        changed = 0
+        now = now_ts()
+        for entry in self.read_context_registry.values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("path", "") or "").replace("\\", "/") != rel:
+                continue
+            if str(entry.get("status", "") or "").lower() == "dropped":
+                continue
+            entry["status"] = "stale"
+            entry["last_stale_ts"] = now
+            entry["stale_reason"] = trim(str(reason or "file changed after read"), 180)
+            changed += 1
+        return changed
+
+    def _read_context_matches_token(self, entry: dict, token: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if isinstance(token, dict):
+            candidates = [
+                token.get("id"),
+                token.get("key"),
+                token.get("signature"),
+                token.get("path"),
+            ]
+            return any(self._read_context_matches_token(entry, x) for x in candidates if x not in (None, ""))
+        needle = str(token or "").strip()
+        if not needle:
+            return False
+        key = str(entry.get("key", "") or "")
+        path = str(entry.get("path", "") or "")
+        sig = str(entry.get("signature", "") or "")
+        return (
+            key == needle
+            or key.startswith(needle)
+            or path == needle
+            or path.endswith(needle)
+            or sig == needle
+            or needle in sig
+        )
+
+    def _apply_read_context_policy(self, args: dict | None, role: str = "") -> str:
+        src = args if isinstance(args, dict) else {}
+        role_key = self._sanitize_agent_role(role) or ""
+        keep_items = src.get("keep_read_context", [])
+        drop_items = src.get("drop_read_context", [])
+        if isinstance(keep_items, (str, dict)):
+            keep_items = [keep_items]
+        if isinstance(drop_items, (str, dict)):
+            drop_items = [drop_items]
+        if not isinstance(keep_items, list):
+            keep_items = []
+        if not isinstance(drop_items, list):
+            drop_items = []
+        if not keep_items and not drop_items:
+            return "read_context policy unchanged"
+        kept = 0
+        dropped = 0
+        now = now_ts()
+        for entry in self.read_context_registry.values():
+            if not isinstance(entry, dict):
+                continue
+            if role_key and str(entry.get("agent_role", "") or "") not in {role_key, "single"}:
+                # A role may still refer to a shared path/signature explicitly.
+                pass
+            if any(self._read_context_matches_token(entry, token) for token in keep_items):
+                entry["status"] = "pinned"
+                entry["last_used_ts"] = now
+                kept += 1
+            if any(self._read_context_matches_token(entry, token) for token in drop_items):
+                entry["status"] = "dropped"
+                entry["last_used_ts"] = now
+                dropped += 1
+        self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
+        return f"read_context policy applied: pinned={kept}, dropped={dropped}"
+
+    def _read_context_prompt_block(
+        self,
+        *,
+        for_role: str = "",
+        max_items: int | None = None,
+        max_chars: int | None = None,
+    ) -> str:
+        registry = getattr(self, "read_context_registry", {})
+        if not isinstance(registry, dict) or not registry:
+            return ""
+        budget = self._read_context_budget()
+        if max_items is None:
+            max_items = int(budget.get("items", READ_CONTEXT_PROMPT_MAX_ITEMS) or READ_CONTEXT_PROMPT_MAX_ITEMS)
+        if max_chars is None:
+            max_chars = int(budget.get("chars", READ_CONTEXT_PROMPT_MAX_CHARS) or READ_CONTEXT_PROMPT_MAX_CHARS)
+        shared_max = int(budget.get("shared", READ_CONTEXT_SHARED_MAX_ITEMS) or 0)
+        role_key = self._sanitize_agent_role(for_role) or ""
+        entries = [
+            dict(v)
+            for _k, v in sorted(registry.items(), key=self._read_context_sort_key)
+            if isinstance(v, dict) and str(v.get("status", "") or "active").lower() != "dropped"
+        ]
+        if not entries:
+            return ""
+        if role_key:
+            own = [e for e in entries if str(e.get("agent_role", "") or "") in {role_key, "single"}]
+            shared = [
+                e
+                for e in entries
+                if str(e.get("agent_role", "") or "") not in {role_key, "single"}
+                and str(e.get("status", "") or "active").lower() in {"pinned", "active"}
+            ]
+            selected = own[:max_items] + shared[:shared_max]
+        else:
+            selected = entries[:max_items]
+        if not selected:
+            return ""
+        now = now_ts()
+
+        def _age(ts: object) -> str:
+            try:
+                seconds = max(0, int(now - float(ts or 0.0)))
+            except Exception:
+                seconds = 0
+            if seconds < 90:
+                return f"{seconds}s"
+            if seconds < 7200:
+                return f"{seconds // 60}m"
+            return f"{seconds // 3600}h"
+
+        rows = [
+            "<read-context-registry>",
+            f"policy={budget.get('policy', DEFAULT_READ_CONTEXT_POLICY)} tier={budget.get('tier', 0)} budget_items={max_items} budget_chars={max_chars} shared_items={shared_max}",
+            "Recent successful file reads are retained here outside raw tool results. Use them as remembered evidence; do not repeat the same broad read when an active/pinned entry already answers the question. If an entry is stale, re-read with a focused mode before relying on exact text.",
+        ]
+        for entry in selected:
+            status = str(entry.get("status", "active") or "active")
+            cache = str(entry.get("cache_path", "") or "")
+            args = entry.get("args", {}) if isinstance(entry.get("args", {}), dict) else {}
+            detail_parts = []
+            for key in ("target", "query", "line", "context"):
+                value = args.get(key)
+                if value not in (None, ""):
+                    detail_parts.append(f"{key}={trim(str(value), 80)}")
+            detail = " " + " ".join(detail_parts) if detail_parts else ""
+            rows.append(
+                "- "
+                f"id={entry.get('key','')} status={status} role={entry.get('agent_role','')} "
+                f"path={entry.get('path','')} mode={entry.get('mode','auto')}{detail} "
+                f"chars={int(entry.get('chars', 0) or 0)} hits={int(entry.get('hit_count', 0) or 0)} "
+                f"age={_age(entry.get('last_read_ts', 0.0))} "
+                f"summary={trim(str(entry.get('summary','') or ''), 260)}"
+                + (f" cache={cache}" if cache else "")
+                + (f" stale_reason={trim(str(entry.get('stale_reason','') or ''), 120)}" if status == "stale" else "")
+            )
+            if len("\n".join(rows)) >= max_chars:
+                break
+        rows.append(
+            "When a phase changes, call compress with keep_read_context=[ids/paths/signatures] "
+            "and drop_read_context=[ids/paths/signatures] to pin useful evidence and remove obsolete reads from future prompts."
+        )
+        rows.append("</read-context-registry>")
+        return trim("\n".join(rows), max_chars)
+
+    def _reset_read_file_loop_tracking(self, role: str = "") -> None:
+        role_key = self._sanitize_agent_role(role) or "single"
+        if isinstance(getattr(self, "read_file_loop_state", {}), dict):
+            self.read_file_loop_state.pop(role_key, None)
+        self.read_file_loop_recent = []
+        self.read_file_loop_count = 0
+
+    def _maybe_inject_read_file_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
+        rows = [r for r in (tool_results or []) if isinstance(r, dict)]
+        if not rows:
+            return False
+        read_rows = [
+            r for r in rows
+            if str(r.get("name", "") or "") == "read_file" and bool(r.get("ok", False))
+        ]
+        if not read_rows or len(read_rows) != len(rows):
+            if any(bool(r.get("ok", False)) and str(r.get("name", "") or "") != "read_file" for r in rows):
+                self._reset_read_file_loop_tracking(role)
+            return False
+        role_key = self._sanitize_agent_role(role) or "single"
+        state = self.read_file_loop_state.get(role_key, {}) if isinstance(getattr(self, "read_file_loop_state", {}), dict) else {}
+        signatures = [self._read_file_signature_from_args(r.get("args", {})) for r in read_rows]
+        signatures = [s for s in signatures if s]
+        if not signatures:
+            return False
+        round_key = hashlib.sha1("\n".join(sorted(signatures)).encode("utf-8", errors="replace")).hexdigest()[:16]
+        recent = list(state.get("recent", []))[-48:]
+        recent.extend(signatures)
+        repeat_rounds = int(state.get("repeat_rounds", 0) or 0) + 1 if state.get("last_round_key") == round_key else 1
+        read_only_rounds = int(state.get("read_only_rounds", 0) or 0) + 1
+        state = {
+            "recent": recent[-64:],
+            "last_round_key": round_key,
+            "repeat_rounds": repeat_rounds,
+            "read_only_rounds": read_only_rounds,
+            "last_ts": now_ts(),
+        }
+        self.read_file_loop_state[role_key] = state
+        self.read_file_loop_recent = recent[-64:]
+        self.read_file_loop_count = read_only_rounds
+        distinct_recent = len(set(recent[-(READ_FILE_LOOP_THRESHOLD * READ_FILE_LOOP_DISTINCT_SOFT_LIMIT):]))
+        repeated_small_set = (
+            read_only_rounds >= max(3, int(READ_FILE_LOOP_THRESHOLD // 2))
+            and distinct_recent <= int(READ_FILE_LOOP_DISTINCT_SOFT_LIMIT)
+        )
+        repeated_same_round = repeat_rounds >= 3 and len(recent) >= int(READ_FILE_LOOP_THRESHOLD)
+        too_many_reads_small_set = (
+            len(recent) >= int(READ_FILE_LOOP_THRESHOLD * 2)
+            and distinct_recent <= int(READ_FILE_LOOP_DISTINCT_SOFT_LIMIT)
+        )
+        if not (repeated_small_set or repeated_same_round or too_many_reads_small_set):
+            return False
+        now = now_ts()
+        if now - float(state.get("last_intervention_ts", 0.0) or 0.0) < 12.0:
+            return False
+        state["last_intervention_ts"] = now
+        self.read_file_loop_state[role_key] = state
+        self.read_file_loop_last_intervention_ts = now
+        context_block = self._read_context_prompt_block(for_role=role_key if role_key != "single" else "", max_chars=2600)
+        paths = []
+        for r in read_rows:
+            args = r.get("args", {}) if isinstance(r.get("args", {}), dict) else {}
+            p = trim(str(args.get("path", "") or ""), 180)
+            if p and p not in paths:
+                paths.append(p)
+        payload = (
+            "<read-context-strategy>\n"
+            f"The last {read_only_rounds} tool round(s) for {role_key} only performed successful read_file calls "
+            f"over a small/repeated evidence set (distinct_recent={distinct_recent}, repeat_rounds={repeat_rounds}). "
+            "This is a strategy warning, not a stop. Decide what evidence is already sufficient, then either edit/write/verify, "
+            "or ask one narrower read question using mode='search', 'symbol', or 'window'. "
+            "Avoid reopening the same full files unless their content changed or a new exact question requires it. "
+            "If useful evidence should persist, call compress with keep_read_context; drop obsolete read contexts with drop_read_context.\n"
+            f"recent_paths={', '.join(paths[:8])}\n"
+            f"{context_block}\n"
+            "</read-context-strategy>"
+        )
+        if role_key != "single":
+            self._append_agent_context_message(
+                role_key,
+                {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
+                mirror_to_global=False,
+            )
+        else:
+            self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+        self._ledger_record_stall(
+            f"read-file-loop({role_key}:{read_only_rounds})",
+            "injected read-context strategy intervention",
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    f"read_file strategy intervention injected "
+                    f"(role={role_key}, rounds={read_only_rounds}, distinct={distinct_recent})"
+                )
+            },
+        )
+        # Give the next round a clean counter while retaining recent signatures for diagnostics.
+        state["read_only_rounds"] = 0
+        state["repeat_rounds"] = 0
+        self.read_file_loop_state[role_key] = state
+        return True
+
+    def _tool_message_name_args(self, messages: list[dict], index: int, msg: dict) -> tuple[str, dict]:
+        name = str(msg.get("name", "") or "").strip()
+        args: dict = {}
+        tool_id = str(msg.get("tool_call_id", "") or msg.get("tool_use_id", "") or "").strip()
+        if tool_id:
+            found_name, found_args = self._find_tool_call_details_by_id(messages[:index], tool_id)
+            if found_name:
+                name = found_name
+            if found_args:
+                args = found_args
+        return name, args
+
+    def _read_file_pinned_tool_message_ids(self, messages: list[dict]) -> set[int]:
+        """Keep recent distinct read_file outputs available across microcompact.
+
+        This is the important part of preventing read_file loops under compact:
+        the model can compare several recently read files at once instead of
+        losing the previous file every time a new read succeeds.
+        """
+        keep: set[int] = set()
+        seen: set[str] = set()
+        budget = self._read_context_budget()
+        max_chars = int(budget.get("pin_chars", READ_FILE_COMPACT_PIN_MAX_CHARS) or READ_FILE_COMPACT_PIN_MAX_CHARS)
+        max_distinct = int(budget.get("pin_distinct", READ_FILE_COMPACT_PIN_DISTINCT) or READ_FILE_COMPACT_PIN_DISTINCT)
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            name, args = self._tool_message_name_args(messages, idx, msg)
+            if name != "read_file":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith("[cleared by microcompact]") or content.startswith("[read_file cached"):
+                continue
+            if len(content) > max_chars:
+                continue
+            sig = self._read_file_signature_from_args(args)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            keep.add(id(msg))
+            if len(seen) >= max_distinct:
+                break
+        return keep
+
+    def _compact_read_file_tool_content(self, messages: list[dict], index: int, msg: dict) -> str:
+        content = str(msg.get("content", "") or "")
+        if not content or content.startswith("[read_file cached"):
+            return content
+        name, args = self._tool_message_name_args(messages, index, msg)
+        if name != "read_file":
+            return "[cleared by microcompact]"
+        path = trim(str(args.get("path", "") or "").replace("\\", "/"), 240) if isinstance(args, dict) else ""
+        mode = str((args if isinstance(args, dict) else {}).get("mode", "") or "auto").strip().lower() or "auto"
+        sig = self._read_file_signature_from_args(args)
+        registry_entry = None
+        for entry in getattr(self, "read_context_registry", {}).values():
+            if isinstance(entry, dict) and str(entry.get("signature", "") or "") == sig:
+                registry_entry = entry
+                break
+        lines = [ln.strip() for ln in content.replace("\r\n", "\n").split("\n") if ln.strip()]
+        summary = trim(" ".join(lines[:6]), 700)
+        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+        cached_path = str((registry_entry or {}).get("cache_path", "") or "")
+        if len(content) >= FILE_BUFFER_CONTENT_THRESHOLD:
+            try:
+                if not cached_path:
+                    entry = self._write_file_buffer_entry(content, label=f"read_file:{path or mode}")
+                    cached_path = str(entry.get("path", "") or "")
+            except Exception:
+                cached_path = ""
+        rows = [
+            f"[read_file cached path={path or '-'} mode={mode} chars={len(content)} sha256={sha}]",
+            f"signature: {sig}",
+        ]
+        if registry_entry:
+            rows.append(
+                f"registry_id: {registry_entry.get('key','')} status={registry_entry.get('status','active')} "
+                f"role={registry_entry.get('agent_role','')}"
+            )
+        if cached_path:
+            rows.append(f"cached_copy: {cached_path}")
+        if summary:
+            rows.append(f"summary: {summary}")
+        rows.append(
+            "Use this cached evidence to continue. Re-read the original path only with a narrower "
+            "mode='search', 'symbol', or 'window' for a new exact question."
+        )
+        return "\n".join(rows)
 
     def _microcompact(self, keep_recent: int = 3):
         """Replace old tool results with compact placeholders to save tokens.
@@ -17931,14 +19252,19 @@ class SessionState:
         """
         # Phase 1: OpenAI-style role=tool messages
         tool_messages = [m for m in self.messages if m.get("role") == "tool"]
+        pinned_read_ids = self._read_file_pinned_tool_message_ids(self.messages)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
-            keep_ids = {id(x) for x in kept}
-            for msg in self.messages:
+            keep_ids = {id(x) for x in kept} | pinned_read_ids
+            for idx, msg in enumerate(self.messages):
                 if msg.get("role") == "tool" and id(msg) not in keep_ids:
                     content = msg.get("content", "")
                     if isinstance(content, str) and len(content) > 120:
-                        msg["content"] = "[cleared by microcompact]"
+                        name, _args = self._tool_message_name_args(self.messages, idx, msg)
+                        if name == "read_file":
+                            msg["content"] = self._compact_read_file_tool_content(self.messages, idx, msg)
+                        else:
+                            msg["content"] = "[cleared by microcompact]"
 
         # Phase 2: Anthropic-style tool_result blocks in user messages
         assistant_indices = [i for i, m in enumerate(self.messages) if m.get("role") == "assistant"]
@@ -17972,14 +19298,19 @@ class SessionState:
     def _microcompact_agent_messages(self, messages: list[dict], keep_recent: int = 3):
         """Apply microcompact to an agent-specific message list (e.g. agent_messages filtered by role)."""
         tool_messages = [m for m in messages if m.get("role") == "tool"]
+        pinned_read_ids = self._read_file_pinned_tool_message_ids(messages)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
-            keep_ids = {id(x) for x in kept}
-            for msg in messages:
+            keep_ids = {id(x) for x in kept} | pinned_read_ids
+            for idx, msg in enumerate(messages):
                 if msg.get("role") == "tool" and id(msg) not in keep_ids:
                     content = msg.get("content", "")
                     if isinstance(content, str) and len(content) > 120:
-                        msg["content"] = "[cleared by microcompact]"
+                        name, _args = self._tool_message_name_args(messages, idx, msg)
+                        if name == "read_file":
+                            msg["content"] = self._compact_read_file_tool_content(messages, idx, msg)
+                        else:
+                            msg["content"] = "[cleared by microcompact]"
         assistant_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
         if len(assistant_indices) <= keep_recent:
             return
@@ -18577,8 +19908,29 @@ class SessionState:
         kept.sort(key=lambda x: x[0])
         return [msg for _, msg in kept]
 
-    def _auto_compact(self, reason: str):
-        context_before = self._context_budget_metrics()
+    def _strip_archival_runtime_hints(self, rows: list[dict]) -> list[dict]:
+        cleaned: list[dict] = []
+        for row in rows or []:
+            item = dict(row) if isinstance(row, dict) else {"role": "", "content": str(row or "")}
+            role = str(item.get("role", "") or "")
+            content = str(item.get("content", "") or "")
+            low = content.strip().lower()
+            if role == "user" and any(low.startswith(prefix) for prefix in RETRY_RUNTIME_HINT_PREFIXES):
+                continue
+            if "<compact-resume>" in low or "<state_handoff>" in low:
+                item["content"] = "[previous compact-resume archived; use context_recall for details]"
+            cleaned.append(item)
+        return cleaned
+
+    def _auto_compact(
+        self,
+        reason: str,
+        *,
+        metrics: dict | None = None,
+        role: str = "",
+        media_inputs: list[dict] | None = None,
+    ):
+        context_before = metrics or self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
         tier = self._context_compression_tier(context_before)
         transcript_dir = self.root / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
@@ -18597,15 +19949,16 @@ class SessionState:
         if len(tail) >= len(self.messages):
             tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
         archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
+        tail = self._strip_archival_runtime_hints(tail)
         seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
         summary = self._summarize_compact_rows(archived_rows)
         seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
         seg_msg_count = int(seg.get("messages", 0) or 0) if isinstance(seg, dict) else 0
         seg_path = str(seg.get("path", "")) if isinstance(seg, dict) else ""
         continuation = (
-            f"If details are missing, call context_recall with segment_id='{seg_id}', max_messages=40, offset=0."
+            f"If details are missing, call context_recall with segment_id='{seg_id}', mode='search' and a specific query, or mode='window' with around_index/context."
             if seg_id
-            else "If details are missing, call context_recall with recent_segments=2."
+            else "If details are missing, call context_recall with mode='summary' first, then mode='search' or mode='window' for focused evidence."
         )
         # Create checkpoint before compaction
         self._maybe_create_checkpoint()
@@ -18650,14 +20003,38 @@ class SessionState:
         while len(tail) > 5 and self._estimate_messages_tokens(tail) > target_tokens:
             tail.pop(0)
         self.messages = tail
-        # Compact agent contexts in sync (critical fix for re-wall prevention)
-        self._compact_agent_contexts(max(tier, 1))
+        # Compact only the pressured role when known; shared state remains tier-aware.
+        role_raw = str(role or "").strip().lower()
+        role_key = "manager" if role_raw == "manager" else self._sanitize_agent_role(role_raw)
+        if role_key in AGENT_ROLES and not self._role_specific_context_is_live_call(role_key):
+            role_key = ""
+        if role_key:
+            self._compact_role_context(role_key, max(tier, 1))
+            if tier >= 2:
+                self._compact_shared_context(tier)
+        else:
+            self._compact_agent_contexts(max(tier, 1))
         # Tier 2+: offload remaining large content in messages to file buffer
         if tier >= 2:
             for msg in self.messages:
                 c = msg.get("content", "")
                 if isinstance(c, str) and len(c) >= FILE_BUFFER_CONTENT_THRESHOLD * 2:
                     msg["content"] = self._offload_to_file_buffer(c, label="compact-msg")
+        context_after = self._active_next_call_context_metrics(role=role, media_inputs=media_inputs)
+        before_used = int(context_before.get("used", 0) or 0)
+        after_used = int(context_after.get("used", 0) or 0)
+        reduction = max(0, before_used - after_used)
+        effective = bool(reduction >= max(400, int(before_used * 0.05)) or after_used < int(context_after.get("effective_limit", 0) or 0))
+        self.context_last_compact_before = dict(context_before)
+        self.context_last_compact_after = dict(context_after)
+        self.context_last_compact_effective = bool(effective)
+        self.context_last_compact_used_reduction = int(reduction)
+        if not effective:
+            self.context_last_compact_skip_ts = now_ts()
+            self.context_last_compact_skip_reason = (
+                f"compact ineffective: used {before_used}->{after_used}, "
+                f"limit={int(context_after.get('effective_limit', 0) or 0)}"
+            )
         self.last_compact_reason = str(reason or "")
         self.last_compact_ts = now_ts()
         self._emit(
@@ -18672,6 +20049,13 @@ class SessionState:
                 "context_used_before": int(context_before.get("used", 0)),
                 "context_left_before": int(context_before.get("left", 0)),
                 "context_left_percent_before": round(float(context_before.get("left_percent", 0.0)), 2),
+                "context_used_after": int(context_after.get("used", 0)),
+                "context_left_after": int(context_after.get("left", 0)),
+                "context_left_percent_after": round(float(context_after.get("left_percent", 0.0)), 2),
+                "context_used_reduction": int(reduction),
+                "effective": bool(effective),
+                "next_call_label": str(context_after.get("next_call_label", "") or ""),
+                "role": role_key or "",
             },
         )
 
@@ -21503,6 +22887,137 @@ body{padding:18px}
         )
         return raw[:cap].rstrip() + suffix
 
+    def _tool_int_arg(self, value: object, default: int, minimum: int, maximum: int) -> int:
+        try:
+            iv = int(value)
+        except Exception:
+            iv = int(default)
+        return max(int(minimum), min(int(maximum), iv))
+
+    def _tool_max_chars(self, value: object = None, default: int = 24000) -> int:
+        return self._tool_int_arg(value, default, 1200, READ_FILE_HARD_MAX_CHARS)
+
+    def _row_text_for_search(self, row: object) -> str:
+        try:
+            return json_dumps(row, indent=0)
+        except Exception:
+            return str(row or "")
+
+    def _row_field_value(self, row: object, field: str) -> str:
+        if not isinstance(row, dict):
+            return ""
+        cur: object = row
+        for part in str(field or "").split("."):
+            if not isinstance(cur, dict):
+                return ""
+            cur = cur.get(part)
+        if isinstance(cur, (dict, list)):
+            return self._row_text_for_search(cur)
+        return str(cur or "")
+
+    def _collection_filter_rows(
+        self,
+        rows: list[dict],
+        *,
+        query: str = "",
+        filters: dict[str, object] | None = None,
+    ) -> list[dict]:
+        q = str(query or "").strip().lower()
+        clean_filters = {
+            str(k): str(v).strip().lower()
+            for k, v in (filters or {}).items()
+            if str(v or "").strip()
+        }
+        out: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if clean_filters:
+                ok = True
+                for key, wanted in clean_filters.items():
+                    actual = self._row_field_value(row, key).strip().lower()
+                    if wanted not in actual:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+            if q and q not in self._row_text_for_search(row).lower():
+                continue
+            out.append(row)
+        return out
+
+    def _render_collection_tool_payload(
+        self,
+        *,
+        tool: str,
+        rows: list[dict],
+        mode: object = None,
+        query: object = "",
+        limit: object = None,
+        around_index: object = None,
+        context: object = None,
+        max_chars: object = None,
+        filters: dict[str, object] | None = None,
+        summary_fields: list[str] | None = None,
+        detail_fields: list[str] | None = None,
+        default_limit: int = 12,
+    ) -> str:
+        mode_text = str(mode or "").strip().lower() or ("search" if str(query or "").strip() else "summary")
+        if mode_text not in {"summary", "search", "recent", "window", "detail", "tail", "peek", "drain"}:
+            mode_text = "summary"
+        cap = self._tool_max_chars(max_chars)
+        all_rows = [row for row in rows if isinstance(row, dict)]
+        filtered = self._collection_filter_rows(all_rows, query=str(query or ""), filters=filters)
+        n = self._tool_int_arg(limit, default_limit, 1, 200)
+        if mode_text in {"recent", "tail", "peek", "drain"}:
+            selected = filtered[-n:]
+        elif mode_text == "window":
+            if around_index is None or str(around_index).strip() == "":
+                selected = filtered[-n:]
+            else:
+                idx = self._tool_int_arg(around_index, 0, 0, max(0, len(filtered) - 1))
+                ctx = self._tool_int_arg(context, 4, 0, 80)
+                selected = filtered[max(0, idx - ctx): min(len(filtered), idx + ctx + 1)]
+        elif mode_text == "detail":
+            selected = filtered[:n] if str(query or "").strip() else filtered[-n:]
+        else:
+            selected = filtered[:n] if str(query or "").strip() else filtered[-n:]
+
+        def compact(row: dict, idx: int) -> dict:
+            if mode_text == "detail":
+                if detail_fields:
+                    return {k: row.get(k) for k in detail_fields if k in row}
+                return row
+            fields = summary_fields or list(row.keys())[:8]
+            item = {"index": idx}
+            for key in fields:
+                if key in row:
+                    val = row.get(key)
+                    item[key] = trim(val if not isinstance(val, (dict, list)) else json_dumps(val), 800)
+            return item
+
+        index_by_identity = {id(row): idx for idx, row in enumerate(filtered)}
+        rendered = [
+            compact(row, int(index_by_identity.get(id(row), 0)))
+            for row in selected
+        ]
+        payload = {
+            "tool": tool,
+            "mode": mode_text,
+            "query": str(query or ""),
+            "filters": {k: v for k, v in (filters or {}).items() if str(v or "").strip()},
+            "total_rows": len(all_rows),
+            "matched_rows": len(filtered),
+            "returned": len(rendered),
+            "items": rendered,
+            "focused_reads": [
+                f"{tool} mode='search' query='<term>'",
+                f"{tool} mode='window' around_index=<index> context=4",
+                f"{tool} mode='detail' query='<specific id/name/status>'",
+            ],
+        }
+        return trim(json_dumps(payload, indent=2), cap)
+
     def _read_file_code_data(self, fp: Path, lines: list[str]) -> dict:
         text = "\n".join(lines)
         language = ""
@@ -22143,6 +23658,29 @@ body{padding:18px}
         ]
         return any(x in t for x in continue_markers)
 
+    def _looks_like_action_promise_without_tool(self, text: str) -> bool:
+        raw = strip_thinking_content(str(text or "")).strip()
+        if not raw:
+            return False
+        low = raw.lower()
+        if self._looks_like_conclusive_reply(raw) or self._looks_like_user_decision_needed(raw):
+            return False
+        promise_markers = (
+            "现在创建", "现在开始", "开始构建", "开始编写", "开始生成", "我将创建", "我会创建",
+            "我将编写", "我会编写", "接下来创建", "接下来构建", "让我创建", "让我开始",
+            "现在建立", "開始建立", "開始編寫", "我將建立", "我會建立", "接下來建立",
+            "now create", "now build", "now write", "i will create", "i will build", "i will write",
+            "i'll create", "i'll build", "i'll write", "let me create", "let me build", "let me write",
+            "next i will create", "next i will build",
+        )
+        if not any(marker in low for marker in promise_markers):
+            return False
+        artifact_markers = (
+            "html", "报告", "報告", "交互", "interactive", "file", "文件", "script", "代码", "程式",
+            ".html", ".js", ".css", "write_file", "edit_file", "bash", "生成", "创建", "建立", "构建", "編寫",
+        )
+        return any(marker in low for marker in artifact_markers)
+
     def _looks_like_user_decision_needed(self, text: str) -> bool:
         t = (text or "").strip().lower()
         if not t:
@@ -22456,6 +23994,27 @@ body{padding:18px}
         if any(
             x in low
             for x in [
+                "action_required",
+                "action required",
+                "tool_required",
+                "tool required",
+                "execute_tool",
+                "execute tool",
+                "needs tool",
+                "needs_action",
+                "needs action",
+                "需要工具",
+                "需要执行",
+                "需要執行",
+                "需要動作",
+                "工具が必要",
+                "実行が必要",
+            ]
+        ):
+            return "ACTION_REQUIRED"
+        if any(
+            x in low
+            for x in [
                 "valid_planning",
                 "valid planning",
                 "plan",
@@ -22500,12 +24059,18 @@ body{padding:18px}
             "VALID_PLAN": "VALID_PLANNING",
             "PLANNING": "VALID_PLANNING",
             "PLAN": "VALID_PLANNING",
+            "ACTION": "ACTION_REQUIRED",
+            "REQUIRES_ACTION": "ACTION_REQUIRED",
+            "NEEDS_ACTION": "ACTION_REQUIRED",
+            "TOOL_REQUIRED": "ACTION_REQUIRED",
+            "NEEDS_TOOL": "ACTION_REQUIRED",
+            "EXECUTE_TOOL": "ACTION_REQUIRED",
             "EMPTY": "EMPTY_RAMBLING",
             "RAMBLING": "EMPTY_RAMBLING",
             "IDLE": "EMPTY_RAMBLING",
         }
         status = aliases.get(key, key)
-        if status in {"TASK_COMPLETED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
+        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
             return status
         inferred = self._infer_arbiter_status_from_text(fallback_text)
         return inferred or ""
@@ -22564,25 +24129,32 @@ body{padding:18px}
 
     def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "") -> dict:
         clean = strip_thinking_content(str(assistant_text or "")).strip()
+        thinking_clean = str(thinking_text or "").strip()
         if not self.arbiter_enabled:
             return {"status": "DISABLED", "reasoning": "arbiter disabled", "raw": ""}
-        if len(clean) < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
+        probe_len = max(len(clean), len(thinking_clean))
+        if (
+            probe_len < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+            and not self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}")
+        ):
             return {"status": "SKIP_SHORT", "reasoning": "content too short", "raw": ""}
         snapshot = self._arbiter_context_snapshot(clean, thinking_text)
         arbiter_system = (
             "You are a task-state arbiter. "
             "Classify worker output into exactly one status: "
-            "TASK_COMPLETED, VALID_PLANNING, or EMPTY_RAMBLING. "
+            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
         arbiter_user = (
             "Read the snapshot and classify the worker state.\n"
             "Status definitions:\n"
             "- TASK_COMPLETED: worker already completed user's target and gave final deliverable/summary.\n"
-            "- VALID_PLANNING: worker output is meaningful planning/analysis that should continue into execution.\n"
+            "- ACTION_REQUIRED: worker has decided or promised to create/write/modify/run/verify something, or thinking contains a concrete next tool action, but no tool call was emitted.\n"
+            "- VALID_PLANNING: worker output is useful high-level analysis or design that still needs more reasoning before a concrete tool action.\n"
             "- EMPTY_RAMBLING: worker is stalling, repeating, or hallucinating with no actionable progress.\n"
+            "Prefer ACTION_REQUIRED over VALID_PLANNING when the next step is already a concrete artifact/action.\n"
             "Output JSON only:\n"
-            "{\"status\":\"TASK_COMPLETED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
+            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
@@ -22612,18 +24184,28 @@ body{padding:18px}
             return {"status": "ARBITER_ERROR", "reasoning": trim(str(err), 220), "raw": ""}
         rsp = box.get("rsp") if isinstance(box.get("rsp"), dict) else {}
         raw_content = trim(str((rsp or {}).get("content", "") or ""), 2000)
+        raw_thinking = trim(str((rsp or {}).get("thinking", "") or ""), 1200)
+        status_source = raw_content or raw_thinking
         payload = extract_json_object_from_text(raw_content, {})
-        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), raw_content)
+        if not payload and raw_thinking:
+            payload = extract_json_object_from_text(raw_thinking, {})
+        status = self._normalize_arbiter_status(str(payload.get("status", "") or ""), status_source)
         if not status:
-            status = self._infer_arbiter_status_from_text(raw_content)
+            status = self._infer_arbiter_status_from_text(status_source)
+        if (
+            (not status or status == "UNKNOWN")
+            and self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}\n{status_source}")
+        ):
+            status = "ACTION_REQUIRED"
         reasoning = trim(
             str(payload.get("reasoning", payload.get("reason", "")) or ""),
             280,
-        ) or trim(raw_content, 280)
+        ) or trim(status_source, 280)
         return {
             "status": status or "UNKNOWN",
             "reasoning": reasoning,
             "raw": raw_content,
+            "raw_thinking": raw_thinking,
             "model": str(self.arbiter_model or self.ollama.model or "").strip(),
         }
 
@@ -22638,6 +24220,26 @@ body{padding:18px}
                     "系统仲裁判定：当前回复属于有效计划。请立即推进执行：下一轮必须调用一个具体工具，"
                     "不要重复口头计划，不要新增无意义 Todo。"
                     f"{(' 判定依据: ' + reasoning + '。') if reasoning else ''}"
+                    "</arbiter-continue>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+
+    def _inject_arbiter_action_required_hint(self, decision: dict, assistant_text: str = ""):
+        reasoning = trim(str(decision.get("reasoning", "") or "").strip(), 180)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 420)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<arbiter-continue>"
+                    "系统仲裁判定：当前回复已经到了需要执行工具的阶段，但没有发出工具调用。"
+                    "下一轮必须只调用一个具体工具来推进，例如 write_file/edit_file/bash/read_file/check_background；"
+                    "如果确实已经完成，则调用 finish_task 并提供文件路径和验证证据。不要再输出计划性说明。"
+                    f"{(' 判定依据: ' + reasoning + '。') if reasoning else ''}"
+                    f"{(' 上一条文本: ' + latest) if latest else ''}"
                     "</arbiter-continue>"
                 ),
                 "ts": now_ts(),
@@ -23646,6 +25248,15 @@ body{padding:18px}
             system=system,
             media_inputs=media_inputs,
         )
+        label_low = str(context_label or "").strip().lower()
+        context_role_hint = ""
+        if "manager" in label_low:
+            context_role_hint = "manager"
+        else:
+            for _role in AGENT_ROLES:
+                if _role in label_low:
+                    context_role_hint = _role
+                    break
 
         def _emit_http_retry(meta: dict):
             try:
@@ -23706,6 +25317,28 @@ body{padding:18px}
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
+                if self._context_window_error_hint(exc):
+                    if self._shrink_context_upper_bound_from_actual_pressure(
+                        estimated_prompt_tokens=estimated_prompt_tokens,
+                        reason=f"{context_label}:{trim(str(exc), 80)}",
+                    ):
+                        self._apply_auto_compact_if_needed(
+                            f"provider-context-error:{context_label}",
+                            metrics=self._context_budget_metrics(token_estimate=estimated_prompt_tokens),
+                            role=context_role_hint,
+                        )
+                        if attempt <= retry_budget:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        f"{context_label} context-window retry after compact "
+                                        f"({attempt}/{retry_budget})"
+                                    )
+                                },
+                            )
+                            time.sleep(min(1.0, 0.25 * attempt))
+                            continue
                 # Detect media format incompatibility and auto-fallback
                 exc_str = str(exc).lower()
                 _media_fmt_err = media_inputs and any(
@@ -25158,7 +26791,8 @@ body{padding:18px}
                     "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
                     "app.py line 240 -> mode='window' line=240 context=5; "
                     "run.txt E123 -> mode='search' query='E123'. "
-                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed."
+                    "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed. "
+                    "Successful reads are remembered in the read-context registry."
                 ),
                 {
                     "path": {"type": "string"},
@@ -25263,10 +26897,27 @@ body{padding:18px}
                         regex=args.get("regex"),
                         max_chars=args.get("max_chars"),
                     )
+                    try:
+                        rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                        self._record_read_context(rel, args if isinstance(args, dict) else {}, out, role="single")
+                    except Exception:
+                        pass
                 elif name == "write_file":
                     out = self._run_write(args.get("path", ""), args.get("content", ""))
+                    if not str(out).startswith("Error:"):
+                        try:
+                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                            self._mark_read_context_stale(rel, reason="subagent write_file changed file")
+                        except Exception:
+                            pass
                 elif name == "edit_file":
                     out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
+                    if not str(out).startswith("Error:"):
+                        try:
+                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
+                            self._mark_read_context_stale(rel, reason="subagent edit_file changed file")
+                        except Exception:
+                            pass
                 else:
                     out = f"Unknown tool: {name}"
                 msgs.append({
@@ -28378,6 +30029,7 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
+        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -28412,6 +30064,11 @@ body{padding:18px}
             and todo_progress_signal
             and self._step_has_accumulated_evidence(current, bb)
         )
+        explicit_verified_path = (
+            subtasks_all_done
+            and verified_tag_current
+            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
+        )
         has_strong_evidence = (
             validation_ok and (
                 (
@@ -28424,7 +30081,7 @@ body{padding:18px}
                     and validation_ok_blackboard
                 )
             )
-        ) or accumulated_evidence_path
+        ) or accumulated_evidence_path or explicit_verified_path
         if has_strong_evidence:
             # Sync mode exec gate: when all subtasks done for implement/test/deploy phases,
             # require at least some execution evidence (bash/test/compile ran at any point).
@@ -28435,7 +30092,7 @@ body{padding:18px}
             )
             if _exec_gate_needed:
                 # Require model's explicit <step-verified/> tag in agent_messages since step activation
-                _has_verified = self._check_step_verified_tag(current, messages=self.agent_messages)
+                _has_verified = verified_tag_current
                 if not _has_verified:
                     _sync_n_flag = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
                     _sync_n = int(getattr(self, _sync_n_flag, 0))
@@ -29997,7 +31654,7 @@ body{padding:18px}
         if not any("<verification-required>" in str(m.get("content", "") or "") for m in _recent if isinstance(m, dict)):
             self.agent_messages.append({"role": "user", "content": msg, "ts": now_ts()})
 
-    def _single_agent_plan_step_check(self, tool_results: list[dict]):
+    def _single_agent_plan_step_check(self, tool_results: list[dict]) -> bool:
         """In single-agent mode, check if current plan step should be advanced based on tool results."""
         bb = self._ensure_blackboard()
         todos = bb.get("project_todos", [])
@@ -30005,7 +31662,7 @@ body{padding:18px}
         if not plan_steps:
             # No plan steps — just sync todos
             self._sync_todos_from_blackboard(reason="single-agent-round")
-            return
+            return False
         current = None
         for t in plan_steps:
             if t.get("status") == "in_progress":
@@ -30013,7 +31670,7 @@ body{padding:18px}
                 break
         if not current:
             self._sync_todos_from_blackboard(reason="single-agent-round")
-            return
+            return False
         # When a new step is activated with no subtasks yet, require TodoWrite first
         _cur_step_id = str(current.get("id", "") or "")
         if _cur_step_id:
@@ -30041,7 +31698,7 @@ body{padding:18px}
                 _recent_msgs = self.messages[-4:]
                 if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
                     self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
-                return  # Wait for TodoWrite before doing other checks
+                return False  # Wait for TodoWrite before doing other checks
         # Heuristic: check if tool results indicate step completion
         step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
@@ -30097,27 +31754,30 @@ body{padding:18px}
                     or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
                 ):
                     should_advance = True
-        # Also check if the agent explicitly mentioned step completion
-        # Also blocked by validation gate when subtasks_done path was blocked
+        # Also allow the explicit post-message verification contract to advance
+        # when there are no linked subtasks. Natural-language completion claims
+        # are intentionally ignored here; advancement must be backed by plan
+        # state, validation evidence, or the structured verification tag.
         if not should_advance and not _gate_blocked:
-            # Check last assistant message for step completion signals
-            last_text = ""
-            for msg in reversed(self.messages[-3:]):
-                if msg.get("role") == "assistant":
-                    last_text = str(msg.get("content", "") or "").lower()
-                    break
-            step_done_signals = ("step completed", "步骤完成", "step done", "完成了", "已完成",
-                                 "next step", "下一步", "proceed to step", "进入下一",
-                                 "全部完成", "✅", "all subtasks")
-            if validation_ok and any(sig in last_text for sig in step_done_signals):
+            _has_subtasks_s2 = bool(self._active_plan_worker_todo_rows(
+                str(current.get("id", "") or ""), role=""
+            ))
+            if (
+                self._check_step_verified_tag(current)
+                and (subtasks_done or not _has_subtasks_s2)
+                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
+            ):
                 should_advance = True
         if should_advance:
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
-            self._advance_plan_step(evidence=evidence, actor="single")
-            try:
-                self._inject_current_plan_step_execution_hints()
-            except Exception:
-                pass
+            advanced = self._advance_plan_step(evidence=evidence, actor="single")
+            if advanced:
+                try:
+                    self._inject_current_plan_step_execution_hints()
+                except Exception:
+                    pass
+                return True
+            return False
         else:
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
@@ -30138,6 +31798,7 @@ body{padding:18px}
                     recent = self.messages[-6:]
                     if not any(str(msg.get("content", "") or "").strip() == focus_msg for msg in recent if isinstance(msg, dict)):
                         self._append_plan_guidance_bubble(focus_msg, summary="todo focus: continue current subtask")
+            return False
 
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -30638,6 +32299,79 @@ body{padding:18px}
         merged["source"] = "manager-low-confidence+fallback"
         return merged
 
+    def _auto_task_level_ceiling_value(self) -> int:
+        return normalize_auto_task_level_ceiling(
+            getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+        )
+
+    def _auto_task_level_ceiling_prompt(self) -> str:
+        cap = self._auto_task_level_ceiling_value()
+        if cap <= 0 or int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+            return ""
+        return (
+            f"Automatic task-level ceiling is L{cap}. Do not emit or route a level above L{cap}. "
+            f"If the request would normally need a higher level, choose L{cap}, keep the objective concrete, "
+            "and mention in judgement that the automatic ceiling was applied. "
+            "This cap only affects automatic classification; explicit user task-level overrides are handled elsewhere.\n"
+        )
+
+    def _apply_auto_task_level_ceiling_to_decision(self, row: dict, *, source: str = "") -> dict:
+        out = dict(row or {})
+        cap = self._auto_task_level_ceiling_value()
+        if cap <= 0 or int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+            return out
+        try:
+            level = int(out.get("level", out.get("task_level", 0)) or 0)
+        except Exception:
+            level = 0
+        if level not in TASK_LEVEL_CHOICES or level <= cap:
+            return out
+        policy = dict(TASK_LEVEL_POLICIES.get(cap, TASK_LEVEL_POLICIES[3]))
+        out["level"] = int(cap)
+        out["task_level"] = int(cap)
+        out["auto_task_level_capped"] = True
+        out["auto_task_level_ceiling"] = int(cap)
+        capped_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
+        current_complexity = normalize_task_complexity(out.get("complexity", ""), default="")
+        if (
+            capped_complexity in TASK_COMPLEXITY_LEVELS
+            and (
+                current_complexity not in TASK_COMPLEXITY_LEVELS
+                or task_complexity_rank(current_complexity) > task_complexity_rank(capped_complexity)
+            )
+        ):
+            out["complexity"] = capped_complexity
+        mode, participants, assigned = self._resolve_level_assignment(
+            cap,
+            assigned=str(policy.get("assigned_expert", "developer") or "developer"),
+            participants=list(policy.get("participants", []) or []),
+            mode=str(policy.get("execution_mode", EXECUTION_MODE_SYNC) or EXECUTION_MODE_SYNC),
+        )
+        out["execution_mode"] = mode
+        out["participants"] = list(participants)
+        out["assigned_expert"] = assigned
+        if cap == 5:
+            out["round_budget"] = 0
+            out["requires_user_confirmation"] = bool(policy.get("requires_user_confirmation", True))
+        else:
+            out["round_budget"] = max(
+                1,
+                min(
+                    int(self.max_agent_rounds or MAX_AGENT_ROUNDS),
+                    int(policy.get("round_budget", self.max_agent_rounds) or self.max_agent_rounds),
+                ),
+            )
+            out["requires_user_confirmation"] = False
+        old_source = trim(str(out.get("source", "") or "").strip(), 80)
+        out["source"] = trim(
+            (old_source + "+auto-ceiling" if old_source else f"{source or 'auto'}-ceiling"),
+            80,
+        )
+        judgement = trim(str(out.get("judgement", "") or "").strip(), 180)
+        cap_note = f"automatic task-level ceiling L{cap} applied (original L{level})"
+        out["judgement"] = trim((judgement + "; " + cap_note) if judgement else cap_note, 220)
+        return out
+
     def _fallback_task_level_decision(self, goal_text: str) -> dict:
         profile = self._infer_task_profile(goal_text)
         task_type = str(profile.get("task_type", "general") or "general")
@@ -30797,6 +32531,7 @@ body{padding:18px}
         }
 
     def _manager_classification_system_prompt(self) -> str:
+        ceiling_prompt = self._auto_task_level_ceiling_prompt()
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
@@ -30829,6 +32564,7 @@ body{padding:18px}
             "The tool call must include concise judgement, inherit_previous_state, "
             "and semantic_confidence (high|medium|low). "
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
+            f"{ceiling_prompt}"
             f"{model_language_instruction(self.ui_language)}"
         )
         if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
@@ -30963,6 +32699,14 @@ body{padding:18px}
         _level_ceiling = int(getattr(self, 'runtime_task_level_ceiling', 0) or 0)
         if _level_ceiling > 0 and int(level) > _level_ceiling:
             level = _level_ceiling
+        _auto_level_ceiling = self._auto_task_level_ceiling_value()
+        if (
+            _auto_level_ceiling > 0
+            and int(getattr(self, 'user_task_level_override', 0) or 0) <= 0
+            and int(level) > _auto_level_ceiling
+        ):
+            level = _auto_level_ceiling
+            row = self._apply_auto_task_level_ceiling_to_decision(row, source="runtime-apply")
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
         config_mode = normalize_execution_mode(self.execution_mode, default="")
@@ -31247,6 +32991,7 @@ body{padding:18px}
             f"{dims_ctx}"
             f"{skills_ctx}"
             f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
+            f"{self._auto_task_level_ceiling_prompt()}"
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
@@ -31322,14 +33067,14 @@ body{padding:18px}
                 reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
                 fallback_row = self._fallback_task_level_decision(goal_text)
                 merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
-                return merged
+                return self._apply_auto_task_level_ceiling_to_decision(merged, source="manager-low-confidence")
             row["source"] = "manager"
-            return row
+            return self._apply_auto_task_level_ceiling_to_decision(row, source="manager")
         row = self._fallback_task_level_decision(goal_text)
         row["source"] = "fallback-no-toolcall"
         row["semantic_confidence"] = "low"
         row["low_confidence_reason"] = "manager classifier returned no valid classify_task_level tool call"
-        return row
+        return self._apply_auto_task_level_ceiling_to_decision(row, source="fallback")
 
     # ------------------------------------------------------------------
     # Continuation / follow-up detection (complexity inheritance)
@@ -31778,6 +33523,9 @@ body{padding:18px}
         html_hint = self._html_frontend_boost_instruction()
         # Loaded skills constraint for manager
         skills_constraint = self._loaded_skills_prompt_hint(for_role="manager")
+        skills_context = self._loaded_skills_context_block(for_role="manager", max_chars=5200)
+        if skills_context:
+            skills_constraint += skills_context
         bb_skills = board.get("loaded_skills", {})
         if isinstance(bb_skills, dict) and bb_skills:
             skill_names = list(bb_skills.keys())[:5]
@@ -33047,6 +34795,11 @@ body{padding:18px}
                 )
                 self._append_manager_context({"role": "user", "content": prompt, "ts": now_ts()})
                 self._microcompact_agent_messages(self.manager_context)
+                self._apply_auto_compact_if_needed(
+                    "auto:manager",
+                    role="manager",
+                    media_inputs=media_inputs_round,
+                )
                 with self.lock:
                     self.current_phase = "manager:model-call"
                     self.current_tool_name = ""
@@ -33284,6 +35037,13 @@ body{padding:18px}
         _level_ceiling = int(self.runtime_task_level_ceiling or 0)
         if _level_ceiling > 0 and effective_level > _level_ceiling:
             effective_level = _level_ceiling
+        _auto_level_ceiling = self._auto_task_level_ceiling_value()
+        if (
+            _auto_level_ceiling > 0
+            and int(getattr(self, 'user_task_level_override', 0) or 0) <= 0
+            and effective_level > _auto_level_ceiling
+        ):
+            effective_level = _auto_level_ceiling
         execution_mode, participants, assigned_expert = self._resolve_level_assignment(
             effective_level,
             assigned=assigned_expert,
@@ -34138,9 +35898,23 @@ body{padding:18px}
         return self._sanitize_agent_role(m.group(1)), self._sanitize_agent_role(m.group(2))
 
     def _effective_execution_mode(self) -> str:
-        runtime_mode = normalize_execution_mode(self.runtime_execution_mode, default="")
+        runtime_raw = str(self.runtime_execution_mode or "").strip()
+        runtime_mode = normalize_execution_mode(runtime_raw, default="") if runtime_raw else ""
         if runtime_mode in {EXECUTION_MODE_SINGLE, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
             return runtime_mode
+        try:
+            bb = self.blackboard if isinstance(self.blackboard, dict) else {}
+            profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile", {}), dict) else {}
+            judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement", {}), dict) else {}
+            for raw in (
+                profile.get("execution_mode", ""),
+                judgement.get("execution_mode", ""),
+            ):
+                mode = normalize_execution_mode(raw, default="")
+                if mode in {EXECUTION_MODE_SINGLE, EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+                    return mode
+        except Exception:
+            pass
         return normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
 
     def _is_multi_agent_mode(self) -> bool:
@@ -34405,6 +36179,7 @@ body{padding:18px}
         engineering_note = self._engineering_execution_boost_instruction()
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
+        read_context_note = self._read_context_prompt_block(for_role=role_key)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
@@ -34419,6 +36194,7 @@ body{padding:18px}
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When inspecting collections or memory, use focused modes too: context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             f"{code_note + ' ' if code_note else ''}"
             f"{engineering_note + ' ' if engineering_note else ''}"
             f"{html_note + ' ' if html_note else ''}"
@@ -34429,6 +36205,8 @@ body{padding:18px}
         if mm_note:
             base = base + mm_note
         base = base + skills_block
+        if read_context_note:
+            base = base + read_context_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
         if role_key == "explorer":
@@ -34472,8 +36250,8 @@ body{padding:18px}
             )
         return base + (
             "Role: implement code changes, execute tools, record progress to blackboard. "
-            "SKILL PRIORITY (critical): When ACTIVE SKILLS are listed above, find the "
-            "<loaded-skill> messages in your context and READ them before starting any step. "
+            "SKILL PRIORITY (critical): When ACTIVE SKILLS are listed above, read the "
+            "ACTIVE SKILL WORKFLOWS or <loaded-skill> messages in your context before starting any step. "
             "The skill's workflow, tools, and file structure OVERRIDE the plan's implementation "
             "approach — if the plan says 'use python-pptx' but the skill says 'use PptxGenJS', "
             "use PptxGenJS. The skill defines HOW to implement; the plan defines WHAT to do. "
@@ -34737,23 +36515,9 @@ body{padding:18px}
         )
 
     def _tighten_context_for_segmented_retry(self, reason: str, output_tokens: int):
-        if self.context_limit_locked:
-            return
-        old_bound = int(self.context_token_upper_bound)
-        reduced = int(max(MIN_CONTEXT_TOKEN_LIMIT, min(old_bound - 1200, old_bound * 0.78)))
-        derived = self._derive_context_limit_from_output(max(1, output_tokens))
-        new_bound = min(old_bound, reduced, derived)
-        if new_bound < old_bound:
-            self.context_token_upper_bound = new_bound
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        "context upper bound reduced for segmented retry "
-                        f"{old_bound}->{new_bound} ({trim(reason, 90)})"
-                    )
-                },
-            )
+        # Segmented retry is an execution-shaping signal. It should not shrink
+        # the input context window unless a provider reports a real context error.
+        self.context_limit_source = str(getattr(self, "context_limit_source", "") or "configured")
 
     def _inject_segmented_retry_hint(self, name: str, reason: str):
         goal = self._latest_user_goal_text()
@@ -34905,7 +36669,7 @@ body{padding:18px}
             actions.append("split into smaller subtasks and regenerate full tool JSON")
         if compact_hints > 0:
             causes.append("context may be compacted")
-            actions.append("call context_recall first for latest segment details")
+            actions.append("call context_recall mode='summary', then mode='search' or mode='window' for focused details")
         if tool_errors > 0:
             causes.append("recent tool execution errors")
             actions.append("repair arguments for one failing tool and retry only that tool")
@@ -34947,7 +36711,7 @@ body{padding:18px}
             seg_id = str(seg.get("id", "")).strip()
             if seg_id:
                 recall_hint = (
-                    f"Call context_recall first with segment_id='{seg_id}', max_messages=40, offset=0. "
+                    f"Call context_recall with segment_id='{seg_id}' and mode='summary' to map the segment, then mode='search' for the missing topic or mode='window' with around_index/context for nearby messages. "
                 )
         self._prune_runtime_retry_hints()
         self.messages.append(
@@ -34974,6 +36738,30 @@ body{padding:18px}
                     f"(streak={streak}; causes={trim(causes, 120)})"
                 )
             },
+        )
+
+    def _inject_action_promise_recovery_hint(self, assistant_text: str):
+        goal = trim(str(self._latest_user_goal_text() or ""), 500)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 500)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<no-tool-recovery>"
+                    "你刚才说明要开始创建/编写/构建产物，但没有调用任何工具，因此产物并未创建。"
+                    "如果任务已完成，请调用 finish_task 并给出文件路径和验证证据；"
+                    "否则下一轮必须只执行一个具体工具调用来推进，例如 write_file 创建 HTML、"
+                    "edit_file 修改文件、或 bash 运行必要的复制/验证命令。不要再输出计划性说明。"
+                    f"目标: {goal}. 上一条文本: {latest}"
+                    "</no-tool-recovery>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": "no-tool action promise detected; forcing one concrete tool turn"},
         )
 
     def _inject_thinking_empty_recovery_hint(self, streak: int = 1, budget_forced: bool = False):
@@ -35113,7 +36901,7 @@ body{padding:18px}
             if "<auto-context-recall>" in content:
                 return False
         try:
-            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "offset": 0})
+            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "mode": "summary"})
         except Exception:
             return False
         text = str(recalled or "").strip()
@@ -35211,13 +36999,13 @@ body{padding:18px}
     def _context_recall(self, args: dict) -> str:
         segment_id = str(args.get("segment_id", "") or "").strip()
         query = str(args.get("query", "") or "").strip()
-        recent_segments = int(args.get("recent_segments", 2) or 2)
-        max_messages = int(args.get("max_messages", 30) or 30)
-        offset = int(args.get("offset", 0) or 0)
+        mode = str(args.get("mode", "") or "").strip().lower()
+        role_filter = str(args.get("role", "") or "").strip()
+        tool_filter = str(args.get("tool_name", "") or "").strip()
+        recent_segments = self._tool_int_arg(args.get("recent_segments", 2), 2, 1, 20)
+        max_messages = self._tool_int_arg(args.get("max_messages", 30), 30, 1, 120)
+        offset = self._tool_int_arg(args.get("offset", 0), 0, 0, 100000)
         include_tools = bool(args.get("include_tools", True))
-        recent_segments = max(1, min(20, recent_segments))
-        max_messages = max(1, min(120, max_messages))
-        offset = max(0, offset)
 
         segments: list[dict] = []
         if segment_id:
@@ -35239,16 +37027,21 @@ body{padding:18px}
                 role = str(row.get("role", ""))
                 if not include_tools and role == "tool":
                     continue
+                if role_filter and role_filter.lower() not in role.lower():
+                    continue
+                name = str(row.get("name", "") or "")
+                if tool_filter and tool_filter.lower() not in name.lower():
+                    continue
                 content = str(row.get("content", ""))
                 if query_low:
-                    pool = f"{role}\n{row.get('name', '')}\n{content}".lower()
+                    pool = f"{role}\n{name}\n{content}".lower()
                     if query_low not in pool:
                         continue
                 out_row = {
                     "segment_id": seg_id,
                     "index": idx,
                     "role": role,
-                    "name": row.get("name", ""),
+                    "name": name,
                     "tool_call_id": row.get("tool_call_id", ""),
                     "ts": float(row.get("ts", 0.0) or 0.0),
                     "content": trim(content, 6000),
@@ -35257,8 +37050,6 @@ body{padding:18px}
                     out_row["thinking"] = trim(row.get("thinking", ""), 2500)
                 matches.append(out_row)
 
-        total = len(matches)
-        page = matches[offset : offset + max_messages]
         selected_segments = [
             {
                 "id": str(seg.get("id", "")),
@@ -35269,17 +37060,256 @@ body{padding:18px}
             }
             for seg in segments
         ]
-        payload = {
-            "query": query,
-            "segment_id": segment_id or "",
-            "segments_considered": selected_segments,
-            "total_matches": total,
-            "offset": offset,
-            "returned": len(page),
-            "next_offset": (offset + len(page)) if (offset + len(page)) < total else None,
-            "matches": page,
+        if not mode and (args.get("offset") is not None):
+            page = matches[offset : offset + max_messages]
+            payload = {
+                "mode": "legacy",
+                "query": query,
+                "segment_id": segment_id or "",
+                "segments_considered": selected_segments,
+                "total_matches": len(matches),
+                "offset": offset,
+                "returned": len(page),
+                "matches": page,
+                "focused_reads": [
+                    "context_recall mode='search' query='<term>'",
+                    "context_recall mode='window' around_index=<index> context=4",
+                    "context_recall mode='detail' query='<exact evidence>'",
+                ],
+            }
+            return trim(json_dumps(payload, indent=2), self._tool_max_chars(args.get("max_chars"), 24000))
+        rendered = self._render_collection_tool_payload(
+            tool="context_recall",
+            rows=matches,
+            mode=mode or ("search" if query else "summary"),
+            query="",
+            limit=max_messages,
+            around_index=args.get("around_index"),
+            context=args.get("context"),
+            max_chars=args.get("max_chars"),
+            filters={},
+            summary_fields=["segment_id", "index", "role", "name", "content"],
+            detail_fields=["segment_id", "index", "role", "name", "tool_call_id", "ts", "content", "thinking"],
+            default_limit=12,
+        )
+        try:
+            payload = parse_json_object(rendered, {})
+            if isinstance(payload, dict):
+                payload["query"] = query
+                payload["role"] = role_filter
+                payload["tool_name"] = tool_filter
+                payload["segments_considered"] = selected_segments
+                return trim(json_dumps(payload, indent=2), self._tool_max_chars(args.get("max_chars"), 24000))
+        except Exception:
+            pass
+        return rendered
+
+    def _read_blackboard_enhanced(self, args: dict) -> str:
+        section = str(args.get("section", "all") or "all").strip().lower()
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 6), 6, 1, 80)
+        board = self._ensure_blackboard()
+        if section in {"", "all"} and not mode and not query and not args.get("actor") and not args.get("around_index"):
+            return self._blackboard_read_state_markdown(max_items=min(20, limit))
+        if section == "original_goal":
+            return trim(str(board.get("original_goal", "") or "").strip(), self._tool_max_chars(args.get("max_chars"), 4000)) or "(empty)"
+        if section == "status":
+            wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
+            dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
+            return trim(json_dumps(
+                {
+                    "status": board.get("status", "INITIALIZING"),
+                    "active_agent": board.get("active_agent", ""),
+                    "manager_cycles": int(board.get("manager_cycles", 0) or 0),
+                    "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
+                    "approval": board.get("approval", {}),
+                    "last_delegate": board.get("last_delegate", {}),
+                    "watchdog": {
+                        "intent_no_tool_streak": int(wd.get("intent_no_tool_streak", 0) or 0),
+                        "repeat_no_tool_streak": int(wd.get("repeat_no_tool_streak", 0) or 0),
+                        "state_unchanged_streak": int(wd.get("state_unchanged_streak", 0) or 0),
+                        "trigger_count": int(wd.get("trigger_count", 0) or 0),
+                        "last_trigger_reason": trim(str(wd.get("last_trigger_reason", "") or "").strip(), 160),
+                    },
+                    "decomposition_queue": {
+                        "active": bool(dq.get("active", False)),
+                        "trigger_reason": trim(str(dq.get("trigger_reason", "") or "").strip(), 160),
+                        "cursor": int(dq.get("cursor", 0) or 0),
+                        "total": len(dq.get("steps", []) or []),
+                        "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
+                    },
+                },
+                indent=2,
+            ), self._tool_max_chars(args.get("max_chars"), 12000))
+        sections = ["research_notes", "execution_logs", "review_feedback", "conversation_history"]
+        rows: list[dict] = []
+        if section == "code_artifacts":
+            artifacts = board.get("code_artifacts", {})
+            if not isinstance(artifacts, dict):
+                artifacts = {}
+            for key, value in artifacts.items():
+                row = dict(value) if isinstance(value, dict) else {"value": value}
+                row["key"] = key
+                rows.append(row)
+        elif section in sections:
+            raw_rows = board.get(section, [])
+            rows = [row for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+        elif section in {"", "all"}:
+            for sec in sections:
+                raw_rows = board.get(sec, [])
+                if isinstance(raw_rows, list):
+                    for row in raw_rows:
+                        if isinstance(row, dict):
+                            item = dict(row)
+                            item["section"] = sec
+                            rows.append(item)
+            artifacts = board.get("code_artifacts", {})
+            if isinstance(artifacts, dict):
+                for key, value in artifacts.items():
+                    item = dict(value) if isinstance(value, dict) else {"value": value}
+                    item["section"] = "code_artifacts"
+                    item["key"] = key
+                    rows.append(item)
+        else:
+            return f"Error: unsupported blackboard section '{section}'"
+        return self._render_collection_tool_payload(
+            tool="read_from_blackboard",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            around_index=args.get("around_index"),
+            context=args.get("context"),
+            max_chars=args.get("max_chars"),
+            filters={"actor": args.get("actor"), "status": args.get("status")},
+            summary_fields=["section", "key", "actor", "status", "content", "summary", "path"],
+            detail_fields=[],
+            default_limit=limit,
+        )
+
+    def _task_list_enhanced(self, args: dict) -> str:
+        rows = []
+        for task in self.tasks.list_objects():
+            if isinstance(task, dict):
+                rows.append(dict(task))
+        if not rows:
+            return "No tasks."
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 30), 30, 1, 200)
+        if not mode and not query and not args.get("status") and not args.get("owner"):
+            return self.tasks.list_all()
+        return self._render_collection_tool_payload(
+            tool="task_list",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            max_chars=args.get("max_chars"),
+            filters={"status": args.get("status"), "owner": args.get("owner")},
+            summary_fields=["id", "status", "owner", "subject", "blockedBy", "worktree", "updated_at"],
+            detail_fields=[],
+            default_limit=limit,
+        )
+
+    def _check_background_enhanced(self, args: dict) -> str:
+        task_id = str(args.get("task_id", "") or "").strip()
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        if task_id and not mode and not query:
+            return self.bg.check(task_id)
+        rows = self.bg.list_objects()
+        if not rows:
+            return "No bg tasks."
+        if not task_id and not mode and not query and not args.get("status"):
+            return self.bg.check(None)
+        known_ids = {str(row.get("id", "") or "").strip() for row in rows if isinstance(row, dict)}
+        if task_id and task_id not in known_ids and (mode or query or args.get("status")):
+            if not query:
+                query = task_id
+            task_id = ""
+        if query and mode in {"tail", "recent"}:
+            mode = "search"
+        filters = {"status": args.get("status")}
+        if task_id:
+            filters["id"] = task_id
+        return self._render_collection_tool_payload(
+            tool="check_background",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=args.get("limit", 20),
+            max_chars=args.get("max_chars"),
+            filters=filters,
+            summary_fields=["id", "status", "command", "started_at", "finished_at"],
+            detail_fields=[],
+            default_limit=20,
+        )
+
+    def _read_inbox_enhanced(self, args: dict) -> str:
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        # Backward compatibility: no arguments means consume the inbox as before.
+        if not args or (not mode and not query and not args.get("from") and not args.get("type")):
+            return json_dumps(self.bus.read_inbox("lead"), indent=2)
+        rows = self.bus.peek_inbox("lead")
+        if mode == "drain":
+            rows = self.bus.read_inbox("lead")
+        if not rows:
+            return "[]"
+        return self._render_collection_tool_payload(
+            tool="read_inbox",
+            rows=rows,
+            mode=mode or ("search" if query else "peek"),
+            query=query,
+            limit=args.get("limit", 20),
+            max_chars=args.get("max_chars"),
+            filters={"from": args.get("from"), "type": args.get("type")},
+            summary_fields=["timestamp", "from", "type", "content"],
+            detail_fields=[],
+            default_limit=20,
+        )
+
+    def _worktree_events_enhanced(self, args: dict) -> str:
+        rows = self.worktrees.events_objects()
+        if not rows:
+            return "[]"
+        mode = str(args.get("mode", "") or "").strip().lower()
+        query = str(args.get("query", "") or "").strip()
+        event_arg = str(args.get("event", "") or "").strip()
+        worktree_arg = str(args.get("worktree", "") or "").strip()
+        limit = self._tool_int_arg(args.get("limit", 20), 20, 1, 200)
+        known_events = {
+            str(row.get("event", "") or "").strip().lower()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("event", "") or "").strip()
         }
-        return json_dumps(payload, indent=2)
+        if event_arg and event_arg.lower() not in known_events and "." not in event_arg:
+            if not worktree_arg:
+                worktree_arg = event_arg
+            elif not query:
+                query = event_arg
+            event_arg = ""
+        if not mode and not query and not event_arg and not worktree_arg and not args.get("task_id"):
+            return self.worktrees.events_recent(limit)
+        filters = {
+            "event": event_arg,
+            "worktree.name": worktree_arg,
+            "task.id": args.get("task_id"),
+        }
+        return self._render_collection_tool_payload(
+            tool="worktree_events",
+            rows=rows,
+            mode=mode or ("search" if query else "summary"),
+            query=query,
+            limit=limit,
+            max_chars=args.get("max_chars"),
+            filters=filters,
+            summary_fields=["ts", "event", "task", "worktree", "error"],
+            detail_fields=[],
+            default_limit=limit,
+        )
 
     def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
@@ -35412,6 +37442,7 @@ body{padding:18px}
                 regex=args.get("regex"),
                 max_chars=args.get("max_chars"),
             )
+            self._record_read_context(rel, args, out, role=role_key)
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
             offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
             mode_val = str(args.get("mode", "") or "").strip()
@@ -35465,6 +37496,7 @@ body{padding:18px}
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_write(rel, args["content"])
             if not out.startswith("Error"):
+                self._mark_read_context_stale(rel, reason="write_file changed file after previous read")
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
                 if summary:
@@ -35519,6 +37551,7 @@ body{padding:18px}
             before_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
             out = self._run_edit(rel, args["old_text"], args["new_text"])
             if not out.startswith("Error"):
+                self._mark_read_context_stale(rel, reason="edit_file changed file after previous read")
                 offline_result = self._localize_html_js_dependencies(rel)
                 summary = str(offline_result.get("summary", "") or "").strip()
                 if summary:
@@ -35640,8 +37673,9 @@ body{padding:18px}
                 ):
                     return (
                         "Error: reviewer finalization requires blackboard evidence read. "
-                        "Call read_from_blackboard first (sections: code_artifacts, execution_logs, "
-                        "review_feedback, status), then call finish_task with structured summary."
+                        "Call read_from_blackboard with mode='summary' or mode='search' "
+                        "(sections: code_artifacts, execution_logs, review_feedback, status), "
+                        "then call finish_task with structured summary."
                     )
                 if not self._final_summary_sufficient(summary, strict=True):
                     return (
@@ -35650,7 +37684,8 @@ body{padding:18px}
                         "(1) changes/files touched, "
                         "(2) validation evidence (tests/commands/results), "
                         "(3) residual risks or next steps. "
-                        "If evidence is missing, read_from_blackboard first or ask Explorer for final_summary_request."
+                        "If evidence is missing, use read_from_blackboard mode='summary' or mode='search', "
+                        "or ask Explorer for final_summary_request."
                     )
             if name == "finish_task":
                 todo_mark = self.todo.complete_all_open(summary)
@@ -35693,7 +37728,8 @@ body{padding:18px}
         if name == "scan_skills":
             return self._scan_global_skills()
         if name == "compress":
-            return "Compress requested."
+            policy_note = self._apply_read_context_policy(args, role=role_key)
+            return f"Compress requested. {policy_note}"
         if name == "context_recall":
             return self._context_recall(args)
         if name == "query_code_library":
@@ -35786,7 +37822,7 @@ body{padding:18px}
             )
             return str(payload.get("output", out_filtered or "(no output)"))
         if name == "check_background":
-            return self.bg.check(args.get("task_id"))
+            return self._check_background_enhanced(args)
         if name == "task_create":
             return self.tasks.create(args["subject"], args.get("description", ""))
         if name == "task_get":
@@ -35794,7 +37830,7 @@ body{padding:18px}
         if name == "task_update":
             return self.tasks.update(int(args["task_id"]), args.get("status"), args.get("add_blocked_by"), args.get("add_blocks"))
         if name == "task_list":
-            return self.tasks.list_all()
+            return self._task_list_enhanced(args)
         if name == "claim_task":
             return self.tasks.claim(int(args["task_id"]), "lead")
         if name == "spawn_teammate":
@@ -35837,57 +37873,7 @@ body{padding:18px}
                 f"intent={env.get('intent')}, id={env.get('id')})"
             )
         if name == "read_from_blackboard":
-            section = str(args.get("section", "all") or "all").strip().lower()
-            limit = max(1, min(20, int(args.get("limit", 6) or 6)))
-            board = self._ensure_blackboard()
-            if section in {"", "all"}:
-                return self._blackboard_read_state_markdown(max_items=limit)
-            if section == "original_goal":
-                return trim(str(board.get("original_goal", "") or "").strip(), 4000) or "(empty)"
-            if section == "status":
-                wd = board.get("watchdog", {}) if isinstance(board.get("watchdog"), dict) else {}
-                dq = board.get("decomposition_queue", {}) if isinstance(board.get("decomposition_queue"), dict) else {}
-                return json_dumps(
-                    {
-                        "status": board.get("status", "INITIALIZING"),
-                        "active_agent": board.get("active_agent", ""),
-                        "manager_cycles": int(board.get("manager_cycles", 0) or 0),
-                        "manager_summary_attempts": int(board.get("manager_summary_attempts", 0) or 0),
-                        "approval": board.get("approval", {}),
-                        "last_delegate": board.get("last_delegate", {}),
-                        "watchdog": {
-                            "intent_no_tool_streak": int(wd.get("intent_no_tool_streak", 0) or 0),
-                            "repeat_no_tool_streak": int(wd.get("repeat_no_tool_streak", 0) or 0),
-                            "state_unchanged_streak": int(wd.get("state_unchanged_streak", 0) or 0),
-                            "trigger_count": int(wd.get("trigger_count", 0) or 0),
-                            "last_trigger_reason": trim(str(wd.get("last_trigger_reason", "") or "").strip(), 160),
-                        },
-                        "decomposition_queue": {
-                            "active": bool(dq.get("active", False)),
-                            "trigger_reason": trim(str(dq.get("trigger_reason", "") or "").strip(), 160),
-                            "cursor": int(dq.get("cursor", 0) or 0),
-                            "total": len(dq.get("steps", []) or []),
-                            "last_error": trim(str(dq.get("last_error", "") or "").strip(), 220),
-                        },
-                    },
-                    indent=2,
-                )
-            if section == "code_artifacts":
-                artifacts = board.get("code_artifacts", {})
-                if not isinstance(artifacts, dict):
-                    artifacts = {}
-                rows = sorted(
-                    list(artifacts.items()),
-                    key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
-                    reverse=True,
-                )
-                return json_dumps({k: v for k, v in rows[:limit]}, indent=2)
-            if section in {"research_notes", "execution_logs", "review_feedback", "conversation_history"}:
-                rows = board.get(section, [])
-                if not isinstance(rows, list):
-                    rows = []
-                return json_dumps(rows[-limit:], indent=2)
-            return f"Error: unsupported blackboard section '{section}'"
+            return self._read_blackboard_enhanced(args)
         if name == "write_to_blackboard":
             section = str(args.get("section", "") or "").strip().lower()
             content = trim(str(args.get("content", "") or "").strip(), BLACKBOARD_MAX_TEXT)
@@ -35917,7 +37903,7 @@ body{padding:18px}
         if name == "send_message":
             return self.bus.send("lead", args["to"], args["content"], args.get("msg_type", "message"))
         if name == "read_inbox":
-            return json_dumps(self.bus.read_inbox("lead"), indent=2)
+            return self._read_inbox_enhanced(args)
         if name == "broadcast":
             return self.bus.broadcast("lead", args["content"], list(self.teammates.keys()))
         if name == "shutdown_request":
@@ -35976,7 +37962,7 @@ body{padding:18px}
         if name == "worktree_remove":
             return self.worktrees.remove(args["name"], bool(args.get("force", False)), bool(args.get("complete_task", False)))
         if name == "worktree_events":
-            return self.worktrees.events_recent(int(args.get("limit", 20)))
+            return self._worktree_events_enhanced(args)
         return f"Unknown tool: {name}"
 
     def _live_input_delay_locked(self) -> tuple[int, str]:
@@ -36601,6 +38587,12 @@ body{padding:18px}
         if not ctx:
             return {"status": "skip", "reason": "empty-context", "role": role_key}
         self._microcompact_agent_messages(ctx)
+        self._apply_auto_compact_if_needed(
+            f"auto:agent:{role_key}",
+            role=role_key,
+            media_inputs=media_inputs_round,
+        )
+        ctx = self._agent_context(role_key)
         with self.lock:
             self.current_phase = f"agent:{role_key}:model-call"
             self.current_tool_name = ""
@@ -36775,6 +38767,7 @@ body{padding:18px}
         with self.lock:
             self.current_phase = f"agent:{role_key}:post-tools"
             self.current_tool_name = ""
+        self._maybe_inject_read_file_strategy_intervention(tool_results, role=role_key)
         return {
             "status": "tools",
             "role": role_key,
@@ -36980,7 +38973,7 @@ body{padding:18px}
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
             self._inject_pending_user_inputs()
-            self._apply_auto_compact_if_needed("auto:multi-sync")
+            self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
                 self._maybe_create_checkpoint()
@@ -37333,7 +39326,7 @@ body{padding:18px}
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
-            self._apply_auto_compact_if_needed("auto:multi-seq")
+            self._apply_auto_compact_if_needed("auto:multi-seq", role=current_role)
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
             latest_user_ts = self._latest_user_message_ts()
@@ -37553,11 +39546,13 @@ body{padding:18px}
                 if preview:
                     skill_previews.append(f"- **{skey}**: {preview}")
             if skill_previews:
+                active_skill_workflows = self._loaded_skills_context_block(for_role="explorer", max_chars=5000)
                 skills_section = (
                     "\n## Loaded Skills\n"
                     + "\n".join(skill_previews)
+                    + (f"\n\n{active_skill_workflows}\n" if active_skill_workflows else "")
                     + "\n\nCRITICAL: For each loaded skill, you MUST:\n"
-                    "1. Read the skill's full content from your context (it was injected as <loaded-skill>)\n"
+                    "1. Read the active-skill workflow block or <loaded-skill> content available in your context\n"
                     "2. Identify the skill's concrete workflow steps (e.g., what scripts to run, what files to read/write)\n"
                     "3. List the specific tool calls and file paths each skill requires\n"
                     "4. Include these details in your plan_findings so the synthesis phase can produce actionable steps\n"
@@ -37603,6 +39598,7 @@ body{padding:18px}
             "Do NOT modify any files. Use read_file, bash (read-only commands), "
             "list_skills, load_skill, and blackboard tools only. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
             f"{skills_block}"
             "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
             "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
@@ -37636,6 +39632,8 @@ body{padding:18px}
             self.current_phase = f"plan-mode:explorer:round-{round_idx}"
             self.current_tool_name = ""
             self.active_agent_role = "explorer"
+        self._apply_auto_compact_if_needed("auto:plan-explorer", role="explorer")
+        ctx = self._agent_context("explorer")
         # Build skills awareness block (same as sync/single mode)
         skills_block = self._skills_awareness_block(for_role="explorer")
         response = self._chat_with_same_model_retry(
@@ -37646,6 +39644,7 @@ body{padding:18px}
                 "Do NOT create, write, or edit files. "
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
                 "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+                "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
                 f"{skills_block}"
                 f"{_detect_os_shell_instruction()} "
                 f"{model_language_instruction(self.ui_language)}"
@@ -38240,9 +40239,11 @@ body{padding:18px}
                 if preview:
                     skill_previews.append(f"- {skey}: {preview}")
             if skill_previews:
+                active_skill_workflows = self._loaded_skills_context_block(for_role="developer", max_chars=6500)
                 skills_section = (
                     "\n## Available Skills\n"
                     + "\n".join(skill_previews)
+                    + (f"\n\n{active_skill_workflows}\n" if active_skill_workflows else "")
                     + "\n\nWhen skills are loaded, each step MUST specify concrete actions:\n"
                     "- Which tool to call (bash, read_file, write_file, etc.)\n"
                     "- Which specific file paths to use (e.g., 'Read uploaded/IEDM_.parsed.md')\n"
@@ -38329,14 +40330,32 @@ body{padding:18px}
             ), "ts": now_ts()},
             {"role": "user", "content": synthesis_prompt, "ts": now_ts()},
         ]
+        synthesis_tools = self._plan_mode_synthesis_tools()
+        synthesis_system = (
+            "Generate a structured plan proposal. "
+            "You MUST call submit_plan_proposal exactly once. "
+            "Do not answer with plain text."
+        )
+        synthesis_metrics = self._context_metrics_for_model_call(
+            synthesis_ctx,
+            tools=synthesis_tools,
+            system=synthesis_system,
+            label="plan-mode synthesis",
+        )
+        synthesis_tier = self._context_compression_tier(synthesis_metrics)
+        if synthesis_tier >= 1:
+            self._compact_plan_context(synthesis_tier)
+            self._compact_role_context("explorer", synthesis_tier)
+            if synthesis_tier >= 2:
+                compact_findings = trim(findings_text, 2400 if synthesis_tier == 2 else 1200)
+                synthesis_ctx[1]["content"] = synthesis_ctx[1]["content"].replace(
+                    f"## Research Findings\n{trim(findings_text, 6000)}",
+                    f"## Research Findings\n{compact_findings}",
+                )
         response = self._chat_with_same_model_retry(
             synthesis_ctx,
-            tools=self._plan_mode_synthesis_tools(),
-            system=(
-                "Generate a structured plan proposal. "
-                "You MUST call submit_plan_proposal exactly once. "
-                "Do not answer with plain text."
-            ),
+            tools=synthesis_tools,
+            system=synthesis_system,
             max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
             think=False,
             stream_thinking=False,
@@ -38359,7 +40378,7 @@ body{padding:18px}
                     "ts": now_ts(),
                 }
             ],
-            tools=self._plan_mode_synthesis_tools(),
+            tools=synthesis_tools,
             system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
             max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
             think=False,
@@ -39134,6 +41153,56 @@ body{padding:18px}
         target = base_level + int(shift)
         return max(min(TASK_LEVEL_CHOICES), min(max(TASK_LEVEL_CHOICES), int(target)))
 
+    def _prune_planner_context_after_plan_approval(self, choice_id: str, chosen: dict, grouped_steps: list):
+        planner_rows = [
+            m for m in self.messages
+            if isinstance(m, dict) and str(m.get("agent_role", "") or "") == "planner"
+        ]
+        if not planner_rows:
+            return
+        seg = self._archive_context_segment(planner_rows, "plan-approved")
+        seg_id = str(seg.get("id", "") if isinstance(seg, dict) else "")
+        title = trim(str((chosen or {}).get("title", "") or choice_id), 220)
+        summary = trim(str((chosen or {}).get("summary", "") or ""), 900)
+        steps_text = "\n".join(
+            f"- {trim(str(step or ''), 260)}"
+            for step in list(grouped_steps or [])[:12]
+            if str(step or "").strip()
+        )
+        handoff = (
+            "<plan-approved-handoff>\n"
+            f"chosen: {choice_id} {title}\n"
+            f"summary: {summary}\n"
+            f"steps:\n{steps_text or '- See blackboard plan.steps and .clouds_coder/plan.md'}\n"
+            f"archived_planner_context: {seg_id or 'none'}\n"
+            "Execution source of truth: blackboard plan.steps, project_todos, and .clouds_coder/plan.md. "
+            "Old plan-mode research/proposal bubbles were compacted after approval; use context_recall only for missing evidence.\n"
+            "</plan-approved-handoff>"
+        )
+        self.messages = [
+            m for m in self.messages
+            if not (isinstance(m, dict) and str(m.get("agent_role", "") or "") == "planner")
+        ][-380:]
+        self.messages.append(
+            {
+                "role": "assistant",
+                "content": trim(handoff, 5000),
+                "ts": now_ts(),
+                "agent_role": "planner",
+                "_compact_planner_handoff": True,
+            }
+        )
+        self.runtime_plan_proposal = {
+            "context": "approved plan compacted",
+            "options": [dict(chosen or {})],
+            "recommended": choice_id,
+        }
+        try:
+            self._compact_role_context("explorer", 2)
+            self._compact_shared_context(1)
+        except Exception:
+            pass
+
     def _inject_plan_into_context(self, choice_id: str):
         chosen = next(
             (o for o in self.runtime_plan_proposal.get("options", [])
@@ -39283,6 +41352,10 @@ body{padding:18px}
         # Pre-load skills explicitly mentioned in plan steps
         try:
             self._preload_skills_from_plan_steps(grouped_steps)
+        except Exception:
+            pass
+        try:
+            self._prune_planner_context_after_plan_approval(choice_id, chosen, grouped_steps)
         except Exception:
             pass
 
@@ -39496,7 +41569,7 @@ body{padding:18px}
                             },
                         )
                         break
-                self._apply_auto_compact_if_needed("auto")
+                self._apply_auto_compact_if_needed("auto", role=single_role)
                 # Periodic checkpoint in single-agent loop
                 _sa_round = int(getattr(self, "agent_round_index", 0) or 0)
                 if _sa_round > 0 and _sa_round % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -39753,6 +41826,46 @@ body{padding:18px}
                     repeated_tool_rounds = 0
                     decision_probe = text if str(text or "").strip() else thinking_text
                     done_probe = f"{text}\n{thinking_text}".strip()
+                    post_message_plan_advanced = False
+                    try:
+                        post_message_plan_advanced = self._single_agent_plan_step_check([])
+                    except Exception as exc:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "post-message plan step check failed: "
+                                    f"{trim(str(exc), 120)}"
+                                )
+                            },
+                        )
+                    if post_message_plan_advanced:
+                        no_tool_rounds = 0
+                        arbiter_planning_rounds = 0
+                        fault_counter = 0
+                        last_fault_reason = ""
+                        self._prune_runtime_retry_hints()
+                        if self._get_active_plan_step(self._ensure_blackboard()):
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "plan step verified after assistant message; "
+                                        "continuing next step"
+                                    )
+                                },
+                            )
+                            continue
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "plan step verified after assistant message; "
+                                    "all plan steps complete"
+                                )
+                            },
+                        )
+                        break
                     decision_needed = self._looks_like_user_decision_needed(decision_probe)
                     if decision_needed:
                         arbiter_planning_rounds = 0
@@ -39785,7 +41898,12 @@ body{padding:18px}
                         )
                         continue
                     clean_decision_probe = strip_thinking_content(decision_probe).strip()
-                    if bool(self.arbiter_enabled) and len(clean_decision_probe) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
+                    arbiter_probe_len = max(len(clean_decision_probe), len(str(thinking_text or "").strip()))
+                    arbiter_should_run = bool(self.arbiter_enabled) and (
+                        arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+                        or self._looks_like_action_promise_without_tool(done_probe)
+                    )
+                    if arbiter_should_run:
                         arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
                         arbiter_status = str(arbiter_decision.get("status", "") or "").strip().upper()
                         if arbiter_status == "TASK_COMPLETED":
@@ -39804,6 +41922,35 @@ body{padding:18px}
                                 },
                             )
                             break
+                        if arbiter_status == "ACTION_REQUIRED":
+                            arbiter_planning_rounds = 0
+                            no_tool_rounds = 0
+                            fault_counter = 0
+                            last_fault_reason = ""
+                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                            self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
+                            if auto_continue_budget > 0:
+                                auto_continue_budget -= 1
+                                self._emit(
+                                    "status",
+                                    {
+                                        "summary": (
+                                            "arbiter decision=ACTION_REQUIRED; "
+                                            "auto-continue to concrete tool execution "
+                                            f"(remaining={auto_continue_budget})"
+                                        )
+                                    },
+                                )
+                                continue
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "arbiter decision=ACTION_REQUIRED but auto-continue budget exhausted; "
+                                        "falling back to no-tool handling"
+                                    )
+                                },
+                            )
                         if arbiter_status == "VALID_PLANNING":
                             arbiter_planning_rounds += 1
                             if arbiter_planning_rounds <= int(ARBITER_VALID_PLANNING_STREAK_LIMIT):
@@ -39880,6 +42027,7 @@ body{padding:18px}
                     substantial_reply = self._looks_like_substantial_informative_reply(done_probe)
                     done_like = self._looks_like_conclusive_reply(done_probe)
                     todo_blocking = self._todo_should_block_auto_continue(done_probe)
+                    action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
                     endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
                     if bool(endpoint.get("matched", False)):
                         arbiter_planning_rounds = 0
@@ -39935,7 +42083,7 @@ body{padding:18px}
                         break
                     no_tool_rounds += 1
                     diagnosis = self._diagnose_no_tool_idle(decision_probe, no_tool_rounds)
-                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking
+                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking or action_promise_pending
                     if no_tool_rounds >= 2 and pending_like:
                         fault_counter += 1
                         last_fault_reason = f"no-tool-idle(streak={no_tool_rounds})"
@@ -39957,7 +42105,11 @@ body{padding:18px}
                     if (not done_like) and no_tool_rounds >= 1 and pending_like:
                         if auto_continue_budget > 0:
                             auto_continue_budget -= 1
-                            if no_tool_rounds >= 2:
+                            if action_promise_pending:
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                self._inject_action_promise_recovery_hint(done_probe)
+                                summary = "no-tool action promise recovered"
+                            elif no_tool_rounds >= 2:
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                                 self._inject_no_tool_recovery_hint(diagnosis)
                                 summary = "no-tool recovery mode engaged"
@@ -39977,7 +42129,7 @@ body{padding:18px}
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
-                        todo_blocking or self._looks_like_incomplete_reply(text)
+                        todo_blocking or action_promise_pending or self._looks_like_incomplete_reply(text)
                     )
                     if can_continue:
                         if self.cancel_requested:
@@ -40366,6 +42518,9 @@ body{padding:18px}
                 )
                 # Single-agent plan step tracking: sync todos and auto-advance
                 self._single_agent_plan_step_check(single_round_tool_results)
+                if self._maybe_inject_read_file_strategy_intervention(single_round_tool_results, role=single_role):
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                    retry_requested_this_round = True
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
@@ -41039,6 +43194,7 @@ body{padding:18px}
                 row["data"] = data
                 operations_view.append(row)
             ctx = self._context_budget_metrics()
+            agent_contexts_view = self._agent_context_budget_metrics_snapshot()
             model_catalog = self.model_catalog() if include_model_catalog else None
             blackboard = self._normalize_blackboard(self.blackboard)
             blackboard_view = (
@@ -41097,6 +43253,7 @@ body{padding:18px}
                 "agent_round_index": int(self.agent_round_index),
                 "agent_phase": str(self.current_phase or "idle"),
                 "agent_active_tool": str(self.current_tool_name or ""),
+                "agent_contexts": agent_contexts_view,
                 "blackboard": blackboard_view,
                 "queued_user_inputs_count": len(self.pending_user_inputs),
                 "scheduler_queued_inputs_count": sum(
@@ -41109,6 +43266,18 @@ body{padding:18px}
                 "context_reserve_percent": float(ctx.get("reserve_percent", 0.0)),
                 "context_token_limit_config": int(self.max_context_token_limit),
                 "context_token_limit_locked": bool(self.context_limit_locked),
+                "context_limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
+                "read_context_policy": normalize_read_context_policy(
+                    getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                ),
+                "auto_task_level_ceiling": self._auto_task_level_ceiling_value(),
+                "read_context_budget": self._read_context_budget(),
+                "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
+                "context_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
+                "context_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
+                "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
+                "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
+                "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
                 "context_estimator": str(ctx.get("estimator", "")),
                 "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
                 "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
@@ -41424,11 +43593,12 @@ class SessionManager:
         thinking: bool = False,
         default_llm_config: dict | None = None,
         default_language: str = DEFAULT_UI_LANGUAGE,
-        context_token_limit: int = TOKEN_THRESHOLD,
+        context_token_limit: int = DEFAULT_CONTEXT_TOKEN_LIMIT,
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -41480,6 +43650,7 @@ class SessionManager:
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+        self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -41488,6 +43659,7 @@ class SessionManager:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.single_advance_prompt_enhance = False
+        self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.upload_callback = upload_callback
         self.reference_prepare_callback = reference_prepare_callback
         self.query_code_library_callback = query_code_library_callback
@@ -41609,6 +43781,12 @@ class SessionManager:
             "ollama_base": self.ollama_base,
             "thinking": self.thinking,
             "ui_language": self.user_language,
+            "read_context_policy": normalize_read_context_policy(
+                getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+            ),
+            "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            ),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -41659,6 +43837,15 @@ class SessionManager:
         if self.user_prefs_path.exists():
             raw = self.crypto.read_json(self.user_prefs_path, {})
             self.user_language = normalize_ui_language(raw.get("ui_language", self.user_language))
+            self.read_context_policy = normalize_read_context_policy(
+                raw.get("read_context_policy", getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
+            )
+            raw_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(raw)
+            self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                raw_auto_task_level_ceiling
+                if raw_auto_task_level_ceiling is not None
+                else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            )
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -41762,6 +43949,12 @@ class SessionManager:
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
+        sess.read_context_policy = normalize_read_context_policy(
+            getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+        )
+        sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+            getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+        )
         sess.shell_command_timeout_seconds = normalize_timeout_seconds(
             self.shell_command_timeout_seconds,
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
@@ -41793,6 +43986,16 @@ class SessionManager:
         self._sync_ollama_defaults(active_profile)
         self.thinking = False
         self.user_language = normalize_ui_language(getattr(sess, "ui_language", self.user_language))
+        self.read_context_policy = normalize_read_context_policy(
+            getattr(sess, "read_context_policy", getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
+        )
+        self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+            getattr(
+                sess,
+                "auto_task_level_ceiling",
+                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
+            )
+        )
         self._persist_user_prefs()
         if not apply_to_all:
             return
@@ -41829,6 +44032,7 @@ class SessionManager:
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
+                auto_task_level_ceiling=self.auto_task_level_ceiling,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -41879,6 +44083,7 @@ class SessionManager:
                 max_rounds=self.max_rounds,
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
+                auto_task_level_ceiling=self.auto_task_level_ceiling,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -42241,6 +44446,9 @@ class SessionManager:
             active_profile = self._active_profile()
             self._sync_ollama_defaults(active_profile)
             self.thinking = False
+            cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
+            if cfg_auto_task_level_ceiling is not None:
+                self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
             self._persist_user_prefs()
             for sess in self.sessions.values():
                 self._apply_user_defaults_to_session(sess, clear_cap_cache=True)
@@ -42791,7 +44999,11 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .ctx-live{margin-left:auto;display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #d6deea;border-radius:999px;background:#f8fbff;min-width:250px}
 .ctx-live-dot{width:8px;height:8px;border-radius:50%;background:#13b8a6;box-shadow:0 0 0 rgba(19,184,166,.45)}
 .ctx-live-bar{position:relative;display:inline-block;width:84px;height:6px;border-radius:999px;background:#e5edf8;overflow:hidden}
-.ctx-live-fill{display:block;height:100%;width:0%;background:linear-gradient(90deg,#13b8a6,#1f6feb);transition:width .24s ease,background .24s ease}
+.ctx-live-fill{position:relative;display:block;height:100%;width:0%;background:linear-gradient(90deg,#13b8a6,#1f6feb);transition:width .24s ease,background .24s ease}
+.ctx-live-fill.segmented{width:100%;background:#e5edf8;transition:background .24s ease}
+.ctx-live-fill.multi{width:100%;height:100%;background:transparent;transition:none}
+.ctx-live-agent-layer{position:absolute;left:0;right:0;top:50%;height:4px;border-radius:999px;transform:translateY(-50%);background:transparent;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ctx-agent-color,#4a5568) 42%, transparent);overflow:hidden;transition:height .24s ease}
+.ctx-live-agent-fill{position:absolute;left:0;top:0;bottom:0;width:0%;border-radius:999px;background:linear-gradient(90deg,color-mix(in srgb,var(--ctx-agent-color,#4a5568) 82%, #ffffff 18%),var(--ctx-agent-color,#4a5568));box-shadow:0 0 0 1px rgba(255,255,255,.22) inset;transition:width .24s ease}
 @media (max-width:760px){
   .composer-footer{flex-direction:column;align-items:stretch}
   .composer-file-btn{justify-content:center}
@@ -42799,8 +45011,12 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 }
 .ctx-live.warn .ctx-live-dot{background:#e1a400}
 .ctx-live.warn .ctx-live-fill{background:linear-gradient(90deg,#ffcc66,#e1a400)}
+.ctx-live.warn .ctx-live-fill.segmented{background:#e5edf8}
+.ctx-live.warn .ctx-live-fill.multi{background:transparent}
 .ctx-live.danger .ctx-live-dot{background:#cf3b3b}
 .ctx-live.danger .ctx-live-fill{background:linear-gradient(90deg,#ff8a8a,#cf3b3b)}
+.ctx-live.danger .ctx-live-fill.segmented{background:#e5edf8}
+.ctx-live.danger .ctx-live-fill.multi{background:transparent}
 .ctx-live.danger{border-color:#f1c5c5;background:#fff4f4}
 .error-box{margin-top:8px;padding:8px 10px;border:1px solid #f2b4b4;background:#fff1f1;color:#8f1d1d;border-radius:8px}
 .hidden{display:none}
@@ -42813,6 +45029,18 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .runtime-pill-label{flex:0 0 auto;font-weight:700;color:#667b94;white-space:nowrap}
 .runtime-pill-value{min-width:0;color:#17283d;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
 .runtime-pill-value.mono{font-size:.76rem}
+.agent-ctx-group{display:flex;flex-wrap:wrap;gap:6px;width:100%;margin-top:2px}
+.agent-ctx-chip{display:inline-flex;align-items:center;gap:6px;min-width:0;padding:5px 8px;border:1px solid #dbe5f2;border-radius:999px;background:#fff;font-size:.75rem;color:#24364b}
+.agent-ctx-chip.active{box-shadow:0 0 0 2px rgba(47,111,237,.12)}
+.agent-ctx-chip.warn{border-color:#f1c97a;background:#fff9ea}
+.agent-ctx-chip.danger{border-color:#ef9a9a;background:#fff1f1}
+.agent-ctx-chip .agent-dot{width:7px;height:7px;border-radius:50%;background:#718096;flex:0 0 auto}
+.agent-ctx-chip.role-explorer .agent-dot{background:#ff4d4f}
+.agent-ctx-chip.role-developer .agent-dot{background:#20c997}
+.agent-ctx-chip.role-reviewer .agent-dot{background:#f59f00}
+.agent-ctx-chip.role-manager .agent-dot{background:#9b5cff}
+.agent-ctx-chip.role-single .agent-dot{background:#64748b}
+.agent-ctx-chip .agent-ctx-value{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#17283d;white-space:nowrap}
 .render-bridge{margin:0 0 10px;border:1px solid #d9e4f1;border-radius:10px;background:#fbfdff;overflow:hidden}
 .render-meta{padding:6px 8px;border-bottom:1px solid #e6edf7;color:#51627a;font-size:.76rem;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .render-canvas{display:block;width:100%;height:220px;background:#ffffff}
@@ -43134,7 +45362,7 @@ const I18N={
 };
 Object.assign(I18N['en'],{
   sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
-  role_explorer:'Explorer',role_developer:'Developer',role_reviewer:'Reviewer',role_manager:'Manager',role_planner:'Planner',role_agent:'Agent',
+  role_explorer:'Explorer',role_developer:'Developer',role_reviewer:'Reviewer',role_manager:'Manager',role_planner:'Planner',role_agent:'Agent',role_single:'Context',
   callout_warning:'Warning',callout_notice:'Notice',callout_instruction:'Instruction',callout_tip:'Tip',callout_reminder:'Reminder',
   event_manager_delegate_title:'Manager Delegate',event_objective:'Objective',event_instruction:'Instruction',event_intent:'intent',
   event_tool_calls_title:'Tool Calls',event_tool_calls_note:'Model scheduled these tools for the current turn.',event_tool_calls_empty:'No structured tool metadata was attached to this turn.',
@@ -43148,7 +45376,7 @@ Object.assign(I18N['en'],{
 	  event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
-  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
@@ -43156,7 +45384,7 @@ Object.assign(I18N['en'],{
 Object.assign(I18N['zh-CN'],{
   sec_todos:'待办',sec_tasks:'任务',sec_activity:'活动',sec_commands:'命令',sec_diffs:'文件差异',sec_catalog:'目录',
   no_todos:'暂无待办',no_tasks:'暂无任务',no_catalog:'暂无目录',
-  role_explorer:'探索者',role_developer:'开发者',role_reviewer:'审查者',role_manager:'管理者',role_planner:'规划者',role_agent:'Agent',
+  role_explorer:'探索者',role_developer:'开发者',role_reviewer:'审查者',role_manager:'管理者',role_planner:'规划者',role_agent:'Agent',role_single:'上下文',
   callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建议',callout_reminder:'提醒',
   event_manager_delegate_title:'管理者委派',event_objective:'目标',event_instruction:'指令',event_intent:'意图',
   event_tool_calls_title:'工具调用',event_tool_calls_note:'模型已为当前轮安排以下工具调用。',event_tool_calls_empty:'当前轮没有附带结构化工具元数据。',
@@ -43170,7 +45398,7 @@ Object.assign(I18N['zh-CN'],{
 	  event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
-  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
@@ -43181,7 +45409,7 @@ Object.assign(I18N['zh-TW'],{
   sec_todos:'待辦',sec_tasks:'任務',sec_activity:'活動',sec_commands:'命令',sec_diffs:'檔案差異',sec_catalog:'目錄',
   no_todos:'尚無待辦',no_tasks:'尚無任務',no_catalog:'尚無目錄',
   level_3_collab:'L3 協作',
-  role_explorer:'探索者',role_developer:'開發者',role_reviewer:'審查者',role_manager:'管理者',role_planner:'規劃者',role_agent:'Agent',
+  role_explorer:'探索者',role_developer:'開發者',role_reviewer:'審查者',role_manager:'管理者',role_planner:'規劃者',role_agent:'Agent',role_single:'上下文',
   callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建議',callout_reminder:'提醒',
   event_manager_delegate_title:'管理者委派',event_objective:'目標',event_instruction:'指令',event_intent:'意圖',
   event_tool_calls_title:'工具呼叫',event_tool_calls_note:'模型已為目前輪安排以下工具呼叫。',event_tool_calls_empty:'目前輪沒有附帶結構化工具中繼資料。',
@@ -43195,7 +45423,7 @@ Object.assign(I18N['zh-TW'],{
 	  event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
-  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
@@ -43204,7 +45432,7 @@ Object.assign(I18N['ja'],{
   sec_todos:'Todo',sec_tasks:'タスク',sec_activity:'アクティビティ',sec_commands:'コマンド',sec_diffs:'ファイル差分',sec_catalog:'カタログ',
   thinking:'思考',thinking_stream:'思考（ストリーム）',copy_code:'コードをコピー',copy_done:'コピーしました',
   no_todos:'Todo はありません',no_tasks:'タスクはありません',no_catalog:'カタログなし',
-  role_explorer:'探索担当',role_developer:'開発担当',role_reviewer:'レビュー担当',role_manager:'マネージャー',role_planner:'プランナー',role_agent:'Agent',
+  role_explorer:'探索担当',role_developer:'開発担当',role_reviewer:'レビュー担当',role_manager:'マネージャー',role_planner:'プランナー',role_agent:'Agent',role_single:'コンテキスト',
   callout_warning:'警告',callout_notice:'通知',callout_instruction:'指示',callout_tip:'ヒント',callout_reminder:'リマインダー',
   event_manager_delegate_title:'マネージャー委任',event_objective:'目的',event_instruction:'指示',event_intent:'意図',
   event_tool_calls_title:'ツール呼び出し',event_tool_calls_note:'モデルはこのターンで次のツール呼び出しを予定しました。',event_tool_calls_empty:'このターンには構造化されたツールメタデータがありません。',
@@ -43218,7 +45446,7 @@ Object.assign(I18N['ja'],{
 	  event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
-  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
@@ -43229,7 +45457,7 @@ function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
-function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
+function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];if(!langs.length){sel.innerHTML='';return}const cur=String(S.config?.language||currentLang());sel.innerHTML='';for(const row of langs){const code=String(row?.code||'').trim();if(!code)continue;const op=document.createElement('option');op.value=code;op.textContent=String(row?.label||code);sel.appendChild(op)}if(cur)sel.value=cur}
 async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();renderUploadList();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
@@ -43286,8 +45514,13 @@ function setPanelHtml(id,html){
   }
 }
 function formatContextLeft(snap){const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct))return '-';return `${left} (${pct.toFixed(1)}%)`}
+function contextLiveRows(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();const showAgents=(mode==='sync'||mode==='sequential');const rows=showAgents&&Array.isArray(snap?.agent_contexts)?snap.agent_contexts.slice():[];const valid=rows.filter(r=>Number.isFinite(Number(r?.left))&&Number.isFinite(Number(r?.left_percent))).sort((a,b)=>(Number(a.left_percent)-Number(b.left_percent))||(Number(a.left)-Number(b.left)));if(valid.length>1)return valid;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(Number.isFinite(left)&&Number.isFinite(pct))return[{role:'single',label:t('role_single'),left,left_percent:pct,tier:0,active:true}];if(valid.length===1)return valid;return[]}
+function agentCtxColor(role){const r=String(role||'').trim().toLowerCase();if(r==='explorer')return'#ff4d4f';if(r==='developer')return'#20c997';if(r==='reviewer')return'#f59f00';if(r==='manager')return'#9b5cff';return'#64748b'}
+function agentContextLabel(row){const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role);if(roleKey)return _chatVirtAgentRoleLabel(roleKey);const raw=String(row?.label||'').trim();if(!raw||raw.toLowerCase()==='single')return t('role_single');return raw}
+function contextLiveNestedHtml(rows){const valid=(Array.isArray(rows)?rows:[]).filter(r=>Number.isFinite(Number(r?.left_percent))).slice(0,6);if(valid.length<=1)return'';const maxH=6;return valid.map((row,i)=>{const pct=Math.max(0,Math.min(100,Number(row?.left_percent)));const left=Number(row?.left);const tier=Number(row?.tier||0);const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role)||role||'single';const label=agentContextLabel(row);const color=agentCtxColor(roleKey);const h=Math.max(1.5,maxH-(i*1.2));const z=valid.length-i;const title=`${t('rt_ctx_left_for',{label})}=${Number.isFinite(left)?left:'-'} (${pct.toFixed(1)}%) · T${tier}`;return `<span class=\"ctx-live-agent-layer role-${esc(roleKey)}\" style=\"--ctx-agent-color:${esc(color)};height:${h.toFixed(1)}px;z-index:${z}\" title=\"${esc(title)}\"><span class=\"ctx-live-agent-fill\" style=\"width:${pct.toFixed(2)}%\"></span></span>`}).join('')}
+function agentContextChipsHtml(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();if(mode!=='sync'&&mode!=='sequential')return'';const rows=Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[];if(rows.length<=1)return'';return `<span class=\"agent-ctx-group\">${rows.slice(0,6).map(row=>{const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role)||role||'single';const label=agentContextLabel(row);const left=Number(row?.left);const pct=Number(row?.left_percent);const tier=Number(row?.tier||0);const safePct=Number.isFinite(pct)?Math.max(0,Math.min(100,pct)):0;const value=Number.isFinite(left)&&Number.isFinite(pct)?`${left} · ${safePct.toFixed(1)}% · T${tier}`:'-';const tone=safePct<=15?' danger':(safePct<=35?' warn':'');const active=row?.active?' active':'';return `<span class=\"agent-ctx-chip role-${esc(roleKey)}${tone}${active}\" title=\"${esc(String(row?.next_call_label||''))}\"><span class=\"agent-dot\"></span><span>${esc(label)}</span><span class=\"agent-ctx-value\">${esc(value)}</span></span>`}).join('')}</span>`}
 function scheduleCompactRefreshBurst(count=COMPACT_AUTO_REFRESH_COUNT){if(!S.activeId)return;const n=Math.max(1,Math.min(10,Number(count)||COMPACT_AUTO_REFRESH_COUNT));const delay=Math.max(90,Math.min(1400,90+((n-1)*COMPACT_AUTO_REFRESH_INTERVAL_MS)));scheduleSnapshot({forceFull:false,delayMs:delay,allowWhenFrozen:true})}
-function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct)){textEl.textContent=`${t('rt_ctx_left')}=-`;fill.style.width='0%';box.classList.remove('warn','danger');return}const safePct=Math.max(0,Math.min(100,pct));textEl.textContent=`${t('rt_ctx_left')}=${left} (${safePct.toFixed(1)}%)`;fill.style.width=`${safePct}%`;box.classList.toggle('warn',safePct<=35&&safePct>15);box.classList.toggle('danger',safePct<=15)}
+function renderCtxLive(snap){const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;const rows=contextLiveRows(snap);const tight=rows[0]||null;const left=Number(tight?.left);const pct=Number(tight?.left_percent);if(!tight||!Number.isFinite(left)||!Number.isFinite(pct)){textEl.textContent=`${t('rt_ctx_left')}=-`;fill.innerHTML='';fill.style.width='0%';fill.style.background='';fill.classList.remove('segmented','multi');box.classList.remove('warn','danger','multi');return}const safePct=Math.max(0,Math.min(100,pct));if(rows.length>1){const label=agentContextLabel(tight);textEl.textContent=`${t('rt_ctx_left_for',{label})}=${left} (${safePct.toFixed(1)}%)`;box.classList.add('multi');fill.classList.remove('segmented');fill.classList.add('multi');fill.style.width='100%';fill.style.background='';fill.innerHTML=contextLiveNestedHtml(rows);const titleRows=rows.slice(0,6).map(row=>{const rowPct=Math.max(0,Math.min(100,Number(row?.left_percent)));const rowLeft=Number(row?.left);const rowLabel=agentContextLabel(row);return `${t('rt_ctx_left_for',{label:rowLabel})}=${Number.isFinite(rowLeft)?rowLeft:'-'} (${Number.isFinite(rowPct)?rowPct.toFixed(1):'-'}%)`}).join(' | ');if(titleRows)fill.setAttribute('title',titleRows)}else{textEl.textContent=`${t('rt_ctx_left')}=${left} (${safePct.toFixed(1)}%)`;box.classList.remove('multi');fill.innerHTML='';fill.classList.remove('segmented','multi');fill.style.width=`${safePct}%`;fill.style.background='';fill.removeAttribute('title')}box.classList.toggle('warn',safePct<=35&&safePct>15);box.classList.toggle('danger',safePct<=15)}
 function showCompactToast(text){let el=document.querySelector('.compact-toast');if(!el){el=document.createElement('div');el.className='compact-toast';document.body.appendChild(el)}el.textContent=text;el.classList.add('show');if(el._t)clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),2800)}
 function parseCompactReason(data){const direct=String(data?.reason||'').trim();if(direct)return direct;const s=String(data?.summary||'');const m=s.match(/context compacted \\(([^)]*)\\)/);return m?String(m[1]||'').trim():''}
 function isRenderRuntimeEventType(evtType){return RENDER_EVT_TYPES.has(String(evtType||''))}
@@ -43624,7 +45857,7 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
-function boardsSignature(snap){return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
+function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
@@ -45040,8 +47273,8 @@ function _chatVirtReleaseNode(node){
   CHAT_VIRT.poolSize=Number(CHAT_VIRT.poolSize||0)+1;
 }
 function _chatVirtReleaseRendered(root){if(!root)return;for(const node of root.querySelectorAll('.msg[data-vk]')){_chatVirtReleaseNode(node)}}
-function _chatVirtAgentRoleKey(raw){const role=String(raw||'').trim().toLowerCase();return(role==='explorer'||role==='developer'||role==='reviewer'||role==='manager'||role==='planner')?role:''}
-function _chatVirtAgentRoleLabel(role){if(role==='explorer')return t('role_explorer');if(role==='developer')return t('role_developer');if(role==='reviewer')return t('role_reviewer');if(role==='manager')return t('role_manager');if(role==='planner')return t('role_planner');return t('role_agent')}
+function _chatVirtAgentRoleKey(raw){const role=String(raw||'').trim().toLowerCase();return(role==='explorer'||role==='developer'||role==='reviewer'||role==='manager'||role==='planner'||role==='single')?role:''}
+function _chatVirtAgentRoleLabel(role){if(role==='explorer')return t('role_explorer');if(role==='developer')return t('role_developer');if(role==='reviewer')return t('role_reviewer');if(role==='manager')return t('role_manager');if(role==='planner')return t('role_planner');if(role==='single')return t('role_single');return t('role_agent')}
 function _stripLeadingAgentTitle(raw,agentRole){
   let txt=String(raw||'').replace(/^\\uFEFF/,'').trimStart();
   const role=_chatVirtAgentRoleKey(agentRole);
@@ -45870,7 +48103,7 @@ function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
 function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];if(!pages.length)return String(d.output||'');const idx=Math.max(0,Math.min(pages.length-1,Number(page||1)-1));return String(pages[idx]||'')}
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
-function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('');
+function renderBoards(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -46249,7 +48482,7 @@ window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','se
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
 type Msg={role:string;text:string;thinking?:string;agent_role?:string};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
-type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;agent_active_role?:string;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
+type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
 type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
 type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
 type SkillProtocol={protocol:string;version:string;active_providers:number;active_skills:number;description:string};
@@ -60445,11 +62678,12 @@ class AppContext:
         thinking: bool = False,
         default_language: str = DEFAULT_UI_LANGUAGE,
         ui_style: str = DEFAULT_UI_STYLE,
-        context_token_limit: int = TOKEN_THRESHOLD,
+        context_token_limit: int = DEFAULT_CONTEXT_TOKEN_LIMIT,
         context_limit_locked: bool = False,
         max_rounds: int = MAX_AGENT_ROUNDS,
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -60499,6 +62733,7 @@ class AppContext:
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+        self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -60507,6 +62742,7 @@ class AppContext:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
+        self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.skills_root = skills_root
         ensure_runtime_skills(self.skills_root)
         self.skills_store = SkillStore(self.skills_root)
@@ -62850,6 +65086,7 @@ class AppContext:
                 self.max_rounds,
                 self.max_run_seconds,
                 self.shell_command_timeout_seconds,
+                self.auto_task_level_ceiling,
                 self.auto_model_switch,
                 self.arbiter_enabled,
                 self.arbiter_model,
@@ -62867,6 +65104,12 @@ class AppContext:
                 code_library_status_callback=self._code_library_status_for_session,
                 knowledge_library_root=self.rag_root,
                 knowledge_library_status_callback=self._knowledge_library_status_for_session,
+            )
+            mgr.read_context_policy = normalize_read_context_policy(
+                getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+            )
+            mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
             self._session_mgrs[user_id] = mgr
             return mgr
@@ -62952,6 +65195,12 @@ class AppContext:
             self.max_output_tokens = max(256, int(cfg_max_output_tokens))
         if "single_advance_prompt_enhance" in cfg:
             self.single_advance_prompt_enhance = bool(cfg["single_advance_prompt_enhance"])
+        cfg_read_context_policy = extract_read_context_policy_setting(cfg)
+        if cfg_read_context_policy:
+            self.read_context_policy = cfg_read_context_policy
+        cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
+        if cfg_auto_task_level_ceiling is not None:
+            self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
 
         def normalized_profiles() -> tuple[dict[str, dict], str]:
             rows: dict[str, dict] = {}
@@ -63009,6 +65258,21 @@ class AppContext:
         for uid, mgr in live_mgrs:
             try:
                 mgr.reset_to_llm_config(cfg, source=source or "global-config")
+                mgr.read_context_policy = normalize_read_context_policy(
+                    getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                )
+                mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                    getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                )
+                for sess in mgr.sessions.values():
+                    sess.read_context_policy = normalize_read_context_policy(
+                        getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                    )
+                    sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+                        getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    )
+                    sess.updated_at = now_ts()
+                    sess._persist()
                 live_users += 1
                 live_sessions += len(mgr.sessions)
             except Exception as exc:
@@ -63045,6 +65309,12 @@ class AppContext:
                     "ollama_base": base_text,
                     "thinking": False,
                     "ui_language": ui_lang,
+                    "read_context_policy": normalize_read_context_policy(
+                        getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                    ),
+                    "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                        getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    ),
                     "updated_at": now_ts(),
                 }
                 self.crypto.write_json(user_prefs_path, user_prefs_payload)
@@ -63060,6 +65330,9 @@ class AppContext:
                             sraw["model_profiles"] = profiles_map
                             sraw["active_profile_id"] = active_id
                             sraw["multimodal_capability_cache"] = {}
+                            sraw["auto_task_level_ceiling"] = normalize_auto_task_level_ceiling(
+                                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                            )
                             sraw["updated_at"] = now_ts()
                             self.crypto.write_json(state_file, sraw)
                             disk_sessions += 1
@@ -63935,6 +66208,12 @@ class Handler(BaseHTTPRequestHandler):
                         "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                         "run_timeout": int(mgr.max_run_seconds),
                         "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                        "read_context_policy": normalize_read_context_policy(
+                            getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                        ),
+                        "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                            getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                        ),
                     }
                 )
             model_cat = mgr.model_catalog()
@@ -63980,6 +66259,12 @@ class Handler(BaseHTTPRequestHandler):
                     "web_ui_dir": str(web_ui_state.get("dir", "")),
                     "context_token_limit": int(mgr.context_token_limit),
                     "context_limit_locked": bool(mgr.context_limit_locked),
+                    "read_context_policy": normalize_read_context_policy(
+                        getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                    ),
+                    "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                        getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    ),
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
@@ -64796,6 +67081,12 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                    "read_context_policy": normalize_read_context_policy(
+                        getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+                    ),
+                    "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
+                        getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    ),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
             )
@@ -65260,9 +67551,13 @@ def main():
     parser.add_argument("--port", default=8080, type=int)
     parser.add_argument(
         "--ctx_limit",
-        default=TOKEN_THRESHOLD,
+        default=DEFAULT_CONTEXT_TOKEN_LIMIT,
         type=int,
-        help=f"Session context token limit [{MIN_CONTEXT_TOKEN_LIMIT}-{TOKEN_THRESHOLD}]",
+        help=(
+            f"Session context token limit (default {DEFAULT_CONTEXT_TOKEN_LIMIT}; "
+            f"allowed {MIN_CONTEXT_TOKEN_LIMIT}-{TOKEN_THRESHOLD}). "
+            "Also configurable via config keys ctx_limit/context_token_limit/context_limit/max_context_tokens."
+        ),
     )
     parser.add_argument(
         "--max_rounds",
@@ -65450,10 +67745,37 @@ def main():
         default="",
         help=(
             "LLM config source (URL or local file path). "
-            "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout and "
+            "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
+            "ctx_limit/context_token_limit, read_context_policy, auto_task_level_ceiling and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
             "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
             "shell_timeout / bash_timeout / command_timeout)."
+        ),
+    )
+    parser.add_argument(
+        "--read_context_policy",
+        "--read-context-policy",
+        dest="read_context_policy",
+        default="",
+        help=(
+            "Read-context prompt/cache budget policy: auto|conservative|balanced|wide "
+            f"(default {DEFAULT_READ_CONTEXT_POLICY}). "
+            "auto follows the current compact tier. Also configurable via config key read_context_policy."
+        ),
+    )
+    parser.add_argument(
+        "--auto_task_level_ceiling",
+        "--auto-task-level-ceiling",
+        "--max_auto_task_level",
+        "--max-auto-task-level",
+        dest="auto_task_level_ceiling",
+        default="",
+        help=(
+            "Limit automatic L1-L5 task classification to this maximum level (1-5); "
+            f"0/off means no cap (default {DEFAULT_AUTO_TASK_LEVEL_CEILING}). "
+            "Manual task-level overrides and manual plan-mode preference are not capped. "
+            "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
+            "max_auto_task_level/complexity_ceiling."
         ),
     )
     parser.add_argument(
@@ -65591,7 +67913,6 @@ def main():
         shell_command_timeout=None,
     )
     args = parser.parse_args()
-    ctx_limit_locked = any(str(arg).split("=", 1)[0] == "--ctx_limit" for arg in sys.argv[1:])
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
     web_ui_config = load_web_ui_config_file(web_ui_config_path)
     raw_web_ui_dir = str(args.web_ui_dir or web_ui_config.get("web_ui_dir") or web_ui_config.get("dir") or "").strip()
@@ -65619,6 +67940,8 @@ def main():
     resolved_show_upload_list = False
     resolved_daily_session_limit_per_ip = 0
     resolved_shell_command_timeout = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
+    resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
+    resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -65653,6 +67976,12 @@ def main():
                     maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
                     fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
                 )
+            external_read_context_policy = extract_read_context_policy_setting(external_config)
+            if external_read_context_policy:
+                resolved_read_context_policy = external_read_context_policy
+            external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
+            if external_auto_task_level_ceiling is not None:
+                resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -65674,6 +68003,12 @@ def main():
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+    web_ui_read_context_policy = extract_read_context_policy_setting(web_ui_config)
+    if web_ui_read_context_policy:
+        resolved_read_context_policy = web_ui_read_context_policy
+    web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
+    if web_ui_auto_task_level_ceiling is not None:
+        resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
     cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
     if cli_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
@@ -65685,6 +68020,18 @@ def main():
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+    cli_read_context_policy = normalize_read_context_policy(
+        getattr(args, "read_context_policy", "") or "",
+        default="",
+    ) if str(getattr(args, "read_context_policy", "") or "").strip() else ""
+    if cli_read_context_policy:
+        resolved_read_context_policy = cli_read_context_policy
+    resolved_read_context_policy = normalize_read_context_policy(resolved_read_context_policy)
+    if str(getattr(args, "auto_task_level_ceiling", "") or "").strip():
+        resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(
+            getattr(args, "auto_task_level_ceiling", "")
+        )
+    resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(resolved_auto_task_level_ceiling)
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -65707,7 +68054,18 @@ def main():
         resolved_model = bootstrap_model
         print(f"[web-agent] ollama: not available at {bootstrap_base_url} — using fallback '{resolved_model}'")
     resolved_thinking = False
-    requested_ctx_limit = int(args.ctx_limit or TOKEN_THRESHOLD)
+    ctx_limit_locked = any(
+        str(arg).split("=", 1)[0] in {"--ctx_limit", "--ctx-limit"}
+        for arg in sys.argv[1:]
+    )
+    requested_ctx_limit = int(args.ctx_limit or DEFAULT_CONTEXT_TOKEN_LIMIT)
+    if not ctx_limit_locked:
+        cfg_ctx_limit = extract_context_token_limit_setting(external_config)
+        if cfg_ctx_limit is None:
+            cfg_ctx_limit = extract_context_token_limit_setting(web_ui_config)
+        if cfg_ctx_limit is not None:
+            requested_ctx_limit = int(cfg_ctx_limit)
+            ctx_limit_locked = True
     resolved_ctx_limit = max(
         MIN_CONTEXT_TOKEN_LIMIT,
         min(TOKEN_THRESHOLD, requested_ctx_limit),
@@ -65738,8 +68096,13 @@ def main():
         print(
             f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
             f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
-        )
+    )
     print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
+    print(f"[web-agent] read_context_policy={resolved_read_context_policy}")
+    print(
+        "[web-agent] auto_task_level_ceiling="
+        + ("off" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+    )
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
     if resolved_live_input_delay_write != requested_live_input_delay_write:
@@ -65923,6 +68286,7 @@ def main():
         resolved_max_rounds,
         resolved_run_timeout,
         resolved_shell_command_timeout,
+        resolved_auto_task_level_ceiling,
         resolved_auto_model_switch,
         resolved_arbiter_enabled,
         resolved_arbiter_model,
@@ -65938,6 +68302,8 @@ def main():
         bool(_js_dl_enabled),
         resolved_rag_include_filename_entities,
     )
+    app.read_context_policy = resolved_read_context_policy
+    app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
     config_apply_result: dict = {}
     if external_config:
         try:
@@ -65946,6 +68312,18 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    app.read_context_policy = resolved_read_context_policy
+    app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    with app._lock:
+        _mgrs_for_read_ctx_policy = list(app._session_mgrs.values())
+    for _mgr in _mgrs_for_read_ctx_policy:
+        _mgr.read_context_policy = resolved_read_context_policy
+        _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        for _sess in getattr(_mgr, "sessions", {}).values():
+            _sess.read_context_policy = resolved_read_context_policy
+            _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            _sess.updated_at = now_ts()
+            _sess._persist()
     # JS lib download (default on; set download_js_lib: false in --config to disable)
     app.js_lib_download_enabled = bool(_js_dl_enabled)
     print(
@@ -66119,6 +68497,10 @@ def main():
     print(f"[web-agent] UI_Style={UI_STYLE_LABELS.get(resolved_ui_style, 'Neo')}")
     print(f"[web-agent] ctx_limit={resolved_ctx_limit}")
     print(f"[web-agent] ctx_limit_lock={'on' if ctx_limit_locked else 'off'}")
+    print(
+        "[web-agent] auto_task_level_ceiling="
+        + ("off" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+    )
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
     print(
         f"[web-agent] run_timeout={resolved_run_timeout}s "
