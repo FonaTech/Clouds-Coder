@@ -30,7 +30,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-本次架构更新三语总览见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | 上期：[`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+架构更新日志归档：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -109,9 +109,11 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - 内置 `LLM -> Coding -> LLM` 三阶段执行模式，适配复杂多步骤工作
 - **Plan Mode** — UI 开关（Auto/On/Off），研究 → 方案 → 用户选择 → 逐步执行，Single 和 Sync 模式均支持
 - **多智能体协作** — 4 角色（manager/explorer/developer/reviewer）+ blackboard 中心化协调
+- **短上下文模型的长线处理能力放大** — 多 Agent 将任务拆成分角色上下文，让较小的本地模型也能连续完成调研、实现、审查与修复链路，而不依赖单次巨大 prompt
 - **Reviewer Debug Mode** — 检测到错误时 reviewer 获得写权限，独立诊断修复 bug
 - **6 类通用错误检测**（test/lint/compilation/build/deploy/runtime）+ 统一 failure ledger
 - **4 级分层上下文压缩**（normal → light → medium → heavy）+ 文件缓冲卸载，支持 4K 到 1M token
+- **分 Agent 独立压缩** — Manager / Explorer / Developer / Reviewer 上下文通道在同一分层 compact 框架下独立压缩，简单 single 任务保持原有单一全局上下文通道
 - **任务阶段感知委派** — manager 根据当前阶段（research/design/implement/test/review/deploy）路由到合适的 agent
 - **原生多模态支持** — read_file 自动检测图片/音频/视频，模型支持时作为原生输入注入
 - **实时用户输入合并** — 执行中途的反馈可调整 plan 方向，无需重启
@@ -185,8 +187,8 @@ flowchart TB
   UI["展示层<br/>Agent Web UI + Plan Mode 开关 + Skills Studio"]
   API["API 与流式层<br/>REST（含 plan-mode）+ SSE + render-state/frame"]
   ORCH["编排与控制层<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree<br/>Plan Mode / 阶段感知委派"]
-  AGENT["多智能体协作层<br/>Manager / Explorer / Developer / Reviewer"]
-  EXEC["模型与工具执行层<br/>OllamaClient + tool dispatch<br/>原生多模态 + 6 类错误检测 + 4 级压缩"]
+  AGENT["多智能体协作层<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + 分角色工作上下文"]
+  EXEC["模型与工具执行层<br/>OllamaClient + tool dispatch<br/>原生多模态 + 6 类错误检测 + 全局/分 Agent 分层压缩"]
   DATA["工件与持久化层<br/>files / uploads / context_archive / code_preview<br/>conversation / activity / operations / file_buffer"]
   UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
@@ -318,6 +320,15 @@ Clouds Coder 已支持在单体内核中进行角色专职协作：
 - 无跨服务 RPC 开销，协同延迟更低
 - 黑板状态可快照、可重放，Manager 决策更稳定
 - 任一环节报错时可快速中断并重路由
+- 通过分角色工作记忆，显著提升短上下文模型的长线任务连续性
+
+上下文拓扑：
+
+- Single 模式保持单一全局上下文通道和单条上下文进度条。
+- Multi-agent 模式只为 Manager 与真实参与的 agent 创建活跃角色通道。
+- 每个角色通道都按同一分层压缩策略独立估算与 compact。
+- 下一次模型调用只注入当前角色相关通道，而不是重新加载所有角色完整历史。
+- UI 只有在真实进入 multi-agent 后才显示嵌套角色上下文条；L1/L2 single 任务保持原有单条进度条。
 
 黑板核心切片（Single Source of Truth）：
 
@@ -363,6 +374,26 @@ flowchart LR
   M -->|delegate_task + mandatory + budget update| E
   M -->|delegate_task + mandatory + budget update| D
   M -->|delegate_task + mandatory + budget update| R
+```
+
+Mermaid（上下文生命周期与 compact 拓扑）：
+
+```mermaid
+flowchart TB
+  S["Single / L1-L2<br/>单一全局上下文通道"] -->|任务升级到 sync/sequential| A["多 Agent 激活"]
+  A --> MCTX["Manager 上下文<br/>路由 / 阶段 / 通过门禁"]
+  A --> ECTX["Explorer 上下文<br/>调研 / 证据 / 路径"]
+  A --> DCTX["Developer 上下文<br/>实现 / 工具结果"]
+  A --> RCTX["Reviewer 上下文<br/>验证 / 缺陷 / 修复"]
+  MCTX --> MC["分层 compact<br/>独立执行"]
+  ECTX --> EC["分层 compact<br/>独立执行"]
+  DCTX --> DC["分层 compact<br/>独立执行"]
+  RCTX --> RC["分层 compact<br/>独立执行"]
+  MC --> N["下一次模型调用<br/>只注入角色相关通道"]
+  EC --> N
+  DC --> N
+  RC --> N
+  N --> UICTX["UI 上下文指示器<br/>默认 single 单条<br/>仅 multi-agent 显示嵌套角色条"]
 ```
 
 Mermaid（动态路由与中途打断）：

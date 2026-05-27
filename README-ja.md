@@ -30,7 +30,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-最新アーキテクチャ更新の三言語サマリー: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | 前回: [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -109,9 +109,11 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - 複雑タスク向け `LLM -> Coding -> LLM` 実行パターンを標準搭載
 - **Plan Mode** — UI トグル（Auto/On/Off）、調査 → 提案 → ユーザー選択 → ステップ実行、Single/Sync 両対応
 - **マルチエージェント協調** — 4 ロール（manager/explorer/developer/reviewer）+ blackboard 中心協調
+- **短コンテキストモデルの長期処理強化** — マルチエージェント mode は作業をロール別コンテキストへ分割し、小さなローカルモデルでも調査・実装・レビュー・修復ループを継続しやすくします
 - **Reviewer Debug Mode** — エラー検出時に reviewer が書き込み権限を取得し、独立してバグ修正
 - **6 カテゴリ統一エラー検出**（test/lint/compilation/build/deploy/runtime）+ 統一 failure ledger
 - **4 段階コンテキスト圧縮**（normal → light → medium → heavy）+ ファイルバッファ、4K〜1M トークン対応
+- **Agent 別独立 compact** — Manager / Explorer / Developer / Reviewer のコンテキストレーンは同じ階層 compact フレームワークで個別に圧縮され、single task は従来の単一グローバルレーンを維持します
 - **タスクフェーズ認識委任** — manager が現在フェーズ（research/design/implement/test/review/deploy）に基づき適切な agent にルーティング
 - **ネイティブマルチモーダルサポート** — read_file が画像/音声/動画を自動検出、モデル対応時にネイティブ入力として注入
 - **リアルタイムユーザー入力マージ** — 実行中のフィードバックで plan 方向を調整、再起動不要
@@ -186,8 +188,8 @@ flowchart TB
   UI["表示レイヤー<br/>Agent Web UI + Plan Mode トグル + Skills Studio"]
   API["API・ストリームレイヤー<br/>REST + SSE + render-state/frame + plan-mode"]
   ORCH["オーケストレーション・制御<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree<br/>Plan Mode / フェーズ認識委任"]
-  AGENT["マルチエージェント協調<br/>Manager / Explorer / Developer / Reviewer"]
-  EXEC["モデル・ツール実行<br/>OllamaClient + tool dispatch<br/>ネイティブマルチモーダル + 6カテゴリエラー検出 + 4段階圧縮<br/>bash/read/write/edit/skills/context/task"]
+  AGENT["マルチエージェント協調<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + ロール別作業コンテキスト"]
+  EXEC["モデル・ツール実行<br/>OllamaClient + tool dispatch<br/>ネイティブマルチモーダル + 6カテゴリエラー検出 + グローバル/Agent別階層圧縮<br/>bash/read/write/edit/skills/context/task"]
   DATA["アーティファクト永続化<br/>files / uploads / context_archive / code_preview / file_buffer<br/>conversation / activity / operations"]
   UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
@@ -319,6 +321,15 @@ Clouds Coder は単一プロセスのモノリシック・ランタイム内で�
 - サービス間 RPC 不要で協調レイテンシを低減
 - Blackboard スナップショットによる Manager 判断の安定化
 - 実行途中エラー時の高速な中断・再ルーティング
+- ロール別作業メモリにより、短コンテキストモデルでも長いタスクの継続性を高める
+
+コンテキストトポロジ:
+
+- Single mode は単一グローバルコンテキストレーンと単一進捗バーを維持します。
+- Multi-agent mode は Manager と実際の参加 agent にだけ active role lane を作成します。
+- 各 role lane は同じ階層圧縮ポリシーで個別に見積もり、compact されます。
+- 次のモデル呼び出しには、すべてのロール履歴ではなく、そのロールに必要な lane だけを注入します。
+- UI は実際に multi-agent mode が有効になった後だけネスト role context bar を表示し、L1/L2 single task は従来の single bar のままです。
 
 Blackboard の主要スライス:
 
@@ -360,6 +371,26 @@ flowchart LR
   M -->|delegate_task + mandatory flags + budget update| E
   M -->|delegate_task + mandatory flags + budget update| D
   M -->|delegate_task + mandatory flags + budget update| R
+```
+
+Mermaid（コンテキストライフサイクルと compact トポロジ）:
+
+```mermaid
+flowchart TB
+  S["Single / L1-L2<br/>単一グローバルコンテキストレーン"] -->|task が sync/sequential へ上がる| A["マルチエージェント有効化"]
+  A --> MCTX["Manager context<br/>ルーティング / フェーズ / 承認"]
+  A --> ECTX["Explorer context<br/>調査 / 証拠 / パス"]
+  A --> DCTX["Developer context<br/>実装 / ツール結果"]
+  A --> RCTX["Reviewer context<br/>検証 / 欠陥 / 修正"]
+  MCTX --> MC["階層 compact<br/>独立実行"]
+  ECTX --> EC["階層 compact<br/>独立実行"]
+  DCTX --> DC["階層 compact<br/>独立実行"]
+  RCTX --> RC["階層 compact<br/>独立実行"]
+  MC --> N["次のモデル呼び出し<br/>必要なロールレーンだけ注入"]
+  EC --> N
+  DC --> N
+  RC --> N
+  N --> UICTX["UI コンテキスト表示<br/>既定は single bar<br/>multi-agent 時のみネスト role bars"]
 ```
 
 Mermaid（動的ルーティングと中断回帰）:

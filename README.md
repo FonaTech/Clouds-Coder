@@ -30,7 +30,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Latest architecture update summary (trilingual): [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | Previous: [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Architecture changelog archive (trilingual): [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -109,9 +109,11 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - Built-in `LLM -> Coding -> LLM` execution pattern for complex multi-step work
 - **Plan Mode** with UI toggle (Auto/On/Off) — research → proposal → user choice → step-by-step execution, works in both Single and Sync modes
 - **Multi-agent collaboration** with 4 roles (manager/explorer/developer/reviewer) and blackboard-centered coordination
+- **Short-context long-horizon scaling** — multi-agent mode splits work into role-isolated contexts so smaller local models can continue research, implementation, and review loops without relying on one giant prompt
 - **Reviewer Debug Mode** — reviewer gains write access to independently diagnose and fix bugs when errors are detected
 - **6-category universal error detection** (test/lint/compilation/build/deploy/runtime) with unified failure ledger
 - **4-tier context compression** (normal → light → medium → heavy) with file buffer offload, supporting ctx_left from 4K to 1M tokens
+- **Per-agent independent compaction** — Manager / Explorer / Developer / Reviewer context lanes compact independently under the same tiered framework, while single-agent tasks keep the original single global context lane
 - **Task phase-aware delegation** — manager routes to the right agent based on current phase (research/design/implement/test/review/deploy)
 - **Native multimodal support** — read_file auto-detects image/audio/video and injects as native model input when supported
 - **Real-time user input merge** — mid-execution feedback adjusts plan direction without restart
@@ -189,8 +191,8 @@ flowchart TB
   UI["Presentation Layer<br/>Agent Web UI + Plan Mode toggle + Skills Studio"]
   API["API & Stream Layer<br/>REST + SSE + render-state/frame + plan-mode"]
   ORCH["Plan & Orchestration<br/>Plan Mode (research→proposal→execute) / Phase-aware delegation<br/>AppContext / SessionManager / SessionState<br/>EventHub / Todo / Task / Worktree"]
-  AGENT["Multi-Agent Collaboration<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + Reviewer Debug Mode + Anti-stall"]
-  EXEC["Model & Tool Execution<br/>OllamaClient + native multimodal + tool dispatch<br/>6-category error detection + 4-tier compression + file buffer"]
+  AGENT["Multi-Agent Collaboration<br/>Manager / Explorer / Developer / Reviewer<br/>Blackboard + role-isolated working contexts"]
+  EXEC["Model & Tool Execution<br/>OllamaClient + native multimodal + tool dispatch<br/>6-category error detection + global/per-agent tiered compression"]
   DATA["Artifact & Persistence<br/>files / uploads / context_archive / file_buffer / code_preview<br/>conversation / activity / operations"]
   UX --> UI --> API --> ORCH --> AGENT --> EXEC --> DATA
   EXEC --> API
@@ -323,6 +325,15 @@ This is not a microservice cluster. All agents run in one process and synchroniz
 - lower coordination overhead (no cross-service RPC/event drift)
 - deterministic state snapshots for Manager decisions
 - faster corrective routing when errors appear mid-execution
+- stronger long-horizon behavior on short-context models through role-isolated working memory
+
+Context topology:
+
+- Single mode keeps one global context lane and one global progress bar.
+- Multi-agent mode creates active role lanes for Manager plus the real participating agents.
+- Each role lane is estimated and compacted independently with the same tiered compression policy.
+- The next model call receives the role-relevant lane instead of reloading every role's full history.
+- The UI only shows nested role context bars after multi-agent mode is active; L1/L2 single tasks stay on the original single bar.
 
 Blackboard-centered data slices:
 
@@ -366,6 +377,26 @@ flowchart LR
   M -->|phase-aware delegate + mandatory flags + budget| E
   M -->|phase-aware delegate + mandatory flags + budget| D
   M -->|phase-aware delegate + debug mode trigger| R
+```
+
+Mermaid (context lifecycle and compact topology):
+
+```mermaid
+flowchart TB
+  S["Single / L1-L2<br/>one global context lane"] -->|task escalates to sync/sequential| A["Multi-agent activation"]
+  A --> MCTX["Manager context<br/>routing / phase / approval"]
+  A --> ECTX["Explorer context<br/>research / evidence / paths"]
+  A --> DCTX["Developer context<br/>implementation / tool results"]
+  A --> RCTX["Reviewer context<br/>validation / defects / fixes"]
+  MCTX --> MC["tiered compact<br/>independent"]
+  ECTX --> EC["tiered compact<br/>independent"]
+  DCTX --> DC["tiered compact<br/>independent"]
+  RCTX --> RC["tiered compact<br/>independent"]
+  MC --> N["Next model call receives<br/>only the role-relevant lane"]
+  EC --> N
+  DC --> N
+  RC --> N
+  N --> UICTX["UI context indicator<br/>single bar by default<br/>nested role bars only in multi-agent mode"]
 ```
 
 Mermaid (routing loop and dynamic interception):
