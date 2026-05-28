@@ -15134,7 +15134,7 @@ class SessionState:
             self.failed_selections = []
         self._apply_active_profile()
         self._ensure_active_profile_capabilities(force_probe=False)
-        cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(config)
+        cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(profile)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
         self.updated_at = now_ts()
@@ -29187,7 +29187,6 @@ body{padding:18px}
     def _blackboard_round_budget(self, board: dict | None = None) -> int:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(bb)
-        focus = self._blackboard_focus_identity(bb)
         max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
         try:
             budget = int(profile.get("round_budget", max_budget) or 0)
@@ -29442,6 +29441,7 @@ body{padding:18px}
     def _watchdog_snapshot_payload(self, board: dict, reason: str, role: str, step: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(bb)
+        focus = self._blackboard_focus_identity(bb)
         code_rows = sorted(
             list((bb.get("code_artifacts", {}) or {}).items()),
             key=lambda item: float((item[1] or {}).get("updated_at", 0.0) if isinstance(item[1], dict) else 0.0),
@@ -45099,8 +45099,6 @@ body{padding:18px}
                                 {"summary": "finish tool accepted; run paused and awaiting user instruction"},
                             )
                         else:
-                            route = finish_result.get("route", {}) if isinstance(finish_result.get("route"), dict) else {}
-                            instruction = trim(str(route.get("instruction", "") or "").strip(), 1200)
                             single_finish_pending_after_step_check = finish_summary or " "
                             retry_requested_this_round = True
                             force_single_tool_rounds = max(force_single_tool_rounds, 2)
