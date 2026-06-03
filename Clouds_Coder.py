@@ -55303,7 +55303,11 @@ function _chatVirtBindScroll(chatEl){
       S.follow.chat=false;
       return;
     }
-    if(nearBottom(chatEl,6))S.follow.chat=true;
+    if(nearBottom(chatEl,32)){
+      S.follow.chat=true;
+      chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),now+520);
+      chatEl._virtAutoFollowPaused=false;
+    }
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -55377,11 +55381,17 @@ function renderChat(reason='snapshot'){
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
   const prevWinEnd=Number(c._virtLastWinEnd||-1);
-  const top=Math.max(0,c.scrollTop);
-  const bottom=top+Math.max(0,c.clientHeight||0);
+  const viewportH=Math.max(0,c.clientHeight||0);
+  let top=Math.max(0,c.scrollTop);
+  let bottom=top+viewportH;
   const offsetCache=_chatVirtOffsetCache(c,rows,feedSig);
-  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const totalEstimated=Number(offsetCache.total||0);
+  const wantsBottomBeforeWindow=_chatVirtWantsBottom(c,36);
+  if(wantsBottomBeforeWindow){
+    top=Math.max(0,totalEstimated-viewportH);
+    bottom=top+viewportH;
+  }
+  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
@@ -55535,7 +55545,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    if(reason!=='scroll')_chatVirtScrollToBottom(c);
+    if(reason!=='scroll'||wantsBottomBeforeWindow||nearBottom(c,48))_chatVirtScrollToBottom(c);
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     _chatVirtSetScrollTop(c,Math.max(0,Math.min(oldScrollTop,maxTop)));
   }
