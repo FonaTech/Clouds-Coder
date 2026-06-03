@@ -52661,6 +52661,17 @@ function _deltaScheduleRender(flags={}){
 }
 function scheduleRenderChat(reason='snapshot'){
   const next=String(reason||'snapshot');
+  const chatEl=E('chat');
+  if(
+    next!=='scroll'&&
+    chatEl&&
+    _chatVirtIsUserScrolling(chatEl)&&
+    !_chatVirtWantsBottom(chatEl,36)
+  ){
+    _chatVirtDebounceWhileScrolling(chatEl,'_virtDeferredRenderTimer',()=>scheduleRenderChat(next),CHAT_SCROLL_SYNC_DEBOUNCE_MS);
+    return;
+  }
+  if(chatEl&&next!=='scroll')_chatVirtCancelDebounce(chatEl,'_virtDeferredRenderTimer');
   const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
   const cur=String(S.chatRenderPendingReason||'');
   if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
@@ -52970,8 +52981,7 @@ function _bindNestedScrollGuards(root){
       Number(chatEl._virtManualUnlockTs||0),
       now+CHAT_SCROLL_LOCK_MS
     );
-    S.follow.chat=false;
-    chatEl._virtAutoFollowPaused=true;
+    _chatVirtClearBottomFollow(chatEl,true);
   };
   for(const node of nodes){
     if(!node||node._nestedScrollGuardBound)continue;
@@ -53159,7 +53169,10 @@ function _mathRunTypeset(root,key=''){
     if(root._mathPending)return;
     root._mathPending=true;
     const chatEl=E('chat');
-    const keepChatBottom=!!(chatEl&&root.closest&&root.closest('#chat')&&_chatVirtWantsBottom(chatEl,48));
+    const inChat=!!(chatEl&&root.closest&&root.closest('#chat'));
+    const keepChatBottom=!!(inChat&&_chatVirtWantsBottom(chatEl,48));
+    const anchorBefore=(inChat&&!keepChatBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+    const oldScrollTop=chatEl?Number(chatEl.scrollTop||0):0;
     Promise.resolve(mj.typesetPromise([root]))
       .catch(()=>{})
       .finally(()=>{
@@ -53176,6 +53189,13 @@ function _mathRunTypeset(root,key=''){
             scheduleRenderChat('measure');
           }
           if(keepChatBottom&&chatEl)_chatVirtScrollToBottom(chatEl);
+          else if(inChat&&chatEl){
+            if(anchorBefore){
+              if(!_chatVirtRestoreAnchor(chatEl,anchorBefore))_chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }else{
+              _chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }
+          }
         }
       });
   };
@@ -53476,21 +53496,28 @@ self.onmessage=(ev)=>{
       let touchedChat=false;
       let changedChatHeight=false;
       const slots=document.querySelectorAll(`[data-md-job=\"${id}\"]`);
-      for(const slot of slots){
-        slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
-        slot.removeAttribute('data-md-job');
-        slot.classList.remove('md-async-slot');
-        const msg=slot.closest('.msg');
-        if(msg){
-          touchedChat=true;
-          const vk=String(msg.getAttribute('data-vk')||'');
-          if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;changedChatHeight=true}}}
-          const req=String(msg.getAttribute('data-math-request')||'').trim();
-          if(req)_mathTypeset(msg,`chat:${req}`);
-        }else{
-          const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
-          if(article)_mathTypeset(article,`pv:md:${id}`);
+      const applySlots=()=>{
+        for(const slot of slots){
+          slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
+          slot.removeAttribute('data-md-job');
+          slot.classList.remove('md-async-slot');
+          const msg=slot.closest('.msg');
+          if(msg){
+            touchedChat=true;
+            const vk=String(msg.getAttribute('data-vk')||'');
+            if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;changedChatHeight=true}}}
+            const req=String(msg.getAttribute('data-math-request')||'').trim();
+            if(req)_mathTypeset(msg,`chat:${req}`);
+          }else{
+            const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
+            if(article)_mathTypeset(article,`pv:md:${id}`);
+          }
         }
+      };
+      if(chatEl&&!keepChatBottom){
+        _chatVirtWithAnchorPreserved(chatEl,applySlots);
+      }else{
+        applySlots();
       }
       if(touchedChat){
         if(changedChatHeight){
@@ -54370,7 +54397,41 @@ function _chatVirtParsePlanHandoff(raw){
   return out;
 }
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');if(!target)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));target.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){
+  if(!chatEl)return;
+  const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);
+  if(!runActive){_chatVirtStopRunTicker(chatEl);return}
+  if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}
+  const nodes=chatEl._virtRunNodes;
+  if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}
+  const keepBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!keepBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  const now=(Date.now()/1000);
+  let changed=false;
+  for(const node of nodes){
+    const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');
+    if(!target)continue;
+    const label=String(node.getAttribute('data-run-label')||'model call');
+    const startedAt=Number(node.getAttribute('data-run-start')||0);
+    const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));
+    const anchorTs=Number(node.getAttribute('data-run-anchor')||0);
+    let elapsed=baseElapsed;
+    if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}
+    const whole=Math.floor(elapsed);
+    if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;
+    node.setAttribute('data-run-last-sec',String(whole));
+    target.textContent=_chatVirtLiveRunText(label,elapsed);
+    changed=true;
+  }
+  if(changed&&!keepBottom){
+    if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
@@ -55185,6 +55246,38 @@ function _chatVirtSetScrollTop(chatEl,target){
   chatEl.scrollTop=next;
   return true;
 }
+function _chatVirtIsBottomLocked(chatEl){
+  return !!chatEl&&Number(chatEl._virtBottomLockUntil||0)>Date.now();
+}
+function _chatVirtClearBottomFollow(chatEl,pause=true){
+  S.follow.chat=false;
+  if(!chatEl)return;
+  chatEl._virtBottomLockUntil=0;
+  if(pause&&S.snap?.running){
+    chatEl._virtAutoFollowPaused=true;
+  }
+}
+function _chatVirtWithAnchorPreserved(chatEl,fn){
+  if(!chatEl||typeof fn!=='function'){
+    return (typeof fn==='function')?fn():undefined;
+  }
+  const wantsBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!wantsBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  let out;
+  try{
+    out=fn();
+  }finally{
+    if(wantsBottom){
+      _chatVirtScrollToBottom(chatEl);
+    }else if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+  return out;
+}
 function _chatVirtHasRecentManualInput(chatEl){
   if(!chatEl)return false;
   const now=Date.now();
@@ -55198,7 +55291,13 @@ function _chatVirtHasRecentManualInput(chatEl){
   const recentTouchMove=Number(chatEl._virtLastTouchMoveTs||0)>0&&(now-Number(chatEl._virtLastTouchMoveTs||0))<touchWindow;
   return manualLock||inputLock||touchLock||recentWheel||recentTouchStart||recentTouchMove;
 }
-function _chatVirtWantsBottom(chatEl,threshold=24){return !!chatEl&&(Boolean(S.follow.chat)||nearBottom(chatEl,threshold)||Number(chatEl._virtBottomLockUntil||0)>Date.now())}
+function _chatVirtWantsBottom(chatEl,threshold=24){
+  if(!chatEl)return false;
+  const th=Math.max(0,Number(threshold)||24);
+  if(nearBottom(chatEl,th)||_chatVirtIsBottomLocked(chatEl))return true;
+  if(chatEl._virtAutoFollowPaused)return false;
+  return false;
+}
 function _chatVirtShouldDeferLiveRender(chatEl){return !!chatEl&&_chatVirtIsUserScrolling(chatEl)&&!_chatVirtWantsBottom(chatEl,36)}
 function _chatVirtScrollToBottom(chatEl){
   if(!chatEl)return;
@@ -55214,7 +55313,7 @@ function _chatVirtScrollToBottom(chatEl){
     if(chatEl._virtBottomRenderRaf)cancelAnimationFrame(chatEl._virtBottomRenderRaf);
     chatEl._virtBottomRenderRaf=requestAnimationFrame(()=>{
       chatEl._virtBottomRenderRaf=0;
-      if(S.follow.chat||nearBottom(chatEl,12))scheduleRenderChat('scroll');
+      if(_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
     });
   }
   if(_chatVirtHasRecentManualInput(chatEl)&&!_chatVirtWantsBottom(chatEl,36))return;
@@ -55222,7 +55321,7 @@ function _chatVirtScrollToBottom(chatEl){
   chatEl._virtBottomRaf=requestAnimationFrame(()=>{
     chatEl._virtBottomRaf=0;
     if(!_chatVirtWantsBottom(chatEl,36))return;
-    if(apply()&&(S.follow.chat||nearBottom(chatEl,12)))scheduleRenderChat('scroll');
+    if(apply()&&_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
     if(_chatVirtWantsBottom(chatEl,18)){
       requestAnimationFrame(()=>{
         if(_chatVirtWantsBottom(chatEl,36))apply();
@@ -55245,7 +55344,9 @@ function _chatVirtBindScroll(chatEl){
       Number(chatEl._virtInputUnlockTs||0),
       now+Math.max(CHAT_SCROLL_ACTIVE_MS,Math.round(lock*0.8))
     );
-    if(S.snap?.running){
+    if(!nearBottom(chatEl,24)){
+      _chatVirtClearBottomFollow(chatEl,true);
+    }else if(S.snap?.running){
       chatEl._virtAutoFollowPaused=true;
     }
   };
@@ -55300,13 +55401,15 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
     if(dy<0){
-      S.follow.chat=false;
+      _chatVirtClearBottomFollow(chatEl,true);
       return;
     }
     if(nearBottom(chatEl,32)){
       S.follow.chat=true;
       chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),now+520);
       chatEl._virtAutoFollowPaused=false;
+    }else{
+      _chatVirtClearBottomFollow(chatEl,true);
     }
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
@@ -55335,10 +55438,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtAutoFollowPaused=false;
       }
     }else if(!programmatic){
-      S.follow.chat=false;
-      if(S.snap?.running){
-        chatEl._virtAutoFollowPaused=true;
-      }
+      _chatVirtClearBottomFollow(chatEl,true);
     }
     if(programmatic&&Number(chatEl._virtSuppressProgrammaticScrollRenderUntil||0)>now)return;
     scheduleScrollRender();
