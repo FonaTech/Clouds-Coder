@@ -13,6 +13,8 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
@@ -30,7 +32,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive (trilingual): [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Architecture changelog archive (trilingual): [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -687,6 +689,107 @@ Full trilingual details: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.
 - The self-check validates top-level symbol coverage, `py_compile`, stale generated files, package import walk, entry-point help, and generated cache cleanup.
 
 Full trilingual details: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+### 3.10 Web Service Runtime Framework
+
+Clouds Coder's Web service is intentionally built as a local-first monolithic runtime rather than a distributed microservice mesh. The browser, HTTP handler, session manager, agent loop, tool router, blackboard, context archives, and preview pipeline run as one coordinated state domain, which keeps latency low and makes long-session recovery easier to reason about.
+
+Service topology:
+
+```mermaid
+flowchart LR
+  Browser["Browser Web UI<br/>chat / runtime / preview / skills"] -->|REST commands<br/>message uploads config preview| HTTP["ThreadingHTTPServer<br/>Handler + SkillsHandler"]
+  HTTP --> Router["API Router<br/>sessions / tools / render / memory"]
+  Router --> Sessions["SessionManager<br/>per-user managers + per-session state"]
+  Sessions --> Runtime["SessionState Runtime Loop<br/>classifier / planner / agent rounds"]
+  Runtime --> Blackboard["Blackboard Control Plane<br/>plan steps / todos / focus / evidence"]
+  Runtime --> Tools["Tool Execution Plane<br/>bash / read / write / edit / search / skills"]
+  Runtime --> Models["Model Plane<br/>Ollama + OpenAI-compatible profiles"]
+  Tools --> Files["Artifact Store<br/>files / uploads / code_preview / context_archive"]
+  Blackboard --> Memory["Memory Plane<br/>tool context / user memory / Web search index"]
+  Files --> Preview["Preview + Render Bridge<br/>Markdown / HTML / code / PDF / media"]
+  Runtime --> Events["EventHub<br/>SSE heartbeat + structured runtime events"]
+  Events -->|live updates| Browser
+  Preview -->|render frames| Browser
+```
+
+Runtime request lifecycle:
+
+```mermaid
+sequenceDiagram
+  participant U as Web UI
+  participant H as HTTP Handler
+  participant S as SessionManager
+  participant R as SessionState
+  participant B as Blackboard
+  participant T as Tool Router
+  participant E as EventHub
+
+  U->>H: POST message / live adjustment
+  H->>S: resolve user_id + session_id
+  S->>R: submit_user_message
+  R->>B: classify continuation / plan choice / new task
+  alt active run
+    R->>R: queue live input with lock
+    R->>E: emit live-input accepted
+  else idle run
+    R->>R: start runtime loop
+  end
+  loop agent round
+    R->>B: read active focus + todo state + evidence
+    R->>T: execute requested tools
+    T->>B: append tool evidence / artifacts / errors
+    R->>E: publish structured events
+  end
+  E-->>U: SSE event stream + heartbeat
+```
+
+Control-plane separation:
+
+| Plane | Runtime responsibility | User-visible effect |
+| --- | --- | --- |
+| API plane | REST endpoints, SSE stream, upload/config/render routing | Browser can reconnect, refresh, and observe running sessions without losing state |
+| Orchestration plane | classifier, plan gate, manager routing, finish/step gates | L1/L2 direct work stays lightweight; complex tasks keep plan continuity |
+| Blackboard plane | approved plan, current focus, todos, evidence, errors, touched files | Single and multi-agent modes cooperate around the same task source of truth |
+| Tool plane | deterministic file/shell/search/skill execution with evidence capture | Tool calls are traceable and reusable instead of being hidden in model prose |
+| Memory plane | per-user summaries, tool context, Web search index, context archives | Long tasks can resume with compact task state instead of reloading raw history |
+| Presentation plane | structured bubbles, virtualized feed, scroll anchoring, render bridge | Large conversations remain readable and the viewport no longer fights live updates |
+
+Plan and live-input control loop:
+
+```mermaid
+flowchart TD
+  UserMsg["User message"] --> Intake["Intent intake<br/>uploads + user profile capsule + session state"]
+  Intake --> Gate{"Plan mode<br/>Auto / On / Off"}
+  Gate -->|direct| Exec["Execution loop"]
+  Gate -->|plan needed| Plan["Research + proposal + user choice"]
+  Plan --> Approved["Approved plan steps"]
+  Approved --> Exec
+  Exec --> Focus["Active focus<br/>plan step or direct task"]
+  Focus --> Todo["Todo / subtask state"]
+  Todo --> Evidence["Tool evidence<br/>artifacts / validation / errors"]
+  Evidence --> Finish{"Finish or advance?"}
+  Finish -->|advance| Focus
+  Finish -->|complete| Summary["Final response / summary bubble"]
+  Live["Live user adjustment during run"] --> Queue["Locked live-input queue"]
+  Queue --> Focus
+```
+
+Web UI update path:
+
+```mermaid
+flowchart TB
+  Event["Runtime event<br/>tool start/done, websearch, todo, finish gate"] --> Normalize["Structured bubble parser"]
+  Snapshot["Session snapshot<br/>conversation / todos / runtime / previews"] --> Normalize
+  Normalize --> Render["Virtualized conversation render"]
+  Render --> Anchor{"User is at bottom?"}
+  Anchor -->|yes| Stick["Stick to latest bubble"]
+  Anchor -->|no| Preserve["Preserve current viewport anchor"]
+  Render --> Panels["Runtime / Todos / Tasks / Preview panels"]
+  Panels --> Throttle["Throttled refresh + stable layout slots"]
+```
+
+The practical result is that Web service behavior is not just "chat over HTTP." It is a coordinated runtime shell: browser actions, model turns, tool outputs, blackboard state, context pressure, live adjustments, and artifact previews are all treated as parts of the same execution graph.
 
 ## 4. Key Runtime Components
 

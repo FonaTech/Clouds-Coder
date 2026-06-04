@@ -10,9 +10,11 @@ import difflib
 import errno
 from email.utils import parsedate_to_datetime
 import html
+from html.parser import HTMLParser
 import hashlib
 import hmac
 import io
+import ipaddress
 import importlib.util
 import json
 import locale
@@ -28,6 +30,7 @@ import shutil
 import shlex
 import ssl
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -44,8 +47,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
+import urllib.robotparser as robotparser
 try:
     import certifi as _certifi
 except Exception:
@@ -151,6 +155,34 @@ RAG_LIBRARY_DIRNAME = "RAG_Library"
 RAG_ADMIN_PORT_OFFSET = 2
 CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
+WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
+DEFAULT_WEB_SEARCH_ENABLED = True
+USER_MEMORY_DIRNAME = ".clouds_coder"
+USER_MEMORY_DB_FILENAME = "user_memory.sqlite"
+USER_MEMORY_PROFILE_FILENAME = "user_profile.json"
+USER_MEMORY_MODE_CHOICES = {"off", "weak", "on"}
+DEFAULT_USER_MEMORY_MODE = "weak"
+USER_MEMORY_WEAK_CAPSULE_CHARS = 1200
+USER_MEMORY_ON_CAPSULE_CHARS = 2200
+USER_MEMORY_MAX_SUMMARY_CHARS = 1200
+USER_MEMORY_QUERY_LIMIT = 8
+USER_MEMORY_DECAY_HALFLIFE_DAYS = 45.0
+USER_MEMORY_PROFILE_SCHEMA_VERSION = 1
+AGENT_WEB_SEARCH_USER_AGENT = "CloudsCoderAgentWebSearch/1.0 (+bounded autonomous agent research)"
+AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS = 8
+AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES = 12
+AGENT_WEB_SEARCH_HARD_MAX_PAGES = 60
+AGENT_WEB_SEARCH_DEFAULT_DEPTH = 1
+AGENT_WEB_SEARCH_HARD_DEPTH = 2
+AGENT_WEB_SEARCH_FETCH_TIMEOUT = 12.0
+AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT = 76.0
+AGENT_WEB_SEARCH_MAX_PAGE_BYTES = 1_200_000
+AGENT_WEB_SEARCH_MAX_TEXT_CHARS = 80_000
+WEB_SEARCH_CONTEXT_REGISTRY_MAX = 80
+WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS = 4
+WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS = 3_200
+WEB_SEARCH_CONTEXT_NODE_MAX = 18
+WEB_SEARCH_CONTEXT_URL_MAX = 12
 RAG_CHUNK_CHARS = 1200
 RAG_CHUNK_OVERLAP = 180
 RAG_MAX_CHUNKS_PER_DOC = 500
@@ -363,7 +395,7 @@ TOOL_MEMORY_COMPACT_PIN_DISTINCT = 10
 TOOL_MEMORY_COMPACT_PIN_MAX_CHARS = 10_000
 TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
-DEFAULT_AUTO_TASK_LEVEL_CEILING = 0  # 0 = no cap; applies only to automatic L1-L5 classification.
+DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
 FUSED_FAULT_BREAK_THRESHOLD = 15
@@ -448,6 +480,7 @@ _TOOL_TIMEOUT_MAP = {
     "search_files": 30,
     "query_knowledge_library": 60,
     "query_code_library": 60,
+    "agent_web_search": 90,
     "generate_media": 120,
     "load_skill": 20,
     "list_skills": 10,
@@ -458,6 +491,33 @@ _TOOL_TIMEOUT_MAP = {
     "compress": 30,
 }
 _DEFAULT_TOOL_TIMEOUT = 90
+CONVERSATION_VISIBLE_TOOL_EVENTS = {
+    "agent_web_search",
+    "query_code_library",
+    "query_knowledge_library",
+    "tool_memory",
+    "context_recall",
+    "check_background",
+    "list_skills",
+    "list_skill_providers",
+    "list_skill_protocols",
+}
+PERSIST_ON_EVENT_TYPES = {
+    "command",
+    "file_patch",
+    "upload",
+    "web_search",
+    "tool_start",
+    "tool_result",
+    "error",
+    "message",
+    "skill_loaded",
+    "plan_notice",
+    "plan_approved_handoff",
+    "step_verified",
+    "todo_focus",
+}
+PERSIST_EVENT_MIN_INTERVAL_SECONDS = 1.5
 TRUNCATION_CONTINUATION_MAX_PASSES = 3
 TRUNCATION_CONTINUATION_MAX_TOKENS = 1800
 TRUNCATION_CONTINUATION_TAIL_CHARS = 2800
@@ -712,7 +772,7 @@ SKILL_BODY_PREVIEW_CHARS = 4_000
 SKILLS_VIRTUAL_PREFIX = "/skills"
 SKILLS_EXTERNAL_MOUNT = "__external__"
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
-PLAN_MODE_FORCED_LEVELS = {3, 4, 5}
+PLAN_MODE_FORCED_LEVELS: set[int] = set()
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
 # Task phase definitions for stage-aware delegation
 TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
@@ -772,7 +832,7 @@ PLAN_STEP_FULL_CONTENT_MAX_CHARS = 24_000
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
     "check_background", "read_from_blackboard", "write_to_blackboard",
-    "list_skills", "load_skill", "compress",
+    "list_skills", "load_skill", "compress", "agent_web_search",
 }
 FAILURE_LEDGER_MAX_FIXES = 20
 FAILURE_LEDGER_MAX_COMPILE_ERRORS = 15
@@ -2603,6 +2663,110 @@ def _to_bool_like(raw: object, default: bool = False) -> bool:
     return default
 
 
+def extract_web_search_enabled_setting(raw: object) -> bool | None:
+    if not isinstance(raw, dict):
+        return None
+    key = "web_search_enabled"
+    if key in raw:
+        return _to_bool_like(raw.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
+    for section_key in ("tools", "web_search", "agent", "runtime"):
+        section = raw.get(section_key)
+        if isinstance(section, dict) and key in section:
+            return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
+    return None
+
+
+def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
+    raw = str(value if value is not None else "").strip().lower().replace("-", "_")
+    if isinstance(value, bool):
+        return "weak" if value else "off"
+    alias = {
+        "": str(default or DEFAULT_USER_MEMORY_MODE).strip().lower(),
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "none": "off",
+        "disable": "off",
+        "disabled": "off",
+        "1": "weak",
+        "true": "weak",
+        "yes": "weak",
+        "enable": "weak",
+        "enabled": "weak",
+        "light": "weak",
+        "low": "weak",
+        "soft": "weak",
+        "strong": "on",
+        "full": "on",
+        "high": "on",
+    }
+    raw = alias.get(raw, raw)
+    if raw in USER_MEMORY_MODE_CHOICES:
+        return raw
+    fallback = str(default or DEFAULT_USER_MEMORY_MODE).strip().lower()
+    return fallback if fallback in USER_MEMORY_MODE_CHOICES else DEFAULT_USER_MEMORY_MODE
+
+
+def user_memory_enabled_from_mode(mode: object) -> bool:
+    return normalize_user_memory_mode(mode) != "off"
+
+
+def extract_user_memory_mode_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    mode_keys = (
+        "user_memory_mode",
+        "userMemoryMode",
+        "user_memory",
+        "userMemory",
+        "long_term_memory",
+        "longTermMemory",
+        "preference_memory",
+        "preferenceMemory",
+    )
+    enabled_keys = (
+        "user_memory_enabled",
+        "userMemoryEnabled",
+        "long_term_memory_enabled",
+        "longTermMemoryEnabled",
+        "preference_memory_enabled",
+        "preferenceMemoryEnabled",
+    )
+    for key in mode_keys:
+        if key in raw:
+            return normalize_user_memory_mode(raw.get(key))
+    for key in enabled_keys:
+        if key in raw:
+            return "weak" if _to_bool_like(raw.get(key), default=True) else "off"
+    for section_key in ("startup", "runtime", "memory", "user_memory", "agent", "manager"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in mode_keys:
+            if key in section:
+                return normalize_user_memory_mode(section.get(key))
+        for key in enabled_keys:
+            if key in section:
+                return "weak" if _to_bool_like(section.get(key), default=True) else "off"
+    return None
+
+
+def set_web_search_enabled_on_runtime(target: object, enabled: bool, *, persist: bool = False) -> None:
+    try:
+        setattr(target, "web_search_enabled", bool(enabled))
+        if hasattr(target, "tool_specs"):
+            setattr(
+                target,
+                "tool_specs",
+                filter_tool_specs_for_runtime(TOOLS, web_search_enabled=bool(enabled)),
+            )
+        if persist and hasattr(target, "_persist"):
+            target.updated_at = now_ts()
+            target._persist()
+    except Exception:
+        pass
+
+
 def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, bool]:
     caps = default_multimodal_capabilities()
     p = str(provider or "").strip().lower()
@@ -2876,6 +3040,146 @@ def detect_local_lan_ip() -> str:
     except Exception:
         pass
     return "127.0.0.1"
+
+_LOCAL_LAN_IP_CACHE: dict[str, object] = {"ts": 0.0, "ip": ""}
+
+def detect_local_lan_ip_cached(max_age_seconds: float = 300.0) -> str:
+    now = now_ts()
+    try:
+        ts = float(_LOCAL_LAN_IP_CACHE.get("ts", 0.0) or 0.0)
+    except Exception:
+        ts = 0.0
+    ip = str(_LOCAL_LAN_IP_CACHE.get("ip", "") or "").strip()
+    if ip and now - ts < max(5.0, float(max_age_seconds or 300.0)):
+        return ip
+    ip = detect_local_lan_ip()
+    _LOCAL_LAN_IP_CACHE["ts"] = now
+    _LOCAL_LAN_IP_CACHE["ip"] = ip
+    return ip
+
+def extract_runtime_region_hint_setting(raw: object) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    keys = (
+        "runtime_region",
+        "runtime_location",
+        "user_region",
+        "user_location",
+        "region",
+        "location",
+        "country",
+    )
+    for key in keys:
+        value = str(raw.get(key, "") or "").strip()
+        if value:
+            return trim(value, 160)
+    for section_name in ("runtime", "agent_runtime", "web_search", "local_context"):
+        section = raw.get(section_name, {})
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            value = str(section.get(key, "") or "").strip()
+            if value:
+                return trim(value, 160)
+    return ""
+
+def extract_runtime_timezone_hint_setting(raw: object) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    keys = ("runtime_timezone", "timezone", "tz", "user_timezone", "user_tz")
+    for key in keys:
+        value = str(raw.get(key, "") or "").strip()
+        if value:
+            return trim(value, 120)
+    for section_name in ("runtime", "agent_runtime", "web_search", "local_context"):
+        section = raw.get(section_name, {})
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            value = str(section.get(key, "") or "").strip()
+            if value:
+                return trim(value, 120)
+    return ""
+
+def runtime_environment_context_snapshot(
+    *,
+    files_root: object = "",
+    region_hint: str = "",
+    timezone_hint: str = "",
+) -> dict:
+    now_local = datetime.now().astimezone()
+    tzinfo = now_local.tzinfo
+    tz_name = str(now_local.tzname() or "").strip()
+    offset = now_local.strftime("%z")
+    if len(offset) == 5:
+        offset = f"{offset[:3]}:{offset[3:]}"
+    locale_name = ""
+    try:
+        loc = locale.getlocale()
+        locale_name = ".".join([x for x in loc if x]) if isinstance(loc, tuple) else str(loc or "")
+    except Exception:
+        locale_name = ""
+    if not locale_name:
+        try:
+            locale_name = str(locale.getpreferredencoding(False) or "")
+        except Exception:
+            locale_name = ""
+    configured_region = trim(
+        str(region_hint or os.getenv("CLOUDS_CODER_RUNTIME_REGION", "")
+            or os.getenv("CLOUDS_CODER_USER_REGION", "")
+            or os.getenv("USER_REGION", "")
+            or os.getenv("REGION", "")).strip(),
+        160,
+    )
+    configured_tz = trim(
+        str(timezone_hint or os.getenv("CLOUDS_CODER_RUNTIME_TIMEZONE", "")
+            or os.getenv("CLOUDS_CODER_USER_TIMEZONE", "")
+            or os.getenv("TZ", "")).strip(),
+        120,
+    )
+    return {
+        "current_date": now_local.strftime("%Y-%m-%d"),
+        "current_time": now_local.strftime("%H:%M:%S"),
+        "weekday": now_local.strftime("%A"),
+        "timezone": str(getattr(tzinfo, "key", "") or tz_name or "local"),
+        "utc_offset": offset,
+        "unix_ts": int(now_ts()),
+        "locale": locale_name,
+        "configured_region_hint": configured_region,
+        "configured_timezone_hint": configured_tz,
+        "lan_ip": detect_local_lan_ip_cached(),
+        "workspace": str(files_root or "").strip(),
+    }
+
+def runtime_environment_context_block(snapshot: dict) -> str:
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    region = str(snap.get("configured_region_hint", "") or "").strip()
+    tz_hint = str(snap.get("configured_timezone_hint", "") or "").strip()
+    location_bits = []
+    if region:
+        location_bits.append(f"configured_region={region}")
+    if tz_hint:
+        location_bits.append(f"configured_timezone_hint={tz_hint}")
+    locale_name = str(snap.get("locale", "") or "").strip()
+    if locale_name:
+        location_bits.append(f"locale={locale_name}")
+    lan_ip = str(snap.get("lan_ip", "") or "").strip()
+    if lan_ip:
+        location_bits.append(f"lan_ip={lan_ip}")
+    workspace = str(snap.get("workspace", "") or "").strip()
+    if workspace:
+        location_bits.append(f"workspace={workspace}")
+    location_line = "; ".join(location_bits) if location_bits else "no configured region; use server local time/locale only"
+    return (
+        "RUNTIME TEMPORAL AND LOCAL CONTEXT:\n"
+        f"- current_local_date={snap.get('current_date', '')} ({snap.get('weekday', '')})\n"
+        f"- current_local_time={snap.get('current_time', '')} timezone={snap.get('timezone', 'local')} utc_offset={snap.get('utc_offset', '')}\n"
+        f"- unix_ts={snap.get('unix_ts', '')}\n"
+        f"- local_context={location_line}\n"
+        "Use this block as the source of truth for relative time and local-context reasoning. "
+        "For news, finance, schedules, regulations, releases, or any current information, resolve words like today, yesterday, this week, recent, latest, current, 今年, 今日, 最近 against this date/time before forming queries or conclusions. "
+        "Do not infer the current year from model memory. If a market or jurisdiction calendar matters and is not in this block, verify it with tools and state any uncertainty."
+    )
 
 def json_dumps(obj: object, *, indent: int | None = None) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=indent)
@@ -3363,6 +3667,1454 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
 def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
+
+
+def _agent_web_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _agent_web_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        num = int(float(str(value).strip()))
+    except Exception:
+        num = int(default)
+    return max(int(minimum), min(int(maximum), num))
+
+
+def _agent_web_host_is_local_name(host: str) -> bool:
+    low = str(host or "").strip().lower().strip(".")
+    if low in {"localhost", "localhost.localdomain", "0.0.0.0"}:
+        return True
+    return low.endswith(".localhost") or low.endswith(".local")
+
+
+def _agent_web_ip_is_blocked(raw_ip: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(raw_ip or "").strip())
+    except Exception:
+        return True
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _agent_web_canonical_url(raw_url: str, base_url: str = "") -> str:
+    raw = html.unescape(str(raw_url or "").strip())
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    if base_url:
+        raw = urljoin(base_url, raw)
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if not parsed.scheme and not parsed.netloc:
+        return ""
+    scheme = (parsed.scheme or "https").lower()
+    host = parsed.hostname or ""
+    if not host:
+        return ""
+    netloc = host.lower()
+    if parsed.port:
+        default_port = 443 if scheme == "https" else 80
+        if int(parsed.port) != default_port:
+            netloc = f"{netloc}:{int(parsed.port)}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if not path.startswith("/"):
+        path = "/" + path
+    path = quote(unquote(path), safe="/:@!$&'()*+,;=-._~")
+    query = parsed.query
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _agent_web_domain_to_seed(domain: str) -> str:
+    raw = str(domain or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if not parsed.hostname:
+        return ""
+    return _agent_web_canonical_url(urlunparse((parsed.scheme or "https", parsed.netloc, "/", "", "", "")))
+
+
+def _agent_web_query_terms(text: str) -> list[str]:
+    raw = unicodedata.normalize("NFKC", str(text or "")).lower()
+    tokens = re.findall(r"[a-z0-9][a-z0-9._+-]{1,}|[\u4e00-\u9fff]{2,}", raw)
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "what", "how", "why", "when",
+        "where", "into", "about", "using", "use", "latest", "official", "docs", "guide",
+        "请", "什么", "如何", "最新", "资料", "搜索", "查询", "官网", "文档",
+    }
+    out: list[str] = []
+    for tok in tokens:
+        tok = tok.strip("._+-")
+        if len(tok) < 2 or tok in stop:
+            continue
+        if tok not in out:
+            out.append(tok)
+    return out[:24]
+
+
+def _agent_web_query_domain_hints(query: str) -> list[str]:
+    low = str(query or "").lower()
+    hints: list[str] = []
+    explicit = re.findall(r"\b(?:site:)?([a-z0-9.-]+\.[a-z]{2,})(?:/[^\s]*)?", low)
+    for host in explicit:
+        if host and host not in hints:
+            hints.append(host)
+    vendor_map = {
+        "openai": "openai.com",
+        "python": "python.org",
+        "pytorch": "pytorch.org",
+        "tensorflow": "tensorflow.org",
+        "fastapi": "fastapi.tiangolo.com",
+        "react": "react.dev",
+        "vue": "vuejs.org",
+        "rust": "rust-lang.org",
+        "go": "go.dev",
+        "node": "nodejs.org",
+        "ollama": "ollama.com",
+        "nvidia": "nvidia.com",
+        "broadcom": "broadcom.com",
+    }
+    for token, domain in vendor_map.items():
+        if token in low and domain not in hints:
+            hints.append(domain)
+    finance_signals = (
+        "a股", "股票", "股市", "主力资金", "北向资金", "南向资金", "资金流向",
+        "涨停", "跌停", "涨幅", "跌幅", "沪深", "创业板", "科创板",
+    )
+    if any(sig in low for sig in finance_signals):
+        for domain in ("finance.eastmoney.com", "stock.eastmoney.com", "data.eastmoney.com", "finance.sina.com.cn", "10jqka.com.cn", "cls.cn"):
+            if domain not in hints:
+                hints.append(domain)
+    optics_signals = ("cpo", "co-packaged optics", "共封装光学", "光模块", "硅光", "silicon photonics")
+    if any(sig in low for sig in optics_signals):
+        for domain in ("oiforum.com", "broadcom.com", "nvidia.com", "ranovus.com", "ieee.org"):
+            if domain not in hints:
+                hints.append(domain)
+    return hints[:8]
+
+
+def _agent_web_query_needs_fresh_network(query: str) -> bool:
+    low = str(query or "").lower()
+    if not low.strip():
+        return False
+    freshness_signals = (
+        "today", "yesterday", "tomorrow", "latest", "recent", "current", "breaking",
+        "news", "market", "price", "schedule", "release",
+        "今天", "昨日", "昨天", "明天", "最新", "近期", "当前", "现在", "新闻",
+        "资讯", "行情", "走势", "涨跌", "资金", "价格", "发布日期", "发布",
+        "本日", "昨日", "最新", "現在", "ニュース", "相場",
+    )
+    if any(sig in low for sig in freshness_signals):
+        return True
+    try:
+        current_year = datetime.now().year
+        years = [int(x) for x in re.findall(r"\b(20\d{2})\b", low)]
+        if any(year >= current_year - 1 for year in years):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _agent_web_extract_text_snippet(text: str, terms: list[str], max_chars: int = 420) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+    low = clean.lower()
+    pos = -1
+    for term in terms:
+        p = low.find(term.lower())
+        if p >= 0 and (pos < 0 or p < pos):
+            pos = p
+    if pos < 0:
+        return trim(clean, max_chars)
+    start = max(0, pos - max_chars // 3)
+    end = min(len(clean), start + max_chars)
+    start = max(0, end - max_chars)
+    return trim(clean[start:end].strip(), max_chars)
+
+
+class AgentWebHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.meta_description = ""
+        self.canonical = ""
+        self.links: list[tuple[str, str]] = []
+        self.text_parts: list[str] = []
+        self._tag_stack: list[str] = []
+        self._capture_title = False
+        self._current_href = ""
+        self._current_anchor: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        tag = str(tag or "").lower()
+        attrs_map = {str(k or "").lower(): str(v or "") for k, v in (attrs or [])}
+        self._tag_stack.append(tag)
+        if tag in {"script", "style", "noscript", "svg", "canvas", "template"}:
+            self._skip_depth += 1
+        if tag == "title":
+            self._capture_title = True
+        if tag == "meta":
+            name = (attrs_map.get("name") or attrs_map.get("property") or "").lower()
+            if name in {"description", "og:description"} and not self.meta_description:
+                self.meta_description = trim(attrs_map.get("content", ""), 800)
+        if tag == "link":
+            rel = attrs_map.get("rel", "").lower()
+            href = attrs_map.get("href", "")
+            if "canonical" in rel and href and not self.canonical:
+                self.canonical = href
+        if tag == "a":
+            self._current_href = attrs_map.get("href", "")
+            self._current_anchor = []
+
+    def handle_endtag(self, tag: str):
+        tag = str(tag or "").lower()
+        if tag == "title":
+            self._capture_title = False
+        if tag == "a" and self._current_href:
+            anchor = trim(re.sub(r"\s+", " ", " ".join(self._current_anchor)).strip(), 240)
+            self.links.append((self._current_href, anchor))
+            self._current_href = ""
+            self._current_anchor = []
+        if tag in {"script", "style", "noscript", "svg", "canvas", "template"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+        if self._tag_stack:
+            try:
+                idx = len(self._tag_stack) - 1 - self._tag_stack[::-1].index(tag)
+                del self._tag_stack[idx:]
+            except Exception:
+                self._tag_stack.pop()
+
+    def handle_data(self, data: str):
+        if not data:
+            return
+        if self._capture_title:
+            self.title_parts.append(data.strip())
+        if self._current_href:
+            self._current_anchor.append(data.strip())
+        if self._skip_depth:
+            return
+        if any(tag in {"nav", "footer", "header", "aside"} for tag in self._tag_stack[-3:]):
+            return
+        text = re.sub(r"\s+", " ", data).strip()
+        if len(text) >= 2:
+            self.text_parts.append(text)
+
+    def payload(self) -> dict:
+        title = re.sub(r"\s+", " ", " ".join(self.title_parts)).strip()
+        body = re.sub(r"\s+", " ", " ".join(self.text_parts)).strip()
+        return {
+            "title": trim(title, 500),
+            "description": trim(self.meta_description, 1000),
+            "canonical": trim(self.canonical, 1000),
+            "text": trim(body, AGENT_WEB_SEARCH_MAX_TEXT_CHARS),
+            "links": self.links[:1500],
+        }
+
+
+def _agent_web_decompress_bytes(raw: bytes, content_encoding: str = "") -> tuple[bytes, str, bool, str]:
+    data = raw if isinstance(raw, bytes) else bytes(raw or b"")
+    enc = str(content_encoding or "").strip().lower()
+    enc = enc.split(",", 1)[0].strip()
+    magic_gzip = len(data) >= 3 and data[:2] == b"\x1f\x8b"
+    try:
+        if enc == "gzip" or magic_gzip:
+            return zlib.decompress(data, 16 + zlib.MAX_WBITS), (enc or "gzip"), True, ""
+        if enc == "deflate":
+            try:
+                return zlib.decompress(data), enc, True, ""
+            except Exception:
+                return zlib.decompress(data, -zlib.MAX_WBITS), enc, True, ""
+        if enc == "br":
+            try:
+                import brotli  # type: ignore
+            except Exception as exc:
+                return data, enc, False, f"brotli unavailable: {trim(str(exc), 120)}"
+            return brotli.decompress(data), enc, True, ""
+    except Exception as exc:
+        return data, enc, False, f"decompress failed: {trim(str(exc), 160)}"
+    return data, enc, False, ""
+
+def _agent_web_charset_candidates(raw: bytes, content_type: str = "") -> list[str]:
+    candidates: list[str] = []
+
+    def add(enc: object) -> None:
+        value = str(enc or "").strip().strip("'\"").lower()
+        if not value:
+            return
+        value = value.replace("gb2312", "gb18030").replace("gbk", "gb18030")
+        if value not in candidates:
+            candidates.append(value)
+
+    ctype = str(content_type or "")
+    m = re.search(r"charset\s*=\s*['\"]?([A-Za-z0-9._:-]+)", ctype, re.I)
+    if m:
+        add(m.group(1))
+    if raw.startswith(b"\xef\xbb\xbf"):
+        add("utf-8-sig")
+    elif raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        add("utf-16")
+    sample = raw[:4096].decode("latin-1", errors="ignore")
+    for pattern in (
+        r"<meta[^>]+charset\s*=\s*['\"]?([A-Za-z0-9._:-]+)",
+        r"<\?xml[^>]+encoding\s*=\s*['\"]([A-Za-z0-9._:-]+)['\"]",
+    ):
+        m = re.search(pattern, sample, re.I)
+        if m:
+            add(m.group(1))
+    explicit_count = len(candidates)
+    try:
+        add(locale.getpreferredencoding(False))
+    except Exception:
+        pass
+    for fallback in ("utf-8", "utf-8-sig", "gb18030", "big5", "shift_jis", "cp1252", "latin-1"):
+        add(fallback)
+    if explicit_count <= 0:
+        try:
+            import charset_normalizer  # type: ignore
+            best = charset_normalizer.from_bytes(raw[:120_000]).best()
+            if best is not None:
+                enc = str(getattr(best, "encoding", "") or "").strip()
+                if enc:
+                    candidates.insert(0, enc.lower().replace("gb2312", "gb18030").replace("gbk", "gb18030"))
+        except Exception:
+            try:
+                import chardet  # type: ignore
+                detected = chardet.detect(raw[:120_000])
+                if isinstance(detected, dict):
+                    enc = str(detected.get("encoding", "") or "").strip()
+                    if enc:
+                        candidates.insert(0, enc.lower().replace("gb2312", "gb18030").replace("gbk", "gb18030"))
+            except Exception:
+                pass
+    deduped: list[str] = []
+    for enc in candidates:
+        if enc and enc not in deduped:
+            deduped.append(enc)
+    candidates = deduped
+    return candidates
+
+def _agent_web_decode_text_bytes(raw: bytes, content_type: str = "", content_encoding: str = "") -> dict:
+    decoded_bytes, encoding, decompressed, decode_error = _agent_web_decompress_bytes(raw, content_encoding)
+    text = ""
+    charset = ""
+    replacement_count = 10**9
+    for enc in _agent_web_charset_candidates(decoded_bytes, content_type):
+        try:
+            candidate = decoded_bytes.decode(enc, errors="replace")
+        except Exception:
+            continue
+        bad = candidate.count("\ufffd")
+        if not text or bad < replacement_count:
+            text = candidate
+            charset = enc
+            replacement_count = bad
+        if bad == 0:
+            break
+    if not text:
+        text = decoded_bytes.decode("utf-8", errors="replace")
+        charset = "utf-8"
+        replacement_count = text.count("\ufffd")
+    text = text.replace("\x00", "")
+    control_count = sum(1 for ch in text[:4000] if ord(ch) < 32 and ch not in "\r\n\t")
+    binary_like = bool(text and control_count / max(1, min(len(text), 4000)) > 0.08)
+    return {
+        "bytes": decoded_bytes,
+        "text": text,
+        "charset": charset,
+        "content_encoding": encoding,
+        "decompressed": bool(decompressed),
+        "decode_error": decode_error,
+        "replacement_count": int(replacement_count if replacement_count != 10**9 else 0),
+        "binary_like": bool(binary_like),
+    }
+
+
+class AgentWebSearchEngine:
+    def __init__(
+        self,
+        index_root: Path | None = None,
+        *,
+        allow_local: bool | None = None,
+        obey_robots: bool = True,
+        deadline_at: float = 0.0,
+        event_callback=None,
+    ):
+        self.index_root = (index_root or (WORKDIR / WEB_SEARCH_INDEX_DIRNAME)).resolve()
+        self.index_root.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.index_root / "agent_web_search.sqlite"
+        self.allow_local = (
+            _agent_web_bool(os.getenv("AGENT_WEB_SEARCH_ALLOW_LOCAL", ""), False)
+            if allow_local is None else bool(allow_local)
+        )
+        self.obey_robots = bool(obey_robots)
+        self.deadline_at = float(deadline_at or 0.0)
+        self.event_callback = event_callback
+        self._robots_cache: dict[str, robotparser.RobotFileParser] = {}
+        self._init_db()
+
+    def _time_left(self) -> float:
+        if self.deadline_at <= 0:
+            return 999999.0
+        return max(0.0, self.deadline_at - now_ts())
+
+    def _deadline_reached(self, reserve: float = 0.0) -> bool:
+        return self.deadline_at > 0 and self._time_left() <= max(0.0, float(reserve or 0.0))
+
+    def _deadline_error(self, url: str = "") -> dict:
+        return {
+            "ok": False,
+            "url": str(url or ""),
+            "error": "agent_web_search soft deadline reached; returning partial evidence",
+            "deadline_reached": True,
+        }
+
+    def _network_timeout(self, preferred: float) -> float:
+        if self.deadline_at <= 0:
+            return max(1.0, float(preferred or 1.0))
+        return max(1.0, min(float(preferred or 1.0), self._time_left() - 0.5))
+
+    def _progress(self, phase: str, **data) -> None:
+        cb = getattr(self, "event_callback", None)
+        if not callable(cb):
+            return
+        try:
+            cb(str(phase or ""), data)
+        except Exception:
+            pass
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pages (
+                    url TEXT PRIMARY KEY,
+                    canonical_url TEXT,
+                    domain TEXT,
+                    title TEXT,
+                    description TEXT,
+                    text TEXT,
+                    fetched_at REAL,
+                    status INTEGER,
+                    content_type TEXT,
+                    source_type TEXT,
+                    depth INTEGER,
+                    metadata_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS links (
+                    src TEXT,
+                    dst TEXT,
+                    anchor TEXT,
+                    discovered_at REAL,
+                    PRIMARY KEY (src, dst, anchor)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fetch_log (
+                    url TEXT,
+                    ts REAL,
+                    status TEXT,
+                    message TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS page_evidence (
+                    id TEXT PRIMARY KEY,
+                    query TEXT,
+                    url TEXT,
+                    topic TEXT,
+                    evidence_type TEXT,
+                    source_quality TEXT,
+                    score REAL,
+                    snippet TEXT,
+                    recorded_at REAL,
+                    metadata_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_trails (
+                    id TEXT PRIMARY KEY,
+                    query TEXT,
+                    mode TEXT,
+                    seeds_json TEXT,
+                    result_json TEXT,
+                    created_at REAL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_domain ON pages(domain)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_fetched ON pages(fetched_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_query ON page_evidence(query)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_url ON page_evidence(url)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_type ON page_evidence(evidence_type)")
+            try:
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(url, title, description, text)")
+            except Exception:
+                pass
+
+    def _validate_url(self, raw_url: str) -> tuple[bool, str, str]:
+        url = _agent_web_canonical_url(raw_url)
+        if not url:
+            return False, "", "invalid or unsupported URL"
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return False, "", "only http/https URLs are supported"
+        host = parsed.hostname or ""
+        if not host:
+            return False, "", "missing host"
+        if (not self.allow_local) and _agent_web_host_is_local_name(host):
+            return False, "", "blocked local hostname"
+        try:
+            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        except Exception as exc:
+            return False, "", f"DNS resolution failed: {trim(str(exc), 160)}"
+        ips: list[str] = []
+        for info in infos:
+            try:
+                ip = str(info[4][0])
+            except Exception:
+                continue
+            if ip not in ips:
+                ips.append(ip)
+        if not ips:
+            return False, "", "DNS resolution returned no addresses"
+        if not self.allow_local:
+            for ip in ips:
+                if _agent_web_ip_is_blocked(ip):
+                    return False, "", f"blocked private/reserved address: {ip}"
+        return True, url, ""
+
+    def _origin(self, url: str) -> str:
+        parsed = urlparse(url)
+        netloc = parsed.netloc
+        return urlunparse((parsed.scheme, netloc, "/", "", "", ""))
+
+    def _same_domain(self, left: str, right: str) -> bool:
+        return (urlparse(left).hostname or "").lower() == (urlparse(right).hostname or "").lower()
+
+    def _robots_allowed(self, url: str) -> tuple[bool, str]:
+        if not self.obey_robots:
+            return True, "robots disabled"
+        if self._deadline_reached(1.5):
+            return False, "agent_web_search deadline reached before robots fetch"
+        origin = self._origin(url)
+        rp = self._robots_cache.get(origin)
+        if rp is None:
+            rp = robotparser.RobotFileParser()
+            robots_url = urljoin(origin, "/robots.txt")
+            ok, safe_url, reason = self._validate_url(robots_url)
+            if not ok:
+                return False, f"robots blocked: {reason}"
+            try:
+                req = Request(
+                    safe_url,
+                    headers={
+                        "User-Agent": AGENT_WEB_SEARCH_USER_AGENT,
+                        "Accept-Encoding": "gzip, deflate",
+                    },
+                    method="GET",
+                )
+                with urlopen(req, timeout=self._network_timeout(min(8.0, AGENT_WEB_SEARCH_FETCH_TIMEOUT))) as resp:
+                    raw = resp.read(300_000)
+                    decoded = _agent_web_decode_text_bytes(
+                        raw,
+                        str(resp.headers.get("Content-Type", "") or ""),
+                        str(resp.headers.get("Content-Encoding", "") or ""),
+                    )
+                    data = str(decoded.get("text", "") or "").splitlines()
+                rp.parse(data)
+            except HTTPError as exc:
+                if exc.code in {401, 403}:
+                    return False, f"robots unavailable with status {exc.code}"
+                rp.parse([])
+            except Exception:
+                rp.parse([])
+            self._robots_cache[origin] = rp
+        try:
+            return bool(rp.can_fetch(AGENT_WEB_SEARCH_USER_AGENT, url)), "robots"
+        except Exception:
+            return True, "robots parse fallback"
+
+    def _log_fetch(self, conn: sqlite3.Connection, url: str, status: str, message: str = "") -> None:
+        try:
+            conn.execute(
+                "INSERT INTO fetch_log(url, ts, status, message) VALUES (?, ?, ?, ?)",
+                (url, now_ts(), trim(status, 80), trim(message, 500)),
+            )
+        except Exception:
+            pass
+
+    def _classify_source_quality(self, url: str, source_type: str = "") -> str:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+        stype = str(source_type or "").lower()
+        if host.endswith((".gov", ".edu")):
+            return "official_public"
+        if any(part in host for part in ("github.com", "gitlab.com", "sourceforge.net")):
+            return "code_repository"
+        if any(part in path for part in ("/docs", "/documentation", "/reference", "/manual", "/spec", "/standard")):
+            return "official_docs"
+        if stype in {"sitemap", "rss"}:
+            return "publisher_feed"
+        if any(part in path for part in ("/blog", "/news", "/press", "/release")):
+            return "publisher_update"
+        if any(part in host for part in ("arxiv.org", "doi.org", "semanticscholar.org", "acm.org", "ieee.org", "springer.com")):
+            return "scholarly"
+        return "web_page"
+
+    def _classify_evidence_type(self, row: dict, terms: list[str]) -> str:
+        url = str(row.get("url", "") or "").lower()
+        title = str(row.get("title", "") or "").lower()
+        desc = str(row.get("description", "") or "").lower()
+        hay = " ".join([url, title, desc])
+        if any(part in hay for part in ("docs", "documentation", "reference", "api", "manual")):
+            return "documentation"
+        if any(part in hay for part in ("release", "changelog", "version", "latest", "news", "announcement")):
+            return "freshness_update"
+        if any(part in hay for part in ("paper", "research", "arxiv", "doi", "journal", "conference")):
+            return "research"
+        if any(part in hay for part in ("github", "gitlab", "source", "repo", "example")):
+            return "implementation"
+        if len(terms) >= 3 and len(row.get("matched_terms", []) or []) >= max(2, len(terms) // 2):
+            return "topic_match"
+        return "background"
+
+    def _record_page_evidence(self, query: str, results: list[dict], mode: str = "search") -> None:
+        q = trim(str(query or "").strip(), 1000)
+        if not q or not results:
+            return
+        terms = _agent_web_query_terms(q)
+        with self._connect() as conn:
+            for row in results[:24]:
+                if not isinstance(row, dict):
+                    continue
+                url = str(row.get("url", "") or "").strip()
+                if not url:
+                    continue
+                evidence_type = self._classify_evidence_type(row, terms)
+                source_quality = self._classify_source_quality(url, str(row.get("source_type", "") or ""))
+                topic = ", ".join((row.get("matched_terms", []) or terms)[:8])
+                raw_id = f"{q}|{url}|{evidence_type}|{trim(str(row.get('snippet', '') or ''), 180)}"
+                evid = hashlib.sha1(raw_id.encode("utf-8", errors="replace")).hexdigest()[:20]
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO page_evidence
+                    (id, query, url, topic, evidence_type, source_quality, score, snippet, recorded_at, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evid,
+                        q,
+                        url,
+                        trim(topic, 400),
+                        evidence_type,
+                        source_quality,
+                        float(row.get("score", 0.0) or 0.0),
+                        trim(str(row.get("snippet", "") or ""), 1200),
+                        now_ts(),
+                        json_dumps({"mode": mode, "title": row.get("title", ""), "domain": row.get("domain", "")}),
+                    ),
+                )
+
+    def _record_query_trail(self, query: str, mode: str, seeds: list[str], payload: dict) -> None:
+        q = trim(str(query or "").strip(), 1000)
+        raw_id = f"{q}|{mode}|{now_ts()}|{len(str(payload))}"
+        trail_id = hashlib.sha1(raw_id.encode("utf-8", errors="replace")).hexdigest()[:20]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO query_trails(id, query, mode, seeds_json, result_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trail_id,
+                    q,
+                    trim(str(mode or ""), 80),
+                    json_dumps(seeds[:30]),
+                    trim(json_dumps(payload), 120_000),
+                    now_ts(),
+                ),
+            )
+
+    def _store_page(self, payload: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO pages
+                (url, canonical_url, domain, title, description, text, fetched_at, status, content_type, source_type, depth, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("url", ""),
+                    payload.get("canonical_url", ""),
+                    payload.get("domain", ""),
+                    payload.get("title", ""),
+                    payload.get("description", ""),
+                    payload.get("text", ""),
+                    float(payload.get("fetched_at", now_ts()) or now_ts()),
+                    int(payload.get("status", 0) or 0),
+                    payload.get("content_type", ""),
+                    payload.get("source_type", ""),
+                    int(payload.get("depth", 0) or 0),
+                    json_dumps(payload.get("metadata", {})),
+                ),
+            )
+            try:
+                conn.execute("DELETE FROM pages_fts WHERE url = ?", (payload.get("url", ""),))
+                conn.execute(
+                    "INSERT INTO pages_fts(url, title, description, text) VALUES (?, ?, ?, ?)",
+                    (
+                        payload.get("url", ""),
+                        payload.get("title", ""),
+                        payload.get("description", ""),
+                        payload.get("text", ""),
+                    ),
+                )
+            except Exception:
+                pass
+            for link in payload.get("links", []) or []:
+                if not isinstance(link, dict):
+                    continue
+                dst = str(link.get("url", "") or "")
+                if not dst:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO links(src, dst, anchor, discovered_at) VALUES (?, ?, ?, ?)",
+                    (payload.get("url", ""), dst, trim(str(link.get("anchor", "") or ""), 240), now_ts()),
+                )
+
+    def fetch(self, url: str, *, depth: int = 0, source_type: str = "fetch", max_chars: int | None = None) -> dict:
+        if self._deadline_reached(1.0):
+            self._progress(
+                "deadline",
+                url=str(url or ""),
+                error="agent_web_search soft deadline reached before fetch",
+                conversation_visible=False,
+            )
+            return self._deadline_error(str(url or ""))
+        ok, safe_url, reason = self._validate_url(url)
+        if not ok:
+            self._progress("fetch_error", url=str(url or ""), error=reason, conversation_visible=False)
+            return {"ok": False, "url": str(url or ""), "error": reason}
+        self._progress(
+            "fetch_start",
+            url=safe_url,
+            source_type=source_type,
+            depth=int(depth or 0),
+            conversation_visible=False,
+        )
+        allowed, robots_reason = self._robots_allowed(safe_url)
+        if not allowed:
+            deadline_hit = "deadline" in str(robots_reason or "").lower()
+            self._progress(
+                "deadline" if deadline_hit else "fetch_error",
+                url=safe_url,
+                error=f"blocked by robots.txt ({robots_reason})",
+                conversation_visible=False,
+            )
+            if deadline_hit:
+                return self._deadline_error(safe_url)
+            return {"ok": False, "url": safe_url, "error": f"blocked by robots.txt ({robots_reason})"}
+        req = Request(
+            safe_url,
+            headers={
+                "User-Agent": AGENT_WEB_SEARCH_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.2",
+                "Accept-Encoding": "gzip, deflate",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(req, timeout=self._network_timeout(AGENT_WEB_SEARCH_FETCH_TIMEOUT)) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                ctype = str(resp.headers.get("Content-Type", "") or "")
+                cenc = str(resp.headers.get("Content-Encoding", "") or "")
+                raw = resp.read(AGENT_WEB_SEARCH_MAX_PAGE_BYTES + 1)
+        except HTTPError as exc:
+            with self._connect() as conn:
+                self._log_fetch(conn, safe_url, "http_error", str(exc))
+            self._progress("fetch_error", url=safe_url, error=f"HTTP {exc.code}", conversation_visible=False)
+            return {"ok": False, "url": safe_url, "error": f"HTTP {exc.code}: {trim(str(exc.reason), 160)}"}
+        except URLError as exc:
+            with self._connect() as conn:
+                self._log_fetch(conn, safe_url, "url_error", str(exc))
+            self._progress("fetch_error", url=safe_url, error=trim(str(exc), 180), conversation_visible=False)
+            return {"ok": False, "url": safe_url, "error": trim(str(exc), 220)}
+        except Exception as exc:
+            with self._connect() as conn:
+                self._log_fetch(conn, safe_url, "error", str(exc))
+            self._progress("fetch_error", url=safe_url, error=trim(str(exc), 180), conversation_visible=False)
+            return {"ok": False, "url": safe_url, "error": trim(str(exc), 220)}
+        if len(raw) > AGENT_WEB_SEARCH_MAX_PAGE_BYTES:
+            self._progress("fetch_error", url=safe_url, error="page exceeds max byte budget", conversation_visible=False)
+            return {"ok": False, "url": safe_url, "error": "page exceeds max byte budget"}
+        parsed = urlparse(safe_url)
+        decoded = _agent_web_decode_text_bytes(raw, ctype, cenc)
+        decoded_bytes = decoded.get("bytes", b"") if isinstance(decoded.get("bytes", b""), bytes) else b""
+        if len(decoded_bytes) > AGENT_WEB_SEARCH_MAX_PAGE_BYTES * 4:
+            self._progress("fetch_error", url=safe_url, error="decoded page exceeds max byte budget", conversation_visible=False)
+            return {"ok": False, "url": safe_url, "error": "decoded page exceeds max byte budget"}
+        text = str(decoded.get("text", "") or "")
+        is_html = ("html" in ctype.lower()) or ("<html" in text[:1000].lower())
+        title = ""
+        description = ""
+        canonical_url = safe_url
+        links: list[dict] = []
+        if is_html:
+            parser = AgentWebHTMLParser()
+            try:
+                parser.feed(text)
+            except Exception:
+                pass
+            data = parser.payload()
+            title = str(data.get("title", "") or "")
+            description = str(data.get("description", "") or "")
+            canonical = _agent_web_canonical_url(str(data.get("canonical", "") or ""), safe_url)
+            if canonical:
+                canonical_url = canonical
+            body_text = str(data.get("text", "") or "")
+            for href, anchor in data.get("links", []) or []:
+                dst = _agent_web_canonical_url(str(href or ""), safe_url)
+                if not dst:
+                    continue
+                dparsed = urlparse(dst)
+                if dparsed.scheme not in {"http", "https"}:
+                    continue
+                links.append({"url": dst, "anchor": trim(str(anchor or ""), 240)})
+        else:
+            title = Path(parsed.path).name or parsed.netloc
+            description = ""
+            body_text = "" if bool(decoded.get("binary_like", False)) else text
+        max_text = max(1000, min(AGENT_WEB_SEARCH_MAX_TEXT_CHARS, int(max_chars or AGENT_WEB_SEARCH_MAX_TEXT_CHARS)))
+        page = {
+            "ok": True,
+            "url": safe_url,
+            "canonical_url": canonical_url,
+            "domain": (parsed.hostname or "").lower(),
+            "title": trim(title, 500),
+            "description": trim(description, 1000),
+            "text": trim(body_text, max_text),
+            "links": links[:600],
+            "fetched_at": now_ts(),
+            "status": status,
+            "content_type": ctype,
+            "source_type": source_type,
+            "depth": int(depth or 0),
+            "metadata": {
+                "bytes": len(raw),
+                "decoded_bytes": len(decoded_bytes),
+                "is_html": bool(is_html),
+                "robots": robots_reason,
+                "charset": str(decoded.get("charset", "") or ""),
+                "content_encoding": str(decoded.get("content_encoding", "") or ""),
+                "decompressed": bool(decoded.get("decompressed", False)),
+                "decode_error": str(decoded.get("decode_error", "") or ""),
+                "binary_like": bool(decoded.get("binary_like", False)),
+            },
+        }
+        self._store_page(page)
+        with self._connect() as conn:
+            self._log_fetch(conn, safe_url, "ok", f"status={status} bytes={len(raw)}")
+        self._progress(
+            "fetch_done",
+            url=safe_url,
+            title=trim(title, 160),
+            status=status,
+            bytes=len(raw),
+            links=len(links),
+            source_type=source_type,
+            conversation_visible=False,
+        )
+        return page
+
+    def _discover_sitemaps_and_feeds(self, seed_url: str) -> list[tuple[str, str]]:
+        if self._deadline_reached(2.0):
+            return []
+        origin = self._origin(seed_url)
+        out: list[tuple[str, str]] = []
+        candidates = [
+            (urljoin(origin, "/sitemap.xml"), "sitemap"),
+            (urljoin(origin, "/sitemap_index.xml"), "sitemap"),
+            (urljoin(origin, "/rss.xml"), "rss"),
+            (urljoin(origin, "/feed.xml"), "rss"),
+            (urljoin(origin, "/atom.xml"), "rss"),
+        ]
+        for url, source_type in candidates:
+            if self._deadline_reached(1.5):
+                break
+            ok, safe_url, _ = self._validate_url(url)
+            if ok:
+                out.append((safe_url, source_type))
+        return out
+
+    def _fetch_xml_urls(self, url: str, source_type: str, budget: int) -> list[str]:
+        if self._deadline_reached(2.0):
+            return []
+        ok, safe_url, reason = self._validate_url(url)
+        if not ok:
+            return []
+        allowed, _ = self._robots_allowed(safe_url)
+        if not allowed:
+            return []
+        try:
+            req = Request(
+                safe_url,
+                headers={
+                    "User-Agent": AGENT_WEB_SEARCH_USER_AGENT,
+                    "Accept-Encoding": "gzip, deflate",
+                },
+                method="GET",
+            )
+            with urlopen(req, timeout=self._network_timeout(min(10.0, AGENT_WEB_SEARCH_FETCH_TIMEOUT))) as resp:
+                raw = resp.read(min(AGENT_WEB_SEARCH_MAX_PAGE_BYTES, 800_000))
+                decoded = _agent_web_decode_text_bytes(
+                    raw,
+                    str(resp.headers.get("Content-Type", "") or ""),
+                    str(resp.headers.get("Content-Encoding", "") or ""),
+                )
+                decoded_raw = decoded.get("bytes", raw)
+                raw = decoded_raw if isinstance(decoded_raw, bytes) else raw
+        except Exception:
+            return []
+        urls: list[str] = []
+        try:
+            root = ET.fromstring(raw)
+            for elem in root.iter():
+                tag = elem.tag.split("}", 1)[-1].lower()
+                if tag in {"loc", "link"} and elem.text:
+                    dst = _agent_web_canonical_url(elem.text)
+                    if dst and dst not in urls:
+                        urls.append(dst)
+                if len(urls) >= budget:
+                    break
+        except Exception:
+            text = _agent_web_decode_text_bytes(raw, "", "").get("text", "")
+            for match in re.findall(r"https?://[^\s<>\"]+", text):
+                dst = _agent_web_canonical_url(match)
+                if dst and dst not in urls:
+                    urls.append(dst)
+                if len(urls) >= budget:
+                    break
+        return urls[:budget]
+
+    def _seed_urls(self, query: str, seed_urls: list[str] | None, domains: list[str] | None) -> list[str]:
+        seeds: list[str] = []
+        for raw in list(seed_urls or []):
+            url = _agent_web_canonical_url(str(raw or ""))
+            if url and url not in seeds:
+                seeds.append(url)
+        for domain in list(domains or []):
+            url = _agent_web_domain_to_seed(str(domain or ""))
+            if url and url not in seeds:
+                seeds.append(url)
+        for domain in _agent_web_query_domain_hints(query):
+            url = _agent_web_domain_to_seed(domain)
+            if url and url not in seeds:
+                seeds.append(url)
+        return seeds[:20]
+
+    def discover(
+        self,
+        query: str = "",
+        *,
+        seed_urls: list[str] | None = None,
+        domains: list[str] | None = None,
+        max_pages: int = AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES,
+        depth: int = AGENT_WEB_SEARCH_DEFAULT_DEPTH,
+        allow_html_discovery: bool = True,
+        max_chars: int | None = None,
+    ) -> dict:
+        page_budget = _agent_web_int(max_pages, AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES, 1, AGENT_WEB_SEARCH_HARD_MAX_PAGES)
+        depth_budget = _agent_web_int(depth, AGENT_WEB_SEARCH_DEFAULT_DEPTH, 0, AGENT_WEB_SEARCH_HARD_DEPTH)
+        terms = _agent_web_query_terms(query)
+        seeds = self._seed_urls(query, seed_urls, domains)
+        queue_rows: deque[tuple[str, int, str]] = deque()
+        for seed in seeds:
+            if self._deadline_reached(3.0):
+                break
+            queue_rows.append((seed, 0, "seed"))
+            for xml_url, stype in self._discover_sitemaps_and_feeds(seed):
+                if self._deadline_reached(2.0):
+                    break
+                for discovered in self._fetch_xml_urls(xml_url, stype, max(1, page_budget // 2)):
+                    queue_rows.append((discovered, 0, stype))
+        fetched: list[dict] = []
+        errors: list[dict] = []
+        seen: set[str] = set()
+        deadline_reached = False
+        while queue_rows and len(fetched) < page_budget:
+            if self._deadline_reached(1.5):
+                deadline_reached = True
+                self._progress(
+                    "deadline",
+                    query=query,
+                    fetched=len(fetched),
+                    remaining_queue=len(queue_rows),
+                    conversation_visible=False,
+                )
+                break
+            url, cur_depth, source_type = queue_rows.popleft()
+            url = _agent_web_canonical_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            page = self.fetch(url, depth=cur_depth, source_type=source_type, max_chars=max_chars)
+            if not page.get("ok"):
+                errors.append({"url": page.get("url", url), "error": page.get("error", "")})
+                if page.get("deadline_reached"):
+                    deadline_reached = True
+                    break
+                continue
+            fetched.append(page)
+            if not allow_html_discovery or cur_depth >= depth_budget:
+                continue
+            links = page.get("links", []) if isinstance(page.get("links", []), list) else []
+            scored_links: list[tuple[float, str]] = []
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                dst = str(link.get("url", "") or "")
+                if not dst or dst in seen or not self._same_domain(dst, str(page.get("url", "") or "")):
+                    continue
+                hay = (dst + " " + str(link.get("anchor", "") or "")).lower()
+                score = sum(1.0 for term in terms if term.lower() in hay)
+                if any(part in hay for part in ("docs", "documentation", "guide", "reference", "blog", "news", "research", "paper")):
+                    score += 0.5
+                scored_links.append((score, dst))
+            for _score, dst in sorted(scored_links, key=lambda item: item[0], reverse=True)[: max(3, page_budget)]:
+                queue_rows.append((dst, cur_depth + 1, "html_link"))
+        return {
+            "ok": True,
+            "mode": "discover",
+            "query": query,
+            "seeds": seeds,
+            "fetched": len(fetched),
+            "deadline_reached": bool(deadline_reached),
+            "errors": errors[:10],
+            "pages": [
+                {
+                    "url": p.get("url", ""),
+                    "title": p.get("title", ""),
+                    "domain": p.get("domain", ""),
+                    "source_type": p.get("source_type", ""),
+                    "depth": p.get("depth", 0),
+                    "snippet": _agent_web_extract_text_snippet(str(p.get("text", "") or p.get("description", "")), terms),
+                }
+                for p in fetched
+            ],
+        }
+
+    def _score_row(self, row: sqlite3.Row | dict, terms: list[str], anchors: dict[str, list[str]]) -> dict:
+        item = dict(row)
+        title = str(item.get("title", "") or "")
+        desc = str(item.get("description", "") or "")
+        text = str(item.get("text", "") or "")
+        url = str(item.get("url", "") or "")
+        source = str(item.get("source_type", "") or "")
+        url_low = url.lower()
+        title_low = title.lower()
+        desc_low = desc.lower()
+        text_low = text.lower()
+        score = 0.0
+        matched: list[str] = []
+        for term in terms:
+            low = term.lower()
+            hit = False
+            if low in title_low:
+                score += 6.0
+                hit = True
+            if low in desc_low:
+                score += 3.0
+                hit = True
+            if low in url_low:
+                score += 2.0
+                hit = True
+            count = text_low.count(low)
+            if count:
+                score += min(8.0, 0.7 * count)
+                hit = True
+            for anchor in anchors.get(url, [])[:8]:
+                if low in anchor.lower():
+                    score += 1.4
+                    hit = True
+                    break
+            if hit:
+                matched.append(term)
+        if source in {"sitemap", "rss"}:
+            score += 1.0
+        if any(part in url_low for part in ("/docs", "/documentation", "/guide", "/reference", "/blog", "/news")):
+            score += 0.7
+        fetched_at = float(item.get("fetched_at", 0.0) or 0.0)
+        if fetched_at > 0 and now_ts() - fetched_at < 30 * 86400:
+            score += 0.4
+        if not terms:
+            score += 1.0
+        return {
+            "url": url,
+            "title": title or url,
+            "description": desc,
+            "domain": item.get("domain", ""),
+            "source_type": source,
+            "fetched_at": fetched_at,
+            "score": round(score, 4),
+            "matched_terms": matched[:12],
+            "snippet": _agent_web_extract_text_snippet(text or desc, terms),
+        }
+
+    def _search_index(self, query: str, max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, freshness_days: int = 0) -> list[dict]:
+        terms = _agent_web_query_terms(query)
+        limit = _agent_web_int(max_results, AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, 1, 30)
+        since = now_ts() - int(freshness_days or 0) * 86400 if int(freshness_days or 0) > 0 else 0.0
+        with self._connect() as conn:
+            anchors: dict[str, list[str]] = defaultdict(list)
+            for row in conn.execute("SELECT dst, anchor FROM links ORDER BY discovered_at DESC LIMIT 5000"):
+                dst = str(row["dst"] or "")
+                anchor = trim(str(row["anchor"] or ""), 240)
+                if dst and anchor and len(anchors[dst]) < 12:
+                    anchors[dst].append(anchor)
+            rows: list[sqlite3.Row] = []
+            try:
+                fts_query = " OR ".join(quote_term.replace('"', "") for quote_term in terms[:10])
+                if fts_query:
+                    sql = (
+                        "SELECT p.* FROM pages_fts f JOIN pages p ON p.url=f.url "
+                        "WHERE pages_fts MATCH ? "
+                        + ("AND p.fetched_at >= ? " if since else "")
+                        + "LIMIT 120"
+                    )
+                    params: tuple = (fts_query, since) if since else (fts_query,)
+                    rows = list(conn.execute(sql, params))
+            except Exception:
+                rows = []
+            if not rows:
+                if terms:
+                    clauses = []
+                    params_list: list[object] = []
+                    for term in terms[:8]:
+                        like = f"%{term}%"
+                        clauses.append("(lower(title) LIKE ? OR lower(description) LIKE ? OR lower(text) LIKE ? OR lower(url) LIKE ?)")
+                        params_list.extend([like, like, like, like])
+                    where = " OR ".join(clauses) if clauses else "1=1"
+                else:
+                    where = "1=1"
+                    params_list = []
+                if since:
+                    where = f"({where}) AND fetched_at >= ?"
+                    params_list.append(since)
+                rows = list(conn.execute(f"SELECT * FROM pages WHERE {where} ORDER BY fetched_at DESC LIMIT 160", tuple(params_list)))
+        scored = [self._score_row(row, terms, anchors) for row in rows]
+        scored = [row for row in scored if row.get("score", 0) > 0 or not terms]
+        scored.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+        selected: list[dict] = []
+        domain_counts: dict[str, int] = defaultdict(int)
+        for row in scored:
+            domain = str(row.get("domain", "") or "")
+            if domain_counts[domain] >= 3 and len(selected) >= max(3, limit // 2):
+                continue
+            selected.append(row)
+            domain_counts[domain] += 1
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _related_links_for_results(self, results: list[dict], terms: list[str], budget: int) -> list[str]:
+        urls = [str(row.get("url", "") or "") for row in (results or []) if isinstance(row, dict) and row.get("url")]
+        if not urls:
+            return []
+        out: list[str] = []
+        with self._connect() as conn:
+            for src in urls[:10]:
+                rows = list(conn.execute("SELECT dst, anchor FROM links WHERE src = ? ORDER BY discovered_at DESC LIMIT 160", (src,)))
+                scored: list[tuple[float, str]] = []
+                src_host = (urlparse(src).hostname or "").lower()
+                for row in rows:
+                    dst = str(row["dst"] or "")
+                    if not dst or dst in out:
+                        continue
+                    dst_host = (urlparse(dst).hostname or "").lower()
+                    hay = (dst + " " + str(row["anchor"] or "")).lower()
+                    score = 0.0
+                    if dst_host and dst_host == src_host:
+                        score += 1.0
+                    score += sum(1.8 for term in terms if term.lower() in hay)
+                    if any(part in hay for part in ("docs", "documentation", "reference", "guide", "release", "blog", "news", "research", "paper")):
+                        score += 1.2
+                    if score > 0:
+                        scored.append((score, dst))
+                for _score, dst in sorted(scored, key=lambda item: item[0], reverse=True):
+                    if dst not in out:
+                        out.append(dst)
+                    if len(out) >= budget:
+                        return out
+        return out[:budget]
+
+    def _search_results_need_fresh_discovery(self, query: str, results: list[dict]) -> bool:
+        terms = _agent_web_query_terms(query)
+        if not terms:
+            return not bool(results)
+        if not results:
+            return True
+        top = results[0] if isinstance(results[0], dict) else {}
+        score = float(top.get("score", 0.0) or 0.0)
+        matched = top.get("matched_terms", []) if isinstance(top.get("matched_terms", []), list) else []
+        required_matches = 1 if len(terms) <= 2 else 2
+        if len(matched) < required_matches:
+            return True
+        return score < 8.0
+
+    def deepen(
+        self,
+        query: str,
+        *,
+        seed_urls: list[str] | None = None,
+        domains: list[str] | None = None,
+        max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS,
+        max_pages: int = AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES,
+        depth: int = 1,
+        freshness_days: int = 0,
+        allow_html_discovery: bool = True,
+        max_chars: int | None = None,
+    ) -> dict:
+        terms = _agent_web_query_terms(query)
+        initial = self.search(
+            query,
+            seed_urls=seed_urls,
+            domains=domains,
+            max_results=max_results,
+            max_pages=max(1, max_pages // 2),
+            depth=depth,
+            freshness_days=freshness_days,
+            allow_html_discovery=allow_html_discovery,
+            max_chars=max_chars,
+        )
+        initial_results = [dict(x) for x in (initial.get("results", []) or []) if isinstance(x, dict)]
+        follow_budget = max(1, _agent_web_int(max_pages, AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES, 1, AGENT_WEB_SEARCH_HARD_MAX_PAGES) - int(initial.get("discovery", {}).get("fetched", 0) or 0))
+        follow_urls = self._related_links_for_results(initial_results, terms, min(follow_budget, AGENT_WEB_SEARCH_HARD_MAX_PAGES))
+        fetched: list[dict] = []
+        errors: list[dict] = []
+        deadline_reached = bool(initial.get("deadline_reached", False))
+        for url in follow_urls[:follow_budget]:
+            if self._deadline_reached(1.5):
+                deadline_reached = True
+                errors.append({"url": url, "error": "agent_web_search soft deadline reached; returning partial evidence"})
+                break
+            page = self.fetch(url, depth=1, source_type="deepen_link", max_chars=max_chars)
+            if page.get("ok"):
+                fetched.append(page)
+            else:
+                errors.append({"url": page.get("url", url), "error": page.get("error", "")})
+                if page.get("deadline_reached"):
+                    deadline_reached = True
+                    break
+        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        payload = {
+            "ok": True,
+            "mode": "deepen",
+            "query": query,
+            "index": str(self.db_path),
+            "initial_result_count": len(initial_results),
+            "followed_links": len(fetched),
+            "deadline_reached": bool(deadline_reached),
+            "follow_errors": errors[:10],
+            "results": results,
+            "evidence_layers": self._evidence_summary(query),
+            "next_actions": [
+                "fetch an exact high-scoring URL for full page evidence",
+                "deepen again with a narrower query term if evidence is still thin",
+                "add explicit seed_urls/domains for sources the current trail uncovered",
+            ],
+        }
+        self._record_page_evidence(query, results, mode="deepen")
+        self._record_query_trail(query, "deepen", follow_urls, payload)
+        return payload
+
+    def follow(self, url: str, *, query: str = "", max_pages: int = 8, max_chars: int | None = None) -> dict:
+        page = self.fetch(url, depth=0, source_type="follow", max_chars=max_chars)
+        if not page.get("ok"):
+            return page
+        terms = _agent_web_query_terms(query or str(page.get("title", "") or ""))
+        candidates: list[tuple[float, dict]] = []
+        for link in page.get("links", []) if isinstance(page.get("links", []), list) else []:
+            if not isinstance(link, dict):
+                continue
+            dst = str(link.get("url", "") or "")
+            if not dst:
+                continue
+            hay = (dst + " " + str(link.get("anchor", "") or "")).lower()
+            score = sum(1.0 for term in terms if term.lower() in hay)
+            if self._same_domain(dst, str(page.get("url", "") or "")):
+                score += 0.5
+            if any(part in hay for part in ("docs", "reference", "guide", "release", "blog", "news", "paper", "research")):
+                score += 0.6
+            if score > 0:
+                candidates.append((score, {"url": dst, "anchor": link.get("anchor", ""), "score": round(score, 3)}))
+        selected = [row for _score, row in sorted(candidates, key=lambda item: item[0], reverse=True)[: _agent_web_int(max_pages, 8, 1, 30)]]
+        payload = {
+            "ok": True,
+            "mode": "follow",
+            "query": query,
+            "page": {
+                "url": page.get("url", ""),
+                "title": page.get("title", ""),
+                "domain": page.get("domain", ""),
+                "source_quality": self._classify_source_quality(str(page.get("url", "") or ""), str(page.get("source_type", "") or "")),
+                "snippet": _agent_web_extract_text_snippet(str(page.get("text", "") or page.get("description", "")), terms),
+            },
+            "promising_links": selected,
+            "next_actions": [
+                "fetch a promising link for exact evidence",
+                "deepen the query to crawl the strongest related links",
+            ],
+        }
+        self._record_query_trail(query or str(page.get("title", "") or ""), "follow", [str(page.get("url", "") or "")], payload)
+        return payload
+
+    def search(
+        self,
+        query: str,
+        *,
+        seed_urls: list[str] | None = None,
+        domains: list[str] | None = None,
+        max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS,
+        max_pages: int = AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES,
+        depth: int = AGENT_WEB_SEARCH_DEFAULT_DEPTH,
+        freshness_days: int = 0,
+        allow_html_discovery: bool = True,
+        max_chars: int | None = None,
+    ) -> dict:
+        before = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        discover_payload: dict = {}
+        force_fresh_discovery = bool(freshness_days and int(freshness_days or 0) > 0) or _agent_web_query_needs_fresh_network(query)
+        if seed_urls or domains or force_fresh_discovery or self._search_results_need_fresh_discovery(query, before):
+            discover_payload = self.discover(
+                query,
+                seed_urls=seed_urls,
+                domains=domains,
+                max_pages=max_pages,
+                depth=depth,
+                allow_html_discovery=allow_html_discovery,
+                max_chars=max_chars,
+            )
+        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        payload = {
+            "ok": True,
+            "mode": "search",
+            "query": query,
+            "index": str(self.db_path),
+            "results": results,
+            "pages": discover_payload.get("pages", []) if discover_payload else [],
+            "discovery": {
+                "ran": bool(discover_payload),
+                "fetched": int(discover_payload.get("fetched", 0) or 0) if discover_payload else 0,
+                "seeds": discover_payload.get("seeds", []) if discover_payload else [],
+                "errors": discover_payload.get("errors", []) if discover_payload else [],
+            },
+            "ranking_note": (
+                "Scores use query-local lexical, URL/path, source, freshness, anchor, and domain-diversity signals only; "
+                "no global iterative link ranking is used."
+            ),
+        }
+        payload["evidence_layers"] = self._evidence_summary(query)
+        self._record_page_evidence(query, results, mode="search")
+        self._record_query_trail(query, "search", list(seed_urls or []) + list(domains or []), payload)
+        return payload
+
+    def _evidence_summary(self, query: str = "") -> dict:
+        q = trim(str(query or "").strip(), 1000)
+        with self._connect() as conn:
+            if q:
+                rows = conn.execute(
+                    "SELECT evidence_type, source_quality, COUNT(*) AS c, MAX(score) AS best FROM page_evidence WHERE query = ? GROUP BY evidence_type, source_quality ORDER BY c DESC, best DESC LIMIT 20",
+                    (q,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT evidence_type, source_quality, COUNT(*) AS c, MAX(score) AS best FROM page_evidence GROUP BY evidence_type, source_quality ORDER BY c DESC, best DESC LIMIT 20"
+                ).fetchall()
+        return {
+            "query": q,
+            "layers": [
+                {
+                    "evidence_type": row["evidence_type"],
+                    "source_quality": row["source_quality"],
+                    "count": int(row["c"] or 0),
+                    "best_score": round(float(row["best"] or 0.0), 4),
+                }
+                for row in rows
+            ],
+        }
+
+    def _index_counts(self) -> dict:
+        with self._connect() as conn:
+            pages = int(conn.execute("SELECT COUNT(*) AS c FROM pages").fetchone()["c"])
+            links = int(conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"])
+            domains = int(conn.execute("SELECT COUNT(DISTINCT domain) AS c FROM pages").fetchone()["c"])
+            evidence = int(conn.execute("SELECT COUNT(*) AS c FROM page_evidence").fetchone()["c"])
+            trails = int(conn.execute("SELECT COUNT(*) AS c FROM query_trails").fetchone()["c"])
+        return {
+            "pages_total": pages,
+            "links_total": links,
+            "domains_total": domains,
+            "evidence_records": evidence,
+            "query_trails": trails,
+        }
+
+    def index_status(self) -> dict:
+        with self._connect() as conn:
+            pages = int(conn.execute("SELECT COUNT(*) AS c FROM pages").fetchone()["c"])
+            links = int(conn.execute("SELECT COUNT(*) AS c FROM links").fetchone()["c"])
+            domains = int(conn.execute("SELECT COUNT(DISTINCT domain) AS c FROM pages").fetchone()["c"])
+            evidence = int(conn.execute("SELECT COUNT(*) AS c FROM page_evidence").fetchone()["c"])
+            trails = int(conn.execute("SELECT COUNT(*) AS c FROM query_trails").fetchone()["c"])
+            latest = conn.execute("SELECT url, title, fetched_at FROM pages ORDER BY fetched_at DESC LIMIT 8").fetchall()
+        return {
+            "ok": True,
+            "mode": "index_status",
+            "index": str(self.db_path),
+            "pages": pages,
+            "links": links,
+            "domains": domains,
+            "evidence_records": evidence,
+            "query_trails": trails,
+            "evidence_layers": self._evidence_summary(),
+            "latest": [dict(row) for row in latest],
+            "allow_local": bool(self.allow_local),
+            "obey_robots": bool(self.obey_robots),
+        }
 
 
 def _fmt_export_ts(ts: float | int) -> str:
@@ -9910,6 +11662,7 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
     tracked = [
         "skills_Gen/SKILL.md",
         "skills_Gen/knowledge_snapshot.json",
+        "generated/agent-web-search/SKILL.md",
         "generated/upload-tabular-parser/SKILL.md",
         "generated/upload-office-parser/SKILL.md",
         "generated/upload-image-parser/SKILL.md",
@@ -9937,6 +11690,70 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "present": present,
     }
     _write_text_if_changed(generated_root / "runtime-skills-manifest.json", json_dumps(payload, indent=2))
+
+
+def ensure_generated_agent_web_search_skill(skills_root: Path):
+    skill_root = skills_root / "generated" / "agent-web-search"
+    skill = """---
+name: agent-web-search
+description: Autonomous bounded web research through the built-in agent_web_search tool, with self-discovery, progressive deepening, local evidence indexing, and citation discipline.
+preferred_tools:
+  - agent_web_search
+  - tool_memory
+  - read_from_blackboard
+  - write_to_blackboard
+---
+
+# Agent Web Search
+
+Use this skill when the task needs current open-web information, source discovery, or evidence beyond uploaded files and local RAG. The built-in `agent_web_search` tool does not call third-party search APIs. It fetches HTTP/HTTPS sources directly with strict budgets, robots compliance, SSRF protection, local SQLite/FTS indexing, and query-local ranking.
+
+## Core Workflow
+
+1. Resolve relative dates and local assumptions against the runtime temporal/local context injected into the system prompt. For current/news/finance queries, convert "today", "latest", "this week", "今年", "今日", "最近" into explicit current-date/current-year search terms and set `freshness_days` when useful.
+2. Start with `agent_web_search(mode="search", query=..., domains=[...])` when you know likely official domains, or `seed_urls=[...]` when the user gives URLs.
+3. Treat each search/fetch/follow/deepen call as a node in one task-local search tree. Inherit useful URLs, failed/dynamic domains, evidence types, and `next_actions` from the latest search context before choosing the next query.
+4. If results are thin or too broad, call `agent_web_search(mode="deepen", query=..., max_pages=...)` to follow promising links already discovered from roots, sitemaps, feeds, and page anchors.
+5. Use `agent_web_search(mode="follow", url=..., query=...)` to inspect one useful page's outgoing evidence map before fetching more.
+6. Use `agent_web_search(mode="fetch", url=...)` for exact page evidence. Cite only URLs that the tool actually fetched or returned.
+7. Before repeating a broad search, inspect the injected web-search context, `tool_memory`, or `agent_web_search(mode="index_status")`; reuse indexed evidence when it already answers the question.
+
+## Evidence Indexing
+
+Successful useful pages are persisted under `Web_Search_Index/agent_web_search.sqlite`:
+
+- `pages`: fetched page text, title, description, source type, domain, metadata.
+- `links`: local discovered links and anchors.
+- `page_evidence`: query, evidence type, source quality, score, snippet, topic.
+- `query_trails`: progressive search/deepen/follow trails.
+
+Treat this as a lightweight RAG-style web evidence layer. The index improves over time as agents fetch useful sources and deepen trails.
+
+## Progressive Search Strategy
+
+- Broad question: `search` first with a conservative page budget.
+- Need more depth: `deepen` with the same query, then narrow query terms based on matched terms and snippets.
+- Need source graph: `follow` the best result, then `fetch` only the most relevant links.
+- Need freshness: set `freshness_days` and include the explicit current date/year from runtime context in the query.
+- Need reliability: prioritize official docs, standards, scholarly pages, publisher feeds, and primary sources.
+- Dynamic page or low-yield repeat: do not keep retrying the same broad query family. Switch to endpoint/RSS/sitemap discovery, exact follow/fetch from useful roots, site-specific terms, cached evidence, or a clearly caveated answer that states the data was not available from fetchable pages.
+- Finance/news tables: prefer accessible article pages, exchange/company notices, official datasets, or feed/API-like endpoints discovered from page source over JavaScript-rendered tables.
+
+## Grounding Rules
+
+- Separate fetched facts from inference.
+- Do not invent citations.
+- Do not use stale calendar assumptions. Runtime temporal/local context is authoritative for relative dates.
+- Do not rely on snippets for claims that require exact wording; fetch the page.
+- If no evidence is found, say the web index/search did not find enough evidence and suggest seeds/domains.
+- The ranking uses local query-specific lexical, anchor, path, source, freshness, and diversity signals only; it is not a global link-importance algorithm.
+
+## Safety Boundary
+
+The tool blocks non-HTTP(S), localhost/private/reserved IPs by default, obeys robots.txt by default, and caps page count, depth, bytes, timeouts, and returned text.
+"""
+    _write_text_if_changed(skill_root / "SKILL.md", skill)
+
 
 BUILTIN_CLAWHUB_SKILLS_VERSION = "2026-03-01.1"
 
@@ -10235,6 +12052,7 @@ def ensure_embedded_clawhub_skills(skills_root: Path):
 
 def ensure_runtime_skills(skills_root: Path):
     ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
+    ensure_generated_agent_web_search_skill(skills_root)
     ensure_generated_document_skills(skills_root)
     ensure_generated_image_coding_feedback_skill(skills_root)
     ensure_generated_skills_gen_skill(skills_root)
@@ -13803,14 +15621,14 @@ TOOLS = [
             "include_cached": {"type": "boolean"},
         },
     ),
-	    tool_def(
-	        "context_recall",
-	        (
-	            "Recall archived compacted context with focused modes. "
-	            "Use this tool, not read_from_blackboard, when the user says archived context, compacted context, previous segment, or context segment. "
-	            "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
-	            "or 'window' with around_index/context for nearby messages."
-	        ),
+        tool_def(
+            "context_recall",
+            (
+                "Recall archived compacted context with focused modes. "
+                "Use this tool, not read_from_blackboard, when the user says archived context, compacted context, previous segment, or context segment. "
+                "Use mode='summary' for a map, 'search' with query/tool_name/role for evidence, "
+                "or 'window' with around_index/context for nearby messages."
+            ),
         {
             "mode": {"type": "string", "enum": ["summary", "search", "recent", "window", "detail"]},
             "segment_id": {"type": "string"},
@@ -13860,6 +15678,31 @@ TOOLS = [
         },
     ),
     tool_def(
+        "agent_web_search",
+        (
+            "Autonomous bounded web research without third-party search APIs. "
+            "Use explicit seed_urls/domains when possible; otherwise it derives official/source domains from the query, "
+            "probes roots, robots, sitemaps, RSS/Atom, and bounded same-domain HTML links, then stores fetched pages in a local SQLite/FTS index. "
+            "Use this for current open-web facts or source discovery; cite only returned fetched URLs. "
+            "For relative dates or time-sensitive queries, ground query terms and freshness_days against the injected runtime temporal/local context; do not use stale years from model memory. "
+            "Safety: http/https only, private/local networks blocked by default, robots obeyed, strict page/depth budgets."
+        ),
+        {
+            "mode": {"type": "string", "enum": ["search", "discover", "deepen", "follow", "fetch", "index_status", "site_probe"]},
+            "query": {"type": "string"},
+            "url": {"type": "string"},
+            "seed_urls": {"type": "array", "items": {"type": "string"}},
+            "domains": {"type": "array", "items": {"type": "string"}},
+            "max_results": {"type": "integer"},
+            "max_pages": {"type": "integer"},
+            "depth": {"type": "integer"},
+            "freshness_days": {"type": "integer"},
+            "allow_html_discovery": {"type": "boolean"},
+            "max_chars": {"type": "integer"},
+            "obey_robots": {"type": "boolean"},
+        },
+    ),
+    tool_def(
         "generate_media",
         "Generate image/audio/video using active model media endpoints.",
         {
@@ -13874,13 +15717,13 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-	    tool_def(
-	        "check_background",
-	        (
-	            "Inspect background tasks with summary/search/detail/tail modes. "
-	            "If the user names an error token, command text, or output text such as E123 or pytest, use mode='search' with query. "
-	            "Use tail only for recent jobs when no query is known."
-	        ),
+        tool_def(
+            "check_background",
+            (
+                "Inspect background tasks with summary/search/detail/tail modes. "
+                "If the user names an error token, command text, or output text such as E123 or pytest, use mode='search' with query. "
+                "Use tail only for recent jobs when no query is known."
+            ),
         {
             "task_id": {"type": "string"},
             "mode": {"type": "string", "enum": ["summary", "search", "detail", "tail"]},
@@ -13918,13 +15761,13 @@ TOOLS = [
         },
         ["to", "intent", "content"],
     ),
-	    tool_def(
-	        "read_from_blackboard",
-	        (
-	            "Read shared multi-agent blackboard state with summary/search/recent/window/detail modes. "
-	            "Use this for memory, research_notes, execution_logs, review_feedback, code_artifacts, and status; "
-	            "use context_recall instead for archived or compacted conversation context."
-	        ),
+        tool_def(
+            "read_from_blackboard",
+            (
+                "Read shared multi-agent blackboard state with summary/search/recent/window/detail modes. "
+                "Use this for memory, research_notes, execution_logs, review_feedback, code_artifacts, and status; "
+                "use context_recall instead for archived or compacted conversation context."
+            ),
         {
             "section": {
                 "type": "string",
@@ -13996,13 +15839,13 @@ TOOLS = [
     tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
-	    tool_def(
-	        "worktree_events",
-	        (
-	            "Read worktree lifecycle events with summary/search/detail modes. "
-	            "For a worktree name like alpha, set worktree='alpha'; do not put worktree names in event. "
-	            "For known failure text use mode='search' and query='failed' or the exact error; event is for lifecycle names like worktree.remove.failed."
-	        ),
+        tool_def(
+            "worktree_events",
+            (
+                "Read worktree lifecycle events with summary/search/detail modes. "
+                "For a worktree name like alpha, set worktree='alpha'; do not put worktree names in event. "
+                "For known failure text use mode='search' and query='failed' or the exact error; event is for lifecycle names like worktree.remove.failed."
+            ),
         {
             "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
             "query": {"type": "string"},
@@ -14059,6 +15902,20 @@ def canonicalize_tool_name(raw: object) -> str:
     mapped = TOOL_NAME_FUZZY_MAP.get(key, "") if key else ""
     return mapped or name
 
+
+def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
+    src = tools if isinstance(tools, list) else []
+    if bool(web_search_enabled):
+        return list(src)
+    out: list[dict] = []
+    for tool in src:
+        fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+        if canonicalize_tool_name(fn.get("name", "")) == "agent_web_search":
+            continue
+        out.append(tool)
+    return out
+
+
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {
         "bash",
@@ -14082,6 +15939,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "compress",
         "query_code_library",
         "query_knowledge_library",
+        "agent_web_search",
     },
     "developer": {str(name) for name in TOOL_SPEC_BY_NAME.keys()},
     "reviewer": {
@@ -14103,6 +15961,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "compress",
         "query_code_library",
         "query_knowledge_library",
+        "agent_web_search",
     },
 }
 
@@ -14142,6 +16001,7 @@ class SessionState:
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
+        web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED,
         ui_language: str = DEFAULT_UI_LANGUAGE,
         js_lib_root: Path | None = None,
         owner_user_id: str = "",
@@ -14206,11 +16066,17 @@ class SessionState:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.web_search_enabled = bool(web_search_enabled)
+        self.user_memory_mode = DEFAULT_USER_MEMORY_MODE
+        self.user_profile_capsule = ""
+        self.user_profile_capsule_meta: dict = {"mode": DEFAULT_USER_MEMORY_MODE, "memory_count": 0}
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
         self.thinking = False
         self.ui_language = normalize_ui_language(ui_language)
+        self.runtime_region_hint = extract_runtime_region_hint_setting(default_llm_config or {})
+        self.runtime_timezone_hint = extract_runtime_timezone_hint_setting(default_llm_config or {})
         self.model_profiles: dict[str, dict] = {}
         self.active_profile_id = ""
         self.multimodal_capability_cache: dict[str, dict] = {}
@@ -14255,6 +16121,7 @@ class SessionState:
         self.scheduler_starting = False
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
+        self.live_input_queue_lock = threading.Lock()
         self.deferred_start_inputs: list[dict] = []
         self.deferred_start_seq = 0
         self.deferred_start_worker_started = False
@@ -14274,6 +16141,7 @@ class SessionState:
         self.runtime_execution_mode = ""
         self.runtime_assigned_expert = ""
         self.runtime_participants: list[str] = []
+        self.multi_agent_context_hud_enabled = False
         self.runtime_round_budget = 0
         self.runtime_requires_confirmation = False
         self.runtime_confirmation_needed = False
@@ -14290,6 +16158,9 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_ts = 0.0
+        self.runtime_goal_reset_handled_ts = 0.0
+        self.runtime_first_task_in_session = False
         self.runtime_plan_mode_needed = False
         self.runtime_plan_approved = False
         self.runtime_plan_proposal = {}
@@ -14318,6 +16189,7 @@ class SessionState:
         self.tool_memory_loop_state: dict[str, dict] = {}
         self.read_context_registry: dict[str, dict] = {}
         self.tool_memory_registry: dict[str, dict] = {}
+        self.web_search_context_registry: dict[str, dict] = {}
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.stall_severity_score = 0
         self.stall_severity_sources: list[dict] = []
@@ -14352,6 +16224,7 @@ class SessionState:
         self.render_frame_latest: dict[str, object] = {}
         self.render_frame_last_payload: dict[str, object] = {}
         self.event_seq = 0
+        self.last_event_persist_ts = 0.0
         self._context_estimate_depth = 0
         self._snapshot_cache_lite: dict = {}
         self._snapshot_cache_full: dict = {}
@@ -14573,17 +16446,223 @@ class SessionState:
             used_rel.add(rel)
         return items
 
+    def _is_external_user_message_for_goal_tracking(self, row: dict | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("role", "")).strip() != "user":
+            return False
+        if bool(row.get("_ui_hidden", False)):
+            return False
+        content = str(row.get("content", "") or "").strip()
+        if not content:
+            return False
+        low = content.lower()
+        if low.startswith("<live-user-adjustment"):
+            return True
+        internal_prefixes = tuple(
+            prefix
+            for prefix in RUNTIME_CONTROL_HINT_PREFIXES
+            if str(prefix).lower() != "<live-user-adjustment"
+        ) + (
+            "<finish-blocked",
+            "<user-feedback-merge",
+            "<intent-fusion",
+            "<plan-approved-handoff",
+            "<compact-resume",
+        )
+        return not any(low.startswith(str(prefix).lower()) for prefix in internal_prefixes)
+
     def _latest_user_message_ts(self) -> float:
         with self.lock:
             rows = list(self.messages)
         for row in reversed(rows):
-            if str(row.get("role", "")).strip() != "user":
+            if not self._is_external_user_message_for_goal_tracking(row):
                 continue
             try:
                 return float(row.get("ts", 0.0) or 0.0)
             except Exception:
                 return 0.0
         return 0.0
+
+    def _mark_runtime_goal_reset_pending(self, goal_text: str = "", *, reason: str = "") -> None:
+        stamp = float(now_ts())
+        self.runtime_goal_reset_pending = True
+        self.runtime_goal_reset_ts = stamp
+        self.runtime_goal_reset_handled_ts = 0.0
+        if str(goal_text or "").strip():
+            self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
+        if reason:
+            try:
+                bb = self._ensure_blackboard()
+                bb["goal_reset_reason"] = trim(str(reason or ""), 120)
+                bb["goal_reset_ts"] = stamp
+                self.blackboard = bb
+            except Exception:
+                pass
+
+    def _mark_runtime_goal_reset_handled(
+        self,
+        *,
+        handled_ts: float | None = None,
+        reason: str = "",
+        clear_reclassify: bool = False,
+    ) -> None:
+        try:
+            stamp = float(handled_ts if handled_ts is not None else now_ts())
+        except Exception:
+            stamp = float(now_ts())
+        self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_handled_ts = max(
+            float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
+            stamp,
+        )
+        if clear_reclassify:
+            self.runtime_reclassify_required = False
+        if reason:
+            try:
+                bb = self._ensure_blackboard()
+                bb["goal_reset_handled_reason"] = trim(str(reason or ""), 120)
+                bb["goal_reset_handled_ts"] = self.runtime_goal_reset_handled_ts
+                self.blackboard = bb
+            except Exception:
+                pass
+
+    def _blackboard_latest_goal_reset_progress_ts(self, board: dict | None = None) -> float:
+        bb = board if isinstance(board, dict) else (
+            self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        )
+        latest = 0.0
+
+        def bump(value: object) -> None:
+            nonlocal latest
+            try:
+                ts = float(value or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > latest:
+                latest = ts
+
+        for key in ("task_profile", "manager_judgement"):
+            row = bb.get(key, {}) if isinstance(bb.get(key), dict) else {}
+            bump(row.get("updated_at", 0.0))
+
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        if str(delegate.get("target", "") or "").strip() and str(delegate.get("source", "") or "") != "finish-gate":
+            bump(delegate.get("ts", 0.0))
+
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if bool(approval.get("approved", False)):
+            bump(approval.get("ts", 0.0))
+
+        last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        if str(last_reply.get("text", "") or "").strip():
+            bump(last_reply.get("ts", 0.0))
+
+        for section in (
+            "research_notes",
+            "execution_logs",
+            "review_feedback",
+            "plan_findings",
+            "plan_proposal",
+            "plan_steps",
+            "plan_risks",
+            "skill_analysis",
+        ):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-12:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("content", "") or "").strip():
+                    bump(row.get("ts", 0.0))
+                    break
+
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        for item in artifacts.values():
+            if isinstance(item, dict):
+                bump(item.get("updated_at", 0.0))
+
+        routes = bb.get("persisted_manager_routes", []) if isinstance(bb.get("persisted_manager_routes"), list) else []
+        for row in reversed(routes[-8:]):
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+                break
+
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        for entries in step_files.values():
+            if not isinstance(entries, list):
+                continue
+            for row in reversed(entries[-8:]):
+                if isinstance(row, dict):
+                    bump(row.get("ts", 0.0))
+                    break
+
+        memory = bb.get("memory", {}) if isinstance(bb.get("memory"), dict) else {}
+        for row in (memory.get("short", []) if isinstance(memory.get("short", []), list) else [])[-12:]:
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+        for row in (memory.get("long", []) if isinstance(memory.get("long", []), list) else [])[-8:]:
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+
+        return float(latest)
+
+    def _runtime_goal_reset_still_pending(self, board: dict | None = None) -> bool:
+        if not bool(getattr(self, "runtime_goal_reset_pending", False)):
+            return False
+        if bool(getattr(self, "runtime_reclassify_required", False)):
+            return True
+        reset_ts = float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0)
+        if reset_ts <= 0.0:
+            reset_ts = self._latest_user_message_ts()
+        handled_ts = float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0)
+        if reset_ts > 0.0 and handled_ts + 1e-6 >= reset_ts:
+            self._mark_runtime_goal_reset_handled(reason="runtime-task-decision")
+            return False
+        progress_ts = self._blackboard_latest_goal_reset_progress_ts(board)
+        if reset_ts > 0.0 and progress_ts > reset_ts + 1e-6:
+            self._mark_runtime_goal_reset_handled(
+                handled_ts=progress_ts,
+                reason="blackboard-progress-after-goal-reset",
+            )
+            return False
+        return True
+
+    def _handle_runtime_goal_reclassification_if_needed(
+        self,
+        *,
+        pinned_selection: str,
+        scope: str,
+        media_inputs_round: list[dict] | None = None,
+    ) -> dict:
+        if not (
+            bool(getattr(self, "runtime_reclassify_required", False))
+            or bool(getattr(self, "runtime_goal_reset_pending", False))
+        ):
+            return {}
+        if bool(getattr(self, "runtime_reclassify_required", False)):
+            if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+                self._mark_runtime_goal_reset_handled(
+                    reason=f"{scope}:user-level-override",
+                    clear_reclassify=True,
+                )
+                return {"source": "user-level-override", "scope": scope}
+            if media_inputs_round is None:
+                media_inputs_round = self._recent_multimodal_inputs()
+            self._emit_multimodal_attach_status(
+                scope=f"{scope} reclassify",
+                media_inputs=media_inputs_round,
+                roles=["manager"],
+            )
+            decision = self._refresh_runtime_task_policy(
+                pinned_selection=pinned_selection,
+                force=True,
+                goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                media_inputs_round=media_inputs_round,
+            )
+            return dict(decision or {})
+        if not self._runtime_goal_reset_still_pending(self._ensure_blackboard()):
+            return {"source": "blackboard-progress-consumed", "scope": scope}
+        return {}
 
     def _emit_multimodal_attach_status(
         self,
@@ -15148,6 +17227,12 @@ class SessionState:
         return self.model_catalog()
 
     def load_llm_config(self, config: dict, source: str = "") -> dict:
+        cfg_web_search_enabled = extract_web_search_enabled_setting(config)
+        if cfg_web_search_enabled is not None:
+            self.web_search_enabled = bool(cfg_web_search_enabled)
+        cfg_user_memory_mode = extract_user_memory_mode_setting(config)
+        if cfg_user_memory_mode is not None:
+            self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
@@ -15305,6 +17390,17 @@ class SessionState:
                         raw.get("read_context_policy", getattr(self, "tool_memory_policy", DEFAULT_TOOL_MEMORY_POLICY)),
                     )
                 )
+                if "web_search_enabled" in raw:
+                    self.web_search_enabled = _to_bool_like(
+                        raw.get("web_search_enabled"),
+                        default=getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED),
+                    )
+                self.user_memory_mode = normalize_user_memory_mode(
+                    raw.get("user_memory_mode", getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+                )
+                self.user_profile_capsule = trim(str(raw.get("user_profile_capsule", "") or ""), USER_MEMORY_ON_CAPSULE_CHARS)
+                capsule_meta = raw.get("user_profile_capsule_meta", {})
+                self.user_profile_capsule_meta = dict(capsule_meta) if isinstance(capsule_meta, dict) else {"mode": self.user_memory_mode}
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     raw.get(
                         "auto_task_level_ceiling",
@@ -15401,6 +17497,9 @@ class SessionState:
                 )
                 if not self.tool_memory_registry and self.read_context_registry:
                     self.tool_memory_registry = self._tool_memory_from_read_context_registry(self.read_context_registry)
+                self.web_search_context_registry = self._normalize_web_search_context_registry(
+                    raw.get("web_search_context_registry", {})
+                )
                 self.last_compact_reason = str(raw.get("last_compact_reason", self.last_compact_reason) or "")
                 self.last_compact_ts = float(raw.get("last_compact_ts", self.last_compact_ts) or 0.0)
                 pref = str(raw.get("plan_mode_user_preference", "auto") or "auto").lower()
@@ -15514,6 +17613,12 @@ class SessionState:
                     raw.get("runtime_execution_mode", self.runtime_execution_mode),
                     default="",
                 )
+                self.multi_agent_context_hud_enabled = bool(
+                    raw.get(
+                        "multi_agent_context_hud_enabled",
+                        getattr(self, "multi_agent_context_hud_enabled", False),
+                    )
+                )
                 self.runtime_assigned_expert = self._sanitize_agent_role(
                     raw.get("runtime_assigned_expert", self.runtime_assigned_expert)
                 )
@@ -15575,6 +17680,25 @@ class SessionState:
                 self.runtime_goal_reset_pending = bool(
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
+                try:
+                    self.runtime_goal_reset_ts = float(
+                        raw.get("runtime_goal_reset_ts", getattr(self, "runtime_goal_reset_ts", 0.0)) or 0.0
+                    )
+                except Exception:
+                    self.runtime_goal_reset_ts = 0.0
+                try:
+                    self.runtime_goal_reset_handled_ts = float(
+                        raw.get(
+                            "runtime_goal_reset_handled_ts",
+                            getattr(self, "runtime_goal_reset_handled_ts", 0.0),
+                        )
+                        or 0.0
+                    )
+                except Exception:
+                    self.runtime_goal_reset_handled_ts = 0.0
+                self.runtime_first_task_in_session = bool(
+                    raw.get("runtime_first_task_in_session", self.runtime_first_task_in_session)
+                )
                 # Restore plan mode state
                 self.runtime_plan_mode_needed = bool(raw.get("runtime_plan_mode_needed", False))
                 self.runtime_plan_approved = bool(raw.get("runtime_plan_approved", False))
@@ -15632,6 +17756,8 @@ class SessionState:
                         if isinstance(row, dict):
                             clean_routes.append(dict(row))
                     self.manager_routes = clean_routes[-240:]
+                if not self.multi_agent_context_hud_enabled:
+                    self.multi_agent_context_hud_enabled = self._infer_multi_agent_hud_from_persisted_state()
                 self.render_frame_seq = int(raw.get("render_frame_seq", self.render_frame_seq) or 0)
                 self.render_frame_received = int(raw.get("render_frame_received", self.render_frame_received) or 0)
                 self.render_frame_last_ts = float(raw.get("render_frame_last_ts", self.render_frame_last_ts) or 0.0)
@@ -15643,6 +17769,8 @@ class SessionState:
                 self.created_at = raw.get("created_at", self.created_at)
                 self.updated_at = raw.get("updated_at", self.updated_at)
                 self.ui_language = normalize_ui_language(raw.get("ui_language", self.ui_language))
+                self.runtime_region_hint = trim(str(raw.get("runtime_region_hint", self.runtime_region_hint) or ""), 160)
+                self.runtime_timezone_hint = trim(str(raw.get("runtime_timezone_hint", self.runtime_timezone_hint) or ""), 120)
             except Exception:
                 pass
         if self.meta_path.exists():
@@ -15661,6 +17789,11 @@ class SessionState:
             self.context_token_upper_bound = self.max_context_token_limit
         # Ensure previous-run volatile state and control-hint artifacts are cleared on load.
         self._reset_runtime_state_locked(purge_runtime_hints=True)
+        if self._has_resumable_plan_state():
+            try:
+                self._restore_runtime_policy_from_blackboard_locked()
+            except Exception:
+                pass
         self._ensure_ollama_profile()
         if self.active_profile_id not in self.model_profiles:
             self.active_profile_id = next(iter(self.model_profiles.keys()))
@@ -15693,6 +17826,8 @@ class SessionState:
             "id": self.id,
             "title": self.title,
             "ui_language": self.ui_language,
+            "runtime_region_hint": trim(str(getattr(self, "runtime_region_hint", "") or ""), 160),
+            "runtime_timezone_hint": trim(str(getattr(self, "runtime_timezone_hint", "") or ""), 120),
             "messages": self.messages[-400:],
             "activity": self.activity[-300:],
             "operations": self.operations[-500:],
@@ -15722,6 +17857,10 @@ class SessionState:
             "tool_memory_policy": normalize_tool_memory_policy(
                 getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
             ),
+            "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+            "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+            "user_profile_capsule": trim(str(getattr(self, "user_profile_capsule", "") or ""), USER_MEMORY_ON_CAPSULE_CHARS),
+            "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
             "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
             "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
             "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
@@ -15739,6 +17878,9 @@ class SessionState:
             ),
             "tool_memory_registry": self._normalize_tool_memory_registry(
                 getattr(self, "tool_memory_registry", {})
+            ),
+            "web_search_context_registry": self._normalize_web_search_context_registry(
+                getattr(self, "web_search_context_registry", {})
             ),
             "last_compact_reason": self.last_compact_reason,
             "last_compact_ts": self.last_compact_ts,
@@ -15763,6 +17905,7 @@ class SessionState:
                 if str(self.runtime_execution_mode or "").strip()
                 else ""
             ),
+            "multi_agent_context_hud_enabled": bool(getattr(self, "multi_agent_context_hud_enabled", False)),
             "runtime_assigned_expert": self._sanitize_agent_role(self.runtime_assigned_expert),
             "runtime_participants": [
                 role for role in [self._sanitize_agent_role(x) for x in self.runtime_participants] if role
@@ -15788,6 +17931,9 @@ class SessionState:
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
+            "runtime_goal_reset_ts": float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0),
+            "runtime_goal_reset_handled_ts": float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
+            "runtime_first_task_in_session": bool(getattr(self, "runtime_first_task_in_session", False)),
             "runtime_plan_mode_needed": bool(self.runtime_plan_mode_needed),
             "runtime_plan_approved": bool(self.runtime_plan_approved),
             "runtime_plan_proposal": dict(self.runtime_plan_proposal) if self.runtime_plan_proposal else {},
@@ -15838,6 +17984,24 @@ class SessionState:
         for prefix in RUNTIME_CONTROL_HINT_PREFIXES:
             if txt.startswith(prefix):
                 return True
+        return False
+
+    def _has_prior_real_user_task_message(self) -> bool:
+        for row in self.messages:
+            if not isinstance(row, dict) or row.get("role") != "user":
+                continue
+            if bool(row.get("_ui_hidden", False)):
+                continue
+            content = row.get("content", "")
+            text = str(content or "").strip()
+            if not text:
+                continue
+            if self._is_runtime_control_hint(text) or self._is_retry_runtime_hint_text("user", text):
+                continue
+            low = text.lower()
+            if low.startswith(("<background-results", "<inbox", "<intent-fusion", "<plan-approved-handoff")):
+                continue
+            return True
         return False
 
     def _prune_runtime_retry_hints(self) -> int:
@@ -15918,7 +18082,8 @@ class SessionState:
                 kept.append(row)
             if removed_hints > 0:
                 self.messages = kept[-400:]
-        self.pending_user_inputs = []
+        with self.live_input_queue_lock:
+            self.pending_user_inputs = []
         self.deferred_start_worker_started = False
         self.cancel_requested = False
         self.current_phase = "idle"
@@ -15971,6 +18136,8 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_ts = 0.0
+        self.runtime_goal_reset_handled_ts = 0.0
         self.runtime_plan_mode_needed = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
@@ -16143,6 +18310,43 @@ class SessionState:
             self.event_seq = int(self.event_seq) + 1
             return int(self.event_seq)
 
+    def _event_should_persist(self, kind: str, payload: dict) -> bool:
+        kind_key = str(kind or "").strip().lower()
+        if kind_key not in PERSIST_ON_EVENT_TYPES:
+            return False
+        if kind_key in {"tool_start", "tool_result"}:
+            tool_name = canonicalize_tool_name(
+                str((payload or {}).get("name", "") or (payload or {}).get("tool", "") or "")
+            )
+            return tool_name in CONVERSATION_VISIBLE_TOOL_EVENTS
+        if kind_key == "web_search":
+            return bool((payload or {}).get("conversation_visible", True))
+        return True
+
+    def _maybe_persist_after_event(self, kind: str, payload: dict) -> None:
+        if not self._event_should_persist(kind, payload):
+            return
+        now_value = now_ts()
+        kind_key = str(kind or "").strip().lower()
+        immediate = kind_key in {"message", "file_patch", "upload", "command", "error"}
+        if kind_key == "web_search":
+            phase = str((payload or {}).get("phase", "") or "").strip().lower()
+            immediate = phase in {"done", "error", "timeout"}
+        elif kind_key == "tool_result":
+            immediate = True
+        if (
+            not immediate
+            and (now_value - float(getattr(self, "last_event_persist_ts", 0.0) or 0.0))
+            < PERSIST_EVENT_MIN_INTERVAL_SECONDS
+        ):
+            return
+        self.last_event_persist_ts = now_value
+        try:
+            self.updated_at = now_value
+            self._persist()
+        except Exception:
+            pass
+
     def _emit(self, kind: str, data: dict):
         try:
             if bool(getattr(self, "running", False)):
@@ -16159,16 +18363,22 @@ class SessionState:
             "data": payload,
         }
         self.events.publish(event)
-        self.operations.append(event)
-        self.operations = self.operations[-500:]
-        self.activity.append(
-            {
-                "ts": event["ts"],
-                "type": kind,
-                "summary": payload.get("summary") or payload.get("text") or payload.get("name") or kind,
-            }
+        record_visible = not (
+            str(kind or "").strip().lower() == "web_search"
+            and not bool(payload.get("conversation_visible", True))
         )
-        self.activity = self.activity[-300:]
+        if record_visible:
+            self.operations.append(event)
+            self.operations = self.operations[-500:]
+            self.activity.append(
+                {
+                    "ts": event["ts"],
+                    "type": kind,
+                    "summary": payload.get("summary") or payload.get("text") or payload.get("name") or kind,
+                }
+            )
+            self.activity = self.activity[-300:]
+        self._maybe_persist_after_event(kind, payload)
 
     def record_scheduler_queued_message(
         self,
@@ -16882,7 +19092,7 @@ class SessionState:
                         f"Task: {goal}\n\n"
                         f"Which skills are relevant? Reply ONLY a JSON array. Max 3. [] if none."
                     )}],
-                    system="/no_think\nOutput ONLY a JSON array.",
+                    system=self._inject_runtime_environment_context("/no_think\nOutput ONLY a JSON array."),
                     max_tokens=120,
                     think=False,
                 )
@@ -17366,6 +19576,36 @@ class SessionState:
             "When claiming progress, capture observable evidence such as command exit codes, test summaries, API responses, rendered output, or parsed results; file existence alone is not sufficient evidence."
         )
 
+    def _runtime_environment_context_snapshot(self) -> dict:
+        return runtime_environment_context_snapshot(
+            files_root=self.files_root,
+            region_hint=str(getattr(self, "runtime_region_hint", "") or ""),
+            timezone_hint=str(getattr(self, "runtime_timezone_hint", "") or ""),
+        )
+
+    def _runtime_environment_context_prompt_block(self) -> str:
+        return runtime_environment_context_block(self._runtime_environment_context_snapshot())
+
+    def _user_profile_capsule_prompt_block(self) -> str:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            return ""
+        capsule = trim(str(getattr(self, "user_profile_capsule", "") or "").strip(), USER_MEMORY_ON_CAPSULE_CHARS)
+        if not capsule:
+            return ""
+        return (
+            "USER PROFILE CAPSULE (per-user summary memory; preference signal only):\n"
+            f"{capsule}\n"
+            "Use this only when the latest user request is silent. Current explicit instructions always win."
+        )
+
+    def _inject_runtime_environment_context(self, system: str = "") -> str:
+        base = str(system or "").strip()
+        if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" in base:
+            return base
+        block = self._runtime_environment_context_prompt_block()
+        return f"{base}\n\n{block}" if base else block
+
     def _system_prompt(self) -> str:
         try:
             self._ensure_skills_ready(force=False)
@@ -17391,6 +19631,16 @@ class SessionState:
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         read_context_block = self._read_context_prompt_block()
         read_context_text = f"{read_context_block}\n\n" if read_context_block else ""
+        web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+        web_search_context_block = self._web_search_context_prompt_block() if web_search_enabled else ""
+        web_search_context_text = f"{web_search_context_block}\n\n" if web_search_context_block else ""
+        web_search_instruction = (
+            "For agent_web_search, treat search/fetch/follow/deepen calls as one task-local search tree. Inherit prior search-context findings, avoid repeating low-yield broad query families, and shift to exact follow/fetch, endpoint discovery, or a caveated conclusion when dynamic pages block structured data. "
+            if web_search_enabled
+            else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
+        )
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"{user_profile_block}\n\n" if user_profile_block else ""
         task_memory_block = self._blackboard_memory_context_markdown(max_chars=3200)
         task_memory_text = f"{task_memory_block}\n\n" if task_memory_block else ""
         _is_single_no_enhance = (
@@ -17414,6 +19664,7 @@ class SessionState:
         plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
+        runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Offline JS libraries root: $JS_LIB_ROOT. "
@@ -17428,12 +19679,14 @@ class SessionState:
             f"budget={'unlimited' if budget <= 0 else budget}. "
             f"Context limit ~{max(1, int(self.context_token_upper_bound) - max(1, int(math.ceil(int(self.context_token_upper_bound) * CONTEXT_AUTO_COMPACT_RESERVE_RATIO))))} usable tokens "
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
+            f"{runtime_env_text}"
             f"{_detect_os_shell_instruction()} "
-	            "Use tools to inspect, edit, and execute. "
-	            "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
+                "Use tools to inspect, edit, and execute. "
+                "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
+                f"{web_search_instruction}"
             "Use Task Memory as the shared mainline: continue the active_focus, reuse cited evidence, and do not branch into a private task unless the user changed the objective. "
             "Call finish_current_task only when the overall user task is done. "
             f"{skill_hint}"
@@ -17446,7 +19699,9 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{user_profile_text}"
             f"{task_memory_text}"
+            f"{web_search_context_text}"
             f"{read_context_text}"
             f"{knowledge_ref_block_text}"
             f"{code_block}"
@@ -17682,7 +19937,8 @@ class SessionState:
             # Overhead: lightweight system prompt estimate + tools. Do not build
             # the full prompt here; it contains dynamic memory budget blocks.
             sys_tokens = self._estimate_system_prompt_tokens_lightweight()
-            tools_tokens = self._estimate_text_tokens_conservative(json_dumps(TOOLS)) if TOOLS else 0
+            available_tools = self._available_tools()
+            tools_tokens = self._estimate_text_tokens_conservative(json_dumps(available_tools)) if available_tools else 0
             return msg_tokens + sys_tokens + tools_tokens
         finally:
             self._context_estimate_depth = max(0, int(getattr(self, "_context_estimate_depth", 1) or 1) - 1)
@@ -17885,17 +20141,94 @@ class SessionState:
             )
         return self._context_metrics_for_model_call(
             self.messages,
-            tools=TOOLS,
+            tools=self._available_tools(),
             system=self._system_prompt(),
             media_inputs=media_inputs,
             label="single-agent next turn",
         )
 
+    def _multi_agent_hud_participants(self) -> list[str]:
+        roles: list[str] = []
+
+        def add_many(items: object):
+            if not isinstance(items, list):
+                return
+            for item in items:
+                role = self._sanitize_agent_role(item)
+                if role and role not in roles:
+                    roles.append(role)
+
+        add_many(list(getattr(self, "runtime_participants", []) or []))
+        try:
+            bb = self.blackboard if isinstance(self.blackboard, dict) else {}
+            profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+            judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
+            add_many(profile.get("participants", []))
+            add_many(profile.get("recommended_agents", []))
+            add_many(judgement.get("participants", []))
+        except Exception:
+            pass
+        for route in reversed(list(getattr(self, "manager_routes", []) or [])[-12:]):
+            if not isinstance(route, dict):
+                continue
+            add_many(route.get("participants", []))
+            target = self._sanitize_agent_role(route.get("target", ""))
+            if target and target not in roles:
+                roles.append(target)
+        if len(roles) < 2:
+            for msg in list(getattr(self, "agent_messages", []) or [])[-160:]:
+                if not isinstance(msg, dict):
+                    continue
+                role = self._sanitize_agent_role(msg.get("agent_role", ""))
+                if role and role not in roles:
+                    roles.append(role)
+                if len(roles) >= 3:
+                    break
+        return roles[:3]
+
+    def _infer_multi_agent_hud_from_persisted_state(self) -> bool:
+        try:
+            mode = self._effective_execution_mode()
+            if mode not in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+                return False
+            roles = self._multi_agent_hud_participants()
+            if len(roles) < 2:
+                return False
+            has_manager_activity = bool(getattr(self, "manager_routes", None) or getattr(self, "manager_context", None))
+            role_mentions = {
+                self._sanitize_agent_role((m if isinstance(m, dict) else {}).get("agent_role", ""))
+                for m in list(getattr(self, "agent_messages", []) or [])[-240:]
+            }
+            role_mentions.discard("")
+            return bool(has_manager_activity or len(role_mentions.intersection(set(AGENT_ROLES))) >= 2)
+        except Exception:
+            return False
+
+    def _multi_agent_context_hud_should_show(self) -> bool:
+        if not bool(getattr(self, "multi_agent_context_hud_enabled", False)):
+            return False
+        if self._effective_execution_mode() not in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+            return False
+        return len(self._multi_agent_hud_participants()) >= 2
+
+    def _mark_multi_agent_context_hud_active(self, *, persist: bool = False):
+        if self._effective_execution_mode() not in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+            return
+        if len(self._multi_agent_hud_participants()) < 2:
+            return
+        if not bool(getattr(self, "multi_agent_context_hud_enabled", False)):
+            self.multi_agent_context_hud_enabled = True
+            if persist:
+                try:
+                    self._persist()
+                except Exception:
+                    pass
+
     def _agent_context_budget_metrics_snapshot(self) -> list[dict]:
         rows: list[dict] = []
         active = str(self.active_agent_role or "").strip().lower()
         candidates: list[str] = []
-        multi_mode = self._is_multi_agent_mode()
+        multi_mode = self._multi_agent_context_hud_should_show()
         plan_role_active = bool(
             (not multi_mode)
             and active in AGENT_ROLES
@@ -17904,7 +20237,7 @@ class SessionState:
         if multi_mode:
             candidates.append("manager")
         if multi_mode:
-            role_order = list(self.runtime_participants or [])
+            role_order = self._multi_agent_hud_participants()
             for role in role_order:
                 role_key = self._sanitize_agent_role(role)
                 if role_key and role_key not in candidates:
@@ -17932,7 +20265,7 @@ class SessionState:
                     display = self._agent_display_name(role)
                 else:
                     messages = self.messages
-                    tools = TOOLS
+                    tools = self._available_tools()
                     system = self._system_prompt()
                     label = "single-agent next turn"
                     msg_count = len(self.messages)
@@ -18996,11 +21329,17 @@ class SessionState:
                 parts.append(f"worktree={trim(str(src.get('name', '') or ''), 120)}")
         elif tool == "load_skill":
             parts.append(f"name={trim(str(src.get('name', '') or ''), 180)}")
-        elif tool in {"query_code_library", "query_knowledge_library"}:
+        elif tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             parts.append(f"query={trim(str(src.get('query', '') or ''), 500)}")
             route = str(src.get("route", "") or "").strip()
             if route:
                 parts.append(f"route={trim(route, 80)}")
+            mode = str(src.get("mode", "") or "").strip()
+            if mode:
+                parts.append(f"mode={trim(mode, 80)}")
+            url = str(src.get("url", "") or "").strip()
+            if url:
+                parts.append(f"url={trim(url, 240)}")
         else:
             for key in sorted(src.keys())[:8]:
                 value = src.get(key)
@@ -19197,6 +21536,387 @@ class SessionState:
             "pin_chars": int(cfg["pin_chars"][t]),
         }
 
+    def _web_search_context_budget(self, tier: int | None = None) -> dict[str, int | str]:
+        base = self._tool_memory_budget(tier=tier)
+        t = int(base.get("tier", 0) or 0)
+        item_by_tier = [WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS, 3, 2, 1]
+        chars_by_tier = [WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS, 2400, 1600, 1000]
+        return {
+            "policy": base.get("policy", DEFAULT_TOOL_MEMORY_POLICY),
+            "effective_policy": base.get("effective_policy", "balanced"),
+            "tier": t,
+            "items": int(item_by_tier[min(max(t, 0), 3)]),
+            "chars": int(chars_by_tier[min(max(t, 0), 3)]),
+            "registry_max": WEB_SEARCH_CONTEXT_REGISTRY_MAX,
+        }
+
+    def _web_search_context_key(self, role: str = "", board: dict | None = None) -> tuple[str, dict]:
+        role_key = self._sanitize_agent_role(role) or "single"
+        try:
+            focus = self._route_focus_fields(board)
+        except Exception:
+            focus = {}
+        focus_kind = trim(str(focus.get("focus_kind", "") or ""), 80) or "task"
+        focus_id = trim(str(focus.get("focus_id", "") or ""), 160)
+        if not focus_id:
+            goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 240)
+            focus_id = hashlib.sha1(goal.encode("utf-8", errors="replace")).hexdigest()[:12] if goal else "global"
+        raw = f"{role_key}|{focus_kind}|{focus_id}".encode("utf-8", errors="replace")
+        key = hashlib.sha1(raw).hexdigest()[:16]
+        return key, {
+            "role": role_key,
+            "focus_kind": focus_kind,
+            "focus_id": focus_id,
+            "focus_epoch": float(focus.get("focus_epoch", 0.0) or 0.0) if isinstance(focus, dict) else 0.0,
+            "plan_step_index": int(focus.get("plan_step_index", -1) or -1) if isinstance(focus, dict) else -1,
+            "plan_step_total": int(focus.get("plan_step_total", 0) or 0) if isinstance(focus, dict) else 0,
+        }
+
+    def _normalize_web_search_context_registry(self, raw: object) -> dict[str, dict]:
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, dict] = {}
+        for raw_key, raw_entry in raw.items():
+            if not isinstance(raw_entry, dict):
+                continue
+            key = trim(str(raw_entry.get("key", "") or raw_key or ""), 40)
+            if not key:
+                continue
+            role_key = self._sanitize_agent_role(raw_entry.get("agent_role", raw_entry.get("role", ""))) or "single"
+            query_counts = raw_entry.get("query_counts", {})
+            if not isinstance(query_counts, dict):
+                query_counts = {}
+            nodes = raw_entry.get("nodes", [])
+            if not isinstance(nodes, list):
+                nodes = []
+            useful = raw_entry.get("useful_pages", [])
+            if not isinstance(useful, list):
+                useful = []
+            dynamic = raw_entry.get("dynamic_pages", [])
+            if not isinstance(dynamic, list):
+                dynamic = []
+            low_yield = raw_entry.get("low_yield_queries", [])
+            if not isinstance(low_yield, list):
+                low_yield = []
+            clean[key] = {
+                "key": key,
+                "agent_role": role_key,
+                "focus_kind": trim(str(raw_entry.get("focus_kind", "task") or "task"), 80),
+                "focus_id": trim(str(raw_entry.get("focus_id", "global") or "global"), 180),
+                "focus_epoch": max(0.0, float(raw_entry.get("focus_epoch", 0.0) or 0.0)),
+                "plan_step_index": int(raw_entry.get("plan_step_index", -1) or -1),
+                "plan_step_total": int(raw_entry.get("plan_step_total", 0) or 0),
+                "root_query": trim(str(raw_entry.get("root_query", "") or ""), 500),
+                "last_query": trim(str(raw_entry.get("last_query", "") or ""), 500),
+                "last_mode": trim(str(raw_entry.get("last_mode", "") or ""), 40),
+                "query_counts": {trim(str(k), 260): max(0, int(v or 0)) for k, v in query_counts.items() if str(k).strip()},
+                "nodes": [dict(x) for x in nodes[-WEB_SEARCH_CONTEXT_NODE_MAX:] if isinstance(x, dict)],
+                "useful_pages": [dict(x) for x in useful[-WEB_SEARCH_CONTEXT_URL_MAX:] if isinstance(x, dict)],
+                "dynamic_pages": [dict(x) for x in dynamic[-WEB_SEARCH_CONTEXT_URL_MAX:] if isinstance(x, dict)],
+                "low_yield_queries": [dict(x) for x in low_yield[-WEB_SEARCH_CONTEXT_URL_MAX:] if isinstance(x, dict)],
+                "next_actions": [
+                    trim(str(x), 260) for x in (raw_entry.get("next_actions", []) if isinstance(raw_entry.get("next_actions", []), list) else [])[:8]
+                    if str(x).strip()
+                ],
+                "hit_count": max(1, int(raw_entry.get("hit_count", 1) or 1)),
+                "created_at": max(0.0, float(raw_entry.get("created_at", 0.0) or 0.0)),
+                "updated_at": max(0.0, float(raw_entry.get("updated_at", 0.0) or 0.0)),
+                "thin_streak": max(0, int(raw_entry.get("thin_streak", 0) or 0)),
+                "dynamic_streak": max(0, int(raw_entry.get("dynamic_streak", 0) or 0)),
+            }
+        return self._pruned_web_search_context_registry(clean)
+
+    def _web_search_context_sort_key(self, item: tuple[str, dict]) -> tuple[float, int, str]:
+        _key, entry = item
+        return (
+            -float(entry.get("updated_at", 0.0) or 0.0),
+            -int(entry.get("hit_count", 0) or 0),
+            str(entry.get("focus_id", "")),
+        )
+
+    def _pruned_web_search_context_registry(self, registry: dict[str, dict] | None = None) -> dict[str, dict]:
+        src = registry if isinstance(registry, dict) else getattr(self, "web_search_context_registry", {})
+        rows = [(str(k), v) for k, v in dict(src or {}).items() if isinstance(v, dict)]
+        rows.sort(key=self._web_search_context_sort_key)
+        keep = rows[: int(self._web_search_context_budget(tier=0).get("registry_max", WEB_SEARCH_CONTEXT_REGISTRY_MAX))]
+        return {k: v for k, v in keep}
+
+    def _web_search_query_signature(self, query: str, url: str = "") -> str:
+        raw = (str(query or "").strip() or str(url or "").strip()).lower()
+        raw = re.sub(r"https?://", "", raw)
+        raw = re.sub(r"[?&#].*$", "", raw)
+        raw = re.sub(r"\s+", " ", raw)
+        return trim(raw, 260)
+
+    def _web_search_payload_has_dynamic_symptoms(self, payload: dict, summary: dict) -> bool:
+        text_parts: list[str] = []
+        for key in ("text", "description", "title"):
+            val = payload.get(key)
+            if isinstance(val, str):
+                text_parts.append(val)
+        page = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+        for key in ("snippet", "title", "description"):
+            val = page.get(key)
+            if isinstance(val, str):
+                text_parts.append(val)
+        for row in (summary.get("top_results", []) if isinstance(summary.get("top_results", []), list) else [])[:6]:
+            if isinstance(row, dict):
+                text_parts.append(str(row.get("snippet", "") or ""))
+                text_parts.append(str(row.get("title", "") or ""))
+        probe = "\n".join(text_parts).lower()
+        if not probe:
+            return False
+        login_or_empty = any(x in probe for x in ("登录后可查看", "尚无内容", "please login", "login required", "dynamic", "数据中心"))
+        table_like_request = any(x in probe for x in ("排行", "排名", "资金流向", "净流入", "净流出", "top ", "ranking"))
+        many_links = int(summary.get("links_total", 0) or 0) > 500 or int(summary.get("page_count", 0) or 0) > 0
+        few_results = int(summary.get("result_count", 0) or 0) <= 1 and not summary.get("top_results")
+        return bool(login_or_empty or (table_like_request and many_links and few_results))
+
+    def _web_search_payload_is_low_yield(self, mode: str, query: str, payload: dict, summary: dict) -> bool:
+        result_count = int(summary.get("result_count", 0) or 0)
+        page_count = int(summary.get("page_count", 0) or summary.get("fetched", 0) or 0)
+        promising = int(summary.get("promising_count", 0) or 0)
+        top = summary.get("top_results", []) if isinstance(summary.get("top_results", []), list) else []
+        if str(mode or "").lower() in {"search", "deepen"}:
+            if result_count <= 0:
+                return True
+            structured_need = bool(re.search(r"(排行|排名|前\s*\d|前五|top\s*\d|净流入|净流出|资金流向|涨跌幅)", str(query or ""), re.I))
+            if structured_need:
+                joined = "\n".join(str(row.get("snippet", "") or row.get("title", "") or "") for row in top if isinstance(row, dict))
+                has_structured_signal = bool(re.search(r"(\d{6}|[+-]?\d+(?:\.\d+)?\s*%|亿元|万元|rank|top)", joined, re.I))
+                if not has_structured_signal:
+                    return True
+            if page_count == 0 and promising == 0:
+                return True
+        if str(mode or "").lower() == "fetch":
+            body = str(payload.get("text", "") or payload.get("description", "") or "")
+            if len(body.strip()) < 240:
+                return True
+        return False
+
+    def _record_web_search_context(
+        self,
+        args: dict | None,
+        payload: dict | None,
+        summary: dict | None,
+        *,
+        role: str = "",
+    ) -> dict:
+        data = payload if isinstance(payload, dict) else {}
+        summ = summary if isinstance(summary, dict) else {}
+        if not data:
+            return {}
+        src = args if isinstance(args, dict) else {}
+        mode = trim(str(data.get("mode", src.get("mode", "search")) or "search").lower(), 40)
+        query = trim(str(data.get("query", src.get("query", "")) or ""), 700)
+        url = trim(str(data.get("url", src.get("url", "")) or ""), 700)
+        key, focus = self._web_search_context_key(role)
+        now = now_ts()
+        registry = getattr(self, "web_search_context_registry", {})
+        if not isinstance(registry, dict):
+            registry = {}
+        entry = dict(registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {})
+        if not entry:
+            entry = {
+                "key": key,
+                "agent_role": focus["role"],
+                "focus_kind": focus["focus_kind"],
+                "focus_id": focus["focus_id"],
+                "focus_epoch": focus["focus_epoch"],
+                "plan_step_index": focus["plan_step_index"],
+                "plan_step_total": focus["plan_step_total"],
+                "root_query": query or url,
+                "query_counts": {},
+                "nodes": [],
+                "useful_pages": [],
+                "dynamic_pages": [],
+                "low_yield_queries": [],
+                "next_actions": [],
+                "hit_count": 0,
+                "created_at": now,
+                "thin_streak": 0,
+                "dynamic_streak": 0,
+            }
+        sig = self._web_search_query_signature(query, url)
+        qcounts = entry.get("query_counts", {}) if isinstance(entry.get("query_counts", {}), dict) else {}
+        qcounts[sig] = int(qcounts.get(sig, 0) or 0) + 1 if sig else 1
+        top_rows = summ.get("top_results", []) if isinstance(summ.get("top_results", []), list) else []
+        top_compact = []
+        for row in top_rows[:5]:
+            if not isinstance(row, dict):
+                continue
+            top_compact.append(
+                {
+                    "url": trim(str(row.get("url", "") or ""), 500),
+                    "title": trim(str(row.get("title", "") or ""), 180),
+                    "domain": trim(str(row.get("domain", "") or ""), 100),
+                    "source_type": trim(str(row.get("source_type", "") or ""), 60),
+                    "snippet": trim(str(row.get("snippet", "") or ""), 220),
+                }
+            )
+        low_yield = self._web_search_payload_is_low_yield(mode, query or url, data, summ)
+        dynamic = self._web_search_payload_has_dynamic_symptoms(data, summ)
+        node = {
+            "ts": now,
+            "mode": mode,
+            "query": trim(query, 360),
+            "url": trim(url, 500),
+            "result_count": int(summ.get("result_count", 0) or 0),
+            "page_count": int(summ.get("page_count", 0) or summ.get("fetched", 0) or 0),
+            "promising_count": int(summ.get("promising_count", 0) or 0),
+            "low_yield": bool(low_yield),
+            "dynamic_symptoms": bool(dynamic),
+            "top": top_compact[:3],
+        }
+        nodes = entry.get("nodes", []) if isinstance(entry.get("nodes", []), list) else []
+        nodes.append(node)
+        useful = entry.get("useful_pages", []) if isinstance(entry.get("useful_pages", []), list) else []
+        for row in top_compact:
+            if row.get("url") and row["url"] not in [x.get("url") for x in useful if isinstance(x, dict)]:
+                useful.append(row)
+        if url and mode in {"fetch", "follow"} and url not in [x.get("url") for x in useful if isinstance(x, dict)]:
+            useful.insert(0, {"url": url, "title": trim(str(data.get("title", "") or ""), 180), "domain": trim(str(data.get("domain", "") or ""), 100)})
+        dynamic_pages = entry.get("dynamic_pages", []) if isinstance(entry.get("dynamic_pages", []), list) else []
+        if dynamic:
+            dyn_url = url or (top_compact[0].get("url", "") if top_compact else "")
+            if dyn_url:
+                dynamic_pages.append({"ts": now, "url": dyn_url, "query": trim(query, 220), "reason": "thin/dynamic page symptoms"})
+        low_yield_queries = entry.get("low_yield_queries", []) if isinstance(entry.get("low_yield_queries", []), list) else []
+        if low_yield:
+            low_yield_queries.append({"ts": now, "mode": mode, "query": trim(query or url, 260), "repeat_count": int(qcounts.get(sig, 0) or 0)})
+        repeat_count = int(qcounts.get(sig, 0) or 0)
+        thin_streak = (int(entry.get("thin_streak", 0) or 0) + 1) if low_yield else 0
+        dynamic_streak = (int(entry.get("dynamic_streak", 0) or 0) + 1) if dynamic else 0
+        next_actions: list[str] = []
+        if repeat_count >= 2 or thin_streak >= 2:
+            next_actions.append("Stop repeating this broad query family; reuse indexed/top evidence, then fetch/follow one exact URL or write a caveated finding.")
+            next_actions.append("If the target is a JS-rendered table, inspect scripts/API endpoints with a narrow follow/fetch, or mark the structured table unavailable.")
+        if dynamic or dynamic_streak:
+            next_actions.append("Dynamic-page symptom detected: search/fetch endpoint or article sources; if no endpoint is found, proceed with confidence caveat instead of looping.")
+        if useful:
+            next_actions.append("Prefer exact fetch/follow of the most useful recorded URL before any new broad search.")
+        if not next_actions:
+            next_actions.append("Continue tree search: deepen or follow the best current URL, then record evidence before broadening.")
+        entry.update(
+            {
+                "agent_role": focus["role"],
+                "focus_kind": focus["focus_kind"],
+                "focus_id": focus["focus_id"],
+                "focus_epoch": focus["focus_epoch"],
+                "plan_step_index": focus["plan_step_index"],
+                "plan_step_total": focus["plan_step_total"],
+                "last_query": query or url,
+                "last_mode": mode,
+                "query_counts": qcounts,
+                "nodes": nodes[-WEB_SEARCH_CONTEXT_NODE_MAX:],
+                "useful_pages": useful[-WEB_SEARCH_CONTEXT_URL_MAX:],
+                "dynamic_pages": dynamic_pages[-WEB_SEARCH_CONTEXT_URL_MAX:],
+                "low_yield_queries": low_yield_queries[-WEB_SEARCH_CONTEXT_URL_MAX:],
+                "next_actions": next_actions[:6],
+                "hit_count": int(entry.get("hit_count", 0) or 0) + 1,
+                "updated_at": now,
+                "thin_streak": thin_streak,
+                "dynamic_streak": dynamic_streak,
+            }
+        )
+        registry[key] = entry
+        self.web_search_context_registry = self._pruned_web_search_context_registry(registry)
+        return {
+            "key": key,
+            "focus": f"{entry.get('focus_kind')}:{entry.get('focus_id')}",
+            "repeat_count": repeat_count,
+            "thin_streak": thin_streak,
+            "dynamic_streak": dynamic_streak,
+            "useful_pages": len(useful),
+            "next_actions": next_actions[:4],
+        }
+
+    def _web_search_context_prompt_block(
+        self,
+        *,
+        for_role: str = "",
+        max_items: int | None = None,
+        max_chars: int | None = None,
+    ) -> str:
+        registry = getattr(self, "web_search_context_registry", {})
+        if not isinstance(registry, dict) or not registry:
+            return ""
+        budget = self._web_search_context_budget()
+        if max_items is None:
+            max_items = int(budget.get("items", WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS) or WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS)
+        if max_chars is None:
+            max_chars = int(budget.get("chars", WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS) or WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS)
+        role_key = self._sanitize_agent_role(for_role) or ""
+        current_key, current_focus = self._web_search_context_key(role_key or "single")
+        entries = [
+            dict(v)
+            for _k, v in sorted(registry.items(), key=self._web_search_context_sort_key)
+            if isinstance(v, dict)
+        ]
+        selected = []
+        for entry in entries:
+            if str(entry.get("key", "") or "") == current_key:
+                selected.insert(0, entry)
+                continue
+            if role_key and str(entry.get("agent_role", "") or "") not in {role_key, "single"}:
+                continue
+            selected.append(entry)
+            if len(selected) >= max_items:
+                break
+        selected = selected[:max_items]
+        if not selected:
+            return ""
+        rows = [
+            "<web-search-context-registry>",
+            (
+                f"policy={budget.get('policy', DEFAULT_TOOL_MEMORY_POLICY)} tier={budget.get('tier', 0)} "
+                f"active_focus={current_focus.get('focus_kind')}:{current_focus.get('focus_id')} "
+                "This is injected on normal calls, not only after compact."
+            ),
+            (
+                "Use this as a search tree memory: inherit prior useful URLs, failed/dynamic-page symptoms, and next actions. "
+                "Do not repeat a broad query family after low-yield repeats; deepen/follow/fetch exact URLs, inspect endpoint clues, "
+                "or produce a caveated finding and advance the active task."
+            ),
+        ]
+        for entry in selected:
+            focus = f"{entry.get('focus_kind','task')}:{entry.get('focus_id','global')}"
+            step = ""
+            if int(entry.get("plan_step_total", 0) or 0) > 0:
+                step = f" step={int(entry.get('plan_step_index', -1) or -1) + 1}/{int(entry.get('plan_step_total', 0) or 0)}"
+            rows.append(
+                f"- ctx={entry.get('key','')} role={entry.get('agent_role','')} focus={focus}{step} "
+                f"hits={int(entry.get('hit_count',0) or 0)} thin_streak={int(entry.get('thin_streak',0) or 0)} "
+                f"dynamic_streak={int(entry.get('dynamic_streak',0) or 0)} last={trim(str(entry.get('last_mode','')),40)}:{trim(str(entry.get('last_query','')),180)}"
+            )
+            useful = entry.get("useful_pages", []) if isinstance(entry.get("useful_pages", []), list) else []
+            if useful:
+                bits = []
+                for row in useful[-4:]:
+                    if isinstance(row, dict):
+                        bits.append(f"{trim(str(row.get('title','') or row.get('domain','')),80)} <{trim(str(row.get('url','')),160)}>")
+                if bits:
+                    rows.append("  useful_pages=" + " | ".join(bits))
+            lows = entry.get("low_yield_queries", []) if isinstance(entry.get("low_yield_queries", []), list) else []
+            if lows:
+                rows.append(
+                    "  low_yield_recent="
+                    + " | ".join(trim(str(row.get("query", "")), 120) for row in lows[-3:] if isinstance(row, dict))
+                )
+            dyn = entry.get("dynamic_pages", []) if isinstance(entry.get("dynamic_pages", []), list) else []
+            if dyn:
+                rows.append(
+                    "  dynamic_pages="
+                    + " | ".join(trim(str(row.get("url", "")), 160) for row in dyn[-3:] if isinstance(row, dict))
+                )
+            actions = entry.get("next_actions", []) if isinstance(entry.get("next_actions", []), list) else []
+            if actions:
+                rows.append("  next_actions=" + " | ".join(trim(str(x), 180) for x in actions[:4]))
+            if len("\n".join(rows)) >= max_chars:
+                break
+        rows.append("</web-search-context-registry>")
+        return trim("\n".join(rows), max_chars)
+
     def _read_context_key(self, role: str, signature: str) -> str:
         role_key = self._sanitize_agent_role(role) or "single"
         raw = f"{role_key}|{signature}".encode("utf-8", errors="replace")
@@ -19392,7 +22112,7 @@ class SessionState:
             return "file_read"
         if tool in {"write_file", "edit_file"}:
             return "file_patch" if ok else "edit_error"
-        if tool in {"query_code_library", "query_knowledge_library"}:
+        if tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             return "retrieval"
         if tool == "load_skill":
             return "skill_loaded"
@@ -19417,7 +22137,22 @@ class SessionState:
         return any(tok in low for tok in tokens)
 
     def _command_output_has_error_shape(self, output: str) -> bool:
-        low = str(output or "").lower()
+        raw = str(output or "")
+        low = raw.lower()
+        benign = (
+            "no errors", "0 errors", "0 error", "no error", "without errors",
+            "no issues found", "workspace clean", "validation: workspace clean",
+            "tests passed", "all tests passed", "build succeeded", "build successful",
+            "compiled successfully", "syntax ok",
+        )
+        if any(token in low for token in benign) and not any(
+            token in low
+            for token in (
+                "traceback", "syntax error", "fatal error", "build failed",
+                "test failed", "assertionerror", "error:", "failed:", "exception:",
+            )
+        ):
+            return False
         markers = (
             "traceback", "exception", "syntax error", "fatal error", "build failed",
             "test failed", "assertionerror", "error:", "failed:", "exit code",
@@ -19449,7 +22184,7 @@ class SessionState:
             return trim(f"{tool}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool == "load_skill" and isinstance(args, dict):
             return trim(f"loaded skill: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
-        if tool in {"query_code_library", "query_knowledge_library"} and isinstance(args, dict):
+        if tool in {"query_code_library", "query_knowledge_library", "agent_web_search"} and isinstance(args, dict):
             return trim(f"{tool}: {args.get('query', '')} :: {' '.join(lines[:6])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         return trim(" ".join(lines[:8]), TOOL_MEMORY_SUMMARY_MAX_CHARS)
 
@@ -20343,7 +23078,7 @@ class SessionState:
                 summary=self._tool_memory_summary_from_output(tool, src_args, text),
             )
             return
-        if tool in {"query_code_library", "query_knowledge_library"}:
+        if tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             self._record_tool_memory(
                 tool,
                 src_args,
@@ -20360,7 +23095,66 @@ class SessionState:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if not rows:
             return False
-        evidence_tools = {"read_file", "bash", "background_run", "worktree_run", "query_code_library", "query_knowledge_library"}
+        web_rows = [
+            r for r in rows
+            if canonicalize_tool_name(r.get("name", "")) == "agent_web_search" and bool(r.get("ok", False))
+        ]
+        if web_rows and len(web_rows) == len(rows):
+            role_key = self._sanitize_agent_role(role) or "single"
+            ctx_key, _focus = self._web_search_context_key(role_key)
+            ctx = (
+                getattr(self, "web_search_context_registry", {}).get(ctx_key, {})
+                if isinstance(getattr(self, "web_search_context_registry", {}), dict)
+                else {}
+            )
+            if isinstance(ctx, dict) and (
+                int(ctx.get("thin_streak", 0) or 0) >= 2
+                or int(ctx.get("dynamic_streak", 0) or 0) >= 1
+            ):
+                state = self.tool_memory_loop_state.get(role_key, {}) if isinstance(getattr(self, "tool_memory_loop_state", {}), dict) else {}
+                now = now_ts()
+                if now - float(state.get("last_web_search_intervention_ts", 0.0) or 0.0) >= 12.0:
+                    state["last_web_search_intervention_ts"] = now
+                    self.tool_memory_loop_state[role_key] = state
+                    context_block = self._web_search_context_prompt_block(
+                        for_role=role_key if role_key != "single" else "",
+                        max_chars=2600,
+                    )
+                    payload = (
+                        "<web-search-strategy>\n"
+                        f"The current search tree for {role_key} is showing low-yield or dynamic-page symptoms "
+                        f"(thin_streak={int(ctx.get('thin_streak', 0) or 0)}, "
+                        f"dynamic_streak={int(ctx.get('dynamic_streak', 0) or 0)}). "
+                        "This is a strategy warning, not a stop. Do not run another broad search over the same query family. "
+                        "Choose the next concrete action: follow/fetch one exact useful URL, inspect endpoint/script clues for a dynamic table, "
+                        "query tool_memory/index_status for indexed evidence, or write a caveated finding and advance the active plan step.\n"
+                        f"{context_block}\n"
+                        "</web-search-strategy>"
+                    )
+                    if role_key != "single":
+                        self._append_agent_context_message(
+                            role_key,
+                            {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
+                            mirror_to_global=False,
+                        )
+                    else:
+                        self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                    self._ledger_record_stall(
+                        f"web-search-low-yield({role_key})",
+                        "injected web-search strategy intervention",
+                    )
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                f"web_search strategy intervention injected "
+                                f"(role={role_key}, thin={int(ctx.get('thin_streak', 0) or 0)}, "
+                                f"dynamic={int(ctx.get('dynamic_streak', 0) or 0)})"
+                            )
+                        },
+                    )
+                    return True
+        evidence_tools = {"read_file", "bash", "background_run", "worktree_run", "query_code_library", "query_knowledge_library", "agent_web_search"}
         names = [canonicalize_tool_name(r.get("name", "")) for r in rows]
         if not names or any(name not in evidence_tools for name in names):
             if any(bool(r.get("ok", False)) and canonicalize_tool_name(r.get("name", "")) in {"write_file", "edit_file"} for r in rows):
@@ -20816,16 +23610,51 @@ class SessionState:
 
     def _load_from_file_buffer(self, ref_id: str) -> str:
         """Load content from file buffer by reference ID."""
-        entry = self.file_buffer_index.get(ref_id)
-        if not entry:
-            return f"[file_buffer:{ref_id} not found]"
-        fp = self.root / entry.get("path", "")
+        ref = self._file_buffer_ref_from_text(ref_id) or str(ref_id or "").strip()
+        entry = self.file_buffer_index.get(ref)
+        fp = self._file_buffer_path_for_ref(ref)
+        if not entry and not fp.exists():
+            return f"[file_buffer:{ref or ref_id} not found; expected path file_buffer/{ref}.txt]"
+        if entry:
+            fp = self.root / entry.get("path", "")
         if not fp.exists():
-            return f"[file_buffer:{ref_id} file missing]"
+            return f"[file_buffer:{ref} file missing; expected path {self._session_rel(fp)}]"
         try:
             return fp.read_text(encoding="utf-8")
         except Exception as exc:
-            return f"[file_buffer:{ref_id} read error: {exc}]"
+            return f"[file_buffer:{ref} read error: {exc}]"
+
+    def _file_buffer_ref_from_text(self, value: object) -> str:
+        """Extract a stable fb_* reference from placeholders or model-guessed paths."""
+        raw = str(value or "").strip().replace("\\", "/")
+        if not raw:
+            return ""
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", "\""}:
+            raw = raw[1:-1].strip()
+        m = re.search(r"\[file_buffer\s*:\s*([A-Za-z0-9_.-]+)", raw, flags=re.I)
+        if m:
+            raw = m.group(1)
+        elif raw.lower().startswith("file_buffer:"):
+            raw = raw.split(":", 1)[1].strip()
+        elif raw.lower().startswith("file_buffer/"):
+            raw = raw.split("/", 1)[1].strip()
+        raw = raw.split("]", 1)[0].split(" ", 1)[0].split("?", 1)[0].strip("/")
+        name = PurePosixPath(raw).name
+        if name.lower().endswith(".txt"):
+            name = name[:-4]
+        if re.fullmatch(r"fb_[A-Za-z0-9_.-]+", name or ""):
+            return name
+        return ""
+
+    def _file_buffer_path_for_ref(self, ref_id: str) -> Path:
+        ref = self._file_buffer_ref_from_text(ref_id) or str(ref_id or "").strip()
+        entry = self.file_buffer_index.get(ref) if isinstance(getattr(self, "file_buffer_index", {}), dict) else None
+        if isinstance(entry, dict) and entry.get("path"):
+            return (self.root / str(entry.get("path") or "")).resolve()
+        safe_ref = self._file_buffer_ref_from_text(ref)
+        if not safe_ref:
+            return self.file_buffer_dir.resolve()
+        return (self.file_buffer_dir / f"{safe_ref}.txt").resolve()
 
     def _is_long_listing_command(self, command: str) -> bool:
         text = str(command or "").strip().lower()
@@ -21017,6 +23846,7 @@ class SessionState:
                         ),
                     }
                 ],
+                system=self._inject_runtime_environment_context("Summarize archived execution context faithfully."),
                 max_tokens=900,
                 think=False,
             )
@@ -21573,6 +24403,9 @@ class SessionState:
             raw = raw[1:-1].strip()
             if not raw:
                 raise ValueError("path is required")
+        file_buffer_ref = self._file_buffer_ref_from_text(raw)
+        if file_buffer_ref:
+            return f".__file_buffer__/{file_buffer_ref}.txt"
         low = raw.lower()
         if low in {"/workspace", "/workspace/"}:
             return "."
@@ -21584,6 +24417,8 @@ class SessionState:
         if low.startswith("/js_lib/"):
             rel = raw[len("/js_lib/") :].lstrip("/")
             return f".__js_lib__/{rel}" if rel else ".__js_lib__"
+        if low in {"file_buffer", "file_buffer/", "/file_buffer", "/file_buffer/"}:
+            return ".__file_buffer__"
         if low in {SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/"}:
             return ".__skills__"
         if low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/"):
@@ -21611,6 +24446,8 @@ class SessionState:
             or low.startswith("/workspace/")
             or low.startswith(f"{SKILLS_VIRTUAL_PREFIX}/")
             or low.startswith("/js_lib/")
+            or low in {"/file_buffer", "/file_buffer/"}
+            or low.startswith("/file_buffer/")
         ):
             return ""
         return (
@@ -21626,6 +24463,12 @@ class SessionState:
         if normalized == ".__js_lib__" or normalized.startswith(".__js_lib__/"):
             rel = normalized[len(".__js_lib__") :].lstrip("/")
             return safe_path(rel or ".", self.js_lib_root)
+        if normalized == ".__file_buffer__" or normalized.startswith(".__file_buffer__/"):
+            rel = normalized[len(".__file_buffer__") :].lstrip("/")
+            ref = self._file_buffer_ref_from_text(rel)
+            if ref:
+                return self._file_buffer_path_for_ref(ref)
+            return safe_path(rel or ".", self.file_buffer_dir)
         return safe_path(normalized, self.files_root)
 
     def _session_rel(self, path: Path) -> str:
@@ -21638,6 +24481,13 @@ class SessionState:
             if target.is_relative_to(js_lib_root):
                 rel = target.relative_to(js_lib_root).as_posix()
                 return f"/js_lib/{rel}".replace("//", "/")
+        except Exception:
+            pass
+        try:
+            file_buffer_root = self.file_buffer_dir.resolve()
+            if target.is_relative_to(file_buffer_root):
+                rel = target.relative_to(file_buffer_root).as_posix()
+                return f"file_buffer/{rel}".replace("//", "/")
         except Exception:
             pass
         try:
@@ -24268,6 +27118,350 @@ body{padding:18px}
     def _tool_max_chars(self, value: object = None, default: int = 24000) -> int:
         return self._tool_int_arg(value, default, 1200, READ_FILE_HARD_MAX_CHARS)
 
+    def _agent_web_search_result_summary(self, payload: dict | None) -> dict:
+        data = payload if isinstance(payload, dict) else {}
+        mode = str(data.get("mode", "") or "").strip()
+        query = trim(str(data.get("query", "") or "").strip(), 400)
+        if not mode and data.get("url"):
+            mode = "fetch"
+        terms = _agent_web_query_terms(query or str(data.get("url", "") or ""))
+        results = data.get("results", []) if isinstance(data.get("results", []), list) else []
+        pages = data.get("pages", []) if isinstance(data.get("pages", []), list) else []
+        promising = data.get("promising_links", []) if isinstance(data.get("promising_links", []), list) else []
+        page = data.get("page", {}) if isinstance(data.get("page", {}), dict) else {}
+        if not page and data.get("url") and (
+            mode in {"fetch", "follow"}
+            or any(k in data for k in ("title", "domain", "status", "content_type", "source_type", "text"))
+        ):
+            page = data
+        discovery = data.get("discovery", {}) if isinstance(data.get("discovery", {}), dict) else {}
+        evidence = data.get("evidence_layers", {}) if isinstance(data.get("evidence_layers", {}), dict) else {}
+        evidence_layers = evidence.get("layers", []) if isinstance(evidence.get("layers", []), list) else []
+        errors = []
+        for key in ("errors", "follow_errors"):
+            vals = data.get(key, []) if isinstance(data.get(key, []), list) else []
+            errors.extend([x for x in vals if isinstance(x, dict)][:6])
+
+        def _top_row(row: dict) -> dict:
+            return {
+                "url": trim(str(row.get("url", "") or ""), 500),
+                "title": trim(str(row.get("title", "") or row.get("anchor", "") or ""), 240),
+                "domain": trim(str(row.get("domain", "") or ""), 120),
+                "score": row.get("score", ""),
+                "source_type": trim(str(row.get("source_type", "") or ""), 80),
+                "snippet": trim(
+                    str(row.get("snippet", "") or "")
+                    or _agent_web_extract_text_snippet(str(row.get("text", "") or row.get("description", "") or ""), terms),
+                    360,
+                ),
+            }
+
+        top_rows: list[dict] = []
+        for row in list(results[:6]) + list(pages[:6]) + list(promising[:6]):
+            if isinstance(row, dict) and row.get("url"):
+                item = _top_row(row)
+                if item["url"] and item["url"] not in [x.get("url") for x in top_rows]:
+                    top_rows.append(item)
+            if len(top_rows) >= 6:
+                break
+        if page.get("url") and page.get("url") not in [x.get("url") for x in top_rows]:
+            top_rows.insert(0, _top_row(page))
+        fetched_pages: list[dict] = []
+        for row in list(pages[:8]) + ([page] if page.get("url") else []):
+            if isinstance(row, dict) and row.get("url"):
+                item = _top_row(row)
+                if item["url"] and item["url"] not in [x.get("url") for x in fetched_pages]:
+                    fetched_pages.append(item)
+        fetched_count = int(data.get("fetched", 0) or discovery.get("fetched", 0) or 0)
+        page_count = int(data.get("page_count", 0) or len(pages) or fetched_count or (1 if page.get("url") else 0))
+        pages_total_raw = data.get("pages_total", data.get("pages", 0))
+        pages_total = int(pages_total_raw or 0) if isinstance(pages_total_raw, int) else 0
+        return {
+            "ok": bool(data.get("ok", False)),
+            "mode": mode,
+            "query": query,
+            "index": trim(str(data.get("index", "") or ""), 500),
+            "result_count": len(results),
+            "page_count": page_count,
+            "promising_count": len(promising),
+            "fetched": fetched_count,
+            "followed_links": int(data.get("followed_links", 0) or 0),
+            "deadline_reached": bool(data.get("deadline_reached", False)),
+            "evidence_layers": [
+                {
+                    "type": trim(str(row.get("evidence_type", "") or ""), 80),
+                    "quality": trim(str(row.get("source_quality", "") or ""), 80),
+                    "count": int(row.get("count", 0) or 0),
+                }
+                for row in evidence_layers[:8]
+                if isinstance(row, dict)
+            ],
+            "errors": errors[:6],
+            "top_results": top_rows[:6],
+            "fetched_pages": fetched_pages[:8],
+            "pages_total": pages_total,
+            "links_total": int(data.get("links_total", data.get("links", 0)) or 0),
+            "domains_total": int(data.get("domains_total", data.get("domains", 0)) or 0),
+            "evidence_records": int(data.get("evidence_records", 0) or 0),
+            "query_trails": int(data.get("query_trails", 0) or 0),
+            "next_actions": [
+                trim(str(x), 260)
+                for x in (data.get("next_actions", []) if isinstance(data.get("next_actions", []), list) else [])[:6]
+                if str(x).strip()
+            ],
+            "search_context": data.get("search_context", {}) if isinstance(data.get("search_context", {}), dict) else {},
+        }
+
+    def _agent_web_search_emit(self, phase: str, payload: dict | None = None, role: str = "") -> None:
+        data = payload if isinstance(payload, dict) else {}
+        mode = trim(str(data.get("mode", "") or ""), 40)
+        query = trim(str(data.get("query", "") or ""), 180)
+        url = trim(str(data.get("url", "") or ""), 500)
+        visible = bool(data.get("conversation_visible", True))
+        summary = trim(
+            str(data.get("summary", "") or "").strip()
+            or f"agent_web_search {phase}: {mode or query or url or 'web'}",
+            240,
+        )
+        event_data = {
+            "tool": "agent_web_search",
+            "phase": trim(str(phase or ""), 40),
+            "mode": mode,
+            "query": query,
+            "url": url,
+            "summary": summary,
+            "conversation_visible": visible,
+        }
+        for key in (
+            "max_pages", "max_results", "depth", "freshness_days", "seed_urls", "domains",
+            "fetched", "result_count", "page_count", "promising_count", "followed_links",
+            "top_results", "fetched_pages", "errors", "evidence_layers", "index", "pages_total", "links_total",
+            "domains_total", "evidence_records", "query_trails", "ok", "title", "status",
+            "bytes", "links", "source_type", "deadline_reached", "runtime_context",
+            "next_actions", "search_context",
+        ):
+            if key in data:
+                event_data[key] = data[key]
+        role_key = self._sanitize_agent_role(role)
+        if role_key:
+            event_data["agent_role"] = role_key
+        self._emit("web_search", event_data)
+
+    def _agent_web_search_tool(self, args: dict | None, role: str = "") -> str:
+        src = args if isinstance(args, dict) else {}
+        mode = str(src.get("mode", "search") or "search").strip().lower()
+        if mode == "site_probe":
+            mode = "discover"
+        query = trim(str(src.get("query", "") or "").strip(), 1200)
+        url = str(src.get("url", "") or "").strip()
+
+        def _clean_str_list(value: object) -> list[str]:
+            rows = value if isinstance(value, list) else ([value] if isinstance(value, str) and value.strip() else [])
+            out: list[str] = []
+            for item in rows[:20]:
+                txt = trim(str(item or "").strip(), 1000)
+                if txt and txt not in out:
+                    out.append(txt)
+            return out
+
+        seed_urls = _clean_str_list(src.get("seed_urls", []))
+        domains = _clean_str_list(src.get("domains", []))
+        max_results = self._tool_int_arg(src.get("max_results", AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS), AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, 1, 30)
+        max_pages = self._tool_int_arg(src.get("max_pages", AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES), AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES, 1, AGENT_WEB_SEARCH_HARD_MAX_PAGES)
+        depth = self._tool_int_arg(src.get("depth", AGENT_WEB_SEARCH_DEFAULT_DEPTH), AGENT_WEB_SEARCH_DEFAULT_DEPTH, 0, AGENT_WEB_SEARCH_HARD_DEPTH)
+        freshness_days = self._tool_int_arg(src.get("freshness_days", 0), 0, 0, 3650)
+        max_chars = self._tool_int_arg(src.get("max_chars", 24_000), 24_000, 1200, AGENT_WEB_SEARCH_MAX_TEXT_CHARS)
+        allow_html = _agent_web_bool(src.get("allow_html_discovery"), True)
+        obey_robots = _agent_web_bool(src.get("obey_robots"), True)
+        runtime_context = self._runtime_environment_context_snapshot()
+        start_payload = {
+            "mode": mode,
+            "query": query,
+            "url": url,
+            "seed_urls": seed_urls[:8],
+            "domains": domains[:8],
+            "max_results": max_results,
+            "max_pages": max_pages,
+            "depth": depth,
+            "freshness_days": freshness_days,
+            "runtime_context": runtime_context,
+            "summary": f"agent_web_search start: {mode} {query or url}",
+        }
+        self._agent_web_search_emit("start", start_payload, role=role)
+        tool_timeout = float(_TOOL_TIMEOUT_MAP.get("agent_web_search", 90) or 90)
+        soft_timeout = max(12.0, min(AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT, tool_timeout - 8.0))
+        engine = AgentWebSearchEngine(
+            WORKDIR / WEB_SEARCH_INDEX_DIRNAME,
+            obey_robots=obey_robots,
+            deadline_at=now_ts() + soft_timeout,
+            event_callback=lambda phase, data: self._agent_web_search_emit(
+                phase,
+                {"mode": mode, "query": query, **(data if isinstance(data, dict) else {})},
+                role=role,
+            ),
+        )
+        payload: dict
+        if mode == "index_status":
+            payload = engine.index_status()
+        elif mode == "fetch":
+            if not url:
+                self._agent_web_search_emit(
+                    "error",
+                    {
+                        "mode": mode,
+                        "query": query,
+                        "url": url,
+                        "ok": False,
+                        "errors": [{"error": "url is required for mode='fetch'"}],
+                        "summary": "agent_web_search error: url is required for fetch",
+                    },
+                    role=role,
+                )
+                return "Error: url is required for agent_web_search mode='fetch'"
+            payload = engine.fetch(url, source_type="fetch", max_chars=max_chars)
+        elif mode == "follow":
+            if not url:
+                self._agent_web_search_emit(
+                    "error",
+                    {
+                        "mode": mode,
+                        "query": query,
+                        "url": url,
+                        "ok": False,
+                        "errors": [{"error": "url is required for mode='follow'"}],
+                        "summary": "agent_web_search error: url is required for follow",
+                    },
+                    role=role,
+                )
+                return "Error: url is required for agent_web_search mode='follow'"
+            payload = engine.follow(url, query=query, max_pages=max_pages, max_chars=max_chars)
+        elif mode == "discover":
+            payload = engine.discover(
+                query,
+                seed_urls=seed_urls or ([url] if url else None),
+                domains=domains,
+                max_pages=max_pages,
+                depth=depth,
+                allow_html_discovery=allow_html,
+                max_chars=max_chars,
+            )
+        elif mode == "deepen":
+            if not query:
+                self._agent_web_search_emit(
+                    "error",
+                    {
+                        "mode": mode,
+                        "query": query,
+                        "url": url,
+                        "ok": False,
+                        "errors": [{"error": "query is required for mode='deepen'"}],
+                        "summary": "agent_web_search error: query is required for deepen",
+                    },
+                    role=role,
+                )
+                return "Error: query is required for agent_web_search mode='deepen'"
+            payload = engine.deepen(
+                query,
+                seed_urls=seed_urls or ([url] if url else None),
+                domains=domains,
+                max_results=max_results,
+                max_pages=max_pages,
+                depth=depth,
+                freshness_days=freshness_days,
+                allow_html_discovery=allow_html,
+                max_chars=max_chars,
+            )
+        else:
+            if not query:
+                self._agent_web_search_emit(
+                    "error",
+                    {
+                        "mode": mode,
+                        "query": query,
+                        "url": url,
+                        "ok": False,
+                        "errors": [{"error": "query is required for mode='search'"}],
+                        "summary": "agent_web_search error: query is required for search",
+                    },
+                    role=role,
+                )
+                return "Error: query is required for agent_web_search mode='search'"
+            payload = engine.search(
+                query,
+                seed_urls=seed_urls or ([url] if url else None),
+                domains=domains,
+                max_results=max_results,
+                max_pages=max_pages,
+                depth=depth,
+                freshness_days=freshness_days,
+                allow_html_discovery=allow_html,
+                max_chars=max_chars,
+            )
+        if isinstance(payload, dict):
+            payload.setdefault("mode", mode)
+            if query:
+                payload.setdefault("query", query)
+            if url:
+                payload.setdefault("url", url)
+        if isinstance(payload, dict) and mode != "index_status":
+            try:
+                payload.update(engine._index_counts())
+            except Exception:
+                pass
+        if isinstance(payload, dict):
+            payload.setdefault("runtime_context", runtime_context)
+        preliminary_summary = self._agent_web_search_result_summary(payload)
+        search_context = {}
+        if isinstance(payload, dict) and mode != "index_status":
+            try:
+                search_context = self._record_web_search_context(src, payload, preliminary_summary, role=role)
+            except Exception:
+                search_context = {}
+            if search_context:
+                payload["search_context"] = search_context
+                actions = search_context.get("next_actions", []) if isinstance(search_context.get("next_actions", []), list) else []
+                if actions:
+                    existing_actions = payload.get("next_actions", []) if isinstance(payload.get("next_actions", []), list) else []
+                    merged_actions = []
+                    for item in list(actions) + list(existing_actions):
+                        txt = trim(str(item), 260)
+                        if txt and txt not in merged_actions:
+                            merged_actions.append(txt)
+                    payload["next_actions"] = merged_actions[:8]
+        result_summary = self._agent_web_search_result_summary(payload)
+        result_summary["summary"] = (
+            f"agent_web_search done: {result_summary.get('mode') or mode} "
+            f"results={result_summary.get('result_count', 0)} "
+            f"pages={result_summary.get('page_count', 0) or result_summary.get('fetched', 0)}"
+        )
+        self._agent_web_search_emit("done", result_summary, role=role)
+        try:
+            if isinstance(payload, dict) and payload.get("ok") and mode in {"search", "deepen", "follow", "fetch", "discover"}:
+                results = payload.get("results", []) if isinstance(payload.get("results", []), list) else []
+                pages = payload.get("pages", []) if isinstance(payload.get("pages", []), list) else []
+                page = payload.get("page", {}) if isinstance(payload.get("page", {}), dict) else {}
+                if not page and payload.get("url"):
+                    page = payload
+                urls = []
+                for row in list(results[:5]) + list(pages[:5]):
+                    if isinstance(row, dict) and row.get("url"):
+                        urls.append(str(row.get("url", "")))
+                if page.get("url"):
+                    urls.append(str(page.get("url", "")))
+                if urls:
+                    self._blackboard_append_memory(
+                        "research",
+                        f"agent_web_search {mode}: {query or url} -> " + "; ".join(urls[:4]),
+                        actor=role or "single",
+                        paths=urls[:6],
+                        tool="agent_web_search",
+                        tier="mid",
+                    )
+        except Exception:
+            pass
+        cap = self._tool_max_chars(src.get("max_chars"), 24_000)
+        return trim(json_dumps(payload, indent=2), cap)
+
     def _row_text_for_search(self, row: object) -> str:
         try:
             return json_dumps(row, indent=0)
@@ -25769,6 +28963,7 @@ body{padding:18px}
             )
             rsp = self.ollama.chat(
                 [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context("Generate a concise user-visible completion summary."),
                 max_tokens=800,
                 temperature=0.3,
             )
@@ -25888,6 +29083,14 @@ body{padding:18px}
         self.todo_reminder_count = 0
         self.todo_write_issue_count = 0
         self.todo_last_issue = ""
+        repair_result: dict = {}
+        if self._has_resumable_plan_state():
+            try:
+                repair_result = self._maybe_prompt_plan_resume_repair(
+                    reason="clear-stale-todos",
+                )
+            except Exception as exc:
+                repair_result = {"issue": False, "reason": f"repair-prompt-error:{trim(str(exc), 120)}"}
         self.updated_at = now_ts()
         self._persist()
         self._emit(
@@ -25900,7 +29103,7 @@ body{padding:18px}
                 )
             },
         )
-        return {"ok": True, **result}
+        return {"ok": True, **result, "repair": repair_result}
 
     def _is_empty_action_turn(self, text: str, thinking_text: str, tool_calls: list | None = None) -> bool:
         if tool_calls:
@@ -26018,7 +29221,7 @@ body{padding:18px}
                         f"Output exactly one line:\n"
                         f"SCOPE:N STEPS:N SKILL:N OUTPUT:N VERDICT:SIMPLE|MODERATE|COMPLEX|EXPERT"
                     )}],
-                    system="/no_think\nAnalyze task dimensions. One line output only.",
+                    system=self._inject_runtime_environment_context("/no_think\nAnalyze task dimensions. One line output only."),
                     max_tokens=40,
                     think=False,
                 )
@@ -26295,7 +29498,7 @@ body{padding:18px}
         try:
             rsp = self.ollama.chat(
                 [{"role": "user", "content": f"/no_think\n{prompt}"}],
-                system=(
+                system=self._inject_runtime_environment_context(
                     "/no_think\n"
                     "You generate short practical session titles for developer workflow tracking. "
                     f"{model_language_instruction(self.ui_language)}"
@@ -26613,6 +29816,7 @@ body{padding:18px}
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
         wake_attempted = False
+        system = self._inject_runtime_environment_context(system)
         estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
             messages,
             tools=tools,
@@ -27547,6 +30751,14 @@ body{padding:18px}
         return fp.read_text(encoding="utf-8", errors="replace")
 
     def _render_missing_read_hint(self, rel: str) -> str:
+        fb_ref = self._file_buffer_ref_from_text(rel)
+        if fb_ref:
+            expected = f"file_buffer/{fb_ref}.txt"
+            return (
+                f"Error: FileNotFoundError: {rel}\n"
+                f"File-buffer hint: use read_file path=\"{expected}\" or reference `[file_buffer:{fb_ref}]`. "
+                "If the buffer was compacted away, use the recent tool result summary/search context instead of repeating the same failed read."
+            )
         suggestions = self._suggest_workspace_paths(rel, limit=6)
         parent = PurePosixPath(str(rel or "").replace("\\", "/")).parent.as_posix()
         lines = [f"Error: FileNotFoundError: {rel}"]
@@ -27736,7 +30948,7 @@ body{padding:18px}
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
-            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
+            rel = self._session_rel(fp)
             if not fp.exists():
                 return self._render_missing_read_hint(rel)
             if fp.is_dir():
@@ -28025,7 +31237,7 @@ body{padding:18px}
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
-            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
+            rel = self._session_rel(fp)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
             return f"Wrote {len(content)} bytes to {rel}"
@@ -28036,7 +31248,7 @@ body{padding:18px}
         try:
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
-            rel = str(fp.relative_to(self.files_root)) if fp.is_relative_to(self.files_root) else rel
+            rel = self._session_rel(fp)
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
                 diag = self._edit_mismatch_diagnostic(content, old_text)
@@ -28732,12 +31944,180 @@ body{padding:18px}
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
         if not logs:
             return False
-        tail = "\n".join(
-            str((row or {}).get("content", "") or "")
-            for row in logs[-3:]
+        recent = [row for row in logs[-12:] if isinstance(row, dict)]
+        last_blocking_idx = -1
+        last_success_idx = -1
+        last_blocking_ts = 0.0
+        for idx, row in enumerate(recent):
+            if self._execution_log_entry_is_blocking_error(row):
+                last_blocking_idx = idx
+                try:
+                    last_blocking_ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    last_blocking_ts = 0.0
+            if self._execution_log_entry_is_success_evidence(row):
+                last_success_idx = idx
+        if last_blocking_idx < 0:
+            return False
+        if last_success_idx > last_blocking_idx:
+            return False
+        if last_blocking_ts > 0:
+            approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+            try:
+                approval_ts = float(approval.get("ts", 0.0) or 0.0)
+            except Exception:
+                approval_ts = 0.0
+            if bool(approval.get("approved", False)) and approval_ts + 1e-6 >= last_blocking_ts:
+                return False
+            feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+            for row in reversed(feedback[-8:]):
+                if not isinstance(row, dict):
+                    continue
+                txt = str(row.get("content", "") or "").strip().lower()
+                if not txt:
+                    continue
+                if not any(tok in txt for tok in ("approved", "review passed", "tests passed", "no issues found", "验证通过", "审核通过", "已通过")):
+                    continue
+                try:
+                    ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts + 1e-6 >= last_blocking_ts:
+                    return False
+        return True
+
+    def _execution_log_entry_is_success_evidence(self, row: dict) -> bool:
+        txt = str((row or {}).get("content", "") or "").strip().lower()
+        if not txt:
+            return False
+        if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", txt) and not self._command_output_has_error_shape(txt):
+            return True
+        success_markers = (
+            "no errors", "0 errors", "0 error", "no error", "no issues found",
+            "tests passed", "all tests passed", "test passed", "build succeeded",
+            "build successful", "compiled successfully", "syntax ok", "validation:",
+            "workspace clean", "passed", "success",
+        )
+        strong_error_markers = (
+            "traceback", "exception", "syntax error", "fatal error", "build failed",
+            "test failed", "assertionerror", "error:", "failed:", "exit code 1",
+            "exit: 1", "exit=1",
+        )
+        return any(marker in txt for marker in success_markers) and not any(
+            marker in txt for marker in strong_error_markers
+        )
+
+    def _execution_log_entry_is_blocking_error(self, row: dict) -> bool:
+        txt = str((row or {}).get("content", "") or "").strip()
+        if not txt:
+            return False
+        low = txt.lower()
+        actor = self._sanitize_agent_role(str((row or {}).get("actor", "") or ""))
+        benign_phrases = (
+            "no errors", "0 errors", "0 error", "no error", "without errors",
+            "no error logs", "no failing", "not an error", "error-free",
+            "workspace clean", "validation: workspace clean",
+        )
+        if any(phrase in low for phrase in benign_phrases):
+            return False
+        if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", low) and not self._command_output_has_error_shape(txt):
+            return False
+        if low.startswith("tool_error agent_web_search:"):
+            return False
+        if "agent_web_search" in low and (
+            "timed out after" in low
+            or "url_error" in low
+            or "http " in low
+            or "network" in low
+        ):
+            return False
+        if low.startswith("tool_error "):
+            return True
+        if "error: tool" in low:
+            return True
+        if "timed out after" in low and actor in {"developer", "reviewer"}:
+            return True
+        return self._command_output_has_error_shape(txt)
+
+    def _plan_step_ready_for_finish_reconcile(self, plan_step: dict, board: dict | None = None) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if not self._step_subtasks_all_completed(plan_step):
+            return False
+        has_evidence = self._plan_step_has_blackboard_evidence(plan_step, bb) or self._step_has_accumulated_evidence(plan_step, bb)
+        if not has_evidence:
+            return False
+        step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_text)
+        if phase in {"implement", "test", "deploy"}:
+            sig = self._plan_step_blackboard_signals(plan_step, bb)
+            verified = self._check_step_verified_tag(plan_step, messages=self.agent_messages)
+            if not (
+                verified
+                or bool(sig.get("has_exec", False))
+                or bool(sig.get("has_review", False))
+                or bool(sig.get("has_compile_pass", False))
+                or bool(sig.get("has_test_pass", False))
+            ):
+                return False
+        return True
+
+    def _reconcile_active_plan_step_before_finish(
+        self,
+        board: dict | None = None,
+        *,
+        actor: str = "manager",
+        source: str = "finish-gate",
+    ) -> bool:
+        changed = False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        actor_key = self._sanitize_agent_role(actor) or "manager"
+        for _ in range(3):
+            current = self._current_plan_step_row(bb)
+            if not isinstance(current, dict):
+                break
+            if not self._plan_step_ready_for_finish_reconcile(current, bb):
+                break
+            evidence = (
+                self._collect_blackboard_step_evidence(current, bb)
+                or self._collect_accumulated_step_evidence(current, bb)
+                or f"{source}: current plan step accepted before finish"
+            )
+            if not self._advance_plan_step(evidence=trim(f"finish-reconcile: {evidence}", 200), actor=actor_key):
+                break
+            changed = True
+            bb = self._ensure_blackboard()
+        return changed
+
+    def _completion_scoped_open_todo_rows(self, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        open_rows = [
+            row for row in self.todo.snapshot()
             if isinstance(row, dict)
-        ).lower()
-        return any(tok in tail for tok in ("error", "failed", "traceback", "exception", "not found", "blocked"))
+            and self._todo_row_kind(row) != "system"
+            and str(row.get("status", "pending") or "pending").strip().lower() != "completed"
+        ]
+        if not open_rows:
+            return []
+        if self._todo_has_plan_steps(bb):
+            active = self._current_plan_step_row(bb)
+            if not isinstance(active, dict):
+                return []
+            step_id = trim(str(active.get("id", "") or ""), 20)
+            if not step_id:
+                return []
+            return [
+                row for row in open_rows
+                if self._todo_row_kind(row) == "plan_worker"
+                and str(row.get("parent_step_id", "") or "").strip() == step_id
+            ]
+        route_kind = self._todo_route_kind(board=bb)
+        if route_kind == "pure_sync":
+            return [row for row in open_rows if self._todo_row_kind(row) == "owner_worker"]
+        if route_kind == "pure_single":
+            return [row for row in open_rows if self._todo_row_kind(row) == "flat"]
+        return open_rows
 
     def _finish_gate_route_for_reason(self, reason: str, board: dict | None = None) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -28858,21 +32238,13 @@ body{padding:18px}
         if can_finish:
             profile = self._ensure_blackboard_task_profile(bb)
             task_type = str(profile.get("task_type", "general") or "general")
-            open_rows = [
-                row for row in self.todo.snapshot()
-                if isinstance(row, dict)
-                and self._todo_row_kind(row) != "system"
-                and str(row.get("status", "pending") or "pending").strip().lower() != "completed"
-            ]
+            open_rows = self._completion_scoped_open_todo_rows(bb)
             if open_rows and task_type != "simple_qa":
                 can_finish = False
                 reason = f"worker-todo-pending:{len(open_rows)}"
         if can_finish and self._manager_has_error_log(bb):
             can_finish = False
             reason = "blocking-error-log"
-        if can_finish and not self._reviewer_final_summary_ready(bb):
-            can_finish = False
-            reason = "reviewer-summary-missing"
         return {
             "ok": bool(can_finish),
             "reason": reason,
@@ -28991,6 +32363,11 @@ body{padding:18px}
             latest_user_ts=self._latest_user_message_ts(),
             emit_status=False,
         )
+        self._reconcile_active_plan_step_before_finish(
+            self._ensure_blackboard(),
+            actor=role_key,
+            source=source,
+        )
         gate = self._evaluate_finish_gate(self._ensure_blackboard(), latest_user_ts=self._latest_user_message_ts())
         if bool(gate.get("ok", False)):
             return self._finalize_completion_once(role_key, source, summary)
@@ -29075,7 +32452,7 @@ body{padding:18px}
         latest_user_ts: float | None = None,
     ) -> tuple[bool, str]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        if bool(self.runtime_goal_reset_pending):
+        if self._runtime_goal_reset_still_pending(bb):
             return False, "goal-reset-pending"
         if self._approval_is_stale_for_latest_user(bb, latest_user_ts=latest_user_ts):
             return False, "approval-stale-new-user-input"
@@ -31076,13 +34453,17 @@ body{padding:18px}
                     if isinstance(fx, dict):
                         lines.append(f"  - {trim(str(fx.get('fix', '') or ''), 120)} -> {trim(str(fx.get('result', '') or ''), 60)}")
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
-        _all_kw = ("error:", "fatal error", "syntax error", "compile error", "build failed",
-                    "traceback", "exception", "failed", "panic:", "FAIL:", "AssertionError")
+        _all_kw = (
+            "error:", "fatal error", "syntax error", "compile error", "build failed",
+            "traceback", "exception", "failed", "panic:", "FAIL:", "AssertionError",
+        )
         for entry in reversed(logs[-6:]):
             if not isinstance(entry, dict):
                 continue
+            if self._execution_log_entry_is_success_evidence(entry):
+                break
             txt = str(entry.get("content", "") or "")
-            if any(kw in txt.lower() for kw in _all_kw):
+            if self._execution_log_entry_is_blocking_error(entry) or any(kw in txt.lower() for kw in _all_kw):
                 lines.append(f"LAST ERROR OUTPUT:\n{trim(txt, 400)}")
                 break
         if not lines:
@@ -31687,11 +35068,13 @@ body{padding:18px}
         phase = self._plan_step_phase_hint(step_text)
         wrote_files = any(str(r.get("name", "")) in ("write_file", "edit_file") for r in rows)
         read_back = any(
-            str(r.get("name", "")) == "read_file" and bool(self._tool_result_output_excerpt(r, 140))
+            str(r.get("name", "")) == "read_file"
+            and not self._is_plan_infrastructure_read_result(r)
+            and bool(self._tool_result_output_excerpt(r, 140))
             for r in rows
         )
         knowledge_signal = any(
-            str(r.get("name", "")) in ("write_to_blackboard", "read_from_blackboard", "query_code_library", "query_knowledge_library")
+            str(r.get("name", "")) in ("write_to_blackboard", "read_from_blackboard", "query_code_library", "query_knowledge_library", "agent_web_search")
             for r in rows
         )
         bash_rows = [r for r in rows if str(r.get("name", "")) == "bash"]
@@ -32301,7 +35684,11 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        _phase_gate = phase_evidence and (subtasks_all_done or not _has_subtasks)
+        _has_expected_subtasks = bool(self._extract_plan_step_subtasks(current, limit=5))
+        _phase_gate = phase_evidence and (
+            subtasks_all_done
+            or ((not _has_subtasks) and (not _has_expected_subtasks))
+        )
         accumulated_evidence_path = (
             subtasks_all_done
             and todo_progress_signal
@@ -32364,12 +35751,35 @@ body{padding:18px}
         """Check if worker step produced concrete tool outputs."""
         results = step.get("tool_results", []) or []
         return any(
-            r.get("ok", False) and str(r.get("name", "")) in (
-                "write_file", "edit_file", "bash", "read_file",
-                "write_to_blackboard",
+            r.get("ok", False)
+            and (
+                str(r.get("name", "")) in (
+                    "write_file", "edit_file", "bash",
+                    "write_to_blackboard", "read_from_blackboard", "agent_web_search",
+                    "query_code_library", "query_knowledge_library",
+                )
+                or (
+                    str(r.get("name", "")) == "read_file"
+                    and not self._is_plan_infrastructure_read_result(r)
+                )
             )
             for r in results
             if isinstance(r, dict)
+        )
+
+    def _is_plan_infrastructure_read_result(self, result: dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("name", "") or "") != "read_file":
+            return False
+        args = result.get("args", {}) if isinstance(result.get("args"), dict) else {}
+        path = str(args.get("path", "") or args.get("file_path", "") or "").replace("\\", "/")
+        if not path:
+            return False
+        return (
+            (path.endswith("plan.md") and ".clouds_coder/" in path)
+            or ".clouds_coder/skills_cache/" in path
+            or path.endswith("/.clouds_coder/skills_cache")
         )
 
     def _step_subtasks_all_completed(self, plan_step: dict) -> bool:
@@ -32421,6 +35831,26 @@ body{padding:18px}
         completed_items = [r for r in worker_items if str(r.get("status", "")).lower() == "completed"]
         pending_items = [r for r in worker_items if str(r.get("status", "")).lower() != "completed"]
         if completed_items and pending_items:
+            expected_subtasks = self._extract_plan_step_subtasks(plan_step, limit=7)
+            expected_ids: set[str] = set()
+            for item in expected_subtasks:
+                mm = re.match(r"^(\d+\.\d+)\b", str(item or "").strip())
+                if mm:
+                    expected_ids.add(mm.group(1))
+            if expected_ids:
+                completed_ids: set[str] = set()
+                pending_expected: list[dict] = []
+                for row in completed_items:
+                    mm = re.match(r"^(\d+\.\d+)\b", str(row.get("content", "") or "").strip())
+                    if mm:
+                        completed_ids.add(mm.group(1))
+                for row in pending_items:
+                    mm = re.match(r"^(\d+\.\d+)\b", str(row.get("content", "") or "").strip())
+                    if mm and mm.group(1) in expected_ids:
+                        pending_expected.append(row)
+                if expected_ids.issubset(completed_ids) and not pending_expected:
+                    worker_items = completed_items
+                    pending_items = []
             # Check if pending items are content-wise duplicates of completed items
             # (indicating the worker re-sent the same items but some got stuck as pending)
             completed_content = {
@@ -32678,7 +36108,7 @@ body{padding:18px}
             )
             resp = self.ollama.chat(
                 [{"role": "user", "content": prompt}],
-                system="You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON.",
+                system=self._inject_runtime_environment_context("You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON."),
                 max_tokens=300,
                 think=False,
             )
@@ -32719,7 +36149,7 @@ body{padding:18px}
                     continue
                 out = self._tool_result_output_excerpt(r, 90)
                 parts.append(f"read: {path}" + (f" => {out}" if out else ""))
-            elif name in ("write_to_blackboard", "query_code_library", "query_knowledge_library"):
+            elif name in ("write_to_blackboard", "read_from_blackboard", "query_code_library", "query_knowledge_library", "agent_web_search"):
                 out = self._tool_result_output_excerpt(r, 100)
                 parts.append(f"{name}" + (f": {out}" if out else ""))
         if not parts:
@@ -33439,6 +36869,15 @@ body{padding:18px}
             self._emit("status", {"summary": trim(summary, 120)})
         return True
 
+    def _wrapped_control_block(self, content: str) -> tuple[str, str]:
+        text = str(content or "").strip()
+        if not text:
+            return ("", "")
+        m = re.fullmatch(r"<([a-zA-Z0-9_-]+)>\s*([\s\S]*?)\s*</\1>", text)
+        if not m:
+            return ("", text)
+        return (str(m.group(1) or "").strip().lower(), str(m.group(2) or "").strip())
+
     def _build_plan_guidance_notice_data(self, content: str, *, summary: str = "") -> dict:
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
@@ -33456,6 +36895,25 @@ body{padding:18px}
         else:
             title = "Plan Execution Guidance"
             note = "The active plan step and Todo rules were synced into the current execution context."
+        control_tag, control_body = self._wrapped_control_block(text)
+        notice_kind = "plan_notice"
+        display_body = control_body if control_tag else text
+        if control_tag == "todo-focus":
+            notice_kind = "todo_focus"
+            if lang == "zh-CN":
+                title = "Todo 焦点"
+                note = "当前 in_progress 子任务已同步为本轮执行焦点。"
+            elif lang == "zh-TW":
+                title = "Todo 焦點"
+                note = "目前 in_progress 子任務已同步為本輪執行焦點。"
+            elif lang == "ja":
+                title = "Todo フォーカス"
+                note = "現在の in_progress サブタスクを今回の実行フォーカスとして同期しました。"
+            else:
+                title = "Todo Focus"
+                note = "The current in_progress subtask was synced as the execution focus."
+        elif control_tag == "reminder":
+            notice_kind = "reminder"
         bb = self._ensure_blackboard()
         step = self._current_plan_step_row(bb)
         total = int(bb.get("plan_step_total", 0) or 0)
@@ -33472,16 +36930,20 @@ body{padding:18px}
         pills: list[dict] = []
         if step_label:
             pills.append({"text": step_label, "tone": "info"})
+        if control_tag:
+            pills.append({"text": control_tag, "tone": "neutral", "mono": True})
         if step_id:
             pills.append({"text": step_id, "tone": "neutral", "mono": True})
         rows = [{"label": "plan.md", "value": PLAN_FILE_RELATIVE_PATH, "mono": True}]
         if step_id:
             rows.append({"label": "parent_step_id", "value": step_id, "mono": True})
         return {
+            "kind": notice_kind,
+            "control_tag": control_tag,
             "title": title,
             "subtitle": subtitle,
             "note": note,
-            "body": text,
+            "body": display_body,
             "pills": pills,
             "rows": rows,
         }
@@ -33552,19 +37014,13 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 220)
         rows = self._active_plan_worker_todo_rows(step_id, role=role)
-        if not rows:
-            try:
-                if self._ensure_worker_todos_for_plan_step(step, force_refresh=False, owner=self._current_plan_worker_owner()):
-                    rows = self._active_plan_worker_todo_rows(step_id, role=role)
-            except Exception:
-                rows = []
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks are available yet for this step. Continue the current plan step; the runtime will try to bootstrap subtasks automatically. "
-                f"Use TodoWrite only if you need to correct or refine progress state for parent_step_id='{step_id}'. "
+                f"No worker subtasks are available yet for this step. Inspect the current plan/todo state before doing broad work. "
+                f"If the state is genuinely broken, use TodoWrite or TodoWriteRescue to repair only parent_step_id='{step_id}', then continue this step. "
             )
             subtasks_exist_ban = ""
         else:
@@ -33766,6 +37222,382 @@ body{padding:18px}
         with self.todo.lock:
             self.todo.items = preserved + replacement
         return True
+
+    def _ensure_worker_todos_available_for_plan_step(
+        self,
+        plan_step: dict | None,
+        *,
+        owner: str = "",
+        force_refresh: bool = False,
+    ) -> dict:
+        if not isinstance(plan_step, dict):
+            return {"ok": False, "available": False, "changed": False, "reason": "missing-active-plan-step"}
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return {"ok": False, "available": False, "changed": False, "reason": "missing-parent-step-id"}
+        expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+        if not expected:
+            return {"ok": False, "available": False, "changed": False, "reason": "no-subtask-template"}
+        before = self._active_plan_worker_todo_rows(step_id, role="")
+        has_pending = any(str(r.get("status", "") or "").strip().lower() == "pending" for r in before)
+        has_active = any(str(r.get("status", "") or "").strip().lower() == "in_progress" for r in before)
+        needs_refresh = bool(force_refresh or not before or (has_pending and not has_active))
+        changed = False
+        if needs_refresh:
+            try:
+                changed = bool(self._ensure_worker_todos_for_plan_step(
+                    plan_step,
+                    force_refresh=bool(force_refresh or (has_pending and not has_active)),
+                    owner=owner,
+                ))
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "available": False,
+                    "changed": False,
+                    "expected_count": len(expected),
+                    "reason": f"worker-bootstrap-error:{trim(str(exc), 120)}",
+                }
+        after = self._active_plan_worker_todo_rows(step_id, role="")
+        if after:
+            return {
+                "ok": True,
+                "available": True,
+                "changed": bool(changed),
+                "expected_count": len(expected),
+                "worker_count": len(after),
+                "reason": "created" if changed else "already-available",
+            }
+        return {
+            "ok": False,
+            "available": False,
+            "changed": bool(changed),
+            "expected_count": len(expected),
+            "worker_count": 0,
+            "reason": "worker-subtasks-still-missing",
+        }
+
+    def _repair_plan_resume_state(
+        self,
+        *,
+        reason: str = "",
+        owner: str = "",
+        sync_todos: bool = True,
+        emit_status: bool = True,
+    ) -> dict:
+        """Repair approved-plan execution invariants without advancing steps.
+
+        This is intentionally conservative: it may rebuild the task tree and
+        current-step worker subtasks, but it never marks a plan step completed.
+        """
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        todos_raw = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        has_plan_rows = any(
+            isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+            for t in todos_raw
+        )
+        plan_steps_src = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+        try:
+            persisted_cursor = int(bb.get("plan_step_cursor", 0) or 0)
+        except Exception:
+            persisted_cursor = 0
+        if plan_phase != "executing" and not has_plan_rows:
+            return {"ok": True, "active": False, "changed": False, "reason": "no-executing-plan"}
+
+        changed = False
+        repairs: list[str] = []
+        if not has_plan_rows and plan_steps_src:
+            plan_todos = self._build_plan_todos_from_steps(plan_steps_src, limit=40)
+            if plan_todos:
+                bb["project_todos"] = plan_todos[:40]
+                todos_raw = bb["project_todos"]
+                has_plan_rows = True
+                changed = True
+                repairs.append("rebuilt-plan-steps")
+
+        if not has_plan_rows:
+            return {
+                "ok": False,
+                "active": True,
+                "changed": changed,
+                "reason": "executing-plan-without-plan-steps",
+            }
+
+        plan_rows: list[dict] = []
+        other_rows: list[dict] = []
+        now_value = float(now_ts())
+        for idx, row in enumerate(todos_raw):
+            if not isinstance(row, dict):
+                changed = True
+                repairs.append("dropped-invalid-todo-row")
+                continue
+            clean = dict(row)
+            if str(clean.get("category", "") or "") != "plan_step":
+                other_rows.append(clean)
+                continue
+            if not str(clean.get("id", "") or "").strip():
+                clean["id"] = f"pt:{len(plan_rows):03d}"
+                changed = True
+                repairs.append("filled-plan-step-id")
+            clean["category"] = "plan_step"
+            try:
+                step_idx = int(clean.get("plan_step_index", len(plan_rows)) or len(plan_rows))
+            except Exception:
+                step_idx = len(plan_rows)
+            clean["plan_step_index"] = max(0, step_idx)
+            status = str(clean.get("status", "pending") or "pending").strip().lower()
+            if status not in {"pending", "in_progress", "completed"}:
+                status = "pending"
+                changed = True
+                repairs.append("normalized-plan-step-status")
+            clean["status"] = status
+            if not str(clean.get("content", "") or "").strip() and str(clean.get("full_content", "") or "").strip():
+                clean["content"] = trim(str(clean.get("full_content", "") or "").splitlines()[0], 400)
+                changed = True
+                repairs.append("filled-plan-step-content")
+            plan_rows.append(clean)
+
+        plan_rows.sort(key=lambda r: int(r.get("plan_step_index", 0) or 0))
+        for idx, row in enumerate(plan_rows):
+            if int(row.get("plan_step_index", 0) or 0) != idx:
+                row["plan_step_index"] = idx
+                changed = True
+                repairs.append("renumbered-plan-step")
+
+        if "rebuilt-plan-steps" in repairs and persisted_cursor > 0:
+            restored_idx = min(max(0, persisted_cursor), len(plan_rows))
+            for idx, row in enumerate(plan_rows):
+                desired_status = (
+                    "completed"
+                    if idx < restored_idx
+                    else ("in_progress" if idx == restored_idx and restored_idx < len(plan_rows) else "pending")
+                )
+                if restored_idx >= len(plan_rows):
+                    desired_status = "completed"
+                if str(row.get("status", "") or "") != desired_status:
+                    row["status"] = desired_status
+                    changed = True
+                if desired_status == "in_progress" and not row.get("activated_at"):
+                    row["activated_at"] = now_value
+                if desired_status == "completed" and not row.get("completed_at"):
+                    row["completed_at"] = now_value
+            repairs.append("restored-plan-cursor")
+
+        active_rows = [r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"]
+        if len(active_rows) > 1:
+            keep = min(active_rows, key=lambda r: int(r.get("plan_step_index", 0) or 0))
+            keep_id = str(keep.get("id", "") or "")
+            for row in plan_rows:
+                if str(row.get("status", "") or "") == "in_progress" and str(row.get("id", "") or "") != keep_id:
+                    row["status"] = "pending"
+                    row["activated_at"] = None
+            changed = True
+            repairs.append("deduped-active-plan-step")
+        elif not active_rows:
+            next_row = next((r for r in plan_rows if str(r.get("status", "") or "") != "completed"), None)
+            if next_row:
+                next_row["status"] = "in_progress"
+                if not next_row.get("activated_at"):
+                    next_row["activated_at"] = now_value
+                changed = True
+                repairs.append("activated-next-plan-step")
+
+        active_step = next((r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"), None)
+        if active_step:
+            active_idx = int(active_step.get("plan_step_index", 0) or 0)
+            bb["plan_step_cursor"] = active_idx
+        else:
+            bb["plan_step_cursor"] = len(plan_rows)
+        bb["plan_step_total"] = len(plan_rows)
+        if plan_phase != "executing":
+            plan = dict(plan)
+            plan["phase"] = "executing"
+            bb["plan"] = plan
+            changed = True
+            repairs.append("restored-plan-executing-phase")
+        bb["project_todos"] = plan_rows + other_rows
+        self.blackboard = bb
+
+        worker_result = {"ok": True, "available": False, "reason": "no-active-step"}
+        if active_step:
+            worker_result = self._ensure_worker_todos_available_for_plan_step(
+                active_step,
+                owner=owner or self._current_plan_worker_owner(bb),
+                force_refresh=False,
+            )
+            if bool(worker_result.get("changed", False)):
+                changed = True
+                repairs.append("rebuilt-worker-subtasks")
+            if not bool(worker_result.get("available", False)):
+                return {
+                    "ok": False,
+                    "active": True,
+                    "changed": changed,
+                    "reason": str(worker_result.get("reason", "worker-subtasks-missing")),
+                    "repairs": list(dict.fromkeys(repairs)),
+                    "active_step_id": str(active_step.get("id", "") or ""),
+                }
+
+        bb = self._ensure_blackboard()
+        bb["focus"] = self._blackboard_focus_identity(bb)
+        self.blackboard = bb
+        self.runtime_plan_approved = True
+        self.runtime_plan_mode_needed = False
+        if changed:
+            self._blackboard_touch()
+            try:
+                self._update_plan_file_step_status()
+            except Exception:
+                pass
+        if sync_todos:
+            try:
+                self._sync_todos_from_blackboard(
+                    reason=f"plan-resume-repair:{trim(str(reason or 'runtime'), 80)}",
+                    board=self._ensure_blackboard(),
+                )
+            except Exception:
+                pass
+        if emit_status and changed:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "plan/todo state repaired "
+                        f"({trim(str(reason or 'runtime'), 80)}; "
+                        f"{', '.join(list(dict.fromkeys(repairs))[:4]) or 'normalized'})"
+                    )
+                },
+            )
+        return {
+            "ok": True,
+            "active": bool(active_step),
+            "changed": changed,
+            "reason": "repaired" if changed else "already-consistent",
+            "repairs": list(dict.fromkeys(repairs)),
+            "active_step_id": str((active_step or {}).get("id", "") or ""),
+            "worker": dict(worker_result),
+        }
+
+    def _detect_plan_resume_state_issue(self, *, role: str = "", board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan_rows = [
+            dict(row) for row in todos
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        plan_steps = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+        if plan_phase != "executing" and not plan_rows:
+            return {"issue": False, "reason": "no-executing-plan", "issues": []}
+        issues: list[str] = []
+        blocking_issues: list[str] = []
+        if plan_phase == "executing" and not plan_rows:
+            issue_key = "missing-plan-rows" if plan_steps else "missing-plan-source"
+            issues.append(issue_key)
+            blocking_issues.append(issue_key)
+        active_rows = [
+            row for row in plan_rows
+            if str(row.get("status", "") or "").strip().lower() == "in_progress"
+        ]
+        if len(active_rows) > 1:
+            issues.append("multiple-active-plan-steps")
+            blocking_issues.append("multiple-active-plan-steps")
+        incomplete_rows = [
+            row for row in plan_rows
+            if str(row.get("status", "") or "").strip().lower() != "completed"
+        ]
+        if plan_rows and not active_rows and incomplete_rows:
+            issues.append("missing-active-plan-step")
+            blocking_issues.append("missing-active-plan-step")
+        active_step = active_rows[0] if active_rows else None
+        expected_count = 0
+        worker_count = 0
+        if isinstance(active_step, dict):
+            step_id = trim(str(active_step.get("id", "") or ""), 20)
+            expected_count = len(self._extract_plan_step_subtasks(active_step, limit=5))
+            worker_rows = self._active_plan_worker_todo_rows(step_id, role=role)
+            worker_count = len(worker_rows)
+            if expected_count > 0 and worker_count == 0:
+                if self._plan_step_has_blackboard_evidence(active_step, bb):
+                    issues.append("missing-worker-subtasks-with-step-evidence")
+                else:
+                    issues.append("missing-worker-subtasks")
+                    blocking_issues.append("missing-worker-subtasks")
+            if worker_rows:
+                has_open = any(str(r.get("status", "") or "").strip().lower() == "pending" for r in worker_rows)
+                has_active = any(str(r.get("status", "") or "").strip().lower() == "in_progress" for r in worker_rows)
+                if has_open and not has_active:
+                    issues.append("missing-active-worker-subtask")
+                    blocking_issues.append("missing-active-worker-subtask")
+        return {
+            "issue": bool(issues),
+            "reason": ",".join(issues) if issues else "consistent",
+            "issues": list(dict.fromkeys(issues)),
+            "blocking": bool(blocking_issues),
+            "blocking_issues": list(dict.fromkeys(blocking_issues)),
+            "active_step_id": str((active_step or {}).get("id", "") or ""),
+            "active_step": trim(str((active_step or {}).get("content", "") or ""), 240),
+            "expected_count": int(expected_count),
+            "worker_count": int(worker_count),
+            "plan_step_count": len(plan_rows),
+            "plan_source_count": len(plan_steps),
+        }
+
+    def _maybe_prompt_plan_resume_repair(
+        self,
+        *,
+        reason: str = "",
+        role: str = "",
+        target_roles: tuple[str, ...] = (),
+    ) -> dict:
+        issue = self._detect_plan_resume_state_issue(role=role)
+        if not bool(issue.get("issue", False)):
+            return issue
+        issues = ", ".join(str(x) for x in issue.get("issues", []) if str(x).strip())
+        active = trim(str(issue.get("active_step", "") or ""), 240)
+        step_id = trim(str(issue.get("active_step_id", "") or ""), 40)
+        detail_parts = [
+            f"detected={issues or issue.get('reason', 'unknown')}",
+            f"source={trim(str(reason or 'runtime'), 80)}",
+        ]
+        if step_id:
+            detail_parts.append(f"active_step_id={step_id}")
+        if active:
+            detail_parts.append(f"active_step={active}")
+        detail_parts.append(
+            f"plan_rows={int(issue.get('plan_step_count', 0) or 0)}; "
+            f"worker_rows={int(issue.get('worker_count', 0) or 0)}/"
+            f"{int(issue.get('expected_count', 0) or 0)} expected"
+        )
+        if bool(issue.get("blocking", False)):
+            action_text = (
+                "Do not advance the plan step and do not restart the whole plan. "
+                "First inspect the current plan/todo state, then repair only the broken structure if the evidence confirms it "
+                "(for example with TodoWrite/TodoWriteRescue for current-step worker subtasks, or blackboard updates for missing plan rows). "
+                "After repair, continue only the active plan step."
+            )
+        else:
+            action_text = (
+                "This is a non-blocking consistency signal. If the current step already has sufficient evidence or the whole task is complete, "
+                "do not recreate todos just for formality; proceed to verification or finish normally. "
+                "Only repair the structure if it is genuinely preventing the active plan step from continuing."
+            )
+        content = (
+            "<plan-state-repair-required>\n"
+            "Approved plan execution state appears structurally inconsistent. "
+            f"{action_text}\n"
+            + "\n".join(detail_parts)
+            + "\n</plan-state-repair-required>"
+        )
+        self._append_plan_guidance_bubble(
+            content,
+            target_roles=target_roles,
+            summary="plan state repair required",
+        )
+        return issue
 
     def _check_step_verified_tag(self, plan_step: dict, *, messages: list | None = None) -> bool:
         """Return True if the agent has emitted <step-verified> in any assistant message
@@ -34481,15 +38313,18 @@ body{padding:18px}
                     "requires_plan": {
                         "type": "boolean",
                         "description": (
-                            "Whether this task needs a plan-mode research phase before execution. "
-                            "True for tasks involving: multi-file refactoring, architecture changes, "
-                            "migration, new feature with unclear scope, system-level changes. "
-                            "False for simple Q&A, single-file edits, direct bug fixes."
-                        ),
+                                "Whether this latest request semantically needs a user-visible plan/proposal phase "
+                                "before execution. Do not set true merely because level is 3/4/5, because the run is "
+                                "multi-agent, or because several files may be touched. True only when the user needs "
+                                "approach selection before action: ground-up rebuild/restart, system-wide audit, "
+                                "architecture redesign, migration with alternatives, or an ambiguous high-risk scope. "
+                                "False for direct implementation, continuation, bounded feature work, direct bug fixes, "
+                                "reviews, explanations, or concrete incremental changes even when they are non-trivial."
+                            ),
+                        },
                     },
-                },
-                ["level", "judgement", "inherit_previous_state"],
-            )
+                    ["level", "judgement", "inherit_previous_state", "requires_plan"],
+                )
         ]
 
     def _looks_like_positive_confirmation(self, text: str) -> bool:
@@ -34749,10 +38584,11 @@ body{padding:18px}
                     800,
                 ),
                 "execution_mode": str(inherited_mode),
-                "participants": list(inherited_participants),
-                "assigned_expert": inherited_assigned,
-                "requires_user_confirmation": bool(inherited_requires_confirmation if inherited_level == 5 else False),
-                "semantic_confidence": "low",
+                    "participants": list(inherited_participants),
+                    "assigned_expert": inherited_assigned,
+                    "requires_user_confirmation": bool(inherited_requires_confirmation if inherited_level == 5 else False),
+                    "requires_plan": False,
+                    "semantic_confidence": "low",
                 "low_confidence_reason": "rule fallback inherited previous runtime state",
                 "source": "fallback",
             }
@@ -34787,21 +38623,25 @@ body{padding:18px}
             "round_budget": int(policy.get("round_budget", profile.get("round_budget", self.max_agent_rounds)) or 0),
             "direct_objective": trim(str(profile.get("direct_objective", "") or ""), 800),
             "execution_mode": (EXECUTION_MODE_SINGLE if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE else str(policy.get("execution_mode", EXECUTION_MODE_SYNC))),
-            "participants": participants,
-            "assigned_expert": assigned,
-            "requires_user_confirmation": bool(requires_confirmation),
-            "semantic_confidence": "low",
+                "participants": participants,
+                "assigned_expert": assigned,
+                "requires_user_confirmation": bool(requires_confirmation),
+                "requires_plan": False,
+                "semantic_confidence": "low",
             "low_confidence_reason": "rule fallback classification",
             "source": "fallback",
         }
 
     def _manager_classification_system_prompt(self) -> str:
         ceiling_prompt = self._auto_task_level_ceiling_prompt()
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"\n{user_profile_block}\n" if user_profile_block else ""
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
             "set it false for a new independent objective.\n\n"
+            f"{user_profile_text}"
             "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
             "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
             "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
@@ -34821,10 +38661,17 @@ body{padding:18px}
             "• Requests asking 'how' or 'what' with no action words → level 1-2.\n"
             "• Requests with 'quick', 'simple', 'just', 'only' from user → can lower by 1 level.\n"
             "• Requests with 'thorough', 'comprehensive', 'detailed', 'production-ready' → raise by 1 level.\n\n"
-            "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
-            "User-stated preference overrides your default strategy. "
-            "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
-            "CRITICAL OUTPUT CONTRACT: You MUST output exactly one classify_task_level tool call and no plain-text answer. "
+                "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
+                "User-stated preference overrides your default strategy. "
+                "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
+                "PLAN MODE DECISION: Task level and plan mode are separate decisions. "
+                "L3/L4/L5, multi-agent routing, or multi-file work does not automatically require plan mode. "
+                "When Plan is Auto, set requires_plan=true only if this latest request needs a user-visible "
+                "proposal/research phase before execution, such as a ground-up rebuild, system-wide inspection, "
+                "architecture redesign, migration with alternatives, or an ambiguous high-risk scope. "
+                "Set requires_plan=false for direct implementation, continuation, concrete bug fixes, reviews, "
+                "bounded feature work, or explanations even if the task remains level 3+.\n\n"
+                "CRITICAL OUTPUT CONTRACT: You MUST output exactly one classify_task_level tool call and no plain-text answer. "
             "A prose-only response is invalid and will be discarded.\n"
             "The tool call must include concise judgement, inherit_previous_state, "
             "and semantic_confidence (high|medium|low). "
@@ -34892,7 +38739,7 @@ body{padding:18px}
             )
             rsp = self.ollama.chat(
                 [{"role": "user", "content": reeval_prompt}],
-                system="/no_think\nOutput one integer 1-5.",
+                system=self._inject_runtime_environment_context("/no_think\nOutput one integer 1-5."),
                 max_tokens=10,
                 think=False,
             )
@@ -34909,6 +38756,96 @@ body{padding:18px}
             pass
         return dict(low_conf_row)
 
+    def _manager_decide_plan_mode_needed(
+        self,
+        goal_text: str,
+        *,
+        pinned_selection: str = "",
+        decision: dict | None = None,
+        media_inputs_round: list[dict] | None = None,
+    ) -> dict:
+        """Semantically decide Plan Auto for paths that bypass manager classification."""
+        user_pref = str(self.plan_mode_user_preference or "auto").strip().lower()
+        if user_pref == "off":
+            return {"requires_plan": False, "reason": "user set Plan Off", "source": "user-preference"}
+        if user_pref == "on":
+            return {"requires_plan": True, "reason": "user set Plan On", "source": "user-preference"}
+        goal = trim(str(goal_text or "").strip(), 2400)
+        if not goal:
+            return {"requires_plan": False, "reason": "empty goal", "source": "empty-goal"}
+        if self.runtime_plan_approved:
+            return {"requires_plan": False, "reason": "plan already approved", "source": "approved-plan"}
+        if self._is_plan_choice_response(goal) or self._is_continuation_input(goal):
+            return {"requires_plan": False, "reason": "continuation should execute without restarting plan mode", "source": "continuation"}
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"\nUser profile preference capsule:\n{user_profile_block}\n" if user_profile_block else ""
+        row = dict(decision or {})
+        try:
+            level = int(row.get("level", getattr(self, "runtime_task_level", 0) or 0) or 0)
+        except Exception:
+            level = 0
+        if level not in PLAN_MODE_ENABLED_LEVELS:
+            return {"requires_plan": False, "reason": f"L{level or 0} below plan-enabled range", "source": "level-gate"}
+        board = self._ensure_blackboard()
+        previous_goal = trim(str(board.get("original_goal", "") or ""), 800)
+        progress_state = self._manager_progress_state(board)
+        prompt = (
+            "Decide whether the latest user request should enter a user-visible Plan phase before execution.\n\n"
+            f"Latest request:\n{goal}\n\n"
+            f"Manual/existing task level: L{level}\n"
+            f"Execution mode: {normalize_execution_mode(row.get('execution_mode', self._effective_execution_mode()), default=self._effective_execution_mode())}\n"
+            f"Previous blackboard goal: {previous_goal or '(none)'}\n"
+            f"Current blackboard progress: {progress_state}\n\n"
+            f"{user_profile_text}"
+            "Use semantic intent only. Do not decide from keywords alone.\n"
+            "Return requires_plan=true only if the user needs a proposal/research/choice phase before action: "
+            "ground-up rebuild or restart, system-wide inspection, architecture redesign, migration with real alternatives, "
+            "ambiguous high-risk scope, or multiple viable implementation strategies that should be selected by the user.\n"
+            "Return requires_plan=false for direct implementation, continuation, bounded feature work, direct bug fixes, "
+            "code review, explanation, concrete incremental changes, or 'continue/implement the plan' style execution, "
+            "even if the task is L3/L4/L5 or multi-agent.\n\n"
+            "Output strict JSON only: {\"requires_plan\": true|false, \"reason\": \"short semantic reason\"}"
+        )
+        try:
+            with self.lock:
+                self.current_phase = "manager:plan-auto-decision"
+                self.current_tool_name = ""
+                self.active_agent_role = "manager"
+            rsp = self._chat_with_same_model_retry(
+                [{"role": "user", "content": prompt, "ts": now_ts()}],
+                system=(
+                    "/no_think\n"
+                    "You are Manager. Decide Plan Auto semantically. "
+                    "Output strict JSON only; no markdown, no prose."
+                    f"{model_language_instruction(self.ui_language)}"
+                ),
+                max_tokens=120,
+                think=False,
+                stream_thinking=False,
+                pinned_selection=pinned_selection,
+                context_label="manager plan-auto",
+                retries=1,
+                media_inputs=media_inputs_round,
+            )
+            content = str(rsp.get("content", "") or "").strip()
+            parsed, _ = parse_tool_arguments_with_error(content)
+            if not parsed and "{" in content and "}" in content:
+                parsed, _ = parse_tool_arguments_with_error(content[content.find("{"):content.rfind("}") + 1])
+            if isinstance(parsed, dict):
+                requires_plan = _to_bool_like(parsed.get("requires_plan", False), default=False)
+                return {
+                    "requires_plan": bool(requires_plan),
+                    "reason": trim(str(parsed.get("reason", "") or "semantic plan-auto decision"), 220),
+                    "source": "manager-plan-auto",
+                }
+        except Exception as exc:
+            self._emit("status", {"summary": f"manager plan-auto decision fallback: {trim(str(exc), 160)}"})
+        return {
+            "requires_plan": False,
+            "reason": "plan-auto semantic judge unavailable; defaulting to direct execution",
+            "source": "manager-plan-auto-fallback",
+        }
+
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
         row = dict(decision or {})
         inherit_previous_state = _to_bool_like(row.get("inherit_previous_state", False), default=False)
@@ -34921,7 +38858,7 @@ body{padding:18px}
                 self._blackboard_history("manager", f"follow-up inherited: {trim(str(goal_text or ''), 300)}")
             else:
                 self._blackboard_reset_for_goal(goal_text)
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="runtime-task-decision")
         try:
             level = int(row.get("level", 3) or 3)
         except Exception:
@@ -35118,20 +39055,20 @@ body{padding:18px}
         self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
         self.runtime_reclassify_required = False
         # Decide plan mode with a strict precedence chain:
-        # user preference > policy defaults > LLM semantic hint.
-        raw_requires_plan = bool(decision.get("requires_plan", False))
+        # user preference > approved-plan state > semantic plan-needed signal.
+        # Task level only gates whether auto-plan is eligible; it never forces plan mode.
+        raw_requires_plan = _to_bool_like(decision.get("requires_plan", False), default=False)
         user_pref = str(self.plan_mode_user_preference or "auto").lower()
         if user_pref == "off":
             requires_plan = False
         elif user_pref == "on":
             requires_plan = True
-        else:  # auto: follow the normal policy/LLM decision path
-            if level in PLAN_MODE_FORCED_LEVELS:
-                requires_plan = True
-            elif level in PLAN_MODE_ENABLED_LEVELS:
-                requires_plan = raw_requires_plan
-            else:
-                requires_plan = False
+        elif bool(getattr(self, "runtime_first_task_in_session", False)) and level in PLAN_MODE_ENABLED_LEVELS:
+            requires_plan = True
+        elif level in PLAN_MODE_ENABLED_LEVELS:
+            requires_plan = raw_requires_plan
+        else:
+            requires_plan = False
         if self.runtime_plan_approved:
             requires_plan = False
         self.runtime_plan_mode_needed = requires_plan
@@ -35328,11 +39265,13 @@ body{padding:18px}
                 default="medium",
             )
             if str(row.get("semantic_confidence", "medium")) == "low":
-                # Skill-aware re-evaluation before falling back to keyword heuristic
-                reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
-                fallback_row = self._fallback_task_level_decision(goal_text)
-                merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
-                return self._apply_auto_task_level_ceiling_to_decision(merged, source="manager-low-confidence")
+                    # Skill-aware re-evaluation before falling back to keyword heuristic
+                    reeval_row = self._skill_aware_reeval_task_level(goal_text, row, pinned_selection)
+                    fallback_row = self._fallback_task_level_decision(goal_text)
+                    merged = self._merge_task_decision_for_low_confidence(reeval_row, fallback_row)
+                    if "requires_plan" in row:
+                        merged["requires_plan"] = _to_bool_like(row.get("requires_plan", False), default=False)
+                    return self._apply_auto_task_level_ceiling_to_decision(merged, source="manager-low-confidence")
             row["source"] = "manager"
             return self._apply_auto_task_level_ceiling_to_decision(row, source="manager")
         row = self._fallback_task_level_decision(goal_text)
@@ -35518,8 +39457,27 @@ body{padding:18px}
                 "source": "user-override",
                 "semantic_confidence": "high",
             }
+            user_pref = str(self.plan_mode_user_preference or "auto").strip().lower()
+            if user_pref == "auto":
+                plan_auto = self._manager_decide_plan_mode_needed(
+                    goal,
+                    pinned_selection=pinned_selection,
+                    decision=decision,
+                    media_inputs_round=media_inputs_round,
+                )
+                decision["requires_plan"] = bool(plan_auto.get("requires_plan", False))
+                decision["plan_mode_reason"] = trim(
+                    str(plan_auto.get("reason", "") or "semantic plan-auto decision"),
+                    240,
+                )
+            elif user_pref == "on":
+                decision["requires_plan"] = True
+                decision["plan_mode_reason"] = "user set Plan On"
+            else:
+                decision["requires_plan"] = False
+                decision["plan_mode_reason"] = "user set Plan Off"
             self.runtime_reclassify_required = False
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="user-level-override", clear_reclassify=True)
             self._apply_runtime_task_decision(goal, decision)
             return dict(decision)
         # --- Continuation input short-circuit: inherit previous complexity ---
@@ -35536,10 +39494,12 @@ body{padding:18px}
                 "round_budget": int(self.runtime_round_budget or 0),
                 "requires_user_confirmation": False,
                 "inherit_previous_state": True,
-                "judgement": "continuation input detected — inheriting previous complexity",
-                "source": "continuation-inherit",
-                "semantic_confidence": "high",
-            }
+                    "judgement": "continuation input detected — inheriting previous complexity",
+                    "source": "continuation-inherit",
+                    "semantic_confidence": "high",
+                    "requires_plan": False,
+                    "plan_mode_reason": "continuation input inherits execution without restarting plan mode",
+                }
             self._apply_runtime_task_decision(goal, decision)
             return dict(decision)
         need = bool(
@@ -35625,21 +39585,32 @@ body{padding:18px}
     def _plan_step_phase_hint(self, step_content: str) -> str:
         """Infer the task phase from a plan step's content."""
         c = str(step_content or "").lower()
-        # implement keywords take priority — if step produces output, it's implement not design/research
-        if any(kw in c for kw in ("实现", "编写", "创建", "开发", "绘制", "生成", "写入",
-                                   "implement", "write", "create", "build", "develop", "code",
-                                   "generate", "draw", "scaffold", "mkdir", ".f90", ".py", ".cpp", ".md")):
+        research_keywords = (
+            "研究", "分析", "调研", "探索", "检索", "搜索", "查找", "查询", "收集", "采集",
+            "整理", "提取", "资料", "数据", "排行", "资金流向", "走势", "来源", "交叉验证",
+            "research", "analyze", "investigate", "explore", "inspect", "search", "collect",
+            "gather", "retrieve", "extract", "summarize", "source", "evidence",
+        )
+        strong_impl_keywords = (
+            "实现", "开发", "编码", "代码", "函数", "组件", "模块", "着色器", "接口实现",
+            "implement", "develop", "code", "component", "module", "function", "shader",
+            "scaffold", "mkdir", ".f90", ".py", ".cpp", ".js", ".ts", ".tsx", ".jsx", ".glsl",
+        )
+        if any(kw in c for kw in strong_impl_keywords):
             return "implement"
-        if any(kw in c for kw in ("研究", "分析", "调研", "探索", "research", "analyze", "investigate", "explore", "inspect")):
+        if any(kw in c for kw in research_keywords):
             return "research"
         if any(kw in c for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
             return "design"
-        if any(kw in c for kw in ("测试", "验证", "检查", "test", "verify", "check", "validate", "compile")):
+        if any(kw in c for kw in ("测试", "单测", "回归", "test", "pytest", "unit", "integration", "compile")):
             return "test"
         if any(kw in c for kw in ("审查", "评审", "review", "audit", "inspect code")):
             return "review"
         if any(kw in c for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
             return "deploy"
+        if any(kw in c for kw in ("编写", "创建", "绘制", "生成", "写入", "制作",
+                                   "write", "create", "build", "generate", "draw")):
+            return "implement"
         return ""
 
     def _infer_current_phase_from_blackboard(self) -> str:
@@ -35723,7 +39694,7 @@ body{padding:18px}
                 pass
             # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
-            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "提取", "read", "analyze", "extract", "research", "summarize", "总结"))
+            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "调研", "检索", "搜索", "查找", "查询", "收集", "采集", "提取", "整理", "数据", "排行", "资金流向", "read", "analyze", "extract", "research", "summarize", "search", "collect", "gather", "retrieve", "总结"))
             is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
             is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
             if is_research_step and research_count > 0 and not worker_hint:
@@ -35827,6 +39798,8 @@ body{padding:18px}
                 "follow the loaded skill's workflow and scripts. Do NOT invent alternative approaches "
                 "when a loaded skill already defines the correct procedure. "
             )
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"{user_profile_block} " if user_profile_block else ""
         todo_route_note = self._plan_todo_discipline_prompt(for_manager=True)
         return (
             "You are Manager in a multi-agent coding system. "
@@ -35852,6 +39825,7 @@ body{padding:18px}
             f"{phase_hint}"
             f"{failure_hint}"
             f"{html_hint}"
+            f"{user_profile_text}"
             f"{skills_constraint}"
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
@@ -36000,6 +39974,8 @@ body{padding:18px}
             latest_user_ts=latest_user_ts,
             emit_status=False,
         )
+        board = self._ensure_blackboard()
+        self._reconcile_active_plan_step_before_finish(board, actor="manager", source="manager-fallback")
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
         task_type = str(profile.get("task_type", "general") or "general")
@@ -36450,6 +40426,8 @@ body{padding:18px}
             emit_status=False,
         )
         board = self._ensure_blackboard()
+        self._reconcile_active_plan_step_before_finish(board, actor="manager", source="manager-policy")
+        board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
         default_type = str(profile.get("task_type", "general") or "general")
         default_complexity = str(profile.get("complexity", "simple") or "simple")
@@ -36813,6 +40791,116 @@ body{padding:18px}
         parsed = self._manager_apply_anti_stall(parsed)
         return self._manager_apply_task_policy(parsed)
 
+    def _manager_coordination_context_for_delegate(
+        self,
+        target: str,
+        board: dict | None = None,
+        *,
+        max_chars: int = 1600,
+    ) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        lines: list[str] = []
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        progress = self._manager_progress_state(bb)
+        focus = self._blackboard_focus_identity(bb)
+        target_role = self._sanitize_agent_role(target) or "developer"
+        lines.append(
+            "Manager coordination snapshot: "
+            f"status={status}, progress={progress}, target={target_role}, "
+            f"level={profile.get('task_level', self.runtime_task_level or '-')}, "
+            f"mode={profile.get('execution_mode', self._effective_execution_mode())}."
+        )
+        focus_title = trim(str(focus.get("title", "") or ""), 220)
+        if focus_title:
+            if focus.get("kind") == "plan_step":
+                idx = int(focus.get("index", -1) if focus.get("index") not in (None, "") else -1) + 1
+                total = int(focus.get("total", 0) or 0)
+                lines.append(f"Active plan focus: step {idx}/{max(1, total)} - {focus_title}.")
+            else:
+                lines.append(f"Active focus: {focus.get('kind', 'task')} - {focus_title}.")
+        snapshot = self._active_plan_progress_snapshot(bb)
+        if int(snapshot.get("worker_todo_count", 0) or 0) > 0:
+            lines.append(
+                "Worker todo state: "
+                f"completed={int(snapshot.get('completed_count', 0) or 0)}, "
+                f"in_progress={int(snapshot.get('in_progress_count', 0) or 0)}, "
+                f"pending={int(snapshot.get('pending_count', 0) or 0)}."
+            )
+            current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
+            if current_subtask:
+                lines.append(f"Current subtask: {current_subtask}.")
+        try:
+            memory_signal = self._blackboard_memory_context_markdown(for_role=target_role, max_chars=900)
+            memory_lines = []
+            for raw_line in str(memory_signal or "").splitlines():
+                line = trim(raw_line.lstrip("#- ").strip(), 180)
+                if not line or line.lower() in {"task memory", "active focus evidence", "stable cross-step memory"}:
+                    continue
+                memory_lines.append(line)
+                if len(memory_lines) >= 4:
+                    break
+            if memory_lines:
+                lines.append("Task memory signal: " + " | ".join(memory_lines))
+        except Exception:
+            pass
+        err = self._recent_error_context(max_chars=450)
+        if err:
+            lines.append("Latest unresolved error evidence: " + trim(err.replace("\n", " | "), 520))
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        if artifacts:
+            artifact_rows = []
+            for path, item in sorted(
+                list(artifacts.items()),
+                key=lambda kv: float((kv[1] or {}).get("updated_at", 0.0) if isinstance(kv[1], dict) else 0.0),
+                reverse=True,
+            )[:4]:
+                details = item if isinstance(item, dict) else {}
+                artifact_rows.append(f"{path}: {trim(str(details.get('summary', '') or ''), 120)}")
+            if artifact_rows:
+                lines.append("Recent code artifacts: " + "; ".join(artifact_rows))
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        if logs:
+            for row in reversed(logs[-4:]):
+                if not isinstance(row, dict):
+                    continue
+                content = trim(str(row.get("content", "") or ""), 220)
+                if content:
+                    lines.append(f"Recent execution evidence: {content}")
+                    break
+        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        if feedback:
+            for row in reversed(feedback[-3:]):
+                if not isinstance(row, dict):
+                    continue
+                content = trim(str(row.get("content", "") or ""), 220)
+                if content:
+                    lines.append(f"Recent review signal: {content}")
+                    break
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        step_id = str(focus.get("id", "") or "")
+        if step_id and isinstance(step_files.get(step_id), list):
+            paths = []
+            for entry in step_files.get(step_id, [])[-12:]:
+                if isinstance(entry, dict):
+                    p = str(entry.get("path", "") or "").strip()
+                else:
+                    p = str(entry or "").strip()
+                if p and p not in paths:
+                    paths.append(p)
+            if paths:
+                lines.append("Files already touched/read for this focus: " + ", ".join(paths[:8]))
+        reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        reply_role = self._sanitize_agent_role(reply.get("role", ""))
+        reply_text = trim(str(reply.get("text", "") or ""), 240)
+        if reply_role and reply_text:
+            lines.append(f"Last worker reply: [{reply_role}] {reply_text}")
+        lines.append(
+            "Use this as context only: preserve the current focus, choose the next concrete action, "
+            "and do not invent a replacement plan."
+        )
+        return trim("\n".join(lines), max(400, int(max_chars or 1600)))
+
     def _format_manager_delegate_message(self, route_row: dict) -> tuple[str, dict]:
         row = dict(route_row or {})
         target = self._sanitize_agent_role(row.get("target", "")) or "developer"
@@ -36826,6 +40914,7 @@ body{padding:18px}
         scale = trim(str(row.get("scale_preference", "balanced") or "balanced"), 20)
         objective_raw = trim(str(row.get("direct_objective", "") or ""), 800)
         instruction_raw = trim(str(row.get("instruction", "") or ""), 1200)
+        coordination_context = trim(str(row.get("coordination_context", "") or ""), 1600)
         objective, _ = self._split_language_policy_from_text(objective_raw, max_len=800)
         instruction, _ = self._split_language_policy_from_text(instruction_raw, max_len=1200)
         is_mandatory = bool(row.get("is_mandatory", False))
@@ -36857,6 +40946,8 @@ body{padding:18px}
             lines.append(focus_text)
         if instruction:
             lines.append(f"instruction: {instruction}")
+        if coordination_context:
+            lines.append(f"context: {coordination_context}")
         text = "\n".join(lines)
         data = {
             "target": target,
@@ -36872,6 +40963,7 @@ body{padding:18px}
             "remaining_rounds": remaining,
             "direct_objective": objective,
             "instruction": instruction,
+            "coordination_context": coordination_context,
             "focus_kind": focus_kind,
             "focus_id": focus_id,
             "focus_epoch": float(row.get("focus_epoch", 0.0) or 0.0),
@@ -37333,6 +41425,12 @@ body{padding:18px}
             "remaining_rounds": int(remaining_rounds),
         }
         route_row.update(self._route_focus_fields(board))
+        if target in AGENT_ROLES:
+            route_row["coordination_context"] = self._manager_coordination_context_for_delegate(
+                target,
+                board,
+                max_chars=1600,
+            )
         # advance_plan_step: REMOVED pre-execution advancement.
         # Step advancement now happens AFTER worker execution via _post_execution_plan_step_check.
         # Store the manager's advance request flag for post-execution validation.
@@ -37462,6 +41560,8 @@ body{padding:18px}
         self.runtime_confirmation_needed = bool(route_row.get("requires_user_confirmation", False))
         board["last_delegate"] = dict(route_row)
         board["active_agent"] = target if target in AGENT_ROLES else ""
+        if execution_mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC} and len(participants) >= 2:
+            self._mark_multi_agent_context_hud_active(persist=True)
         self._sync_todos_from_blackboard(reason=f"manager-delegate:{target}", board=board)
         self._blackboard_touch()
         self._blackboard_history(
@@ -37649,6 +41749,27 @@ body{padding:18px}
                 "</compile-error-context>\n"
             )
         board_md = self._blackboard_read_state_markdown(max_items=10)
+        coordination_context = ""
+        try:
+            bb_coord = self._ensure_blackboard()
+            last_delegate = bb_coord.get("last_delegate", {}) if isinstance(bb_coord.get("last_delegate"), dict) else {}
+            if self._sanitize_agent_role(last_delegate.get("target", "")) == role_key:
+                coordination_context = trim(str(last_delegate.get("coordination_context", "") or ""), 1600)
+            if not coordination_context:
+                coordination_context = self._manager_coordination_context_for_delegate(
+                    role_key,
+                    board=bb_coord,
+                    max_chars=1600,
+                )
+        except Exception:
+            coordination_context = ""
+        coordination_section = (
+            "<coordination-context>\n"
+            f"{coordination_context}\n"
+            "</coordination-context>\n"
+            if coordination_context
+            else ""
+        )
         # Include loaded skills hint in delegation
         loaded_skills_note = self._loaded_skills_prompt_hint(for_role=role_key)
         # Include current plan step in delegation so agents stay on track
@@ -37706,6 +41827,7 @@ body{padding:18px}
             f"{executor_note}\n"
             f"{collaboration_note}\n"
             f"{role_capability_note}\n"
+            f"{coordination_section}"
             f"{loaded_skills_note}"
             f"{current_plan_step_note}"
             f"{todo_update_note}"
@@ -38111,31 +42233,12 @@ body{padding:18px}
         return bool(verdict.get("strict_ok" if strict else "ok", False))
 
     def _finish_requires_structured_summary(self, role: str, tool_name: str) -> bool:
-        role_key = self._sanitize_agent_role(role)
-        if tool_name not in {"finish_task", "finish_current_task", "mark_done"}:
-            return False
-        if not role_key:
-            return False
-        bb = self._ensure_blackboard()
-        profile = self._ensure_blackboard_task_profile(bb)
-        task_type = str(profile.get("task_type", "general") or "general")
-        if task_type == "simple_qa":
-            return False
-        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
-        delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
-        delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
-        delegate_instruction = str(delegate.get("instruction", "") or "").strip().lower()
-        summary_markers = (
-            "summary",
-            "wrap-up",
-            "final report",
-            "最终总结",
-            "总结",
-            "收尾",
-        )
-        if delegate_target == role_key and any(tok in delegate_reason or tok in delegate_instruction for tok in summary_markers):
-            return True
-        return bool(role_key == "reviewer" and self._is_multi_agent_mode())
+        # Final summaries are advisory before finish and authoritative during
+        # finalization. Blocking the finish tool here creates a circular gate:
+        # the finalizer can synthesize the summary, but the tool could never
+        # reach the finalizer. Keep finish validation focused on real work
+        # completion; `_finalize_completion_once` emits the summary bubble.
+        return False
 
     def _recent_agent_used_tools(
         self,
@@ -38328,24 +42431,33 @@ body{padding:18px}
         return mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}
 
     def _tool_allowed_for_agent(self, role: str, name: str) -> bool:
+        if canonicalize_tool_name(name) == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
+            return False
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return True
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
         return str(name or "").strip() in allowed
 
+    def _available_tools(self) -> list[dict]:
+        return filter_tool_specs_for_runtime(
+            TOOLS,
+            web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+        )
+
     def _tools_for_agent(self, role: str) -> list[dict]:
         role_key = self._sanitize_agent_role(role)
+        base_tools = self._available_tools()
         if not role_key:
-            return TOOLS
+            return base_tools
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
         filtered = []
-        for tool in TOOLS:
+        for tool in base_tools:
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
             if name in allowed:
                 filtered.append(tool)
-        return filtered or TOOLS
+        return filtered or base_tools
 
     def _agent_context(self, role: str) -> list[dict]:
         role_key = self._sanitize_agent_role(role)
@@ -38586,6 +42698,13 @@ body{padding:18px}
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
         read_context_note = self._read_context_prompt_block(for_role=role_key)
+        web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+        web_search_context_note = self._web_search_context_prompt_block(for_role=role_key) if web_search_enabled else ""
+        web_search_instruction = (
+            "For agent_web_search, continue the shared search tree for the active focus: reuse useful URLs, respect low-yield/dynamic-page signals, and choose follow/fetch/deepen, endpoint discovery, or caveated progress instead of looping broad searches. "
+            if web_search_enabled
+            else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
+        )
         task_memory_note = self._blackboard_memory_context_markdown(for_role=role_key, max_chars=2800)
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
@@ -38603,6 +42722,7 @@ body{padding:18px}
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
+            f"{web_search_instruction}"
             "Use Task Memory as the shared mainline: continue the active_focus with the other agents, reuse cited evidence, and avoid private parallel objectives. "
             f"{code_note + ' ' if code_note else ''}"
             f"{engineering_note + ' ' if engineering_note else ''}"
@@ -38616,6 +42736,8 @@ body{padding:18px}
         base = base + skills_block
         if read_context_note:
             base = base + read_context_note + " "
+        if web_search_context_note:
+            base = base + web_search_context_note + " "
         if task_memory_note:
             base = base + task_memory_note + " "
         if plan_todo_note:
@@ -38699,6 +42821,7 @@ body{padding:18px}
     def _seed_multi_agent_contexts_if_needed(self, user_text: str = ""):
         if not self._is_multi_agent_mode():
             return
+        self._mark_multi_agent_context_hud_active(persist=True)
         language_note = self._agent_language_policy_note()
         for role in AGENT_ROLES:
             _ = self._agent_context(role)
@@ -38707,7 +42830,7 @@ body{padding:18px}
             current_goal = trim(str(self._ensure_blackboard().get("original_goal", "") or "").strip(), 4000)
             if not current_goal:
                 self._blackboard_reset_for_goal(goal_text)
-                self.runtime_goal_reset_pending = False
+                self._mark_runtime_goal_reset_handled(reason="multi-agent-seed")
             self._append_agent_context_message(
                 "explorer",
                 {
@@ -39803,6 +43926,8 @@ body{padding:18px}
             return "Error: ValueError: tool name is required"
         if not isinstance(args, dict):
             return "Error: TypeError: tool arguments must be a JSON object"
+        if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
+            return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
         role_key = self._sanitize_agent_role(agent_role)
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
@@ -39817,19 +43942,38 @@ body{padding:18px}
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 return out
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}") as pool:
-                future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
-                try:
-                    out = future.result(timeout=timeout)
-                    self._maybe_record_tool_memory_after_result(name, args, out, role_key)
-                    return out
-                except concurrent.futures.TimeoutError:
-                    self._emit("error", {
-                        "summary": f"tool '{name}' timed out after {timeout}s",
-                    })
-                    out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
-                    self._maybe_record_tool_memory_after_result(name, args, out, role_key)
-                    return out
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
+            future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
+            try:
+                out = future.result(timeout=timeout)
+                self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                pool.shutdown(wait=True)
+                return out
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                if name == "agent_web_search":
+                    self._agent_web_search_emit(
+                        "timeout",
+                        {
+                            "mode": str(args.get("mode", "search") or "search"),
+                            "query": trim(str(args.get("query", "") or ""), 180),
+                            "url": trim(str(args.get("url", "") or ""), 500),
+                            "ok": False,
+                            "errors": [{"error": f"timed out after {timeout}s"}],
+                            "summary": f"agent_web_search timed out after {timeout}s",
+                        },
+                        role=role_key,
+                    )
+                self._emit("error", {
+                    "summary": f"tool '{name}' timed out after {timeout}s",
+                })
+                out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
+                self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                return out
+            except Exception:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
         except Exception as exc:
             tb_lines = traceback.format_exc()
             self._emit("error", {
@@ -40102,6 +44246,12 @@ body{padding:18px}
         if name in {"finish_task", "finish_current_task", "mark_done"}:
             summary = trim(str(args.get("summary", "") or "").strip(), 400)
             bb_finish = self._ensure_blackboard()
+            self._reconcile_active_plan_step_before_finish(
+                bb_finish,
+                actor=role_key or "agent",
+                source=name,
+            )
+            bb_finish = self._ensure_blackboard()
             plan_steps = [
                 t for t in bb_finish.get("project_todos", [])
                 if isinstance(t, dict) and t.get("category") == "plan_step"
@@ -40124,15 +44274,6 @@ body{padding:18px}
                     f"The approved plan is still active at {active_label}: {active_text}. "
                     "Update TodoWrite/TodoWriteRescue for the current subtask and keep following the current plan step."
                 )
-            if role_key == "explorer":
-                delegate = bb_finish.get("last_delegate", {}) if isinstance(bb_finish.get("last_delegate"), dict) else {}
-                delegate_target = self._sanitize_agent_role(delegate.get("target", ""))
-                delegate_reason = str(delegate.get("reason", "") or "").strip().lower()
-                if delegate_target == "explorer" and "summary-handoff" in delegate_reason:
-                    return (
-                        "Error: explorer summary handoff step must not call finish tool. "
-                        "Write structured summary to blackboard first, then wait for manager close."
-                    )
             if self._finish_requires_structured_summary(role_key, name):
                 if role_key == "reviewer" and not self._recent_agent_used_tools(
                     role_key,
@@ -40202,6 +44343,8 @@ body{padding:18px}
                 return str(out if out is not None else "")
             except Exception as exc:
                 return f"Error: knowledge library query failed: {exc}"
+        if name == "agent_web_search":
+            return self._agent_web_search_tool(args, role=role_key)
         if name == "generate_media":
             media_type = str(args.get("media_type", "") or "").strip().lower()
             if media_type not in {"image", "audio", "video"}:
@@ -40425,10 +44568,71 @@ body{padding:18px}
             return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
         return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
 
-    def _enqueue_running_user_input(self, content: str) -> dict:
+    def _enqueue_running_user_input(self, content: str, *, best_effort: bool = False) -> dict:
         text = trim(str(content or "").strip(), 6000)
         if not text:
             raise ValueError("content required")
+        acquired = False
+        if best_effort:
+            try:
+                acquired = bool(self.lock.acquire(timeout=0.02))
+            except Exception:
+                acquired = False
+        if (not best_effort) or acquired:
+            lock_cm = self.lock if not acquired else None
+            if lock_cm is not None:
+                lock_cm.acquire()
+            try:
+                row = self._enqueue_running_user_input_locked(text)
+            finally:
+                if lock_cm is not None:
+                    lock_cm.release()
+                elif acquired:
+                    try:
+                        self.lock.release()
+                    except Exception:
+                        pass
+        else:
+            phase = str(getattr(self, "current_phase", "") or "")
+            tool = str(getattr(self, "current_tool_name", "") or "")
+            if tool in {"write_file", "edit_file"} or phase in {"tool:write_file", "tool:edit_file"}:
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_WRITE_ROUNDS, "write-phase"
+            elif phase.startswith("tool:"):
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
+            else:
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
+            round_idx = int(getattr(self, "agent_round_index", 0) or 0)
+            with self.live_input_queue_lock:
+                self.live_input_seq += 1
+                row = {
+                    "id": int(self.live_input_seq),
+                    "content": text,
+                    "queued_at": now_ts(),
+                    "queued_round": round_idx,
+                    "delay_rounds": int(delay_rounds),
+                    "next_round": int(round_idx + delay_rounds),
+                    "applied_count": 0,
+                    "last_applied_round": -1,
+                    "delay_reason": delay_reason,
+                    "run_generation": int(getattr(self, "run_generation", 0) or 0),
+                    "best_effort": True,
+                }
+                self.pending_user_inputs.append(row)
+                self.pending_user_inputs = self.pending_user_inputs[-40:]
+            self.updated_at = now_ts()
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "live user input queued "
+                    f"(id={row['id']}, delay_rounds={row.get('delay_rounds', 0)}, "
+                    f"reason={row.get('delay_reason', '')})"
+                )
+            },
+        )
+        return row
+
+    def _enqueue_running_user_input_locked(self, text: str) -> dict:
         with self.lock:
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
@@ -40445,19 +44649,11 @@ body{padding:18px}
                 "delay_reason": delay_reason,
                 "run_generation": int(self.run_generation),
             }
-            self.pending_user_inputs.append(row)
-            self.pending_user_inputs = self.pending_user_inputs[-40:]
+            with self.live_input_queue_lock:
+                self.pending_user_inputs.append(row)
+                self.pending_user_inputs = self.pending_user_inputs[-40:]
             self.updated_at = now_ts()
             self._persist()
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    "live user input queued "
-                    f"(id={row['id']}, delay_rounds={delay_rounds}, reason={delay_reason})"
-                )
-            },
-        )
         return row
 
     def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
@@ -40561,68 +44757,69 @@ body{padding:18px}
     def _inject_pending_user_inputs(self) -> int:
         injected: list[dict] = []
         with self.lock:
-            if not self.pending_user_inputs:
-                return 0
-            round_idx = int(self.agent_round_index)
-            current_generation = int(self.run_generation)
-            kept: list[dict] = []
-            for row in list(self.pending_user_inputs):
-                row_generation = int(row.get("run_generation", current_generation) or current_generation)
-                if row_generation != current_generation:
-                    continue
-                next_round = int(row.get("next_round", round_idx) or round_idx)
-                if round_idx < next_round:
-                    kept.append(row)
-                    continue
-                content = trim(str(row.get("content", "") or "").strip(), 6000)
-                if not content:
-                    continue
-                self._refresh_runtime_code_reference(content)
-                applied = int(row.get("applied_count", 0) or 0) + 1
-                delay_rounds = int(row.get("delay_rounds", 0) or 0)
-                base_weight = (
-                    float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
-                    if delay_rounds > 0
-                    else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
-                )
-                weight_step = (
-                    float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
-                    if delay_rounds > 0
-                    else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
-                )
-                weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
-                priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
-                payload = (
-                    "<live-user-adjustment "
-                    f"id=\"{int(row.get('id', 0) or 0)}\" "
-                    f"priority=\"{priority}\" "
-                    f"weight=\"{weight:.2f}\">"
-                    f"\n{content}\n"
-                    "</live-user-adjustment>"
-                )
-                self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
-                self.runtime_reclassify_goal = trim(content, 4000)
-                # Only trigger reclassification in auto mode (no user override)
-                if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
-                    self.runtime_reclassify_required = False
-                else:
-                    self.runtime_reclassify_required = True
-                self.runtime_goal_reset_pending = True
-                injected.append(
-                    {
-                        "id": int(row.get("id", 0) or 0),
-                        "weight": weight,
-                        "priority": priority,
-                        "applied": applied,
-                        "content": content,
-                    }
-                )
-                row["applied_count"] = applied
-                row["last_applied_round"] = round_idx
-                if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
-                    row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
-                    kept.append(row)
-            self.pending_user_inputs = kept[-40:]
+            with self.live_input_queue_lock:
+                if not self.pending_user_inputs:
+                    return 0
+                round_idx = int(self.agent_round_index)
+                current_generation = int(self.run_generation)
+                kept: list[dict] = []
+                for row in list(self.pending_user_inputs):
+                    row_generation = int(row.get("run_generation", current_generation) or current_generation)
+                    if row_generation != current_generation:
+                        continue
+                    next_round = int(row.get("next_round", round_idx) or round_idx)
+                    if round_idx < next_round:
+                        kept.append(row)
+                        continue
+                    content = trim(str(row.get("content", "") or "").strip(), 6000)
+                    if not content:
+                        continue
+                    self._refresh_runtime_code_reference(content)
+                    applied = int(row.get("applied_count", 0) or 0) + 1
+                    delay_rounds = int(row.get("delay_rounds", 0) or 0)
+                    base_weight = (
+                        float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                    )
+                    weight_step = (
+                        float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                    )
+                    weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                    priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                    payload = (
+                        "<live-user-adjustment "
+                        f"id=\"{int(row.get('id', 0) or 0)}\" "
+                        f"priority=\"{priority}\" "
+                        f"weight=\"{weight:.2f}\">"
+                        f"\n{content}\n"
+                        "</live-user-adjustment>"
+                    )
+                    self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                    self.runtime_reclassify_goal = trim(content, 4000)
+                    # Only trigger reclassification in auto mode (no user override).
+                    if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+                        self.runtime_reclassify_required = False
+                    else:
+                        self.runtime_reclassify_required = True
+                    self._mark_runtime_goal_reset_pending(content, reason="live-user-adjustment")
+                    injected.append(
+                        {
+                            "id": int(row.get("id", 0) or 0),
+                            "weight": weight,
+                            "priority": priority,
+                            "applied": applied,
+                            "content": content,
+                        }
+                    )
+                    row["applied_count"] = applied
+                    row["last_applied_round"] = round_idx
+                    if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                        row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
+                        kept.append(row)
+                self.pending_user_inputs = kept[-40:]
             if injected:
                 self.updated_at = now_ts()
                 self._persist()
@@ -40784,7 +44981,7 @@ body{padding:18px}
                 )
                 self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
                 # Don't reset blackboard — continue
-                self.runtime_goal_reset_pending = False
+                self._mark_runtime_goal_reset_handled(reason="continuation-intent-fusion", clear_reclassify=True)
                 return
         if is_continuation and original_goal:
             # Continuation without plan — inherit context intent
@@ -40797,7 +44994,7 @@ body{padding:18px}
                 f"</intent-fusion>"
             )
             self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="continuation-intent-fusion", clear_reclassify=True)
             return
         # New instruction — fuse with context but user intent takes priority
         if original_goal:
@@ -40820,6 +45017,18 @@ body{padding:18px}
         except Exception:
             acquired = False
         if not acquired:
+            if bool(getattr(self, "running", False)):
+                row = self._enqueue_running_user_input(content, best_effort=True)
+                return {
+                    "ok": True,
+                    "queued": True,
+                    "running": True,
+                    "queue_id": int(row.get("id", 0) or 0),
+                    "delay_rounds": int(row.get("delay_rounds", 0) or 0),
+                    "delay_reason": str(row.get("delay_reason", "")),
+                    "live_input": True,
+                    "best_effort": bool(row.get("best_effort", False)),
+                }
             row = self._enqueue_deferred_start_input(content, "session lock busy")
             return {
                 "ok": True,
@@ -40835,29 +45044,48 @@ body{padding:18px}
             else:
                 if self.pending_user_inputs:
                     dropped_stale_inputs = len(self.pending_user_inputs)
-                # Preserve plan state if awaiting user choice
+                clean_goal_pre = trim(str(content or "").strip(), 4000)
+                # Preserve plan state if awaiting user choice or continuing an approved plan.
                 _awaiting_plan_choice = bool(
-                    self.runtime_plan_proposal
-                    and not self.runtime_plan_approved
+                    (
+                        self.runtime_plan_proposal
+                        and not self.runtime_plan_approved
+                    )
+                    or self._is_plan_choice_response(clean_goal_pre)
+                )
+                _continue_existing_plan = bool(
+                    self._is_continuation_input(clean_goal_pre)
+                    and self._has_resumable_plan_state()
                 )
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
+                self.runtime_first_task_in_session = not self._has_prior_real_user_task_message()
                 if _awaiting_plan_choice:
-                    # Restore plan proposal so choice can be parsed
+                    # Restore plan proposal so choice can be parsed.
                     self.runtime_plan_mode_needed = True
+                    if not self.runtime_plan_proposal:
+                        bb_plan = self._ensure_blackboard().get("plan", {})
+                        if isinstance(bb_plan, dict) and isinstance(bb_plan.get("proposal"), dict):
+                            self.runtime_plan_proposal = dict(bb_plan.get("proposal", {}))
+                    self._restore_runtime_policy_from_blackboard_locked()
+                elif _continue_existing_plan:
                     self._restore_runtime_policy_from_blackboard_locked()
                 # Reset completed plan/todo/skills blackboard state so the manager
                 # does not see status=COMPLETED on the very first round and immediately finish.
                 # But preserve plan state if user is continuing an existing task.
-                if not _awaiting_plan_choice:
-                    clean_goal_pre = trim(str(content or "").strip(), 4000)
-                    if self._is_continuation_input(clean_goal_pre) and self._has_resumable_plan_state():
-                        pass  # Preserve plan state for continuation
-                    else:
-                        self._reset_blackboard_plan_state_locked()
+                if not (_awaiting_plan_choice or _continue_existing_plan):
+                    self._reset_blackboard_plan_state_locked()
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
+                if _continue_existing_plan:
+                    try:
+                        self._maybe_prompt_plan_resume_repair(
+                            reason="submit-continuation",
+                            target_roles=(self._current_plan_worker_owner(),),
+                        )
+                    except Exception:
+                        pass
                 # Parse plan choice immediately after clean_goal is available
                 if _awaiting_plan_choice:
                     choice = self._parse_plan_choice(clean_goal, self.runtime_plan_proposal)
@@ -40870,19 +45098,32 @@ body{padding:18px}
                         self.stall_escalation_triggered = False
                         self._inject_plan_into_context(choice)
                         self.runtime_reclassify_required = False
-                        self.runtime_goal_reset_pending = False
+                        self._mark_runtime_goal_reset_handled(reason="plan-choice-accepted", clear_reclassify=True)
                 # Restart intent fusion: merge user/plan/context intents
-                if self._is_restart_scenario():
+                if (not _continue_existing_plan) and self._is_restart_scenario():
                     self._fuse_restart_intent(clean_goal)
                 self.runtime_reclassify_goal = clean_goal
                 # Skip reclassification for plan choice responses — preserve complexity
                 # Also skip when user has manually set task level override
                 _has_user_override = int(getattr(self, 'user_task_level_override', 0) or 0) > 0
-                if _awaiting_plan_choice or self._is_plan_choice_response(clean_goal) or _has_user_override:
+                if _continue_existing_plan:
                     self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_handled(
+                        reason="continuation-submit",
+                        clear_reclassify=True,
+                    )
+                elif _awaiting_plan_choice or self._is_plan_choice_response(clean_goal):
+                    self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_handled(
+                        reason="plan-choice-response",
+                        clear_reclassify=True,
+                    )
+                elif _has_user_override:
+                    self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_pending(clean_goal, reason="new-user-message")
                 else:
                     self.runtime_reclassify_required = True
-                self.runtime_goal_reset_pending = True
+                    self._mark_runtime_goal_reset_pending(clean_goal, reason="new-user-message")
                 self.running = True
                 self.run_started_at = now_ts()
                 self.run_last_heartbeat = self.run_started_at
@@ -40928,6 +45169,8 @@ body{padding:18px}
                 "queue_id": int(row.get("id", 0) or 0),
                 "delay_rounds": int(row.get("delay_rounds", 0) or 0),
                 "delay_reason": str(row.get("delay_reason", "")),
+                "live_input": True,
+                "best_effort": bool(row.get("best_effort", False)),
             }
         threading.Thread(target=self._agent_worker, daemon=True).start()
         return {"ok": True, "queued": False, "running": True}
@@ -40970,7 +45213,9 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
         if not logs:
-            return False, "execution_logs is empty"
+            return True, "no execution logs recorded"
+        if self._manager_has_error_log(bb):
+            return False, "latest blocking execution error is not superseded by later success/review evidence"
         latest = ""
         for row in reversed(logs):
             if not isinstance(row, dict):
@@ -40980,7 +45225,7 @@ body{padding:18px}
                 latest = txt
                 break
         if not latest:
-            return False, "latest execution log is empty"
+            return True, "latest execution log is empty"
         low = latest.lower()
         error_tokens = (
             "error",
@@ -40994,7 +45239,7 @@ body{padding:18px}
             "non-zero",
         )
         if any(tok in low for tok in error_tokens):
-            return False, "latest execution log indicates error/failure"
+            return True, "latest execution log has error-like text but no unsuperseded blocking error"
         return True, "ok"
 
     def _reviewer_deems_done(self, text: str) -> bool:
@@ -41135,6 +45380,15 @@ body{padding:18px}
                 self.current_phase = f"agent:{role_key}:tool:{name}"
                 self.current_tool_name = name
             args = tc["function"]["arguments"]
+            self._emit(
+                "tool_start",
+                {
+                    "name": name,
+                    "agent_role": role_key,
+                    "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
+                    "summary": f"{self._agent_display_name(role_key)} tool start: {name}",
+                },
+            )
             args_error = str(tc.get("args_error", "") or "").strip()
             if args_error:
                 output = (
@@ -41180,6 +45434,7 @@ body{padding:18px}
                     "name": name,
                     "agent_role": role_key,
                     "result": trim(output, 500),
+                    "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                     "summary": f"{self._agent_display_name(role_key)} tool: {name}",
                 },
             )
@@ -41189,11 +45444,14 @@ body{padding:18px}
                 "output": trim(str(output or ""), 3000),
                 "ok": not str(output).startswith("Error:"),
             }
+            is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
             self._blackboard_update_from_tool_result(role_key, item)
-            # Failure ledger: record tool call and detect errors (unified)
-            self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
-            self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, item["ok"], role_key)
+            # Failure ledger: record actionable tool calls. Finish requests are
+            # gated separately and should not become their own stale error source.
+            if not is_finish_tool:
+                self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
+                self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, item["ok"], role_key)
             # Failure ledger: record edit_file as potential fix attempt if errors exist
             if name in ("edit_file", "write_file") and isinstance(args, dict):
                 fl = self._ensure_blackboard().get("failure_ledger", {})
@@ -41411,7 +45669,12 @@ body{padding:18px}
             if self.stall_escalation_triggered:
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
-            self._inject_pending_user_inputs()
+            injected_inputs = self._inject_pending_user_inputs()
+            if injected_inputs or bool(getattr(self, "runtime_reclassify_required", False)):
+                self._handle_runtime_goal_reclassification_if_needed(
+                    pinned_selection=pinned_selection,
+                    scope="multi-agent sync",
+                )
             self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -41623,11 +45886,18 @@ body{padding:18px}
             _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in _step_results)
             if _wrote and not _did_todo:
                 _bb_nudge = self._ensure_blackboard()
-                _cur_step = next((t for t in _bb_nudge.get("project_todos", []) if t.get("category") == "plan_step" and t.get("status") == "in_progress"), None)
+                _cur_step = next(
+                    (
+                        t for t in _bb_nudge.get("project_todos", [])
+                        if t.get("category") == "plan_step" and t.get("status") == "in_progress"
+                    ),
+                    None,
+                )
                 if _cur_step:
+                    _missing_subtasks = not self._active_plan_step_has_worker_todos(role)
                     _msg = self._build_plan_todo_reminder_text(
                         _cur_step,
-                        missing_subtasks=not self._active_plan_step_has_worker_todos(role),
+                        missing_subtasks=_missing_subtasks,
                     )
                     if _msg:
                         self._append_instruction_bubble(
@@ -41635,6 +45905,15 @@ body{padding:18px}
                             target_roles=(role,),
                             summary=f"plan+sync todo reminder injected ({role})",
                         )
+                    if _missing_subtasks:
+                        try:
+                            self._maybe_prompt_plan_resume_repair(
+                                reason="multi-agent-missing-subtasks",
+                                role=role,
+                                target_roles=(role,),
+                            )
+                        except Exception:
+                            pass
             # End-of-turn finish guard:
             # conclusive reply + no open todos + no known errors => auto-finish.
             agent_text = self._latest_agent_assistant_text(role)
@@ -41754,6 +46033,12 @@ body{padding:18px}
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
+            injected_inputs = self._inject_pending_user_inputs()
+            if injected_inputs or bool(getattr(self, "runtime_reclassify_required", False)):
+                self._handle_runtime_goal_reclassification_if_needed(
+                    pinned_selection=pinned_selection,
+                    scope="multi-agent sequential",
+                )
             self._apply_auto_compact_if_needed("auto:multi-seq", role=current_role)
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
@@ -42079,7 +46364,7 @@ body{padding:18px}
             return {"status": "skip", "reason": "empty-context"}
         # Build filtered tool list (read-only allowlist)
         filtered_tools = []
-        for tool in TOOLS:
+        for tool in self._available_tools():
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
             if name in PLAN_MODE_RESEARCH_TOOL_ALLOWLIST:
@@ -42182,6 +46467,12 @@ body{padding:18px}
                 return {"status": "interrupted"}
             fn_name = tc["function"]["name"]
             fn_args = tc["function"]["arguments"]
+            self._emit("tool_start", {
+                "name": fn_name,
+                "agent_role": "planner",
+                "conversation_visible": canonicalize_tool_name(fn_name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
+                "summary": f"plan-mode research start: {fn_name}",
+            })
             # Block write operations in bash
             if fn_name == "bash":
                 cmd = str(fn_args.get("command", "") if isinstance(fn_args, dict) else "")
@@ -42219,6 +46510,7 @@ body{padding:18px}
                 "name": fn_name,
                 "agent_role": "planner",
                 "result": trim(result_content, 500),
+                "conversation_visible": canonicalize_tool_name(fn_name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                 "summary": f"plan-mode research: {fn_name}",
             })
         finding_text = str(text or "").strip()
@@ -43662,7 +47954,7 @@ body{padding:18px}
         try:
             rsp = self.ollama.chat(
                 [{"role": "user", "content": f"/no_think\n{prompt}"}],
-                system="/no_think\nYou are a precise intent classifier. Output only the option ID or NONE.",
+                system=self._inject_runtime_environment_context("/no_think\nYou are a precise intent classifier. Output only the option ID or NONE."),
                 max_tokens=60,
                 think=False,
             )
@@ -43724,10 +48016,19 @@ body{padding:18px}
         seg_id = str(seg.get("id", "") if isinstance(seg, dict) else "")
         title = trim(str((chosen or {}).get("title", "") or choice_id), 220)
         summary = trim(str((chosen or {}).get("summary", "") or ""), 900)
-        steps_text = "\n".join(
-            f"- {trim(str(step or ''), 260)}"
+        grouped_step_rows = [
+            trim(str(step or ""), 260)
             for step in list(grouped_steps or [])[:12]
             if str(step or "").strip()
+        ]
+        steps_text = "\n".join(
+            f"- {step}"
+            for step in grouped_step_rows
+        )
+        source_of_truth = (
+            "blackboard plan.steps, project_todos, and .clouds_coder/plan.md. "
+            "Old plan-mode research/proposal bubbles were compacted after approval; "
+            "use context_recall only for missing evidence."
         )
         handoff = (
             "<plan-approved-handoff>\n"
@@ -43735,8 +48036,7 @@ body{padding:18px}
             f"summary: {summary}\n"
             f"steps:\n{steps_text or '- See blackboard plan.steps and .clouds_coder/plan.md'}\n"
             f"archived_planner_context: {seg_id or 'none'}\n"
-            "Execution source of truth: blackboard plan.steps, project_todos, and .clouds_coder/plan.md. "
-            "Old plan-mode research/proposal bubbles were compacted after approval; use context_recall only for missing evidence.\n"
+            f"Execution source of truth: {source_of_truth}\n"
             "</plan-approved-handoff>"
         )
         self.messages = [
@@ -43749,6 +48049,17 @@ body{padding:18px}
                 "content": trim(handoff, 5000),
                 "ts": now_ts(),
                 "agent_role": "planner",
+                "type": "plan_approved_handoff",
+                "data": {
+                    "choice_id": trim(str(choice_id or ""), 40),
+                    "title": title,
+                    "summary": summary,
+                    "steps": grouped_step_rows,
+                    "step_count": len([s for s in grouped_steps or [] if str(s or "").strip()]),
+                    "archived_planner_context": seg_id or "none",
+                    "plan_path": PLAN_FILE_RELATIVE_PATH,
+                    "source_of_truth": source_of_truth,
+                },
                 "_compact_planner_handoff": True,
             }
         )
@@ -43998,6 +48309,20 @@ body{padding:18px}
                 goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
                 media_inputs_round=initial_policy_media_inputs,
             )
+            if self._has_resumable_plan_state():
+                try:
+                    self._restore_runtime_policy_from_blackboard_locked()
+                    repair_issue = self._maybe_prompt_plan_resume_repair(
+                        reason="run-start",
+                        target_roles=(self._current_plan_worker_owner(),),
+                    )
+                    if bool(repair_issue.get("issue", False)):
+                        self._emit(
+                            "status",
+                            {"summary": f"plan state repair prompt injected: {repair_issue.get('reason', 'unknown')}"},
+                        )
+                except Exception:
+                    pass
             if bool(self.runtime_confirmation_needed) and int(self.runtime_task_level or 0) == 5:
                 confirm_prompt = self._level5_confirmation_prompt()
                 self.messages.append(
@@ -44159,7 +48484,7 @@ body{padding:18px}
                     # Skip reclassification if user has manually set task level
                     if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
                         self.runtime_reclassify_required = False
-                        self.runtime_goal_reset_pending = False
+                        self._mark_runtime_goal_reset_handled(reason="single-agent-user-level-override", clear_reclassify=True)
                     else:
                         policy_media_inputs = self._recent_multimodal_inputs()
                         self._emit_multimodal_attach_status(
@@ -44237,7 +48562,7 @@ body{padding:18px}
                 self._clear_live_truncation()
                 response = self._chat_with_same_model_retry(
                     self.messages,
-                    tools=TOOLS,
+                    tools=self._available_tools(),
                     system=self._system_prompt(),
                     max_tokens=self.max_output_tokens,
                     think=False,
@@ -44804,7 +49129,14 @@ body{padding:18px}
                     args = tc["function"]["arguments"]
                     args_error = str(tc.get("args_error", "") or "").strip()
                     raw_args = tc.get("raw_arguments")
-                    self._emit("tool_start", {"name": name, "summary": f"tool start: {name}"})
+                    self._emit(
+                        "tool_start",
+                        {
+                            "name": name,
+                            "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
+                            "summary": f"tool start: {name}",
+                        },
+                    )
                     dispatched_name = name
                     output = ""
                     skip_dispatch = False
@@ -45032,6 +49364,7 @@ body{padding:18px}
                             "ok": not str(output).startswith("Error:"),
                         }
                     )
+                    is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
                     # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
                     # plan+single there is no worker turn — we must update inline so that
@@ -45049,9 +49382,11 @@ body{padding:18px}
                     except Exception:
                         pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
-                    self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
+                    if not is_finish_tool:
+                        self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
                     _sa_ok = not str(output or "").startswith("Error")
-                    self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
+                    if not is_finish_tool:
+                        self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
                     if name in ("edit_file", "write_file") and isinstance(args, dict):
                         _fl = self._ensure_blackboard().get("failure_ledger", {})
                         _all_errors = _fl.get("errors", []) if isinstance(_fl, dict) else []
@@ -45067,7 +49402,15 @@ body{padding:18px}
                                     "applied" if _sa_ok else "failed(edit_error)",
                                     "single",
                                 )
-                    self._emit("tool_result", {"name": name, "result": trim(output, 500), "summary": f"tool done: {name}"})
+                    self._emit(
+                        "tool_result",
+                        {
+                            "name": name,
+                            "result": trim(output, 500),
+                            "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
+                            "summary": f"tool done: {name}",
+                        },
+                    )
                     if int(tool_error_streaks.get(tool_key, 0) or 0) >= HARD_BREAK_TOOL_ERROR_THRESHOLD:
                         stop_due_to_hard_break = True
                         hard_break_reason = (
@@ -45429,17 +49772,25 @@ body{padding:18px}
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        bootstrapped = False
+                        repair_issue = {}
                         try:
-                            bootstrapped = self._ensure_worker_todos_for_plan_step(
-                                self._get_active_plan_step(),
-                                force_refresh=False,
-                                owner=single_role,
+                            repair_issue = self._maybe_prompt_plan_resume_repair(
+                                reason="missing-progress",
+                                role=single_role,
+                                target_roles=(single_role,),
                             )
                         except Exception:
-                            bootstrapped = False
-                        if bootstrapped:
-                            self._emit("status", {"summary": "todo subtasks auto-bootstrapped after missing-progress detection"})
+                            repair_issue = {}
+                        if bool(repair_issue.get("issue", False)):
+                            self._emit(
+                                "status",
+                                {"summary": f"plan state repair required: {repair_issue.get('reason', 'unknown')}"},
+                            )
+                            self.last_todo_reminder_ts = now_tick
+                            self.todo_reminder_count += 1
+                            if bool(repair_issue.get("blocking", True)):
+                                retry_requested_this_round = True
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         else:
                             self._append_plan_guidance_bubble(
                                 "<reminder>Plan subtasks are still unavailable. Continue with one concrete action for the active plan step, or report the blocker with exact evidence.</reminder>",
@@ -45783,6 +50134,63 @@ body{padding:18px}
                     conversation_feed.append(
                         {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
                     )
+                elif t == "web_search":
+                    d = op.get("data", {})
+                    if not bool(d.get("conversation_visible", True)):
+                        continue
+                    d_view = dict(d)
+                    if lite:
+                        if isinstance(d_view.get("top_results"), list):
+                            d_view["top_results"] = d_view.get("top_results", [])[:3]
+                        if isinstance(d_view.get("fetched_pages"), list):
+                            d_view["fetched_pages"] = d_view.get("fetched_pages", [])[:4]
+                        if isinstance(d_view.get("errors"), list):
+                            d_view["errors"] = d_view.get("errors", [])[:3]
+                    phase = str(d.get("phase", "") or "")
+                    mode = str(d.get("mode", "") or "")
+                    query_text = str(d.get("query", "") or d.get("url", "") or "")
+                    text = (
+                        f"[web_search] agent_web_search {phase} {mode}\n"
+                        f"query: {query_text}\n"
+                        f"results: {d.get('result_count', 0)} pages: {d.get('page_count', d.get('fetched', 0))} "
+                        f"evidence: {d.get('evidence_records', 0)}\n"
+                        f"{d.get('summary', '')}"
+                    )
+                    row = {
+                        "role": "system",
+                        "type": "web_search",
+                        "ts": op.get("ts", 0),
+                        "text": text,
+                        "data": d_view,
+                    }
+                    agent_role = self._sanitize_agent_bubble_role(d.get("agent_role", ""))
+                    if agent_role:
+                        row["agent_role"] = agent_role
+                    conversation_feed.append(row)
+                elif t in {"tool_start", "tool_result"}:
+                    d = op.get("data", {})
+                    tool_name = str(d.get("name", "") or d.get("tool", "") or "").strip()
+                    visible_tools = CONVERSATION_VISIBLE_TOOL_EVENTS
+                    if not bool(d.get("conversation_visible", tool_name in visible_tools)):
+                        continue
+                    if canonicalize_tool_name(tool_name) not in visible_tools:
+                        continue
+                    result = str(d.get("result", "") or "")
+                    if lite and result:
+                        result = trim(result, 1200)
+                    d_view = dict(d)
+                    if lite and d_view.get("result") is not None:
+                        d_view["result"] = result
+                    text = (
+                        f"[{t}] {tool_name}\n"
+                        f"{str(d.get('summary', '') or '').strip()}\n"
+                        f"{result}"
+                    ).strip()
+                    row = {"role": "system", "type": t, "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    agent_role = self._sanitize_agent_bubble_role(d.get("agent_role", ""))
+                    if agent_role:
+                        row["agent_role"] = agent_role
+                    conversation_feed.append(row)
             conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
             upload_view = []
@@ -45802,6 +50210,12 @@ body{padding:18px}
                 )
             operations_view = []
             for op in self.operations[-ops_window:]:
+                if (
+                    str(op.get("type") or "") == "web_search"
+                    and isinstance(op.get("data"), dict)
+                    and not bool((op.get("data") or {}).get("conversation_visible", True))
+                ):
+                    continue
                 if not lite:
                     operations_view.append(op)
                     continue
@@ -45885,6 +50299,7 @@ body{padding:18px}
                 "arbiter_max_tokens": int(self.arbiter_max_tokens),
                 "arbiter_temperature": float(self.arbiter_temperature),
                 "execution_mode": self._effective_execution_mode(),
+                "multi_agent_context_hud_enabled": bool(self._multi_agent_context_hud_should_show()),
                 "agent_active_role": self._sanitize_agent_bubble_role(self.active_agent_role),
                 "agent_round_index": int(self.agent_round_index),
                 "agent_phase": str(self.current_phase or "idle"),
@@ -45909,6 +50324,9 @@ body{padding:18px}
                 "tool_memory_policy": normalize_tool_memory_policy(
                     getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
                 ),
+                "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+                "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+                "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
                 "auto_task_level_ceiling": self._auto_task_level_ceiling_value(),
                 "read_context_budget": self._read_context_budget(),
                 "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
@@ -46279,6 +50697,10 @@ class SessionManager:
         arbiter_temperature: float = ARBITER_DEFAULT_TEMPERATURE,
         execution_mode: str = EXECUTION_MODE_SYNC,
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
+        web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED,
+        web_search_setting_locked: bool = False,
+        user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
+        user_memory_setting_locked: bool = False,
         upload_callback=None,
         run_finished_callback=None,
         reference_prepare_callback=None,
@@ -46330,6 +50752,10 @@ class SessionManager:
         self.arbiter_max_tokens = max(24, min(256, int(arbiter_max_tokens or ARBITER_DEFAULT_MAX_TOKENS)))
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
+        self.web_search_enabled = bool(web_search_enabled)
+        self.web_search_setting_locked = bool(web_search_setting_locked)
+        self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
+        self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.single_advance_prompt_enhance = False
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
@@ -46351,6 +50777,9 @@ class SessionManager:
         self.user_root = self.root.parent
         self.user_root.mkdir(parents=True, exist_ok=True)
         self.user_prefs_path = self.user_root / "user_prefs.json"
+        self.user_memory_store = UserMemoryStore(self.user_root, user_id=self.user_id)
+        self.user_interaction_optimizer = UserInteractionOptimizer()
+        self.user_intent_profiler = UserIntentProfiler(self.user_memory_store, self.user_interaction_optimizer)
         self.user_model_profiles: dict[str, dict] = {}
         self.user_active_profile_id = ""
         self.user_language = normalize_ui_language(default_language)
@@ -46469,6 +50898,8 @@ class SessionManager:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+            "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -46534,6 +50965,15 @@ class SessionManager:
                 if raw_auto_task_level_ceiling is not None
                 else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            if not bool(getattr(self, "web_search_setting_locked", False)) and "web_search_enabled" in raw:
+                self.web_search_enabled = _to_bool_like(
+                    raw.get("web_search_enabled"),
+                    default=getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED),
+                )
+            if not bool(getattr(self, "user_memory_setting_locked", False)):
+                raw_user_memory_mode = extract_user_memory_mode_setting(raw)
+                if raw_user_memory_mode is not None:
+                    self.user_memory_mode = normalize_user_memory_mode(raw_user_memory_mode)
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -46646,6 +51086,8 @@ class SessionManager:
         sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
         )
+        sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+        sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
         sess.shell_command_timeout_seconds = normalize_timeout_seconds(
             self.shell_command_timeout_seconds,
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
@@ -46694,6 +51136,18 @@ class SessionManager:
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
             )
         )
+        if bool(getattr(self, "web_search_setting_locked", False)):
+            set_web_search_enabled_on_runtime(sess, self.web_search_enabled, persist=True)
+        else:
+            self.web_search_enabled = bool(
+                getattr(sess, "web_search_enabled", getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+            )
+        if bool(getattr(self, "user_memory_setting_locked", False)):
+            sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        else:
+            self.user_memory_mode = normalize_user_memory_mode(
+                getattr(sess, "user_memory_mode", getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            )
         self._persist_user_prefs()
         if not apply_to_all:
             return
@@ -46701,6 +51155,69 @@ class SessionManager:
             if other.id == sess.id:
                 continue
             self._apply_user_defaults_to_session(other, clear_cap_cache=True)
+
+    def prepare_user_intent_for_session(self, sess: SessionState, content: str) -> dict:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            sess.user_memory_mode = "off"
+            sess.user_profile_capsule = ""
+            sess.user_profile_capsule_meta = {"mode": "off", "memory_count": 0}
+            return {"ok": True, "mode": "off", "capsule_chars": 0, "memory_count": 0}
+        try:
+            out = self.user_intent_profiler.prepare_session(sess, content, mode)
+            sess.user_memory_mode = mode
+            sess.updated_at = now_ts()
+            sess._persist()
+            return out
+        except Exception as exc:
+            sess.user_profile_capsule = ""
+            sess.user_profile_capsule_meta = {"mode": mode, "error": trim(str(exc), 160)}
+            return {"ok": False, "mode": mode, "error": trim(str(exc), 200)}
+
+    def capture_user_memory_from_session(self, sess: SessionState) -> dict:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            return {"ok": True, "skipped": True, "mode": "off"}
+        try:
+            return self.user_memory_store.capture_session(sess)
+        except Exception as exc:
+            return {"ok": False, "error": trim(str(exc), 220)}
+
+    def user_memory_payload(self, *, limit: int = 80) -> dict:
+        payload = self.user_memory_store.payload(limit=limit)
+        payload["user_memory_mode"] = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        payload["setting_locked"] = bool(getattr(self, "user_memory_setting_locked", False))
+        return payload
+
+    def user_memory_export_payload(self) -> dict:
+        payload = self.user_memory_store.export_payload()
+        payload["user_memory_mode"] = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        return payload
+
+    def clear_user_memory(self) -> dict:
+        return self.user_memory_store.clear()
+
+    def set_user_memory_mode(self, mode: str) -> dict:
+        if bool(getattr(self, "user_memory_setting_locked", False)):
+            return {
+                "ok": False,
+                "locked": True,
+                "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+                "error": "user memory mode is locked by startup argument",
+            }
+        self.user_memory_mode = normalize_user_memory_mode(mode)
+        for sess in list(self.sessions.values()):
+            try:
+                sess.user_memory_mode = self.user_memory_mode
+                if self.user_memory_mode == "off":
+                    sess.user_profile_capsule = ""
+                    sess.user_profile_capsule_meta = {"mode": "off", "memory_count": 0}
+                sess.updated_at = now_ts()
+                sess._persist()
+            except Exception:
+                pass
+        self._persist_user_prefs()
+        return {"ok": True, "user_memory_mode": self.user_memory_mode}
 
     def _session_summary_from_disk(self, path: Path) -> dict:
         sid = str(path.name or "").strip()
@@ -46764,6 +51281,7 @@ class SessionManager:
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
                 max_output_tokens=self.max_output_tokens,
+                web_search_enabled=self.web_search_enabled,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -46865,6 +51383,7 @@ class SessionManager:
                 arbiter_temperature=self.arbiter_temperature,
                 execution_mode=self.execution_mode,
                 max_output_tokens=self.max_output_tokens,
+                web_search_enabled=self.web_search_enabled,
                 ui_language=self.user_language,
                 js_lib_root=self.js_lib_root,
                 owner_user_id=self.user_id,
@@ -47220,6 +51739,8 @@ class SessionManager:
             if not sess:
                 raise KeyError(session_id)
             catalog = sess.load_llm_config(config, source=source)
+            if bool(getattr(self, "web_search_setting_locked", False)):
+                set_web_search_enabled_on_runtime(sess, self.web_search_enabled, persist=True)
             self._sync_from_session(sess, apply_to_all=True)
             return catalog
 
@@ -47257,6 +51778,12 @@ class SessionManager:
             cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
             if cfg_auto_task_level_ceiling is not None:
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+            cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
+            if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
+                self.web_search_enabled = bool(cfg_web_search_enabled)
+            cfg_user_memory_mode = extract_user_memory_mode_setting(cfg)
+            if cfg_user_memory_mode is not None and not bool(getattr(self, "user_memory_setting_locked", False)):
+                self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
             self._persist_user_prefs()
             for sess in self.sessions.values():
                 self._apply_user_defaults_to_session(sess, clear_cap_cache=True)
@@ -47494,6 +52021,9 @@ window.MathJax={
             <div id="toolsMenu" class="popup-menu" style="display:none">
               <a id="compactAction" class="popup-item" href="#">Compact</a>
               <a id="refreshAction" class="popup-item" href="#">Refresh</a>
+              <a id="memoryModeAction" class="popup-item" href="#">Memory: Weak</a>
+              <a id="memoryExportAction" class="popup-item" href="#">Export Memory</a>
+              <a id="memoryClearAction" class="popup-item" href="#">Clear Memory</a>
             </div>
           </div>
           <div class="popup-dropdown" style="position:relative;display:inline-block">
@@ -47510,7 +52040,7 @@ window.MathJax={
           <button id="planModeBtn" class="subtle" title="Toggle Plan Mode">Plan: Auto</button>
           <div class="export-dropdown" style="position:relative;display:inline-block">
             <button id="exportMenuBtn" class="subtle">Export ▾</button>
-            <div id="exportMenu" style="display:none;position:absolute;bottom:100%;left:0;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:999;min-width:160px;padding:4px 0;margin-bottom:4px">
+            <div id="exportMenu" class="popup-menu" style="display:none">
               <a id="downloadSessionBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export ZIP</a>
               <a id="exportMdBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export Markdown</a>
               <a id="exportPdfBtn" class="export-item" href="#" style="display:block;padding:6px 14px;text-decoration:none;color:#333;font-size:13px">Export PDF</a>
@@ -47677,7 +52207,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-preview-row{margin-top:6px}
 .msg-preview-btn{border:1px solid #c8d8ee;background:#f5f9ff;color:#204a7a;padding:4px 8px;border-radius:999px;font-size:.75rem;cursor:pointer}
 .msg-preview-btn:hover{background:#eaf2ff}
-.msg{padding:10px 12px;border-radius:12px;max-width:88%;white-space:normal;margin:0 0 8px 0;flex:0 0 auto}
+.msg{padding:8px 10px;border-radius:10px;max-width:88%;white-space:normal;margin:0 0 6px 0;flex:0 0 auto}
 .chat-virt-spacer{flex:0 0 auto;margin:0!important;padding:0!important;border:0!important;min-height:0!important;max-width:none!important;pointer-events:none}
 @supports (content-visibility:auto){
   .msg{contain:layout paint}
@@ -47698,7 +52228,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
 .msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
-.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:10px 11px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
 .msg.agent-reviewer .msg-agent-shell{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
@@ -47714,6 +52244,12 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .manager-delegate-line{margin:7px 0 0}
 .manager-delegate-line>span{display:block;font-size:.68rem;font-weight:700;color:#6c5794;text-transform:uppercase;letter-spacing:.03em;margin-bottom:2px}
 .manager-delegate-line>div{font-size:.82rem;white-space:pre-wrap;word-break:break-word}
+.manager-delegate-context{margin:8px 0 0;border:1px solid rgba(126,92,185,.22);border-radius:10px;background:rgba(255,255,255,.48);overflow:hidden}
+.manager-delegate-context>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:.72rem;font-weight:800;color:#6c5794;text-transform:uppercase;letter-spacing:.03em;user-select:none}
+.manager-delegate-context>summary::-webkit-details-marker{display:none}
+.manager-delegate-context>summary::before{content:'+';display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#efe5ff;border:1px solid #d7c3fb;color:#5f3da1;font-size:.72rem;line-height:1}
+.manager-delegate-context[open]>summary::before{content:'-'}
+.manager-delegate-context-body{padding:0 9px 9px 31px;font-size:.82rem;line-height:1.45;white-space:pre-wrap;word-break:break-word;color:#2d2440}
 .agent-control-card{border:1px solid #d8e2f1;background:#f8fbff;border-radius:10px;padding:9px}
 .agent-control-head{font-size:.78rem;font-weight:700;color:#38557a;margin-bottom:6px;text-transform:uppercase;letter-spacing:.03em}
 .agent-control-pills{display:flex;flex-wrap:wrap;gap:6px}
@@ -47774,18 +52310,23 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
 .msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
 .msg.msg-event-wrap{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
-.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:9px 10px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-event-card{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-event-card{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
 .msg.agent-reviewer .msg-event-card{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
 .msg.agent-manager .msg-event-card{background:linear-gradient(180deg,#fcfaff 0%,#f2eaff 100%);border-color:#dcc6ff}
 .msg.agent-planner .msg-event-card{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
 .msg-event-card-skill{background:linear-gradient(180deg,#f9fcff 0%,#edf6ff 100%);border-color:#cadff7}
-.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px}
+.msg-event-card-web{background:linear-gradient(180deg,#fbfffe 0%,#ebf8f5 100%);border-color:#bfe5dd}
+.msg-event-card-adjustment{background:linear-gradient(180deg,#fffefd 0%,#fff3e7 100%);border-color:#ffd1a5}
+.msg-event-card-feedback{background:linear-gradient(180deg,#fffaff 0%,#f5edff 100%);border-color:#dec7ff}
+.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:7px;min-width:0}
+.msg-event-head>div:first-child{min-width:0}
 .msg-event-title{font-size:.94rem;font-weight:800;line-height:1.2;color:#1f314b}
 .msg-event-sub{margin-top:3px;font-size:.76rem;line-height:1.4;color:#627790}
-.msg-event-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end}
-.msg-event-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.72rem;font-weight:700;line-height:1}
+.msg-event-title,.msg-event-sub{overflow-wrap:anywhere}
+.msg-event-pills{display:flex;flex-wrap:wrap;gap:5px;align-items:center;justify-content:flex-end;min-width:0}
+.msg-event-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.7rem;font-weight:700;line-height:1}
 .msg-event-pill.ok{background:#ebf8ef;border-color:#c7e6ce;color:#21623a}
 .msg-event-pill.warn{background:#fff4e3;border-color:#ffd5a4;color:#8a4b08}
 .msg-event-pill.error{background:#fff0f0;border-color:#f1c5c5;color:#a12d2d}
@@ -47793,13 +52334,25 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-event-pill.live{background:#eefaf8;border-color:#bfe8df;color:#0f6e62}
 .msg-event-pill.neutral{background:#f5f8fd;border-color:#dce5f1;color:#55687f}
 .msg-event-pill.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px}
-.msg-event-cell{padding:9px 10px;border:1px solid #e1eaf5;border-radius:12px;background:rgba(255,255,255,.78)}
+.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;margin-bottom:7px}
+.msg-event-cell{padding:7px 8px;border:1px solid #e1eaf5;border-radius:9px;background:rgba(255,255,255,.78)}
 .msg-event-label{font-size:.68rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#6a7e96;margin-bottom:4px}
 .msg-event-value{font-size:.83rem;line-height:1.45;color:#1f314b;white-space:pre-wrap;word-break:break-word}
 .msg-event-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem}
-.msg-event-body{display:grid;gap:10px}
+.msg-event-body{display:grid;gap:7px}
+.msg-event-search-results{display:grid;gap:8px;max-height:260px;overflow:auto}
+.msg-event-card-web .msg-event-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+.msg-event-card-web .msg-event-value{overflow-wrap:anywhere}
+.msg-event-search-result{border:1px solid rgba(79,128,141,.2);border-radius:10px;background:rgba(255,255,255,.58);padding:8px 9px;display:grid;gap:3px}
+.msg-event-search-title{font-weight:800;font-size:.84rem;color:#173f49;line-height:1.25}
+.msg-event-search-domain,.msg-event-search-url{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.68rem;color:#58707b;word-break:break-all}
+.msg-event-search-snippet{font-size:.78rem;color:#334155;line-height:1.4;white-space:pre-wrap}
+.msg-event-details{border:1px solid rgba(79,128,141,.18);border-radius:10px;background:rgba(255,255,255,.48);overflow:hidden}
+.msg-event-details>summary{cursor:pointer;padding:7px 9px;font-size:.72rem;font-weight:800;color:#49636e;user-select:none}
 .msg-event-note{font-size:.79rem;line-height:1.48;color:#60748d}
+.msg-event-check-list{display:grid;gap:6px}
+.msg-event-check{display:flex;gap:8px;align-items:flex-start;padding:7px 9px;border:1px solid #e1eaf5;border-radius:10px;background:rgba(255,255,255,.72);font-size:.82rem;line-height:1.42;color:#1f314b}
+.msg-event-check-mark{font-weight:900;color:#1f8a4c;line-height:1.35}
 .msg-event-tool-grid{display:flex;flex-wrap:wrap;gap:8px}
 .msg-run-dot{width:8px;height:8px;border-radius:999px;background:#13b8a6;box-shadow:0 0 0 0 rgba(19,184,166,.38);animation:msgRunPulse 1.6s ease-out infinite}
 @keyframes msgRunPulse{0%{box-shadow:0 0 0 0 rgba(19,184,166,.36)}70%{box-shadow:0 0 0 9px rgba(19,184,166,0)}100%{box-shadow:0 0 0 0 rgba(19,184,166,0)}}
@@ -47997,7 +52550,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -48066,6 +52619,8 @@ const I18N={
     btn_new_session:'New Session',btn_rename:'Rename',btn_delete:'Delete',
     btn_send:'Send',btn_interrupt:'Interrupt',btn_compact:'Compact',btn_refresh:'Refresh',btn_export_session:'Export Session',
     btn_clear_stale_todos:'Clear Stale Todos',
+    btn_memory_mode:'Memory: {mode}',btn_memory_export:'Export Memory',btn_memory_clear:'Clear Memory',
+    memory_mode_off:'Off',memory_mode_weak:'Weak',memory_mode_on:'On',memory_clear_confirm:'Clear this user memory? This only removes summary memory for the current user.',memory_exported:'User memory exported',memory_cleared:'User memory cleared',memory_mode_locked:'Memory mode is locked by startup arguments',
     prompt_placeholder:'Describe your task, or drag files here...',
     upload_drop:'Drag and drop code / Markdown / PDF / Excel / Word / PPT / CSV here, click to choose files, or paste clipboard files',
     upload_file_hint:'Supports drag/drop or paste: code / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -48102,6 +52657,8 @@ const I18N={
     btn_new_session:'新建会话',btn_rename:'重命名',btn_delete:'删除',
     btn_send:'发送',btn_interrupt:'中断',btn_compact:'压缩',btn_refresh:'刷新',btn_export_session:'导出会话',
     btn_clear_stale_todos:'清除陈旧待办',
+    btn_memory_mode:'记忆：{mode}',btn_memory_export:'导出记忆',btn_memory_clear:'清空记忆',
+    memory_mode_off:'关闭',memory_mode_weak:'弱',memory_mode_on:'开启',memory_clear_confirm:'清空当前用户的长期记忆？这只会删除当前用户的摘要记忆。',memory_exported:'用户记忆已导出',memory_cleared:'用户记忆已清空',memory_mode_locked:'记忆模式已被启动参数锁定',
     prompt_placeholder:'描述你的任务，或将文件拖入此处...',
     upload_drop:'拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件，也可直接粘贴剪切板文件',
     upload_file_hint:'支持拖入或粘贴文件：代码 / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -48138,6 +52695,8 @@ const I18N={
     btn_new_session:'新增會話',btn_rename:'重新命名',btn_delete:'刪除',
     btn_send:'送出',btn_interrupt:'中斷',btn_compact:'壓縮',btn_refresh:'重新整理',btn_export_session:'匯出會話',
     btn_clear_stale_todos:'清除陳舊待辦',
+    btn_memory_mode:'記憶：{mode}',btn_memory_export:'匯出記憶',btn_memory_clear:'清空記憶',
+    memory_mode_off:'關閉',memory_mode_weak:'弱',memory_mode_on:'開啟',memory_clear_confirm:'清空目前使用者的長期記憶？這只會刪除目前使用者的摘要記憶。',memory_exported:'使用者記憶已匯出',memory_cleared:'使用者記憶已清空',memory_mode_locked:'記憶模式已被啟動參數鎖定',
     prompt_placeholder:'描述你的任務，或將檔案拖入此處...',
     upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案，也可直接貼上剪貼簿檔案',
     upload_file_hint:'支援拖入或貼上檔案：程式碼 / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -48174,6 +52733,8 @@ const I18N={
     btn_new_session:'新規セッション',btn_rename:'リネーム',btn_delete:'削除',
     btn_send:'送信',btn_interrupt:'中断',btn_compact:'コンパクト',btn_refresh:'更新',btn_export_session:'セッションをエクスポート',
     btn_clear_stale_todos:'古いTodoを消去',
+    btn_memory_mode:'メモリ：{mode}',btn_memory_export:'メモリをエクスポート',btn_memory_clear:'メモリを消去',
+    memory_mode_off:'オフ',memory_mode_weak:'弱',memory_mode_on:'オン',memory_clear_confirm:'このユーザーの長期メモリを消去しますか？現在のユーザーの要約メモリのみ削除します。',memory_exported:'ユーザーメモリをエクスポートしました',memory_cleared:'ユーザーメモリを消去しました',memory_mode_locked:'メモリモードは起動引数で固定されています',
     prompt_placeholder:'タスクを説明、またはファイルをここにドラッグ...',
     upload_drop:'コード / Markdown / PDF / Excel / Word / PPT / CSV をドラッグ＆ドロップ、クリックして選択、またはクリップボードから貼り付け',
     upload_file_hint:'ドラッグ＆ドロップまたは貼り付け対応：コード / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -48208,16 +52769,22 @@ Object.assign(I18N['en'],{
   sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_catalog:'Catalog',
   role_explorer:'Explorer',role_developer:'Developer',role_reviewer:'Reviewer',role_manager:'Manager',role_planner:'Planner',role_agent:'Agent',role_single:'Context',
   callout_warning:'Warning',callout_notice:'Notice',callout_instruction:'Instruction',callout_tip:'Tip',callout_reminder:'Reminder',
-  event_manager_delegate_title:'Manager Delegate',event_objective:'Objective',event_instruction:'Instruction',event_intent:'intent',
+      event_manager_delegate_title:'Manager Delegate',event_objective:'Objective',event_instruction:'Instruction',event_context:'Context',event_intent:'intent',
+  event_plan_handoff_title:'Plan Approved',event_plan_handoff_choice:'choice',event_plan_handoff_steps:'steps',event_plan_handoff_archive:'archive',event_plan_handoff_source:'source of truth',event_summary:'summary',event_plan_path:'plan path',
+  event_step_verified_title:'Step Verified',event_step_verified_note:'The active step acceptance checks were marked as passed.',event_step_verified_checks:'checks',
+  event_todo_focus_title:'Todo Focus',event_todo_focus_note:'Continue the current in-progress subtask.',
+  event_live_user_adjustment_title:'Live User Adjustment',event_live_user_adjustment_note:'Latest user feedback was injected into the active run.',event_feedback_merge_title:'Feedback Merge',event_feedback_merge_note:'Manager merged the latest user feedback with the active task direction.',event_feedback_input:'user input',event_current_step:'current step',event_directive:'directive',event_priority:'priority',event_weight:'weight',event_conflict:'conflict',event_score:'score',
   event_tool_calls_title:'Tool Calls',event_tool_calls_note:'Model scheduled these tools for the current turn.',event_tool_calls_empty:'No structured tool metadata was attached to this turn.',
+  event_tool_result_title:'Tool Result',event_tool_start:'started',event_tool_done:'done',
+  event_web_search_title:'Web Search',event_web_query:'Query',event_web_results:'results',event_web_pages:'pages',event_web_fetched_pages:'visited pages',event_web_followed:'followed',event_web_errors:'errors',event_web_evidence:'evidence',event_web_trails:'trails',event_web_note:'agent_web_search updated the local web evidence index.',
   event_skill_loaded_title:'Skill Loaded',event_skill_loaded_note:'Skill context was auto-loaded into the current run.',event_skill_loaded_empty:'No public description was attached to this skill notification.',event_skill_label:'skill',
   event_loaded:'loaded',event_preview_truncated:'preview truncated',
   event_file_patch_title:'File Patch',event_session:'session',
   event_upload_title:'Upload',event_upload_path:'path',event_upload_filename:'filename',event_preview_unavailable:'Preview unavailable for this upload.',event_upload_parsing:'Parsing uploaded file in background. The bubble will refresh when parsing completes.',event_upload_failed:'Upload parsing failed',
   event_command_title:'Command',event_command_label:'command',event_cwd:'cwd',event_changed:'changed',event_command_empty:'No command output captured.',event_ui_truncated:'UI truncated',event_model_truncated:'Model truncated',event_temp_read_file:'Temp read_file',event_buffered:'Buffered',
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
-	  event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
-	  event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
+      event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
+      event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
@@ -48230,16 +52797,22 @@ Object.assign(I18N['zh-CN'],{
   no_todos:'暂无待办',no_tasks:'暂无任务',no_catalog:'暂无目录',
   role_explorer:'探索者',role_developer:'开发者',role_reviewer:'审查者',role_manager:'管理者',role_planner:'规划者',role_agent:'Agent',role_single:'上下文',
   callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建议',callout_reminder:'提醒',
-  event_manager_delegate_title:'管理者委派',event_objective:'目标',event_instruction:'指令',event_intent:'意图',
+      event_manager_delegate_title:'管理者委派',event_objective:'目标',event_instruction:'指令',event_context:'上下文',event_intent:'意图',
+  event_plan_handoff_title:'计划已批准',event_plan_handoff_choice:'方案',event_plan_handoff_steps:'步骤',event_plan_handoff_archive:'归档',event_plan_handoff_source:'执行依据',event_summary:'总结',event_plan_path:'计划路径',
+  event_step_verified_title:'步骤已验收',event_step_verified_note:'当前步骤的验收检查已标记为通过。',event_step_verified_checks:'验收项',
+  event_todo_focus_title:'Todo 焦点',event_todo_focus_note:'继续当前进行中的子任务。',
+  event_live_user_adjustment_title:'实时用户调整',event_live_user_adjustment_note:'最新用户反馈已注入当前运行。',event_feedback_merge_title:'反馈合并',event_feedback_merge_note:'管理者已将最新用户反馈合并到当前任务方向。',event_feedback_input:'用户输入',event_current_step:'当前步骤',event_directive:'指令',event_priority:'优先级',event_weight:'权重',event_conflict:'冲突',event_score:'分数',
   event_tool_calls_title:'工具调用',event_tool_calls_note:'模型已为当前轮安排以下工具调用。',event_tool_calls_empty:'当前轮没有附带结构化工具元数据。',
+  event_tool_result_title:'工具结果',event_tool_start:'开始',event_tool_done:'完成',
+  event_web_search_title:'联网检索',event_web_query:'检索词',event_web_results:'结果',event_web_pages:'页面',event_web_fetched_pages:'已访问页面',event_web_followed:'跟进',event_web_errors:'错误',event_web_evidence:'证据',event_web_trails:'轨迹',event_web_note:'agent_web_search 已更新本地网页证据索引。',
   event_skill_loaded_title:'Skill 已加载',event_skill_loaded_note:'Skill 上下文已自动加载到当前运行。',event_skill_loaded_empty:'该 skill 通知没有附带公开描述。',event_skill_label:'skill',
   event_loaded:'已加载',event_preview_truncated:'预览被截断',
   event_file_patch_title:'文件补丁',event_session:'会话',
   event_upload_title:'上传',event_upload_path:'路径',event_upload_filename:'文件名',event_preview_unavailable:'该上传暂不支持预览。',event_upload_parsing:'正在后台解析上传文件。解析完成后气泡会自动刷新。',event_upload_failed:'上传解析失败',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目录',event_changed:'变更',event_command_empty:'未捕获到命令输出。',event_ui_truncated:'UI 截断',event_model_truncated:'模型截断',event_temp_read_file:'临时 read_file',event_buffered:'已缓冲',
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
-	  event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
-	  event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
+      event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
+      event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
@@ -48255,16 +52828,22 @@ Object.assign(I18N['zh-TW'],{
   level_3_collab:'L3 協作',
   role_explorer:'探索者',role_developer:'開發者',role_reviewer:'審查者',role_manager:'管理者',role_planner:'規劃者',role_agent:'Agent',role_single:'上下文',
   callout_warning:'警告',callout_notice:'提示',callout_instruction:'指令',callout_tip:'建議',callout_reminder:'提醒',
-  event_manager_delegate_title:'管理者委派',event_objective:'目標',event_instruction:'指令',event_intent:'意圖',
+      event_manager_delegate_title:'管理者委派',event_objective:'目標',event_instruction:'指令',event_context:'上下文',event_intent:'意圖',
+  event_plan_handoff_title:'計畫已批准',event_plan_handoff_choice:'方案',event_plan_handoff_steps:'步驟',event_plan_handoff_archive:'封存',event_plan_handoff_source:'執行依據',event_summary:'總結',event_plan_path:'計畫路徑',
+  event_step_verified_title:'步驟已驗收',event_step_verified_note:'目前步驟的驗收檢查已標記為通過。',event_step_verified_checks:'驗收項',
+  event_todo_focus_title:'Todo 焦點',event_todo_focus_note:'繼續目前進行中的子任務。',
+  event_live_user_adjustment_title:'即時使用者調整',event_live_user_adjustment_note:'最新使用者回饋已注入目前執行。',event_feedback_merge_title:'回饋合併',event_feedback_merge_note:'管理者已將最新使用者回饋合併到目前任務方向。',event_feedback_input:'使用者輸入',event_current_step:'目前步驟',event_directive:'指令',event_priority:'優先級',event_weight:'權重',event_conflict:'衝突',event_score:'分數',
   event_tool_calls_title:'工具呼叫',event_tool_calls_note:'模型已為目前輪安排以下工具呼叫。',event_tool_calls_empty:'目前輪沒有附帶結構化工具中繼資料。',
+  event_tool_result_title:'工具結果',event_tool_start:'開始',event_tool_done:'完成',
+  event_web_search_title:'網路檢索',event_web_query:'檢索詞',event_web_results:'結果',event_web_pages:'頁面',event_web_fetched_pages:'已訪問頁面',event_web_followed:'跟進',event_web_errors:'錯誤',event_web_evidence:'證據',event_web_trails:'軌跡',event_web_note:'agent_web_search 已更新本機網頁證據索引。',
   event_skill_loaded_title:'Skill 已載入',event_skill_loaded_note:'Skill 上下文已自動載入到目前執行。',event_skill_loaded_empty:'此 skill 通知沒有附帶公開描述。',event_skill_label:'skill',
   event_loaded:'已載入',event_preview_truncated:'預覽已截斷',
   event_file_patch_title:'檔案補丁',event_session:'會話',
   event_upload_title:'上傳',event_upload_path:'路徑',event_upload_filename:'檔名',event_preview_unavailable:'此上傳暫時無法預覽。',event_upload_parsing:'正在背景解析上傳檔案。解析完成後氣泡會自動更新。',event_upload_failed:'上傳解析失敗',
   event_command_title:'命令',event_command_label:'命令',event_cwd:'工作目錄',event_changed:'變更',event_command_empty:'未擷取到命令輸出。',event_ui_truncated:'UI 截斷',event_model_truncated:'模型截斷',event_temp_read_file:'暫存 read_file',event_buffered:'已緩衝',
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
-	  event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
-	  event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
+      event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
+      event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
@@ -48278,16 +52857,22 @@ Object.assign(I18N['ja'],{
   no_todos:'Todo はありません',no_tasks:'タスクはありません',no_catalog:'カタログなし',
   role_explorer:'探索担当',role_developer:'開発担当',role_reviewer:'レビュー担当',role_manager:'マネージャー',role_planner:'プランナー',role_agent:'Agent',role_single:'コンテキスト',
   callout_warning:'警告',callout_notice:'通知',callout_instruction:'指示',callout_tip:'ヒント',callout_reminder:'リマインダー',
-  event_manager_delegate_title:'マネージャー委任',event_objective:'目的',event_instruction:'指示',event_intent:'意図',
+      event_manager_delegate_title:'マネージャー委任',event_objective:'目的',event_instruction:'指示',event_context:'コンテキスト',event_intent:'意図',
+  event_plan_handoff_title:'計画承認済み',event_plan_handoff_choice:'選択',event_plan_handoff_steps:'ステップ',event_plan_handoff_archive:'アーカイブ',event_plan_handoff_source:'実行基準',event_summary:'要約',event_plan_path:'計画パス',
+  event_step_verified_title:'ステップ検証済み',event_step_verified_note:'現在のステップの受け入れチェックは合格として記録されました。',event_step_verified_checks:'チェック',
+  event_todo_focus_title:'Todo フォーカス',event_todo_focus_note:'現在進行中のサブタスクを続行します。',
+  event_live_user_adjustment_title:'ライブユーザー調整',event_live_user_adjustment_note:'最新のユーザーフィードバックを現在の実行に注入しました。',event_feedback_merge_title:'フィードバック統合',event_feedback_merge_note:'マネージャーが最新のユーザーフィードバックを現在のタスク方針に統合しました。',event_feedback_input:'ユーザー入力',event_current_step:'現在のステップ',event_directive:'指示',event_priority:'優先度',event_weight:'重み',event_conflict:'競合',event_score:'スコア',
   event_tool_calls_title:'ツール呼び出し',event_tool_calls_note:'モデルはこのターンで次のツール呼び出しを予定しました。',event_tool_calls_empty:'このターンには構造化されたツールメタデータがありません。',
+  event_tool_result_title:'ツール結果',event_tool_start:'開始',event_tool_done:'完了',
+  event_web_search_title:'Web検索',event_web_query:'クエリ',event_web_results:'結果',event_web_pages:'ページ',event_web_fetched_pages:'訪問済みページ',event_web_followed:'追跡',event_web_errors:'エラー',event_web_evidence:'証拠',event_web_trails:'履歴',event_web_note:'agent_web_search がローカルWeb証拠インデックスを更新しました。',
   event_skill_loaded_title:'Skill 読み込み完了',event_skill_loaded_note:'Skill コンテキストが現在の実行に自動読み込みされました。',event_skill_loaded_empty:'この skill 通知には公開説明が付いていません。',event_skill_label:'skill',
   event_loaded:'読み込み済み',event_preview_truncated:'プレビュー切り詰め',
   event_file_patch_title:'ファイルパッチ',event_session:'セッション',
   event_upload_title:'アップロード',event_upload_path:'パス',event_upload_filename:'ファイル名',event_preview_unavailable:'このアップロードではプレビューを利用できません。',event_upload_parsing:'アップロードファイルをバックグラウンドで解析中です。完了するとバブルが更新されます。',event_upload_failed:'アップロード解析失敗',
   event_command_title:'コマンド',event_command_label:'コマンド',event_cwd:'作業ディレクトリ',event_changed:'変更',event_command_empty:'コマンド出力は取得されませんでした。',event_ui_truncated:'UI 切り詰め',event_model_truncated:'モデル切り詰め',event_temp_read_file:'一時 read_file',event_buffered:'バッファ済み',
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
-	  event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
-	  event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
+      event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
+      event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
@@ -48301,8 +52886,10 @@ function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
-function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
-function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];const cur=String(S.config?.language||currentLang());if(!langs.length){setHtmlIfChanged('langSelect','','langSelect');return}const html=langs.map(row=>{const code=String(row?.code||'').trim();if(!code)return'';return `<option value=\"${esc(code)}\">${esc(String(row?.label||code))}</option>`}).join('');setHtmlIfChanged('langSelect',html,'langSelect');if(cur&&sel.value!==cur)sel.value=cur}
+function currentUserMemoryMode(){const raw=String(S.config?.user_memory_mode||S.snap?.user_memory_mode||'weak').trim().toLowerCase();return ['off','weak','on'].includes(raw)?raw:'weak'}
+function renderMemoryModeAction(){const el=E('memoryModeAction');if(!el)return;const mode=currentUserMemoryMode();el.textContent=t('btn_memory_mode',{mode:t('memory_mode_'+mode)});el.classList.toggle('disabled',!!S.config?.user_memory_setting_locked)}
+function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('memoryExportAction','btn_memory_export');setText('memoryClearAction','btn_memory_clear');renderMemoryModeAction();setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
+function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];const cur=String(S.config?.language||currentLang());const active=document.activeElement===sel;if(!langs.length){setHtmlIfChanged('langSelect','','langSelect');return}const html=langs.map(row=>{const code=String(row?.code||'').trim();if(!code)return'';return `<option value=\"${esc(code)}\">${esc(String(row?.label||code))}</option>`}).join('');setHtmlIfChanged('langSelect',html,'langSelect');if(cur&&sel.value!==cur&&!active)sel.value=cur}
 async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const explicit=Number(o.timeoutMs);const timeoutMs=(Number.isFinite(explicit)&&explicit>0)?Math.max(1000,Math.min(86400000,Math.round(explicit))):globalApiTimeoutMs();delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
@@ -48323,6 +52910,59 @@ function _panelIsUserScrolling(el){
   const active=(lastTs>0)&&((now-lastTs)<PANEL_SCROLL_ACTIVE_MS);
   return active||(lockUntil>now);
 }
+function _domUpdateWouldInterrupt(el){
+  if(!el)return false;
+  const ae=document.activeElement;
+  if(!ae||ae===document.body||ae===document.documentElement)return false;
+  if(!el.contains(ae))return false;
+  if(ae.matches&&ae.matches('input,textarea,select,[contenteditable="true"]'))return true;
+  if(ae.closest&&ae.closest('.popup-menu,.cmd-pager,.chat-tab,.fe-row,.msg-preview-row'))return true;
+  return false;
+}
+function _flushDeferredHtml(){
+  S.deferredHtmlTimer=0;
+  const pending=S.deferredHtml&&typeof S.deferredHtml==='object'?S.deferredHtml:Object.create(null);
+  const entries=Object.entries(pending);
+  if(!entries.length)return;
+  let blocked=false;
+  for(const [key,row] of entries){
+    const id=String(row?.id||'');
+    const el=E(id);
+    if(!el){delete pending[key];continue}
+    if(_domUpdateWouldInterrupt(el)){blocked=true;continue}
+    delete pending[key];
+    setHtmlIfChanged(id,String(row?.html??''),String(row?.sigKey||key),{force:true});
+  }
+  if(blocked&&!S.deferredHtmlTimer){
+    S.deferredHtmlTimer=setTimeout(_flushDeferredHtml,220);
+  }
+}
+function _queueDeferredHtml(id,html,sigKey){
+  if(!S.deferredHtml||typeof S.deferredHtml!=='object')S.deferredHtml=Object.create(null);
+  const key=String(sigKey||id);
+  S.deferredHtml[key]={id:String(id||''),html:String(html??''),sigKey:key};
+  if(!S.deferredHtmlTimer)S.deferredHtmlTimer=setTimeout(_flushDeferredHtml,220);
+}
+function _markPanelUserInteraction(el,lockMs=PANEL_SCROLL_ACTIVE_MS){
+  if(!el)return;
+  const now=Date.now();
+  const span=Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS);
+  el._panelUserScrollTs=now;
+  el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+span);
+}
+function bindPanelScrollState(id,el){
+  if(!el||id==='chat')return;
+  const fixedTop=(id==='sessionList'||id==='todos'||id==='tasks');
+  if(fixedTop)S.follow[id]=false;
+  el.addEventListener('wheel',()=>_markPanelUserInteraction(el,PANEL_SCROLL_ACTIVE_MS+260),{passive:true});
+  el.addEventListener('touchstart',()=>_markPanelUserInteraction(el,PANEL_SCROLL_ACTIVE_MS+520),{passive:true});
+  el.addEventListener('touchmove',()=>_markPanelUserInteraction(el,PANEL_SCROLL_ACTIVE_MS+520),{passive:true});
+  el.addEventListener('mousedown',()=>_markPanelUserInteraction(el,PANEL_SCROLL_ACTIVE_MS+180),{passive:true});
+  el.addEventListener('scroll',()=>{
+    _markPanelUserInteraction(el,PANEL_SCROLL_ACTIVE_MS);
+    if(!fixedTop)S.follow[id]=nearBottom(el);
+  },{passive:true});
+}
 function setPanelHtml(id,html){
   const el=E(id);
   if(!el)return;
@@ -48338,7 +52978,7 @@ function setPanelHtml(id,html){
     return;
   }
   S.panelHtml[id]=html;
-  const pinWhileScrolling=locked&&_panelIsUserScrolling(el);
+  const pinWhileScrolling=_panelIsUserScrolling(el);
   el.innerHTML=html;
   if(pinWhileScrolling){
     const deltaH=Number(el.scrollHeight||0)-oldHeight;
@@ -48364,6 +53004,11 @@ function setHtmlIfChanged(id,html,sigKey){
   if(!S.renderSigs||typeof S.renderSigs!=='object')S.renderSigs=Object.create(null);
   const htmlText=String(html??'');
   if(S.renderSigs[key]===htmlText)return false;
+  const opt=(arguments.length>3&&arguments[3]&&typeof arguments[3]==='object')?arguments[3]:{};
+  if(!opt.force&&_domUpdateWouldInterrupt(el)){
+    _queueDeferredHtml(id,htmlText,key);
+    return false;
+  }
   S.renderSigs[key]=htmlText;
   el.innerHTML=htmlText;
   return true;
@@ -48375,12 +53020,46 @@ function setTextIfChanged(el,text){
   el.textContent=txt;
   return true;
 }
+function closePopups(except=''){
+  const keep=String(except||'');
+  for(const menu of document.querySelectorAll('.popup-menu')){
+    if(menu.id&&menu.id===keep)continue;
+    menu.style.display='none';
+  }
+  S.openPopup=keep;
+}
+function setPopupOpen(menuId,open){
+  const id=String(menuId||'');
+  const menu=E(id);
+  if(!menu)return;
+  if(open){
+    closePopups(id);
+    menu.style.display='block';
+    S.openPopup=id;
+  }else{
+    menu.style.display='none';
+    if(S.openPopup===id)S.openPopup='';
+  }
+}
+function togglePopup(menuId,ev){
+  if(ev){ev.preventDefault();ev.stopPropagation()}
+  const menu=E(menuId);
+  if(!menu)return;
+  setPopupOpen(menuId,menu.style.display==='none'||!menu.style.display);
+}
+function bindPopupButton(buttonId,menuId,onOption){
+  const btn=E(buttonId);const menu=E(menuId);
+  if(!btn||!menu)return;
+  btn.addEventListener('click',e=>togglePopup(menuId,e));
+  menu.addEventListener('click',e=>e.stopPropagation());
+  if(typeof onOption==='function')onOption(menu);
+}
 function formatContextLeft(snap){const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(!Number.isFinite(left)||!Number.isFinite(pct))return '-';return `${left} (${pct.toFixed(1)}%)`}
-function contextLiveRows(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();const showAgents=(mode==='sync'||mode==='sequential');const rows=showAgents&&Array.isArray(snap?.agent_contexts)?snap.agent_contexts.slice():[];const valid=rows.filter(r=>Number.isFinite(Number(r?.left))&&Number.isFinite(Number(r?.left_percent))).sort((a,b)=>(Number(a.left_percent)-Number(b.left_percent))||(Number(a.left)-Number(b.left)));if(valid.length>1)return valid;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(Number.isFinite(left)&&Number.isFinite(pct))return[{role:'single',label:t('role_single'),left,left_percent:pct,tier:0,active:true}];if(valid.length===1)return valid;return[]}
+function contextLiveRows(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();const rowsRaw=Array.isArray(snap?.agent_contexts)?snap.agent_contexts.slice():[];const flag=(snap?.multi_agent_context_hud_enabled===true)||(!('multi_agent_context_hud_enabled' in (snap||{}))&&rowsRaw.length>1);const showAgents=flag&&(mode==='sync'||mode==='sequential');const rows=showAgents?rowsRaw:[];const valid=rows.filter(r=>Number.isFinite(Number(r?.left))&&Number.isFinite(Number(r?.left_percent))).sort((a,b)=>(Number(a.left_percent)-Number(b.left_percent))||(Number(a.left)-Number(b.left)));if(valid.length>1)return valid;const left=Number(snap?.context_left_tokens);const pct=Number(snap?.context_left_percent);if(Number.isFinite(left)&&Number.isFinite(pct))return[{role:'single',label:t('role_single'),left,left_percent:pct,tier:0,active:true}];if(valid.length===1)return valid;return[]}
 function agentCtxColor(role){const r=String(role||'').trim().toLowerCase();if(r==='explorer')return'#ff3b4f';if(r==='developer')return'#12d49d';if(r==='reviewer')return'#ffb020';if(r==='manager')return'#a855ff';return'#64748b'}
 function agentContextLabel(row){const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role);if(roleKey)return _chatVirtAgentRoleLabel(roleKey);const raw=String(row?.label||'').trim();if(!raw||raw.toLowerCase()==='single')return t('role_single');return raw}
 function contextLiveNestedHtml(rows){const valid=(Array.isArray(rows)?rows:[]).filter(r=>Number.isFinite(Number(r?.left_percent))).slice(0,6);if(valid.length<=1)return'';const maxH=6;return valid.map((row,i)=>{const pct=Math.max(0,Math.min(100,Number(row?.left_percent)));const left=Number(row?.left);const tier=Number(row?.tier||0);const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role)||role||'single';const label=agentContextLabel(row);const color=agentCtxColor(roleKey);const h=Math.max(1.5,maxH-(i*1.1));const z=valid.length-i;const title=`${t('rt_ctx_left_for',{label})}=${Number.isFinite(left)?left:'-'} (${pct.toFixed(1)}%) · T${tier}`;return `<div class=\"ctx-live-agent-layer role-${esc(roleKey)}\" style=\"--ctx-agent-color:${esc(color)};height:${h.toFixed(1)}px;z-index:${z}\" title=\"${esc(title)}\"><div class=\"ctx-live-agent-fill\" style=\"width:${pct.toFixed(2)}%\"></div></div>`}).join('')}
-function agentContextChipsHtml(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();if(mode!=='sync'&&mode!=='sequential')return'';const rows=Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[];if(rows.length<=1)return'';return `<span class=\"agent-ctx-group\">${rows.slice(0,6).map(row=>{const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role)||role||'single';const label=agentContextLabel(row);const left=Number(row?.left);const pct=Number(row?.left_percent);const tier=Number(row?.tier||0);const safePct=Number.isFinite(pct)?Math.max(0,Math.min(100,pct)):0;const value=Number.isFinite(left)&&Number.isFinite(pct)?`${left} · ${safePct.toFixed(1)}% · T${tier}`:'-';const tone=safePct<=15?' danger':(safePct<=35?' warn':'');const active=row?.active?' active':'';return `<span class=\"agent-ctx-chip role-${esc(roleKey)}${tone}${active}\" title=\"${esc(String(row?.next_call_label||''))}\"><span class=\"agent-dot\"></span><span>${esc(label)}</span><span class=\"agent-ctx-value\">${esc(value)}</span></span>`}).join('')}</span>`}
+function agentContextChipsHtml(snap){const mode=String(snap?.execution_mode||'').trim().toLowerCase();const rows=Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[];const flag=(snap?.multi_agent_context_hud_enabled===true)||(!('multi_agent_context_hud_enabled' in (snap||{}))&&rows.length>1);if(!flag||(mode!=='sync'&&mode!=='sequential'))return'';if(rows.length<=1)return'';return `<span class=\"agent-ctx-group\">${rows.slice(0,6).map(row=>{const role=String(row?.role||'single').trim().toLowerCase();const roleKey=_chatVirtAgentRoleKey(role)||role||'single';const label=agentContextLabel(row);const left=Number(row?.left);const pct=Number(row?.left_percent);const tier=Number(row?.tier||0);const safePct=Number.isFinite(pct)?Math.max(0,Math.min(100,pct)):0;const value=Number.isFinite(left)&&Number.isFinite(pct)?`${left} · ${safePct.toFixed(1)}% · T${tier}`:'-';const tone=safePct<=15?' danger':(safePct<=35?' warn':'');const active=row?.active?' active':'';return `<span class=\"agent-ctx-chip role-${esc(roleKey)}${tone}${active}\" title=\"${esc(String(row?.next_call_label||''))}\"><span class=\"agent-dot\"></span><span>${esc(label)}</span><span class=\"agent-ctx-value\">${esc(value)}</span></span>`}).join('')}</span>`}
 function scheduleCompactRefreshBurst(count=COMPACT_AUTO_REFRESH_COUNT){if(!S.activeId)return;const n=Math.max(1,Math.min(10,Number(count)||COMPACT_AUTO_REFRESH_COUNT));const delay=Math.max(90,Math.min(1400,90+((n-1)*COMPACT_AUTO_REFRESH_INTERVAL_MS)));scheduleSnapshot({forceFull:false,delayMs:delay,allowWhenFrozen:true})}
 function renderCtxLive(snap){
   const box=E('ctxLive');const textEl=E('ctxLiveText');const fill=E('ctxLiveFill');if(!box||!textEl||!fill)return;
@@ -48479,6 +53158,13 @@ function _deltaConversationTextByType(type,data){
     const note=status?`status: ${status}`:'';
     return `[upload] ${String(d.filename||'')}\npath: ${String(d.workspace_path||'')}\nkind: ${String(d.kind||'')} size: ${String(d.size||0)}${note?`\n${note}`:''}${err?`\nerror: ${err}`:''}\n${String(d.preview||'')}`;
   }
+  if(type==='web_search'){
+    const fetched=Array.isArray(d.fetched_pages)?d.fetched_pages.map(x=>String(x?.url||'').trim()).filter(Boolean).slice(0,6):[];
+    return `[web_search] agent_web_search ${String(d.phase||'')} ${String(d.mode||'')}\nquery: ${String(d.query||d.url||'')}\nresults: ${String(d.result_count||0)} pages: ${String(d.page_count||d.fetched||0)} visited: ${String(fetched.length)} evidence: ${String(d.evidence_records||0)}${fetched.length?`\nvisited_pages:\n${fetched.map(x=>`- ${x}`).join('\\n')}`:''}\n${String(d.summary||'')}`;
+  }
+  if(type==='tool_start'||type==='tool_result'){
+    return `[${type}] ${String(d.name||d.tool||'')}\n${String(d.summary||'')}\n${String(d.result||'')}`;
+  }
   return String(d.text||'');
 }
 function _deltaScheduleRender(flags={}){
@@ -48504,12 +53190,12 @@ function _deltaScheduleRender(flags={}){
       return;
     }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
+    const deferLiveRender=_chatVirtShouldDeferLiveRender(chatEl);
     if(needChat){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
+        if(deferLiveRender&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');scheduleRenderChat('delta');}
       }
     }
@@ -48517,7 +53203,7 @@ function _deltaScheduleRender(flags={}){
       const boardSig=boardsSignature(S.snap||{});
       if(boardSig!==S.lastBoardsSig){
         S.lastBoardsSig=boardSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);}
+        if(deferLiveRender&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);}
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
       }
     }
@@ -48525,6 +53211,17 @@ function _deltaScheduleRender(flags={}){
 }
 function scheduleRenderChat(reason='snapshot'){
   const next=String(reason||'snapshot');
+  const chatEl=E('chat');
+  if(
+    next!=='scroll'&&
+    chatEl&&
+    _chatVirtIsUserScrolling(chatEl)&&
+    !_chatVirtWantsBottom(chatEl,36)
+  ){
+    _chatVirtDebounceWhileScrolling(chatEl,'_virtDeferredRenderTimer',()=>scheduleRenderChat(next),CHAT_SCROLL_SYNC_DEBOUNCE_MS);
+    return;
+  }
+  if(chatEl&&next!=='scroll')_chatVirtCancelDebounce(chatEl,'_virtDeferredRenderTimer');
   const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
   const cur=String(S.chatRenderPendingReason||'');
   if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
@@ -48662,10 +53359,17 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaScheduleRender({chat:true,boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
-  if(typ==='command'||typ==='file_patch'||typ==='upload'){
+  if(typ==='web_search'&&Boolean(data.conversation_visible===false)){
+    S.lastHiddenWebSearch={ts:ts,phase:String(data.phase||''),mode:String(data.mode||''),query:String(data.query||data.url||''),summary:String(data.summary||'')};
+    return{handled:true,needsSnapshot:false};
+  }
+  if(typ==='command'||typ==='file_patch'||typ==='upload'||typ==='web_search'){
     _deltaAppendOperation(typ,data,ts);
-    if(!(typ==='upload'&&String(data.parse_status||'').trim().toLowerCase()==='pending')){
+    const visible=(typ!=='web_search')||Boolean(data.conversation_visible!==false);
+    if(visible&&!(typ==='upload'&&String(data.parse_status||'').trim().toLowerCase()==='pending')){
       const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
+      const ar=_chatVirtAgentRoleKey(data.agent_role);
+      if(ar)row.agent_role=ar;
       _deltaAppendConversationRow(row);
     }
     _deltaAppendActivity(typ,data,ts);
@@ -48689,12 +53393,22 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='status'||typ==='tool_start'||typ==='tool_result'||typ==='error'||typ==='file_read'||typ==='agent_bus'||typ==='background'||typ==='inbox'||typ==='teammate'||typ==='task.completed'||typ==='model_config'||typ==='skill_write'||typ.startsWith('worktree.')){
     _deltaAppendActivity(typ,data,ts);
+    if(typ==='tool_start'||typ==='tool_result'){
+      const toolName=String(data.name||data.tool||'').trim();
+      const visibleTools=new Set(['agent_web_search','query_code_library','query_knowledge_library','tool_memory','context_recall','check_background','list_skills','list_skill_providers','list_skill_protocols']);
+      if(Boolean(data.conversation_visible!==false)&&visibleTools.has(toolName)){
+        const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
+        const ar=_chatVirtAgentRoleKey(data.agent_role);
+        if(ar)row.agent_role=ar;
+        _deltaAppendConversationRow(row);
+      }
+    }
     const schedulerStatus=String(data.scheduler_status||'').trim().toLowerCase();
     const schedulerQueueId=Number(data.scheduler_queue_id||0);
     const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
     if(summaryLow==='run finished')S.snap.running=false;
-    _deltaScheduleRender({chat:removedScheduler>0,boards:true,sessions:true});
+    _deltaScheduleRender({chat:removedScheduler>0||typ==='tool_start'||typ==='tool_result',boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
   return{handled:false,needsSnapshot:true};
@@ -48743,7 +53457,7 @@ function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?s
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
-function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
+function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
 function renderSessions(){
   const host=E('sessionList');
@@ -48817,8 +53531,7 @@ function _bindNestedScrollGuards(root){
       Number(chatEl._virtManualUnlockTs||0),
       now+CHAT_SCROLL_LOCK_MS
     );
-    S.follow.chat=false;
-    chatEl._virtAutoFollowPaused=true;
+    _chatVirtClearBottomFollow(chatEl,true);
   };
   for(const node of nodes){
     if(!node||node._nestedScrollGuardBound)continue;
@@ -49005,11 +53718,35 @@ function _mathRunTypeset(root,key=''){
     }
     if(root._mathPending)return;
     root._mathPending=true;
+    const chatEl=E('chat');
+    const inChat=!!(chatEl&&root.closest&&root.closest('#chat'));
+    const keepChatBottom=!!(inChat&&_chatVirtWantsBottom(chatEl,48));
+    const anchorBefore=(inChat&&!keepChatBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+    const oldScrollTop=chatEl?Number(chatEl.scrollTop||0):0;
     Promise.resolve(mj.typesetPromise([root]))
       .catch(()=>{})
       .finally(()=>{
         root._mathPending=false;
         if(k)root.setAttribute('data-math-key',k);
+        const msg=(root.matches&&root.matches('.msg[data-vk]'))?root:(root.closest?root.closest('.msg[data-vk]'):null);
+        if(msg){
+          const vk=String(msg.getAttribute('data-vk')||'');
+          const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));
+          const oldH=Number(CHAT_VIRT.heights[vk]||0);
+          if(vk&&newH>0&&(!oldH||Math.abs(oldH-newH)>=3)){
+            CHAT_VIRT.heights[vk]=newH;
+            CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
+            scheduleRenderChat('measure');
+          }
+          if(keepChatBottom&&chatEl)_chatVirtScrollToBottom(chatEl);
+          else if(inChat&&chatEl){
+            if(anchorBefore){
+              if(!_chatVirtRestoreAnchor(chatEl,anchorBefore))_chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }else{
+              _chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }
+          }
+        }
       });
   };
   run(0);
@@ -49304,21 +54041,40 @@ self.onmessage=(ev)=>{
       const key=String(d.key||pending.key||'');
       const html=String(d.html||'');
       if(key&&html)_mdCacheSet(key,html);
+      const chatEl=E('chat');
+      const keepChatBottom=!!(chatEl&&_chatVirtWantsBottom(chatEl,48));
+      let touchedChat=false;
+      let changedChatHeight=false;
       const slots=document.querySelectorAll(`[data-md-job=\"${id}\"]`);
-      for(const slot of slots){
-        slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
-        slot.removeAttribute('data-md-job');
-        slot.classList.remove('md-async-slot');
-        const msg=slot.closest('.msg');
-        if(msg){
-          const vk=String(msg.getAttribute('data-vk')||'');
-          if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1}}}
-          const req=String(msg.getAttribute('data-math-request')||'').trim();
-          if(req)_mathTypeset(msg,`chat:${req}`);
-        }else{
-          const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
-          if(article)_mathTypeset(article,`pv:md:${id}`);
+      const applySlots=()=>{
+        for(const slot of slots){
+          slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
+          slot.removeAttribute('data-md-job');
+          slot.classList.remove('md-async-slot');
+          const msg=slot.closest('.msg');
+          if(msg){
+            touchedChat=true;
+            const vk=String(msg.getAttribute('data-vk')||'');
+            if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;changedChatHeight=true}}}
+            const req=String(msg.getAttribute('data-math-request')||'').trim();
+            if(req)_mathTypeset(msg,`chat:${req}`);
+          }else{
+            const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
+            if(article)_mathTypeset(article,`pv:md:${id}`);
+          }
         }
+      };
+      if(chatEl&&!keepChatBottom){
+        _chatVirtWithAnchorPreserved(chatEl,applySlots);
+      }else{
+        applySlots();
+      }
+      if(touchedChat){
+        if(changedChatHeight){
+          CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
+          scheduleRenderChat('measure');
+        }
+        if(keepChatBottom&&chatEl)_chatVirtScrollToBottom(chatEl);
       }
     };
     worker.onerror=()=>{};
@@ -50013,7 +54769,7 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
-const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','file_patch','upload','command','live_truncation','live_run_notice','skill_loaded','plan_notice']);
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge']);
 function _chatVirtFormatDurationMs(ms){
   const n=Number(ms||0);
   if(!Number.isFinite(n)||n<=0)return '';
@@ -50063,8 +54819,169 @@ function _chatVirtParseSkillLoaded(raw){
     truncated:truncated,
   };
 }
+function _chatVirtParseTodoFocus(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^<todo-focus(?:\\s+[^>]*)?>\\s*([\\s\\S]*?)\\s*<\\/todo-focus>\\s*$/i);
+  if(!m)return null;
+  return {body:String(m[1]||'').trim()};
+}
+function _chatVirtParseTagAttrs(raw){
+  const attrs={};
+  String(raw||'').replace(/([A-Za-z_][\\w:-]*)\\s*=\\s*\"([^\"]*)\"/g,(_,k,v)=>{attrs[String(k||'').trim()]=String(v||'').trim();return''});
+  return attrs;
+}
+function _chatVirtParseTaggedBlock(raw,tag){
+  const name=String(tag||'').trim();
+  if(!name)return null;
+  const re=new RegExp('^<'+name+'(?:\\\\s+([^>]*))?>\\\\s*([\\\\s\\\\S]*?)\\\\s*<\\\\/'+name+'>\\\\s*$','i');
+  const m=String(raw||'').trim().match(re);
+  if(!m)return null;
+  return {attrs:_chatVirtParseTagAttrs(String(m[1]||'')),body:String(m[2]||'').trim()};
+}
+function _chatVirtParseLiveUserAdjustment(raw){
+  const parsed=_chatVirtParseTaggedBlock(raw,'live-user-adjustment');
+  if(!parsed)return null;
+  const a=parsed.attrs||{};
+  return {id:String(a.id||''),priority:String(a.priority||''),weight:String(a.weight||''),body:String(parsed.body||'').trim()};
+}
+function _chatVirtParseUserFeedbackMerge(raw){
+  const parsed=_chatVirtParseTaggedBlock(raw,'user-feedback-merge');
+  if(!parsed)return null;
+  const a=parsed.attrs||{};
+  const body=String(parsed.body||'').trim();
+  const out={conflict:String(a.conflict||''),score:String(a.score||''),user_input:'',current_step:'',directive:'',body:body};
+  const rest=[];
+  for(const line of body.split(/\\n+/)){
+    const s=String(line||'').trim();
+    if(!s)continue;
+    let m=s.match(/^User provided new input(?: during plan execution)?\\s*:\\s*(.*)$/i);
+    if(m){out.user_input=String(m[1]||'').trim();continue}
+    m=s.match(/^Current plan step\\s*:\\s*(.*)$/i);
+    if(m){out.current_step=String(m[1]||'').trim();continue}
+    rest.push(s);
+  }
+  out.directive=rest.join('\\n').trim();
+  return out;
+}
+function _chatVirtParseStepVerified(raw){
+  const txt=String(raw||'').trim();
+  if(!/<step-verified\\b/i.test(txt))return null;
+  let body=txt.replace(/<step-verified\\s*\\/?>/ig,'').replace(/<\\/step-verified>/ig,'').trim();
+  body=body.replace(/\\n{3,}/g,'\\n\\n');
+  const lines=body.split(/\\n+/).map(x=>String(x||'').trim()).filter(Boolean);
+  let summary='';
+  if(lines.length>1&&/[：:]\\s*$/.test(lines[0])){
+    summary=lines.shift().replace(/[：:]\\s*$/,'').trim();
+  }
+  const checks=lines.map(x=>x.replace(/^[-*]\\s*/,'').trim()).filter(Boolean);
+  if(!summary)summary=body&&!checks.length?body:t('event_step_verified_note');
+  return {body:body,summary:summary,checks:checks};
+}
+function _chatVirtParseWebSearchText(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^\\[(?:web_search|websearch)\\]\\s*(?:agent[_ ]?web[_ ]?search|agentwebsearch)?\\s*([^\\n]*)\\n([\\s\\S]*)$/i);
+  if(!m)return null;
+  const head=String(m[1]||'').trim();
+  const rest=String(m[2]||'').trim();
+  const out={tool:'agent_web_search',phase:'',mode:'',query:'',url:'',summary:'',result_count:0,page_count:0,evidence_records:0};
+  const headParts=head.split(/\s+/).filter(Boolean);
+  if(headParts.length){out.phase=headParts.shift()||'';out.mode=headParts.shift()||'';}
+  for(const line of rest.split(/\\n/)){
+    const s=String(line||'').trim();
+    if(!s)continue;
+    let mm=s.match(/^(?:query|url)\s*:\s*(.*)$/i);
+    if(mm){out.query=String(mm[1]||'').trim();continue;}
+    mm=s.match(/results\s*:\s*(\d+)\s+pages\s*:\s*(\d+)\s+evidence\s*:\s*(\d+)/i);
+    if(mm){out.result_count=Number(mm[1]||0);out.page_count=Number(mm[2]||0);out.evidence_records=Number(mm[3]||0);continue;}
+    out.summary+=(out.summary?'\\n':'')+s;
+  }
+  return out;
+}
+function _chatVirtParseToolEventText(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^\\[(tool_start|toolstart|tool_result|toolresult)\\]\\s*([^\\n]*)\\n?([\\s\\S]*)$/i);
+  if(!m)return null;
+  const tag=String(m[1]||'').toLowerCase();
+  const name=String(m[2]||'tool').trim()||'tool';
+  const rest=String(m[3]||'').trim();
+  const isStart=(tag==='tool_start'||tag==='toolstart');
+  let summary='';
+  let result='';
+  if(rest){
+    const lines=rest.split(/\\n/);
+    summary=String(lines.shift()||'').trim();
+    result=lines.join('\\n').trim();
+  }
+  return {type:isStart?'tool_start':'tool_result',data:{name:name,tool:name,summary:summary,result:result}};
+}
+function _chatVirtParsePlanHandoff(raw){
+  const txt=String(raw||'').trim();
+  const m=txt.match(/^<plan-approved-handoff(?:\\s+[^>]*)?>\\s*([\\s\\S]*?)\\s*<\\/plan-approved-handoff>\\s*$/i);
+  if(!m)return null;
+  const body=String(m[1]||'').trim();
+  const lines=body.split(/\\n/).map(x=>String(x||'').trim()).filter(Boolean);
+  const out={choice_id:'',title:'',summary:'',steps:[],archived_planner_context:'',source_of_truth:'',body:body};
+  let inSteps=false;
+  for(const line of lines){
+    if(/^chosen\\s*:/i.test(line)){
+      const val=line.replace(/^chosen\\s*:\\s*/i,'').trim();
+      const parts=val.split(/\\s+/);
+      out.choice_id=parts.shift()||'';
+      out.title=parts.join(' ').trim()||out.choice_id;
+      inSteps=false;
+    }else if(/^summary\\s*:/i.test(line)){
+      out.summary=line.replace(/^summary\\s*:\\s*/i,'').trim();
+      inSteps=false;
+    }else if(/^steps\\s*:/i.test(line)){
+      inSteps=true;
+    }else if(/^archived_planner_context\\s*:/i.test(line)){
+      out.archived_planner_context=line.replace(/^archived_planner_context\\s*:\\s*/i,'').trim();
+      inSteps=false;
+    }else if(/^Execution source of truth\\s*:/i.test(line)){
+      out.source_of_truth=line.replace(/^Execution source of truth\\s*:\\s*/i,'').trim();
+      inSteps=false;
+    }else if(inSteps){
+      out.steps.push(line.replace(/^[-*]\\s*/,'').trim());
+    }
+  }
+  return out;
+}
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');if(!target)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));target.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){
+  if(!chatEl)return;
+  const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);
+  if(!runActive){_chatVirtStopRunTicker(chatEl);return}
+  if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}
+  const nodes=chatEl._virtRunNodes;
+  if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}
+  const keepBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!keepBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  const now=(Date.now()/1000);
+  let changed=false;
+  for(const node of nodes){
+    const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');
+    if(!target)continue;
+    const label=String(node.getAttribute('data-run-label')||'model call');
+    const startedAt=Number(node.getAttribute('data-run-start')||0);
+    const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));
+    const anchorTs=Number(node.getAttribute('data-run-anchor')||0);
+    let elapsed=baseElapsed;
+    if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}
+    const whole=Math.floor(elapsed);
+    if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;
+    node.setAttribute('data-run-last-sec',String(whole));
+    target.textContent=_chatVirtLiveRunText(label,elapsed);
+    changed=true;
+  }
+  if(changed&&!keepBottom){
+    if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
@@ -50274,18 +55191,33 @@ function _chatVirtParseRuntimeHint(raw){
   return {name,body:String(m[2]||'').trim(),meta:{label:t(String(meta.labelKey||'event_reminder')),tone:String(meta.tone||'notice')}};
 }
 function _chatVirtBuildMessageNode(m){
-  let kind='assistant_text';
-  if(m.type==='manager_delegate')kind='manager_delegate';
-  else if(m.type==='agent_bus')kind='agent_bus';
-  else if(m.type==='tool_calls')kind='tool_calls';
-  else if(/^\\[tool calls\\]/i.test(String(m.text||'')))kind='tool_calls';
-  else if(/^\\[skill loaded:\\s*[^\\]]+\\]/i.test(String(m.text||'')))kind='skill_loaded';
-  else if(m.type==='file_patch'&&m.data)kind='file_patch';
-  else if(m.type==='upload'&&m.data)kind='upload';
-  else if(m.type==='command'&&m.data)kind='command';
+      let kind='assistant_text';
+      const rawTextForKind=String(m?.text||'');
+      const dataKind=(m&&typeof m.data==='object')?String(m.data.kind||m.data.control_tag||'').trim().toLowerCase():'';
+      const parsedWebSearchText=_chatVirtParseWebSearchText(rawTextForKind);
+      const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
+      const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
+      const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
+      if(m.type==='manager_delegate')kind='manager_delegate';
+      else if(m.type==='agent_bus')kind='agent_bus';
+      else if(m.type==='tool_calls')kind='tool_calls';
+      else if(/^\\[tool calls\\]/i.test(String(m.text||'')))kind='tool_calls';
+      else if(/^\\[skill loaded:\\s*[^\\]]+\\]/i.test(String(m.text||'')))kind='skill_loaded';
+      else if((m.type==='tool_start'||m.type==='tool_result')&&m.data)kind=m.type;
+      else if(parsedToolEventText)kind=parsedToolEventText.type;
+      else if(m.type==='file_patch'&&m.data)kind='file_patch';
+      else if(m.type==='upload'&&m.data)kind='upload';
+      else if(m.type==='command'&&m.data)kind='command';
+      else if(m.type==='web_search'&&m.data)kind='web_search';
+      else if(parsedWebSearchText)kind='web_search';
   else if(m.type==='live_thinking')kind='live_thinking';
   else if(m.type==='live_truncation')kind='live_truncation';
   else if(m.type==='live_run_notice')kind='live_run_notice';
+  else if(m.type==='plan_approved_handoff'||_chatVirtParsePlanHandoff(rawTextForKind))kind='plan_approved_handoff';
+  else if(m.type==='step_verified'||_chatVirtParseStepVerified(rawTextForKind))kind='step_verified';
+  else if(m.type==='todo_focus'||_chatVirtParseTodoFocus(rawTextForKind)||(m.type==='plan_notice'&&(dataKind==='todo_focus'||dataKind==='todo-focus')))kind='todo_focus';
+  else if(m.type==='live_user_adjustment'||parsedLiveUserAdjustment)kind='live_user_adjustment';
+  else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
   else if(m.type==='plan_notice')kind='plan_notice';
   else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
   else kind='plain_text';
@@ -50303,7 +55235,142 @@ function _chatVirtBuildMessageNode(m){
   d.className='msg '+baseRole+(agentRole?(' agent-'+agentRole):'')+` msg-kind-${kind}`+(CHAT_EVENT_CARD_KINDS.has(kind)?' msg-event-wrap':'');
   d.setAttribute('data-msg-kind',kind);
   const roleBadge=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-badge ${agentRole}\">${esc(_chatVirtAgentRoleLabel(agentRole))}</div>`:'';
-  if(m.type==='manager_delegate'){
+  if(kind==='plan_approved_handoff'){
+    const info=(m&&typeof m.data==='object')?m.data:{};
+    const parsed=_chatVirtParsePlanHandoff(String(m.text||''))||{};
+    const choice=String(info.choice_id||parsed.choice_id||'').trim();
+    const title=String(info.title||parsed.title||choice||t('event_plan_handoff_title')).trim();
+    const summary=String(info.summary||parsed.summary||'').trim();
+    const stepsRaw=Array.isArray(info.steps)?info.steps:(Array.isArray(parsed.steps)?parsed.steps:[]);
+    const steps=stepsRaw.map(x=>String(x||'').trim()).filter(Boolean);
+    const stepCountRaw=Number(info.step_count||steps.length||0);
+    const stepCount=Number.isFinite(stepCountRaw)?stepCountRaw:steps.length;
+    const archive=String(info.archived_planner_context||parsed.archived_planner_context||'').trim();
+    const source=String(info.source_of_truth||parsed.source_of_truth||'').trim();
+    const planPath=String(info.plan_path||'').trim();
+    const pills=[
+      choice?_chatVirtEventPillHtml(`${t('event_plan_handoff_choice')} ${choice}`,'info','mono'):'',
+      stepCount?_chatVirtEventPillHtml(`${stepCount} ${t('event_plan_handoff_steps')}`,'ok'):'',
+      archive?_chatVirtEventPillHtml(`${t('event_plan_handoff_archive')} ${archive}`,'neutral','mono'):'',
+    ];
+    const grid=[
+      choice?_chatVirtEventCellHtml(t('event_plan_handoff_choice'),choice,{mono:true}):'',
+      planPath?_chatVirtEventCellHtml(t('event_plan_path'),planPath,{mono:true}):'',
+      source?_chatVirtEventCellHtml(t('event_plan_handoff_source'),source,{}):'',
+    ];
+    const key=`${String(m._vk||'')}:plan-handoff`;
+    const summaryHtml=summary?`<div class=\"msg-event-note\"><strong>${esc(t('event_summary'))}</strong>: ${esc(summary)}</div>`:'';
+    const stepsHtml=steps.length?`<div class=\"msg-event-check-list\">${steps.slice(0,8).map((step,idx)=>`<div class=\"msg-event-check\"><span class=\"msg-event-check-mark\">${idx+1}.</span><span>${esc(step)}</span></div>`).join('')}</div>`:'';
+    const bodyHtml=`<div class=\"msg-event-body\">${summaryHtml}${stepsHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_plan_handoff_title'),title,pills,grid,bodyHtml,'msg-event-card-plan')}`;
+    d.setAttribute('data-math-request',key);
+    return d;
+  }
+  if(kind==='step_verified'){
+    const info=(m&&typeof m.data==='object')?m.data:{};
+    const parsed=_chatVirtParseStepVerified(String(m.text||''))||{};
+    const checksRaw=Array.isArray(info.checks)?info.checks:(Array.isArray(parsed.checks)?parsed.checks:[]);
+    const checks=checksRaw.map(x=>String(x||'').trim()).filter(Boolean);
+    const summary=String(info.summary||parsed.summary||'').trim();
+    const title=String(info.title||t('event_step_verified_title')).trim();
+    const subtitle=String(info.subtitle||'').trim();
+    const pills=[
+      _chatVirtEventPillHtml(t('completed'),'ok'),
+      checks.length?_chatVirtEventPillHtml(`${checks.length} ${t('event_step_verified_checks')}`,'info'):'',
+    ];
+    const grid=[
+      info.plan_step_id?_chatVirtEventCellHtml('parent_step_id',String(info.plan_step_id||''),{mono:true}):'',
+      info.plan_path?_chatVirtEventCellHtml(t('event_plan_path'),String(info.plan_path||''),{mono:true}):'',
+    ];
+    const key=`${String(m._vk||'')}:step-verified`;
+    const noteHtml=`<div class=\"msg-event-note\">${esc(summary||t('event_step_verified_note'))}</div>`;
+    const checksHtml=checks.length?`<div class=\"msg-event-check-list\">${checks.map(item=>`<div class=\"msg-event-check\"><span class=\"msg-event-check-mark\">✓</span><span>${esc(item)}</span></div>`).join('')}</div>`:'';
+    const bodyHtml=`<div class=\"msg-event-body\">${noteHtml}${checksHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,'msg-event-card-plan')}`;
+    d.setAttribute('data-math-request',key);
+    return d;
+  }
+	  if(kind==='todo_focus'){
+    const info=(m&&typeof m.data==='object')?m.data:{};
+    const parsed=_chatVirtParseTodoFocus(String(m.text||''))||_chatVirtParseTodoFocus(String(info.body||''))||{};
+    const title=String(info.title||t('event_todo_focus_title')).trim();
+    const subtitle=String(info.subtitle||'').trim();
+    const body=String(parsed.body||info.body||m.text||'').trim();
+    const note=String(info.note||t('event_todo_focus_note')).trim();
+    const pills=(Array.isArray(info.pills)?info.pills:[]).map(item=>{
+      if(item&&typeof item==='object'){
+        const txt=String(item.text||'').trim();
+        if(!txt)return'';
+        return _chatVirtEventPillHtml(txt,String(item.tone||'neutral'),item.mono?'mono':'');
+      }
+      const txt=String(item||'').trim();
+      return txt?_chatVirtEventPillHtml(txt,'neutral'):'';
+    }).filter(Boolean);
+    if(!pills.length)pills.push(_chatVirtEventPillHtml('todo-focus','info','mono'));
+    const grid=(Array.isArray(info.rows)?info.rows:[]).map(item=>{
+      if(!item||typeof item!=='object')return'';
+      const label=String(item.label||'').trim();
+      const value=String(item.value||'').trim();
+      if(!label||!value)return'';
+      return _chatVirtEventCellHtml(label,value,{mono:!!item.mono});
+    }).filter(Boolean);
+    const key=`${String(m._vk||'')}:todo-focus`;
+    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(note)}</div>${body?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:''}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,'msg-event-card-plan')}`;
+    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(kind==='live_user_adjustment'){
+	    const info=(m&&typeof m.data==='object')?m.data:{};
+	    const parsed=parsedLiveUserAdjustment||_chatVirtParseLiveUserAdjustment(String(info.body||''))||{};
+	    const id=String(info.id||parsed.id||'').trim();
+	    const priority=String(info.priority||parsed.priority||'').trim();
+	    const weight=String(info.weight||parsed.weight||'').trim();
+	    const body=String(info.body||parsed.body||m.text||'').trim();
+	    const key=`${String(m._vk||'')}:live-user-adjustment`;
+	    const pills=[
+	      id?_chatVirtEventPillHtml(`#${id}`,'neutral','mono'):'',
+	      priority?_chatVirtEventPillHtml(`${t('event_priority')} ${priority}`,priority==='high'?'warn':'info'):'',
+	      weight?_chatVirtEventPillHtml(`${t('event_weight')} ${weight}`,'neutral','mono'):'',
+	    ];
+	    const grid=[
+	      priority?_chatVirtEventCellHtml(t('event_priority'),priority,{mono:true}):'',
+	      weight?_chatVirtEventCellHtml(t('event_weight'),weight,{mono:true}):'',
+	    ];
+	    const noteHtml=`<div class=\"msg-event-note\">${esc(t('event_live_user_adjustment_note'))}</div>`;
+	    const bodyHtml=`<div class=\"msg-event-body\">${noteHtml}${body?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:''}</div>`;
+	    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_user_adjustment_title'),'',pills,grid,bodyHtml,'msg-event-card-adjustment')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(kind==='user_feedback_merge'){
+	    const info=(m&&typeof m.data==='object')?m.data:{};
+	    const parsed=parsedUserFeedbackMerge||_chatVirtParseUserFeedbackMerge(String(info.body||''))||{};
+	    const conflict=String(info.conflict||parsed.conflict||'').trim();
+	    const score=String(info.score||parsed.score||'').trim();
+	    const userInput=String(info.user_input||parsed.user_input||'').trim();
+	    const currentStep=String(info.current_step||parsed.current_step||'').trim();
+	    const directive=String(info.directive||parsed.directive||'').trim();
+	    const body=String(parsed.body||info.body||m.text||'').trim();
+	    const key=`${String(m._vk||'')}:user-feedback-merge`;
+	    const conflictTone=conflict==='HIGH'?'warn':(conflict==='LOW'?'ok':'info');
+	    const pills=[
+	      conflict?_chatVirtEventPillHtml(`${t('event_conflict')} ${conflict}`,conflictTone,'mono'):'',
+	      score?_chatVirtEventPillHtml(`${t('event_score')} ${score}`,'neutral','mono'):'',
+	    ];
+	    const grid=[
+	      userInput?_chatVirtEventCellHtml(t('event_feedback_input'),userInput,{}):'',
+	      currentStep?_chatVirtEventCellHtml(t('event_current_step'),currentStep,{}):'',
+	    ];
+	    const noteHtml=`<div class=\"msg-event-note\">${esc(t('event_feedback_merge_note'))}</div>`;
+	    const directiveHtml=directive?`<div class=\"msg-event-cell\"><div class=\"msg-event-label\">${esc(t('event_directive'))}</div><div class=\"msg-event-value\">${esc(directive)}</div></div>`:'';
+	    const fallbackHtml=(!userInput&&!currentStep&&!directive&&body)?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:'';
+	    const bodyHtml=`<div class=\"msg-event-body\">${noteHtml}${directiveHtml}${fallbackHtml}</div>`;
+	    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_feedback_merge_title'),'',pills,grid,bodyHtml,'msg-event-card-feedback')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(m.type==='manager_delegate'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const targetRole=_chatVirtAgentRoleKey(info.target);
     const targetLabel=String(info.target_label||_chatVirtAgentRoleLabel(targetRole)||info.target||t('role_agent'));
@@ -50315,9 +55382,10 @@ function _chatVirtBuildMessageNode(m){
     const mandatory=Boolean(info.is_mandatory);
     const budgetNum=Number(info.round_budget||0);
     const remainNum=Number(info.remaining_rounds);
-    const objective=_stripDirectObjectivePrefix(String(info.direct_objective||'').trim());
-    const instructionRaw=String(info.instruction||'').trim()||String(m.text||'').trim();
-    const instruction=_stripObjectiveInstructionForWorker(instructionRaw)||_stripDirectObjectivePrefix(instructionRaw);
+        const objective=_stripDirectObjectivePrefix(String(info.direct_objective||'').trim());
+        const instructionRaw=String(info.instruction||'').trim()||String(m.text||'').trim();
+        const instruction=_stripObjectiveInstructionForWorker(instructionRaw)||_stripDirectObjectivePrefix(instructionRaw);
+        const coordination=String(info.coordination_context||'').trim();
     const pills=[];
     pills.push(level>0?`L${level}`:'L-');
     if(mode)pills.push(mode);
@@ -50328,10 +55396,11 @@ function _chatVirtBuildMessageNode(m){
     if(Number.isFinite(remainNum))pills.push(`remaining=${remainNum<0?'unlimited':remainNum}`);
     const pillsHtml=pills.map(x=>`<span class=\"manager-delegate-pill\">${esc(String(x))}</span>`).join('');
     const routeHtml=`<div class=\"manager-delegate-route\"><span class=\"agent-bus-pill manager\">${esc(t('role_manager'))}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${targetRole?(' '+targetRole):''}\">${esc(targetLabel)}</span></div>`;
-    const objectiveHtml=(objective&&instruction&&objective.toLowerCase()===instruction.toLowerCase())?'':(objective?`<div class=\"manager-delegate-line\"><span>${esc(t('event_objective'))}</span><div>${esc(objective)}</div></div>`:'');
-    const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>${esc(t('event_instruction'))}</span><div>${esc(instruction)}</div></div>`:'';
-    d.innerHTML=`${roleBadge}<div class=\"manager-delegate-card\"><div class=\"manager-delegate-head\">${esc(t('event_manager_delegate_title'))}</div>${routeHtml}<div class=\"manager-delegate-pills\">${pillsHtml}</div>${objectiveHtml}${instructionHtml}</div>`;
-    return d;
+        const objectiveHtml=(objective&&instruction&&objective.toLowerCase()===instruction.toLowerCase())?'':(objective?`<div class=\"manager-delegate-line\"><span>${esc(t('event_objective'))}</span><div>${esc(objective)}</div></div>`:'');
+        const instructionHtml=instruction?`<div class=\"manager-delegate-line\"><span>${esc(t('event_instruction'))}</span><div>${esc(instruction)}</div></div>`:'';
+        const contextHtml=coordination?`<details class=\"manager-delegate-context\"><summary>${esc(t('event_context'))}</summary><div class=\"manager-delegate-context-body\">${esc(coordination)}</div></details>`:'';
+        d.innerHTML=`${roleBadge}<div class=\"manager-delegate-card\"><div class=\"manager-delegate-head\">${esc(t('event_manager_delegate_title'))}</div>${routeHtml}<div class=\"manager-delegate-pills\">${pillsHtml}</div>${objectiveHtml}${instructionHtml}${contextHtml}</div>`;
+        return d;
   }
   if(m.type==='agent_bus'){
     const info=(m&&typeof m.data==='object')?m.data:{};
@@ -50347,9 +55416,9 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}<div class=\"agent-bus-card\"><div class=\"agent-bus-route\"><span class=\"agent-bus-pill${fromCls}\">${esc(fromLabel)}</span><span class=\"agent-bus-arrow\">→</span><span class=\"agent-bus-pill${toCls}\">${esc(toLabel)}</span></div><div class=\"agent-bus-intent\">${esc(t('event_intent'))}: ${esc(intent)}</div><div class=\"agent-bus-payload\">${esc(payload)}</div></div>`;
     return d;
   }
-  if(m.type==='tool_calls'){
-    const info=(m&&typeof m.data==='object')?m.data:{};
-    let tools=Array.isArray(info.tools)?info.tools:[];
+      if(m.type==='tool_calls'){
+        const info=(m&&typeof m.data==='object')?m.data:{};
+        let tools=Array.isArray(info.tools)?info.tools:[];
     if(!tools.length){
       const txt=String(m.text||'').trim().replace(/^\\[tool calls\\]\\s*/i,'');
       tools=txt?txt.split(',').map(x=>String(x||'').trim()).filter(Boolean):[];
@@ -50358,10 +55427,76 @@ function _chatVirtBuildMessageNode(m){
     const bodyHtml=tools.length
       ? `<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_tool_calls_note'))}</div><div class=\"msg-event-tool-grid\">${tools.slice(0,24).map(name=>_chatVirtEventPillHtml(String(name||'?'),'info')).join('')}</div></div>`
       : `<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(t('event_tool_calls_empty'))}</div></div>`;
-    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_tool_calls_title'),tools.length?`${tools.length}`:'',pills,[],bodyHtml,'msg-event-card-tools')}`;
+        d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_tool_calls_title'),tools.length?`${tools.length}`:'',pills,[],bodyHtml,'msg-event-card-tools')}`;
+        return d;
+      }
+  if(kind==='web_search'){
+    const info=(m&&typeof m.data==='object'&&Object.keys(m.data||{}).length)?m.data:(parsedWebSearchText||{});
+    const phase=String(info.phase||'').trim();
+    const mode=String(info.mode||'').trim();
+    const query=String(info.query||info.url||'').trim();
+    const ok=info.ok===undefined?true:Boolean(info.ok);
+    const resultCount=Number(info.result_count||0);
+    const pageCount=Number(info.page_count||info.fetched||0);
+    const followed=Number(info.followed_links||0);
+    const evidence=Number(info.evidence_records||0);
+    const trails=Number(info.query_trails||0);
+    const errors=Array.isArray(info.errors)?info.errors.filter(Boolean):[];
+    const layers=Array.isArray(info.evidence_layers)?info.evidence_layers.filter(Boolean):[];
+    const top=Array.isArray(info.top_results)?info.top_results.filter(Boolean):[];
+    const fetched=Array.isArray(info.fetched_pages)?info.fetched_pages.filter(Boolean):[];
+    const pills=[
+      _chatVirtEventPillHtml(mode||'search','info','mono'),
+      phase?_chatVirtEventPillHtml(phase,phase==='start'?'live':(ok?'ok':'error')):'',
+      resultCount?_chatVirtEventPillHtml(`${resultCount} ${t('event_web_results')}`,'ok'):'',
+      pageCount?_chatVirtEventPillHtml(`${pageCount} ${t('event_web_pages')}`,'neutral'):'',
+      fetched.length?_chatVirtEventPillHtml(`${fetched.length} ${t('event_web_fetched_pages')}`,'info'):'',
+      followed?_chatVirtEventPillHtml(`${followed} ${t('event_web_followed')}`,'neutral'):'',
+      errors.length?_chatVirtEventPillHtml(`${errors.length} ${t('event_web_errors')}`,'warn'):'',
+    ];
+    const grid=[
+      query?_chatVirtEventCellHtml(t('event_web_query'),query,{mono:false}):'',
+      evidence?_chatVirtEventCellHtml(t('event_web_evidence'),String(evidence),{mono:true}):'',
+      trails?_chatVirtEventCellHtml(t('event_web_trails'),String(trails),{mono:true}):'',
+      info.index?_chatVirtEventCellHtml('index',String(info.index||''),{mono:true}):'',
+    ];
+    const renderRows=(rows,limit=6)=>rows.slice(0,limit).map(row=>{
+      const url=String(row?.url||'').trim();
+      const title=String(row?.title||row?.domain||url||'').trim();
+      const snippet=String(row?.snippet||'').trim();
+      const domain=String(row?.domain||'').trim();
+      const source=String(row?.source_type||'').trim();
+      const score=(row&&row.score!==undefined&&row.score!==null&&String(row.score)!=='')?String(row.score):'';
+      const meta=[domain,source,score?`score ${score}`:''].filter(Boolean).join(' · ');
+      return `<div class=\"msg-event-search-result\"><div class=\"msg-event-search-title\">${esc(title||url)}</div>${meta?`<div class=\"msg-event-search-domain\">${esc(meta)}</div>`:''}${url?`<div class=\"msg-event-search-url\">${esc(url)}</div>`:''}${snippet?`<div class=\"msg-event-search-snippet\">${esc(snippet)}</div>`:''}</div>`;
+    }).join('');
+    const fetchedHtml=fetched.length?`<details class=\"msg-event-details\" open><summary>${esc(`${fetched.length} ${t('event_web_fetched_pages')}`)}</summary><div class=\"msg-event-search-results\">${renderRows(fetched,8)}</div></details>`:'';
+    const topHtml=top.length?`<details class=\"msg-event-details\"><summary>${esc(`${top.length} ${t('event_web_results')}`)}</summary><div class=\"msg-event-search-results\">${renderRows(top,6)}</div></details>`:'';
+    const layerHtml=layers.length?`<div class=\"msg-event-tool-grid\">${layers.slice(0,8).map(row=>{
+      const label=`${String(row?.type||'evidence')} · ${String(row?.quality||'web')} ×${String(row?.count||0)}`;
+      return _chatVirtEventPillHtml(label,'neutral');
+    }).join('')}</div>`:'';
+    const errHtml=errors.length?`<details class=\"msg-event-details\"><summary>${esc(t('event_web_errors'))}</summary><pre class=\"msg-code-shell\">${esc(errors.slice(0,4).map(x=>`${String(x?.url||'')}: ${String(x?.error||x?.message||'')}`).join('\\n'))}</pre></details>`:'';
+    const note=String(info.summary||'').trim()||t('event_web_note');
+    const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(note)}</div>${fetchedHtml}${topHtml}${layerHtml}${errHtml}</div>`;
+    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_web_search_title'),query||mode||'agent_web_search',pills,grid,bodyHtml,'msg-event-card-web')}`;
     return d;
   }
-  if(kind==='skill_loaded'){
+          if(kind==='tool_start'||kind==='tool_result'){
+            const info=(m&&typeof m.data==='object'&&Object.keys(m.data||{}).length)?m.data:((parsedToolEventText&&parsedToolEventText.data)||{});
+            const name=String(info.name||info.tool||'tool').trim();
+            const result=String(info.result||'').trim();
+            const isStart=kind==='tool_start';
+        const pills=[
+          _chatVirtEventPillHtml(isStart?t('event_tool_start'):t('event_tool_done'),isStart?'live':'ok'),
+          _chatVirtEventPillHtml(name,'info','mono'),
+        ];
+        const summary=String(info.summary||'').trim();
+        const bodyHtml=`<div class=\"msg-event-body\">${summary?`<div class=\"msg-event-note\">${esc(summary)}</div>`:''}${result?`<pre class=\"msg-code-shell\">${esc(result)}</pre>`:''}</div>`;
+        d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_tool_result_title'),name,pills,[],bodyHtml,'msg-event-card-tools')}`;
+        return d;
+      }
+      if(kind==='skill_loaded'){
     const parsed=_chatVirtParseSkillLoaded(String(m.text||''))||{name:'skill',desc:String(m.text||''),truncated:false};
     const pills=[
       _chatVirtEventPillHtml(t('event_loaded'),'ok'),
@@ -50476,9 +55611,9 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-math-request',key);
     return d;
   }
-	  if(m.type==='live_run_notice'){
-	    const label=String(m.label||'model call');
-	    const elapsedNow=Math.max(0,Number(m.elapsed||0));
+      if(m.type==='live_run_notice'){
+        const label=String(m.label||'model call');
+        const elapsedNow=Math.max(0,Number(m.elapsed||0));
     const startedAt=Number(m.startedAt||0);
     d.setAttribute('data-run-live','1');
     d.setAttribute('data-run-label',label);
@@ -50494,28 +55629,28 @@ function _chatVirtBuildMessageNode(m){
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_model_call_title'),label,pills,[],bodyHtml,'msg-event-card-live')}`;
     const elapsedEl=d.querySelector('.msg-event-pill.mono');
     if(elapsedEl)elapsedEl.setAttribute('data-run-elapsed-text','1');
-	    return d;
-	  }
-	  if(m.type==='scheduler_queued'){
-	    const status=String(m.scheduler_status||'queued').trim()||'queued';
-	    const qid=Number(m.scheduler_queue_id||0);
-	    const pos=Number(m.queue_position||0);
-	    const size=Number(m.queue_size||0);
-	    const reason=String(m.scheduler_reason||'').trim();
-	    const pills=[
-	      _chatVirtEventPillHtml(t('event_scheduler_queued_hint'),'warn'),
-	      qid?_chatVirtEventPillHtml(`#${qid}`,'neutral','mono'):'',
-	      pos?_chatVirtEventPillHtml(`${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`,'info'):'',
-	      reason?_chatVirtEventPillHtml(`${t('event_scheduler_reason')} ${reason}`,'neutral'):'',
-	    ];
-	    const key=`${String(m._vk||'')}:scheduler`;
-	    const noteHtml=`<div class="msg-event-note">${esc(t('event_scheduler_queued_note'))}</div>`;
-	    const bodyHtml=`<div class="msg-event-body">${noteHtml}<div class="msg-md">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
-	    d.innerHTML=`${_chatVirtEventCardHtml(t('event_scheduler_queued_title'),status,pills,[],bodyHtml,'msg-event-card-plan')}`;
-	    d.setAttribute('data-math-request',key);
-	    return d;
-	  }
-	  if(m.type==='plan_notice'){
+        return d;
+      }
+      if(m.type==='scheduler_queued'){
+        const status=String(m.scheduler_status||'queued').trim()||'queued';
+        const qid=Number(m.scheduler_queue_id||0);
+        const pos=Number(m.queue_position||0);
+        const size=Number(m.queue_size||0);
+        const reason=String(m.scheduler_reason||'').trim();
+        const pills=[
+          _chatVirtEventPillHtml(t('event_scheduler_queued_hint'),'warn'),
+          qid?_chatVirtEventPillHtml(`#${qid}`,'neutral','mono'):'',
+          pos?_chatVirtEventPillHtml(`${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`,'info'):'',
+          reason?_chatVirtEventPillHtml(`${t('event_scheduler_reason')} ${reason}`,'neutral'):'',
+        ];
+        const key=`${String(m._vk||'')}:scheduler`;
+        const noteHtml=`<div class="msg-event-note">${esc(t('event_scheduler_queued_note'))}</div>`;
+        const bodyHtml=`<div class="msg-event-body">${noteHtml}<div class="msg-md">${renderMarkdownCached(String(m.text||''),key)}</div></div>`;
+        d.innerHTML=`${_chatVirtEventCardHtml(t('event_scheduler_queued_title'),status,pills,[],bodyHtml,'msg-event-card-plan')}`;
+        d.setAttribute('data-math-request',key);
+        return d;
+      }
+      if(m.type==='plan_notice'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const title=String(info.title||'Plan Guidance').trim()||'Plan Guidance';
     const subtitle=String(info.subtitle||'').trim();
@@ -50661,6 +55796,38 @@ function _chatVirtSetScrollTop(chatEl,target){
   chatEl.scrollTop=next;
   return true;
 }
+function _chatVirtIsBottomLocked(chatEl){
+  return !!chatEl&&Number(chatEl._virtBottomLockUntil||0)>Date.now();
+}
+function _chatVirtClearBottomFollow(chatEl,pause=true){
+  S.follow.chat=false;
+  if(!chatEl)return;
+  chatEl._virtBottomLockUntil=0;
+  if(pause&&S.snap?.running){
+    chatEl._virtAutoFollowPaused=true;
+  }
+}
+function _chatVirtWithAnchorPreserved(chatEl,fn){
+  if(!chatEl||typeof fn!=='function'){
+    return (typeof fn==='function')?fn():undefined;
+  }
+  const wantsBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!wantsBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  let out;
+  try{
+    out=fn();
+  }finally{
+    if(wantsBottom){
+      _chatVirtScrollToBottom(chatEl);
+    }else if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+  return out;
+}
 function _chatVirtHasRecentManualInput(chatEl){
   if(!chatEl)return false;
   const now=Date.now();
@@ -50674,8 +55841,19 @@ function _chatVirtHasRecentManualInput(chatEl){
   const recentTouchMove=Number(chatEl._virtLastTouchMoveTs||0)>0&&(now-Number(chatEl._virtLastTouchMoveTs||0))<touchWindow;
   return manualLock||inputLock||touchLock||recentWheel||recentTouchStart||recentTouchMove;
 }
+function _chatVirtWantsBottom(chatEl,threshold=24){
+  if(!chatEl)return false;
+  const th=Math.max(0,Number(threshold)||24);
+  if(nearBottom(chatEl,th)||_chatVirtIsBottomLocked(chatEl))return true;
+  if(chatEl._virtAutoFollowPaused)return false;
+  return false;
+}
+function _chatVirtShouldDeferLiveRender(chatEl){return !!chatEl&&_chatVirtIsUserScrolling(chatEl)&&!_chatVirtWantsBottom(chatEl,36)}
 function _chatVirtScrollToBottom(chatEl){
   if(!chatEl)return;
+  S.follow.chat=true;
+  chatEl._virtAutoFollowPaused=false;
+  chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),Date.now()+420);
   const apply=()=>{
     const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
     return _chatVirtSetScrollTop(chatEl,maxTop);
@@ -50685,15 +55863,20 @@ function _chatVirtScrollToBottom(chatEl){
     if(chatEl._virtBottomRenderRaf)cancelAnimationFrame(chatEl._virtBottomRenderRaf);
     chatEl._virtBottomRenderRaf=requestAnimationFrame(()=>{
       chatEl._virtBottomRenderRaf=0;
-      if(S.follow.chat||nearBottom(chatEl,12))scheduleRenderChat('scroll');
+      if(_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
     });
   }
-  if(_chatVirtHasRecentManualInput(chatEl))return;
+  if(_chatVirtHasRecentManualInput(chatEl)&&!_chatVirtWantsBottom(chatEl,36))return;
   if(chatEl._virtBottomRaf)cancelAnimationFrame(chatEl._virtBottomRaf);
   chatEl._virtBottomRaf=requestAnimationFrame(()=>{
     chatEl._virtBottomRaf=0;
-    if(!S.follow.chat&&!nearBottom(chatEl,12))return;
-    if(apply()&&(S.follow.chat||nearBottom(chatEl,12)))scheduleRenderChat('scroll');
+    if(!_chatVirtWantsBottom(chatEl,36))return;
+    if(apply()&&_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
+    if(_chatVirtWantsBottom(chatEl,18)){
+      requestAnimationFrame(()=>{
+        if(_chatVirtWantsBottom(chatEl,36))apply();
+      });
+    }
   });
 }
 function _chatVirtBindScroll(chatEl){
@@ -50711,7 +55894,9 @@ function _chatVirtBindScroll(chatEl){
       Number(chatEl._virtInputUnlockTs||0),
       now+Math.max(CHAT_SCROLL_ACTIVE_MS,Math.round(lock*0.8))
     );
-    if(S.snap?.running){
+    if(!nearBottom(chatEl,24)){
+      _chatVirtClearBottomFollow(chatEl,true);
+    }else if(S.snap?.running){
       chatEl._virtAutoFollowPaused=true;
     }
   };
@@ -50766,10 +55951,16 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
     if(dy<0){
-      S.follow.chat=false;
+      _chatVirtClearBottomFollow(chatEl,true);
       return;
     }
-    if(nearBottom(chatEl,6))S.follow.chat=true;
+    if(nearBottom(chatEl,32)){
+      S.follow.chat=true;
+      chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),now+520);
+      chatEl._virtAutoFollowPaused=false;
+    }else{
+      _chatVirtClearBottomFollow(chatEl,true);
+    }
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -50797,10 +55988,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtAutoFollowPaused=false;
       }
     }else if(!programmatic){
-      S.follow.chat=false;
-      if(S.snap?.running){
-        chatEl._virtAutoFollowPaused=true;
-      }
+      _chatVirtClearBottomFollow(chatEl,true);
     }
     if(programmatic&&Number(chatEl._virtSuppressProgrammaticScrollRenderUntil||0)>now)return;
     scheduleScrollRender();
@@ -50843,11 +56031,17 @@ function renderChat(reason='snapshot'){
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
   const prevWinEnd=Number(c._virtLastWinEnd||-1);
-  const top=Math.max(0,c.scrollTop);
-  const bottom=top+Math.max(0,c.clientHeight||0);
+  const viewportH=Math.max(0,c.clientHeight||0);
+  let top=Math.max(0,c.scrollTop);
+  let bottom=top+viewportH;
   const offsetCache=_chatVirtOffsetCache(c,rows,feedSig);
-  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const totalEstimated=Number(offsetCache.total||0);
+  const wantsBottomBeforeWindow=_chatVirtWantsBottom(c,36);
+  if(wantsBottomBeforeWindow){
+    top=Math.max(0,totalEstimated-viewportH);
+    bottom=top+viewportH;
+  }
+  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
@@ -50867,7 +56061,7 @@ function renderChat(reason='snapshot'){
   if((!S.snap?.running)&&atBottomNow){
     c._virtAutoFollowPaused=false;
   }
-  const keep=first||Boolean(S.follow.chat)||atBottomNow;
+  const keep=first||atBottomNow||_chatVirtWantsBottom(c,36);
   const oldScrollTop=Number(c.scrollTop||0);
   const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
   c._virtRendering=true;
@@ -51001,7 +56195,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    if(reason!=='scroll')_chatVirtScrollToBottom(c);
+    if(reason!=='scroll'||wantsBottomBeforeWindow||nearBottom(c,48))_chatVirtScrollToBottom(c);
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     _chatVirtSetScrollTop(c,Math.max(0,Math.min(oldScrollTop,maxTop)));
   }
@@ -51085,7 +56279,7 @@ function renderTodoBoard(items){
   return `<div class="board-summary"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div>${html}`;
 }
 function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
-function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;return st}
+function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,lastRequestAt:0,lastErrorAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;if(!Number.isFinite(Number(st.lastRequestAt)))st.lastRequestAt=0;if(!Number.isFinite(Number(st.lastErrorAt)))st.lastErrorAt=0;return st}
 function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}
 function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)return '-';if(n<1024)return `${n}B`;if(n<1024*1024)return `${(n/1024).toFixed(1)}KB`;if(n<1024*1024*1024)return `${(n/(1024*1024)).toFixed(1)}MB`;return `${(n/(1024*1024*1024)).toFixed(1)}GB`}
 function _feTs(ts){const n=Number(ts||0);if(!Number.isFinite(n)||n<=0)return'';try{return new Date(n*1000).toLocaleString()}catch(_){return''}}
@@ -51094,7 +56288,7 @@ function _feIcon(kind,type='file'){if(type==='dir')return'📁';const k=String(k
 function _feRenderNodes(nodes,depth,st){const rows=Array.isArray(nodes)?nodes:[];if(!rows.length)return'';let out='';for(const node of rows){const type=String(node?.type||'');const name=String(node?.name||'').trim();const path=String(node?.path||'').trim();if(!name)continue;if(type==='dir'){const hasOwn=Object.prototype.hasOwnProperty.call(st.expanded,path);const open=hasOwn?!!st.expanded[path]:(depth<1);const kids=Array.isArray(node?.children)?node.children:[];out+=`<div class=\"fe-row dir\" style=\"--depth:${depth}\"><button class=\"fe-toggle\" data-fe-toggle=\"${esc(path)}\" data-fe-open=\"${open?'1':'0'}\">${open?'▾':'▸'}</button><span class=\"fe-icon\">${_feIcon('', 'dir')}</span><span class=\"fe-name\">${esc(name)}</span><span class=\"fe-meta\">${esc(t('fe_items',{n:kids.length}))}</span></div>`;if(open&&kids.length){out+=_feRenderNodes(kids,depth+1,st)}continue}const kind=String(node?.preview_kind||'').trim();const canPreview=!!kind;const active=(String(st.selected||'')===path);const sizeText=_feSize(node?.size);const timeText=_feTs(node?.mtime);const kindLabel=_feKindLabel(kind);const kindHtml=kindLabel?`<span class=\"fe-kind\">${esc(kindLabel)}</span>`:'';const clickAttr=canPreview?` data-fe-open-path=\"${esc(path)}\"`:'';out+=`<div class=\"fe-row file${active?' active':''}\" style=\"--depth:${depth}\"${clickAttr}><span class=\"fe-icon\">${_feIcon(kind,'file')}</span><span class=\"fe-name\">${esc(name)}</span>${kindHtml}<span class=\"fe-meta\">${esc(sizeText)}${timeText?` · ${esc(timeText)}`:''}</span></div>`}return out}
 function renderFileExplorer(){const host=E('fileExplorer');if(!host)return;const sid=String(S.activeId||'').trim();if(!sid){setHtmlIfChanged('fileExplorer',`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`,'fileExplorer');return}const st=ensureFileExplorerState(sid);if(!st){setHtmlIfChanged('fileExplorer',`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`,'fileExplorer');return}const tree=(st&&typeof st.tree==='object')?st.tree:null;const children=Array.isArray(tree?.children)?tree.children:[];const rootText=String(st.root||S.snap?.session_files_root||'').trim();const summary=[t('fe_nodes',{n:Number(st.nodeCount||0)}),st.inflight?t('fe_loading'):''].filter(Boolean).join(' · ');const treeHtml=children.length?`<div class=\"file-explorer-tree\">${_feRenderNodes(children,0,st)}</div>`:`<div class=\"fe-empty mono\">${esc(t('no_files'))}</div>`;const truncHtml=st.truncated?`<div class=\"fe-trunc mono\">${esc(t('fe_tree_truncated',{n:Number(st.maxNodes||0)}))}</div>`:'';const html=`<div class=\"file-explorer-wrap\"><div class=\"file-explorer-head\"><span class=\"mono file-explorer-root\">${esc(rootText||'/workspace')}</span><span class=\"file-explorer-summary\">${esc(summary)}</span></div>${treeHtml}${truncHtml}</div>`;if(!setHtmlIfChanged('fileExplorer',html,'fileExplorer'))return;for(const btn of host.querySelectorAll('[data-fe-toggle]')){btn.onclick=(ev)=>{ev.preventDefault();ev.stopPropagation();const p=String(btn.getAttribute('data-fe-toggle')||'');const open=String(btn.getAttribute('data-fe-open')||'')==='1';st.expanded[p]=!open;renderFileExplorer()}}for(const row of host.querySelectorAll('[data-fe-open-path]')){row.onclick=(ev)=>{if(ev.target&&ev.target.closest&&ev.target.closest('[data-fe-toggle]'))return;const rel=String(row.getAttribute('data-fe-open-path')||'').trim();if(!rel)return;st.selected=rel;renderFileExplorer();openPreviewTab(rel)}}}
 function renderUploadList(){const host=E('uploadList');if(!host)return;const enabled=!!S.config?.show_upload_list;host.classList.toggle('hidden',!enabled);if(!enabled){setHtmlIfChanged('uploadList','','uploadList');return}const uploads=(S.snap?.uploads||[]).slice(-8).reverse();const html=uploads.map(u=>{const status=String(u.parse_status||'').trim();const statusTxt=status?` · parse=${status}`:'';const err=String(u.parse_error||'').trim();return `<div class="upload-entry"><div class="upload-entry-top"><span class="upload-entry-name">${esc(u.filename||'')}</span><span class="upload-entry-meta">${esc(u.kind||'file')} · ${esc(_feSize(u.size||0))}${esc(statusTxt)}</span></div><div class="upload-entry-path">${esc(u.workspace_path||'')}</div>${err?`<div class="upload-entry-path">${esc(err)}</div>`:''}</div>`}).join('')||`<div class="upload-empty">${esc(t('no_uploads'))}</div>`;setHtmlIfChanged('uploadList',html,'uploadList')}
-async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<1400))return;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){if(String(S.activeId||'')===sid){setHtmlIfChanged('fileExplorer',`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`,'fileExplorer')}}finally{st.inflight=false;if(btn)btn.disabled=false;if(String(S.activeId||'')===sid)renderFileExplorer()}}
+async function refreshFileExplorer(force=false){const sid=String(S.activeId||'').trim();if(!sid)return;const st=ensureFileExplorerState(sid);if(!st)return;const now=Date.now();if(st.inflight)return;const recentReq=now-Number(st.lastRequestAt||0);if(force&&recentReq<250)return;if(!force&&recentReq<1800)return;if(!force&&st.tree&&(now-Number(st.fetchedAt||0)<3500))return;st.lastRequestAt=now;st.inflight=true;const btn=E('refreshFilesBtn');if(btn)btn.disabled=true;renderFileExplorer();try{const payload=await api(_fePath(sid));if(String(S.activeId||'')!==sid)return;st.tree=(payload&&typeof payload==='object'&&payload.tree&&typeof payload.tree==='object')?payload.tree:null;st.root=String(payload?.root||S.snap?.session_files_root||'');st.nodeCount=Number(payload?.node_count||0);st.truncated=!!payload?.truncated;st.maxNodes=Number(payload?.max_nodes||0);st.fetchedAt=Date.now();renderFileExplorer()}catch(err){st.lastErrorAt=Date.now();if(String(S.activeId||'')===sid){setHtmlIfChanged('fileExplorer',`<div class=\"fe-empty mono\">${esc(err?.message||String(err))}</div>`,'fileExplorer')}}finally{st.inflight=false;if(btn)btn.disabled=false;if(String(S.activeId||'')===sid)renderFileExplorer()}}
 function _cmdStateKey(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};return String(op?.id||op?.seq||`${String(d.name||'cmd')}:${String(d.command||'')}:${Number(op?.ts||0)}`)}
 function _cmdPageCount(op){const d=(op&&typeof op==='object'&&op.data&&typeof op.data==='object')?op.data:{};const pages=Array.isArray(d.ui_output_pages)?d.ui_output_pages:[];return Math.max(1,pages.length||Number(d.ui_output_page_count||0)||1)}
 function _cmdCurrentPage(op){if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const key=_cmdStateKey(op);const total=_cmdPageCount(op);let page=Number(S.commandPageState[key]||1);if(!Number.isFinite(page)||page<1)page=1;if(page>total)page=total;S.commandPageState[key]=page;return page}
@@ -51161,7 +56355,7 @@ renderSkillsEntryLink()}
 function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection)}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;return{options,models,selected,thinking}}
 function _modelNameFromSelection(selection){const raw=String(selection||'').trim();if(!raw)return'';if(raw.includes('::')){const parts=raw.split('::',2);return String(parts[1]||parts[0]||'').trim()}return raw}
 function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;renderModelControls();return true}
-function renderModelControls(){const sel=E('modelSelect');if(!sel)return;const opts=S.modelOptions||[];const parts=[];if(opts.length){for(const it of opts){parts.push(`<option value=\"${esc(it.selection)}\">${esc(it.label||it.selection)}</option>`)}}else{const models=S.models||[];if(!models.length&&S.config?.model){parts.push(`<option value=\"${esc(S.config.model)}\">${esc(S.config.model)}</option>`)}for(const m of models){parts.push(`<option value=\"${esc(m)}\">${esc(m)}</option>`)}}const selected=String(S.config?.model||'').trim();let html=parts.join('');if(selected&&!parts.some(p=>p.includes(`value=\"${esc(selected)}\"`))){html+=`<option value=\"${esc(selected)}\">${esc(selected)}</option>`}setHtmlIfChanged('modelSelect',html,'modelSelect');if(selected&&sel.value!==selected)sel.value=selected}
+function renderModelControls(){const sel=E('modelSelect');if(!sel)return;const active=document.activeElement===sel;const opts=S.modelOptions||[];const parts=[];if(opts.length){for(const it of opts){parts.push(`<option value=\"${esc(it.selection)}\">${esc(it.label||it.selection)}</option>`)}}else{const models=S.models||[];if(!models.length&&S.config?.model){parts.push(`<option value=\"${esc(S.config.model)}\">${esc(S.config.model)}</option>`)}for(const m of models){parts.push(`<option value=\"${esc(m)}\">${esc(m)}</option>`)}}const selected=String(S.config?.model||'').trim();let html=parts.join('');if(selected&&!parts.some(p=>p.includes(`value=\"${esc(selected)}\"`))){html+=`<option value=\"${esc(selected)}\">${esc(selected)}</option>`}setHtmlIfChanged('modelSelect',html,'modelSelect');if(selected&&sel.value!==selected&&!active)sel.value=selected}
 async function refreshSessions(opt={}){
   const useProvidedCfg=Object.prototype.hasOwnProperty.call(opt,'statsConfig');
   const useProvidedRows=Object.prototype.hasOwnProperty.call(opt,'sessions');
@@ -51306,6 +56500,8 @@ async function refreshSnapshot(opt={}){
     ensurePreviewState(S.activeId);
     const q=forceFull?'?lite=0':'?lite=1';
     S.snap=await api('/api/sessions/'+S.activeId+q);
+    if(S.deltaRenderRaf){cancelAnimationFrame(S.deltaRenderRaf);S.deltaRenderRaf=0}
+    S.deltaRenderChat=false;S.deltaRenderBoards=false;S.deltaRenderSessions=false;
     const snapSeq=Number(S.snap?.event_seq||0);
     if(Number.isFinite(snapSeq)&&snapSeq>0){
       S.lastEventSeq=Math.max(Number(S.lastEventSeq||0),snapSeq);
@@ -51329,12 +56525,21 @@ async function refreshSnapshot(opt={}){
     }
     if(S.snap?.ui_language){
       S.config=S.config||{};
-      S.config.language=S.snap.ui_language;
-      renderLanguageControls();
-      applyMainI18n();
+      const snapLang=String(S.snap.ui_language||'').trim();
+      const oldLang=String(S.config.language||'').trim();
+      if(snapLang&&snapLang!==oldLang){
+        S.config.language=snapLang;
+        renderLanguageControls();
+        applyMainI18n();
+      }
+    }
+    if(S.snap?.user_memory_mode){
+      S.config=S.config||{};
+      S.config.user_memory_mode=String(S.snap.user_memory_mode||'weak');
+      renderMemoryModeAction();
     }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
+    const deferLiveRender=_chatVirtShouldDeferLiveRender(chatEl);
     const feedSig=feedSignature(S.snap);
     const boardSig=boardsSignature(S.snap);
     const needChat=forceFull||feedSig!==S.lastFeedSig;
@@ -51346,7 +56551,7 @@ async function refreshSnapshot(opt={}){
         if(needChat)scheduleRenderChat('snapshot');
         if(needBoards)renderBoards();
       };
-      if(scrolling&&chatEl){
+      if(deferLiveRender&&chatEl){
         _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',doRender);
       }else{
         if(chatEl){_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');}
@@ -51474,10 +56679,13 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();if(out&&out.queued&&!out.scheduler_started){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})}else if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
+async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
+async function exportUserMemory(e){if(e)e.preventDefault();try{const data=await api('/api/user-memory/export');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='clouds-coder-user-memory.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showError(t('memory_exported'))}catch(err){showError(err.message||String(err))}}
+async function clearUserMemory(e){if(e)e.preventDefault();const ok=confirm(t('memory_clear_confirm'));if(!ok)return;try{await api('/api/user-memory/clear',{method:'POST'});showError(t('memory_cleared'))}catch(err){showError(err.message||String(err))}}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
@@ -51500,13 +56708,14 @@ async function refreshAll(forceProbe=false){
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:true,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){const el=E(id);if(el){if(id==='chat'){continue}if(id==='sessionList'||id==='todos'||id==='tasks'){S.follow[id]=false;const mark=(lockMs=PANEL_SCROLL_ACTIVE_MS)=>{const now=Date.now();el._panelUserScrollTs=now;el._panelUserScrollLockTs=Math.max(Number(el._panelUserScrollLockTs||0),now+Math.max(PANEL_SCROLL_ACTIVE_MS,Number(lockMs)||PANEL_SCROLL_ACTIVE_MS))};el.addEventListener('wheel',()=>mark(PANEL_SCROLL_ACTIVE_MS+260),{passive:true});el.addEventListener('touchstart',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('touchmove',()=>mark(PANEL_SCROLL_ACTIVE_MS+520),{passive:true});el.addEventListener('mousedown',()=>mark(PANEL_SCROLL_ACTIVE_MS+180),{passive:true});el.addEventListener('scroll',()=>mark(PANEL_SCROLL_ACTIVE_MS),{passive:true});continue}el.addEventListener('scroll',()=>{S.follow[id]=nearBottom(el)})}}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());const toolsMenuBtn=E('toolsMenuBtn');const toolsMenu=E('toolsMenu');if(toolsMenuBtn&&toolsMenu){toolsMenuBtn.addEventListener('click',e=>{e.stopPropagation();toolsMenu.style.display=toolsMenu.style.display==='none'?'block':'none'})}bindClick('compactAction',(e)=>{if(e)e.preventDefault();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();refreshAll(true)});const levelMenuBtn=E('levelBtn');const levelMenu=E('levelMenu');if(levelMenuBtn&&levelMenu){levelMenuBtn.addEventListener('click',e=>{e.stopPropagation();levelMenu.style.display=levelMenu.style.display==='none'?'block':'none'});levelMenu.addEventListener('click',e=>{e.stopPropagation()});for(const opt of levelMenu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);levelMenu.style.display='none'})}}const exportMenuBtn=E('exportMenuBtn');const exportMenu=E('exportMenu');if(exportMenuBtn&&exportMenu){exportMenuBtn.addEventListener('click',e=>{e.stopPropagation();exportMenu.style.display=exportMenu.style.display==='none'?'block':'none'});exportMenu.addEventListener('click',e=>{e.stopPropagation()});for(const a of exportMenu.querySelectorAll('.export-item')){a.addEventListener('click',()=>{exportMenu.style.display='none'})}}document.addEventListener('click',()=>{for(const menu of document.querySelectorAll('.popup-menu')){menu.style.display='none'}if(exportMenu)exportMenu.style.display='none'});const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
-type Msg={role:string;text:string;thinking?:string;agent_role?:string};
+type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
-type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
+type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
 type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
 type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
 type SkillProtocol={protocol:string;version:string;active_providers:number;active_skills:number;description:string};
@@ -61428,6 +66637,662 @@ class WikiStore:
         }
 
 
+class UserMemoryStore:
+    """Per-user summary memory for preferences, task patterns, and project anchors."""
+
+    TECH_STACK_PATTERNS = (
+        ("python", ("python", "pytest", "fastapi", "django", "flask", ".py")),
+        ("react", ("react", "vite", "jsx", "tsx", "create-react-app")),
+        ("typescript", ("typescript", "tsconfig", ".ts", ".tsx")),
+        ("javascript", ("javascript", "node.js", "nodejs", "npm", ".js")),
+        ("fastapi", ("fastapi",)),
+        ("celery", ("celery",)),
+        ("redis", ("redis",)),
+        ("sqlite", ("sqlite", "sqlite3")),
+        ("postgresql", ("postgres", "postgresql")),
+        ("ollama", ("ollama",)),
+        ("glm", ("glm",)),
+        ("three.js", ("three.js", "threejs", "webgl", "glsl", "shader")),
+        ("echarts", ("echarts",)),
+        ("mermaid", ("mermaid",)),
+        ("html/css/js", ("html", "css", "交互报告", "interactive report")),
+    )
+    OUTPUT_PATTERNS = (
+        ("html", ("html", "交互报告", "interactive report")),
+        ("markdown", ("markdown", ".md", "readme")),
+        ("ppt", ("ppt", "pptx", "演示文稿", "presentation")),
+        ("pdf", ("pdf",)),
+        ("mermaid", ("mermaid", "架构图")),
+        ("tests", ("pytest", "测试", "验证", "lint", "ruff")),
+    )
+    TASK_PATTERNS = (
+        ("debugging", ("bug", "debug", "报错", "修复", "失败", "error", "traceback")),
+        ("architecture", ("架构", "系统性", "设计", "方案", "architecture")),
+        ("frontend", ("前端", "ui", "webui", "css", "交互", "react")),
+        ("agent-runtime", ("agent", "多agent", "manager", "blackboard", "compact")),
+        ("research", ("搜索", "调研", "web search", "资料", "新闻")),
+        ("report", ("报告", "ppt", "html", "文档", "summary")),
+    )
+
+    def __init__(self, user_root: Path, user_id: str = ""):
+        self.user_root = Path(user_root).resolve()
+        self.user_id = str(user_id or self.user_root.name or "").strip()
+        self.root = self.user_root / USER_MEMORY_DIRNAME
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.root / USER_MEMORY_DB_FILENAME
+        self.profile_path = self.root / USER_MEMORY_PROFILE_FILENAME
+        self.lock = threading.RLock()
+        self._init_db()
+        if not self.profile_path.exists():
+            self._write_profile_locked(self._empty_profile())
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_items (
+                        id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        tags_json TEXT NOT NULL DEFAULT '[]',
+                        confidence REAL NOT NULL DEFAULT 0.3,
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        source_ts REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL DEFAULT 0,
+                        decay_weight REAL NOT NULL DEFAULT 1.0,
+                        meta_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_summaries (
+                        session_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        task_type TEXT NOT NULL DEFAULT '',
+                        output_formats_json TEXT NOT NULL DEFAULT '[]',
+                        tech_stack_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at REAL NOT NULL DEFAULT 0,
+                        confidence REAL NOT NULL DEFAULT 0.3,
+                        meta_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_kind ON memory_items(kind)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_updated ON memory_items(updated_at)")
+                conn.commit()
+
+    def _empty_profile(self) -> dict:
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "updated_at": now_ts(),
+            "categories": {
+                "long_term_preferences": [],
+                "common_tech_stack": [],
+                "common_task_types": [],
+                "interaction_style": [],
+                "project_anchors": [],
+                "output_formats": [],
+                "role_activation": [],
+            },
+            "stats": {"items": 0, "sessions": 0},
+        }
+
+    def _write_profile_locked(self, profile: dict):
+        data = dict(profile or self._empty_profile())
+        data["schema_version"] = USER_MEMORY_PROFILE_SCHEMA_VERSION
+        data["user_id"] = self.user_id
+        data["updated_at"] = now_ts()
+        _write_json_file(self.profile_path, data)
+
+    def load_profile(self) -> dict:
+        with self.lock:
+            raw = _read_json_file(self.profile_path, self._empty_profile())
+            return dict(raw) if isinstance(raw, dict) else self._empty_profile()
+
+    def _json_load_list(self, raw: object) -> list:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    def _json_load_dict(self, raw: object) -> dict:
+        try:
+            parsed = json.loads(str(raw or "{}"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _sanitize_summary(self, text: object, limit: int = USER_MEMORY_MAX_SUMMARY_CHARS) -> str:
+        raw = trim(str(text or "").replace("\r", "\n").strip(), max(80, int(limit or USER_MEMORY_MAX_SUMMARY_CHARS)))
+        raw = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^\s,'\"]+", r"\1=[redacted]", raw)
+        raw = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email-redacted]", raw)
+        return raw
+
+    def _terms(self, text: object) -> set[str]:
+        low = str(text or "").lower()
+        terms = {m.group(0) for m in re.finditer(r"[a-z0-9_./+-]{2,}", low)}
+        cjk = re.sub(r"[^\u3400-\u9fff]+", "", low)
+        if len(cjk) >= 2:
+            terms.update(cjk[i : i + 2] for i in range(min(len(cjk) - 1, 80)))
+        return {t for t in terms if t.strip()}
+
+    def _detect_patterns(self, haystack: str, patterns: tuple[tuple[str, tuple[str, ...]], ...]) -> list[str]:
+        low = haystack.lower()
+        out = []
+        for label, needles in patterns:
+            if any(str(n).lower() in low for n in needles):
+                out.append(label)
+        return out
+
+    def _extract_session_text(self, sess: object) -> tuple[str, list[str], list[str]]:
+        messages = list(getattr(sess, "messages", []) or [])[-80:]
+        user_lines: list[str] = []
+        assistant_lines: list[str] = []
+        for row in messages:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "") or "").strip().lower()
+            content = trim(str(row.get("content", row.get("text", "")) or "").replace("\n", " "), 600)
+            if not content:
+                continue
+            if role == "user":
+                user_lines.append(content)
+            elif role in {"assistant", "developer"}:
+                assistant_lines.append(content)
+        paths = []
+        try:
+            paths.extend(str(x) for x in (getattr(sess, "code_preview_index", {}) or {}).keys())
+        except Exception:
+            pass
+        try:
+            for upload in list(getattr(sess, "uploads", []) or [])[-20:]:
+                if isinstance(upload, dict):
+                    name = str(upload.get("filename", "") or "").strip()
+                    rel = str(upload.get("workspace_path", "") or "").strip()
+                    if name:
+                        paths.append(name)
+                    if rel:
+                        paths.append(rel)
+        except Exception:
+            pass
+        text = "\n".join(user_lines[-12:] + assistant_lines[-8:] + paths[-40:])
+        return text, user_lines, paths
+
+    def _interaction_style_items(self, text: str, ui_language: str) -> list[dict]:
+        low = text.lower()
+        items: list[dict] = []
+        if ui_language:
+            items.append({
+                "kind": "interaction_style",
+                "summary": f"Preferred UI/output language signal: {ui_language}.",
+                "tags": ["language", ui_language],
+                "confidence": 0.62,
+            })
+        if any(x in low for x in ("直接", "不要废话", "别废话", "快速", "少解释", "concise", "direct")):
+            items.append({
+                "kind": "interaction_style",
+                "summary": "User often prefers direct, action-oriented responses when the current request allows it.",
+                "tags": ["direct", "concise"],
+                "confidence": 0.58,
+            })
+        if any(x in low for x in ("仔细", "系统性", "深入", "完整", "审查", "thorough", "systematic")):
+            items.append({
+                "kind": "interaction_style",
+                "summary": "User often values systematic root-cause analysis and architecture-level judgement for complex engineering issues.",
+                "tags": ["systematic", "architecture", "review"],
+                "confidence": 0.64,
+            })
+        if any(x in low for x in ("多语言", "四种语言", "i18n", "国际化")):
+            items.append({
+                "kind": "long_term_preferences",
+                "summary": "When frontend text changes, preserve multilingual/i18n coverage instead of adding single-language strings.",
+                "tags": ["i18n", "frontend"],
+                "confidence": 0.7,
+            })
+        if any(x in low for x in ("不要硬停", "不要触发硬停", "自由度", "不要关键词")):
+            items.append({
+                "kind": "long_term_preferences",
+                "summary": "User prefers semantic, model-guided control flow over brittle keyword or hard-stop defensive mechanisms.",
+                "tags": ["semantic-control", "agent-runtime"],
+                "confidence": 0.72,
+            })
+        return items
+
+    def _project_anchor_items(self, paths: list[str]) -> list[dict]:
+        anchors: list[str] = []
+        for raw in paths:
+            rel = normalize_rel_preview_path(raw)
+            if not rel:
+                continue
+            first = rel.split("/", 1)[0]
+            if first and first not in anchors and first not in {"uploaded", "uploads", ".clouds_coder"}:
+                anchors.append(first)
+            if len(anchors) >= 8:
+                break
+        if not anchors:
+            return []
+        return [{
+            "kind": "project_anchors",
+            "summary": "Recent project/file anchors: " + ", ".join(anchors[:8]) + ".",
+            "tags": anchors[:8],
+            "confidence": 0.52,
+        }]
+
+    def _capture_from_session(self, sess: object) -> dict:
+        sid = str(getattr(sess, "id", "") or "").strip()
+        title = trim(str(getattr(sess, "title", "") or sid or "session"), 160)
+        objective = trim(str(getattr(sess, "runtime_direct_objective", "") or title), 500)
+        task_type = trim(str(getattr(sess, "runtime_task_type", "") or "general"), 80)
+        ui_language = normalize_ui_language(getattr(sess, "ui_language", DEFAULT_UI_LANGUAGE))
+        text, user_lines, paths = self._extract_session_text(sess)
+        haystack = "\n".join([title, objective, task_type, text, " ".join(paths)])
+        tech_stack = self._detect_patterns(haystack, self.TECH_STACK_PATTERNS)
+        output_formats = self._detect_patterns(haystack, self.OUTPUT_PATTERNS)
+        task_types = self._detect_patterns(haystack, self.TASK_PATTERNS)
+        try:
+            operations = list(getattr(sess, "operations", []) or [])[-80:]
+        except Exception:
+            operations = []
+        tool_names = []
+        for row in operations:
+            if isinstance(row, dict):
+                name = str(row.get("tool", row.get("name", row.get("type", ""))) or "").strip()
+                if name and name not in tool_names:
+                    tool_names.append(name)
+        summary_bits = [f"Task: {objective or title}"]
+        if task_types or task_type:
+            summary_bits.append("Task type: " + ", ".join((task_types or [task_type])[:5]))
+        if tech_stack:
+            summary_bits.append("Tech stack: " + ", ".join(tech_stack[:8]))
+        if output_formats:
+            summary_bits.append("Output format: " + ", ".join(output_formats[:6]))
+        if tool_names:
+            summary_bits.append("Tools used: " + ", ".join(tool_names[:8]))
+        if paths:
+            summary_bits.append("Artifacts/files: " + ", ".join(paths[:8]))
+        session_summary = self._sanitize_summary("; ".join(summary_bits), 1100)
+        items: list[dict] = []
+        for label in tech_stack[:10]:
+            items.append({
+                "kind": "common_tech_stack",
+                "summary": f"User has recent work involving {label}.",
+                "tags": [label],
+                "confidence": 0.48,
+            })
+        for label in output_formats[:8]:
+            items.append({
+                "kind": "output_formats",
+                "summary": f"User has recent tasks requesting or producing {label} outputs.",
+                "tags": [label],
+                "confidence": 0.5,
+            })
+        for label in (task_types or ([task_type] if task_type else []))[:8]:
+            items.append({
+                "kind": "common_task_types",
+                "summary": f"Recent task pattern: {label}.",
+                "tags": [label],
+                "confidence": 0.46,
+            })
+        items.extend(self._interaction_style_items("\n".join(user_lines[-12:]), ui_language))
+        items.extend(self._project_anchor_items(paths))
+        mode = normalize_execution_mode(getattr(sess, "runtime_execution_mode", ""), default="")
+        participants = [str(x) for x in (getattr(sess, "runtime_participants", []) or []) if str(x).strip()]
+        if mode == EXECUTION_MODE_SYNC and participants:
+            items.append({
+                "kind": "role_activation",
+                "summary": "Recent complex work used multi-agent coordination with roles: " + ", ".join(participants[:4]) + ".",
+                "tags": participants[:4],
+                "confidence": 0.42,
+            })
+        return {
+            "session_id": sid,
+            "title": title,
+            "summary": session_summary,
+            "task_type": task_types[0] if task_types else task_type,
+            "output_formats": output_formats[:12],
+            "tech_stack": tech_stack[:16],
+            "items": items[:36],
+            "confidence": 0.55 if items else 0.35,
+            "updated_at": now_ts(),
+        }
+
+    def _memory_id(self, source_session_id: str, kind: str, summary: str) -> str:
+        base = f"{self.user_id}|{source_session_id}|{kind}|{summary}".encode("utf-8", errors="ignore")
+        return hashlib.sha1(base).hexdigest()[:24]
+
+    def _insert_memory_item_locked(self, conn, row: dict, source_session_id: str, ts: float):
+        kind = trim(str(row.get("kind", "") or "preference"), 80)
+        summary = self._sanitize_summary(row.get("summary", ""), USER_MEMORY_MAX_SUMMARY_CHARS)
+        if not summary:
+            return
+        tags = [trim(str(x), 80) for x in (row.get("tags", []) or []) if str(x).strip()][:20]
+        confidence = max(0.05, min(1.0, float(row.get("confidence", 0.35) or 0.35)))
+        mid = self._memory_id(source_session_id, kind, summary)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_items
+            (id, kind, summary, tags_json, confidence, source_session_id, source_ts, updated_at, decay_weight, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mid,
+                kind,
+                summary,
+                json_dumps(tags),
+                confidence,
+                source_session_id,
+                ts,
+                ts,
+                1.0,
+                json_dumps({"summary_only": True}),
+            ),
+        )
+
+    def capture_session(self, sess: object) -> dict:
+        if sess is None:
+            return {"ok": False, "error": "session missing"}
+        capture = self._capture_from_session(sess)
+        sid = str(capture.get("session_id", "") or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id missing"}
+        ts = float(capture.get("updated_at", now_ts()) or now_ts())
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO session_summaries
+                    (session_id, title, summary, task_type, output_formats_json, tech_stack_json, updated_at, confidence, meta_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        str(capture.get("title", "") or sid),
+                        self._sanitize_summary(capture.get("summary", ""), USER_MEMORY_MAX_SUMMARY_CHARS),
+                        str(capture.get("task_type", "") or ""),
+                        json_dumps(capture.get("output_formats", []) or []),
+                        json_dumps(capture.get("tech_stack", []) or []),
+                        ts,
+                        float(capture.get("confidence", 0.35) or 0.35),
+                        json_dumps({"summary_only": True}),
+                    ),
+                )
+                conn.execute("DELETE FROM memory_items WHERE source_session_id = ?", (sid,))
+                for item in list(capture.get("items", []) or [])[:40]:
+                    if isinstance(item, dict):
+                        self._insert_memory_item_locked(conn, item, sid, ts)
+                conn.commit()
+                profile = self._rebuild_profile_locked(conn)
+            self._write_profile_locked(profile)
+        return {"ok": True, "session_id": sid, "items": len(capture.get("items", []) or [])}
+
+    def _row_decay(self, updated_at: float) -> float:
+        age = max(0.0, now_ts() - float(updated_at or 0.0))
+        half_life = max(1.0, USER_MEMORY_DECAY_HALFLIFE_DAYS) * 86400.0
+        return max(0.05, min(1.0, 0.5 ** (age / half_life)))
+
+    def _row_to_dict(self, row) -> dict:
+        return {
+            "id": str(row["id"]),
+            "kind": str(row["kind"]),
+            "summary": str(row["summary"]),
+            "tags": self._json_load_list(row["tags_json"]),
+            "confidence": float(row["confidence"] or 0.0),
+            "source_session_id": str(row["source_session_id"] or ""),
+            "source_ts": float(row["source_ts"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+            "decay_weight": float(row["decay_weight"] or 1.0),
+            "meta": self._json_load_dict(row["meta_json"]),
+        }
+
+    def _score_row(self, query_terms: set[str], row: dict) -> float:
+        summary = str(row.get("summary", "") or "")
+        tags = " ".join(str(x) for x in (row.get("tags", []) or []))
+        terms = self._terms(summary + " " + tags)
+        overlap = len(query_terms & terms) / max(1, min(len(query_terms), 12))
+        confidence = float(row.get("confidence", 0.0) or 0.0)
+        decay = self._row_decay(float(row.get("updated_at", 0.0) or 0.0))
+        return round((overlap * 0.52) + (confidence * 0.30) + (decay * 0.18), 6)
+
+    def query(self, query_text: str, *, limit: int = USER_MEMORY_QUERY_LIMIT) -> list[dict]:
+        query = str(query_text or "").strip()
+        if not query:
+            return []
+        qterms = self._terms(query)
+        if not qterms:
+            return []
+        with self.lock:
+            with self._connect() as conn:
+                rows = [
+                    self._row_to_dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM memory_items ORDER BY updated_at DESC LIMIT 240"
+                    ).fetchall()
+                ]
+        scored = []
+        for row in rows:
+            score = self._score_row(qterms, row)
+            if score <= 0.08:
+                continue
+            item = dict(row)
+            item["score"] = score
+            scored.append(item)
+        scored.sort(key=lambda x: (float(x.get("score", 0.0)), float(x.get("updated_at", 0.0))), reverse=True)
+        return scored[: max(1, min(24, int(limit or USER_MEMORY_QUERY_LIMIT)))]
+
+    def _rebuild_profile_locked(self, conn) -> dict:
+        rows = [self._row_to_dict(row) for row in conn.execute("SELECT * FROM memory_items ORDER BY updated_at DESC").fetchall()]
+        session_count = int(conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0] or 0)
+        categories = self._empty_profile()["categories"]
+        for row in rows:
+            kind = str(row.get("kind", "") or "")
+            if kind not in categories:
+                continue
+            weight = float(row.get("confidence", 0.0) or 0.0) * self._row_decay(float(row.get("updated_at", 0.0) or 0.0))
+            item = {
+                "summary": trim(str(row.get("summary", "") or ""), 360),
+                "tags": list(row.get("tags", []) or [])[:12],
+                "confidence": round(float(row.get("confidence", 0.0) or 0.0), 3),
+                "weight": round(weight, 3),
+                "source_session_id": str(row.get("source_session_id", "") or ""),
+                "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            }
+            categories[kind].append(item)
+        for key, items in list(categories.items()):
+            deduped: list[dict] = []
+            seen: set[str] = set()
+            for item in sorted(items, key=lambda x: (float(x.get("weight", 0.0)), float(x.get("updated_at", 0.0))), reverse=True):
+                sig = trim(str(item.get("summary", "") or "").lower(), 180)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                deduped.append(item)
+                if len(deduped) >= 10:
+                    break
+            categories[key] = deduped
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "updated_at": now_ts(),
+            "categories": categories,
+            "stats": {"items": len(rows), "sessions": session_count},
+        }
+
+    def payload(self, *, limit: int = 80) -> dict:
+        with self.lock:
+            profile = self.load_profile()
+            with self._connect() as conn:
+                items = [
+                    self._row_to_dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM memory_items ORDER BY updated_at DESC LIMIT ?",
+                        (max(1, min(400, int(limit or 80))),),
+                    ).fetchall()
+                ]
+                sessions = int(conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0] or 0)
+        return {
+            "ok": True,
+            "root": str(self.root),
+            "mode": "summary-only",
+            "profile": profile,
+            "stats": {"items": len(items), "sessions": sessions},
+            "items": items,
+        }
+
+    def export_payload(self) -> dict:
+        with self.lock:
+            profile = self.load_profile()
+            with self._connect() as conn:
+                items = [self._row_to_dict(row) for row in conn.execute("SELECT * FROM memory_items ORDER BY updated_at DESC").fetchall()]
+                sessions = []
+                for row in conn.execute("SELECT * FROM session_summaries ORDER BY updated_at DESC").fetchall():
+                    sessions.append({
+                        "session_id": str(row["session_id"]),
+                        "title": str(row["title"]),
+                        "summary": str(row["summary"]),
+                        "task_type": str(row["task_type"]),
+                        "output_formats": self._json_load_list(row["output_formats_json"]),
+                        "tech_stack": self._json_load_list(row["tech_stack_json"]),
+                        "updated_at": float(row["updated_at"] or 0.0),
+                        "confidence": float(row["confidence"] or 0.0),
+                        "meta": self._json_load_dict(row["meta_json"]),
+                    })
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "summary_only": True,
+            "exported_at": now_ts(),
+            "profile": profile,
+            "memory_items": items,
+            "session_summaries": sessions,
+        }
+
+    def clear(self) -> dict:
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM memory_items")
+                conn.execute("DELETE FROM session_summaries")
+                conn.commit()
+            self._write_profile_locked(self._empty_profile())
+        return {"ok": True, "cleared": True, "user_id": self.user_id}
+
+
+class UserInteractionOptimizer:
+    """Convert user memory into bounded preference hints for the current task."""
+
+    def build_capsule(self, *, profile: dict, memories: list[dict], mode: str, latest_text: str, max_chars: int) -> tuple[str, dict]:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "off":
+            return "", {"mode": "off", "memory_count": 0}
+        categories = profile.get("categories", {}) if isinstance(profile, dict) else {}
+        influence = (
+            "Weak preference signals only; use them for defaults when the latest request is silent."
+            if mode_key == "weak"
+            else "Active preference signals; use them to choose sensible defaults, but explicit current instructions always override them."
+        )
+        lines = [
+            "<user-profile-capsule>",
+            f"mode={mode_key}; summary_only=true; {influence}",
+            "Never infer sensitive identity attributes. Never override the latest user instruction, manual Level, manual Plan, or explicit tool preference.",
+        ]
+        category_labels = (
+            ("interaction_style", "Interaction style"),
+            ("long_term_preferences", "Long-term preferences"),
+            ("common_tech_stack", "Common tech stack"),
+            ("common_task_types", "Common task types"),
+            ("output_formats", "Common output formats"),
+            ("project_anchors", "Project anchors"),
+            ("role_activation", "Role activation"),
+        )
+        category_count = 0
+        per_category = 1 if mode_key == "weak" else 2
+        for key, label in category_labels:
+            rows = categories.get(key, []) if isinstance(categories.get(key, []), list) else []
+            picked = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                summary = trim(str(row.get("summary", "") or ""), 240)
+                if summary:
+                    picked.append(summary)
+                if len(picked) >= per_category:
+                    break
+            if picked:
+                lines.append(f"{label}: " + " | ".join(picked))
+                category_count += len(picked)
+        if memories:
+            lines.append("Relevant prior summaries:")
+            for row in memories[: (3 if mode_key == "weak" else 6)]:
+                summary = trim(str(row.get("summary", "") or ""), 240)
+                if not summary:
+                    continue
+                source = trim(str(row.get("source_session_id", "") or ""), 32)
+                conf = float(row.get("confidence", 0.0) or 0.0)
+                kind = trim(str(row.get("kind", "") or ""), 40)
+                lines.append(f"- {kind} conf={conf:.2f} source={source or '-'}: {summary}")
+        lines.append("</user-profile-capsule>")
+        capsule = trim("\n".join(lines), max(400, int(max_chars or USER_MEMORY_WEAK_CAPSULE_CHARS)))
+        meta = {
+            "mode": mode_key,
+            "memory_count": len(memories),
+            "category_count": category_count,
+            "chars": len(capsule),
+            "latest_hash": hashlib.sha1(str(latest_text or "").encode("utf-8", errors="ignore")).hexdigest()[:12],
+        }
+        return capsule, meta
+
+
+class UserIntentProfiler:
+    """Prepare per-user preference capsules before task classification starts."""
+
+    def __init__(self, store: UserMemoryStore, optimizer: UserInteractionOptimizer | None = None):
+        self.store = store
+        self.optimizer = optimizer or UserInteractionOptimizer()
+
+    def max_chars_for_mode(self, mode: str) -> int:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "on":
+            return USER_MEMORY_ON_CAPSULE_CHARS
+        if mode_key == "weak":
+            return USER_MEMORY_WEAK_CAPSULE_CHARS
+        return 0
+
+    def prepare_session(self, sess: object, latest_text: str, mode: str) -> dict:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "off":
+            setattr(sess, "user_memory_mode", "off")
+            setattr(sess, "user_profile_capsule", "")
+            setattr(sess, "user_profile_capsule_meta", {"mode": "off", "memory_count": 0})
+            return {"ok": True, "mode": "off", "capsule_chars": 0, "memory_count": 0}
+        memories = self.store.query(latest_text, limit=USER_MEMORY_QUERY_LIMIT)
+        profile = self.store.load_profile()
+        capsule, meta = self.optimizer.build_capsule(
+            profile=profile,
+            memories=memories,
+            mode=mode_key,
+            latest_text=latest_text,
+            max_chars=self.max_chars_for_mode(mode_key),
+        )
+        setattr(sess, "user_memory_mode", mode_key)
+        setattr(sess, "user_profile_capsule", capsule)
+        setattr(sess, "user_profile_capsule_meta", meta)
+        return {
+            "ok": True,
+            "mode": mode_key,
+            "capsule_chars": len(capsule),
+            "memory_count": int(meta.get("memory_count", 0) or 0),
+        }
+
+
 class WorkflowMemoryStore:
     """Accepted programming workflow patterns captured from finished sessions."""
 
@@ -65722,6 +71587,10 @@ class AppContext:
         daily_session_reset_hour: int = 8,
         js_lib_download_enabled: bool = True,
         rag_include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
+        web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED,
+        web_search_setting_locked: bool = False,
+        user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
+        user_memory_setting_locked: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -65766,6 +71635,10 @@ class AppContext:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
+        self.web_search_enabled = bool(web_search_enabled)
+        self.web_search_setting_locked = bool(web_search_setting_locked)
+        self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
+        self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.skills_root = skills_root
@@ -65798,7 +71671,10 @@ class AppContext:
         self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self._task_queue: deque[dict] = deque()
         self._task_queue_seq = 0
-        self.tool_specs = TOOLS
+        self.tool_specs = filter_tool_specs_for_runtime(
+            TOOLS,
+            web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+        )
         self.web_ui_config_path = str(resolve_optional_file_path("", self.workspace))
         self.web_ui_dir = resolve_web_ui_dir_path(DEFAULT_WEB_UI_DIR, self.workspace)
         self.web_ui_external_requested = False
@@ -67897,6 +73773,10 @@ class AppContext:
             if not isinstance(sess, SessionState):
                 continue
             try:
+                uid = str(req.get("user_id", "") or "")
+                if uid:
+                    mgr = self.manager_for_user(uid)
+                    mgr.prepare_user_intent_for_session(sess, str(req.get("content", "") or ""))
                 out = sess.submit_user_message(str(req.get("content", "") or ""))
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
@@ -67945,6 +73825,10 @@ class AppContext:
                 self.workflow_memory.capture_session(sess)
             except Exception:
                 pass
+            try:
+                mgr.capture_user_memory_from_session(sess)
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -67980,6 +73864,7 @@ class AppContext:
         if not text:
             raise ValueError("content required")
         if not self.scheduler_limits_enabled():
+            mgr.prepare_user_intent_for_session(sess, text)
             return sess.submit_user_message(text)
 
         selected_rows: list[dict] = []
@@ -68088,6 +73973,22 @@ class AppContext:
                 pass
         return response
 
+    def user_memory_payload(self, user_id: str, *, limit: int = 80) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.user_memory_payload(limit=limit)
+
+    def user_memory_export_payload(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.user_memory_export_payload()
+
+    def clear_user_memory(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.clear_user_memory()
+
+    def set_user_memory_mode_for_user(self, user_id: str, mode: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.set_user_memory_mode(mode)
+
     def manager_for_user(self, user_id: str) -> SessionManager:
         with self._lock:
             if user_id in self._session_mgrs:
@@ -68120,6 +74021,10 @@ class AppContext:
                 self.arbiter_temperature,
                 self.execution_mode,
                 self.max_output_tokens,
+                web_search_enabled=self.web_search_enabled,
+                web_search_setting_locked=self.web_search_setting_locked,
+                user_memory_mode=self.user_memory_mode,
+                user_memory_setting_locked=self.user_memory_setting_locked,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -68139,6 +74044,10 @@ class AppContext:
             mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+            mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
+            mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
             self._session_mgrs[user_id] = mgr
             return mgr
 
@@ -68232,6 +74141,16 @@ class AppContext:
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
+        if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
+            self.web_search_enabled = bool(cfg_web_search_enabled)
+            self.tool_specs = filter_tool_specs_for_runtime(
+                TOOLS,
+                web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+            )
+        cfg_user_memory_mode = extract_user_memory_mode_setting(cfg)
+        if cfg_user_memory_mode is not None and not bool(getattr(self, "user_memory_setting_locked", False)):
+            self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
 
         def normalized_profiles() -> tuple[dict[str, dict], str]:
             rows: dict[str, dict] = {}
@@ -68298,6 +74217,10 @@ class AppContext:
                 mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                 )
+                mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+                mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
+                mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+                mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
                 for sess in mgr.sessions.values():
                     sess.read_context_policy = normalize_read_context_policy(
                         getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -68308,6 +74231,8 @@ class AppContext:
                     sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     )
+                    sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+                    sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
                     sess.updated_at = now_ts()
                     sess._persist()
                 live_users += 1
@@ -68355,6 +74280,8 @@ class AppContext:
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     ),
+                    "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+                    "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
                     "updated_at": now_ts(),
                 }
                 self.crypto.write_json(user_prefs_path, user_prefs_payload)
@@ -68372,6 +74299,12 @@ class AppContext:
                             sraw["multimodal_capability_cache"] = {}
                             sraw["auto_task_level_ceiling"] = normalize_auto_task_level_ceiling(
                                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                            )
+                            sraw["web_search_enabled"] = bool(
+                                getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)
+                            )
+                            sraw["user_memory_mode"] = normalize_user_memory_mode(
+                                getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
                             )
                             sraw["read_context_policy"] = normalize_read_context_policy(
                                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -68458,6 +74391,10 @@ class AppContext:
 
     def tools_catalog(self) -> list[dict]:
         out = []
+        self.tool_specs = filter_tool_specs_for_runtime(
+            TOOLS,
+            web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+        )
         for item in self.tool_specs:
             fn = item.get("function", {})
             out.append(
@@ -69263,6 +75200,9 @@ class Handler(BaseHTTPRequestHandler):
                         "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                             getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                         ),
+                        "user_memory_mode": normalize_user_memory_mode(
+                            getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
+                        ),
                     }
                 )
             model_cat = mgr.model_catalog()
@@ -69317,6 +75257,10 @@ class Handler(BaseHTTPRequestHandler):
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                         getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     ),
+                    "user_memory_mode": normalize_user_memory_mode(
+                        getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
+                    ),
+                    "user_memory_setting_locked": bool(getattr(mgr, "user_memory_setting_locked", False)),
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
@@ -69338,6 +75282,20 @@ class Handler(BaseHTTPRequestHandler):
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
                 }
             )
+        if path == "/api/user-memory":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            try:
+                return self._send_json(self.app.user_memory_payload(self._user_id(), limit=limit))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/export":
+            try:
+                return self._send_json(self.app.user_memory_export_payload(self._user_id()))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/models":
             return self._send_json(mgr.model_catalog(force_probe=refresh_probe))
         if path == "/api/tools":
@@ -69697,6 +75655,20 @@ class Handler(BaseHTTPRequestHandler):
                 out = mgr.set_user_language(language)
                 out["supported_languages"] = supported_ui_languages_payload()
                 return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/config":
+            payload = self._read_json()
+            mode = normalize_user_memory_mode(payload.get("mode", payload.get("user_memory_mode", DEFAULT_USER_MEMORY_MODE)))
+            try:
+                out = self.app.set_user_memory_mode_for_user(self._user_id(), mode)
+                status = 423 if bool(out.get("locked")) else 200
+                return self._send_json(out, status=status)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/clear":
+            try:
+                return self._send_json(self.app.clear_user_memory(self._user_id()))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/webui/export":
@@ -70831,6 +76803,43 @@ def main():
         ),
     )
     parser.add_argument(
+        "--disable-web-search",
+        dest="web_search_enabled",
+        action="store_false",
+        help="Disable the built-in agent_web_search tool for all sessions in this process.",
+    )
+    parser.add_argument(
+        "--enable-web-search",
+        dest="web_search_enabled",
+        action="store_true",
+        help="Force-enable the built-in agent_web_search tool for all sessions in this process.",
+    )
+    parser.add_argument(
+        "--user-memory",
+        "--user-memory-mode",
+        dest="user_memory_mode",
+        choices=sorted(USER_MEMORY_MODE_CHOICES),
+        help=(
+            "Per-user long-term preference memory mode: off disables it; weak (default) injects "
+            "short low-priority preference signals; on uses a larger, more active preference capsule "
+            "when the current request is silent. Current explicit instructions always override memory."
+        ),
+    )
+    parser.add_argument(
+        "--disable-user-memory",
+        dest="user_memory_mode",
+        action="store_const",
+        const="off",
+        help="Disable per-user long-term preference memory for this process.",
+    )
+    parser.add_argument(
+        "--enable-user-memory",
+        dest="user_memory_mode",
+        action="store_const",
+        const="on",
+        help="Enable active per-user preference memory mode for this process (same as --user-memory on).",
+    )
+    parser.add_argument(
         "--auto_task_level_ceiling",
         "--auto-task-level-ceiling",
         "--max_auto_task_level",
@@ -70840,6 +76849,9 @@ def main():
         help=(
             "Limit automatic L1-L5 task classification to this maximum level (1-5); "
             f"0/off means no cap (default {DEFAULT_AUTO_TASK_LEVEL_CEILING}). "
+            "Default L2 keeps routine tasks lightweight. Raise it with "
+            "--auto-task-level-ceiling 3, 4, or 5 for more capable automatic planning; "
+            "use --auto-task-level-ceiling 0 to disable the cap. "
             "Manual task-level overrides and manual plan-mode preference are not capped. "
             "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
             "max_auto_task_level/complexity_ceiling."
@@ -70978,6 +76990,8 @@ def main():
         show_upload_list=None,
         download_js_lib=None,
         shell_command_timeout=None,
+        web_search_enabled=None,
+        user_memory_mode=None,
     )
     args = parser.parse_args()
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
@@ -71010,11 +77024,14 @@ def main():
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
+    resolved_web_search_enabled = DEFAULT_WEB_SEARCH_ENABLED
+    resolved_user_memory_mode = DEFAULT_USER_MEMORY_MODE
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
     bootstrap_model = args.model
     external_default_provider = ""
+    external_default_model = ""
     if str(args.config or "").strip():
         try:
             external_config, external_config_source = load_llm_config_from_source(
@@ -71027,6 +77044,7 @@ def main():
             ext_active = dict(ext_profiles.get(ext_default_id, {}))
             if ext_active:
                 external_default_provider = str(ext_active.get("provider", "") or "").strip().lower()
+                external_default_model = str(ext_active.get("model", "") or "").strip()
                 if external_default_provider == "ollama":
                     bootstrap_base_url = str(ext_active.get("base_url", bootstrap_base_url) or bootstrap_base_url)
                     bootstrap_model = str(ext_active.get("model", bootstrap_model) or bootstrap_model)
@@ -71054,6 +77072,12 @@ def main():
             external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
             if external_auto_task_level_ceiling is not None:
                 resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
+            external_web_search_enabled = extract_web_search_enabled_setting(external_config)
+            if external_web_search_enabled is not None:
+                resolved_web_search_enabled = bool(external_web_search_enabled)
+            external_user_memory_mode = extract_user_memory_mode_setting(external_config)
+            if external_user_memory_mode is not None:
+                resolved_user_memory_mode = normalize_user_memory_mode(external_user_memory_mode)
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -71085,6 +77109,21 @@ def main():
     web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
     if web_ui_auto_task_level_ceiling is not None:
         resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
+    web_ui_web_search_enabled = extract_web_search_enabled_setting(web_ui_config)
+    if web_ui_web_search_enabled is not None:
+        resolved_web_search_enabled = bool(web_ui_web_search_enabled)
+    web_ui_user_memory_mode = extract_user_memory_mode_setting(web_ui_config)
+    if web_ui_user_memory_mode is not None:
+        resolved_user_memory_mode = normalize_user_memory_mode(web_ui_user_memory_mode)
+    cli_web_search_enabled = getattr(args, "web_search_enabled", None)
+    web_search_setting_locked = cli_web_search_enabled is not None
+    if cli_web_search_enabled is not None:
+        resolved_web_search_enabled = bool(cli_web_search_enabled)
+    cli_user_memory_mode = getattr(args, "user_memory_mode", None)
+    user_memory_setting_locked = cli_user_memory_mode is not None
+    if cli_user_memory_mode is not None:
+        resolved_user_memory_mode = normalize_user_memory_mode(cli_user_memory_mode)
+    resolved_user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
     cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
     if cli_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
@@ -71130,13 +77169,22 @@ def main():
     cli_js_dl_enabled = getattr(args, "download_js_lib", None)
     if cli_js_dl_enabled is not None:
         _js_dl_enabled = bool(cli_js_dl_enabled)
-    startup_tags = list_ollama_models(bootstrap_base_url)
-    if startup_tags:
-        resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
-        print(f"[web-agent] ollama: found {len(startup_tags)} model(s) at {bootstrap_base_url} — using '{resolved_model}'")
+    startup_tags: list[str] = []
+    if external_default_provider and external_default_provider != "ollama":
+        resolved_model = external_default_model or bootstrap_model
+        print(
+            "[web-agent] --config default profile "
+            f"provider={external_default_provider} model={resolved_model}; "
+            "skipping ollama bootstrap probe"
+        )
     else:
-        resolved_model = bootstrap_model
-        print(f"[web-agent] ollama: not available at {bootstrap_base_url} — using fallback '{resolved_model}'")
+        startup_tags = list_ollama_models(bootstrap_base_url)
+        if startup_tags:
+            resolved_model = bootstrap_model if bootstrap_model in startup_tags else startup_tags[0]
+            print(f"[web-agent] ollama: found {len(startup_tags)} model(s) at {bootstrap_base_url} — using '{resolved_model}'")
+        else:
+            resolved_model = bootstrap_model
+            print(f"[web-agent] ollama: not available at {bootstrap_base_url} — using fallback '{resolved_model}'")
     resolved_thinking = False
     ctx_limit_locked = any(
         str(arg).split("=", 1)[0] in {"--ctx_limit", "--ctx-limit"}
@@ -71184,9 +77232,22 @@ def main():
     print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
     print(f"[web-agent] read_context_policy={resolved_read_context_policy}")
     print(f"[web-agent] tool_memory_policy={resolved_tool_memory_policy}")
+    print(f"[web-agent] web_search={'on' if resolved_web_search_enabled else 'off'}")
+    print(
+        "[web-agent] user_memory="
+        f"{resolved_user_memory_mode} "
+        "(off disables; weak is the default low-priority preference signal; on uses stronger defaults when the current request is silent)"
+    )
     print(
         "[web-agent] auto_task_level_ceiling="
         + ("off" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+    )
+    print(
+        "[web-agent] Automatic task classification is capped at "
+        + ("no limit" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+        + ". To allow more complex automatic plans, start with "
+        "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
+        "Manual Level and Plan settings are never capped."
     )
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
@@ -71386,10 +77447,22 @@ def main():
         8,
         bool(_js_dl_enabled),
         resolved_rag_include_filename_entities,
+        web_search_enabled=resolved_web_search_enabled,
+        web_search_setting_locked=web_search_setting_locked,
+        user_memory_mode=resolved_user_memory_mode,
+        user_memory_setting_locked=user_memory_setting_locked,
     )
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    app.web_search_enabled = bool(resolved_web_search_enabled)
+    app.web_search_setting_locked = bool(web_search_setting_locked)
+    app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
+    app.user_memory_setting_locked = bool(user_memory_setting_locked)
+    app.tool_specs = filter_tool_specs_for_runtime(
+        TOOLS,
+        web_search_enabled=bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+    )
     config_apply_result: dict = {}
     if external_config:
         try:
@@ -71401,16 +77474,32 @@ def main():
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    if bool(web_search_setting_locked):
+        app.web_search_enabled = bool(resolved_web_search_enabled)
+    app.web_search_setting_locked = bool(web_search_setting_locked)
+    if bool(user_memory_setting_locked):
+        app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
+    app.user_memory_setting_locked = bool(user_memory_setting_locked)
+    app.tool_specs = filter_tool_specs_for_runtime(
+        TOOLS,
+        web_search_enabled=bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+    )
     with app._lock:
         _mgrs_for_read_ctx_policy = list(app._session_mgrs.values())
     for _mgr in _mgrs_for_read_ctx_policy:
         _mgr.read_context_policy = resolved_read_context_policy
         _mgr.tool_memory_policy = resolved_tool_memory_policy
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        _mgr.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+        _mgr.web_search_setting_locked = bool(web_search_setting_locked)
+        _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        _mgr.user_memory_setting_locked = bool(user_memory_setting_locked)
         for _sess in getattr(_mgr, "sessions", {}).values():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+            _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             _sess.updated_at = now_ts()
             _sess._persist()
     # JS lib download (default on; set download_js_lib: false in --config to disable)
@@ -71566,11 +77655,17 @@ def main():
         print(f"[web-agent] llm_config={LLM_CONFIG_PATH}")
     else:
         print("[web-agent] llm_config missing; you can upload LLM.config.json in WebUI")
-    if startup_tags:
+    if external_default_provider and external_default_provider != "ollama":
+        print(
+            "[web-agent] default profile="
+            f"{external_default_provider} model={external_default_model or resolved_model}; "
+            "ollama bootstrap probe skipped"
+        )
+    elif startup_tags:
         print(f"[web-agent] ollama tags detected={len(startup_tags)} startup_model={resolved_model}")
     else:
         print(f"[web-agent] ollama tags unavailable; using requested model={resolved_model}")
-    print(f"[web-agent] ollama={bootstrap_base_url} model={resolved_model} thinking={resolved_thinking}")
+    print(f"[web-agent] ollama_bootstrap={bootstrap_base_url} model={resolved_model} thinking={resolved_thinking}")
     if external_config_source:
         print(
             "[web-agent] --config applied "
@@ -71589,6 +77684,13 @@ def main():
     print(
         "[web-agent] auto_task_level_ceiling="
         + ("off" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+    )
+    print(
+        "[web-agent] Automatic task classification is capped at "
+        + ("no limit" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
+        + ". To allow more complex automatic plans, start with "
+        "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
+        "Manual Level and Plan settings are never capped."
     )
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
     print(

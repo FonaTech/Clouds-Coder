@@ -7,5 +7,8 @@ from .._source_bridge import _split_source_symbol
 # Use FRAMEWORK.md for the architecture map and Clouds_Coder.py for executable source.
 RAGLibraryStore = _split_source_symbol('RAGLibraryStore')
 WikiStore = _split_source_symbol('WikiStore')
+UserMemoryStore = _split_source_symbol('UserMemoryStore')
+UserInteractionOptimizer = _split_source_symbol('UserInteractionOptimizer')
+UserIntentProfiler = _split_source_symbol('UserIntentProfiler')
 WorkflowMemoryStore = _split_source_symbol('WorkflowMemoryStore')
 CodeLibraryStore = _split_source_symbol('CodeLibraryStore')

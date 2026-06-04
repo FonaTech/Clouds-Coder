@@ -27,6 +27,7 @@ ensure_generated_research_scientific_skills = _split_source_symbol('ensure_gener
 ensure_generated_rag_mastery_skills = _split_source_symbol('ensure_generated_rag_mastery_skills')
 ensure_generated_multimodal_comprehension_skills = _split_source_symbol('ensure_generated_multimodal_comprehension_skills')
 ensure_generated_runtime_skills_manifest = _split_source_symbol('ensure_generated_runtime_skills_manifest')
+ensure_generated_agent_web_search_skill = _split_source_symbol('ensure_generated_agent_web_search_skill')
 ensure_embedded_clawhub_skills = _split_source_symbol('ensure_embedded_clawhub_skills')
 ensure_runtime_skills = _split_source_symbol('ensure_runtime_skills')
 _BUILTIN_SKILLS = _split_source_symbol('_BUILTIN_SKILLS')

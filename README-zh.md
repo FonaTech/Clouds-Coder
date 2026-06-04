@@ -13,6 +13,8 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 更新日志（EN/中文/日本語）</a> ·
@@ -30,7 +32,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+架构更新日志归档：[`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -137,7 +139,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - 预览链路：Markdown/HTML/代码/PDF/CSV/Excel/Word/PPT/媒体/代码阶段预览
 - 前端资源控制：live/static 冻结、快照调度、对话虚拟化
 - 可导入架构拆分工具：`split_coder.py` 通过 `_source_bridge.py` 重新生成可 import 的 `Code_Structure/` 导航包
-- 科研��务友好：工件优先、阶段可追溯、可复现持久化链路
+- 科研任务友好：工件优先、阶段可追溯、可复现持久化链路
 
 ## 3. 架构总览
 
@@ -170,7 +172,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 │  - Ollama/OpenAI-compatible profile 编排                             │
 │  - tools: bash/read/write/edit/Todo/skills/context/task/render       │
 │  - 原生多模态 + 6 类错误检测 + 4 级压缩 + Reviewer Debug Mode       │
-��  - live-input 仲裁 + 小模型保护策略                                  │
+│  - live-input 仲裁 + 小模型保护策略                                  │
 ├───────────────────────────────────────────────────────────────────────┤
 │ 工件与持久化层                                                       │
 │  - 每会话 files/uploads/context_archive/code_preview                 │
@@ -676,6 +678,107 @@ sequenceDiagram
 - self-check 覆盖顶层符号一致性、`py_compile`、陈旧生成文件、package import walk、entry-point help 和生成缓存清理。
 
 完整三语详情见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+### 3.10 Web 服务运行框架
+
+Clouds Coder 的 Web 服务不是分散的微服务网格，而是一个本地优先的单体运行时。浏览器、HTTP Handler、Session Manager、Agent Loop、Tool Router、Blackboard、Context Archive 与 Preview Pipeline 处于同一个协调状态域内，因此延迟更低，也更容易在长会话中做恢复、接续和审计。
+
+服务拓扑：
+
+```mermaid
+flowchart LR
+  Browser["浏览器 Web UI<br/>对话 / 运行状态 / 预览 / Skills"] -->|REST 指令<br/>消息 上传 配置 预览| HTTP["ThreadingHTTPServer<br/>Handler + SkillsHandler"]
+  HTTP --> Router["API Router<br/>sessions / tools / render / memory"]
+  Router --> Sessions["SessionManager<br/>按用户 manager + 按会话 state"]
+  Sessions --> Runtime["SessionState Runtime Loop<br/>分类 / 规划 / Agent 回合"]
+  Runtime --> Blackboard["Blackboard 控制面<br/>plan steps / todos / focus / evidence"]
+  Runtime --> Tools["Tool 执行面<br/>bash / read / write / edit / search / skills"]
+  Runtime --> Models["模型面<br/>Ollama + OpenAI-compatible profiles"]
+  Tools --> Files["工件存储<br/>files / uploads / code_preview / context_archive"]
+  Blackboard --> Memory["记忆面<br/>tool context / user memory / Web search index"]
+  Files --> Preview["预览与渲染桥<br/>Markdown / HTML / 代码 / PDF / 媒体"]
+  Runtime --> Events["EventHub<br/>SSE 心跳 + 结构化运行事件"]
+  Events -->|实时更新| Browser
+  Preview -->|render frames| Browser
+```
+
+运行请求生命周期：
+
+```mermaid
+sequenceDiagram
+  participant U as Web UI
+  participant H as HTTP Handler
+  participant S as SessionManager
+  participant R as SessionState
+  participant B as Blackboard
+  participant T as Tool Router
+  participant E as EventHub
+
+  U->>H: POST message / live adjustment
+  H->>S: 解析 user_id + session_id
+  S->>R: submit_user_message
+  R->>B: 判定接续 / plan choice / 新任务
+  alt 当前已有运行中任务
+    R->>R: 带锁写入 live-input queue
+    R->>E: 推送 live-input accepted
+  else 空闲
+    R->>R: 启动 runtime loop
+  end
+  loop agent round
+    R->>B: 读取 active focus + todo state + evidence
+    R->>T: 执行模型请求的 tools
+    T->>B: 写入 tool evidence / artifacts / errors
+    R->>E: 发布结构化事件
+  end
+  E-->>U: SSE event stream + heartbeat
+```
+
+控制面分层：
+
+| 分层 | 运行时职责 | 用户可见效果 |
+| --- | --- | --- |
+| API 面 | REST 端点、SSE 流、上传/配置/渲染路由 | 浏览器刷新或重连后仍能观察正在运行的 session |
+| 编排面 | 分类器、Plan 门控、Manager 路由、finish/step gates | 简单任务保持轻量，复杂任务保持计划连续性 |
+| Blackboard 面 | 已批准 plan、当前 focus、todos、证据、错误、已触碰文件 | Single 与 Multi-agent 围绕同一任务事实源协作 |
+| Tool 面 | 文件、shell、search、skills 的确定性执行与证据记录 | 工具调用可追踪、可复用，不隐藏在模型文字里 |
+| 记忆面 | 用户摘要记忆、tool context、Web search index、context archives | 长任务可用压缩后的任务状态接续，不必重读全部历史 |
+| 展示面 | 结构化气泡、虚拟列表、滚动锚定、render bridge | 大会话仍可读，实时刷新不再强行拉动用户视口 |
+
+Plan 与实时输入控制环：
+
+```mermaid
+flowchart TD
+  UserMsg["用户消息"] --> Intake["意图摄取<br/>上传文件 + 用户偏好 capsule + session state"]
+  Intake --> Gate{"Plan mode<br/>Auto / On / Off"}
+  Gate -->|直接执行| Exec["执行循环"]
+  Gate -->|需要规划| Plan["调研 + 方案 + 用户选择"]
+  Plan --> Approved["已批准 plan steps"]
+  Approved --> Exec
+  Exec --> Focus["当前 focus<br/>plan step 或 direct task"]
+  Focus --> Todo["Todo / subtask state"]
+  Todo --> Evidence["Tool evidence<br/>artifacts / validation / errors"]
+  Evidence --> Finish{"Finish 还是推进?"}
+  Finish -->|推进| Focus
+  Finish -->|完成| Summary["最终回复 / 总结气泡"]
+  Live["运行中的用户追加意见"] --> Queue["带锁 live-input queue"]
+  Queue --> Focus
+```
+
+Web UI 更新路径：
+
+```mermaid
+flowchart TB
+  Event["运行事件<br/>tool start/done, websearch, todo, finish gate"] --> Normalize["结构化气泡解析器"]
+  Snapshot["Session snapshot<br/>conversation / todos / runtime / previews"] --> Normalize
+  Normalize --> Render["虚拟化对话渲染"]
+  Render --> Anchor{"用户是否贴底?"}
+  Anchor -->|是| Stick["跟随最新气泡"]
+  Anchor -->|否| Preserve["保持当前 viewport 锚点"]
+  Render --> Panels["Runtime / Todos / Tasks / Preview 面板"]
+  Panels --> Throttle["节流刷新 + 稳定布局槽位"]
+```
+
+因此 Clouds Coder 的 Web 服务不是“HTTP 上的聊天框”，而是一个可观测的运行时外壳：浏览器动作、模型回合、工具输出、黑板状态、上下文压力、实时用户修正和工件预览都会进入同一张执行图。
 
 ## 4. 关键运行时组件
 

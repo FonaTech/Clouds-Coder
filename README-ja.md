@@ -13,6 +13,8 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
+  <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
@@ -30,7 +32,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -135,7 +137,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - Task/Todo/Background/Team/Worktree を一体実装
 - SSE ハートビートと書き込み例外処理
 - Markdown/HTML/コード/PDF/CSV/Excel/Word/PPT/メディア/コード段階プレビュー
-- フロントエンド負荷制御（live/static 凍結、スナップショット制御、��想リスト）
+- フロントエンド負荷制御（live/static 凍結、スナップショット制御、仮想リスト）
 - import 可能な分割アーキテクチャツール：`split_coder.py` が `_source_bridge.py` に支えられた `Code_Structure/` ナビゲーションパッケージを再生成
 - 研究ワークロード向け: 成果物中心、段階追跡可能、再現性重視の永続化設計
 
@@ -267,7 +269,7 @@ Agent Loop
   │    └─ 切断シグナル ───► 継続/回復
   │
   ├─ no-tool idle 検知 -> 診断/回復ヒント
-  ├─ timeout 制御（モデル active 区間を除��）
+  ├─ timeout 制御（モデル active 区間を除外）
   ├─ コンテキスト圧迫 -> 4段階圧縮（normal/light/medium/heavy）+ recall
   ├─ Reviewer Debug Mode（書き込み権限でバグ独立修正）
   ├─ リアルタイムユーザー入力マージ（plan 方向調整）
@@ -535,7 +537,7 @@ stateDiagram-v2
 - エラー検出時、reviewer が自動的に `write_file`/`edit_file` 権限を取得し独立してバグ修正。
 - エラー解消または 6 ラウンド後に自動解除（developer にフォールバック）。Explorer ストール検出：連続 3 回同一委任 → 強制切替。
 
-**複雑度継承 & リア��タイム入力**
+**複雑度継承 & リアルタイム入力**
 - Plan 選択応答で再分類をスキップ、複雑度レベルを維持。
 - リアルタイムユーザー入力が `_merge_user_feedback_with_plan()` をトリガーし、実行中に plan 方向を調整。
 - リスタート意図融合：ユーザー意図 > plan 意図 > コンテキスト意図の優先度。
@@ -545,8 +547,8 @@ stateDiagram-v2
 - Manager に `PHASE INDEPENDENCE` 指示で前フェーズの実装パターン引き継ぎを防止。
 
 **マルチモーダルネイティブサポート & TodoWrite 分離**
-- `_run_read()` が画像/音声/動画ファイルを検出、モデル対応時にネイティブマルチモ���ダル入力として注入。
-- Plan mode 下の TodoWrite は owner タグ付きサブタスクを���成、plan_step を上書きしない。
+- `_run_read()` が画像/音声/動画ファイルを検出、モデル対応時にネイティブマルチモーダル入力として注入。
+- Plan mode 下の TodoWrite は owner タグ付きサブタスクを作成、plan_step を上書きしない。
 
 三言語の完全版詳細: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
 
@@ -670,6 +672,60 @@ sequenceDiagram
 - self-check はトップレベルシンボル一致、`py_compile`、古い生成ファイル、package import walk、entry-point help、生成キャッシュ削除を検証します。
 
 三言語の完全版詳細: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+### 3.10 Web サービスランタイムフレームワーク
+
+Clouds Coder の Web サービスは分散 microservice mesh ではなく、local-first の単一 runtime として設計されています。Browser、HTTP handler、SessionManager、agent loop、tool router、blackboard、context archive、preview pipeline が同じ状態ドメインで協調し、長い session の回復と監査を扱いやすくします。
+
+サービス構成:
+
+```mermaid
+flowchart LR
+  Browser["Browser Web UI<br/>chat / runtime / preview / skills"] -->|REST commands<br/>message uploads config preview| HTTP["ThreadingHTTPServer<br/>Handler + SkillsHandler"]
+  HTTP --> Router["API Router<br/>sessions / tools / render / memory"]
+  Router --> Sessions["SessionManager<br/>user managers + session state"]
+  Sessions --> Runtime["SessionState Runtime Loop<br/>classifier / planner / agent rounds"]
+  Runtime --> Blackboard["Blackboard Control Plane<br/>plan steps / todos / focus / evidence"]
+  Runtime --> Tools["Tool Execution Plane<br/>bash / read / write / edit / search / skills"]
+  Runtime --> Models["Model Plane<br/>Ollama + OpenAI-compatible profiles"]
+  Tools --> Files["Artifact Store<br/>files / uploads / code_preview / context_archive"]
+  Blackboard --> Memory["Memory Plane<br/>tool context / user memory / Web search index"]
+  Files --> Preview["Preview + Render Bridge<br/>Markdown / HTML / code / PDF / media"]
+  Runtime --> Events["EventHub<br/>SSE heartbeat + structured runtime events"]
+  Events -->|live updates| Browser
+  Preview -->|render frames| Browser
+```
+
+制御面の分離:
+
+| Plane | Runtime responsibility | User-visible effect |
+| --- | --- | --- |
+| API | REST endpoints、SSE、upload/config/render routing | Browser reconnect 後も running session を観測できる |
+| Orchestration | classifier、plan gate、manager routing、finish/step gates | simple task は軽量に、complex task は plan continuity を維持 |
+| Blackboard | approved plan、current focus、todos、evidence、errors | single/multi-agent が同じ task source of truth を共有 |
+| Tool | file/shell/search/skill execution と evidence capture | tool call が追跡・再利用可能になる |
+| Memory | user summaries、tool context、Web search index、context archive | raw history 全体を再読込せずに long task を継続できる |
+| Presentation | structured bubbles、virtualized feed、scroll anchoring、render bridge | 大きな conversation でも viewport が安定する |
+
+Plan と live-input の制御ループ:
+
+```mermaid
+flowchart TD
+  UserMsg["User message"] --> Intake["Intent intake<br/>uploads + user profile capsule + session state"]
+  Intake --> Gate{"Plan mode<br/>Auto / On / Off"}
+  Gate -->|direct| Exec["Execution loop"]
+  Gate -->|plan needed| Plan["Research + proposal + user choice"]
+  Plan --> Approved["Approved plan steps"]
+  Approved --> Exec
+  Exec --> Focus["Active focus<br/>plan step or direct task"]
+  Focus --> Todo["Todo / subtask state"]
+  Todo --> Evidence["Tool evidence<br/>artifacts / validation / errors"]
+  Evidence --> Finish{"Finish or advance?"}
+  Finish -->|advance| Focus
+  Finish -->|complete| Summary["Final response / summary bubble"]
+  Live["Live user adjustment during run"] --> Queue["Locked live-input queue"]
+  Queue --> Focus
+```
 
 ## 4. 主要ランタイム構成
 
