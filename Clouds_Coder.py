@@ -157,6 +157,17 @@ CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
 WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
 DEFAULT_WEB_SEARCH_ENABLED = True
+USER_MEMORY_DIRNAME = ".clouds_coder"
+USER_MEMORY_DB_FILENAME = "user_memory.sqlite"
+USER_MEMORY_PROFILE_FILENAME = "user_profile.json"
+USER_MEMORY_MODE_CHOICES = {"off", "weak", "on"}
+DEFAULT_USER_MEMORY_MODE = "weak"
+USER_MEMORY_WEAK_CAPSULE_CHARS = 1200
+USER_MEMORY_ON_CAPSULE_CHARS = 2200
+USER_MEMORY_MAX_SUMMARY_CHARS = 1200
+USER_MEMORY_QUERY_LIMIT = 8
+USER_MEMORY_DECAY_HALFLIFE_DAYS = 45.0
+USER_MEMORY_PROFILE_SCHEMA_VERSION = 1
 AGENT_WEB_SEARCH_USER_AGENT = "CloudsCoderAgentWebSearch/1.0 (+bounded autonomous agent research)"
 AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS = 8
 AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES = 12
@@ -2662,6 +2673,81 @@ def extract_web_search_enabled_setting(raw: object) -> bool | None:
         section = raw.get(section_key)
         if isinstance(section, dict) and key in section:
             return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
+    return None
+
+
+def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
+    raw = str(value if value is not None else "").strip().lower().replace("-", "_")
+    if isinstance(value, bool):
+        return "weak" if value else "off"
+    alias = {
+        "": str(default or DEFAULT_USER_MEMORY_MODE).strip().lower(),
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "none": "off",
+        "disable": "off",
+        "disabled": "off",
+        "1": "weak",
+        "true": "weak",
+        "yes": "weak",
+        "enable": "weak",
+        "enabled": "weak",
+        "light": "weak",
+        "low": "weak",
+        "soft": "weak",
+        "strong": "on",
+        "full": "on",
+        "high": "on",
+    }
+    raw = alias.get(raw, raw)
+    if raw in USER_MEMORY_MODE_CHOICES:
+        return raw
+    fallback = str(default or DEFAULT_USER_MEMORY_MODE).strip().lower()
+    return fallback if fallback in USER_MEMORY_MODE_CHOICES else DEFAULT_USER_MEMORY_MODE
+
+
+def user_memory_enabled_from_mode(mode: object) -> bool:
+    return normalize_user_memory_mode(mode) != "off"
+
+
+def extract_user_memory_mode_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    mode_keys = (
+        "user_memory_mode",
+        "userMemoryMode",
+        "user_memory",
+        "userMemory",
+        "long_term_memory",
+        "longTermMemory",
+        "preference_memory",
+        "preferenceMemory",
+    )
+    enabled_keys = (
+        "user_memory_enabled",
+        "userMemoryEnabled",
+        "long_term_memory_enabled",
+        "longTermMemoryEnabled",
+        "preference_memory_enabled",
+        "preferenceMemoryEnabled",
+    )
+    for key in mode_keys:
+        if key in raw:
+            return normalize_user_memory_mode(raw.get(key))
+    for key in enabled_keys:
+        if key in raw:
+            return "weak" if _to_bool_like(raw.get(key), default=True) else "off"
+    for section_key in ("startup", "runtime", "memory", "user_memory", "agent", "manager"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in mode_keys:
+            if key in section:
+                return normalize_user_memory_mode(section.get(key))
+        for key in enabled_keys:
+            if key in section:
+                return "weak" if _to_bool_like(section.get(key), default=True) else "off"
     return None
 
 
@@ -15981,6 +16067,9 @@ class SessionState:
         self.arbiter_temperature = max(0.0, min(1.0, float(arbiter_temperature if arbiter_temperature is not None else ARBITER_DEFAULT_TEMPERATURE)))
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.web_search_enabled = bool(web_search_enabled)
+        self.user_memory_mode = DEFAULT_USER_MEMORY_MODE
+        self.user_profile_capsule = ""
+        self.user_profile_capsule_meta: dict = {"mode": DEFAULT_USER_MEMORY_MODE, "memory_count": 0}
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -16032,6 +16121,7 @@ class SessionState:
         self.scheduler_starting = False
         self.cancel_requested = False
         self.pending_user_inputs: list[dict] = []
+        self.live_input_queue_lock = threading.Lock()
         self.deferred_start_inputs: list[dict] = []
         self.deferred_start_seq = 0
         self.deferred_start_worker_started = False
@@ -16068,6 +16158,8 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_ts = 0.0
+        self.runtime_goal_reset_handled_ts = 0.0
         self.runtime_first_task_in_session = False
         self.runtime_plan_mode_needed = False
         self.runtime_plan_approved = False
@@ -16354,17 +16446,223 @@ class SessionState:
             used_rel.add(rel)
         return items
 
+    def _is_external_user_message_for_goal_tracking(self, row: dict | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("role", "")).strip() != "user":
+            return False
+        if bool(row.get("_ui_hidden", False)):
+            return False
+        content = str(row.get("content", "") or "").strip()
+        if not content:
+            return False
+        low = content.lower()
+        if low.startswith("<live-user-adjustment"):
+            return True
+        internal_prefixes = tuple(
+            prefix
+            for prefix in RUNTIME_CONTROL_HINT_PREFIXES
+            if str(prefix).lower() != "<live-user-adjustment"
+        ) + (
+            "<finish-blocked",
+            "<user-feedback-merge",
+            "<intent-fusion",
+            "<plan-approved-handoff",
+            "<compact-resume",
+        )
+        return not any(low.startswith(str(prefix).lower()) for prefix in internal_prefixes)
+
     def _latest_user_message_ts(self) -> float:
         with self.lock:
             rows = list(self.messages)
         for row in reversed(rows):
-            if str(row.get("role", "")).strip() != "user":
+            if not self._is_external_user_message_for_goal_tracking(row):
                 continue
             try:
                 return float(row.get("ts", 0.0) or 0.0)
             except Exception:
                 return 0.0
         return 0.0
+
+    def _mark_runtime_goal_reset_pending(self, goal_text: str = "", *, reason: str = "") -> None:
+        stamp = float(now_ts())
+        self.runtime_goal_reset_pending = True
+        self.runtime_goal_reset_ts = stamp
+        self.runtime_goal_reset_handled_ts = 0.0
+        if str(goal_text or "").strip():
+            self.runtime_reclassify_goal = trim(str(goal_text or "").strip(), 4000)
+        if reason:
+            try:
+                bb = self._ensure_blackboard()
+                bb["goal_reset_reason"] = trim(str(reason or ""), 120)
+                bb["goal_reset_ts"] = stamp
+                self.blackboard = bb
+            except Exception:
+                pass
+
+    def _mark_runtime_goal_reset_handled(
+        self,
+        *,
+        handled_ts: float | None = None,
+        reason: str = "",
+        clear_reclassify: bool = False,
+    ) -> None:
+        try:
+            stamp = float(handled_ts if handled_ts is not None else now_ts())
+        except Exception:
+            stamp = float(now_ts())
+        self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_handled_ts = max(
+            float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
+            stamp,
+        )
+        if clear_reclassify:
+            self.runtime_reclassify_required = False
+        if reason:
+            try:
+                bb = self._ensure_blackboard()
+                bb["goal_reset_handled_reason"] = trim(str(reason or ""), 120)
+                bb["goal_reset_handled_ts"] = self.runtime_goal_reset_handled_ts
+                self.blackboard = bb
+            except Exception:
+                pass
+
+    def _blackboard_latest_goal_reset_progress_ts(self, board: dict | None = None) -> float:
+        bb = board if isinstance(board, dict) else (
+            self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        )
+        latest = 0.0
+
+        def bump(value: object) -> None:
+            nonlocal latest
+            try:
+                ts = float(value or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts > latest:
+                latest = ts
+
+        for key in ("task_profile", "manager_judgement"):
+            row = bb.get(key, {}) if isinstance(bb.get(key), dict) else {}
+            bump(row.get("updated_at", 0.0))
+
+        delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
+        if str(delegate.get("target", "") or "").strip() and str(delegate.get("source", "") or "") != "finish-gate":
+            bump(delegate.get("ts", 0.0))
+
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        if bool(approval.get("approved", False)):
+            bump(approval.get("ts", 0.0))
+
+        last_reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
+        if str(last_reply.get("text", "") or "").strip():
+            bump(last_reply.get("ts", 0.0))
+
+        for section in (
+            "research_notes",
+            "execution_logs",
+            "review_feedback",
+            "plan_findings",
+            "plan_proposal",
+            "plan_steps",
+            "plan_risks",
+            "skill_analysis",
+        ):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in reversed(rows[-12:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("content", "") or "").strip():
+                    bump(row.get("ts", 0.0))
+                    break
+
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        for item in artifacts.values():
+            if isinstance(item, dict):
+                bump(item.get("updated_at", 0.0))
+
+        routes = bb.get("persisted_manager_routes", []) if isinstance(bb.get("persisted_manager_routes"), list) else []
+        for row in reversed(routes[-8:]):
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+                break
+
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        for entries in step_files.values():
+            if not isinstance(entries, list):
+                continue
+            for row in reversed(entries[-8:]):
+                if isinstance(row, dict):
+                    bump(row.get("ts", 0.0))
+                    break
+
+        memory = bb.get("memory", {}) if isinstance(bb.get("memory"), dict) else {}
+        for row in (memory.get("short", []) if isinstance(memory.get("short", []), list) else [])[-12:]:
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+        for row in (memory.get("long", []) if isinstance(memory.get("long", []), list) else [])[-8:]:
+            if isinstance(row, dict):
+                bump(row.get("ts", 0.0))
+
+        return float(latest)
+
+    def _runtime_goal_reset_still_pending(self, board: dict | None = None) -> bool:
+        if not bool(getattr(self, "runtime_goal_reset_pending", False)):
+            return False
+        if bool(getattr(self, "runtime_reclassify_required", False)):
+            return True
+        reset_ts = float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0)
+        if reset_ts <= 0.0:
+            reset_ts = self._latest_user_message_ts()
+        handled_ts = float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0)
+        if reset_ts > 0.0 and handled_ts + 1e-6 >= reset_ts:
+            self._mark_runtime_goal_reset_handled(reason="runtime-task-decision")
+            return False
+        progress_ts = self._blackboard_latest_goal_reset_progress_ts(board)
+        if reset_ts > 0.0 and progress_ts > reset_ts + 1e-6:
+            self._mark_runtime_goal_reset_handled(
+                handled_ts=progress_ts,
+                reason="blackboard-progress-after-goal-reset",
+            )
+            return False
+        return True
+
+    def _handle_runtime_goal_reclassification_if_needed(
+        self,
+        *,
+        pinned_selection: str,
+        scope: str,
+        media_inputs_round: list[dict] | None = None,
+    ) -> dict:
+        if not (
+            bool(getattr(self, "runtime_reclassify_required", False))
+            or bool(getattr(self, "runtime_goal_reset_pending", False))
+        ):
+            return {}
+        if bool(getattr(self, "runtime_reclassify_required", False)):
+            if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+                self._mark_runtime_goal_reset_handled(
+                    reason=f"{scope}:user-level-override",
+                    clear_reclassify=True,
+                )
+                return {"source": "user-level-override", "scope": scope}
+            if media_inputs_round is None:
+                media_inputs_round = self._recent_multimodal_inputs()
+            self._emit_multimodal_attach_status(
+                scope=f"{scope} reclassify",
+                media_inputs=media_inputs_round,
+                roles=["manager"],
+            )
+            decision = self._refresh_runtime_task_policy(
+                pinned_selection=pinned_selection,
+                force=True,
+                goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
+                media_inputs_round=media_inputs_round,
+            )
+            return dict(decision or {})
+        if not self._runtime_goal_reset_still_pending(self._ensure_blackboard()):
+            return {"source": "blackboard-progress-consumed", "scope": scope}
+        return {}
 
     def _emit_multimodal_attach_status(
         self,
@@ -16932,6 +17230,9 @@ class SessionState:
         cfg_web_search_enabled = extract_web_search_enabled_setting(config)
         if cfg_web_search_enabled is not None:
             self.web_search_enabled = bool(cfg_web_search_enabled)
+        cfg_user_memory_mode = extract_user_memory_mode_setting(config)
+        if cfg_user_memory_mode is not None:
+            self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
@@ -17094,6 +17395,12 @@ class SessionState:
                         raw.get("web_search_enabled"),
                         default=getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED),
                     )
+                self.user_memory_mode = normalize_user_memory_mode(
+                    raw.get("user_memory_mode", getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+                )
+                self.user_profile_capsule = trim(str(raw.get("user_profile_capsule", "") or ""), USER_MEMORY_ON_CAPSULE_CHARS)
+                capsule_meta = raw.get("user_profile_capsule_meta", {})
+                self.user_profile_capsule_meta = dict(capsule_meta) if isinstance(capsule_meta, dict) else {"mode": self.user_memory_mode}
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     raw.get(
                         "auto_task_level_ceiling",
@@ -17373,6 +17680,22 @@ class SessionState:
                 self.runtime_goal_reset_pending = bool(
                     raw.get("runtime_goal_reset_pending", self.runtime_goal_reset_pending)
                 )
+                try:
+                    self.runtime_goal_reset_ts = float(
+                        raw.get("runtime_goal_reset_ts", getattr(self, "runtime_goal_reset_ts", 0.0)) or 0.0
+                    )
+                except Exception:
+                    self.runtime_goal_reset_ts = 0.0
+                try:
+                    self.runtime_goal_reset_handled_ts = float(
+                        raw.get(
+                            "runtime_goal_reset_handled_ts",
+                            getattr(self, "runtime_goal_reset_handled_ts", 0.0),
+                        )
+                        or 0.0
+                    )
+                except Exception:
+                    self.runtime_goal_reset_handled_ts = 0.0
                 self.runtime_first_task_in_session = bool(
                     raw.get("runtime_first_task_in_session", self.runtime_first_task_in_session)
                 )
@@ -17466,6 +17789,11 @@ class SessionState:
             self.context_token_upper_bound = self.max_context_token_limit
         # Ensure previous-run volatile state and control-hint artifacts are cleared on load.
         self._reset_runtime_state_locked(purge_runtime_hints=True)
+        if self._has_resumable_plan_state():
+            try:
+                self._restore_runtime_policy_from_blackboard_locked()
+            except Exception:
+                pass
         self._ensure_ollama_profile()
         if self.active_profile_id not in self.model_profiles:
             self.active_profile_id = next(iter(self.model_profiles.keys()))
@@ -17530,6 +17858,9 @@ class SessionState:
                 getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
             ),
             "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+            "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+            "user_profile_capsule": trim(str(getattr(self, "user_profile_capsule", "") or ""), USER_MEMORY_ON_CAPSULE_CHARS),
+            "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
             "last_context_actual_prompt_tokens": int(getattr(self, "last_context_actual_prompt_tokens", 0) or 0),
             "last_context_actual_completion_tokens": int(getattr(self, "last_context_actual_completion_tokens", 0) or 0),
             "last_context_actual_total_tokens": int(getattr(self, "last_context_actual_total_tokens", 0) or 0),
@@ -17600,6 +17931,8 @@ class SessionState:
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
+            "runtime_goal_reset_ts": float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0),
+            "runtime_goal_reset_handled_ts": float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
             "runtime_first_task_in_session": bool(getattr(self, "runtime_first_task_in_session", False)),
             "runtime_plan_mode_needed": bool(self.runtime_plan_mode_needed),
             "runtime_plan_approved": bool(self.runtime_plan_approved),
@@ -17749,7 +18082,8 @@ class SessionState:
                 kept.append(row)
             if removed_hints > 0:
                 self.messages = kept[-400:]
-        self.pending_user_inputs = []
+        with self.live_input_queue_lock:
+            self.pending_user_inputs = []
         self.deferred_start_worker_started = False
         self.cancel_requested = False
         self.current_phase = "idle"
@@ -17802,6 +18136,8 @@ class SessionState:
         self.runtime_reclassify_goal = ""
         self.runtime_reclassify_required = False
         self.runtime_goal_reset_pending = False
+        self.runtime_goal_reset_ts = 0.0
+        self.runtime_goal_reset_handled_ts = 0.0
         self.runtime_plan_mode_needed = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
@@ -19250,6 +19586,19 @@ class SessionState:
     def _runtime_environment_context_prompt_block(self) -> str:
         return runtime_environment_context_block(self._runtime_environment_context_snapshot())
 
+    def _user_profile_capsule_prompt_block(self) -> str:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            return ""
+        capsule = trim(str(getattr(self, "user_profile_capsule", "") or "").strip(), USER_MEMORY_ON_CAPSULE_CHARS)
+        if not capsule:
+            return ""
+        return (
+            "USER PROFILE CAPSULE (per-user summary memory; preference signal only):\n"
+            f"{capsule}\n"
+            "Use this only when the latest user request is silent. Current explicit instructions always win."
+        )
+
     def _inject_runtime_environment_context(self, system: str = "") -> str:
         base = str(system or "").strip()
         if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" in base:
@@ -19290,6 +19639,8 @@ class SessionState:
             if web_search_enabled
             else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
         )
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"{user_profile_block}\n\n" if user_profile_block else ""
         task_memory_block = self._blackboard_memory_context_markdown(max_chars=3200)
         task_memory_text = f"{task_memory_block}\n\n" if task_memory_block else ""
         _is_single_no_enhance = (
@@ -19348,6 +19699,7 @@ class SessionState:
             f"{knowledge_block}"
             f"{code_hint_block}"
             f"{engineering_block}"
+            f"{user_profile_text}"
             f"{task_memory_text}"
             f"{web_search_context_text}"
             f"{read_context_text}"
@@ -28731,6 +29083,14 @@ body{padding:18px}
         self.todo_reminder_count = 0
         self.todo_write_issue_count = 0
         self.todo_last_issue = ""
+        repair_result: dict = {}
+        if self._has_resumable_plan_state():
+            try:
+                repair_result = self._maybe_prompt_plan_resume_repair(
+                    reason="clear-stale-todos",
+                )
+            except Exception as exc:
+                repair_result = {"issue": False, "reason": f"repair-prompt-error:{trim(str(exc), 120)}"}
         self.updated_at = now_ts()
         self._persist()
         self._emit(
@@ -28743,7 +29103,7 @@ body{padding:18px}
                 )
             },
         )
-        return {"ok": True, **result}
+        return {"ok": True, **result, "repair": repair_result}
 
     def _is_empty_action_turn(self, text: str, thinking_text: str, tool_calls: list | None = None) -> bool:
         if tool_calls:
@@ -32092,7 +32452,7 @@ body{padding:18px}
         latest_user_ts: float | None = None,
     ) -> tuple[bool, str]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        if bool(self.runtime_goal_reset_pending):
+        if self._runtime_goal_reset_still_pending(bb):
             return False, "goal-reset-pending"
         if self._approval_is_stale_for_latest_user(bb, latest_user_ts=latest_user_ts):
             return False, "approval-stale-new-user-input"
@@ -34708,7 +35068,9 @@ body{padding:18px}
         phase = self._plan_step_phase_hint(step_text)
         wrote_files = any(str(r.get("name", "")) in ("write_file", "edit_file") for r in rows)
         read_back = any(
-            str(r.get("name", "")) == "read_file" and bool(self._tool_result_output_excerpt(r, 140))
+            str(r.get("name", "")) == "read_file"
+            and not self._is_plan_infrastructure_read_result(r)
+            and bool(self._tool_result_output_excerpt(r, 140))
             for r in rows
         )
         knowledge_signal = any(
@@ -35322,7 +35684,11 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        _phase_gate = phase_evidence and (subtasks_all_done or not _has_subtasks)
+        _has_expected_subtasks = bool(self._extract_plan_step_subtasks(current, limit=5))
+        _phase_gate = phase_evidence and (
+            subtasks_all_done
+            or ((not _has_subtasks) and (not _has_expected_subtasks))
+        )
         accumulated_evidence_path = (
             subtasks_all_done
             and todo_progress_signal
@@ -35385,13 +35751,35 @@ body{padding:18px}
         """Check if worker step produced concrete tool outputs."""
         results = step.get("tool_results", []) or []
         return any(
-            r.get("ok", False) and str(r.get("name", "")) in (
-                "write_file", "edit_file", "bash", "read_file",
-                "write_to_blackboard", "read_from_blackboard", "agent_web_search",
-                "query_code_library", "query_knowledge_library",
+            r.get("ok", False)
+            and (
+                str(r.get("name", "")) in (
+                    "write_file", "edit_file", "bash",
+                    "write_to_blackboard", "read_from_blackboard", "agent_web_search",
+                    "query_code_library", "query_knowledge_library",
+                )
+                or (
+                    str(r.get("name", "")) == "read_file"
+                    and not self._is_plan_infrastructure_read_result(r)
+                )
             )
             for r in results
             if isinstance(r, dict)
+        )
+
+    def _is_plan_infrastructure_read_result(self, result: dict) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("name", "") or "") != "read_file":
+            return False
+        args = result.get("args", {}) if isinstance(result.get("args"), dict) else {}
+        path = str(args.get("path", "") or args.get("file_path", "") or "").replace("\\", "/")
+        if not path:
+            return False
+        return (
+            (path.endswith("plan.md") and ".clouds_coder/" in path)
+            or ".clouds_coder/skills_cache/" in path
+            or path.endswith("/.clouds_coder/skills_cache")
         )
 
     def _step_subtasks_all_completed(self, plan_step: dict) -> bool:
@@ -36626,19 +37014,13 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 220)
         rows = self._active_plan_worker_todo_rows(step_id, role=role)
-        if not rows:
-            try:
-                if self._ensure_worker_todos_for_plan_step(step, force_refresh=False, owner=self._current_plan_worker_owner()):
-                    rows = self._active_plan_worker_todo_rows(step_id, role=role)
-            except Exception:
-                rows = []
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks are available yet for this step. Continue the current plan step; the runtime will try to bootstrap subtasks automatically. "
-                f"Use TodoWrite only if you need to correct or refine progress state for parent_step_id='{step_id}'. "
+                f"No worker subtasks are available yet for this step. Inspect the current plan/todo state before doing broad work. "
+                f"If the state is genuinely broken, use TodoWrite or TodoWriteRescue to repair only parent_step_id='{step_id}', then continue this step. "
             )
             subtasks_exist_ban = ""
         else:
@@ -36840,6 +37222,382 @@ body{padding:18px}
         with self.todo.lock:
             self.todo.items = preserved + replacement
         return True
+
+    def _ensure_worker_todos_available_for_plan_step(
+        self,
+        plan_step: dict | None,
+        *,
+        owner: str = "",
+        force_refresh: bool = False,
+    ) -> dict:
+        if not isinstance(plan_step, dict):
+            return {"ok": False, "available": False, "changed": False, "reason": "missing-active-plan-step"}
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return {"ok": False, "available": False, "changed": False, "reason": "missing-parent-step-id"}
+        expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+        if not expected:
+            return {"ok": False, "available": False, "changed": False, "reason": "no-subtask-template"}
+        before = self._active_plan_worker_todo_rows(step_id, role="")
+        has_pending = any(str(r.get("status", "") or "").strip().lower() == "pending" for r in before)
+        has_active = any(str(r.get("status", "") or "").strip().lower() == "in_progress" for r in before)
+        needs_refresh = bool(force_refresh or not before or (has_pending and not has_active))
+        changed = False
+        if needs_refresh:
+            try:
+                changed = bool(self._ensure_worker_todos_for_plan_step(
+                    plan_step,
+                    force_refresh=bool(force_refresh or (has_pending and not has_active)),
+                    owner=owner,
+                ))
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "available": False,
+                    "changed": False,
+                    "expected_count": len(expected),
+                    "reason": f"worker-bootstrap-error:{trim(str(exc), 120)}",
+                }
+        after = self._active_plan_worker_todo_rows(step_id, role="")
+        if after:
+            return {
+                "ok": True,
+                "available": True,
+                "changed": bool(changed),
+                "expected_count": len(expected),
+                "worker_count": len(after),
+                "reason": "created" if changed else "already-available",
+            }
+        return {
+            "ok": False,
+            "available": False,
+            "changed": bool(changed),
+            "expected_count": len(expected),
+            "worker_count": 0,
+            "reason": "worker-subtasks-still-missing",
+        }
+
+    def _repair_plan_resume_state(
+        self,
+        *,
+        reason: str = "",
+        owner: str = "",
+        sync_todos: bool = True,
+        emit_status: bool = True,
+    ) -> dict:
+        """Repair approved-plan execution invariants without advancing steps.
+
+        This is intentionally conservative: it may rebuild the task tree and
+        current-step worker subtasks, but it never marks a plan step completed.
+        """
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        todos_raw = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        has_plan_rows = any(
+            isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+            for t in todos_raw
+        )
+        plan_steps_src = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+        try:
+            persisted_cursor = int(bb.get("plan_step_cursor", 0) or 0)
+        except Exception:
+            persisted_cursor = 0
+        if plan_phase != "executing" and not has_plan_rows:
+            return {"ok": True, "active": False, "changed": False, "reason": "no-executing-plan"}
+
+        changed = False
+        repairs: list[str] = []
+        if not has_plan_rows and plan_steps_src:
+            plan_todos = self._build_plan_todos_from_steps(plan_steps_src, limit=40)
+            if plan_todos:
+                bb["project_todos"] = plan_todos[:40]
+                todos_raw = bb["project_todos"]
+                has_plan_rows = True
+                changed = True
+                repairs.append("rebuilt-plan-steps")
+
+        if not has_plan_rows:
+            return {
+                "ok": False,
+                "active": True,
+                "changed": changed,
+                "reason": "executing-plan-without-plan-steps",
+            }
+
+        plan_rows: list[dict] = []
+        other_rows: list[dict] = []
+        now_value = float(now_ts())
+        for idx, row in enumerate(todos_raw):
+            if not isinstance(row, dict):
+                changed = True
+                repairs.append("dropped-invalid-todo-row")
+                continue
+            clean = dict(row)
+            if str(clean.get("category", "") or "") != "plan_step":
+                other_rows.append(clean)
+                continue
+            if not str(clean.get("id", "") or "").strip():
+                clean["id"] = f"pt:{len(plan_rows):03d}"
+                changed = True
+                repairs.append("filled-plan-step-id")
+            clean["category"] = "plan_step"
+            try:
+                step_idx = int(clean.get("plan_step_index", len(plan_rows)) or len(plan_rows))
+            except Exception:
+                step_idx = len(plan_rows)
+            clean["plan_step_index"] = max(0, step_idx)
+            status = str(clean.get("status", "pending") or "pending").strip().lower()
+            if status not in {"pending", "in_progress", "completed"}:
+                status = "pending"
+                changed = True
+                repairs.append("normalized-plan-step-status")
+            clean["status"] = status
+            if not str(clean.get("content", "") or "").strip() and str(clean.get("full_content", "") or "").strip():
+                clean["content"] = trim(str(clean.get("full_content", "") or "").splitlines()[0], 400)
+                changed = True
+                repairs.append("filled-plan-step-content")
+            plan_rows.append(clean)
+
+        plan_rows.sort(key=lambda r: int(r.get("plan_step_index", 0) or 0))
+        for idx, row in enumerate(plan_rows):
+            if int(row.get("plan_step_index", 0) or 0) != idx:
+                row["plan_step_index"] = idx
+                changed = True
+                repairs.append("renumbered-plan-step")
+
+        if "rebuilt-plan-steps" in repairs and persisted_cursor > 0:
+            restored_idx = min(max(0, persisted_cursor), len(plan_rows))
+            for idx, row in enumerate(plan_rows):
+                desired_status = (
+                    "completed"
+                    if idx < restored_idx
+                    else ("in_progress" if idx == restored_idx and restored_idx < len(plan_rows) else "pending")
+                )
+                if restored_idx >= len(plan_rows):
+                    desired_status = "completed"
+                if str(row.get("status", "") or "") != desired_status:
+                    row["status"] = desired_status
+                    changed = True
+                if desired_status == "in_progress" and not row.get("activated_at"):
+                    row["activated_at"] = now_value
+                if desired_status == "completed" and not row.get("completed_at"):
+                    row["completed_at"] = now_value
+            repairs.append("restored-plan-cursor")
+
+        active_rows = [r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"]
+        if len(active_rows) > 1:
+            keep = min(active_rows, key=lambda r: int(r.get("plan_step_index", 0) or 0))
+            keep_id = str(keep.get("id", "") or "")
+            for row in plan_rows:
+                if str(row.get("status", "") or "") == "in_progress" and str(row.get("id", "") or "") != keep_id:
+                    row["status"] = "pending"
+                    row["activated_at"] = None
+            changed = True
+            repairs.append("deduped-active-plan-step")
+        elif not active_rows:
+            next_row = next((r for r in plan_rows if str(r.get("status", "") or "") != "completed"), None)
+            if next_row:
+                next_row["status"] = "in_progress"
+                if not next_row.get("activated_at"):
+                    next_row["activated_at"] = now_value
+                changed = True
+                repairs.append("activated-next-plan-step")
+
+        active_step = next((r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"), None)
+        if active_step:
+            active_idx = int(active_step.get("plan_step_index", 0) or 0)
+            bb["plan_step_cursor"] = active_idx
+        else:
+            bb["plan_step_cursor"] = len(plan_rows)
+        bb["plan_step_total"] = len(plan_rows)
+        if plan_phase != "executing":
+            plan = dict(plan)
+            plan["phase"] = "executing"
+            bb["plan"] = plan
+            changed = True
+            repairs.append("restored-plan-executing-phase")
+        bb["project_todos"] = plan_rows + other_rows
+        self.blackboard = bb
+
+        worker_result = {"ok": True, "available": False, "reason": "no-active-step"}
+        if active_step:
+            worker_result = self._ensure_worker_todos_available_for_plan_step(
+                active_step,
+                owner=owner or self._current_plan_worker_owner(bb),
+                force_refresh=False,
+            )
+            if bool(worker_result.get("changed", False)):
+                changed = True
+                repairs.append("rebuilt-worker-subtasks")
+            if not bool(worker_result.get("available", False)):
+                return {
+                    "ok": False,
+                    "active": True,
+                    "changed": changed,
+                    "reason": str(worker_result.get("reason", "worker-subtasks-missing")),
+                    "repairs": list(dict.fromkeys(repairs)),
+                    "active_step_id": str(active_step.get("id", "") or ""),
+                }
+
+        bb = self._ensure_blackboard()
+        bb["focus"] = self._blackboard_focus_identity(bb)
+        self.blackboard = bb
+        self.runtime_plan_approved = True
+        self.runtime_plan_mode_needed = False
+        if changed:
+            self._blackboard_touch()
+            try:
+                self._update_plan_file_step_status()
+            except Exception:
+                pass
+        if sync_todos:
+            try:
+                self._sync_todos_from_blackboard(
+                    reason=f"plan-resume-repair:{trim(str(reason or 'runtime'), 80)}",
+                    board=self._ensure_blackboard(),
+                )
+            except Exception:
+                pass
+        if emit_status and changed:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "plan/todo state repaired "
+                        f"({trim(str(reason or 'runtime'), 80)}; "
+                        f"{', '.join(list(dict.fromkeys(repairs))[:4]) or 'normalized'})"
+                    )
+                },
+            )
+        return {
+            "ok": True,
+            "active": bool(active_step),
+            "changed": changed,
+            "reason": "repaired" if changed else "already-consistent",
+            "repairs": list(dict.fromkeys(repairs)),
+            "active_step_id": str((active_step or {}).get("id", "") or ""),
+            "worker": dict(worker_result),
+        }
+
+    def _detect_plan_resume_state_issue(self, *, role: str = "", board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan_rows = [
+            dict(row) for row in todos
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        plan_steps = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
+        if plan_phase != "executing" and not plan_rows:
+            return {"issue": False, "reason": "no-executing-plan", "issues": []}
+        issues: list[str] = []
+        blocking_issues: list[str] = []
+        if plan_phase == "executing" and not plan_rows:
+            issue_key = "missing-plan-rows" if plan_steps else "missing-plan-source"
+            issues.append(issue_key)
+            blocking_issues.append(issue_key)
+        active_rows = [
+            row for row in plan_rows
+            if str(row.get("status", "") or "").strip().lower() == "in_progress"
+        ]
+        if len(active_rows) > 1:
+            issues.append("multiple-active-plan-steps")
+            blocking_issues.append("multiple-active-plan-steps")
+        incomplete_rows = [
+            row for row in plan_rows
+            if str(row.get("status", "") or "").strip().lower() != "completed"
+        ]
+        if plan_rows and not active_rows and incomplete_rows:
+            issues.append("missing-active-plan-step")
+            blocking_issues.append("missing-active-plan-step")
+        active_step = active_rows[0] if active_rows else None
+        expected_count = 0
+        worker_count = 0
+        if isinstance(active_step, dict):
+            step_id = trim(str(active_step.get("id", "") or ""), 20)
+            expected_count = len(self._extract_plan_step_subtasks(active_step, limit=5))
+            worker_rows = self._active_plan_worker_todo_rows(step_id, role=role)
+            worker_count = len(worker_rows)
+            if expected_count > 0 and worker_count == 0:
+                if self._plan_step_has_blackboard_evidence(active_step, bb):
+                    issues.append("missing-worker-subtasks-with-step-evidence")
+                else:
+                    issues.append("missing-worker-subtasks")
+                    blocking_issues.append("missing-worker-subtasks")
+            if worker_rows:
+                has_open = any(str(r.get("status", "") or "").strip().lower() == "pending" for r in worker_rows)
+                has_active = any(str(r.get("status", "") or "").strip().lower() == "in_progress" for r in worker_rows)
+                if has_open and not has_active:
+                    issues.append("missing-active-worker-subtask")
+                    blocking_issues.append("missing-active-worker-subtask")
+        return {
+            "issue": bool(issues),
+            "reason": ",".join(issues) if issues else "consistent",
+            "issues": list(dict.fromkeys(issues)),
+            "blocking": bool(blocking_issues),
+            "blocking_issues": list(dict.fromkeys(blocking_issues)),
+            "active_step_id": str((active_step or {}).get("id", "") or ""),
+            "active_step": trim(str((active_step or {}).get("content", "") or ""), 240),
+            "expected_count": int(expected_count),
+            "worker_count": int(worker_count),
+            "plan_step_count": len(plan_rows),
+            "plan_source_count": len(plan_steps),
+        }
+
+    def _maybe_prompt_plan_resume_repair(
+        self,
+        *,
+        reason: str = "",
+        role: str = "",
+        target_roles: tuple[str, ...] = (),
+    ) -> dict:
+        issue = self._detect_plan_resume_state_issue(role=role)
+        if not bool(issue.get("issue", False)):
+            return issue
+        issues = ", ".join(str(x) for x in issue.get("issues", []) if str(x).strip())
+        active = trim(str(issue.get("active_step", "") or ""), 240)
+        step_id = trim(str(issue.get("active_step_id", "") or ""), 40)
+        detail_parts = [
+            f"detected={issues or issue.get('reason', 'unknown')}",
+            f"source={trim(str(reason or 'runtime'), 80)}",
+        ]
+        if step_id:
+            detail_parts.append(f"active_step_id={step_id}")
+        if active:
+            detail_parts.append(f"active_step={active}")
+        detail_parts.append(
+            f"plan_rows={int(issue.get('plan_step_count', 0) or 0)}; "
+            f"worker_rows={int(issue.get('worker_count', 0) or 0)}/"
+            f"{int(issue.get('expected_count', 0) or 0)} expected"
+        )
+        if bool(issue.get("blocking", False)):
+            action_text = (
+                "Do not advance the plan step and do not restart the whole plan. "
+                "First inspect the current plan/todo state, then repair only the broken structure if the evidence confirms it "
+                "(for example with TodoWrite/TodoWriteRescue for current-step worker subtasks, or blackboard updates for missing plan rows). "
+                "After repair, continue only the active plan step."
+            )
+        else:
+            action_text = (
+                "This is a non-blocking consistency signal. If the current step already has sufficient evidence or the whole task is complete, "
+                "do not recreate todos just for formality; proceed to verification or finish normally. "
+                "Only repair the structure if it is genuinely preventing the active plan step from continuing."
+            )
+        content = (
+            "<plan-state-repair-required>\n"
+            "Approved plan execution state appears structurally inconsistent. "
+            f"{action_text}\n"
+            + "\n".join(detail_parts)
+            + "\n</plan-state-repair-required>"
+        )
+        self._append_plan_guidance_bubble(
+            content,
+            target_roles=target_roles,
+            summary="plan state repair required",
+        )
+        return issue
 
     def _check_step_verified_tag(self, plan_step: dict, *, messages: list | None = None) -> bool:
         """Return True if the agent has emitted <step-verified> in any assistant message
@@ -37876,11 +38634,14 @@ body{padding:18px}
 
     def _manager_classification_system_prompt(self) -> str:
         ceiling_prompt = self._auto_task_level_ceiling_prompt()
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"\n{user_profile_block}\n" if user_profile_block else ""
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
             "set it false for a new independent objective.\n\n"
+            f"{user_profile_text}"
             "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
             "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
             "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
@@ -38016,6 +38777,8 @@ body{padding:18px}
             return {"requires_plan": False, "reason": "plan already approved", "source": "approved-plan"}
         if self._is_plan_choice_response(goal) or self._is_continuation_input(goal):
             return {"requires_plan": False, "reason": "continuation should execute without restarting plan mode", "source": "continuation"}
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"\nUser profile preference capsule:\n{user_profile_block}\n" if user_profile_block else ""
         row = dict(decision or {})
         try:
             level = int(row.get("level", getattr(self, "runtime_task_level", 0) or 0) or 0)
@@ -38033,6 +38796,7 @@ body{padding:18px}
             f"Execution mode: {normalize_execution_mode(row.get('execution_mode', self._effective_execution_mode()), default=self._effective_execution_mode())}\n"
             f"Previous blackboard goal: {previous_goal or '(none)'}\n"
             f"Current blackboard progress: {progress_state}\n\n"
+            f"{user_profile_text}"
             "Use semantic intent only. Do not decide from keywords alone.\n"
             "Return requires_plan=true only if the user needs a proposal/research/choice phase before action: "
             "ground-up rebuild or restart, system-wide inspection, architecture redesign, migration with real alternatives, "
@@ -38094,7 +38858,7 @@ body{padding:18px}
                 self._blackboard_history("manager", f"follow-up inherited: {trim(str(goal_text or ''), 300)}")
             else:
                 self._blackboard_reset_for_goal(goal_text)
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="runtime-task-decision")
         try:
             level = int(row.get("level", 3) or 3)
         except Exception:
@@ -38713,7 +39477,7 @@ body{padding:18px}
                 decision["requires_plan"] = False
                 decision["plan_mode_reason"] = "user set Plan Off"
             self.runtime_reclassify_required = False
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="user-level-override", clear_reclassify=True)
             self._apply_runtime_task_decision(goal, decision)
             return dict(decision)
         # --- Continuation input short-circuit: inherit previous complexity ---
@@ -39034,6 +39798,8 @@ body{padding:18px}
                 "follow the loaded skill's workflow and scripts. Do NOT invent alternative approaches "
                 "when a loaded skill already defines the correct procedure. "
             )
+        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_text = f"{user_profile_block} " if user_profile_block else ""
         todo_route_note = self._plan_todo_discipline_prompt(for_manager=True)
         return (
             "You are Manager in a multi-agent coding system. "
@@ -39059,6 +39825,7 @@ body{padding:18px}
             f"{phase_hint}"
             f"{failure_hint}"
             f"{html_hint}"
+            f"{user_profile_text}"
             f"{skills_constraint}"
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
@@ -42063,7 +42830,7 @@ body{padding:18px}
             current_goal = trim(str(self._ensure_blackboard().get("original_goal", "") or "").strip(), 4000)
             if not current_goal:
                 self._blackboard_reset_for_goal(goal_text)
-                self.runtime_goal_reset_pending = False
+                self._mark_runtime_goal_reset_handled(reason="multi-agent-seed")
             self._append_agent_context_message(
                 "explorer",
                 {
@@ -43801,10 +44568,71 @@ body{padding:18px}
             return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
         return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
 
-    def _enqueue_running_user_input(self, content: str) -> dict:
+    def _enqueue_running_user_input(self, content: str, *, best_effort: bool = False) -> dict:
         text = trim(str(content or "").strip(), 6000)
         if not text:
             raise ValueError("content required")
+        acquired = False
+        if best_effort:
+            try:
+                acquired = bool(self.lock.acquire(timeout=0.02))
+            except Exception:
+                acquired = False
+        if (not best_effort) or acquired:
+            lock_cm = self.lock if not acquired else None
+            if lock_cm is not None:
+                lock_cm.acquire()
+            try:
+                row = self._enqueue_running_user_input_locked(text)
+            finally:
+                if lock_cm is not None:
+                    lock_cm.release()
+                elif acquired:
+                    try:
+                        self.lock.release()
+                    except Exception:
+                        pass
+        else:
+            phase = str(getattr(self, "current_phase", "") or "")
+            tool = str(getattr(self, "current_tool_name", "") or "")
+            if tool in {"write_file", "edit_file"} or phase in {"tool:write_file", "tool:edit_file"}:
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_WRITE_ROUNDS, "write-phase"
+            elif phase.startswith("tool:"):
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
+            else:
+                delay_rounds, delay_reason = LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
+            round_idx = int(getattr(self, "agent_round_index", 0) or 0)
+            with self.live_input_queue_lock:
+                self.live_input_seq += 1
+                row = {
+                    "id": int(self.live_input_seq),
+                    "content": text,
+                    "queued_at": now_ts(),
+                    "queued_round": round_idx,
+                    "delay_rounds": int(delay_rounds),
+                    "next_round": int(round_idx + delay_rounds),
+                    "applied_count": 0,
+                    "last_applied_round": -1,
+                    "delay_reason": delay_reason,
+                    "run_generation": int(getattr(self, "run_generation", 0) or 0),
+                    "best_effort": True,
+                }
+                self.pending_user_inputs.append(row)
+                self.pending_user_inputs = self.pending_user_inputs[-40:]
+            self.updated_at = now_ts()
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "live user input queued "
+                    f"(id={row['id']}, delay_rounds={row.get('delay_rounds', 0)}, "
+                    f"reason={row.get('delay_reason', '')})"
+                )
+            },
+        )
+        return row
+
+    def _enqueue_running_user_input_locked(self, text: str) -> dict:
         with self.lock:
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
@@ -43821,19 +44649,11 @@ body{padding:18px}
                 "delay_reason": delay_reason,
                 "run_generation": int(self.run_generation),
             }
-            self.pending_user_inputs.append(row)
-            self.pending_user_inputs = self.pending_user_inputs[-40:]
+            with self.live_input_queue_lock:
+                self.pending_user_inputs.append(row)
+                self.pending_user_inputs = self.pending_user_inputs[-40:]
             self.updated_at = now_ts()
             self._persist()
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    "live user input queued "
-                    f"(id={row['id']}, delay_rounds={delay_rounds}, reason={delay_reason})"
-                )
-            },
-        )
         return row
 
     def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
@@ -43937,68 +44757,69 @@ body{padding:18px}
     def _inject_pending_user_inputs(self) -> int:
         injected: list[dict] = []
         with self.lock:
-            if not self.pending_user_inputs:
-                return 0
-            round_idx = int(self.agent_round_index)
-            current_generation = int(self.run_generation)
-            kept: list[dict] = []
-            for row in list(self.pending_user_inputs):
-                row_generation = int(row.get("run_generation", current_generation) or current_generation)
-                if row_generation != current_generation:
-                    continue
-                next_round = int(row.get("next_round", round_idx) or round_idx)
-                if round_idx < next_round:
-                    kept.append(row)
-                    continue
-                content = trim(str(row.get("content", "") or "").strip(), 6000)
-                if not content:
-                    continue
-                self._refresh_runtime_code_reference(content)
-                applied = int(row.get("applied_count", 0) or 0) + 1
-                delay_rounds = int(row.get("delay_rounds", 0) or 0)
-                base_weight = (
-                    float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
-                    if delay_rounds > 0
-                    else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
-                )
-                weight_step = (
-                    float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
-                    if delay_rounds > 0
-                    else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
-                )
-                weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
-                priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
-                payload = (
-                    "<live-user-adjustment "
-                    f"id=\"{int(row.get('id', 0) or 0)}\" "
-                    f"priority=\"{priority}\" "
-                    f"weight=\"{weight:.2f}\">"
-                    f"\n{content}\n"
-                    "</live-user-adjustment>"
-                )
-                self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
-                self.runtime_reclassify_goal = trim(content, 4000)
-                # Only trigger reclassification in auto mode (no user override)
-                if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
-                    self.runtime_reclassify_required = False
-                else:
-                    self.runtime_reclassify_required = True
-                self.runtime_goal_reset_pending = True
-                injected.append(
-                    {
-                        "id": int(row.get("id", 0) or 0),
-                        "weight": weight,
-                        "priority": priority,
-                        "applied": applied,
-                        "content": content,
-                    }
-                )
-                row["applied_count"] = applied
-                row["last_applied_round"] = round_idx
-                if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
-                    row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
-                    kept.append(row)
-            self.pending_user_inputs = kept[-40:]
+            with self.live_input_queue_lock:
+                if not self.pending_user_inputs:
+                    return 0
+                round_idx = int(self.agent_round_index)
+                current_generation = int(self.run_generation)
+                kept: list[dict] = []
+                for row in list(self.pending_user_inputs):
+                    row_generation = int(row.get("run_generation", current_generation) or current_generation)
+                    if row_generation != current_generation:
+                        continue
+                    next_round = int(row.get("next_round", round_idx) or round_idx)
+                    if round_idx < next_round:
+                        kept.append(row)
+                        continue
+                    content = trim(str(row.get("content", "") or "").strip(), 6000)
+                    if not content:
+                        continue
+                    self._refresh_runtime_code_reference(content)
+                    applied = int(row.get("applied_count", 0) or 0) + 1
+                    delay_rounds = int(row.get("delay_rounds", 0) or 0)
+                    base_weight = (
+                        float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                    )
+                    weight_step = (
+                        float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                    )
+                    weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                    priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                    payload = (
+                        "<live-user-adjustment "
+                        f"id=\"{int(row.get('id', 0) or 0)}\" "
+                        f"priority=\"{priority}\" "
+                        f"weight=\"{weight:.2f}\">"
+                        f"\n{content}\n"
+                        "</live-user-adjustment>"
+                    )
+                    self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                    self.runtime_reclassify_goal = trim(content, 4000)
+                    # Only trigger reclassification in auto mode (no user override).
+                    if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+                        self.runtime_reclassify_required = False
+                    else:
+                        self.runtime_reclassify_required = True
+                    self._mark_runtime_goal_reset_pending(content, reason="live-user-adjustment")
+                    injected.append(
+                        {
+                            "id": int(row.get("id", 0) or 0),
+                            "weight": weight,
+                            "priority": priority,
+                            "applied": applied,
+                            "content": content,
+                        }
+                    )
+                    row["applied_count"] = applied
+                    row["last_applied_round"] = round_idx
+                    if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                        row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
+                        kept.append(row)
+                self.pending_user_inputs = kept[-40:]
             if injected:
                 self.updated_at = now_ts()
                 self._persist()
@@ -44160,7 +44981,7 @@ body{padding:18px}
                 )
                 self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
                 # Don't reset blackboard — continue
-                self.runtime_goal_reset_pending = False
+                self._mark_runtime_goal_reset_handled(reason="continuation-intent-fusion", clear_reclassify=True)
                 return
         if is_continuation and original_goal:
             # Continuation without plan — inherit context intent
@@ -44173,7 +44994,7 @@ body{padding:18px}
                 f"</intent-fusion>"
             )
             self.messages.append({"role": "user", "content": fused, "ts": now_ts()})
-            self.runtime_goal_reset_pending = False
+            self._mark_runtime_goal_reset_handled(reason="continuation-intent-fusion", clear_reclassify=True)
             return
         # New instruction — fuse with context but user intent takes priority
         if original_goal:
@@ -44196,6 +45017,18 @@ body{padding:18px}
         except Exception:
             acquired = False
         if not acquired:
+            if bool(getattr(self, "running", False)):
+                row = self._enqueue_running_user_input(content, best_effort=True)
+                return {
+                    "ok": True,
+                    "queued": True,
+                    "running": True,
+                    "queue_id": int(row.get("id", 0) or 0),
+                    "delay_rounds": int(row.get("delay_rounds", 0) or 0),
+                    "delay_reason": str(row.get("delay_reason", "")),
+                    "live_input": True,
+                    "best_effort": bool(row.get("best_effort", False)),
+                }
             row = self._enqueue_deferred_start_input(content, "session lock busy")
             return {
                 "ok": True,
@@ -44211,30 +45044,48 @@ body{padding:18px}
             else:
                 if self.pending_user_inputs:
                     dropped_stale_inputs = len(self.pending_user_inputs)
-                # Preserve plan state if awaiting user choice
+                clean_goal_pre = trim(str(content or "").strip(), 4000)
+                # Preserve plan state if awaiting user choice or continuing an approved plan.
                 _awaiting_plan_choice = bool(
-                    self.runtime_plan_proposal
-                    and not self.runtime_plan_approved
+                    (
+                        self.runtime_plan_proposal
+                        and not self.runtime_plan_approved
+                    )
+                    or self._is_plan_choice_response(clean_goal_pre)
+                )
+                _continue_existing_plan = bool(
+                    self._is_continuation_input(clean_goal_pre)
+                    and self._has_resumable_plan_state()
                 )
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.runtime_first_task_in_session = not self._has_prior_real_user_task_message()
                 if _awaiting_plan_choice:
-                    # Restore plan proposal so choice can be parsed
+                    # Restore plan proposal so choice can be parsed.
                     self.runtime_plan_mode_needed = True
+                    if not self.runtime_plan_proposal:
+                        bb_plan = self._ensure_blackboard().get("plan", {})
+                        if isinstance(bb_plan, dict) and isinstance(bb_plan.get("proposal"), dict):
+                            self.runtime_plan_proposal = dict(bb_plan.get("proposal", {}))
+                    self._restore_runtime_policy_from_blackboard_locked()
+                elif _continue_existing_plan:
                     self._restore_runtime_policy_from_blackboard_locked()
                 # Reset completed plan/todo/skills blackboard state so the manager
                 # does not see status=COMPLETED on the very first round and immediately finish.
                 # But preserve plan state if user is continuing an existing task.
-                if not _awaiting_plan_choice:
-                    clean_goal_pre = trim(str(content or "").strip(), 4000)
-                    if self._is_continuation_input(clean_goal_pre) and self._has_resumable_plan_state():
-                        pass  # Preserve plan state for continuation
-                    else:
-                        self._reset_blackboard_plan_state_locked()
+                if not (_awaiting_plan_choice or _continue_existing_plan):
+                    self._reset_blackboard_plan_state_locked()
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
                 self.messages.append({"role": "user", "content": content, "ts": now_ts()})
+                if _continue_existing_plan:
+                    try:
+                        self._maybe_prompt_plan_resume_repair(
+                            reason="submit-continuation",
+                            target_roles=(self._current_plan_worker_owner(),),
+                        )
+                    except Exception:
+                        pass
                 # Parse plan choice immediately after clean_goal is available
                 if _awaiting_plan_choice:
                     choice = self._parse_plan_choice(clean_goal, self.runtime_plan_proposal)
@@ -44247,19 +45098,32 @@ body{padding:18px}
                         self.stall_escalation_triggered = False
                         self._inject_plan_into_context(choice)
                         self.runtime_reclassify_required = False
-                        self.runtime_goal_reset_pending = False
+                        self._mark_runtime_goal_reset_handled(reason="plan-choice-accepted", clear_reclassify=True)
                 # Restart intent fusion: merge user/plan/context intents
-                if self._is_restart_scenario():
+                if (not _continue_existing_plan) and self._is_restart_scenario():
                     self._fuse_restart_intent(clean_goal)
                 self.runtime_reclassify_goal = clean_goal
                 # Skip reclassification for plan choice responses — preserve complexity
                 # Also skip when user has manually set task level override
                 _has_user_override = int(getattr(self, 'user_task_level_override', 0) or 0) > 0
-                if _awaiting_plan_choice or self._is_plan_choice_response(clean_goal) or _has_user_override:
+                if _continue_existing_plan:
                     self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_handled(
+                        reason="continuation-submit",
+                        clear_reclassify=True,
+                    )
+                elif _awaiting_plan_choice or self._is_plan_choice_response(clean_goal):
+                    self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_handled(
+                        reason="plan-choice-response",
+                        clear_reclassify=True,
+                    )
+                elif _has_user_override:
+                    self.runtime_reclassify_required = False
+                    self._mark_runtime_goal_reset_pending(clean_goal, reason="new-user-message")
                 else:
                     self.runtime_reclassify_required = True
-                self.runtime_goal_reset_pending = True
+                    self._mark_runtime_goal_reset_pending(clean_goal, reason="new-user-message")
                 self.running = True
                 self.run_started_at = now_ts()
                 self.run_last_heartbeat = self.run_started_at
@@ -44305,6 +45169,8 @@ body{padding:18px}
                 "queue_id": int(row.get("id", 0) or 0),
                 "delay_rounds": int(row.get("delay_rounds", 0) or 0),
                 "delay_reason": str(row.get("delay_reason", "")),
+                "live_input": True,
+                "best_effort": bool(row.get("best_effort", False)),
             }
         threading.Thread(target=self._agent_worker, daemon=True).start()
         return {"ok": True, "queued": False, "running": True}
@@ -44803,7 +45669,12 @@ body{padding:18px}
             if self.stall_escalation_triggered:
                 self._emit("status", {"summary": "sync loop break: stall escalated to plan mode"})
                 break
-            self._inject_pending_user_inputs()
+            injected_inputs = self._inject_pending_user_inputs()
+            if injected_inputs or bool(getattr(self, "runtime_reclassify_required", False)):
+                self._handle_runtime_goal_reclassification_if_needed(
+                    pinned_selection=pinned_selection,
+                    scope="multi-agent sync",
+                )
             self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -45015,11 +45886,18 @@ body{padding:18px}
             _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in _step_results)
             if _wrote and not _did_todo:
                 _bb_nudge = self._ensure_blackboard()
-                _cur_step = next((t for t in _bb_nudge.get("project_todos", []) if t.get("category") == "plan_step" and t.get("status") == "in_progress"), None)
+                _cur_step = next(
+                    (
+                        t for t in _bb_nudge.get("project_todos", [])
+                        if t.get("category") == "plan_step" and t.get("status") == "in_progress"
+                    ),
+                    None,
+                )
                 if _cur_step:
+                    _missing_subtasks = not self._active_plan_step_has_worker_todos(role)
                     _msg = self._build_plan_todo_reminder_text(
                         _cur_step,
-                        missing_subtasks=not self._active_plan_step_has_worker_todos(role),
+                        missing_subtasks=_missing_subtasks,
                     )
                     if _msg:
                         self._append_instruction_bubble(
@@ -45027,6 +45905,15 @@ body{padding:18px}
                             target_roles=(role,),
                             summary=f"plan+sync todo reminder injected ({role})",
                         )
+                    if _missing_subtasks:
+                        try:
+                            self._maybe_prompt_plan_resume_repair(
+                                reason="multi-agent-missing-subtasks",
+                                role=role,
+                                target_roles=(role,),
+                            )
+                        except Exception:
+                            pass
             # End-of-turn finish guard:
             # conclusive reply + no open todos + no known errors => auto-finish.
             agent_text = self._latest_agent_assistant_text(role)
@@ -45146,6 +46033,12 @@ body{padding:18px}
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
+            injected_inputs = self._inject_pending_user_inputs()
+            if injected_inputs or bool(getattr(self, "runtime_reclassify_required", False)):
+                self._handle_runtime_goal_reclassification_if_needed(
+                    pinned_selection=pinned_selection,
+                    scope="multi-agent sequential",
+                )
             self._apply_auto_compact_if_needed("auto:multi-seq", role=current_role)
             with self.lock:
                 self.agent_round_index = int(self.agent_round_index) + 1
@@ -47416,6 +48309,20 @@ body{padding:18px}
                 goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
                 media_inputs_round=initial_policy_media_inputs,
             )
+            if self._has_resumable_plan_state():
+                try:
+                    self._restore_runtime_policy_from_blackboard_locked()
+                    repair_issue = self._maybe_prompt_plan_resume_repair(
+                        reason="run-start",
+                        target_roles=(self._current_plan_worker_owner(),),
+                    )
+                    if bool(repair_issue.get("issue", False)):
+                        self._emit(
+                            "status",
+                            {"summary": f"plan state repair prompt injected: {repair_issue.get('reason', 'unknown')}"},
+                        )
+                except Exception:
+                    pass
             if bool(self.runtime_confirmation_needed) and int(self.runtime_task_level or 0) == 5:
                 confirm_prompt = self._level5_confirmation_prompt()
                 self.messages.append(
@@ -47577,7 +48484,7 @@ body{padding:18px}
                     # Skip reclassification if user has manually set task level
                     if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
                         self.runtime_reclassify_required = False
-                        self.runtime_goal_reset_pending = False
+                        self._mark_runtime_goal_reset_handled(reason="single-agent-user-level-override", clear_reclassify=True)
                     else:
                         policy_media_inputs = self._recent_multimodal_inputs()
                         self._emit_multimodal_attach_status(
@@ -48865,17 +49772,25 @@ body{padding:18px}
                         self.last_todo_reminder_ts = now_tick
                         self.todo_reminder_count += 1
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
-                        bootstrapped = False
+                        repair_issue = {}
                         try:
-                            bootstrapped = self._ensure_worker_todos_for_plan_step(
-                                self._get_active_plan_step(),
-                                force_refresh=False,
-                                owner=single_role,
+                            repair_issue = self._maybe_prompt_plan_resume_repair(
+                                reason="missing-progress",
+                                role=single_role,
+                                target_roles=(single_role,),
                             )
                         except Exception:
-                            bootstrapped = False
-                        if bootstrapped:
-                            self._emit("status", {"summary": "todo subtasks auto-bootstrapped after missing-progress detection"})
+                            repair_issue = {}
+                        if bool(repair_issue.get("issue", False)):
+                            self._emit(
+                                "status",
+                                {"summary": f"plan state repair required: {repair_issue.get('reason', 'unknown')}"},
+                            )
+                            self.last_todo_reminder_ts = now_tick
+                            self.todo_reminder_count += 1
+                            if bool(repair_issue.get("blocking", True)):
+                                retry_requested_this_round = True
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         else:
                             self._append_plan_guidance_bubble(
                                 "<reminder>Plan subtasks are still unavailable. Continue with one concrete action for the active plan step, or report the blocker with exact evidence.</reminder>",
@@ -49410,6 +50325,8 @@ body{padding:18px}
                     getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
                 ),
                 "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+                "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+                "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
                 "auto_task_level_ceiling": self._auto_task_level_ceiling_value(),
                 "read_context_budget": self._read_context_budget(),
                 "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
@@ -49782,6 +50699,8 @@ class SessionManager:
         max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS,
         web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED,
         web_search_setting_locked: bool = False,
+        user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
+        user_memory_setting_locked: bool = False,
         upload_callback=None,
         run_finished_callback=None,
         reference_prepare_callback=None,
@@ -49835,6 +50754,8 @@ class SessionManager:
         self.execution_mode = normalize_execution_mode(execution_mode, default=EXECUTION_MODE_SYNC)
         self.web_search_enabled = bool(web_search_enabled)
         self.web_search_setting_locked = bool(web_search_setting_locked)
+        self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
+        self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.single_advance_prompt_enhance = False
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
@@ -49856,6 +50777,9 @@ class SessionManager:
         self.user_root = self.root.parent
         self.user_root.mkdir(parents=True, exist_ok=True)
         self.user_prefs_path = self.user_root / "user_prefs.json"
+        self.user_memory_store = UserMemoryStore(self.user_root, user_id=self.user_id)
+        self.user_interaction_optimizer = UserInteractionOptimizer()
+        self.user_intent_profiler = UserIntentProfiler(self.user_memory_store, self.user_interaction_optimizer)
         self.user_model_profiles: dict[str, dict] = {}
         self.user_active_profile_id = ""
         self.user_language = normalize_ui_language(default_language)
@@ -49975,6 +50899,7 @@ class SessionManager:
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
             "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+            "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -50045,6 +50970,10 @@ class SessionManager:
                     raw.get("web_search_enabled"),
                     default=getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED),
                 )
+            if not bool(getattr(self, "user_memory_setting_locked", False)):
+                raw_user_memory_mode = extract_user_memory_mode_setting(raw)
+                if raw_user_memory_mode is not None:
+                    self.user_memory_mode = normalize_user_memory_mode(raw_user_memory_mode)
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -50158,6 +51087,7 @@ class SessionManager:
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
         )
         sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+        sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
         sess.shell_command_timeout_seconds = normalize_timeout_seconds(
             self.shell_command_timeout_seconds,
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
@@ -50212,6 +51142,12 @@ class SessionManager:
             self.web_search_enabled = bool(
                 getattr(sess, "web_search_enabled", getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             )
+        if bool(getattr(self, "user_memory_setting_locked", False)):
+            sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        else:
+            self.user_memory_mode = normalize_user_memory_mode(
+                getattr(sess, "user_memory_mode", getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            )
         self._persist_user_prefs()
         if not apply_to_all:
             return
@@ -50219,6 +51155,69 @@ class SessionManager:
             if other.id == sess.id:
                 continue
             self._apply_user_defaults_to_session(other, clear_cap_cache=True)
+
+    def prepare_user_intent_for_session(self, sess: SessionState, content: str) -> dict:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            sess.user_memory_mode = "off"
+            sess.user_profile_capsule = ""
+            sess.user_profile_capsule_meta = {"mode": "off", "memory_count": 0}
+            return {"ok": True, "mode": "off", "capsule_chars": 0, "memory_count": 0}
+        try:
+            out = self.user_intent_profiler.prepare_session(sess, content, mode)
+            sess.user_memory_mode = mode
+            sess.updated_at = now_ts()
+            sess._persist()
+            return out
+        except Exception as exc:
+            sess.user_profile_capsule = ""
+            sess.user_profile_capsule_meta = {"mode": mode, "error": trim(str(exc), 160)}
+            return {"ok": False, "mode": mode, "error": trim(str(exc), 200)}
+
+    def capture_user_memory_from_session(self, sess: SessionState) -> dict:
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            return {"ok": True, "skipped": True, "mode": "off"}
+        try:
+            return self.user_memory_store.capture_session(sess)
+        except Exception as exc:
+            return {"ok": False, "error": trim(str(exc), 220)}
+
+    def user_memory_payload(self, *, limit: int = 80) -> dict:
+        payload = self.user_memory_store.payload(limit=limit)
+        payload["user_memory_mode"] = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        payload["setting_locked"] = bool(getattr(self, "user_memory_setting_locked", False))
+        return payload
+
+    def user_memory_export_payload(self) -> dict:
+        payload = self.user_memory_store.export_payload()
+        payload["user_memory_mode"] = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        return payload
+
+    def clear_user_memory(self) -> dict:
+        return self.user_memory_store.clear()
+
+    def set_user_memory_mode(self, mode: str) -> dict:
+        if bool(getattr(self, "user_memory_setting_locked", False)):
+            return {
+                "ok": False,
+                "locked": True,
+                "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+                "error": "user memory mode is locked by startup argument",
+            }
+        self.user_memory_mode = normalize_user_memory_mode(mode)
+        for sess in list(self.sessions.values()):
+            try:
+                sess.user_memory_mode = self.user_memory_mode
+                if self.user_memory_mode == "off":
+                    sess.user_profile_capsule = ""
+                    sess.user_profile_capsule_meta = {"mode": "off", "memory_count": 0}
+                sess.updated_at = now_ts()
+                sess._persist()
+            except Exception:
+                pass
+        self._persist_user_prefs()
+        return {"ok": True, "user_memory_mode": self.user_memory_mode}
 
     def _session_summary_from_disk(self, path: Path) -> dict:
         sid = str(path.name or "").strip()
@@ -50782,6 +51781,9 @@ class SessionManager:
             cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
             if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
                 self.web_search_enabled = bool(cfg_web_search_enabled)
+            cfg_user_memory_mode = extract_user_memory_mode_setting(cfg)
+            if cfg_user_memory_mode is not None and not bool(getattr(self, "user_memory_setting_locked", False)):
+                self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
             self._persist_user_prefs()
             for sess in self.sessions.values():
                 self._apply_user_defaults_to_session(sess, clear_cap_cache=True)
@@ -51019,6 +52021,9 @@ window.MathJax={
             <div id="toolsMenu" class="popup-menu" style="display:none">
               <a id="compactAction" class="popup-item" href="#">Compact</a>
               <a id="refreshAction" class="popup-item" href="#">Refresh</a>
+              <a id="memoryModeAction" class="popup-item" href="#">Memory: Weak</a>
+              <a id="memoryExportAction" class="popup-item" href="#">Export Memory</a>
+              <a id="memoryClearAction" class="popup-item" href="#">Clear Memory</a>
             </div>
           </div>
           <div class="popup-dropdown" style="position:relative;display:inline-block">
@@ -51202,7 +52207,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-preview-row{margin-top:6px}
 .msg-preview-btn{border:1px solid #c8d8ee;background:#f5f9ff;color:#204a7a;padding:4px 8px;border-radius:999px;font-size:.75rem;cursor:pointer}
 .msg-preview-btn:hover{background:#eaf2ff}
-.msg{padding:10px 12px;border-radius:12px;max-width:88%;white-space:normal;margin:0 0 8px 0;flex:0 0 auto}
+.msg{padding:8px 10px;border-radius:10px;max-width:88%;white-space:normal;margin:0 0 6px 0;flex:0 0 auto}
 .chat-virt-spacer{flex:0 0 auto;margin:0!important;padding:0!important;border:0!important;min-height:0!important;max-width:none!important;pointer-events:none}
 @supports (content-visibility:auto){
   .msg{contain:layout paint}
@@ -51223,7 +52228,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
 .msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
-.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:10px 11px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
 .msg.agent-reviewer .msg-agent-shell{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
@@ -51305,7 +52310,7 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-system-head{font-weight:700;font-size:.86rem;margin-bottom:4px}
 .msg-system-meta{font-size:.78rem;color:#667085;margin-bottom:6px;white-space:pre-wrap}
 .msg.msg-event-wrap{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
-.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:16px;padding:12px 13px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 10px 24px rgba(15,23,42,.08);overflow:hidden}
+.msg-event-card{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:9px 10px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-event-card{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-event-card{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
 .msg.agent-reviewer .msg-event-card{background:linear-gradient(180deg,#fffdf8 0%,#fff5dc 100%);border-color:#f0ddaa}
@@ -51313,13 +52318,15 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg.agent-planner .msg-event-card{background:linear-gradient(180deg,#fffaf8 0%,#feeee8 100%);border-color:#f5c8bd}
 .msg-event-card-skill{background:linear-gradient(180deg,#f9fcff 0%,#edf6ff 100%);border-color:#cadff7}
 .msg-event-card-web{background:linear-gradient(180deg,#fbfffe 0%,#ebf8f5 100%);border-color:#bfe5dd}
-.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:10px;min-width:0}
+.msg-event-card-adjustment{background:linear-gradient(180deg,#fffefd 0%,#fff3e7 100%);border-color:#ffd1a5}
+.msg-event-card-feedback{background:linear-gradient(180deg,#fffaff 0%,#f5edff 100%);border-color:#dec7ff}
+.msg-event-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:7px;min-width:0}
 .msg-event-head>div:first-child{min-width:0}
 .msg-event-title{font-size:.94rem;font-weight:800;line-height:1.2;color:#1f314b}
 .msg-event-sub{margin-top:3px;font-size:.76rem;line-height:1.4;color:#627790}
 .msg-event-title,.msg-event-sub{overflow-wrap:anywhere}
-.msg-event-pills{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;min-width:0}
-.msg-event-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.72rem;font-weight:700;line-height:1}
+.msg-event-pills{display:flex;flex-wrap:wrap;gap:5px;align-items:center;justify-content:flex-end;min-width:0}
+.msg-event-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;border:1px solid #d7e3f2;background:#eef4ff;color:#355071;font-size:.7rem;font-weight:700;line-height:1}
 .msg-event-pill.ok{background:#ebf8ef;border-color:#c7e6ce;color:#21623a}
 .msg-event-pill.warn{background:#fff4e3;border-color:#ffd5a4;color:#8a4b08}
 .msg-event-pill.error{background:#fff0f0;border-color:#f1c5c5;color:#a12d2d}
@@ -51327,12 +52334,12 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-event-pill.live{background:#eefaf8;border-color:#bfe8df;color:#0f6e62}
 .msg-event-pill.neutral{background:#f5f8fd;border-color:#dce5f1;color:#55687f}
 .msg-event-pill.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px}
-.msg-event-cell{padding:9px 10px;border:1px solid #e1eaf5;border-radius:12px;background:rgba(255,255,255,.78)}
+.msg-event-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;margin-bottom:7px}
+.msg-event-cell{padding:7px 8px;border:1px solid #e1eaf5;border-radius:9px;background:rgba(255,255,255,.78)}
 .msg-event-label{font-size:.68rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:#6a7e96;margin-bottom:4px}
 .msg-event-value{font-size:.83rem;line-height:1.45;color:#1f314b;white-space:pre-wrap;word-break:break-word}
 .msg-event-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem}
-.msg-event-body{display:grid;gap:10px}
+.msg-event-body{display:grid;gap:7px}
 .msg-event-search-results{display:grid;gap:8px;max-height:260px;overflow:auto}
 .msg-event-card-web .msg-event-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
 .msg-event-card-web .msg-event-value{overflow-wrap:anywhere}
@@ -51612,6 +52619,8 @@ const I18N={
     btn_new_session:'New Session',btn_rename:'Rename',btn_delete:'Delete',
     btn_send:'Send',btn_interrupt:'Interrupt',btn_compact:'Compact',btn_refresh:'Refresh',btn_export_session:'Export Session',
     btn_clear_stale_todos:'Clear Stale Todos',
+    btn_memory_mode:'Memory: {mode}',btn_memory_export:'Export Memory',btn_memory_clear:'Clear Memory',
+    memory_mode_off:'Off',memory_mode_weak:'Weak',memory_mode_on:'On',memory_clear_confirm:'Clear this user memory? This only removes summary memory for the current user.',memory_exported:'User memory exported',memory_cleared:'User memory cleared',memory_mode_locked:'Memory mode is locked by startup arguments',
     prompt_placeholder:'Describe your task, or drag files here...',
     upload_drop:'Drag and drop code / Markdown / PDF / Excel / Word / PPT / CSV here, click to choose files, or paste clipboard files',
     upload_file_hint:'Supports drag/drop or paste: code / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -51648,6 +52657,8 @@ const I18N={
     btn_new_session:'新建会话',btn_rename:'重命名',btn_delete:'删除',
     btn_send:'发送',btn_interrupt:'中断',btn_compact:'压缩',btn_refresh:'刷新',btn_export_session:'导出会话',
     btn_clear_stale_todos:'清除陈旧待办',
+    btn_memory_mode:'记忆：{mode}',btn_memory_export:'导出记忆',btn_memory_clear:'清空记忆',
+    memory_mode_off:'关闭',memory_mode_weak:'弱',memory_mode_on:'开启',memory_clear_confirm:'清空当前用户的长期记忆？这只会删除当前用户的摘要记忆。',memory_exported:'用户记忆已导出',memory_cleared:'用户记忆已清空',memory_mode_locked:'记忆模式已被启动参数锁定',
     prompt_placeholder:'描述你的任务，或将文件拖入此处...',
     upload_drop:'拖拽上传代码 / Markdown / PDF / Excel / Word / PPT / CSV，或点击这里选择文件，也可直接粘贴剪切板文件',
     upload_file_hint:'支持拖入或粘贴文件：代码 / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -51684,6 +52695,8 @@ const I18N={
     btn_new_session:'新增會話',btn_rename:'重新命名',btn_delete:'刪除',
     btn_send:'送出',btn_interrupt:'中斷',btn_compact:'壓縮',btn_refresh:'重新整理',btn_export_session:'匯出會話',
     btn_clear_stale_todos:'清除陳舊待辦',
+    btn_memory_mode:'記憶：{mode}',btn_memory_export:'匯出記憶',btn_memory_clear:'清空記憶',
+    memory_mode_off:'關閉',memory_mode_weak:'弱',memory_mode_on:'開啟',memory_clear_confirm:'清空目前使用者的長期記憶？這只會刪除目前使用者的摘要記憶。',memory_exported:'使用者記憶已匯出',memory_cleared:'使用者記憶已清空',memory_mode_locked:'記憶模式已被啟動參數鎖定',
     prompt_placeholder:'描述你的任務，或將檔案拖入此處...',
     upload_drop:'拖曳上傳程式碼 / Markdown / PDF / Excel / Word / PPT / CSV，或點擊此處選擇檔案，也可直接貼上剪貼簿檔案',
     upload_file_hint:'支援拖入或貼上檔案：程式碼 / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -51720,6 +52733,8 @@ const I18N={
     btn_new_session:'新規セッション',btn_rename:'リネーム',btn_delete:'削除',
     btn_send:'送信',btn_interrupt:'中断',btn_compact:'コンパクト',btn_refresh:'更新',btn_export_session:'セッションをエクスポート',
     btn_clear_stale_todos:'古いTodoを消去',
+    btn_memory_mode:'メモリ：{mode}',btn_memory_export:'メモリをエクスポート',btn_memory_clear:'メモリを消去',
+    memory_mode_off:'オフ',memory_mode_weak:'弱',memory_mode_on:'オン',memory_clear_confirm:'このユーザーの長期メモリを消去しますか？現在のユーザーの要約メモリのみ削除します。',memory_exported:'ユーザーメモリをエクスポートしました',memory_cleared:'ユーザーメモリを消去しました',memory_mode_locked:'メモリモードは起動引数で固定されています',
     prompt_placeholder:'タスクを説明、またはファイルをここにドラッグ...',
     upload_drop:'コード / Markdown / PDF / Excel / Word / PPT / CSV をドラッグ＆ドロップ、クリックして選択、またはクリップボードから貼り付け',
     upload_file_hint:'ドラッグ＆ドロップまたは貼り付け対応：コード / Markdown / PDF / Excel / Word / PPT / CSV',
@@ -51758,6 +52773,7 @@ Object.assign(I18N['en'],{
   event_plan_handoff_title:'Plan Approved',event_plan_handoff_choice:'choice',event_plan_handoff_steps:'steps',event_plan_handoff_archive:'archive',event_plan_handoff_source:'source of truth',event_summary:'summary',event_plan_path:'plan path',
   event_step_verified_title:'Step Verified',event_step_verified_note:'The active step acceptance checks were marked as passed.',event_step_verified_checks:'checks',
   event_todo_focus_title:'Todo Focus',event_todo_focus_note:'Continue the current in-progress subtask.',
+  event_live_user_adjustment_title:'Live User Adjustment',event_live_user_adjustment_note:'Latest user feedback was injected into the active run.',event_feedback_merge_title:'Feedback Merge',event_feedback_merge_note:'Manager merged the latest user feedback with the active task direction.',event_feedback_input:'user input',event_current_step:'current step',event_directive:'directive',event_priority:'priority',event_weight:'weight',event_conflict:'conflict',event_score:'score',
   event_tool_calls_title:'Tool Calls',event_tool_calls_note:'Model scheduled these tools for the current turn.',event_tool_calls_empty:'No structured tool metadata was attached to this turn.',
   event_tool_result_title:'Tool Result',event_tool_start:'started',event_tool_done:'done',
   event_web_search_title:'Web Search',event_web_query:'Query',event_web_results:'results',event_web_pages:'pages',event_web_fetched_pages:'visited pages',event_web_followed:'followed',event_web_errors:'errors',event_web_evidence:'evidence',event_web_trails:'trails',event_web_note:'agent_web_search updated the local web evidence index.',
@@ -51785,6 +52801,7 @@ Object.assign(I18N['zh-CN'],{
   event_plan_handoff_title:'计划已批准',event_plan_handoff_choice:'方案',event_plan_handoff_steps:'步骤',event_plan_handoff_archive:'归档',event_plan_handoff_source:'执行依据',event_summary:'总结',event_plan_path:'计划路径',
   event_step_verified_title:'步骤已验收',event_step_verified_note:'当前步骤的验收检查已标记为通过。',event_step_verified_checks:'验收项',
   event_todo_focus_title:'Todo 焦点',event_todo_focus_note:'继续当前进行中的子任务。',
+  event_live_user_adjustment_title:'实时用户调整',event_live_user_adjustment_note:'最新用户反馈已注入当前运行。',event_feedback_merge_title:'反馈合并',event_feedback_merge_note:'管理者已将最新用户反馈合并到当前任务方向。',event_feedback_input:'用户输入',event_current_step:'当前步骤',event_directive:'指令',event_priority:'优先级',event_weight:'权重',event_conflict:'冲突',event_score:'分数',
   event_tool_calls_title:'工具调用',event_tool_calls_note:'模型已为当前轮安排以下工具调用。',event_tool_calls_empty:'当前轮没有附带结构化工具元数据。',
   event_tool_result_title:'工具结果',event_tool_start:'开始',event_tool_done:'完成',
   event_web_search_title:'联网检索',event_web_query:'检索词',event_web_results:'结果',event_web_pages:'页面',event_web_fetched_pages:'已访问页面',event_web_followed:'跟进',event_web_errors:'错误',event_web_evidence:'证据',event_web_trails:'轨迹',event_web_note:'agent_web_search 已更新本地网页证据索引。',
@@ -51815,6 +52832,7 @@ Object.assign(I18N['zh-TW'],{
   event_plan_handoff_title:'計畫已批准',event_plan_handoff_choice:'方案',event_plan_handoff_steps:'步驟',event_plan_handoff_archive:'封存',event_plan_handoff_source:'執行依據',event_summary:'總結',event_plan_path:'計畫路徑',
   event_step_verified_title:'步驟已驗收',event_step_verified_note:'目前步驟的驗收檢查已標記為通過。',event_step_verified_checks:'驗收項',
   event_todo_focus_title:'Todo 焦點',event_todo_focus_note:'繼續目前進行中的子任務。',
+  event_live_user_adjustment_title:'即時使用者調整',event_live_user_adjustment_note:'最新使用者回饋已注入目前執行。',event_feedback_merge_title:'回饋合併',event_feedback_merge_note:'管理者已將最新使用者回饋合併到目前任務方向。',event_feedback_input:'使用者輸入',event_current_step:'目前步驟',event_directive:'指令',event_priority:'優先級',event_weight:'權重',event_conflict:'衝突',event_score:'分數',
   event_tool_calls_title:'工具呼叫',event_tool_calls_note:'模型已為目前輪安排以下工具呼叫。',event_tool_calls_empty:'目前輪沒有附帶結構化工具中繼資料。',
   event_tool_result_title:'工具結果',event_tool_start:'開始',event_tool_done:'完成',
   event_web_search_title:'網路檢索',event_web_query:'檢索詞',event_web_results:'結果',event_web_pages:'頁面',event_web_fetched_pages:'已訪問頁面',event_web_followed:'跟進',event_web_errors:'錯誤',event_web_evidence:'證據',event_web_trails:'軌跡',event_web_note:'agent_web_search 已更新本機網頁證據索引。',
@@ -51843,6 +52861,7 @@ Object.assign(I18N['ja'],{
   event_plan_handoff_title:'計画承認済み',event_plan_handoff_choice:'選択',event_plan_handoff_steps:'ステップ',event_plan_handoff_archive:'アーカイブ',event_plan_handoff_source:'実行基準',event_summary:'要約',event_plan_path:'計画パス',
   event_step_verified_title:'ステップ検証済み',event_step_verified_note:'現在のステップの受け入れチェックは合格として記録されました。',event_step_verified_checks:'チェック',
   event_todo_focus_title:'Todo フォーカス',event_todo_focus_note:'現在進行中のサブタスクを続行します。',
+  event_live_user_adjustment_title:'ライブユーザー調整',event_live_user_adjustment_note:'最新のユーザーフィードバックを現在の実行に注入しました。',event_feedback_merge_title:'フィードバック統合',event_feedback_merge_note:'マネージャーが最新のユーザーフィードバックを現在のタスク方針に統合しました。',event_feedback_input:'ユーザー入力',event_current_step:'現在のステップ',event_directive:'指示',event_priority:'優先度',event_weight:'重み',event_conflict:'競合',event_score:'スコア',
   event_tool_calls_title:'ツール呼び出し',event_tool_calls_note:'モデルはこのターンで次のツール呼び出しを予定しました。',event_tool_calls_empty:'このターンには構造化されたツールメタデータがありません。',
   event_tool_result_title:'ツール結果',event_tool_start:'開始',event_tool_done:'完了',
   event_web_search_title:'Web検索',event_web_query:'クエリ',event_web_results:'結果',event_web_pages:'ページ',event_web_fetched_pages:'訪問済みページ',event_web_followed:'追跡',event_web_errors:'エラー',event_web_evidence:'証拠',event_web_trails:'履歴',event_web_note:'agent_web_search がローカルWeb証拠インデックスを更新しました。',
@@ -51867,7 +52886,9 @@ function applyUiStyle(){const style=normalizeUiStyle(S.config?.ui_style||'neo');
 function t(key,vars){const lang=currentLang();const pack=I18N[lang]||I18N['en'];const fallback=I18N['en'];let txt=String((pack&&pack[key])??(fallback&&fallback[key])??key);if(vars&&typeof vars==='object'){for(const [k,v] of Object.entries(vars)){txt=txt.replaceAll('{'+k+'}',String(v??''))}}return txt}
 function setText(id,key){const el=E(id);if(el)el.textContent=t(key)}
 function setPlaceholder(id,key){const el=E(id);if(el)el.placeholder=t(key)}
-function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
+function currentUserMemoryMode(){const raw=String(S.config?.user_memory_mode||S.snap?.user_memory_mode||'weak').trim().toLowerCase();return ['off','weak','on'].includes(raw)?raw:'weak'}
+function renderMemoryModeAction(){const el=E('memoryModeAction');if(!el)return;const mode=currentUserMemoryMode();el.textContent=t('btn_memory_mode',{mode:t('memory_mode_'+mode)});el.classList.toggle('disabled',!!S.config?.user_memory_setting_locked)}
+function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('memoryExportAction','btn_memory_export');setText('memoryClearAction','btn_memory_clear');renderMemoryModeAction();setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];const cur=String(S.config?.language||currentLang());const active=document.activeElement===sel;if(!langs.length){setHtmlIfChanged('langSelect','','langSelect');return}const html=langs.map(row=>{const code=String(row?.code||'').trim();if(!code)return'';return `<option value=\"${esc(code)}\">${esc(String(row?.label||code))}</option>`}).join('');setHtmlIfChanged('langSelect',html,'langSelect');if(cur&&sel.value!==cur&&!active)sel.value=cur}
 async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
@@ -52169,12 +53190,12 @@ function _deltaScheduleRender(flags={}){
       return;
     }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
+    const deferLiveRender=_chatVirtShouldDeferLiveRender(chatEl);
     if(needChat){
       const feedSig=feedSignature(S.snap||{});
       if(feedSig!==S.lastFeedSig){
         S.lastFeedSig=feedSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
+        if(deferLiveRender&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',()=>scheduleRenderChat('delta'));}
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');scheduleRenderChat('delta');}
       }
     }
@@ -52182,7 +53203,7 @@ function _deltaScheduleRender(flags={}){
       const boardSig=boardsSignature(S.snap||{});
       if(boardSig!==S.lastBoardsSig){
         S.lastBoardsSig=boardSig;
-        if(scrolling&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);}
+        if(deferLiveRender&&chatEl){_chatVirtDebounceWhileScrolling(chatEl,'_virtBoardsSyncTimer',()=>renderBoards(),CHAT_SCROLL_SYNC_DEBOUNCE_MS+20);}
         else{if(chatEl)_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');renderBoards();}
       }
     }
@@ -52190,6 +53211,17 @@ function _deltaScheduleRender(flags={}){
 }
 function scheduleRenderChat(reason='snapshot'){
   const next=String(reason||'snapshot');
+  const chatEl=E('chat');
+  if(
+    next!=='scroll'&&
+    chatEl&&
+    _chatVirtIsUserScrolling(chatEl)&&
+    !_chatVirtWantsBottom(chatEl,36)
+  ){
+    _chatVirtDebounceWhileScrolling(chatEl,'_virtDeferredRenderTimer',()=>scheduleRenderChat(next),CHAT_SCROLL_SYNC_DEBOUNCE_MS);
+    return;
+  }
+  if(chatEl&&next!=='scroll')_chatVirtCancelDebounce(chatEl,'_virtDeferredRenderTimer');
   const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
   const cur=String(S.chatRenderPendingReason||'');
   if(!cur||(priority[next]||3)>=(priority[cur]||3))S.chatRenderPendingReason=next;
@@ -52425,7 +53457,7 @@ function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?s
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
-function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model}
+function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
 function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
 function renderSessions(){
   const host=E('sessionList');
@@ -52499,8 +53531,7 @@ function _bindNestedScrollGuards(root){
       Number(chatEl._virtManualUnlockTs||0),
       now+CHAT_SCROLL_LOCK_MS
     );
-    S.follow.chat=false;
-    chatEl._virtAutoFollowPaused=true;
+    _chatVirtClearBottomFollow(chatEl,true);
   };
   for(const node of nodes){
     if(!node||node._nestedScrollGuardBound)continue;
@@ -52687,11 +53718,35 @@ function _mathRunTypeset(root,key=''){
     }
     if(root._mathPending)return;
     root._mathPending=true;
+    const chatEl=E('chat');
+    const inChat=!!(chatEl&&root.closest&&root.closest('#chat'));
+    const keepChatBottom=!!(inChat&&_chatVirtWantsBottom(chatEl,48));
+    const anchorBefore=(inChat&&!keepChatBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+    const oldScrollTop=chatEl?Number(chatEl.scrollTop||0):0;
     Promise.resolve(mj.typesetPromise([root]))
       .catch(()=>{})
       .finally(()=>{
         root._mathPending=false;
         if(k)root.setAttribute('data-math-key',k);
+        const msg=(root.matches&&root.matches('.msg[data-vk]'))?root:(root.closest?root.closest('.msg[data-vk]'):null);
+        if(msg){
+          const vk=String(msg.getAttribute('data-vk')||'');
+          const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));
+          const oldH=Number(CHAT_VIRT.heights[vk]||0);
+          if(vk&&newH>0&&(!oldH||Math.abs(oldH-newH)>=3)){
+            CHAT_VIRT.heights[vk]=newH;
+            CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
+            scheduleRenderChat('measure');
+          }
+          if(keepChatBottom&&chatEl)_chatVirtScrollToBottom(chatEl);
+          else if(inChat&&chatEl){
+            if(anchorBefore){
+              if(!_chatVirtRestoreAnchor(chatEl,anchorBefore))_chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }else{
+              _chatVirtSetScrollTop(chatEl,oldScrollTop);
+            }
+          }
+        }
       });
   };
   run(0);
@@ -52986,21 +54041,40 @@ self.onmessage=(ev)=>{
       const key=String(d.key||pending.key||'');
       const html=String(d.html||'');
       if(key&&html)_mdCacheSet(key,html);
+      const chatEl=E('chat');
+      const keepChatBottom=!!(chatEl&&_chatVirtWantsBottom(chatEl,48));
+      let touchedChat=false;
+      let changedChatHeight=false;
       const slots=document.querySelectorAll(`[data-md-job=\"${id}\"]`);
-      for(const slot of slots){
-        slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
-        slot.removeAttribute('data-md-job');
-        slot.classList.remove('md-async-slot');
-        const msg=slot.closest('.msg');
-        if(msg){
-          const vk=String(msg.getAttribute('data-vk')||'');
-          if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1}}}
-          const req=String(msg.getAttribute('data-math-request')||'').trim();
-          if(req)_mathTypeset(msg,`chat:${req}`);
-        }else{
-          const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
-          if(article)_mathTypeset(article,`pv:md:${id}`);
+      const applySlots=()=>{
+        for(const slot of slots){
+          slot.innerHTML=html||`<p>${esc(String(pending.text||''))}</p>`;
+          slot.removeAttribute('data-md-job');
+          slot.classList.remove('md-async-slot');
+          const msg=slot.closest('.msg');
+          if(msg){
+            touchedChat=true;
+            const vk=String(msg.getAttribute('data-vk')||'');
+            if(vk){const newH=Math.max(48,Math.ceil(msg.getBoundingClientRect().height||msg.offsetHeight||0));if(newH>0){const oldH=Number(CHAT_VIRT.heights[vk]||0);if(!oldH||Math.abs(oldH-newH)>=3){CHAT_VIRT.heights[vk]=newH;changedChatHeight=true}}}
+            const req=String(msg.getAttribute('data-math-request')||'').trim();
+            if(req)_mathTypeset(msg,`chat:${req}`);
+          }else{
+            const article=slot.closest('article.preview-md')||slot.closest('.preview-md');
+            if(article)_mathTypeset(article,`pv:md:${id}`);
+          }
         }
+      };
+      if(chatEl&&!keepChatBottom){
+        _chatVirtWithAnchorPreserved(chatEl,applySlots);
+      }else{
+        applySlots();
+      }
+      if(touchedChat){
+        if(changedChatHeight){
+          CHAT_VIRT.heightVersion=Number(CHAT_VIRT.heightVersion||0)+1;
+          scheduleRenderChat('measure');
+        }
+        if(keepChatBottom&&chatEl)_chatVirtScrollToBottom(chatEl);
       }
     };
     worker.onerror=()=>{};
@@ -53695,7 +54769,7 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
-const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_approved_handoff','step_verified','todo_focus']);
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge']);
 function _chatVirtFormatDurationMs(ms){
   const n=Number(ms||0);
   if(!Number.isFinite(n)||n<=0)return '';
@@ -53750,6 +54824,44 @@ function _chatVirtParseTodoFocus(raw){
   const m=txt.match(/^<todo-focus(?:\\s+[^>]*)?>\\s*([\\s\\S]*?)\\s*<\\/todo-focus>\\s*$/i);
   if(!m)return null;
   return {body:String(m[1]||'').trim()};
+}
+function _chatVirtParseTagAttrs(raw){
+  const attrs={};
+  String(raw||'').replace(/([A-Za-z_][\\w:-]*)\\s*=\\s*\"([^\"]*)\"/g,(_,k,v)=>{attrs[String(k||'').trim()]=String(v||'').trim();return''});
+  return attrs;
+}
+function _chatVirtParseTaggedBlock(raw,tag){
+  const name=String(tag||'').trim();
+  if(!name)return null;
+  const re=new RegExp('^<'+name+'(?:\\\\s+([^>]*))?>\\\\s*([\\\\s\\\\S]*?)\\\\s*<\\\\/'+name+'>\\\\s*$','i');
+  const m=String(raw||'').trim().match(re);
+  if(!m)return null;
+  return {attrs:_chatVirtParseTagAttrs(String(m[1]||'')),body:String(m[2]||'').trim()};
+}
+function _chatVirtParseLiveUserAdjustment(raw){
+  const parsed=_chatVirtParseTaggedBlock(raw,'live-user-adjustment');
+  if(!parsed)return null;
+  const a=parsed.attrs||{};
+  return {id:String(a.id||''),priority:String(a.priority||''),weight:String(a.weight||''),body:String(parsed.body||'').trim()};
+}
+function _chatVirtParseUserFeedbackMerge(raw){
+  const parsed=_chatVirtParseTaggedBlock(raw,'user-feedback-merge');
+  if(!parsed)return null;
+  const a=parsed.attrs||{};
+  const body=String(parsed.body||'').trim();
+  const out={conflict:String(a.conflict||''),score:String(a.score||''),user_input:'',current_step:'',directive:'',body:body};
+  const rest=[];
+  for(const line of body.split(/\\n+/)){
+    const s=String(line||'').trim();
+    if(!s)continue;
+    let m=s.match(/^User provided new input(?: during plan execution)?\\s*:\\s*(.*)$/i);
+    if(m){out.user_input=String(m[1]||'').trim();continue}
+    m=s.match(/^Current plan step\\s*:\\s*(.*)$/i);
+    if(m){out.current_step=String(m[1]||'').trim();continue}
+    rest.push(s);
+  }
+  out.directive=rest.join('\\n').trim();
+  return out;
 }
 function _chatVirtParseStepVerified(raw){
   const txt=String(raw||'').trim();
@@ -53835,7 +54947,41 @@ function _chatVirtParsePlanHandoff(raw){
   return out;
 }
 function _chatVirtStopRunTicker(chatEl){if(!chatEl)return;const timer=Number(chatEl._virtRunTicker||0);if(timer){clearInterval(timer);chatEl._virtRunTicker=0}}
-function _chatVirtTickRunNotice(chatEl){if(!chatEl)return;const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);if(!runActive){_chatVirtStopRunTicker(chatEl);return}if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}const nodes=chatEl._virtRunNodes;if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}const now=(Date.now()/1000);for(const node of nodes){const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');if(!target)continue;const label=String(node.getAttribute('data-run-label')||'model call');const startedAt=Number(node.getAttribute('data-run-start')||0);const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));const anchorTs=Number(node.getAttribute('data-run-anchor')||0);let elapsed=baseElapsed;if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}const whole=Math.floor(elapsed);if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;node.setAttribute('data-run-last-sec',String(whole));target.textContent=_chatVirtLiveRunText(label,elapsed)}}
+function _chatVirtTickRunNotice(chatEl){
+  if(!chatEl)return;
+  const runActive=!!(S.snap?.running&&S.snap?.live_run_notice_active);
+  if(!runActive){_chatVirtStopRunTicker(chatEl);return}
+  if(!chatEl._virtRunNodes||!chatEl._virtRunNodes.length){chatEl._virtRunNodes=Array.from(chatEl.querySelectorAll('.msg[data-run-live="1"]'))}
+  const nodes=chatEl._virtRunNodes;
+  if(!nodes.length){_chatVirtStopRunTicker(chatEl);return}
+  const keepBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!keepBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  const now=(Date.now()/1000);
+  let changed=false;
+  for(const node of nodes){
+    const target=node.querySelector('[data-run-elapsed-text]')||node.querySelector('pre');
+    if(!target)continue;
+    const label=String(node.getAttribute('data-run-label')||'model call');
+    const startedAt=Number(node.getAttribute('data-run-start')||0);
+    const baseElapsed=Math.max(0,Number(node.getAttribute('data-run-elapsed')||0));
+    const anchorTs=Number(node.getAttribute('data-run-anchor')||0);
+    let elapsed=baseElapsed;
+    if(startedAt>0){elapsed=Math.max(baseElapsed,now-startedAt)}else if(anchorTs>0){elapsed=Math.max(0,baseElapsed+(now-anchorTs))}
+    const whole=Math.floor(elapsed);
+    if(String(node.getAttribute('data-run-last-sec')||'')===String(whole))continue;
+    node.setAttribute('data-run-last-sec',String(whole));
+    target.textContent=_chatVirtLiveRunText(label,elapsed);
+    changed=true;
+  }
+  if(changed&&!keepBottom){
+    if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+}
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
@@ -54050,6 +55196,8 @@ function _chatVirtBuildMessageNode(m){
       const dataKind=(m&&typeof m.data==='object')?String(m.data.kind||m.data.control_tag||'').trim().toLowerCase():'';
       const parsedWebSearchText=_chatVirtParseWebSearchText(rawTextForKind);
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
+      const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
+      const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -54068,6 +55216,8 @@ function _chatVirtBuildMessageNode(m){
   else if(m.type==='plan_approved_handoff'||_chatVirtParsePlanHandoff(rawTextForKind))kind='plan_approved_handoff';
   else if(m.type==='step_verified'||_chatVirtParseStepVerified(rawTextForKind))kind='step_verified';
   else if(m.type==='todo_focus'||_chatVirtParseTodoFocus(rawTextForKind)||(m.type==='plan_notice'&&(dataKind==='todo_focus'||dataKind==='todo-focus')))kind='todo_focus';
+  else if(m.type==='live_user_adjustment'||parsedLiveUserAdjustment)kind='live_user_adjustment';
+  else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
   else if(m.type==='plan_notice')kind='plan_notice';
   else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
   else kind='plain_text';
@@ -54140,7 +55290,7 @@ function _chatVirtBuildMessageNode(m){
     d.setAttribute('data-math-request',key);
     return d;
   }
-  if(kind==='todo_focus'){
+	  if(kind==='todo_focus'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const parsed=_chatVirtParseTodoFocus(String(m.text||''))||_chatVirtParseTodoFocus(String(info.body||''))||{};
     const title=String(info.title||t('event_todo_focus_title')).trim();
@@ -54168,9 +55318,59 @@ function _chatVirtBuildMessageNode(m){
     const bodyHtml=`<div class=\"msg-event-body\"><div class=\"msg-event-note\">${esc(note)}</div>${body?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:''}</div>`;
     d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(title,subtitle,pills,grid,bodyHtml,'msg-event-card-plan')}`;
     d.setAttribute('data-math-request',key);
-    return d;
-  }
-  if(m.type==='manager_delegate'){
+	    return d;
+	  }
+	  if(kind==='live_user_adjustment'){
+	    const info=(m&&typeof m.data==='object')?m.data:{};
+	    const parsed=parsedLiveUserAdjustment||_chatVirtParseLiveUserAdjustment(String(info.body||''))||{};
+	    const id=String(info.id||parsed.id||'').trim();
+	    const priority=String(info.priority||parsed.priority||'').trim();
+	    const weight=String(info.weight||parsed.weight||'').trim();
+	    const body=String(info.body||parsed.body||m.text||'').trim();
+	    const key=`${String(m._vk||'')}:live-user-adjustment`;
+	    const pills=[
+	      id?_chatVirtEventPillHtml(`#${id}`,'neutral','mono'):'',
+	      priority?_chatVirtEventPillHtml(`${t('event_priority')} ${priority}`,priority==='high'?'warn':'info'):'',
+	      weight?_chatVirtEventPillHtml(`${t('event_weight')} ${weight}`,'neutral','mono'):'',
+	    ];
+	    const grid=[
+	      priority?_chatVirtEventCellHtml(t('event_priority'),priority,{mono:true}):'',
+	      weight?_chatVirtEventCellHtml(t('event_weight'),weight,{mono:true}):'',
+	    ];
+	    const noteHtml=`<div class=\"msg-event-note\">${esc(t('event_live_user_adjustment_note'))}</div>`;
+	    const bodyHtml=`<div class=\"msg-event-body\">${noteHtml}${body?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:''}</div>`;
+	    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_live_user_adjustment_title'),'',pills,grid,bodyHtml,'msg-event-card-adjustment')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(kind==='user_feedback_merge'){
+	    const info=(m&&typeof m.data==='object')?m.data:{};
+	    const parsed=parsedUserFeedbackMerge||_chatVirtParseUserFeedbackMerge(String(info.body||''))||{};
+	    const conflict=String(info.conflict||parsed.conflict||'').trim();
+	    const score=String(info.score||parsed.score||'').trim();
+	    const userInput=String(info.user_input||parsed.user_input||'').trim();
+	    const currentStep=String(info.current_step||parsed.current_step||'').trim();
+	    const directive=String(info.directive||parsed.directive||'').trim();
+	    const body=String(parsed.body||info.body||m.text||'').trim();
+	    const key=`${String(m._vk||'')}:user-feedback-merge`;
+	    const conflictTone=conflict==='HIGH'?'warn':(conflict==='LOW'?'ok':'info');
+	    const pills=[
+	      conflict?_chatVirtEventPillHtml(`${t('event_conflict')} ${conflict}`,conflictTone,'mono'):'',
+	      score?_chatVirtEventPillHtml(`${t('event_score')} ${score}`,'neutral','mono'):'',
+	    ];
+	    const grid=[
+	      userInput?_chatVirtEventCellHtml(t('event_feedback_input'),userInput,{}):'',
+	      currentStep?_chatVirtEventCellHtml(t('event_current_step'),currentStep,{}):'',
+	    ];
+	    const noteHtml=`<div class=\"msg-event-note\">${esc(t('event_feedback_merge_note'))}</div>`;
+	    const directiveHtml=directive?`<div class=\"msg-event-cell\"><div class=\"msg-event-label\">${esc(t('event_directive'))}</div><div class=\"msg-event-value\">${esc(directive)}</div></div>`:'';
+	    const fallbackHtml=(!userInput&&!currentStep&&!directive&&body)?`<div class=\"msg-md\">${renderMarkdownCached(body,key)}</div>`:'';
+	    const bodyHtml=`<div class=\"msg-event-body\">${noteHtml}${directiveHtml}${fallbackHtml}</div>`;
+	    d.innerHTML=`${roleBadge}${_chatVirtEventCardHtml(t('event_feedback_merge_title'),'',pills,grid,bodyHtml,'msg-event-card-feedback')}`;
+	    d.setAttribute('data-math-request',key);
+	    return d;
+	  }
+	  if(m.type==='manager_delegate'){
     const info=(m&&typeof m.data==='object')?m.data:{};
     const targetRole=_chatVirtAgentRoleKey(info.target);
     const targetLabel=String(info.target_label||_chatVirtAgentRoleLabel(targetRole)||info.target||t('role_agent'));
@@ -54596,6 +55796,38 @@ function _chatVirtSetScrollTop(chatEl,target){
   chatEl.scrollTop=next;
   return true;
 }
+function _chatVirtIsBottomLocked(chatEl){
+  return !!chatEl&&Number(chatEl._virtBottomLockUntil||0)>Date.now();
+}
+function _chatVirtClearBottomFollow(chatEl,pause=true){
+  S.follow.chat=false;
+  if(!chatEl)return;
+  chatEl._virtBottomLockUntil=0;
+  if(pause&&S.snap?.running){
+    chatEl._virtAutoFollowPaused=true;
+  }
+}
+function _chatVirtWithAnchorPreserved(chatEl,fn){
+  if(!chatEl||typeof fn!=='function'){
+    return (typeof fn==='function')?fn():undefined;
+  }
+  const wantsBottom=_chatVirtWantsBottom(chatEl,36);
+  const anchor=(!wantsBottom&&chatEl._chatHasRendered)?_chatVirtCaptureAnchor(chatEl):null;
+  const oldTop=Number(chatEl.scrollTop||0);
+  let out;
+  try{
+    out=fn();
+  }finally{
+    if(wantsBottom){
+      _chatVirtScrollToBottom(chatEl);
+    }else if(anchor){
+      if(!_chatVirtRestoreAnchor(chatEl,anchor))_chatVirtSetScrollTop(chatEl,oldTop);
+    }else{
+      _chatVirtSetScrollTop(chatEl,oldTop);
+    }
+  }
+  return out;
+}
 function _chatVirtHasRecentManualInput(chatEl){
   if(!chatEl)return false;
   const now=Date.now();
@@ -54609,8 +55841,19 @@ function _chatVirtHasRecentManualInput(chatEl){
   const recentTouchMove=Number(chatEl._virtLastTouchMoveTs||0)>0&&(now-Number(chatEl._virtLastTouchMoveTs||0))<touchWindow;
   return manualLock||inputLock||touchLock||recentWheel||recentTouchStart||recentTouchMove;
 }
+function _chatVirtWantsBottom(chatEl,threshold=24){
+  if(!chatEl)return false;
+  const th=Math.max(0,Number(threshold)||24);
+  if(nearBottom(chatEl,th)||_chatVirtIsBottomLocked(chatEl))return true;
+  if(chatEl._virtAutoFollowPaused)return false;
+  return false;
+}
+function _chatVirtShouldDeferLiveRender(chatEl){return !!chatEl&&_chatVirtIsUserScrolling(chatEl)&&!_chatVirtWantsBottom(chatEl,36)}
 function _chatVirtScrollToBottom(chatEl){
   if(!chatEl)return;
+  S.follow.chat=true;
+  chatEl._virtAutoFollowPaused=false;
+  chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),Date.now()+420);
   const apply=()=>{
     const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
     return _chatVirtSetScrollTop(chatEl,maxTop);
@@ -54620,15 +55863,20 @@ function _chatVirtScrollToBottom(chatEl){
     if(chatEl._virtBottomRenderRaf)cancelAnimationFrame(chatEl._virtBottomRenderRaf);
     chatEl._virtBottomRenderRaf=requestAnimationFrame(()=>{
       chatEl._virtBottomRenderRaf=0;
-      if(S.follow.chat||nearBottom(chatEl,12))scheduleRenderChat('scroll');
+      if(_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
     });
   }
-  if(_chatVirtHasRecentManualInput(chatEl))return;
+  if(_chatVirtHasRecentManualInput(chatEl)&&!_chatVirtWantsBottom(chatEl,36))return;
   if(chatEl._virtBottomRaf)cancelAnimationFrame(chatEl._virtBottomRaf);
   chatEl._virtBottomRaf=requestAnimationFrame(()=>{
     chatEl._virtBottomRaf=0;
-    if(!S.follow.chat&&!nearBottom(chatEl,12))return;
-    if(apply()&&(S.follow.chat||nearBottom(chatEl,12)))scheduleRenderChat('scroll');
+    if(!_chatVirtWantsBottom(chatEl,36))return;
+    if(apply()&&_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
+    if(_chatVirtWantsBottom(chatEl,18)){
+      requestAnimationFrame(()=>{
+        if(_chatVirtWantsBottom(chatEl,36))apply();
+      });
+    }
   });
 }
 function _chatVirtBindScroll(chatEl){
@@ -54646,7 +55894,9 @@ function _chatVirtBindScroll(chatEl){
       Number(chatEl._virtInputUnlockTs||0),
       now+Math.max(CHAT_SCROLL_ACTIVE_MS,Math.round(lock*0.8))
     );
-    if(S.snap?.running){
+    if(!nearBottom(chatEl,24)){
+      _chatVirtClearBottomFollow(chatEl,true);
+    }else if(S.snap?.running){
       chatEl._virtAutoFollowPaused=true;
     }
   };
@@ -54701,10 +55951,16 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
     if(dy<0){
-      S.follow.chat=false;
+      _chatVirtClearBottomFollow(chatEl,true);
       return;
     }
-    if(nearBottom(chatEl,6))S.follow.chat=true;
+    if(nearBottom(chatEl,32)){
+      S.follow.chat=true;
+      chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),now+520);
+      chatEl._virtAutoFollowPaused=false;
+    }else{
+      _chatVirtClearBottomFollow(chatEl,true);
+    }
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -54732,10 +55988,7 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtAutoFollowPaused=false;
       }
     }else if(!programmatic){
-      S.follow.chat=false;
-      if(S.snap?.running){
-        chatEl._virtAutoFollowPaused=true;
-      }
+      _chatVirtClearBottomFollow(chatEl,true);
     }
     if(programmatic&&Number(chatEl._virtSuppressProgrammaticScrollRenderUntil||0)>now)return;
     scheduleScrollRender();
@@ -54778,11 +56031,17 @@ function renderChat(reason='snapshot'){
   const prevRows=Array.isArray(c._virtLastRows)?c._virtLastRows:[];
   const prevWinStart=Number(c._virtLastWinStart||-1);
   const prevWinEnd=Number(c._virtLastWinEnd||-1);
-  const top=Math.max(0,c.scrollTop);
-  const bottom=top+Math.max(0,c.clientHeight||0);
+  const viewportH=Math.max(0,c.clientHeight||0);
+  let top=Math.max(0,c.scrollTop);
+  let bottom=top+viewportH;
   const offsetCache=_chatVirtOffsetCache(c,rows,feedSig);
-  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const totalEstimated=Number(offsetCache.total||0);
+  const wantsBottomBeforeWindow=_chatVirtWantsBottom(c,36);
+  if(wantsBottomBeforeWindow){
+    top=Math.max(0,totalEstimated-viewportH);
+    bottom=top+viewportH;
+  }
+  const win=((reason==='scroll')?_chatVirtReuseWindow(c,rows,top,bottom):null)||_chatVirtFindWindow(rows,top,bottom,offsetCache.offsets);
   const firstKey=String(rows[win.start]?._vk||'');
   const lastKey=String(rows[Math.max(0,win.end-1)]?._vk||'');
   const rangeKey=`${rows.length}|${win.start}|${win.end}|${Math.round(win.topOffset)}|${Math.round(Math.max(0,totalEstimated-win.endOffset))}|${firstKey}|${lastKey}`;
@@ -54802,7 +56061,7 @@ function renderChat(reason='snapshot'){
   if((!S.snap?.running)&&atBottomNow){
     c._virtAutoFollowPaused=false;
   }
-  const keep=first||Boolean(S.follow.chat)||atBottomNow;
+  const keep=first||atBottomNow||_chatVirtWantsBottom(c,36);
   const oldScrollTop=Number(c.scrollTop||0);
   const anchor=(!keep&&!first)?_chatVirtCaptureAnchor(c):null;
   c._virtRendering=true;
@@ -54936,7 +56195,7 @@ function renderChat(reason='snapshot'){
   }
   const maxTop=Math.max(0,c.scrollHeight-c.clientHeight);
   if(keep){
-    if(reason!=='scroll')_chatVirtScrollToBottom(c);
+    if(reason!=='scroll'||wantsBottomBeforeWindow||nearBottom(c,48))_chatVirtScrollToBottom(c);
   }else if(!(anchor&&_chatVirtRestoreAnchor(c,anchor))){
     _chatVirtSetScrollTop(c,Math.max(0,Math.min(oldScrollTop,maxTop)));
   }
@@ -55274,8 +56533,13 @@ async function refreshSnapshot(opt={}){
         applyMainI18n();
       }
     }
+    if(S.snap?.user_memory_mode){
+      S.config=S.config||{};
+      S.config.user_memory_mode=String(S.snap.user_memory_mode||'weak');
+      renderMemoryModeAction();
+    }
     const chatEl=E('chat');
-    const scrolling=_chatVirtIsUserScrolling(chatEl);
+    const deferLiveRender=_chatVirtShouldDeferLiveRender(chatEl);
     const feedSig=feedSignature(S.snap);
     const boardSig=boardsSignature(S.snap);
     const needChat=forceFull||feedSig!==S.lastFeedSig;
@@ -55287,7 +56551,7 @@ async function refreshSnapshot(opt={}){
         if(needChat)scheduleRenderChat('snapshot');
         if(needBoards)renderBoards();
       };
-      if(scrolling&&chatEl){
+      if(deferLiveRender&&chatEl){
         _chatVirtDebounceWhileScrolling(chatEl,'_virtScrollSyncTimer',doRender);
       }else{
         if(chatEl){_chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');_chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');}
@@ -55415,10 +56679,13 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();if(out&&out.queued&&!out.scheduler_started){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})}else if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:120,allowWhenFrozen:true})}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
+async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
+async function exportUserMemory(e){if(e)e.preventDefault();try{const data=await api('/api/user-memory/export');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='clouds-coder-user-memory.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showError(t('memory_exported'))}catch(err){showError(err.message||String(err))}}
+async function clearUserMemory(e){if(e)e.preventDefault();const ok=confirm(t('memory_clear_confirm'));if(!ok)return;try{await api('/api/user-memory/clear',{method:'POST'});showError(t('memory_cleared'))}catch(err){showError(err.message||String(err))}}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
@@ -55442,6 +56709,7 @@ async function refreshAll(forceProbe=false){
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
@@ -65369,6 +66637,662 @@ class WikiStore:
         }
 
 
+class UserMemoryStore:
+    """Per-user summary memory for preferences, task patterns, and project anchors."""
+
+    TECH_STACK_PATTERNS = (
+        ("python", ("python", "pytest", "fastapi", "django", "flask", ".py")),
+        ("react", ("react", "vite", "jsx", "tsx", "create-react-app")),
+        ("typescript", ("typescript", "tsconfig", ".ts", ".tsx")),
+        ("javascript", ("javascript", "node.js", "nodejs", "npm", ".js")),
+        ("fastapi", ("fastapi",)),
+        ("celery", ("celery",)),
+        ("redis", ("redis",)),
+        ("sqlite", ("sqlite", "sqlite3")),
+        ("postgresql", ("postgres", "postgresql")),
+        ("ollama", ("ollama",)),
+        ("glm", ("glm",)),
+        ("three.js", ("three.js", "threejs", "webgl", "glsl", "shader")),
+        ("echarts", ("echarts",)),
+        ("mermaid", ("mermaid",)),
+        ("html/css/js", ("html", "css", "交互报告", "interactive report")),
+    )
+    OUTPUT_PATTERNS = (
+        ("html", ("html", "交互报告", "interactive report")),
+        ("markdown", ("markdown", ".md", "readme")),
+        ("ppt", ("ppt", "pptx", "演示文稿", "presentation")),
+        ("pdf", ("pdf",)),
+        ("mermaid", ("mermaid", "架构图")),
+        ("tests", ("pytest", "测试", "验证", "lint", "ruff")),
+    )
+    TASK_PATTERNS = (
+        ("debugging", ("bug", "debug", "报错", "修复", "失败", "error", "traceback")),
+        ("architecture", ("架构", "系统性", "设计", "方案", "architecture")),
+        ("frontend", ("前端", "ui", "webui", "css", "交互", "react")),
+        ("agent-runtime", ("agent", "多agent", "manager", "blackboard", "compact")),
+        ("research", ("搜索", "调研", "web search", "资料", "新闻")),
+        ("report", ("报告", "ppt", "html", "文档", "summary")),
+    )
+
+    def __init__(self, user_root: Path, user_id: str = ""):
+        self.user_root = Path(user_root).resolve()
+        self.user_id = str(user_id or self.user_root.name or "").strip()
+        self.root = self.user_root / USER_MEMORY_DIRNAME
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.root / USER_MEMORY_DB_FILENAME
+        self.profile_path = self.root / USER_MEMORY_PROFILE_FILENAME
+        self.lock = threading.RLock()
+        self._init_db()
+        if not self.profile_path.exists():
+            self._write_profile_locked(self._empty_profile())
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_items (
+                        id TEXT PRIMARY KEY,
+                        kind TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        tags_json TEXT NOT NULL DEFAULT '[]',
+                        confidence REAL NOT NULL DEFAULT 0.3,
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        source_ts REAL NOT NULL DEFAULT 0,
+                        updated_at REAL NOT NULL DEFAULT 0,
+                        decay_weight REAL NOT NULL DEFAULT 1.0,
+                        meta_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_summaries (
+                        session_id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL DEFAULT '',
+                        summary TEXT NOT NULL DEFAULT '',
+                        task_type TEXT NOT NULL DEFAULT '',
+                        output_formats_json TEXT NOT NULL DEFAULT '[]',
+                        tech_stack_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at REAL NOT NULL DEFAULT 0,
+                        confidence REAL NOT NULL DEFAULT 0.3,
+                        meta_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_kind ON memory_items(kind)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_updated ON memory_items(updated_at)")
+                conn.commit()
+
+    def _empty_profile(self) -> dict:
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "updated_at": now_ts(),
+            "categories": {
+                "long_term_preferences": [],
+                "common_tech_stack": [],
+                "common_task_types": [],
+                "interaction_style": [],
+                "project_anchors": [],
+                "output_formats": [],
+                "role_activation": [],
+            },
+            "stats": {"items": 0, "sessions": 0},
+        }
+
+    def _write_profile_locked(self, profile: dict):
+        data = dict(profile or self._empty_profile())
+        data["schema_version"] = USER_MEMORY_PROFILE_SCHEMA_VERSION
+        data["user_id"] = self.user_id
+        data["updated_at"] = now_ts()
+        _write_json_file(self.profile_path, data)
+
+    def load_profile(self) -> dict:
+        with self.lock:
+            raw = _read_json_file(self.profile_path, self._empty_profile())
+            return dict(raw) if isinstance(raw, dict) else self._empty_profile()
+
+    def _json_load_list(self, raw: object) -> list:
+        try:
+            parsed = json.loads(str(raw or "[]"))
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    def _json_load_dict(self, raw: object) -> dict:
+        try:
+            parsed = json.loads(str(raw or "{}"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _sanitize_summary(self, text: object, limit: int = USER_MEMORY_MAX_SUMMARY_CHARS) -> str:
+        raw = trim(str(text or "").replace("\r", "\n").strip(), max(80, int(limit or USER_MEMORY_MAX_SUMMARY_CHARS)))
+        raw = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^\s,'\"]+", r"\1=[redacted]", raw)
+        raw = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email-redacted]", raw)
+        return raw
+
+    def _terms(self, text: object) -> set[str]:
+        low = str(text or "").lower()
+        terms = {m.group(0) for m in re.finditer(r"[a-z0-9_./+-]{2,}", low)}
+        cjk = re.sub(r"[^\u3400-\u9fff]+", "", low)
+        if len(cjk) >= 2:
+            terms.update(cjk[i : i + 2] for i in range(min(len(cjk) - 1, 80)))
+        return {t for t in terms if t.strip()}
+
+    def _detect_patterns(self, haystack: str, patterns: tuple[tuple[str, tuple[str, ...]], ...]) -> list[str]:
+        low = haystack.lower()
+        out = []
+        for label, needles in patterns:
+            if any(str(n).lower() in low for n in needles):
+                out.append(label)
+        return out
+
+    def _extract_session_text(self, sess: object) -> tuple[str, list[str], list[str]]:
+        messages = list(getattr(sess, "messages", []) or [])[-80:]
+        user_lines: list[str] = []
+        assistant_lines: list[str] = []
+        for row in messages:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "") or "").strip().lower()
+            content = trim(str(row.get("content", row.get("text", "")) or "").replace("\n", " "), 600)
+            if not content:
+                continue
+            if role == "user":
+                user_lines.append(content)
+            elif role in {"assistant", "developer"}:
+                assistant_lines.append(content)
+        paths = []
+        try:
+            paths.extend(str(x) for x in (getattr(sess, "code_preview_index", {}) or {}).keys())
+        except Exception:
+            pass
+        try:
+            for upload in list(getattr(sess, "uploads", []) or [])[-20:]:
+                if isinstance(upload, dict):
+                    name = str(upload.get("filename", "") or "").strip()
+                    rel = str(upload.get("workspace_path", "") or "").strip()
+                    if name:
+                        paths.append(name)
+                    if rel:
+                        paths.append(rel)
+        except Exception:
+            pass
+        text = "\n".join(user_lines[-12:] + assistant_lines[-8:] + paths[-40:])
+        return text, user_lines, paths
+
+    def _interaction_style_items(self, text: str, ui_language: str) -> list[dict]:
+        low = text.lower()
+        items: list[dict] = []
+        if ui_language:
+            items.append({
+                "kind": "interaction_style",
+                "summary": f"Preferred UI/output language signal: {ui_language}.",
+                "tags": ["language", ui_language],
+                "confidence": 0.62,
+            })
+        if any(x in low for x in ("直接", "不要废话", "别废话", "快速", "少解释", "concise", "direct")):
+            items.append({
+                "kind": "interaction_style",
+                "summary": "User often prefers direct, action-oriented responses when the current request allows it.",
+                "tags": ["direct", "concise"],
+                "confidence": 0.58,
+            })
+        if any(x in low for x in ("仔细", "系统性", "深入", "完整", "审查", "thorough", "systematic")):
+            items.append({
+                "kind": "interaction_style",
+                "summary": "User often values systematic root-cause analysis and architecture-level judgement for complex engineering issues.",
+                "tags": ["systematic", "architecture", "review"],
+                "confidence": 0.64,
+            })
+        if any(x in low for x in ("多语言", "四种语言", "i18n", "国际化")):
+            items.append({
+                "kind": "long_term_preferences",
+                "summary": "When frontend text changes, preserve multilingual/i18n coverage instead of adding single-language strings.",
+                "tags": ["i18n", "frontend"],
+                "confidence": 0.7,
+            })
+        if any(x in low for x in ("不要硬停", "不要触发硬停", "自由度", "不要关键词")):
+            items.append({
+                "kind": "long_term_preferences",
+                "summary": "User prefers semantic, model-guided control flow over brittle keyword or hard-stop defensive mechanisms.",
+                "tags": ["semantic-control", "agent-runtime"],
+                "confidence": 0.72,
+            })
+        return items
+
+    def _project_anchor_items(self, paths: list[str]) -> list[dict]:
+        anchors: list[str] = []
+        for raw in paths:
+            rel = normalize_rel_preview_path(raw)
+            if not rel:
+                continue
+            first = rel.split("/", 1)[0]
+            if first and first not in anchors and first not in {"uploaded", "uploads", ".clouds_coder"}:
+                anchors.append(first)
+            if len(anchors) >= 8:
+                break
+        if not anchors:
+            return []
+        return [{
+            "kind": "project_anchors",
+            "summary": "Recent project/file anchors: " + ", ".join(anchors[:8]) + ".",
+            "tags": anchors[:8],
+            "confidence": 0.52,
+        }]
+
+    def _capture_from_session(self, sess: object) -> dict:
+        sid = str(getattr(sess, "id", "") or "").strip()
+        title = trim(str(getattr(sess, "title", "") or sid or "session"), 160)
+        objective = trim(str(getattr(sess, "runtime_direct_objective", "") or title), 500)
+        task_type = trim(str(getattr(sess, "runtime_task_type", "") or "general"), 80)
+        ui_language = normalize_ui_language(getattr(sess, "ui_language", DEFAULT_UI_LANGUAGE))
+        text, user_lines, paths = self._extract_session_text(sess)
+        haystack = "\n".join([title, objective, task_type, text, " ".join(paths)])
+        tech_stack = self._detect_patterns(haystack, self.TECH_STACK_PATTERNS)
+        output_formats = self._detect_patterns(haystack, self.OUTPUT_PATTERNS)
+        task_types = self._detect_patterns(haystack, self.TASK_PATTERNS)
+        try:
+            operations = list(getattr(sess, "operations", []) or [])[-80:]
+        except Exception:
+            operations = []
+        tool_names = []
+        for row in operations:
+            if isinstance(row, dict):
+                name = str(row.get("tool", row.get("name", row.get("type", ""))) or "").strip()
+                if name and name not in tool_names:
+                    tool_names.append(name)
+        summary_bits = [f"Task: {objective or title}"]
+        if task_types or task_type:
+            summary_bits.append("Task type: " + ", ".join((task_types or [task_type])[:5]))
+        if tech_stack:
+            summary_bits.append("Tech stack: " + ", ".join(tech_stack[:8]))
+        if output_formats:
+            summary_bits.append("Output format: " + ", ".join(output_formats[:6]))
+        if tool_names:
+            summary_bits.append("Tools used: " + ", ".join(tool_names[:8]))
+        if paths:
+            summary_bits.append("Artifacts/files: " + ", ".join(paths[:8]))
+        session_summary = self._sanitize_summary("; ".join(summary_bits), 1100)
+        items: list[dict] = []
+        for label in tech_stack[:10]:
+            items.append({
+                "kind": "common_tech_stack",
+                "summary": f"User has recent work involving {label}.",
+                "tags": [label],
+                "confidence": 0.48,
+            })
+        for label in output_formats[:8]:
+            items.append({
+                "kind": "output_formats",
+                "summary": f"User has recent tasks requesting or producing {label} outputs.",
+                "tags": [label],
+                "confidence": 0.5,
+            })
+        for label in (task_types or ([task_type] if task_type else []))[:8]:
+            items.append({
+                "kind": "common_task_types",
+                "summary": f"Recent task pattern: {label}.",
+                "tags": [label],
+                "confidence": 0.46,
+            })
+        items.extend(self._interaction_style_items("\n".join(user_lines[-12:]), ui_language))
+        items.extend(self._project_anchor_items(paths))
+        mode = normalize_execution_mode(getattr(sess, "runtime_execution_mode", ""), default="")
+        participants = [str(x) for x in (getattr(sess, "runtime_participants", []) or []) if str(x).strip()]
+        if mode == EXECUTION_MODE_SYNC and participants:
+            items.append({
+                "kind": "role_activation",
+                "summary": "Recent complex work used multi-agent coordination with roles: " + ", ".join(participants[:4]) + ".",
+                "tags": participants[:4],
+                "confidence": 0.42,
+            })
+        return {
+            "session_id": sid,
+            "title": title,
+            "summary": session_summary,
+            "task_type": task_types[0] if task_types else task_type,
+            "output_formats": output_formats[:12],
+            "tech_stack": tech_stack[:16],
+            "items": items[:36],
+            "confidence": 0.55 if items else 0.35,
+            "updated_at": now_ts(),
+        }
+
+    def _memory_id(self, source_session_id: str, kind: str, summary: str) -> str:
+        base = f"{self.user_id}|{source_session_id}|{kind}|{summary}".encode("utf-8", errors="ignore")
+        return hashlib.sha1(base).hexdigest()[:24]
+
+    def _insert_memory_item_locked(self, conn, row: dict, source_session_id: str, ts: float):
+        kind = trim(str(row.get("kind", "") or "preference"), 80)
+        summary = self._sanitize_summary(row.get("summary", ""), USER_MEMORY_MAX_SUMMARY_CHARS)
+        if not summary:
+            return
+        tags = [trim(str(x), 80) for x in (row.get("tags", []) or []) if str(x).strip()][:20]
+        confidence = max(0.05, min(1.0, float(row.get("confidence", 0.35) or 0.35)))
+        mid = self._memory_id(source_session_id, kind, summary)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_items
+            (id, kind, summary, tags_json, confidence, source_session_id, source_ts, updated_at, decay_weight, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mid,
+                kind,
+                summary,
+                json_dumps(tags),
+                confidence,
+                source_session_id,
+                ts,
+                ts,
+                1.0,
+                json_dumps({"summary_only": True}),
+            ),
+        )
+
+    def capture_session(self, sess: object) -> dict:
+        if sess is None:
+            return {"ok": False, "error": "session missing"}
+        capture = self._capture_from_session(sess)
+        sid = str(capture.get("session_id", "") or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id missing"}
+        ts = float(capture.get("updated_at", now_ts()) or now_ts())
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO session_summaries
+                    (session_id, title, summary, task_type, output_formats_json, tech_stack_json, updated_at, confidence, meta_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sid,
+                        str(capture.get("title", "") or sid),
+                        self._sanitize_summary(capture.get("summary", ""), USER_MEMORY_MAX_SUMMARY_CHARS),
+                        str(capture.get("task_type", "") or ""),
+                        json_dumps(capture.get("output_formats", []) or []),
+                        json_dumps(capture.get("tech_stack", []) or []),
+                        ts,
+                        float(capture.get("confidence", 0.35) or 0.35),
+                        json_dumps({"summary_only": True}),
+                    ),
+                )
+                conn.execute("DELETE FROM memory_items WHERE source_session_id = ?", (sid,))
+                for item in list(capture.get("items", []) or [])[:40]:
+                    if isinstance(item, dict):
+                        self._insert_memory_item_locked(conn, item, sid, ts)
+                conn.commit()
+                profile = self._rebuild_profile_locked(conn)
+            self._write_profile_locked(profile)
+        return {"ok": True, "session_id": sid, "items": len(capture.get("items", []) or [])}
+
+    def _row_decay(self, updated_at: float) -> float:
+        age = max(0.0, now_ts() - float(updated_at or 0.0))
+        half_life = max(1.0, USER_MEMORY_DECAY_HALFLIFE_DAYS) * 86400.0
+        return max(0.05, min(1.0, 0.5 ** (age / half_life)))
+
+    def _row_to_dict(self, row) -> dict:
+        return {
+            "id": str(row["id"]),
+            "kind": str(row["kind"]),
+            "summary": str(row["summary"]),
+            "tags": self._json_load_list(row["tags_json"]),
+            "confidence": float(row["confidence"] or 0.0),
+            "source_session_id": str(row["source_session_id"] or ""),
+            "source_ts": float(row["source_ts"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+            "decay_weight": float(row["decay_weight"] or 1.0),
+            "meta": self._json_load_dict(row["meta_json"]),
+        }
+
+    def _score_row(self, query_terms: set[str], row: dict) -> float:
+        summary = str(row.get("summary", "") or "")
+        tags = " ".join(str(x) for x in (row.get("tags", []) or []))
+        terms = self._terms(summary + " " + tags)
+        overlap = len(query_terms & terms) / max(1, min(len(query_terms), 12))
+        confidence = float(row.get("confidence", 0.0) or 0.0)
+        decay = self._row_decay(float(row.get("updated_at", 0.0) or 0.0))
+        return round((overlap * 0.52) + (confidence * 0.30) + (decay * 0.18), 6)
+
+    def query(self, query_text: str, *, limit: int = USER_MEMORY_QUERY_LIMIT) -> list[dict]:
+        query = str(query_text or "").strip()
+        if not query:
+            return []
+        qterms = self._terms(query)
+        if not qterms:
+            return []
+        with self.lock:
+            with self._connect() as conn:
+                rows = [
+                    self._row_to_dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM memory_items ORDER BY updated_at DESC LIMIT 240"
+                    ).fetchall()
+                ]
+        scored = []
+        for row in rows:
+            score = self._score_row(qterms, row)
+            if score <= 0.08:
+                continue
+            item = dict(row)
+            item["score"] = score
+            scored.append(item)
+        scored.sort(key=lambda x: (float(x.get("score", 0.0)), float(x.get("updated_at", 0.0))), reverse=True)
+        return scored[: max(1, min(24, int(limit or USER_MEMORY_QUERY_LIMIT)))]
+
+    def _rebuild_profile_locked(self, conn) -> dict:
+        rows = [self._row_to_dict(row) for row in conn.execute("SELECT * FROM memory_items ORDER BY updated_at DESC").fetchall()]
+        session_count = int(conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0] or 0)
+        categories = self._empty_profile()["categories"]
+        for row in rows:
+            kind = str(row.get("kind", "") or "")
+            if kind not in categories:
+                continue
+            weight = float(row.get("confidence", 0.0) or 0.0) * self._row_decay(float(row.get("updated_at", 0.0) or 0.0))
+            item = {
+                "summary": trim(str(row.get("summary", "") or ""), 360),
+                "tags": list(row.get("tags", []) or [])[:12],
+                "confidence": round(float(row.get("confidence", 0.0) or 0.0), 3),
+                "weight": round(weight, 3),
+                "source_session_id": str(row.get("source_session_id", "") or ""),
+                "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            }
+            categories[kind].append(item)
+        for key, items in list(categories.items()):
+            deduped: list[dict] = []
+            seen: set[str] = set()
+            for item in sorted(items, key=lambda x: (float(x.get("weight", 0.0)), float(x.get("updated_at", 0.0))), reverse=True):
+                sig = trim(str(item.get("summary", "") or "").lower(), 180)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                deduped.append(item)
+                if len(deduped) >= 10:
+                    break
+            categories[key] = deduped
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "updated_at": now_ts(),
+            "categories": categories,
+            "stats": {"items": len(rows), "sessions": session_count},
+        }
+
+    def payload(self, *, limit: int = 80) -> dict:
+        with self.lock:
+            profile = self.load_profile()
+            with self._connect() as conn:
+                items = [
+                    self._row_to_dict(row)
+                    for row in conn.execute(
+                        "SELECT * FROM memory_items ORDER BY updated_at DESC LIMIT ?",
+                        (max(1, min(400, int(limit or 80))),),
+                    ).fetchall()
+                ]
+                sessions = int(conn.execute("SELECT COUNT(*) FROM session_summaries").fetchone()[0] or 0)
+        return {
+            "ok": True,
+            "root": str(self.root),
+            "mode": "summary-only",
+            "profile": profile,
+            "stats": {"items": len(items), "sessions": sessions},
+            "items": items,
+        }
+
+    def export_payload(self) -> dict:
+        with self.lock:
+            profile = self.load_profile()
+            with self._connect() as conn:
+                items = [self._row_to_dict(row) for row in conn.execute("SELECT * FROM memory_items ORDER BY updated_at DESC").fetchall()]
+                sessions = []
+                for row in conn.execute("SELECT * FROM session_summaries ORDER BY updated_at DESC").fetchall():
+                    sessions.append({
+                        "session_id": str(row["session_id"]),
+                        "title": str(row["title"]),
+                        "summary": str(row["summary"]),
+                        "task_type": str(row["task_type"]),
+                        "output_formats": self._json_load_list(row["output_formats_json"]),
+                        "tech_stack": self._json_load_list(row["tech_stack_json"]),
+                        "updated_at": float(row["updated_at"] or 0.0),
+                        "confidence": float(row["confidence"] or 0.0),
+                        "meta": self._json_load_dict(row["meta_json"]),
+                    })
+        return {
+            "schema_version": USER_MEMORY_PROFILE_SCHEMA_VERSION,
+            "user_id": self.user_id,
+            "summary_only": True,
+            "exported_at": now_ts(),
+            "profile": profile,
+            "memory_items": items,
+            "session_summaries": sessions,
+        }
+
+    def clear(self) -> dict:
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM memory_items")
+                conn.execute("DELETE FROM session_summaries")
+                conn.commit()
+            self._write_profile_locked(self._empty_profile())
+        return {"ok": True, "cleared": True, "user_id": self.user_id}
+
+
+class UserInteractionOptimizer:
+    """Convert user memory into bounded preference hints for the current task."""
+
+    def build_capsule(self, *, profile: dict, memories: list[dict], mode: str, latest_text: str, max_chars: int) -> tuple[str, dict]:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "off":
+            return "", {"mode": "off", "memory_count": 0}
+        categories = profile.get("categories", {}) if isinstance(profile, dict) else {}
+        influence = (
+            "Weak preference signals only; use them for defaults when the latest request is silent."
+            if mode_key == "weak"
+            else "Active preference signals; use them to choose sensible defaults, but explicit current instructions always override them."
+        )
+        lines = [
+            "<user-profile-capsule>",
+            f"mode={mode_key}; summary_only=true; {influence}",
+            "Never infer sensitive identity attributes. Never override the latest user instruction, manual Level, manual Plan, or explicit tool preference.",
+        ]
+        category_labels = (
+            ("interaction_style", "Interaction style"),
+            ("long_term_preferences", "Long-term preferences"),
+            ("common_tech_stack", "Common tech stack"),
+            ("common_task_types", "Common task types"),
+            ("output_formats", "Common output formats"),
+            ("project_anchors", "Project anchors"),
+            ("role_activation", "Role activation"),
+        )
+        category_count = 0
+        per_category = 1 if mode_key == "weak" else 2
+        for key, label in category_labels:
+            rows = categories.get(key, []) if isinstance(categories.get(key, []), list) else []
+            picked = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                summary = trim(str(row.get("summary", "") or ""), 240)
+                if summary:
+                    picked.append(summary)
+                if len(picked) >= per_category:
+                    break
+            if picked:
+                lines.append(f"{label}: " + " | ".join(picked))
+                category_count += len(picked)
+        if memories:
+            lines.append("Relevant prior summaries:")
+            for row in memories[: (3 if mode_key == "weak" else 6)]:
+                summary = trim(str(row.get("summary", "") or ""), 240)
+                if not summary:
+                    continue
+                source = trim(str(row.get("source_session_id", "") or ""), 32)
+                conf = float(row.get("confidence", 0.0) or 0.0)
+                kind = trim(str(row.get("kind", "") or ""), 40)
+                lines.append(f"- {kind} conf={conf:.2f} source={source or '-'}: {summary}")
+        lines.append("</user-profile-capsule>")
+        capsule = trim("\n".join(lines), max(400, int(max_chars or USER_MEMORY_WEAK_CAPSULE_CHARS)))
+        meta = {
+            "mode": mode_key,
+            "memory_count": len(memories),
+            "category_count": category_count,
+            "chars": len(capsule),
+            "latest_hash": hashlib.sha1(str(latest_text or "").encode("utf-8", errors="ignore")).hexdigest()[:12],
+        }
+        return capsule, meta
+
+
+class UserIntentProfiler:
+    """Prepare per-user preference capsules before task classification starts."""
+
+    def __init__(self, store: UserMemoryStore, optimizer: UserInteractionOptimizer | None = None):
+        self.store = store
+        self.optimizer = optimizer or UserInteractionOptimizer()
+
+    def max_chars_for_mode(self, mode: str) -> int:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "on":
+            return USER_MEMORY_ON_CAPSULE_CHARS
+        if mode_key == "weak":
+            return USER_MEMORY_WEAK_CAPSULE_CHARS
+        return 0
+
+    def prepare_session(self, sess: object, latest_text: str, mode: str) -> dict:
+        mode_key = normalize_user_memory_mode(mode)
+        if mode_key == "off":
+            setattr(sess, "user_memory_mode", "off")
+            setattr(sess, "user_profile_capsule", "")
+            setattr(sess, "user_profile_capsule_meta", {"mode": "off", "memory_count": 0})
+            return {"ok": True, "mode": "off", "capsule_chars": 0, "memory_count": 0}
+        memories = self.store.query(latest_text, limit=USER_MEMORY_QUERY_LIMIT)
+        profile = self.store.load_profile()
+        capsule, meta = self.optimizer.build_capsule(
+            profile=profile,
+            memories=memories,
+            mode=mode_key,
+            latest_text=latest_text,
+            max_chars=self.max_chars_for_mode(mode_key),
+        )
+        setattr(sess, "user_memory_mode", mode_key)
+        setattr(sess, "user_profile_capsule", capsule)
+        setattr(sess, "user_profile_capsule_meta", meta)
+        return {
+            "ok": True,
+            "mode": mode_key,
+            "capsule_chars": len(capsule),
+            "memory_count": int(meta.get("memory_count", 0) or 0),
+        }
+
+
 class WorkflowMemoryStore:
     """Accepted programming workflow patterns captured from finished sessions."""
 
@@ -69665,6 +71589,8 @@ class AppContext:
         rag_include_filename_entities: bool = RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
         web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED,
         web_search_setting_locked: bool = False,
+        user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
+        user_memory_setting_locked: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -69711,6 +71637,8 @@ class AppContext:
         self.max_output_tokens = max(256, int(max_output_tokens or AGENT_MAX_OUTPUT_TOKENS))
         self.web_search_enabled = bool(web_search_enabled)
         self.web_search_setting_locked = bool(web_search_setting_locked)
+        self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
+        self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.skills_root = skills_root
@@ -71845,6 +73773,10 @@ class AppContext:
             if not isinstance(sess, SessionState):
                 continue
             try:
+                uid = str(req.get("user_id", "") or "")
+                if uid:
+                    mgr = self.manager_for_user(uid)
+                    mgr.prepare_user_intent_for_session(sess, str(req.get("content", "") or ""))
                 out = sess.submit_user_message(str(req.get("content", "") or ""))
             except Exception as exc:
                 out = {"ok": False, "error": str(exc)}
@@ -71893,6 +73825,10 @@ class AppContext:
                 self.workflow_memory.capture_session(sess)
             except Exception:
                 pass
+            try:
+                mgr.capture_user_memory_from_session(sess)
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
@@ -71928,6 +73864,7 @@ class AppContext:
         if not text:
             raise ValueError("content required")
         if not self.scheduler_limits_enabled():
+            mgr.prepare_user_intent_for_session(sess, text)
             return sess.submit_user_message(text)
 
         selected_rows: list[dict] = []
@@ -72036,6 +73973,22 @@ class AppContext:
                 pass
         return response
 
+    def user_memory_payload(self, user_id: str, *, limit: int = 80) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.user_memory_payload(limit=limit)
+
+    def user_memory_export_payload(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.user_memory_export_payload()
+
+    def clear_user_memory(self, user_id: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.clear_user_memory()
+
+    def set_user_memory_mode_for_user(self, user_id: str, mode: str) -> dict:
+        mgr = self.manager_for_user(user_id)
+        return mgr.set_user_memory_mode(mode)
+
     def manager_for_user(self, user_id: str) -> SessionManager:
         with self._lock:
             if user_id in self._session_mgrs:
@@ -72070,6 +74023,8 @@ class AppContext:
                 self.max_output_tokens,
                 web_search_enabled=self.web_search_enabled,
                 web_search_setting_locked=self.web_search_setting_locked,
+                user_memory_mode=self.user_memory_mode,
+                user_memory_setting_locked=self.user_memory_setting_locked,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -72091,6 +74046,8 @@ class AppContext:
             )
             mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
+            mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
             self._session_mgrs[user_id] = mgr
             return mgr
 
@@ -72191,6 +74148,9 @@ class AppContext:
                 TOOLS,
                 web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
             )
+        cfg_user_memory_mode = extract_user_memory_mode_setting(cfg)
+        if cfg_user_memory_mode is not None and not bool(getattr(self, "user_memory_setting_locked", False)):
+            self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
 
         def normalized_profiles() -> tuple[dict[str, dict], str]:
             rows: dict[str, dict] = {}
@@ -72259,6 +74219,8 @@ class AppContext:
                 )
                 mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
                 mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
+                mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+                mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
                 for sess in mgr.sessions.values():
                     sess.read_context_policy = normalize_read_context_policy(
                         getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -72270,6 +74232,7 @@ class AppContext:
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     )
                     sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+                    sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
                     sess.updated_at = now_ts()
                     sess._persist()
                 live_users += 1
@@ -72318,6 +74281,7 @@ class AppContext:
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     ),
                     "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
+                    "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
                     "updated_at": now_ts(),
                 }
                 self.crypto.write_json(user_prefs_path, user_prefs_payload)
@@ -72338,6 +74302,9 @@ class AppContext:
                             )
                             sraw["web_search_enabled"] = bool(
                                 getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)
+                            )
+                            sraw["user_memory_mode"] = normalize_user_memory_mode(
+                                getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
                             )
                             sraw["read_context_policy"] = normalize_read_context_policy(
                                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -73233,6 +75200,9 @@ class Handler(BaseHTTPRequestHandler):
                         "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                             getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                         ),
+                        "user_memory_mode": normalize_user_memory_mode(
+                            getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
+                        ),
                     }
                 )
             model_cat = mgr.model_catalog()
@@ -73287,6 +75257,10 @@ class Handler(BaseHTTPRequestHandler):
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                         getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                     ),
+                    "user_memory_mode": normalize_user_memory_mode(
+                        getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
+                    ),
+                    "user_memory_setting_locked": bool(getattr(mgr, "user_memory_setting_locked", False)),
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
@@ -73308,6 +75282,20 @@ class Handler(BaseHTTPRequestHandler):
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
                 }
             )
+        if path == "/api/user-memory":
+            try:
+                limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+            except Exception:
+                limit = 80
+            try:
+                return self._send_json(self.app.user_memory_payload(self._user_id(), limit=limit))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/export":
+            try:
+                return self._send_json(self.app.user_memory_export_payload(self._user_id()))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/models":
             return self._send_json(mgr.model_catalog(force_probe=refresh_probe))
         if path == "/api/tools":
@@ -73667,6 +75655,20 @@ class Handler(BaseHTTPRequestHandler):
                 out = mgr.set_user_language(language)
                 out["supported_languages"] = supported_ui_languages_payload()
                 return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/config":
+            payload = self._read_json()
+            mode = normalize_user_memory_mode(payload.get("mode", payload.get("user_memory_mode", DEFAULT_USER_MEMORY_MODE)))
+            try:
+                out = self.app.set_user_memory_mode_for_user(self._user_id(), mode)
+                status = 423 if bool(out.get("locked")) else 200
+                return self._send_json(out, status=status)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/user-memory/clear":
+            try:
+                return self._send_json(self.app.clear_user_memory(self._user_id()))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/webui/export":
@@ -74813,6 +76815,31 @@ def main():
         help="Force-enable the built-in agent_web_search tool for all sessions in this process.",
     )
     parser.add_argument(
+        "--user-memory",
+        "--user-memory-mode",
+        dest="user_memory_mode",
+        choices=sorted(USER_MEMORY_MODE_CHOICES),
+        help=(
+            "Per-user long-term preference memory mode: off disables it; weak (default) injects "
+            "short low-priority preference signals; on uses a larger, more active preference capsule "
+            "when the current request is silent. Current explicit instructions always override memory."
+        ),
+    )
+    parser.add_argument(
+        "--disable-user-memory",
+        dest="user_memory_mode",
+        action="store_const",
+        const="off",
+        help="Disable per-user long-term preference memory for this process.",
+    )
+    parser.add_argument(
+        "--enable-user-memory",
+        dest="user_memory_mode",
+        action="store_const",
+        const="on",
+        help="Enable active per-user preference memory mode for this process (same as --user-memory on).",
+    )
+    parser.add_argument(
         "--auto_task_level_ceiling",
         "--auto-task-level-ceiling",
         "--max_auto_task_level",
@@ -74964,6 +76991,7 @@ def main():
         download_js_lib=None,
         shell_command_timeout=None,
         web_search_enabled=None,
+        user_memory_mode=None,
     )
     args = parser.parse_args()
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
@@ -74997,6 +77025,7 @@ def main():
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
     resolved_web_search_enabled = DEFAULT_WEB_SEARCH_ENABLED
+    resolved_user_memory_mode = DEFAULT_USER_MEMORY_MODE
     external_config: dict = {}
     external_config_source = ""
     bootstrap_base_url = args.ollama_base_url
@@ -75046,6 +77075,9 @@ def main():
             external_web_search_enabled = extract_web_search_enabled_setting(external_config)
             if external_web_search_enabled is not None:
                 resolved_web_search_enabled = bool(external_web_search_enabled)
+            external_user_memory_mode = extract_user_memory_mode_setting(external_config)
+            if external_user_memory_mode is not None:
+                resolved_user_memory_mode = normalize_user_memory_mode(external_user_memory_mode)
             print(f"[web-agent] external config loaded: {external_config_source}")
         except Exception as exc:
             print(f"[web-agent] invalid --config: {exc}")
@@ -75080,10 +77112,18 @@ def main():
     web_ui_web_search_enabled = extract_web_search_enabled_setting(web_ui_config)
     if web_ui_web_search_enabled is not None:
         resolved_web_search_enabled = bool(web_ui_web_search_enabled)
+    web_ui_user_memory_mode = extract_user_memory_mode_setting(web_ui_config)
+    if web_ui_user_memory_mode is not None:
+        resolved_user_memory_mode = normalize_user_memory_mode(web_ui_user_memory_mode)
     cli_web_search_enabled = getattr(args, "web_search_enabled", None)
     web_search_setting_locked = cli_web_search_enabled is not None
     if cli_web_search_enabled is not None:
         resolved_web_search_enabled = bool(cli_web_search_enabled)
+    cli_user_memory_mode = getattr(args, "user_memory_mode", None)
+    user_memory_setting_locked = cli_user_memory_mode is not None
+    if cli_user_memory_mode is not None:
+        resolved_user_memory_mode = normalize_user_memory_mode(cli_user_memory_mode)
+    resolved_user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
     cli_daily_session_limit = getattr(args, "daily_session_limit_per_ip", None)
     if cli_daily_session_limit is not None:
         resolved_daily_session_limit_per_ip = max(0, int(cli_daily_session_limit or 0))
@@ -75193,6 +77233,11 @@ def main():
     print(f"[web-agent] read_context_policy={resolved_read_context_policy}")
     print(f"[web-agent] tool_memory_policy={resolved_tool_memory_policy}")
     print(f"[web-agent] web_search={'on' if resolved_web_search_enabled else 'off'}")
+    print(
+        "[web-agent] user_memory="
+        f"{resolved_user_memory_mode} "
+        "(off disables; weak is the default low-priority preference signal; on uses stronger defaults when the current request is silent)"
+    )
     print(
         "[web-agent] auto_task_level_ceiling="
         + ("off" if int(resolved_auto_task_level_ceiling or 0) <= 0 else f"L{int(resolved_auto_task_level_ceiling)}")
@@ -75404,12 +77449,16 @@ def main():
         resolved_rag_include_filename_entities,
         web_search_enabled=resolved_web_search_enabled,
         web_search_setting_locked=web_search_setting_locked,
+        user_memory_mode=resolved_user_memory_mode,
+        user_memory_setting_locked=user_memory_setting_locked,
     )
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
     app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
+    app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
+    app.user_memory_setting_locked = bool(user_memory_setting_locked)
     app.tool_specs = filter_tool_specs_for_runtime(
         TOOLS,
         web_search_enabled=bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
@@ -75428,6 +77477,9 @@ def main():
     if bool(web_search_setting_locked):
         app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
+    if bool(user_memory_setting_locked):
+        app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
+    app.user_memory_setting_locked = bool(user_memory_setting_locked)
     app.tool_specs = filter_tool_specs_for_runtime(
         TOOLS,
         web_search_enabled=bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
@@ -75440,11 +77492,14 @@ def main():
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
         _mgr.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         _mgr.web_search_setting_locked = bool(web_search_setting_locked)
+        _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        _mgr.user_memory_setting_locked = bool(user_memory_setting_locked)
         for _sess in getattr(_mgr, "sessions", {}).values():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
             _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
+            _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             _sess.updated_at = now_ts()
             _sess._persist()
     # JS lib download (default on; set download_js_lib: false in --config to disable)
