@@ -7898,6 +7898,13 @@ class TodoManager:
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
+            for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+                if meta_key in raw and raw.get(meta_key) not in (None, ""):
+                    row[meta_key] = raw.get(meta_key)
+            if status == "completed" and not row.get("completed_at"):
+                row["completed_at"] = float(now_ts())
+            if status in {"completed", "in_progress"} and not row.get("updated_at"):
+                row["updated_at"] = float(now_ts())
             validated.append(row)
         if len(validated) > 40:
             raise ValueError("max 40 todos")
@@ -32594,6 +32601,8 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if not self._step_subtasks_all_completed(plan_step):
             return False
+        if not self._plan_step_acceptance_gate_passed(plan_step, None, bb):
+            return False
         has_evidence = self._plan_step_has_blackboard_evidence(plan_step, bb) or self._step_has_accumulated_evidence(plan_step, bb)
         if not has_evidence:
             return False
@@ -34001,6 +34010,7 @@ body{padding:18px}
             "execution_logs": [],
             "review_feedback": [],
             "conversation_history": [],
+            "plan_worker_todos": {},
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -34225,6 +34235,38 @@ body{padding:18px}
         board["execution_logs"] = _clean_rows(src.get("execution_logs", []), key="content", actor_key="actor")
         board["review_feedback"] = _clean_rows(src.get("review_feedback", []), key="content", actor_key="actor")
         board["conversation_history"] = _clean_rows(src.get("conversation_history", []), key="content", actor_key="actor")
+        raw_worker_todos = src.get("plan_worker_todos")
+        if isinstance(raw_worker_todos, dict):
+            clean_worker_todos: dict[str, list[dict]] = {}
+            for raw_step_id, raw_rows in list(raw_worker_todos.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_rows, list):
+                    continue
+                clean_rows: list[dict] = []
+                for row in raw_rows[-12:]:
+                    if not isinstance(row, dict):
+                        continue
+                    content = trim(normalize_work_text(row.get("content", "") or "") or str(row.get("content", "") or "").strip(), 360)
+                    if not content:
+                        continue
+                    status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+                    if status == "blocked":
+                        status = "pending"
+                    clean_rows.append({
+                        "content": content,
+                        "status": status,
+                        "owner": self._sanitize_agent_role(row.get("owner", "")) or "developer",
+                        "parent_step_id": trim(str(row.get("parent_step_id", "") or step_id), 40) or step_id,
+                        "created_at": float(row.get("created_at", 0.0) or 0.0),
+                        "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                        "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
+                        "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
+                        "evidence": trim(str(row.get("evidence", "") or ""), 300),
+                    })
+                if clean_rows:
+                    clean_worker_todos[step_id] = clean_rows
+            if clean_worker_todos:
+                board["plan_worker_todos"] = clean_worker_todos
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
@@ -35970,10 +36012,23 @@ body{padding:18px}
         except Exception:
             return 0.0
 
-    def _plan_step_blackboard_signals(self, plan_step: dict, board: dict | None = None) -> dict:
+    def _plan_step_blackboard_signals(
+        self,
+        plan_step: dict,
+        board: dict | None = None,
+        *,
+        since_ts_override: float | None = None,
+    ) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
         since_ts = self._plan_step_activation_ts(plan_step)
+        if since_ts_override is not None:
+            try:
+                override_ts = float(since_ts_override or 0.0)
+            except Exception:
+                override_ts = 0.0
+            if override_ts > 0:
+                since_ts = max(float(since_ts or 0.0), override_ts)
 
         def _rows_since(rows: object) -> list[dict]:
             out: list[dict] = []
@@ -36125,6 +36180,213 @@ body{padding:18px}
         if wants_runtime_validation:
             return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
+
+    def _plan_step_acceptance_gate_status(
+        self,
+        plan_step: dict,
+        worker_step: dict | None = None,
+        board: dict | None = None,
+    ) -> dict:
+        """Return the final acceptance-subtask gate status for a plan step."""
+        if not isinstance(plan_step, dict):
+            return {"ok": False, "reason": "missing-plan-step"}
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return {"ok": False, "reason": "missing-plan-step-id"}
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if not rows:
+            return {"ok": False, "reason": "missing-step-local-subtasks"}
+        acceptance_rows = [
+            row for row in rows
+            if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not acceptance_rows:
+            return {"ok": False, "reason": "missing-final-acceptance-subtask"}
+        acceptance = dict(acceptance_rows[-1])
+        if str(acceptance.get("status", "") or "").strip().lower() != "completed":
+            return {
+                "ok": False,
+                "reason": "final-acceptance-subtask-not-completed",
+                "acceptance": acceptance,
+            }
+        text = str(acceptance.get("content", "") or "").strip().lower()
+        if not text:
+            return {"ok": False, "reason": "empty-final-acceptance-subtask", "acceptance": acceptance}
+
+        results = [
+            row for row in ((worker_step or {}).get("tool_results", []) if isinstance(worker_step, dict) else [])
+            if isinstance(row, dict) and row.get("ok", False)
+        ]
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        try:
+            acceptance_started_ts = float(
+                acceptance.get("updated_at", 0.0)
+                or acceptance.get("created_at", 0.0)
+                or acceptance.get("completed_at", 0.0)
+                or 0.0
+            )
+        except Exception:
+            acceptance_started_ts = 0.0
+        sig = self._plan_step_blackboard_signals(
+            plan_step,
+            bb,
+            since_ts_override=acceptance_started_ts,
+        )
+        has_current_read = any(
+            str(row.get("name", "") or "") == "read_file"
+            and not self._is_plan_infrastructure_read_result(row)
+            and bool(self._tool_result_output_excerpt(row, 80))
+            for row in results
+        )
+        has_current_exec = any(str(row.get("name", "") or "") in {"bash", "worktree_run", "background_run"} for row in results)
+        has_current_validation = self._tool_results_have_validation_evidence(plan_step, results)
+        has_current_retrieval = any(self._tool_result_has_positive_retrieval_signal(row) for row in results)
+        has_current_blackboard_acceptance = any(
+            str(row.get("name", "") or "") == "write_to_blackboard"
+            and any(marker in str(row.get("args", {})).lower() for marker in ("验收", "驗收", "acceptance", "受入確認"))
+            for row in results
+        )
+
+        wants_runtime = any(
+            tok in text
+            for tok in (
+                "运行", "执行", "测试", "构建", "编译", "浏览器", "控制台", "页面", "http", "200",
+                "selftest", "assert", "bash", "node", "pytest", "test", "build", "compile", "browser",
+                "console", "playwright", "screenshot", "run", "curl", "server", "服务", "驗證", "測試",
+                "実行", "テスト", "ブラウザ", "コンソール",
+            )
+        )
+        wants_file_inspection = any(
+            tok in text
+            for tok in (
+                "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
+                "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル", "ディレクトリ",
+            )
+        )
+        wants_research = any(
+            tok in text
+            for tok in (
+                "检索", "搜索", "研究", "调研", "资料", "来源", "引用", "research", "search",
+                "source", "citation", "evidence chain", "搜集", "收集", "調査", "検索",
+            )
+        )
+        wants_blackboard_record = any(
+            tok in text
+            for tok in ("黑板", "blackboard", "记录", "記錄", "record", "status", "review_feedback")
+        )
+
+        current_match = False
+        blackboard_match = False
+        expected = "generic-observable-check"
+        if wants_runtime:
+            expected = "runtime/test/build/browser execution evidence"
+            current_match = bool(has_current_validation or has_current_exec)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review"))
+        elif wants_file_inspection:
+            expected = "file/path/directory inspection evidence"
+            current_match = bool(has_current_read or has_current_exec)
+            blackboard_match = bool(sig.get("has_read") or sig.get("has_exec") or sig.get("has_review"))
+        elif wants_research:
+            expected = "research/retrieval evidence"
+            current_match = bool(has_current_retrieval or has_current_read)
+            blackboard_match = bool(sig.get("has_research") or sig.get("has_read") or sig.get("has_review"))
+        elif wants_blackboard_record:
+            expected = "blackboard acceptance record"
+            current_match = bool(has_current_blackboard_acceptance or has_current_validation)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_research"))
+        else:
+            current_match = bool(has_current_validation or has_current_read or has_current_exec or has_current_retrieval)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_read") or sig.get("has_research"))
+
+        # During a live worker/single-agent turn, the acceptance action must be
+        # visible in this turn's tool_results. Blackboard fallback is only for
+        # finish/resume reconciliation where current tool_results are no longer
+        # available but the step-scoped evidence has already been recorded.
+        if results:
+            blackboard_match = False
+        if current_match:
+            return {
+                "ok": True,
+                "reason": "current-tool-evidence-matches-final-acceptance",
+                "source": "current_tool_results",
+                "expected": expected,
+                "acceptance": acceptance,
+            }
+        if blackboard_match:
+            return {
+                "ok": True,
+                "reason": "blackboard-evidence-matches-final-acceptance",
+                "source": "blackboard",
+                "expected": expected,
+                "acceptance": acceptance,
+            }
+        return {
+            "ok": False,
+            "reason": "final-acceptance-evidence-missing",
+            "expected": expected,
+            "acceptance": acceptance,
+        }
+
+    def _plan_step_acceptance_gate_passed(
+        self,
+        plan_step: dict,
+        worker_step: dict | None = None,
+        board: dict | None = None,
+    ) -> bool:
+        """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
+        return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
+
+    def _inject_acceptance_gate_rework_hint(
+        self,
+        plan_step: dict,
+        gate: dict | None = None,
+        *,
+        target_roles: tuple[str, ...] = (),
+    ) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return False
+        _flag = f"_acceptance_gate_hint_ts_{step_id}"
+        try:
+            last_ts = float(getattr(self, _flag, 0.0) or 0.0)
+        except Exception:
+            last_ts = 0.0
+        if float(now_ts()) - last_ts < 20.0:
+            return False
+        try:
+            setattr(self, _flag, float(now_ts()))
+        except Exception:
+            pass
+        gate_row = gate if isinstance(gate, dict) else self._plan_step_acceptance_gate_status(plan_step)
+        acceptance = gate_row.get("acceptance", {}) if isinstance(gate_row.get("acceptance"), dict) else {}
+        acceptance_text = trim(str(acceptance.get("content", "") or ""), 300)
+        reason = trim(str(gate_row.get("reason", "") or "final-acceptance-gate-failed"), 160)
+        expected = trim(str(gate_row.get("expected", "") or ""), 180)
+        step_label = trim(str(plan_step.get("content", "") or ""), 160)
+        roles = tuple(
+            role for role in (self._sanitize_agent_role(x) for x in target_roles)
+            if role
+        )
+        if not roles and self._is_multi_agent_mode():
+            roles = (self._current_plan_worker_owner(),)
+        content = (
+            "<acceptance-required>\n"
+            f"Stay on the current plan step: {step_label}. "
+            "The final acceptance subtask is a normal step-local TodoWrite task, but the plan step cannot advance until its check action has matching tool or blackboard evidence. "
+            f"Gate reason: {reason}. "
+            f"{('Expected evidence: ' + expected + '. ') if expected else ''}"
+            f"{('Final acceptance subtask: ' + acceptance_text + '. ') if acceptance_text else ''}"
+            "Execute the acceptance check now, record the concrete evidence, then update the same acceptance TodoWrite row to completed only if the check passes. "
+            "Do not skip to another plan step and do not edit .clouds_coder/plan.md directly.\n"
+            "</acceptance-required>"
+        )
+        return self._append_plan_guidance_bubble(
+            content,
+            target_roles=roles,
+            summary="acceptance gate requires evidence",
+        )
 
     def _step_has_accumulated_evidence(self, plan_step: dict, bb: dict | None = None) -> bool:
         """Check whether a step has accumulated candidate evidence across turns."""
@@ -37020,7 +37282,9 @@ body{padding:18px}
             and verified_tag_current
             and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
         )
-        has_strong_evidence = subtasks_all_done and (
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
             validation_ok
             or validation_ok_blackboard
             or phase_evidence
@@ -37031,6 +37295,16 @@ body{padding:18px}
             self._blackboard_append_memory(
                 "decision",
                 "ignored plan advancement request because step-local subtasks are incomplete",
+                actor="manager",
+                tier="long",
+            )
+        if manager_requested and subtasks_all_done and not acceptance_gate_ok:
+            self._blackboard_append_memory(
+                "decision",
+                (
+                    "ignored plan advancement request because final acceptance subtask gate failed: "
+                    f"{trim(str(acceptance_gate.get('reason', '') or ''), 160)}"
+                ),
                 actor="manager",
                 tier="long",
             )
@@ -37048,6 +37322,13 @@ body{padding:18px}
                 actor=str(route.get("target", "developer") or "developer"),
             )
         else:
+            if subtasks_all_done and not acceptance_gate_ok:
+                target_role = self._sanitize_agent_role(str(route.get("target", "") or ""))
+                self._inject_acceptance_gate_rework_hint(
+                    current,
+                    acceptance_gate,
+                    target_roles=((target_role,) if target_role else ()),
+                )
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -37494,12 +37775,115 @@ body{padding:18px}
                 continue
             all_rows.append(dict(row))
         if not all_rows:
-            return []
+            return self._plan_worker_todo_rows_from_blackboard(step_key, role=role_key)
         rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
         if role_key and not rows:
             rows = list(all_rows)
         rows.sort(key=self._plan_worker_todo_sort_key)
         return rows
+
+    def _plan_worker_todo_rows_from_blackboard(self, step_id: str, role: str = "", board: dict | None = None) -> list[dict]:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return []
+        bb = board if isinstance(board, dict) else (self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {})
+        mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+        raw_rows = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+        role_key = self._sanitize_agent_role(role)
+        rows: list[dict] = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            owner = self._sanitize_agent_role(row.get("owner", "")) or "developer"
+            if role_key and owner != role_key:
+                continue
+            content = trim(normalize_work_text(row.get("content", "") or "") or str(row.get("content", "") or "").strip(), 360)
+            if not content:
+                continue
+            status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            if status == "blocked":
+                status = "pending"
+            rows.append({
+                "content": content,
+                "status": status,
+                "owner": owner,
+                "parent_step_id": step_key,
+                "created_at": float(row.get("created_at", 0.0) or 0.0),
+                "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
+                "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
+                "evidence": trim(str(row.get("evidence", "") or ""), 300),
+            })
+        if role_key and not rows:
+            return self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
+        rows.sort(key=self._plan_worker_todo_sort_key)
+        return rows
+
+    def _sync_plan_worker_todos_to_blackboard(
+        self,
+        step_id: str = "",
+        *,
+        rows: list[dict] | None = None,
+        board: dict | None = None,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
+        worker_owners = {"developer", "explorer", "reviewer"}
+        step_filter = trim(str(step_id or "").strip(), 40)
+        src_rows = rows if isinstance(rows, list) else self.todo.snapshot()
+        grouped: dict[str, list[dict]] = {}
+        for raw in src_rows:
+            if not isinstance(raw, dict):
+                continue
+            owner = self._sanitize_agent_role(raw.get("owner", "")) or ""
+            parent = trim(str(raw.get("parent_step_id", "") or "").strip(), 40)
+            if owner not in worker_owners or not parent:
+                continue
+            if step_filter and parent != step_filter:
+                continue
+            content = trim(normalize_work_text(raw.get("content", "") or "") or str(raw.get("content", "") or "").strip(), 360)
+            if not content:
+                continue
+            status = self._normalize_todo_status_value(raw.get("status", ""), "pending")
+            if status == "blocked":
+                status = "pending"
+            item = {
+                "content": content,
+                "status": status,
+                "owner": owner,
+                "parent_step_id": parent,
+                "created_at": float(raw.get("created_at", 0.0) or 0.0),
+                "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
+                "completed_at": float(raw.get("completed_at", 0.0) or 0.0) if raw.get("completed_at") else None,
+                "completed_by": trim(str(raw.get("completed_by", "") or ""), 40),
+                "evidence": trim(str(raw.get("evidence", "") or ""), 300),
+            }
+            grouped.setdefault(parent, []).append(item)
+        target_steps = {step_filter} if step_filter else set(grouped.keys())
+        if not step_filter:
+            target_steps.update(
+                trim(str(row.get("parent_step_id", "") or "").strip(), 40)
+                for row in src_rows
+                if isinstance(row, dict)
+                and self._sanitize_agent_role(row.get("owner", "")) in worker_owners
+                and str(row.get("parent_step_id", "") or "").strip()
+            )
+        changed = False
+        for parent in sorted(x for x in target_steps if x):
+            clean_rows = grouped.get(parent, [])
+            clean_rows.sort(key=self._plan_worker_todo_sort_key)
+            if clean_rows:
+                if mirror.get(parent) != clean_rows:
+                    mirror[parent] = clean_rows
+                    changed = True
+            elif parent in mirror:
+                mirror.pop(parent, None)
+                changed = True
+        if changed:
+            bb["plan_worker_todos"] = mirror
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+        return changed
 
     def _active_plan_step_has_worker_todos(self, role: str = "") -> bool:
         step = self._get_active_plan_step()
@@ -37653,7 +38037,7 @@ body{padding:18px}
             evidence = self._collect_blackboard_step_evidence(current_step, bb)
             if evidence:
                 parts.append(f"evidence={trim(evidence, 180)}")
-            if self._step_subtasks_all_completed(current_step) and self._plan_step_has_blackboard_evidence(current_step, bb):
+            if self._step_subtasks_all_completed(current_step) and self._plan_step_acceptance_gate_passed(current_step, None, bb):
                 parts.append("acceptance=ready")
         reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
         if self._sanitize_agent_role(reply.get("role", "")) == role_key:
@@ -38201,7 +38585,13 @@ body{padding:18px}
                     _insert_idx = _i + 1
                     break
         final_rows = preserved[:_insert_idx] + passthrough_rows + merged_target_rows + preserved[_insert_idx:]
-        return self.todo.update(final_rows)
+        result = self.todo.update(final_rows)
+        try:
+            self._sync_plan_worker_todos_to_blackboard(step_id)
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
+        return result
 
     def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
         if not isinstance(items, list):
@@ -39565,6 +39955,11 @@ body{padding:18px}
         ]
         with self.todo.lock:
             self.todo.items = preserved + replacement
+        try:
+            self._sync_plan_worker_todos_to_blackboard(step_id)
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
         return True
 
     def _ensure_worker_todos_available_for_plan_step(
@@ -40142,12 +40537,14 @@ body{padding:18px}
         _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, {"tool_results": tool_results}, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
         if subtasks_done:
             # The final step-local acceptance subtask is the validation gate.
             # Once all subtasks are completed, advancement only needs concrete
             # current or accumulated evidence; no external semantic reviewer or
             # extra structured verification tag.
-            if validation_ok or self._step_has_accumulated_evidence(current, bb):
+            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
                 should_advance = True
             else:
                 _gate_blocked = True  # Evidence missing — disable weaker advancement paths
@@ -40197,6 +40594,17 @@ body{padding:18px}
                 return True
             return False
         else:
+            if subtasks_done and not acceptance_gate_ok:
+                self._blackboard_append_memory(
+                    "decision",
+                    (
+                        "blocked single-agent plan advancement because final acceptance subtask gate failed: "
+                        f"{trim(str(acceptance_gate.get('reason', '') or ''), 160)}"
+                    ),
+                    actor="single",
+                    tier="long",
+                )
+                self._inject_acceptance_gate_rework_hint(current, acceptance_gate, target_roles=("developer",))
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -40259,6 +40667,7 @@ body{padding:18px}
         plan_data = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         if has_plan_steps and str(plan_data.get("phase", "") or "").strip() == "executing":
             try:
+                self._sync_plan_worker_todos_to_blackboard(board=bb)
                 self._update_plan_file_step_status()
             except Exception:
                 pass
@@ -40274,8 +40683,16 @@ body{padding:18px}
                 bridged_rows, bridged_flat_rows = self._bridge_flat_todos_to_active_plan_step(flat_rows, board=bb)
                 if bridged_flat_rows:
                     worker_rows = self._todo_route_rows(route_kind, rows=bridged_rows, board=bb)
+            if not worker_rows:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+                worker_rows = self._plan_worker_todo_rows_from_blackboard(active_step_id, board=bb)
         elif route_kind == "plan_sync":
             worker_rows = self._todo_route_rows(route_kind, rows=existing, board=bb)
+            if not worker_rows:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+                worker_rows = self._plan_worker_todo_rows_from_blackboard(active_step_id, board=bb)
         elif route_kind == "pure_sync":
             worker_rows = self._todo_route_rows(
                 route_kind,
@@ -42021,32 +42438,32 @@ body{padding:18px}
             # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
+                cur_step_id = trim(str(cur.get("id", "") or ""), 40)
                 worker_todos = [
                     r for r in self.todo.snapshot()
                     if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
+                    and str(r.get("parent_step_id", "") or "").strip() == cur_step_id
                     and not str(r.get("key", "") or "").startswith("bb:")
                 ]
+                if not worker_todos:
+                    worker_todos = self._plan_worker_todo_rows_from_blackboard(cur_step_id, board=bb)
                 if worker_todos:
                     completed_w = [r for r in worker_todos if str(r.get("status", "")).lower() == "completed"]
                     pending_w = [r for r in worker_todos if str(r.get("status", "")).lower() not in ("completed",)]
                     if not pending_w and completed_w:
-                        # Verify actual work evidence before suggesting advance
-                        bb_now = self._ensure_blackboard()
-                        has_artifacts = bool(bb_now.get("code_artifacts"))
-                        has_research = bool(bb_now.get("research_notes"))
-                        has_shell_output = bool(bb_now.get("execution_logs"))
-                        has_evidence = has_artifacts or has_research or has_shell_output
-                        if has_evidence:
+                        acceptance_gate = self._plan_step_acceptance_gate_status(cur, None, self._ensure_blackboard())
+                        if bool(acceptance_gate.get("ok", False)):
                             worker_hint = (
                                 f"Worker subtasks: all {len(completed_w)} completed "
                                 f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
-                                "Blackboard has concrete outputs. \u2192 Set advance_plan_step=true NOW. "
+                                "Final acceptance gate has matching evidence. \u2192 Set advance_plan_step=true NOW. "
                             )
                         else:
                             worker_hint = (
                                 f"Worker subtasks: all {len(completed_w)} marked completed "
-                                "but blackboard has NO concrete outputs (no code_artifacts, research_notes, or execution_logs). "
-                                "\u2192 Do NOT advance. Re-delegate to verify actual work was done. "
+                                "but the final acceptance gate is not satisfied "
+                                f"({trim(str(acceptance_gate.get('reason', '') or ''), 80)}). "
+                                "\u2192 Do NOT advance. Re-delegate to execute the acceptance subtask and record evidence. "
                             )
                     elif completed_w or pending_w:
                         worker_hint = (
@@ -50305,6 +50722,7 @@ body{padding:18px}
             full = _mid_re_exec.sub(r"\n\1", full)
             header = full.split("\n")[0] if "\n" in full else full
             sub_lines = [ln for ln in full.split("\n")[1:] if ln.strip()] if "\n" in full else []
+            step_worker_rows = self._active_plan_worker_todo_rows(str(t.get("id", "") or ""), role="")
             status = str(t.get("status", "pending") or "pending")
             if status == "completed":
                 actor = str(t.get("completed_by", "") or "")
@@ -50312,6 +50730,13 @@ body{padding:18px}
                 lines.append(self._ui_text("active_plan_step_done", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
                 meta_parts = []
                 if actor:
                     meta_parts.append(self._ui_text("active_plan_completed_by", actor=actor))
@@ -50323,10 +50748,24 @@ body{padding:18px}
                 lines.append(self._ui_text("active_plan_step_current", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
             else:
                 lines.append(self._ui_text("active_plan_step_pending", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
         return "\n".join(lines) + "\n"
 
     def _update_plan_file_step_status(self) -> bool:
